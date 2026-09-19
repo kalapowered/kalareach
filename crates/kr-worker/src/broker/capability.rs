@@ -114,12 +114,11 @@ impl CapabilityOwner {
     /// source that cannot establish a working capability claiming one, or an unusable state with
     /// no reason a person can read.
     pub fn record(&mut self, record: CapabilityRecord) -> Result<()> {
-        record.validate()?;
         self.maps
             .entry(record.application_instance_id)
             .or_default()
-            .upsert(record);
-        Ok(())
+            .upsert(record)
+            .map_err(BrokerError::from)
     }
 
     /// Records the result of a probe the host ran.
@@ -252,6 +251,7 @@ mod tests {
     ) -> CapabilityRecord {
         CapabilityRecord {
             capability_id: capability(name),
+            capability_version: "1".to_owned(),
             application_instance_id: instance(),
             identity: CapabilitySubjectIdentity {
                 binary_digest: Nullable::some(Digest256::from_bytes([3; 32])),

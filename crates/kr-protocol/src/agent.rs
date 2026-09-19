@@ -32,6 +32,81 @@ use crate::semantic::SemanticContinuation;
 /// Longer content belongs in a draft, which has its own revision and its own attachments.
 pub const MAX_INLINE_PROMPT_BYTES: usize = 64 * 1024;
 
+/// Prompt or steering text, bounded by the contract rather than by a caller's restraint.
+///
+/// The bound is part of the wire type rather than a check somewhere downstream, so the generated
+/// schema states it and a decoder refuses an over-long value before anything allocates it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct PromptText(String);
+
+/// Text that is empty or longer than one call may carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("prompt text is 1 to 65536 bytes; longer content belongs in a draft")]
+pub struct PromptTextError;
+
+impl PromptText {
+    /// Validates and wraps prompt text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptTextError`] when the text is empty or longer than
+    /// [`MAX_INLINE_PROMPT_BYTES`] bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, PromptTextError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_INLINE_PROMPT_BYTES {
+            return Err(PromptTextError);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for PromptText {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl core::str::FromStr for PromptText {
+    type Err = PromptTextError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::new(text)
+    }
+}
+
+impl<'de> Deserialize<'de> for PromptText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::new(text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for PromptText {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PromptText".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "kalareach::PromptText".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_INLINE_PROMPT_BYTES,
+            "description": "Prompt or steering text carried inline, bounded at 64 KiB."
+        })
+    }
+}
+
 /// What every agent method names: the session and the exact instance inside it.
 ///
 /// Section 12 is explicit that observation binds to the instance, not to a product name: "Semantic
@@ -203,7 +278,23 @@ pub struct AgentPromptParams {
     /// The draft to submit, when the prompt has attachments or was composed elsewhere.
     pub draft_id: Nullable<DraftId>,
     /// The prompt itself, when it is short enough to travel inline.
-    pub text: Nullable<String>,
+    pub text: Nullable<PromptText>,
+}
+
+impl AgentPromptParams {
+    /// Checks that exactly one of the two ways of naming a prompt was used.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming what was wrong. A call with neither has nothing to submit, and one
+    /// with both is two prompts wearing one identifier.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.draft_id.is_present(), self.text.is_present()) {
+            (true, false) | (false, true) => Ok(()),
+            (false, false) => Err("a prompt names either a draft or inline text"),
+            (true, true) => Err("a prompt names a draft or inline text, not both"),
+        }
+    }
 }
 
 /// Parameters of `agent.turn.steer`.
@@ -215,7 +306,7 @@ pub struct AgentSteerParams {
     /// The turn being steered. A turn that has ended is refused rather than redirected.
     pub turn_id: AgentTurnId,
     /// The steering text.
-    pub text: String,
+    pub text: PromptText,
 }
 
 /// Parameters of `agent.turn.cancel`.
@@ -298,6 +389,48 @@ mod tests {
         let encoded = serde_json::to_value(subject).expect("the subject encodes");
         assert!(encoded.get("application_instance_id").is_some());
         assert!(encoded.get("session_id").is_some());
+    }
+
+    #[test]
+    fn inline_text_is_bounded_by_the_contract() {
+        assert!(PromptText::new("hello").is_ok());
+        assert!(PromptText::new(String::new()).is_err());
+        assert!(PromptText::new("a".repeat(MAX_INLINE_PROMPT_BYTES)).is_ok());
+        assert!(PromptText::new("a".repeat(MAX_INLINE_PROMPT_BYTES + 1)).is_err());
+        let over_long = serde_json::Value::String("a".repeat(MAX_INLINE_PROMPT_BYTES + 1));
+        assert!(
+            serde_json::from_value::<PromptText>(over_long).is_err(),
+            "the bound is enforced on the way in, not somewhere downstream"
+        );
+    }
+
+    #[test]
+    fn a_prompt_names_a_draft_or_inline_text_and_not_both() {
+        let target = AgentMutationTarget {
+            subject: AgentSubject {
+                session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+                application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
+            },
+            binding_revision: AgentBindingRevision::new(7),
+        };
+        let neither = AgentPromptParams {
+            target,
+            draft_id: Nullable::null(),
+            text: Nullable::null(),
+        };
+        assert!(neither.validate().is_err());
+        let inline = AgentPromptParams {
+            target,
+            draft_id: Nullable::null(),
+            text: Nullable::some(PromptText::new("hello").expect("valid")),
+        };
+        inline.validate().expect("inline text alone is a prompt");
+        let both = AgentPromptParams {
+            target,
+            draft_id: Nullable::some(DraftId::new(Uuid::from_bytes([4; 16]))),
+            text: Nullable::some(PromptText::new("hello").expect("valid")),
+        };
+        assert!(both.validate().is_err());
     }
 
     #[test]

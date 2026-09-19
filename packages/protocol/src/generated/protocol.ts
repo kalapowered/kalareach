@@ -68,6 +68,14 @@ export type Digest256 = string
  */
 export type BrokerBindingId = string
 /**
+ * A plugin identifier from its manifest.
+ */
+export type PluginId = string
+/**
+ * A package publisher identity from its manifest. Decoding trust is recorded against it.
+ */
+export type PublisherId = string
+/**
  * A schema or protocol version as text, so a record survives a vendor's own numbering.
  */
 export type MethodTableVersionText = string
@@ -80,7 +88,8 @@ export type CapabilityInvalidation =
   | 'schema_changed'
   | 'os_permission_changed'
   | 'desktop_generation_changed'
-  | 'profile_changed'
+  | 'qualification_profile_changed'
+  | 'launch_profile_changed'
 /**
  * One foreground application within a terminal session.
  */
@@ -89,6 +98,10 @@ export type ApplicationInstanceId = string
  * One durable device-owned draft, independent of an attachment.
  */
 export type DraftId = string
+/**
+ * Prompt or steering text carried inline, bounded at 64 KiB.
+ */
+export type PromptText = string
 /**
  * One change an installation makes, with its inverse implied by its kind.
  */
@@ -728,10 +741,6 @@ export type PayerAuthorisationId = string
  */
 export type PendingResourceId = string
 /**
- * A plugin identifier from its manifest.
- */
-export type PluginId = string
-/**
  * The revision of an organisation's policy-signing key, advanced on every rotation.
  */
 export type PolicyKeyRevision = string
@@ -739,10 +748,6 @@ export type PolicyKeyRevision = string
  * One environment-bound source repository.
  */
 export type ProjectRepositoryId = string
-/**
- * A package publisher identity from its manifest. Decoding trust is recorded against it.
- */
-export type PublisherId = string
 /**
  * One attempt to bind a push token to an installation. 128 random bits.
  */
@@ -2425,6 +2430,10 @@ export interface CapabilityRecord {
    */
   capability_id: string
   /**
+   * The version of that capability the record is about.
+   */
+  capability_version: string
+  /**
    * The user-facing reason, required whenever the state is not usable.
    */
   disabled_reason: string | null
@@ -2450,6 +2459,7 @@ export interface CapabilityRecord {
    */
   state:
     | 'qualified_available'
+    | 'version_qualified'
     | 'missing_installation'
     | 'permission_required'
     | 'incompatible'
@@ -2477,9 +2487,21 @@ export interface CapabilitySubjectIdentity {
    */
   os_permission_held: boolean | null
   /**
-   * The launch profile the evidence was gathered under.
+   * The package the evidence is about, where it is about one.
+   */
+  plugin_id: PluginId | null
+  /**
+   * The host's launch profile the evidence was gathered under.
    */
   profile_id: LaunchProfileId | null
+  /**
+   * The publisher whose signed record supplied the evidence, where one did.
+   */
+  publisher_id: PublisherId | null
+  /**
+   * The digest of the signed qualification profile the evidence came from, where one did.
+   */
+  qualification_profile_digest: Digest256 | null
   /**
    * The upstream schema or protocol version the evidence is about.
    */
@@ -2910,7 +2932,7 @@ export interface AgentPromptParams {
   /**
    * The prompt itself, when it is short enough to travel inline.
    */
-  text: string | null
+  text: PromptText | null
 }
 /**
  * What the prompt acts on.
@@ -3062,7 +3084,7 @@ export interface AgentSnapshotEntry {
 export interface AgentSteerParams {
   target: AgentMutationTarget3
   /**
-   * The steering text.
+   * Prompt or steering text carried inline, bounded at 64 KiB.
    */
   text: string
   /**
@@ -7133,11 +7155,11 @@ export interface DeclarativeTable {
    */
   method_field: string
   /**
-   * The package that supplied the table.
+   * A plugin identifier from its manifest.
    */
   plugin_id: string
   /**
-   * The publisher whose semantic trust grant qualifies it.
+   * A package publisher identity from its manifest. Decoding trust is recorded against it.
    */
   publisher_id: string
   /**
@@ -7202,21 +7224,25 @@ export interface DecoderLedgerEntry {
    */
   method: string
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  offered_decisions: string
-  /**
    * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   package_digest: string
   /**
-   * The package that binding runs.
+   * A plugin identifier from its manifest.
    */
   plugin_id: string
+  projection: DecodedProjection
   /**
-   * The publisher of that package, for a person reading the pending resource.
+   * A package publisher identity from its manifest. Decoding trust is recorded against it.
    */
   publisher_id: string
+  /**
+   * The original source bytes, so the request can be shown as it arrived.
+   *
+   * A digest proves which bytes these are; it cannot reproduce them, and section 11 requires
+   * the original source to be retained rather than merely identified.
+   */
+  source_bytes: string
   /**
    * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
@@ -7225,6 +7251,44 @@ export interface DecoderLedgerEntry {
    * The generation of the source frame the decoder read.
    */
   source_generation: string
+  /**
+   * True when the frame was larger than [`MAX_RETAINED_SOURCE_BYTES`] and was cut.
+   */
+  source_truncated: boolean
+  /**
+   * An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.
+   */
+  upstream_request_id: string
+}
+/**
+ * The projection the decoder produced, with the exact decisions it offered.
+ */
+export interface DecodedProjection {
+  /**
+   * The decisions offered, in the order the upstream offered them.
+   */
+  decisions: OfferedDecision[]
+  /**
+   * The projection schema the decoder wrote this against.
+   */
+  schema_version: string
+  /**
+   * What the request is asking, for a person.
+   */
+  summary: string
+}
+/**
+ * One decision a decoder offers a person.
+ */
+export interface OfferedDecision {
+  /**
+   * What the decision says, for a person.
+   */
+  label: string
+  /**
+   * The identifier the upstream expects back. Answering is choosing one of these.
+   */
+  option_id: string
 }
 /**
  * What a component is trusted to interpret, and whose interpretation it is.
@@ -7239,6 +7303,10 @@ export interface DecodingTrust {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   granted_at: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_decisions: string
   /**
    * Whether the component may also encode an answer to those requests.
    *
@@ -7258,13 +7326,21 @@ export interface DecodingTrust {
    */
   package_digest: string
   /**
-   * The package whose component holds the trust.
+   * A plugin identifier from its manifest.
    */
   plugin_id: string
   /**
-   * The publisher that signed that package.
+   * A package publisher identity from its manifest. Decoding trust is recorded against it.
    */
   publisher_id: string
+  /**
+   * The projection schema versions this trust covers.
+   *
+   * This is the schema policy the broker checks before a decoded projection becomes an
+   * actionable approval. A projection that names a version outside this set is not one this
+   * trust was granted for, whatever it contains.
+   */
+  schema_versions: string[]
 }
 /**
  * Every capability record for one desktop, with the context they are about.

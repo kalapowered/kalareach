@@ -6,11 +6,16 @@
 //!
 //! The order of the four steps is what makes the rule hold. Encoding happens *outside* the claim,
 //! because encoding can be slow and a native answer that arrives during it must win. The recheck
-//! and the claim happen together under one lock, so between deciding that the request is still
-//! answerable and taking it nothing can move. Dispatch happens after the claim, so two answers
-//! cannot both be sent. And an answer whose outcome nobody can establish leaves the resource
-//! `uncertain` rather than pending, because a pending resource is one a later answer could still
-//! claim and that would be the second dispatch.
+//! and the claim happen together, so between deciding that the request is still answerable and
+//! taking it nothing can move. The dispatch marker is committed before the answer is written to
+//! the upstream, so a crash in the middle leaves a record that says an answer may already have
+//! gone. And an answer whose outcome nobody can establish leaves the resource `uncertain` rather
+//! than pending, because a pending resource is one a later answer could still claim.
+//!
+//! Every state change here is *planned* before it is *committed*. A plan validates and produces
+//! the record as it would be; the caller writes that record durably and only then commits the plan
+//! to memory. That split is what keeps a failed or racing write from leaving memory ahead of the
+//! ledger.
 
 use std::collections::BTreeMap;
 
@@ -18,8 +23,8 @@ use kr_protocol::gateway::{
     ArbitrationError, DownstreamRequestId, Durability, PendingResource, PendingState,
     check_transition,
 };
-use kr_protocol::ids::{ActorId, PendingResourceId};
-use kr_protocol::scalars::TimestampMs;
+use kr_protocol::ids::{ActorId, ApplicationInstanceId, BrokerBindingId, PendingResourceId};
+use kr_protocol::scalars::{TimestampMs, Uuid};
 
 use crate::broker::error::{BrokerError, Result};
 
@@ -28,25 +33,60 @@ use crate::broker::error::{BrokerError, Result};
 pub struct Pending {
     /// The resource as clients see it.
     pub resource: PendingResource,
-    /// The actor whose answer holds the claim, while one does.
-    pub claimed_by: Option<ActorId>,
+    /// The claim currently held, while one is.
+    pub claim: Option<Claim>,
     /// True once an answer has left this host for the upstream.
     ///
     /// This is the flag that decides what a reconnect does. A claimed resource that was never
     /// dispatched can go back to pending; one that was dispatched and never confirmed is
     /// uncertain, and an uncertain resource is never answered a second time.
     pub dispatched: bool,
+    /// The binding whose decoder produced it, where one did.
+    pub decoder: Option<BrokerBindingId>,
 }
 
 /// What a claim gives its holder.
+///
+/// The identifier is the point. Checking only the actor would let a claim that a reconnect
+/// released resolve the *next* claim the same actor takes, which is two answers under one
+/// authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
+    /// This claim, distinct from every other claim on this resource.
+    pub claim_id: Uuid,
     /// The resource claimed.
     pub resource_id: PendingResourceId,
     /// The actor holding it.
     pub actor_id: ActorId,
-    /// The state the resource was in when the claim was taken.
+    /// When the claim was taken.
     pub claimed_at: TimestampMs,
+}
+
+/// A validated state change that has not been applied yet.
+///
+/// The caller writes [`Transition::resource`] durably, then calls [`Arbitration::commit`]. Nothing
+/// between those two points changes what the transition will do, because the arbitration is held
+/// under the broker's one lock for both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transition {
+    /// The resource as it will be.
+    pub resource: PendingResource,
+    /// The state it is in now, which the durable write is conditional on.
+    pub from: PendingState,
+    /// The claim this transition establishes or discharges.
+    claim: Option<Claim>,
+    /// Whether the transition takes the claim or gives it up.
+    holds_claim: bool,
+    /// Whether this transition also sets the dispatch marker.
+    dispatched: bool,
+}
+
+impl Transition {
+    /// Returns the claim this transition establishes, for a caller that took one.
+    #[must_use]
+    pub fn claim(&self) -> Option<&Claim> {
+        self.claim.as_ref()
+    }
 }
 
 /// What a reconnect found.
@@ -60,6 +100,19 @@ pub struct Reconciliation {
     pub withdrawn: Vec<PendingResourceId>,
     /// Claims that were never dispatched, released back to pending for a fresh answer.
     pub released: Vec<PendingResourceId>,
+}
+
+/// Which resources one reconciliation is about.
+///
+/// A reconnect knows what one upstream connection still has pending. It knows nothing about any
+/// other, so applying its list to every resource this broker holds would cancel other upstreams'
+/// requests for the crime of not being on a list that was never about them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconcileScope {
+    /// The application instance that reconnected.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The gateway connection whose identifiers the list names.
+    pub connection: kr_protocol::ids::GatewayConnectionId,
 }
 
 /// The broker's live arbitration.
@@ -84,7 +137,11 @@ impl Arbitration {
     /// already in use. Two live requests cannot share one identifier on one connection: the
     /// response correlation would be ambiguous, and an ambiguous correlation is how one answer
     /// resolves the wrong request.
-    pub fn record(&mut self, resource: PendingResource) -> Result<()> {
+    pub fn record(
+        &mut self,
+        resource: PendingResource,
+        decoder: Option<BrokerBindingId>,
+    ) -> Result<()> {
         if let Some(existing) = self.by_request.get(&resource.request) {
             return Err(BrokerError::invalid(format!(
                 "{} already names pending resource {existing}",
@@ -97,26 +154,41 @@ impl Arbitration {
             resource.resource_id,
             Pending {
                 resource,
-                claimed_by: None,
+                claim: None,
                 dispatched: false,
+                decoder,
             },
         );
         Ok(())
     }
 
+    /// Returns true when this downstream identifier already names a live resource.
+    #[must_use]
+    pub fn holds_request(&self, request: &DownstreamRequestId) -> bool {
+        self.by_request.contains_key(request)
+    }
+
     /// Restores a resource read back from the ledger, without the duplicate check.
     ///
     /// Recovery is not a second record: the identifiers were already unique when they were
-    /// written, and refusing them now would drop what a restart is meant to recover.
-    pub fn restore(&mut self, resource: PendingResource, dispatched: bool) {
+    /// written, and refusing them now would drop what a restart is meant to recover. The claim is
+    /// not restored, because the client that held it is gone; what is restored is whether an
+    /// answer had already been dispatched, which is what a reconnect needs.
+    pub fn restore(
+        &mut self,
+        resource: PendingResource,
+        dispatched: bool,
+        decoder: Option<BrokerBindingId>,
+    ) {
         self.by_request
             .insert(resource.request.clone(), resource.resource_id);
         self.by_id.insert(
             resource.resource_id,
             Pending {
                 resource,
-                claimed_by: None,
+                claim: None,
                 dispatched,
+                decoder,
             },
         );
     }
@@ -149,26 +221,26 @@ impl Arbitration {
             .count()
     }
 
-    /// Takes the claim on one resource.
+    /// Plans the claim on one resource.
     ///
-    /// This is the "recheck and claim" half of the transaction, and it is one operation because
-    /// the two halves have to be. The caller encodes its answer first, then calls this; if a
-    /// native answer arrived while it was encoding, the resource is no longer claimable and the
-    /// caller is told the resolved state instead of dispatching over it.
+    /// This is the "recheck" half of the transaction. The caller has already encoded its answer;
+    /// if a native answer arrived while it was encoding, the resource is no longer claimable and
+    /// the caller is told the resolved state instead of dispatching over it.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier, and
-    /// [`BrokerError::Arbitration`] when the resource is already claimed or already resolved.
-    pub fn claim(
-        &mut self,
+    /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier,
+    /// [`BrokerError::Arbitration`] when the resource is already claimed or already resolved, and
+    /// [`BrokerError::PreconditionFailed`] when its interpretation has not been verified.
+    pub fn plan_claim(
+        &self,
         resource_id: PendingResourceId,
         actor_id: &ActorId,
         now: TimestampMs,
-    ) -> Result<Claim> {
+    ) -> Result<Transition> {
         let pending = self
             .by_id
-            .get_mut(&resource_id)
+            .get(&resource_id)
             .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
         check_transition(pending.resource.state, PendingState::Claimed)?;
         if !pending.resource.interpretation_verified {
@@ -178,59 +250,66 @@ impl Arbitration {
                 ),
             });
         }
-        pending.resource.state = PendingState::Claimed;
-        pending.claimed_by = Some(actor_id.clone());
-        Ok(Claim {
-            resource_id,
-            actor_id: actor_id.clone(),
-            claimed_at: now,
+        if let Some(deadline) = pending.resource.deadline_ms.as_ref()
+            && deadline.get() <= now.get()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("the upstream's deadline for {resource_id} has passed"),
+            });
+        }
+        let mut resource = pending.resource.clone();
+        resource.state = PendingState::Claimed;
+        Ok(Transition {
+            resource,
+            from: pending.resource.state,
+            claim: Some(Claim {
+                claim_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
+                resource_id,
+                actor_id: actor_id.clone(),
+                claimed_at: now,
+            }),
+            holds_claim: true,
+            dispatched: false,
         })
     }
 
-    /// Marks that the claimed answer has left this host.
-    ///
-    /// Called between the write and the confirmation, so a crash in the middle leaves a record
-    /// that says an answer may already have been sent.
+    /// Plans the dispatch marker for a claimed resource.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier, and
-    /// [`BrokerError::PermissionDenied`] when another actor holds the claim.
-    pub fn mark_dispatched(&mut self, claim: &Claim) -> Result<()> {
+    /// Returns [`BrokerError::UnknownSubject`] or [`BrokerError::PermissionDenied`] as the claim
+    /// requires.
+    pub fn plan_dispatch(&self, claim: &Claim) -> Result<Transition> {
         let pending = self.claimed_by(claim)?;
-        pending.dispatched = true;
-        Ok(())
+        Ok(Transition {
+            resource: pending.resource.clone(),
+            from: pending.resource.state,
+            claim: Some(claim.clone()),
+            holds_claim: true,
+            dispatched: true,
+        })
     }
 
-    /// Resolves a claimed resource: the upstream confirmed the answer.
+    /// Plans the resolution of a claimed resource: the upstream confirmed the answer.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`], [`BrokerError::PermissionDenied`] or
     /// [`BrokerError::Arbitration`] as the claim, the actor or the state requires.
-    pub fn resolve(&mut self, claim: &Claim) -> Result<PendingResource> {
-        let pending = self.claimed_by(claim)?;
-        check_transition(pending.resource.state, PendingState::Resolved)?;
-        pending.resource.state = PendingState::Resolved;
-        pending.claimed_by = None;
-        Ok(pending.resource.clone())
+    pub fn plan_resolve(&self, claim: &Claim) -> Result<Transition> {
+        self.plan_from_claim(claim, PendingState::Resolved, true)
     }
 
-    /// Leaves a claimed resource uncertain: an answer went and nothing confirmed it.
+    /// Plans leaving a claimed resource uncertain: an answer went and nothing confirmed it.
     ///
     /// # Errors
     ///
-    /// Returns the same failures [`Arbitration::resolve`] does.
-    pub fn uncertain(&mut self, claim: &Claim) -> Result<PendingResource> {
-        let pending = self.claimed_by(claim)?;
-        check_transition(pending.resource.state, PendingState::Uncertain)?;
-        pending.resource.state = PendingState::Uncertain;
-        pending.dispatched = true;
-        pending.claimed_by = None;
-        Ok(pending.resource.clone())
+    /// Returns the same failures [`Arbitration::plan_resolve`] does.
+    pub fn plan_uncertain(&self, claim: &Claim) -> Result<Transition> {
+        self.plan_from_claim(claim, PendingState::Uncertain, true)
     }
 
-    /// Records that the upstream answered or withdrew the request itself.
+    /// Plans the record of the upstream answering or withdrawing the request itself.
     ///
     /// A native answer that arrives while a rich answer is encoding wins. The claim it beats is
     /// released as the upstream's own resolution rather than as a second dispatch, and the rich
@@ -240,18 +319,46 @@ impl Arbitration {
     ///
     /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier, and
     /// [`BrokerError::Arbitration`] when the resource has already reached a terminal state.
-    pub fn upstream_resolved(&mut self, request: &DownstreamRequestId) -> Result<PendingResource> {
+    pub fn plan_upstream_resolved(&self, request: &DownstreamRequestId) -> Result<Transition> {
         let resource_id = *self
             .by_request
             .get(request)
             .ok_or_else(|| BrokerError::unknown(format!("no pending resource for {request}")))?;
         let pending = self
             .by_id
-            .get_mut(&resource_id)
+            .get(&resource_id)
             .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
         check_transition(pending.resource.state, PendingState::Cancelled)?;
-        pending.resource.state = PendingState::Cancelled;
-        pending.claimed_by = None;
+        let mut resource = pending.resource.clone();
+        resource.state = PendingState::Cancelled;
+        Ok(Transition {
+            resource,
+            from: pending.resource.state,
+            claim: None,
+            holds_claim: false,
+            dispatched: false,
+        })
+    }
+
+    /// Applies a planned transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when the resource has gone since the plan was made,
+    /// which cannot happen while both are under the broker's lock and is reported rather than
+    /// ignored if it ever does.
+    pub fn commit(&mut self, transition: Transition) -> Result<PendingResource> {
+        let resource_id = transition.resource.resource_id;
+        let pending = self.by_id.get_mut(&resource_id).ok_or_else(|| {
+            BrokerError::unknown(format!("no pending resource {resource_id} to commit"))
+        })?;
+        pending.resource = transition.resource;
+        pending.claim = if transition.holds_claim {
+            transition.claim
+        } else {
+            None
+        };
+        pending.dispatched = pending.dispatched || transition.dispatched;
         Ok(pending.resource.clone())
     }
 
@@ -260,9 +367,9 @@ impl Arbitration {
     /// A claimed resource is never expired out from under its answer: the claim is what decides
     /// its outcome, and the deadline the upstream stated is about how long it will wait, not about
     /// what this host has already done.
-    pub fn expire(&mut self, now: TimestampMs) -> Vec<PendingResourceId> {
+    pub fn expire(&mut self, now: TimestampMs) -> Vec<PendingResource> {
         let mut expired = Vec::new();
-        for (resource_id, pending) in &mut self.by_id {
+        for pending in self.by_id.values_mut() {
             if pending.resource.state != PendingState::Pending {
                 continue;
             }
@@ -271,13 +378,13 @@ impl Arbitration {
             };
             if deadline.get() <= now.get() {
                 pending.resource.state = PendingState::Expired;
-                expired.push(*resource_id);
+                expired.push(pending.resource.clone());
             }
         }
         expired
     }
 
-    /// Reconciles this host's records with what the upstream still has pending.
+    /// Plans the reconciliation of one upstream's records with what it still has pending.
     ///
     /// The three outcomes are the whole contract:
     ///
@@ -286,55 +393,101 @@ impl Arbitration {
     /// * This host dispatched an answer and cannot tell whether it landed: uncertain, for ever.
     ///   Asking again is the one thing that must not happen, because the answer may already have
     ///   been applied.
-    pub fn reconcile(&mut self, still_open: &[DownstreamRequestId]) -> Reconciliation {
+    ///
+    /// Only resources inside `scope` are considered. A reconnect speaks for one upstream on one
+    /// connection and for nothing else.
+    ///
+    /// Nothing is applied here. The caller writes each transition durably and commits it, the
+    /// same way it does for a single resource.
+    #[must_use]
+    pub fn plan_reconcile(
+        &self,
+        scope: ReconcileScope,
+        still_open: &[DownstreamRequestId],
+    ) -> (Reconciliation, Vec<Transition>) {
         let open: std::collections::BTreeSet<&DownstreamRequestId> = still_open.iter().collect();
         let mut result = Reconciliation::default();
-        for (resource_id, pending) in &mut self.by_id {
+        let mut transitions = Vec::new();
+        for (resource_id, pending) in &self.by_id {
             if pending.resource.state.is_terminal() {
                 continue;
             }
+            if pending.resource.application_instance_id != scope.application_instance_id
+                || pending.resource.request.connection != scope.connection
+            {
+                continue;
+            }
             let upstream_has_it = open.contains(&pending.resource.request);
-            match (upstream_has_it, pending.dispatched) {
+            let to = match (upstream_has_it, pending.dispatched) {
                 (_, true) => {
-                    pending.resource.state = PendingState::Uncertain;
-                    pending.claimed_by = None;
                     result.uncertain.push(*resource_id);
+                    PendingState::Uncertain
                 }
                 (true, false) => {
                     if pending.resource.state == PendingState::Claimed {
-                        pending.resource.state = PendingState::Pending;
-                        pending.claimed_by = None;
                         result.released.push(*resource_id);
+                        PendingState::Pending
                     } else {
                         result.still_pending.push(*resource_id);
+                        continue;
                     }
                 }
                 (false, false) => {
-                    pending.resource.state = PendingState::Cancelled;
-                    pending.claimed_by = None;
                     result.withdrawn.push(*resource_id);
+                    PendingState::Cancelled
                 }
-            }
+            };
+            let mut resource = pending.resource.clone();
+            resource.state = to;
+            transitions.push(Transition {
+                resource,
+                from: pending.resource.state,
+                claim: None,
+                holds_claim: false,
+                dispatched: pending.dispatched,
+            });
         }
-        result
+        (result, transitions)
     }
 
-    /// Marks every unresolved resource volatile, and returns how many were already claimed.
+    /// Marks every unresolved resource volatile, and returns the records that changed.
     ///
-    /// The count is what the evidence gap carries: these are the identifiers a second response
-    /// must never be emitted for, and they are carried across the gap rather than forgotten.
-    pub fn enter_volatile(&mut self) -> u64 {
+    /// The returned count of already-claimed identifiers is what the evidence gap carries: these
+    /// are the ones a second response must never be emitted for, and they are carried across the
+    /// gap rather than forgotten.
+    pub fn enter_volatile(&mut self) -> (u64, Vec<PendingResource>) {
         let mut carried = 0;
+        let mut changed = Vec::new();
         for pending in self.by_id.values_mut() {
             if pending.resource.state.is_terminal() {
                 continue;
             }
             pending.resource.durability = Durability::Volatile;
+            changed.push(pending.resource.clone());
             if pending.resource.state == PendingState::Claimed || pending.dispatched {
                 carried += 1;
             }
         }
-        carried
+        (carried, changed)
+    }
+
+    /// Returns every unresolved resource and whether an answer had gone for it.
+    ///
+    /// This is what recovery commits: the resources that lived inside a gap, exactly as they
+    /// stand, rather than a replay of the operations that produced them.
+    #[must_use]
+    pub fn unresolved(&self) -> Vec<(PendingResource, Option<BrokerBindingId>, bool)> {
+        self.by_id
+            .values()
+            .filter(|pending| !pending.resource.state.is_terminal())
+            .map(|pending| {
+                (
+                    pending.resource.clone(),
+                    pending.decoder,
+                    pending.dispatched,
+                )
+            })
+            .collect()
     }
 
     /// Forgets every resource that has reached a terminal state.
@@ -356,12 +509,31 @@ impl Arbitration {
         resolved.len()
     }
 
-    fn claimed_by(&mut self, claim: &Claim) -> Result<&mut Pending> {
-        let pending = self.by_id.get_mut(&claim.resource_id).ok_or_else(|| {
+    fn plan_from_claim(
+        &self,
+        claim: &Claim,
+        to: PendingState,
+        dispatched: bool,
+    ) -> Result<Transition> {
+        let pending = self.claimed_by(claim)?;
+        check_transition(pending.resource.state, to)?;
+        let mut resource = pending.resource.clone();
+        resource.state = to;
+        Ok(Transition {
+            resource,
+            from: pending.resource.state,
+            claim: Some(claim.clone()),
+            holds_claim: false,
+            dispatched,
+        })
+    }
+
+    fn claimed_by(&self, claim: &Claim) -> Result<&Pending> {
+        let pending = self.by_id.get(&claim.resource_id).ok_or_else(|| {
             BrokerError::unknown(format!("no pending resource {}", claim.resource_id))
         })?;
-        match pending.claimed_by.as_ref() {
-            Some(holder) if holder == &claim.actor_id => Ok(pending),
+        match pending.claim.as_ref() {
+            Some(held) if held.claim_id == claim.claim_id => Ok(pending),
             Some(_) => Err(BrokerError::denied(format!(
                 "another answer holds the claim on {}",
                 claim.resource_id
@@ -381,19 +553,29 @@ mod tests {
     use super::*;
     use kr_protocol::gateway::{NativeClassification, NativeMethodClass, PendingKind};
     use kr_protocol::ids::{
-        ApplicationInstanceId, GatewayConnectionId, SourceGeneration, UpstreamMethod,
-        UpstreamRequestId,
+        GatewayConnectionId, SourceGeneration, UpstreamMethod, UpstreamRequestId,
     };
-    use kr_protocol::scalars::{Nullable, Uuid};
+    use kr_protocol::scalars::Nullable;
 
     fn actor(name: &str) -> ActorId {
         ActorId::new(name).expect("valid")
     }
 
+    fn instance() -> ApplicationInstanceId {
+        ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
+    }
+
+    fn scope() -> ReconcileScope {
+        ReconcileScope {
+            application_instance_id: instance(),
+            connection: GatewayConnectionId::new(1),
+        }
+    }
+
     fn resource(byte: u8, request: &str) -> PendingResource {
         PendingResource {
             resource_id: PendingResourceId::new(Uuid::from_bytes([byte; 16])),
-            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
+            application_instance_id: instance(),
             request: DownstreamRequestId::new(
                 GatewayConnectionId::new(1),
                 UpstreamRequestId::new(request).expect("valid"),
@@ -410,40 +592,82 @@ mod tests {
         }
     }
 
+    /// Reconciles and applies, the way the broker does under its lock.
+    fn reconcile(
+        arbitration: &mut Arbitration,
+        scope: ReconcileScope,
+        still_open: &[DownstreamRequestId],
+    ) -> Reconciliation {
+        let (result, transitions) = arbitration.plan_reconcile(scope, still_open);
+        for transition in transitions {
+            arbitration.commit(transition).expect("committed");
+        }
+        result
+    }
+
+    /// Takes a claim and applies it, the way the broker does under its lock.
+    fn claim(
+        arbitration: &mut Arbitration,
+        resource_id: PendingResourceId,
+        who: &str,
+        now: u64,
+    ) -> Result<Claim> {
+        let transition = arbitration.plan_claim(resource_id, &actor(who), TimestampMs::new(now))?;
+        let claim = transition.claim().cloned().expect("a claim was planned");
+        arbitration.commit(transition)?;
+        Ok(claim)
+    }
+
     #[test]
     fn one_resource_takes_one_claim() {
         let mut arbitration = Arbitration::new();
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
-        arbitration.record(resource).expect("recorded");
-        let claim = arbitration
-            .claim(resource_id, &actor("device-1"), TimestampMs::new(2))
-            .expect("the first answer claims it");
+        arbitration.record(resource, None).expect("recorded");
+        let held = claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
         assert!(
-            arbitration
-                .claim(resource_id, &actor("device-2"), TimestampMs::new(3))
-                .is_err(),
+            claim(&mut arbitration, resource_id, "device-2", 3).is_err(),
             "a second answer cannot claim a resource that is already claimed"
         );
-        arbitration.resolve(&claim).expect("the claim resolves it");
+        let resolve = arbitration.plan_resolve(&held).expect("planned");
+        arbitration.commit(resolve).expect("committed");
         assert!(
-            arbitration
-                .claim(resource_id, &actor("device-2"), TimestampMs::new(4))
-                .is_err(),
+            claim(&mut arbitration, resource_id, "device-2", 4).is_err(),
             "a resolved resource takes no further claim"
         );
     }
 
     #[test]
+    fn a_released_claim_cannot_resolve_the_claim_that_replaced_it() {
+        let mut arbitration = Arbitration::new();
+        let resource = resource(7, "11");
+        let resource_id = resource.resource_id;
+        let request = resource.request.clone();
+        arbitration.record(resource, None).expect("recorded");
+        let released = claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
+        reconcile(&mut arbitration, scope(), &[request]);
+        // The same actor claims again. The old claim names an older attempt and must not resolve
+        // the new one.
+        let fresh = claim(&mut arbitration, resource_id, "device-1", 3).expect("claimed again");
+        assert_ne!(released.claim_id, fresh.claim_id);
+        assert!(arbitration.plan_resolve(&released).is_err());
+        arbitration
+            .plan_resolve(&fresh)
+            .expect("the claim in force resolves it");
+    }
+
+    #[test]
     fn a_duplicate_downstream_identifier_is_refused() {
         let mut arbitration = Arbitration::new();
-        arbitration.record(resource(7, "11")).expect("recorded");
-        assert!(arbitration.record(resource(8, "11")).is_err());
+        arbitration
+            .record(resource(7, "11"), None)
+            .expect("recorded");
+        assert!(arbitration.record(resource(8, "11"), None).is_err());
         // The same identifier on another connection is a different resource.
         let mut other = resource(8, "11");
         other.request =
             DownstreamRequestId::new(GatewayConnectionId::new(2), other.request.upstream.clone());
-        arbitration.record(other).expect("recorded");
+        arbitration.record(other, None).expect("recorded");
     }
 
     #[test]
@@ -452,20 +676,27 @@ mod tests {
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
         let request = resource.request.clone();
-        arbitration.record(resource).expect("recorded");
-        let claim = arbitration
-            .claim(resource_id, &actor("device-1"), TimestampMs::new(2))
-            .expect("claimed while the rich answer encodes");
-        let resolved = arbitration
-            .upstream_resolved(&request)
+        arbitration.record(resource, None).expect("recorded");
+
+        // The rich answer is encoded first: this is the encode step, before the recheck.
+        let encoded = "allow";
+        // The upstream answers itself while that encoding was happening.
+        let native = arbitration
+            .plan_upstream_resolved(&request)
             .expect("the upstream answered itself");
-        assert_eq!(resolved.state, PendingState::Cancelled);
-        // The later rich answer is told the resolved state rather than dispatching over it.
-        assert!(arbitration.resolve(&claim).is_err());
+        arbitration.commit(native).expect("committed");
+
+        // Now the rich answer reaches the recheck, and there is nothing left to claim.
+        assert!(
+            arbitration
+                .plan_claim(resource_id, &actor("device-1"), TimestampMs::new(5))
+                .is_err(),
+            "the encoded answer {encoded} must not be dispatched over the native one"
+        );
         assert_eq!(
             arbitration
                 .get(resource_id)
-                .expect("still recorded")
+                .expect("recorded")
                 .resource
                 .state,
             PendingState::Cancelled
@@ -483,32 +714,71 @@ mod tests {
         let untouched_request = untouched.request.clone();
         let withdrawn = resource(9, "13");
         let withdrawn_id = withdrawn.resource_id;
-        arbitration.record(dispatched).expect("recorded");
-        arbitration.record(untouched).expect("recorded");
-        arbitration.record(withdrawn).expect("recorded");
+        arbitration.record(dispatched, None).expect("recorded");
+        arbitration.record(untouched, None).expect("recorded");
+        arbitration.record(withdrawn, None).expect("recorded");
 
-        let claim = arbitration
-            .claim(dispatched_id, &actor("device-1"), TimestampMs::new(2))
-            .expect("claimed");
-        arbitration.mark_dispatched(&claim).expect("dispatched");
+        let held = claim(&mut arbitration, dispatched_id, "device-1", 2).expect("claimed");
+        let marker = arbitration.plan_dispatch(&held).expect("planned");
+        arbitration.commit(marker).expect("the marker is committed");
 
-        let reconciliation = arbitration.reconcile(&[dispatched_request, untouched_request]);
+        let reconciliation = reconcile(
+            &mut arbitration,
+            scope(),
+            &[dispatched_request, untouched_request],
+        );
         assert_eq!(reconciliation.uncertain, vec![dispatched_id]);
         assert_eq!(reconciliation.still_pending, vec![untouched_id]);
         assert_eq!(reconciliation.withdrawn, vec![withdrawn_id]);
+        assert!(
+            claim(&mut arbitration, dispatched_id, "device-1", 5).is_err(),
+            "an uncertain resource is never answered again"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_touches_only_the_upstream_it_speaks_for() {
+        let mut arbitration = Arbitration::new();
+        let mine = resource(7, "11");
+        let mine_id = mine.resource_id;
+        arbitration.record(mine, None).expect("recorded");
+
+        let mut another_instance = resource(8, "21");
+        another_instance.application_instance_id =
+            ApplicationInstanceId::new(Uuid::from_bytes([3; 16]));
+        let another_instance_id = another_instance.resource_id;
+        arbitration
+            .record(another_instance, None)
+            .expect("recorded");
+
+        let mut another_connection = resource(9, "31");
+        another_connection.request = DownstreamRequestId::new(
+            GatewayConnectionId::new(2),
+            UpstreamRequestId::new("31").expect("valid"),
+        );
+        let another_connection_id = another_connection.resource_id;
+        arbitration
+            .record(another_connection, None)
+            .expect("recorded");
+
+        // The reconnect lists nothing. Only its own resource is withdrawn.
+        let reconciliation = reconcile(&mut arbitration, scope(), &[]);
+        assert_eq!(reconciliation.withdrawn, vec![mine_id]);
         assert_eq!(
             arbitration
-                .get(dispatched_id)
+                .get(another_instance_id)
                 .expect("recorded")
                 .resource
                 .state,
-            PendingState::Uncertain
+            PendingState::Pending
         );
-        assert!(
+        assert_eq!(
             arbitration
-                .claim(dispatched_id, &actor("device-1"), TimestampMs::new(5))
-                .is_err(),
-            "an uncertain resource is never answered again"
+                .get(another_connection_id)
+                .expect("recorded")
+                .resource
+                .state,
+            PendingState::Pending
         );
     }
 
@@ -518,11 +788,9 @@ mod tests {
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
         let request = resource.request.clone();
-        arbitration.record(resource).expect("recorded");
-        arbitration
-            .claim(resource_id, &actor("device-1"), TimestampMs::new(2))
-            .expect("claimed");
-        let reconciliation = arbitration.reconcile(&[request]);
+        arbitration.record(resource, None).expect("recorded");
+        claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
+        let reconciliation = reconcile(&mut arbitration, scope(), &[request]);
         assert_eq!(reconciliation.released, vec![resource_id]);
         assert_eq!(
             arbitration
@@ -532,8 +800,7 @@ mod tests {
                 .state,
             PendingState::Pending
         );
-        arbitration
-            .claim(resource_id, &actor("device-2"), TimestampMs::new(3))
+        claim(&mut arbitration, resource_id, "device-2", 3)
             .expect("a fresh answer may claim it again");
     }
 
@@ -543,12 +810,19 @@ mod tests {
         let mut resource = resource(7, "11");
         resource.interpretation_verified = false;
         let resource_id = resource.resource_id;
-        arbitration.record(resource).expect("recorded");
-        assert!(
-            arbitration
-                .claim(resource_id, &actor("device-1"), TimestampMs::new(2))
-                .is_err()
-        );
+        arbitration.record(resource, None).expect("recorded");
+        assert!(claim(&mut arbitration, resource_id, "device-1", 2).is_err());
+    }
+
+    #[test]
+    fn a_claim_is_refused_after_the_upstream_deadline() {
+        let mut arbitration = Arbitration::new();
+        let mut resource = resource(7, "11");
+        resource.deadline_ms = Nullable::some(TimestampMs::new(100));
+        let resource_id = resource.resource_id;
+        arbitration.record(resource, None).expect("recorded");
+        assert!(claim(&mut arbitration, resource_id, "device-1", 200).is_err());
+        claim(&mut arbitration, resource_id, "device-1", 50).expect("inside the deadline");
     }
 
     #[test]
@@ -556,13 +830,16 @@ mod tests {
         let mut arbitration = Arbitration::new();
         let claimed = resource(7, "11");
         let claimed_id = claimed.resource_id;
-        arbitration.record(claimed).expect("recorded");
-        arbitration.record(resource(8, "12")).expect("recorded");
-        let claim = arbitration
-            .claim(claimed_id, &actor("device-1"), TimestampMs::new(2))
-            .expect("claimed");
-        arbitration.mark_dispatched(&claim).expect("dispatched");
-        assert_eq!(arbitration.enter_volatile(), 1);
+        arbitration.record(claimed, None).expect("recorded");
+        arbitration
+            .record(resource(8, "12"), None)
+            .expect("recorded");
+        let held = claim(&mut arbitration, claimed_id, "device-1", 2).expect("claimed");
+        let marker = arbitration.plan_dispatch(&held).expect("planned");
+        arbitration.commit(marker).expect("committed");
+        let (carried, changed) = arbitration.enter_volatile();
+        assert_eq!(carried, 1);
+        assert_eq!(changed.len(), 2);
         for pending in arbitration.iter() {
             assert_eq!(pending.resource.durability, Durability::Volatile);
         }
@@ -577,12 +854,12 @@ mod tests {
         let mut answered = resource(8, "12");
         answered.deadline_ms = Nullable::some(TimestampMs::new(100));
         let answered_id = answered.resource_id;
-        arbitration.record(waiting).expect("recorded");
-        arbitration.record(answered).expect("recorded");
-        arbitration
-            .claim(answered_id, &actor("device-1"), TimestampMs::new(50))
-            .expect("claimed");
-        assert_eq!(arbitration.expire(TimestampMs::new(200)), vec![waiting_id]);
+        arbitration.record(waiting, None).expect("recorded");
+        arbitration.record(answered, None).expect("recorded");
+        claim(&mut arbitration, answered_id, "device-1", 50).expect("claimed");
+        let expired = arbitration.expire(TimestampMs::new(200));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].resource_id, waiting_id);
         assert_eq!(
             arbitration
                 .get(answered_id)

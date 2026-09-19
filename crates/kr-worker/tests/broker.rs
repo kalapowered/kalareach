@@ -2,26 +2,28 @@
 //! action tokens, launch profiles and capability evidence.
 //!
 //! Each test is named for the requirement row it closes, so a reader can go from a row to the
-//! behaviour that establishes it without searching.
+//! behaviour that establishes it without searching. Where a test establishes less than its row
+//! asks for, the name says what it does establish and the comment says what is left.
 
 use kr_protocol::broker::{
     ActionName, ActionTokenClaim, AuthenticationState, BinaryIdentity, BrokerGrant, BrokerGrants,
     CapabilityEvidenceSource, CapabilityInvalidation, CapabilityRecord, CapabilityState,
-    CapabilitySubjectIdentity, DecodingTrust, IntegrationMode, LaunchProfile, LaunchRefusal,
+    CapabilitySubjectIdentity, DecodedProjection, DecodingTrust, IntegrationMode, LaunchProfile,
+    LaunchRefusal, OfferedDecision,
 };
 use kr_protocol::gateway::{
     DownstreamRequestId, NativeClassification, NativeMethodClass, PendingState,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
-    ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, CapabilityId,
-    CapabilityRevision, EnvironmentId, GatewayConnectionId, GrantId, LaunchProfileId, PluginId,
-    PublisherId, StreamCursor, UpstreamMethod, UpstreamRequestId,
+    ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, BrokerBindingId,
+    CapabilityId, CapabilityRevision, EnvironmentId, GatewayConnectionId, GrantId, LaunchProfileId,
+    PluginId, PublisherId, SourceEventHandle, StreamCursor, UpstreamMethod, UpstreamRequestId,
 };
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Credential, ForegroundMark, InstanceEnding, Invocation,
-    ManagedProcess, Probe, TransportHandle,
+    ManagedProcess, Probe, ReconcileScope, TransportHandle,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -51,7 +53,14 @@ fn process_identity(pid: u64, start: u64) -> ProcessStartIdentity {
 }
 
 fn managed(instance_id: ApplicationInstanceId, dedicated: bool) -> ManagedProcess {
-    let process = process_identity(41, 900);
+    managed_as(instance_id, dedicated, process_identity(41, 900))
+}
+
+fn managed_as(
+    instance_id: ApplicationInstanceId,
+    dedicated: bool,
+    process: ProcessStartIdentity,
+) -> ManagedProcess {
     ManagedProcess::new(
         instance_id,
         process.clone(),
@@ -73,8 +82,27 @@ fn trust(methods: &[UpstreamMethod], may_encode: bool) -> DecodingTrust {
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         package_digest: Digest256::from_bytes([5; 32]),
         methods: methods.iter().cloned().collect(),
+        schema_versions: ["kr-approval/1".to_owned()].into_iter().collect(),
+        max_decisions: U64::new(4),
         may_encode_response: may_encode,
         granted_at: TimestampMs::new(1),
+    }
+}
+
+fn projection() -> DecodedProjection {
+    DecodedProjection {
+        schema_version: "kr-approval/1".to_owned(),
+        summary: "the agent wants to write a file".to_owned(),
+        decisions: vec![
+            OfferedDecision {
+                option_id: "allow".to_owned(),
+                label: "Allow".to_owned(),
+            },
+            OfferedDecision {
+                option_id: "deny".to_owned(),
+                label: "Deny".to_owned(),
+            },
+        ],
     }
 }
 
@@ -102,6 +130,13 @@ fn request(connection: u64, id: &str) -> DownstreamRequestId {
     )
 }
 
+fn scope(instance_id: ApplicationInstanceId, connection: u64) -> ReconcileScope {
+    ReconcileScope {
+        application_instance_id: instance_id,
+        connection: GatewayConnectionId::new(connection),
+    }
+}
+
 fn evidence(
     name: &str,
     state: CapabilityState,
@@ -110,6 +145,7 @@ fn evidence(
 ) -> CapabilityRecord {
     CapabilityRecord {
         capability_id: capability(name),
+        capability_version: "1".to_owned(),
         application_instance_id: instance_id,
         identity: CapabilitySubjectIdentity {
             binary_digest: Nullable::some(Digest256::from_bytes([3; 32])),
@@ -125,6 +161,19 @@ fn evidence(
             Nullable::some("this installation cannot do it".to_owned())
         },
         observed_at: TimestampMs::new(1),
+    }
+}
+
+fn invocation(instance_id: ApplicationInstanceId, revision: u64, action: &str) -> Invocation {
+    Invocation {
+        actor_id: actor("device-1"),
+        grant: BrokerGrant::UpstreamAction,
+        grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
+        application_instance_id: instance_id,
+        binding_revision: AgentBindingRevision::new(revision),
+        action: ActionName::new(action).expect("valid"),
+        capability: None,
+        parameters: b"{\"text\":\"hello\"}".to_vec(),
     }
 }
 
@@ -152,6 +201,28 @@ fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker 
     broker
 }
 
+/// Records a frame and offers it as an approval, the way a decoder does.
+fn offer(
+    broker: &Broker,
+    instance_id: ApplicationInstanceId,
+    binding_id: BrokerBindingId,
+    body: &[u8],
+    request: DownstreamRequestId,
+    now: u64,
+) -> Result<kr_protocol::gateway::PendingResource, BrokerError> {
+    let handle = broker.record_source(instance_id, body, TimestampMs::new(now))?;
+    broker.offer_resource(
+        binding_id,
+        &handle,
+        request,
+        permission_method(),
+        NativeClassification::declared(NativeMethodClass::Mutation),
+        projection(),
+        None,
+        TimestampMs::new(now + 1),
+    )
+}
+
 /// KR-REQ-11.22: the broker owns the processes it launched, their credentials, their source
 /// frames and the arbitration over what those frames imply.
 #[test]
@@ -167,24 +238,27 @@ fn kr_req_11_22_the_broker_owns_processes_credentials_source_frames_and_arbitrat
     assert!(!process.authenticates(&CREDENTIAL, &process_identity(41, 901)));
 
     // The source frame is the broker's, immutable, and identified by its digest.
-    let frame = broker
+    let handle = broker
         .record_source(instance(2), b"{\"id\":11}", TimestampMs::new(2))
         .expect("the frame is recorded");
     let held = broker
-        .source(instance(2), &frame.handle)
+        .source(instance(2), &handle)
         .expect("the broker holds it");
-    assert_eq!(held.digest, frame.digest);
     assert_eq!(held.bytes(), b"{\"id\":11}");
+    assert_eq!(
+        held.digest,
+        Digest256::from_bytes(kr_cbor::sha256(b"{\"id\":11}"))
+    );
 
     // The arbitration is the broker's, and the resource it produced belongs to it.
     let resource = broker
         .offer_resource(
             binding(9),
-            &frame,
+            &handle,
             request(1, "11"),
             permission_method(),
             NativeClassification::declared(NativeMethodClass::Mutation),
-            2,
+            projection(),
             None,
             TimestampMs::new(3),
         )
@@ -198,8 +272,8 @@ fn kr_req_11_22_the_broker_owns_processes_credentials_source_frames_and_arbitrat
     );
 }
 
-/// KR-REQ-11.23: a transport handle binds the executable and the process identity, and a
-/// credential never leaves the broker.
+/// KR-REQ-11.23: a transport handle binds the executable and the process identity, both halves
+/// are required to authenticate, and a credential has no path out of the broker.
 #[test]
 fn kr_req_11_23_a_handle_binds_the_executable_and_identity_and_credentials_stay_here() {
     let process = managed(instance(2), true);
@@ -215,11 +289,18 @@ fn kr_req_11_23_a_handle_binds_the_executable_and_identity_and_credentials_stay_
         "a handle names the upstream identity it reaches"
     );
 
+    // Both halves are required: the secret alone, from another process, authenticates nothing.
+    assert!(process.authenticates(&CREDENTIAL, &process_identity(41, 900)));
+    assert!(!process.authenticates(&CREDENTIAL, &process_identity(42, 900)));
+    assert!(!process.authenticates(&[8; 32], &process_identity(41, 900)));
+
     // There is no accessor that returns a credential's bytes, and the debug rendering carries
     // none, so nothing this host hands to a component can carry one.
     let rendered = format!("{:?}", Credential::from_bytes(CREDENTIAL));
     assert_eq!(rendered, "Credential(<redacted>)");
-    assert!(!rendered.contains("09"));
+    let whole_process = format!("{process:?}");
+    assert!(whole_process.contains("Credential(<redacted>)"));
+    assert!(!whole_process.contains("0909"));
 
     // A transcript tail is a supported transport and is not one the forwarding path uses.
     assert!(BrokerTransport::PrivateSocket.carries_forwarding());
@@ -240,15 +321,7 @@ fn kr_req_11_24_the_three_grants_are_held_separately() {
     // An observation binding asked to prepare an effect is refused before its component runs.
     let refused = broker.issue_token(
         binding(9),
-        &Invocation {
-            actor_id: actor("device-1"),
-            grant: BrokerGrant::UpstreamAction,
-            grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
-            application_instance_id: instance(2),
-            binding_revision: AgentBindingRevision::new(1),
-            action: ActionName::new("prompt.submit").expect("valid"),
-            parameters: b"{}".to_vec(),
-        },
+        &invocation(instance(2), 1, "prompt.submit"),
         TimestampMs::new(2),
     );
     assert!(matches!(refused, Err(BrokerError::Grant(_))));
@@ -271,26 +344,20 @@ fn kr_req_11_24_the_three_grants_are_held_separately() {
     assert!(grants.holds(BrokerGrant::ApprovalInterpreter));
 }
 
-/// KR-REQ-11.25: decoding trust is explicit and recorded, and a display-only component cannot
-/// create an approval whatever it reports.
+/// KR-REQ-11.25: decoding trust is explicit, belongs to one package, and a display-only component
+/// cannot create an approval whatever it reports.
 #[test]
 fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval() {
     let display_only = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
-    let frame = display_only
-        .record_source(instance(2), b"{\"id\":11}", TimestampMs::new(2))
-        .expect("the frame is recorded");
-    let refusal = display_only
-        .offer_resource(
-            binding(9),
-            &frame,
-            request(1, "11"),
-            permission_method(),
-            NativeClassification::declared(NativeMethodClass::Mutation),
-            2,
-            None,
-            TimestampMs::new(3),
-        )
-        .expect_err("a display-only component creates no approval");
+    let refusal = offer(
+        &display_only,
+        instance(2),
+        binding(9),
+        b"{\"id\":11}",
+        request(1, "11"),
+        2,
+    )
+    .expect_err("a display-only component creates no approval");
     assert!(matches!(refusal, BrokerError::Grant(_)));
 
     // The interpreter grant alone is not trust either: a record naming the method is required.
@@ -301,24 +368,18 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
             true,
         )),
     );
-    let frame = untrusted
-        .record_source(instance(2), b"{\"id\":11}", TimestampMs::new(2))
-        .expect("the frame is recorded");
-    let refusal = untrusted
-        .offer_resource(
-            binding(9),
-            &frame,
-            request(1, "11"),
-            permission_method(),
-            NativeClassification::declared(NativeMethodClass::Mutation),
-            2,
-            None,
-            TimestampMs::new(3),
-        )
-        .expect_err("a decoder trusted for another method is refused");
+    let refusal = offer(
+        &untrusted,
+        instance(2),
+        binding(9),
+        b"{\"id\":11}",
+        request(1, "11"),
+        2,
+    )
+    .expect_err("a decoder trusted for another method is refused");
     assert!(matches!(refusal, BrokerError::PermissionDenied { .. }));
 
-    // And trust without the grant it depends on is refused when it is offered, not stored.
+    // Trust without the grant it depends on is refused when it is offered, not stored.
     let broker = Broker::open(None).expect("the broker opens");
     broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
     let refusal = broker
@@ -334,10 +395,25 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
         )
         .expect_err("trust needs the grant it depends on");
     assert!(matches!(refusal, BrokerError::PermissionDenied { .. }));
+
+    // And one package's trust is never another's: the record names the package it was granted to.
+    let refusal = broker
+        .bind(
+            binding(9),
+            instance(2),
+            PluginId::new("someone.else").expect("valid"),
+            PublisherId::new("someone").expect("valid"),
+            Digest256::from_bytes([7; 32]),
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            Some(trust(&[permission_method()], true)),
+            TimestampMs::new(1),
+        )
+        .expect_err("another package cannot bind with this trust");
+    assert!(matches!(refusal, BrokerError::PermissionDenied { .. }));
 }
 
-/// KR-REQ-11.26: the broker checks decoder role, application binding, source generation and
-/// non-reuse, and retains the ledger that says what it checked.
+/// KR-REQ-11.26: the broker checks decoder role, application binding, source generation, schema
+/// policy and non-reuse, and retains the ledger that says what it checked.
 #[test]
 fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_its_ledger() {
     let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
@@ -371,7 +447,8 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
             )
             .expect("the binding is recorded");
 
-        // Binding: a frame of another application is not this binding's to interpret.
+        // Binding: a frame of another application is not this binding's to interpret, and the
+        // handle is looked up in the binding's own instance rather than trusted from the caller.
         let other = broker
             .record_source(instance(3), b"{\"id\":99}", TimestampMs::new(2))
             .expect("the frame is recorded");
@@ -382,61 +459,91 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
                 request(1, "99"),
                 permission_method(),
                 NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
+                projection(),
                 None,
                 TimestampMs::new(3),
             ),
             Err(BrokerError::PreconditionFailed { .. })
         ));
 
-        let frame = broker
-            .record_source(instance(2), b"{\"id\":11}", TimestampMs::new(2))
+        // Schema policy: a projection outside the trust's declared schema is refused.
+        let handle = broker
+            .record_source(instance(2), b"{\"id\":10}", TimestampMs::new(2))
             .expect("the frame is recorded");
-        let resource = broker
-            .offer_resource(
-                binding(9),
-                &frame,
-                request(1, "11"),
-                permission_method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
-                Some(TimestampMs::new(900)),
-                TimestampMs::new(3),
-            )
-            .expect("the offer is accepted");
-
-        // Non-reuse: the same source event does not become a second resource.
+        let mut foreign = projection();
+        foreign.schema_version = "kr-approval/99".to_owned();
         assert!(matches!(
             broker.offer_resource(
                 binding(9),
-                &frame,
+                &handle,
+                request(1, "10"),
+                permission_method(),
+                NativeClassification::declared(NativeMethodClass::Mutation),
+                foreign,
+                None,
+                TimestampMs::new(3),
+            ),
+            Err(BrokerError::Trust(_))
+        ));
+
+        let resource = offer(
+            &broker,
+            instance(2),
+            binding(9),
+            b"{\"id\":11}",
+            request(1, "11"),
+            4,
+        )
+        .expect("the offer is accepted");
+
+        // Non-reuse: the same source event does not become a second resource, and the refusal
+        // holds after the frame has been consumed.
+        let consumed = broker
+            .record_source(instance(2), b"{\"id\":12}", TimestampMs::new(6))
+            .expect("the frame is recorded");
+        broker
+            .offer_resource(
+                binding(9),
+                &consumed,
                 request(1, "12"),
                 permission_method(),
                 NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
+                projection(),
                 None,
-                TimestampMs::new(4),
+                TimestampMs::new(7),
+            )
+            .expect("the first offer is accepted");
+        assert!(matches!(
+            broker.offer_resource(
+                binding(9),
+                &consumed,
+                request(1, "13"),
+                permission_method(),
+                NativeClassification::declared(NativeMethodClass::Mutation),
+                projection(),
+                None,
+                TimestampMs::new(8),
             ),
             Err(BrokerError::PreconditionFailed { .. })
         ));
 
         // Source generation: a frame from before the owner changed is refused after it.
         let stale = broker
-            .record_source(instance(2), b"{\"id\":13}", TimestampMs::new(5))
+            .record_source(instance(2), b"{\"id\":14}", TimestampMs::new(9))
             .expect("the frame is recorded");
         broker
-            .advance_binding(instance(2), None)
+            .advance_binding(instance(2), None, TimestampMs::new(10))
             .expect("the selected thread changed");
         assert!(matches!(
             broker.offer_resource(
                 binding(9),
                 &stale,
-                request(1, "13"),
+                request(1, "14"),
                 permission_method(),
                 NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
+                projection(),
                 None,
-                TimestampMs::new(6),
+                TimestampMs::new(11),
             ),
             Err(BrokerError::PreconditionFailed { .. })
         ));
@@ -444,7 +551,8 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
         resource.resource_id
     };
 
-    // The ledger is retained across a restart, and it says whose interpretation this was.
+    // The ledger is retained across a restart, and it says whose interpretation this was, over
+    // which bytes, and exactly which decisions were offered.
     let restarted = Broker::open(Some(&path)).expect("the broker reopens");
     let entry = restarted
         .decoding(resource_id)
@@ -454,8 +562,15 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     assert_eq!(entry.plugin_id.as_str(), "kalareach.codex");
     assert_eq!(entry.package_digest, Digest256::from_bytes([5; 32]));
     assert_eq!(entry.method, permission_method());
-    assert_eq!(entry.offered_decisions.get(), 2);
-    assert_eq!(entry.deadline_ms.as_ref().map(|at| at.get()), Some(900));
+    assert_eq!(entry.upstream_request_id.as_str(), "11");
+    assert_eq!(entry.source_bytes.as_slice(), b"{\"id\":11}");
+    assert!(!entry.source_truncated);
+    assert!(entry.offers("allow"));
+    assert!(entry.offers("deny"));
+    assert!(
+        !entry.offers("allow_always"),
+        "an answer the request never offered is not one this host can encode"
+    );
     assert_eq!(
         restarted
             .pending(resource_id)
@@ -466,29 +581,23 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// KR-REQ-11.27: one resolution per pending resource, and a reconnect reconciles without
-/// reissuing an uncertain response.
+/// KR-REQ-11.27: one resolution per pending resource, and a reconnect reconciles an answer that
+/// went without reissuing it.
 #[test]
 fn kr_req_11_27_one_resolution_each_and_a_reconnect_never_reissues() {
     let broker = broker_with(
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
     );
-    let frame = broker
-        .record_source(instance(2), b"{\"id\":11}", TimestampMs::new(2))
-        .expect("the frame is recorded");
-    let resource = broker
-        .offer_resource(
-            binding(9),
-            &frame,
-            request(1, "11"),
-            permission_method(),
-            NativeClassification::declared(NativeMethodClass::Mutation),
-            2,
-            None,
-            TimestampMs::new(3),
-        )
-        .expect("the offer is accepted");
+    let resource = offer(
+        &broker,
+        instance(2),
+        binding(9),
+        b"{\"id\":11}",
+        request(1, "11"),
+        2,
+    )
+    .expect("the offer is accepted");
 
     let claim = broker
         .claim(
@@ -507,69 +616,116 @@ fn kr_req_11_27_one_resolution_each_and_a_reconnect_never_reissues() {
             .is_err(),
         "a second answer cannot claim a resource that is already claimed"
     );
+
+    // The answer leaves this host. The marker is committed first, and nothing confirms it.
     broker
-        .resolve(&claim, TimestampMs::new(6))
-        .expect("the claim resolves it");
+        .mark_dispatched(&claim)
+        .expect("the dispatch marker is committed");
+
+    // The connection comes back and the upstream still lists the request. This host cannot tell
+    // whether its answer landed, so the resource is uncertain and is never answered again.
+    let reconciliation = broker
+        .reconcile(
+            scope(instance(2), 1),
+            &[request(1, "11")],
+            TimestampMs::new(8),
+        )
+        .expect("the reconnect reconciles");
+    assert_eq!(reconciliation.uncertain, vec![resource.resource_id]);
+    assert!(reconciliation.still_pending.is_empty());
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .expect("recorded")
+            .state,
+        PendingState::Uncertain
+    );
     assert!(
         broker
             .claim(
                 resource.resource_id,
-                &actor("device-2"),
-                TimestampMs::new(7)
+                &actor("device-1"),
+                TimestampMs::new(9)
             )
             .is_err(),
-        "a resolved resource takes no further answer"
+        "a reconnect never reissues an uncertain response"
     );
-
-    // A reconnect that still sees the request reconciles it to uncertain, because an answer went.
-    let reconciliation = broker
-        .reconcile(&[request(1, "11")], TimestampMs::new(8))
-        .expect("the reconnect reconciles");
-    assert!(reconciliation.uncertain.is_empty());
-    assert!(reconciliation.still_pending.is_empty());
+    // And the claim that was in force before the reconnect cannot resolve it either.
+    assert!(broker.resolve(&claim, TimestampMs::new(10)).is_err());
 }
 
 /// KR-REQ-11.28: an action token binds the actor, the grant, the revision, the declared action
-/// and the parameter hash, and every one of them is checked.
+/// and the parameter hash, and the broker rejects a change to any of them.
 #[test]
 fn kr_req_11_28_an_action_token_binds_actor_grant_revision_action_and_parameters() {
-    let broker = broker_with(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
-    let invocation = Invocation {
-        actor_id: actor("device-1"),
-        grant: BrokerGrant::UpstreamAction,
-        grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
-        application_instance_id: instance(2),
-        binding_revision: AgentBindingRevision::new(1),
-        action: ActionName::new("prompt.submit").expect("valid"),
-        parameters: b"{\"text\":\"hello\"}".to_vec(),
-    };
+    let broker = broker_with(
+        BrokerGrants::granted([BrokerGrant::UpstreamAction, BrokerGrant::Observation]),
+        None,
+    );
+    let prepared = invocation(instance(2), 1, "prompt.submit");
     let token = broker
-        .issue_token(binding(9), &invocation, TimestampMs::new(2))
+        .issue_token(binding(9), &prepared, TimestampMs::new(2))
         .expect("the token is issued");
     assert_eq!(token.actor_id, actor("device-1"));
     assert_eq!(token.grant, BrokerGrant::UpstreamAction);
     assert_eq!(token.binding_revision, AgentBindingRevision::new(1));
     assert_eq!(token.action.as_str(), "prompt.submit");
 
-    let mut wrong_actor = ActionTokenClaim::from(&token);
-    wrong_actor.actor_id = actor("device-2");
-    assert!(broker.spend_token(&wrong_actor).is_err());
+    // Every binding is checked at the broker, one changed field at a time.
+    /// One field of a presented claim, changed.
+    type Tamper = fn(&mut ActionTokenClaim);
+
+    let tampering: Vec<(&str, Tamper)> = vec![
+        ("actor", |claim| claim.actor_id = actor("device-2")),
+        ("grant", |claim| claim.grant = BrokerGrant::Observation),
+        ("grant record", |claim| {
+            claim.grant_id = GrantId::new(Uuid::from_bytes([8; 16]));
+        }),
+        ("application", |claim| {
+            claim.application_instance_id = instance(3);
+        }),
+        ("revision", |claim| {
+            claim.binding_revision = AgentBindingRevision::new(2);
+        }),
+        ("action", |claim| {
+            claim.action = ActionName::new("turn.cancel").expect("valid");
+        }),
+        ("parameters", |claim| {
+            claim.parameter_hash = Digest256::from_bytes([0; 32]);
+        }),
+    ];
+    for (what, tamper) in tampering {
+        let token = broker
+            .issue_token(binding(9), &prepared, TimestampMs::new(3))
+            .expect("the token is issued");
+        let mut claim = ActionTokenClaim::from(&token);
+        tamper(&mut claim);
+        assert!(
+            broker.spend_token(&claim).is_err(),
+            "a changed {what} must not spend the token"
+        );
+    }
 
     let token = broker
-        .issue_token(binding(9), &invocation, TimestampMs::new(3))
-        .expect("the token is issued");
-    let mut wrong_parameters = ActionTokenClaim::from(&token);
-    wrong_parameters.parameter_hash = Digest256::from_bytes([0; 32]);
-    assert!(broker.spend_token(&wrong_parameters).is_err());
-
-    let token = broker
-        .issue_token(binding(9), &invocation, TimestampMs::new(4))
+        .issue_token(binding(9), &prepared, TimestampMs::new(4))
         .expect("the token is issued");
     let claim = ActionTokenClaim::from(&token);
     broker.spend_token(&claim).expect("the token is spent");
     assert!(
         broker.spend_token(&claim).is_err(),
         "one invocation's authority is spent once"
+    );
+
+    // A grant withdrawn after the token was issued is authority the token no longer carries.
+    let token = broker
+        .issue_token(binding(9), &prepared, TimestampMs::new(5))
+        .expect("the token is issued");
+    broker
+        .withdraw_grant(binding(9), BrokerGrant::UpstreamAction)
+        .expect("the grant is withdrawn");
+    assert!(
+        broker.spend_token(&ActionTokenClaim::from(&token)).is_err(),
+        "a token whose grant has been withdrawn is not authority"
     );
 }
 
@@ -603,10 +759,14 @@ fn kr_req_12_02_a_launch_profile_records_what_was_resolved() {
     );
 }
 
-/// KR-REQ-12.03: a stale launch is refused when an application takes the foreground, and there
-/// is no path that pastes it instead.
+/// KR-REQ-12.03: a stale launch is refused, and the refusal is the whole answer.
+///
+/// What this establishes is the refusal and that nothing was started. That there is no path which
+/// writes the command into the foreground application's input is a property of the code: the
+/// refusal returns before anything is produced, and no function in this module writes bytes. The
+/// end-to-end demonstration of an untouched terminal belongs to the gateway suite.
 #[test]
-fn kr_req_12_03_a_stale_launch_is_refused_and_never_pasted() {
+fn kr_req_12_03_a_stale_launch_is_refused_and_starts_nothing() {
     let broker = Broker::open(None).expect("the broker opens");
     let intent = broker
         .prepare_launch(
@@ -639,10 +799,11 @@ fn kr_req_12_03_a_stale_launch_is_refused_and_never_pasted() {
         moved,
         BrokerError::Launch(LaunchRefusal::PromptMoved)
     ));
+    assert!(broker.profile_of(instance(2)).is_none());
 }
 
-/// KR-REQ-12.05 and KR-REQ-02.10: no second agent process is started against the same saved
-/// conversation, and a live execution is never silently replaced by a replay of its history.
+/// KR-REQ-12.05 and KR-REQ-02.10: no second agent process runs against one saved conversation,
+/// and selecting another conversation moves the reservation rather than leaving both taken.
 #[test]
 fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
     let broker = Broker::open(None).expect("the broker opens");
@@ -656,6 +817,12 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
     broker
         .execute_launch(&first, &ForegroundMark::idle(4), instance(2))
         .expect("the first execution runs");
+    broker.register_instance(
+        instance(2),
+        IntegrationMode::Gateway,
+        None,
+        Some(managed(instance(2), true)),
+    );
 
     let second = broker
         .prepare_launch(
@@ -673,11 +840,30 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
             application_instance_id
         }) if application_instance_id == instance(2)
     ));
+
+    // The running instance selects another conversation. The one it left is free; the one it took
+    // is not, and neither is stale.
+    broker
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-8").expect("valid")),
+            TimestampMs::new(5),
+        )
+        .expect("the selection changes");
+    assert_eq!(broker.conversation_owner("thread-7"), None);
+    assert_eq!(broker.conversation_owner("thread-8"), Some(instance(2)));
+    broker
+        .execute_launch(&second, &ForegroundMark::idle(4), instance(3))
+        .expect("the conversation it left is free for another execution");
 }
 
-/// KR-REQ-11.16: the host owns the evidence, and probes are bounded and disclosed.
+/// KR-REQ-11.16: a probe declares what it will do and how long it may take before it runs, and a
+/// source that cannot establish a working capability never claims one.
+///
+/// What this establishes is the admission contract for probes. Running one against a real upstream
+/// and measuring its deadline is the acceptance owner's, because it needs an upstream to probe.
 #[test]
-fn kr_req_11_16_probes_are_bounded_disclosed_and_never_touch_unrelated_data() {
+fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
     let broker = Broker::open(None).expect("the broker opens");
     broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
 
@@ -725,6 +911,28 @@ fn kr_req_11_16_probes_are_bounded_disclosed_and_never_touch_unrelated_data() {
         "a destructive probe needs its own isolated test context"
     );
 
+    let unbounded = Probe {
+        capability_id: capability("agent.prompt"),
+        declared_operations: vec!["list the upstream's advertised commands".to_owned()],
+        destructive: false,
+        isolated_context: None,
+        budget_ms: 60_000,
+    };
+    assert!(
+        broker
+            .record_probe(
+                &unbounded,
+                evidence(
+                    "agent.prompt",
+                    CapabilityState::QualifiedAvailable,
+                    CapabilityInvalidation::BinaryChanged,
+                    instance(2)
+                )
+            )
+            .is_err(),
+        "a probe is a bounded question, not a test suite"
+    );
+
     let disclosed = Probe {
         capability_id: capability("agent.prompt"),
         declared_operations: vec!["list the upstream's advertised commands".to_owned()],
@@ -756,11 +964,11 @@ fn kr_req_11_16_probes_are_bounded_disclosed_and_never_touch_unrelated_data() {
 }
 
 /// KR-REQ-11.17: evidence is invalidated by the change it is about, an installed upgrade leaves a
-/// running binding's pinned evidence alone, and every action rechecks its own revision.
+/// running binding's pinned evidence alone, and an action rechecks its own capability revision on
+/// the dispatch path rather than only when a client asks.
 #[test]
-fn kr_req_11_17_evidence_is_invalidated_by_the_right_change_and_every_action_rechecks() {
-    let broker = Broker::open(None).expect("the broker opens");
-    broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
+fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned_binding() {
+    let broker = broker_with(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
     broker
         .record_capability(evidence(
             "agent.prompt",
@@ -778,13 +986,30 @@ fn kr_req_11_17_evidence_is_invalidated_by_the_right_change_and_every_action_rec
         ))
         .expect("recorded");
 
+    let with_capability = |name: &str, read_at: Option<CapabilityRevision>| {
+        let mut prepared = invocation(instance(2), 1, "prompt.submit");
+        prepared.capability = Some((capability(name), read_at));
+        prepared
+    };
+
+    // The action path itself performs the recheck.
     broker
-        .recheck_capability(
-            instance(2),
-            &capability("agent.prompt"),
-            Some(CapabilityRevision::new(1)),
+        .issue_token(
+            binding(9),
+            &with_capability("agent.prompt", Some(CapabilityRevision::new(1))),
+            TimestampMs::new(2),
         )
         .expect("the revision the caller read is the one held");
+    assert!(
+        broker
+            .issue_token(
+                binding(9),
+                &with_capability("agent.prompt", Some(CapabilityRevision::new(2))),
+                TimestampMs::new(3)
+            )
+            .is_err(),
+        "an action prepared against a revision that has moved is refused"
+    );
 
     assert_eq!(
         broker.invalidate_capabilities(
@@ -796,27 +1021,25 @@ fn kr_req_11_17_evidence_is_invalidated_by_the_right_change_and_every_action_rec
     );
     assert!(
         broker
-            .recheck_capability(instance(2), &capability("agent.prompt"), None)
+            .issue_token(
+                binding(9),
+                &with_capability("agent.prompt", None),
+                TimestampMs::new(21)
+            )
             .is_err(),
         "an upgraded binary invalidates the evidence that was about the binary"
     );
     broker
-        .recheck_capability(instance(2), &capability("agent.approval"), None)
+        .issue_token(
+            binding(9),
+            &with_capability("agent.approval", None),
+            TimestampMs::new(22),
+        )
         .expect("a running binding's pinned evidence survives an installed upgrade");
-
-    // A caller acting on a revision that has since moved is refused rather than served.
-    assert!(
-        broker
-            .recheck_capability(
-                instance(2),
-                &capability("agent.approval"),
-                Some(CapabilityRevision::new(2))
-            )
-            .is_err()
-    );
 }
 
-/// KR-REQ-01.02: the capability map is per installation, with no authority taken from screen text.
+/// KR-REQ-01.02: the capability map is per installation, and no source that cannot try something
+/// here can say it works here.
 #[test]
 fn kr_req_01_02_the_capability_map_is_per_installation() {
     let broker = Broker::open(None).expect("the broker opens");
@@ -864,44 +1087,73 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
     assert!(!CapabilityEvidenceSource::PackageDeclaration.can_establish_qualified());
 }
 
-/// KR-REQ-07.67: a native exit stops the instance's dedicated backend; closing an attachment does
-/// not, and a backend this host did not launch is never stopped as owned.
+/// KR-REQ-07.67: a native exit names the backend to stop by its full process identity; closing an
+/// attachment names nothing and leaves a real child process running.
+#[cfg(unix)]
 #[test]
-fn kr_req_07_67_a_native_exit_stops_its_backend_and_closing_an_attachment_does_not() {
-    let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
+fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves_it_running() {
+    // A real child, started by this test and stopped by it. `sleep` is on the internal disk and
+    // needs nothing from the workspace.
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("the child starts");
+    let pid = u64::from(child.id());
+    let identity = process_identity(pid, 12_345);
+
+    let broker = Broker::open(None).expect("the broker opens");
+    broker.register_instance(
+        instance(2),
+        IntegrationMode::Gateway,
+        None,
+        Some(managed_as(instance(2), true, identity.clone())),
+    );
     broker.attach(instance(2));
     broker.attach(instance(2));
 
     let closed = broker.end(instance(2), InstanceEnding::AttachmentClosed);
     assert!(!closed.instance_ended);
-    assert!(!closed.stop_backend);
+    assert_eq!(closed.backend, None);
     assert_eq!(closed.attachments_remaining, 1);
     broker
         .binding_state(instance(2))
         .expect("the instance is still running");
+    assert!(
+        child.try_wait().expect("the child can be polled").is_none(),
+        "closing an attachment does not end the process in the worker's terminal"
+    );
 
     let exited = broker.end(instance(2), InstanceEnding::NativeExit);
     assert!(exited.instance_ended);
-    assert!(exited.stop_backend);
+    assert_eq!(
+        exited.backend,
+        Some(identity),
+        "the outcome names which process to stop, by the identity this host recorded"
+    );
     assert!(broker.binding_state(instance(2)).is_err());
+
+    // The supervisor is what stops it in the product; this test started the child, so this test
+    // stops it.
+    let _ = child.kill();
+    let _ = child.wait();
 
     let bypassed = Broker::open(None).expect("the broker opens");
     bypassed.register_instance(instance(4), IntegrationMode::NativeTerminal, None, None);
     let ended = bypassed.end(instance(4), InstanceEnding::NativeExit);
     assert!(ended.instance_ended);
-    assert!(
-        !ended.stop_backend,
+    assert_eq!(
+        ended.backend, None,
         "a bypassed or shared backend is never claimed or terminated as owned"
     );
 }
 
 /// KR-REQ-19.05: upstream bytes are data. Nothing a source frame contains changes a grant, and a
-/// frame that asks for more than it was granted is still refused.
+/// frame that asks for more than its binding was granted is still refused.
 #[test]
 fn kr_req_19_05_upstream_content_is_data_and_never_authority() {
     let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
     let hostile = br#"{"grants":["approval_interpreter","upstream_action"],"trusted":true}"#;
-    let frame = broker
+    let handle = broker
         .record_source(instance(2), hostile, TimestampMs::new(2))
         .expect("the frame is recorded");
 
@@ -911,23 +1163,28 @@ fn kr_req_19_05_upstream_content_is_data_and_never_authority() {
         broker
             .offer_resource(
                 binding(9),
-                &frame,
+                &handle,
                 request(1, "11"),
                 permission_method(),
                 NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
+                projection(),
                 None,
                 TimestampMs::new(3),
             )
             .is_err(),
         "content that claims trust does not create it"
     );
+    let grants = broker.grants(binding(9)).expect("the binding is there");
+    assert!(grants.is_display_only(), "and it did not change on the way");
 }
 
-/// KR-REQ-24.24: an adapter replays from the cursor it consumed, and that cursor survives a
-/// restart.
+/// KR-REQ-24.24: an adapter's consumed cursor survives a restart, which is what a replay starts
+/// from.
+///
+/// The replay itself, and the visible history gap an evicted range produces, are the gateway's
+/// and are established by its own suite.
 #[test]
-fn kr_req_24_24_an_adapter_replays_from_the_cursor_it_consumed() {
+fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
     let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&directory).expect("the directory is created");
     let path = directory.join("session.sqlite");
@@ -953,4 +1210,35 @@ fn kr_req_24_24_an_adapter_replays_from_the_cursor_it_consumed() {
         Some(StreamCursor::new(40))
     );
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// The broker holds a bounded number of unconsumed source frames.
+///
+/// A connector that never decodes anything is a connector whose oldest frames this host forgets,
+/// rather than a session whose memory grows for the rest of the day.
+#[test]
+fn unconsumed_source_frames_are_bounded() {
+    let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
+    let mut handles: Vec<SourceEventHandle> = Vec::new();
+    for index in 0..(kr_worker::broker::MAX_RETAINED_FRAMES + 8) {
+        handles.push(
+            broker
+                .record_source(
+                    instance(2),
+                    format!("{{\"id\":{index}}}").as_bytes(),
+                    TimestampMs::new(index as u64),
+                )
+                .expect("the frame is recorded"),
+        );
+    }
+    assert!(
+        broker.source(instance(2), &handles[0]).is_none(),
+        "the oldest unconsumed frame is the one that goes"
+    );
+    assert!(
+        broker
+            .source(instance(2), handles.last().expect("a handle"))
+            .is_some(),
+        "the newest is still there"
+    );
 }

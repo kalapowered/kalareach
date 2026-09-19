@@ -34,9 +34,9 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{
     ActionTokenId, ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId,
     CapabilityId, CapabilityRevision, EnvironmentId, GrantId, LaunchProfileId, PluginId,
-    PublisherId, SourceGeneration, UpstreamMethod,
+    PublisherId, SourceGeneration, UpstreamMethod, UpstreamRequestId,
 };
-use crate::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64};
+use crate::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64};
 
 /// Maximum length in bytes of a declared action name.
 pub const MAX_ACTION_NAME_LEN: usize = 96;
@@ -49,6 +49,22 @@ pub const MAX_BROKER_REASON_LEN: usize = 512;
 /// A record that covered everything would not be a boundary. The bound is generous enough for a
 /// real connector's approval surface and small enough that the list is readable.
 pub const MAX_TRUSTED_METHODS: usize = 64;
+
+/// How many decisions one decoded projection may offer.
+///
+/// A person chooses one of these. A list longer than this is not a decision, and a decoder that
+/// produced one has misread the request.
+pub const MAX_OFFERED_DECISIONS: usize = 16;
+
+/// Maximum length in bytes of one decision identifier or label.
+pub const MAX_DECISION_TEXT_LEN: usize = 256;
+
+/// Maximum bytes of original source the ledger retains per decoded request.
+///
+/// Section 11 requires the ledger to retain the original source. A frame larger than this is
+/// retained up to the bound with [`DecoderLedgerEntry::source_truncated`] set, because a record
+/// that silently held part of a request would be worse than one that says it holds part of it.
+pub const MAX_RETAINED_SOURCE_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------------------------
 // Grants
@@ -230,6 +246,14 @@ pub struct DecodingTrust {
     /// A method outside this list is forwarded opaquely and produces no rich approval, whatever
     /// the component reports about it.
     pub methods: CanonicalSet<UpstreamMethod>,
+    /// The projection schema versions this trust covers.
+    ///
+    /// This is the schema policy the broker checks before a decoded projection becomes an
+    /// actionable approval. A projection that names a version outside this set is not one this
+    /// trust was granted for, whatever it contains.
+    pub schema_versions: CanonicalSet<String>,
+    /// The most decisions a projection under this trust may offer.
+    pub max_decisions: U64,
     /// Whether the component may also encode an answer to those requests.
     ///
     /// Decoding and answering are separate capabilities in the package contract, and they stay
@@ -244,6 +268,64 @@ impl DecodingTrust {
     #[must_use]
     pub fn covers(&self, method: &UpstreamMethod) -> bool {
         self.methods.contains(method)
+    }
+
+    /// Returns true when the record was granted to exactly this package.
+    ///
+    /// Trust is granted to a publisher's package at a digest. A binding that runs different bytes
+    /// is a different decoder, and one package's trust is never another's.
+    #[must_use]
+    pub fn belongs_to(
+        &self,
+        plugin_id: &PluginId,
+        publisher_id: &PublisherId,
+        package_digest: &Digest256,
+    ) -> bool {
+        &self.plugin_id == plugin_id
+            && &self.publisher_id == publisher_id
+            && &self.package_digest == package_digest
+    }
+
+    /// Checks a decoded projection against this trust's schema policy.
+    ///
+    /// Section 11 lists schema policy among the things the broker checks before it believes a
+    /// decoder, and this is that check: the projection names a schema version the trust covers,
+    /// it offers at least one decision and no more than the trust permits, and its decision
+    /// identifiers are unique and bounded. Only a projection that passes becomes an actionable
+    /// approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the projection breaks.
+    pub fn check_projection(&self, projection: &DecodedProjection) -> Result<(), TrustError> {
+        if !self.schema_versions.contains(&projection.schema_version) {
+            return Err(TrustError::SchemaNotCovered);
+        }
+        if projection.decisions.is_empty() {
+            return Err(TrustError::NoDecisions);
+        }
+        let permitted = usize::try_from(self.max_decisions.get())
+            .unwrap_or(MAX_OFFERED_DECISIONS)
+            .min(MAX_OFFERED_DECISIONS);
+        if projection.decisions.len() > permitted {
+            return Err(TrustError::TooManyDecisions {
+                decisions: projection.decisions.len(),
+                limit: permitted,
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for decision in &projection.decisions {
+            if decision.option_id.is_empty()
+                || decision.option_id.len() > MAX_DECISION_TEXT_LEN
+                || decision.label.len() > MAX_DECISION_TEXT_LEN
+            {
+                return Err(TrustError::DecisionText);
+            }
+            if !seen.insert(decision.option_id.as_str()) {
+                return Err(TrustError::DuplicateDecision);
+            }
+        }
+        Ok(())
     }
 
     /// Checks that the record is one the broker can act on.
@@ -263,16 +345,70 @@ impl DecodingTrust {
                 limit: MAX_TRUSTED_METHODS,
             });
         }
+        if self.schema_versions.is_empty() {
+            return Err(TrustError::NoSchemaVersions);
+        }
+        if self.max_decisions.get() == 0 {
+            return Err(TrustError::NoDecisions);
+        }
         Ok(())
     }
 }
 
-/// A decoding-trust record the broker will not act on.
+/// One decision a decoder offers a person.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct OfferedDecision {
+    /// The identifier the upstream expects back. Answering is choosing one of these.
+    pub option_id: String,
+    /// What the decision says, for a person.
+    pub label: String,
+}
+
+/// What a decoder made of one native request.
+///
+/// It is a proposal. The broker checks it against the trust's schema policy before any of it
+/// becomes an approval a person can answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DecodedProjection {
+    /// The projection schema the decoder wrote this against.
+    pub schema_version: String,
+    /// What the request is asking, for a person.
+    pub summary: String,
+    /// The decisions offered, in the order the upstream offered them.
+    pub decisions: Vec<OfferedDecision>,
+}
+
+/// A decoding-trust record, or a projection under it, the broker will not act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TrustError {
     /// The record named no method.
     #[error("a decoding trust record must name at least one upstream method")]
     NoMethods,
+    /// The record named no projection schema version.
+    #[error("a decoding trust record must name at least one projection schema version")]
+    NoSchemaVersions,
+    /// The projection names a schema version this trust does not cover.
+    #[error("this decoding trust does not cover the projection's schema version")]
+    SchemaNotCovered,
+    /// The projection offered nothing to choose between.
+    #[error("a decoded projection must offer at least one decision")]
+    NoDecisions,
+    /// The projection offered more decisions than the trust permits.
+    #[error("this decoding trust permits {limit} decisions and the projection offered {decisions}")]
+    TooManyDecisions {
+        /// How many it offered.
+        decisions: usize,
+        /// The limit.
+        limit: usize,
+    },
+    /// A decision identifier or label was empty or too long.
+    #[error("a decision identifier is 1 to 256 bytes and a label is at most 256 bytes")]
+    DecisionText,
+    /// Two decisions shared one identifier.
+    #[error("a decoded projection's decision identifiers must be unique")]
+    DuplicateDecision,
     /// The record named more methods than one record may cover.
     #[error(
         "a decoding trust record covers at most {limit} methods, and this one covers {methods}"
@@ -304,16 +440,39 @@ pub struct DecoderLedgerEntry {
     pub package_digest: Digest256,
     /// The upstream method the original request named.
     pub method: UpstreamMethod,
+    /// The native request identifier, exactly as the upstream wrote it.
+    pub upstream_request_id: UpstreamRequestId,
     /// The generation of the source frame the decoder read.
     pub source_generation: SourceGeneration,
-    /// The digest of those immutable source bytes, so the original is identifiable afterwards.
+    /// The digest of those immutable source bytes.
     pub source_digest: Digest256,
-    /// How many decisions the decoder offered.
-    pub offered_decisions: U64,
+    /// The original source bytes, so the request can be shown as it arrived.
+    ///
+    /// A digest proves which bytes these are; it cannot reproduce them, and section 11 requires
+    /// the original source to be retained rather than merely identified.
+    pub source_bytes: Bytes,
+    /// True when the frame was larger than [`MAX_RETAINED_SOURCE_BYTES`] and was cut.
+    pub source_truncated: bool,
+    /// The projection the decoder produced, with the exact decisions it offered.
+    pub projection: DecodedProjection,
     /// The deadline the upstream put on its request, where it stated one.
     pub deadline_ms: Nullable<TimestampMs>,
     /// When the entry was written.
     pub decoded_at: TimestampMs,
+}
+
+impl DecoderLedgerEntry {
+    /// Returns true when the named decision is one this request actually offered.
+    ///
+    /// Answering is choosing from what the upstream offered, so an identifier that is not in the
+    /// retained list is not an answer this host will encode.
+    #[must_use]
+    pub fn offers(&self, option_id: &str) -> bool {
+        self.projection
+            .decisions
+            .iter()
+            .any(|decision| decision.option_id == option_id)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -777,6 +936,11 @@ pub enum LaunchRefusal {
 pub enum CapabilityState {
     /// Qualified here and available now.
     QualifiedAvailable,
+    /// This version was qualified, and nothing has established that this host can use it.
+    ///
+    /// A signed compatibility record establishes this and never [`CapabilityState::QualifiedAvailable`]:
+    /// it is evidence about a version, not about this host's permission or live binding.
+    VersionQualified,
     /// The software that would provide it is not installed.
     MissingInstallation,
     /// An operating-system permission is needed first.
@@ -793,6 +957,7 @@ impl CapabilityState {
     /// Every state, in declaration order.
     pub const ALL: &'static [Self] = &[
         Self::QualifiedAvailable,
+        Self::VersionQualified,
         Self::MissingInstallation,
         Self::PermissionRequired,
         Self::Incompatible,
@@ -805,6 +970,7 @@ impl CapabilityState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::QualifiedAvailable => "qualified_available",
+            Self::VersionQualified => "version_qualified",
             Self::MissingInstallation => "missing_installation",
             Self::PermissionRequired => "permission_required",
             Self::Incompatible => "incompatible",
@@ -869,6 +1035,18 @@ impl CapabilityEvidenceSource {
     pub const fn can_establish_qualified(self) -> bool {
         matches!(self, Self::HostProbe | Self::LiveBinding)
     }
+
+    /// Returns true when this source can establish that a version was qualified.
+    ///
+    /// A package's own declaration cannot: a package saying its capabilities work is the claim
+    /// under review, not evidence for it.
+    #[must_use]
+    pub const fn can_establish_version_qualified(self) -> bool {
+        matches!(
+            self,
+            Self::HostProbe | Self::LiveBinding | Self::SignedRecord
+        )
+    }
 }
 
 impl fmt::Display for CapabilityEvidenceSource {
@@ -893,8 +1071,13 @@ pub enum CapabilityInvalidation {
     OsPermissionChanged,
     /// The desktop session generation changed.
     DesktopGenerationChanged,
-    /// The launch profile changed.
-    ProfileChanged,
+    /// The signed qualification profile in the catalogue changed.
+    QualificationProfileChanged,
+    /// The host's own launch profile changed.
+    ///
+    /// Separate from the catalogue's qualification profile, because a record gathered under one
+    /// argument vector says nothing about another and neither implies the other changed.
+    LaunchProfileChanged,
 }
 
 impl CapabilityInvalidation {
@@ -905,7 +1088,8 @@ impl CapabilityInvalidation {
         Self::SchemaChanged,
         Self::OsPermissionChanged,
         Self::DesktopGenerationChanged,
-        Self::ProfileChanged,
+        Self::QualificationProfileChanged,
+        Self::LaunchProfileChanged,
     ];
 
     /// Returns the stable wire string.
@@ -917,7 +1101,8 @@ impl CapabilityInvalidation {
             Self::SchemaChanged => "schema_changed",
             Self::OsPermissionChanged => "os_permission_changed",
             Self::DesktopGenerationChanged => "desktop_generation_changed",
-            Self::ProfileChanged => "profile_changed",
+            Self::QualificationProfileChanged => "qualification_profile_changed",
+            Self::LaunchProfileChanged => "launch_profile_changed",
         }
     }
 }
@@ -939,7 +1124,13 @@ pub struct CapabilitySubjectIdentity {
     pub binary_digest: Nullable<Digest256>,
     /// The upstream schema or protocol version the evidence is about.
     pub schema_version: Nullable<MethodTableVersionText>,
-    /// The launch profile the evidence was gathered under.
+    /// The package the evidence is about, where it is about one.
+    pub plugin_id: Nullable<PluginId>,
+    /// The publisher whose signed record supplied the evidence, where one did.
+    pub publisher_id: Nullable<PublisherId>,
+    /// The digest of the signed qualification profile the evidence came from, where one did.
+    pub qualification_profile_digest: Nullable<Digest256>,
+    /// The host's launch profile the evidence was gathered under.
     pub profile_id: Nullable<LaunchProfileId>,
     /// The binding the evidence was gathered through.
     pub binding_id: Nullable<BrokerBindingId>,
@@ -954,6 +1145,9 @@ impl Default for CapabilitySubjectIdentity {
         Self {
             binary_digest: Nullable::null(),
             schema_version: Nullable::null(),
+            plugin_id: Nullable::null(),
+            publisher_id: Nullable::null(),
+            qualification_profile_digest: Nullable::null(),
             profile_id: Nullable::null(),
             binding_id: Nullable::null(),
             desktop_generation: Nullable::null(),
@@ -978,6 +1172,8 @@ pub struct MethodTableVersionText(pub String);
 pub struct CapabilityRecord {
     /// The versioned capability this record is about.
     pub capability_id: CapabilityId,
+    /// The version of that capability the record is about.
+    pub capability_version: String,
     /// The application instance the record is about.
     pub application_instance_id: ApplicationInstanceId,
     /// The exact identity the evidence was gathered against.
@@ -1009,6 +1205,21 @@ impl CapabilityRecord {
             return Err(CapabilityError::UnqualifiedSource {
                 evidence_source: self.source,
             });
+        }
+        if self.state == CapabilityState::VersionQualified
+            && !self.source.can_establish_version_qualified()
+        {
+            return Err(CapabilityError::DeclaredQualification);
+        }
+        // A record nothing can make stale is a record that never becomes stale, which is how
+        // evidence outlives the thing it was about.
+        if self.invalidated_by.is_empty() {
+            return Err(CapabilityError::NoInvalidation);
+        }
+        if self.source == CapabilityEvidenceSource::SignedRecord
+            && !self.identity.qualification_profile_digest.is_present()
+        {
+            return Err(CapabilityError::MissingProfileIdentity);
         }
         if !self.state.is_usable() && self.disabled_reason.as_ref().is_none() {
             return Err(CapabilityError::MissingReason { state: self.state });
@@ -1047,6 +1258,23 @@ pub enum CapabilityError {
     MissingReason {
         /// The state that carried none.
         state: CapabilityState,
+    },
+    /// A package declaration claimed a version had been qualified.
+    #[error("a package declaration cannot establish that a capability version was qualified")]
+    DeclaredQualification,
+    /// The record named nothing that would make it stale.
+    #[error("a capability record must name at least one change that invalidates it")]
+    NoInvalidation,
+    /// A record from a signed profile did not name the profile it came from.
+    #[error("a record from a signed profile must name that profile's digest")]
+    MissingProfileIdentity,
+    /// An update carried a revision that is not newer than the record it would replace.
+    #[error("a capability record at revision {held} is not replaced by one at {offered}")]
+    StaleUpdate {
+        /// The revision the map holds.
+        held: CapabilityRevision,
+        /// The revision the update offered.
+        offered: CapabilityRevision,
     },
     /// The reason was longer than a person will read.
     #[error("a disabled reason is at most {limit} bytes, and this one is {length}")]
@@ -1087,14 +1315,34 @@ impl CapabilityMap {
     }
 
     /// Adds or replaces one record, keeping the map ordered by capability.
-    pub fn upsert(&mut self, record: CapabilityRecord) {
+    ///
+    /// A record only moves forward. An update at a revision the map has already passed is refused
+    /// rather than applied: a late answer from a probe that started before an invalidation would
+    /// otherwise restore availability the host had already withdrawn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityError::StaleUpdate`] when the offered revision is not newer than the
+    /// one held, and whatever [`CapabilityRecord::validate`] refuses.
+    pub fn upsert(&mut self, record: CapabilityRecord) -> Result<(), CapabilityError> {
+        record.validate()?;
         match self
             .records
             .binary_search_by(|held| held.capability_id.cmp(&record.capability_id))
         {
-            Ok(position) => self.records[position] = record,
+            Ok(position) => {
+                let held = &self.records[position];
+                if record.revision.get() <= held.revision.get() {
+                    return Err(CapabilityError::StaleUpdate {
+                        held: held.revision,
+                        offered: record.revision,
+                    });
+                }
+                self.records[position] = record;
+            }
             Err(position) => self.records.insert(position, record),
         }
+        Ok(())
     }
 
     /// Invalidates every record the change makes stale, returning how many were affected.
@@ -1229,12 +1477,15 @@ mod tests {
     fn a_signed_record_cannot_say_a_capability_works_here() {
         let mut record = CapabilityRecord {
             capability_id: CapabilityId::new("agent.prompt").expect("valid"),
+            capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
             identity: CapabilitySubjectIdentity::default(),
             revision: CapabilityRevision::new(1),
             state: CapabilityState::QualifiedAvailable,
             source: CapabilityEvidenceSource::SignedRecord,
-            invalidated_by: CanonicalSet::new(),
+            invalidated_by: [CapabilityInvalidation::BinaryChanged]
+                .into_iter()
+                .collect(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
         };
@@ -1256,6 +1507,7 @@ mod tests {
         let mut map = CapabilityMap::default();
         map.upsert(CapabilityRecord {
             capability_id: CapabilityId::new("agent.prompt").expect("valid"),
+            capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
             identity: CapabilitySubjectIdentity {
                 binding_id: Nullable::some(BrokerBindingId::new(Uuid::from_bytes([9; 16]))),
@@ -1269,9 +1521,11 @@ mod tests {
                 .collect(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
-        });
+        })
+        .expect("a fresh record is accepted");
         map.upsert(CapabilityRecord {
             capability_id: CapabilityId::new("agent.commands").expect("valid"),
+            capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
             identity: CapabilitySubjectIdentity {
                 binary_digest: Nullable::some(Digest256::from_bytes([4; 32])),
@@ -1285,7 +1539,8 @@ mod tests {
                 .collect(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
-        });
+        })
+        .expect("a fresh record is accepted");
 
         let affected = map.invalidate(
             CapabilityInvalidation::BinaryChanged,
@@ -1314,6 +1569,8 @@ mod tests {
             methods: [UpstreamMethod::new("session/request_permission").expect("valid")]
                 .into_iter()
                 .collect(),
+            schema_versions: ["kr-approval/1".to_owned()].into_iter().collect(),
+            max_decisions: U64::new(4),
             may_encode_response: true,
             granted_at: TimestampMs::new(1),
         };
@@ -1326,5 +1583,196 @@ mod tests {
             ..trust
         };
         assert_eq!(empty.validate(), Err(TrustError::NoMethods));
+    }
+
+    fn decoding_trust() -> DecodingTrust {
+        DecodingTrust {
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            package_digest: Digest256::from_bytes([5; 32]),
+            methods: [UpstreamMethod::new("session/request_permission").expect("valid")]
+                .into_iter()
+                .collect(),
+            schema_versions: ["kr-approval/1".to_owned()].into_iter().collect(),
+            max_decisions: U64::new(3),
+            may_encode_response: true,
+            granted_at: TimestampMs::new(1),
+        }
+    }
+
+    fn projection(schema: &str, ids: &[&str]) -> DecodedProjection {
+        DecodedProjection {
+            schema_version: schema.to_owned(),
+            summary: "the agent wants to write a file".to_owned(),
+            decisions: ids
+                .iter()
+                .map(|option_id| OfferedDecision {
+                    option_id: (*option_id).to_owned(),
+                    label: format!("choose {option_id}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn trust_belongs_to_one_package_at_one_digest() {
+        let trust = decoding_trust();
+        assert!(trust.belongs_to(
+            &PluginId::new("kalareach.codex").expect("valid"),
+            &PublisherId::new("kalareach").expect("valid"),
+            &Digest256::from_bytes([5; 32])
+        ));
+        assert!(
+            !trust.belongs_to(
+                &PluginId::new("someone.else").expect("valid"),
+                &PublisherId::new("kalareach").expect("valid"),
+                &Digest256::from_bytes([5; 32])
+            ),
+            "one package's trust is never another's"
+        );
+        assert!(
+            !trust.belongs_to(
+                &PluginId::new("kalareach.codex").expect("valid"),
+                &PublisherId::new("kalareach").expect("valid"),
+                &Digest256::from_bytes([6; 32])
+            ),
+            "different bytes are a different decoder"
+        );
+    }
+
+    #[test]
+    fn a_projection_is_checked_against_the_schema_policy_it_was_granted() {
+        let trust = decoding_trust();
+        trust
+            .check_projection(&projection("kr-approval/1", &["allow", "deny"]))
+            .expect("a projection under the covered schema is accepted");
+        assert_eq!(
+            trust.check_projection(&projection("kr-approval/2", &["allow"])),
+            Err(TrustError::SchemaNotCovered)
+        );
+        assert_eq!(
+            trust.check_projection(&projection("kr-approval/1", &[])),
+            Err(TrustError::NoDecisions)
+        );
+        assert!(matches!(
+            trust.check_projection(&projection("kr-approval/1", &["a", "b", "c", "d"])),
+            Err(TrustError::TooManyDecisions { .. })
+        ));
+        assert_eq!(
+            trust.check_projection(&projection("kr-approval/1", &["allow", "allow"])),
+            Err(TrustError::DuplicateDecision)
+        );
+        assert_eq!(
+            trust.check_projection(&projection("kr-approval/1", &[""])),
+            Err(TrustError::DecisionText)
+        );
+    }
+
+    #[test]
+    fn a_ledger_entry_answers_only_what_the_request_offered() {
+        let entry = DecoderLedgerEntry {
+            binding_id: BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            package_digest: Digest256::from_bytes([5; 32]),
+            method: UpstreamMethod::new("session/request_permission").expect("valid"),
+            upstream_request_id: UpstreamRequestId::new("11").expect("valid"),
+            source_generation: SourceGeneration::new(1),
+            source_digest: Digest256::from_bytes([6; 32]),
+            source_bytes: Bytes::from(b"{\"id\":11}".to_vec()),
+            source_truncated: false,
+            projection: projection("kr-approval/1", &["allow", "deny"]),
+            deadline_ms: Nullable::null(),
+            decoded_at: TimestampMs::new(2),
+        };
+        assert!(entry.offers("allow"));
+        assert!(entry.offers("deny"));
+        assert!(
+            !entry.offers("allow_always"),
+            "an identifier the request never offered is not an answer this host encodes"
+        );
+        assert_eq!(entry.source_bytes.as_slice(), b"{\"id\":11}");
+    }
+
+    #[test]
+    fn a_record_that_nothing_invalidates_is_refused() {
+        let record = CapabilityRecord {
+            capability_id: CapabilityId::new("agent.prompt").expect("valid"),
+            capability_version: "1".to_owned(),
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            identity: CapabilitySubjectIdentity::default(),
+            revision: CapabilityRevision::new(1),
+            state: CapabilityState::QualifiedAvailable,
+            source: CapabilityEvidenceSource::HostProbe,
+            invalidated_by: CanonicalSet::new(),
+            disabled_reason: Nullable::null(),
+            observed_at: TimestampMs::new(1),
+        };
+        assert_eq!(record.validate(), Err(CapabilityError::NoInvalidation));
+    }
+
+    #[test]
+    fn a_signed_record_names_the_profile_it_came_from() {
+        let record = CapabilityRecord {
+            capability_id: CapabilityId::new("agent.prompt").expect("valid"),
+            capability_version: "1".to_owned(),
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            identity: CapabilitySubjectIdentity::default(),
+            revision: CapabilityRevision::new(1),
+            state: CapabilityState::VersionQualified,
+            source: CapabilityEvidenceSource::SignedRecord,
+            invalidated_by: [CapabilityInvalidation::QualificationProfileChanged]
+                .into_iter()
+                .collect(),
+            disabled_reason: Nullable::some("not tried on this host".to_owned()),
+            observed_at: TimestampMs::new(1),
+        };
+        assert_eq!(
+            record.validate(),
+            Err(CapabilityError::MissingProfileIdentity)
+        );
+        let named = CapabilityRecord {
+            identity: CapabilitySubjectIdentity {
+                qualification_profile_digest: Nullable::some(Digest256::from_bytes([8; 32])),
+                ..CapabilitySubjectIdentity::default()
+            },
+            ..record
+        };
+        named.validate().expect("a named profile is accepted");
+    }
+
+    #[test]
+    fn a_late_answer_never_restores_evidence_the_host_withdrew() {
+        let mut map = CapabilityMap::default();
+        let qualified = CapabilityRecord {
+            capability_id: CapabilityId::new("agent.prompt").expect("valid"),
+            capability_version: "1".to_owned(),
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            identity: CapabilitySubjectIdentity::default(),
+            revision: CapabilityRevision::new(1),
+            state: CapabilityState::QualifiedAvailable,
+            source: CapabilityEvidenceSource::HostProbe,
+            invalidated_by: [CapabilityInvalidation::BinaryChanged]
+                .into_iter()
+                .collect(),
+            disabled_reason: Nullable::null(),
+            observed_at: TimestampMs::new(1),
+        };
+        map.upsert(qualified.clone()).expect("the first record");
+        map.invalidate(
+            CapabilityInvalidation::BinaryChanged,
+            "the executable was upgraded",
+            TimestampMs::new(2),
+        );
+        assert!(matches!(
+            map.upsert(qualified),
+            Err(CapabilityError::StaleUpdate { .. })
+        ));
+        assert_eq!(
+            map.record(&CapabilityId::new("agent.prompt").expect("valid"))
+                .expect("still recorded")
+                .state,
+            CapabilityState::NotTested
+        );
     }
 }

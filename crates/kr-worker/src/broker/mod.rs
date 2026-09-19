@@ -2,10 +2,20 @@
 //! that wants to say what that application is doing.
 //!
 //! Section 2 calls this a "serial dispatch broker", and the shape follows from that word. One lock
-//! covers the whole of the broker's state, and every decision that depends on more than one part
-//! of it is one operation under that lock: check the grant, check the binding revision, check the
-//! source is fresh, claim the pending resource. Splitting those would leave windows in which a
-//! check had passed and the thing it checked had already changed.
+//! covers the whole of the broker's state **and its durable ledger**, and every decision that
+//! depends on more than one part of them is one operation under that lock: check the grant, check
+//! the binding revision, check the source is fresh, write the record, take the claim. Splitting
+//! those would leave windows in which a check had passed and the thing it checked had already
+//! changed, or in which memory was ahead of the ledger.
+//!
+//! Two orderings inside that lock are the whole durability contract.
+//!
+//! * **Validate, write, then apply.** Every state change is planned against the state as it is,
+//!   written to the ledger conditionally on the state it expects to find, and only then applied in
+//!   memory. A failed or racing write therefore leaves memory exactly as it was.
+//! * **The dispatch marker is committed before the answer goes.** A crash between them leaves a
+//!   record that says an answer may already have been sent, which is what stops a restart from
+//!   sending a second one.
 //!
 //! | Module | What it owns |
 //! | --- | --- |
@@ -20,9 +30,10 @@
 //!
 //! What the broker will not do is as much of the contract as what it will. It does not let an
 //! observation-only component create an approval. It does not believe a decoder that was not
-//! granted trust for the method it decoded. It does not let the same source event become two
-//! resources. It does not paste a launch command into an application that took the foreground. And
-//! it does not answer a request twice, whatever reconnects.
+//! granted trust for the exact package, method and projection schema it decoded. It does not let
+//! the same source event become two resources. It does not paste a launch command into an
+//! application that took the foreground. And it does not answer a request twice, whatever
+//! reconnects.
 
 pub mod arbitration;
 pub mod capability;
@@ -38,30 +49,45 @@ use std::sync::Mutex;
 
 use kr_protocol::agent::AgentBindingState;
 use kr_protocol::broker::{
-    ActionName, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants, DecoderLedgerEntry,
-    DecodingTrust, IntegrationMode, LaunchProfile,
+    ActionName, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants, CapabilityInvalidation,
+    CapabilityMap, CapabilityRecord, DecodedProjection, DecoderLedgerEntry, DecodingTrust,
+    IntegrationMode, LaunchProfile, MAX_RETAINED_SOURCE_BYTES,
 };
 use kr_protocol::gateway::{
-    Durability, NativeClassification, PendingKind, PendingResource, PendingState,
+    DownstreamRequestId, Durability, NativeClassification, PendingKind, PendingResource,
+    PendingState,
 };
+use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, AgentTurnId, ApplicationInstanceId,
-    BrokerBindingId, GatewayConnectionId, LaunchProfileId, PendingResourceId, PluginId,
-    PublisherId, SourceEventHandle, SourceGeneration, StreamCursor, UpstreamMethod,
-    UpstreamRequestId,
+    BrokerBindingId, CapabilityId, CapabilityRevision, GatewayConnectionId, LaunchProfileId,
+    PendingResourceId, PluginId, PublisherId, SourceEventHandle, SourceGeneration, StreamCursor,
+    UpstreamMethod, UpstreamRequestId,
 };
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 
-pub use crate::broker::arbitration::{Arbitration, Claim, Pending, Reconciliation};
+pub use crate::broker::arbitration::{
+    Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition,
+};
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::error::{BrokerError, Result};
-pub use crate::broker::ledger::{BindingRecord, Ledger};
+pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
 pub use crate::broker::process::{
     BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
 };
 pub use crate::broker::profiles::{ForegroundMark, LaunchIntent, ProfileStore, new_profile_id};
 pub use crate::broker::tokens::{Invocation, TokenStore};
 pub use crate::broker::volatile::{VolatileState, VolatileTransition};
+
+/// How many source frames one instance holds while it waits for a decoder to read them.
+///
+/// A frame is released when it is consumed, so the bound is on what has not been interpreted. A
+/// connector that never decodes anything is a connector whose oldest frames this host forgets
+/// rather than a session whose memory grows for the rest of the day.
+pub const MAX_RETAINED_FRAMES: usize = 64;
+
+/// How many bytes of unconsumed source frames one instance holds.
+pub const MAX_RETAINED_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 /// One component bound to one application instance.
 #[derive(Debug)]
@@ -95,7 +121,8 @@ impl Binding {
     /// that was trusted for something else interpret this.
     #[must_use]
     pub fn may_decode(&self, method: &UpstreamMethod) -> bool {
-        self.grants.holds(BrokerGrant::ApprovalInterpreter)
+        self.rich_disabled.is_none()
+            && self.grants.holds(BrokerGrant::ApprovalInterpreter)
             && self
                 .trust
                 .as_ref()
@@ -122,6 +149,11 @@ pub struct Instance {
     pub process: Option<ManagedProcess>,
     /// The revision that advances when the upstream owner or selected thread changes.
     pub binding_revision: AgentBindingRevision,
+    /// The generation of the source frames this instance is producing.
+    ///
+    /// It lives here rather than on the process, so an instance the host did not launch still gets
+    /// a new generation when its binding changes.
+    pub source_generation: SourceGeneration,
     /// The upstream's own conversation identifier, where it exposes one.
     pub thread_id: Option<AgentThreadId>,
     /// The turn currently running, where one is.
@@ -137,8 +169,12 @@ pub struct Instance {
     /// Closing one does not end the process. Section 7: "Closing a KR attachment does not end the
     /// TUI process in the worker PTY."
     pub attachments: usize,
-    /// The source frames the broker is holding for this instance's decoders.
+    /// The unconsumed source frames the broker is holding for this instance's decoders.
     frames: BTreeMap<SourceEventHandle, SourceFrame>,
+    /// The order those frames arrived in, so the oldest is the one that goes.
+    frame_order: std::collections::VecDeque<SourceEventHandle>,
+    /// How many bytes those frames hold.
+    frame_bytes: usize,
 }
 
 impl Instance {
@@ -154,6 +190,37 @@ impl Instance {
             rich_mutations_suspended: self.rich_suspension.is_some(),
             suspension_reason: Nullable::from(self.rich_suspension.clone()),
         }
+    }
+
+    /// Holds one frame, forgetting the oldest unconsumed ones if it must.
+    fn retain(&mut self, frame: SourceFrame) {
+        self.frame_bytes = self.frame_bytes.saturating_add(frame.bytes().len());
+        self.frame_order.push_back(frame.handle.clone());
+        self.frames.insert(frame.handle.clone(), frame);
+        while self.frames.len() > MAX_RETAINED_FRAMES || self.frame_bytes > MAX_RETAINED_FRAME_BYTES
+        {
+            let Some(oldest) = self.frame_order.pop_front() else {
+                break;
+            };
+            self.release(&oldest);
+        }
+    }
+
+    /// Forgets one frame, because it has been consumed or evicted.
+    fn release(&mut self, handle: &SourceEventHandle) {
+        if let Some(frame) = self.frames.remove(handle) {
+            self.frame_bytes = self.frame_bytes.saturating_sub(frame.bytes().len());
+        }
+        self.frame_order.retain(|held| held != handle);
+    }
+
+    /// Advances the source generation and forgets the frames of the execution that has gone.
+    fn advance_generation(&mut self) {
+        self.source_generation =
+            SourceGeneration::new(self.source_generation.get().saturating_add(1));
+        self.frames.clear();
+        self.frame_order.clear();
+        self.frame_bytes = 0;
     }
 }
 
@@ -171,22 +238,25 @@ pub enum InstanceEnding {
 }
 
 /// What stopping an instance actually does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopOutcome {
     /// True when the instance's record was removed.
     pub instance_ended: bool,
-    /// True when a dedicated backend this host owns is to be stopped.
+    /// The backend to stop, by full process identity, when this host owns one.
     ///
-    /// A bypassed or shared backend is never claimed or terminated as owned, so this is false for
-    /// one of those however the instance ended.
-    pub stop_backend: bool,
+    /// It is the identity rather than a flag because the supervisor has to know *which* process to
+    /// stop, and a process identifier alone can already belong to something else. A bypassed or
+    /// shared backend is never claimed or terminated as owned, so this is absent for one of those
+    /// however the instance ended.
+    pub backend: Option<ProcessStartIdentity>,
     /// How many attachments are still watching.
     pub attachments_remaining: usize,
 }
 
-/// The broker's whole state, behind one lock.
-#[derive(Debug, Default)]
+/// The broker's whole state and its ledger, behind one lock.
+#[derive(Debug)]
 struct BrokerState {
+    ledger: Ledger,
     instances: BTreeMap<ApplicationInstanceId, Instance>,
     bindings: BTreeMap<BrokerBindingId, Binding>,
     tokens: TokenStore,
@@ -201,7 +271,6 @@ struct BrokerState {
 #[derive(Debug)]
 pub struct Broker {
     state: Mutex<BrokerState>,
-    ledger: Mutex<Ledger>,
 }
 
 impl Broker {
@@ -209,32 +278,35 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the ledger cannot be opened.
+    /// Returns [`BrokerError::LedgerUnavailable`] when the ledger cannot be opened or read.
     pub fn open(journal_path: Option<&std::path::Path>) -> Result<Self> {
         let ledger = Ledger::open(journal_path)?;
-        let mut state = BrokerState::default();
-        // A restarted worker starts from what it wrote, not from nothing. An unresolved resource
-        // that was already dispatched comes back so a reconnect can reconcile it; one that was
-        // not comes back answerable.
-        for resource in ledger.unresolved()? {
-            let dispatched = resource.state == PendingState::Claimed;
-            state.arbitration.restore(resource, dispatched);
+        let mut arbitration = Arbitration::new();
+        // A restarted worker starts from what it wrote, not from nothing. The dispatch marker is
+        // read back with each resource: one that was answered comes back so a reconnect can
+        // reconcile it to uncertain, and one that was not comes back answerable.
+        for record in ledger.unresolved()? {
+            arbitration.restore(record.resource, record.dispatched, record.decoder);
         }
-        state.profiles.restore(ledger.profiles()?);
+        let mut profiles = ProfileStore::new();
+        profiles.restore(ledger.profiles()?);
         Ok(Self {
-            state: Mutex::new(state),
-            ledger: Mutex::new(ledger),
+            state: Mutex::new(BrokerState {
+                ledger,
+                instances: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+                tokens: TokenStore::new(),
+                profiles,
+                arbitration,
+                capabilities: CapabilityOwner::new(),
+                volatile: VolatileState::new(),
+                next_connection: 0,
+            }),
         })
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, BrokerState> {
         self.state.lock().expect("the broker lock is not poisoned")
-    }
-
-    fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
-        self.ledger
-            .lock()
-            .expect("the broker ledger lock is not poisoned")
     }
 
     // -- instances ----------------------------------------------------------------------------
@@ -253,6 +325,7 @@ impl Broker {
                 application_instance_id,
                 process,
                 binding_revision: AgentBindingRevision::new(1),
+                source_generation: SourceGeneration::new(1),
                 thread_id: None,
                 turn_id: None,
                 mode,
@@ -260,6 +333,8 @@ impl Broker {
                 rich_suspension: None,
                 attachments: 0,
                 frames: BTreeMap::new(),
+                frame_order: std::collections::VecDeque::new(),
+                frame_bytes: 0,
             },
         );
     }
@@ -278,48 +353,79 @@ impl Broker {
             .instances
             .get(&application_instance_id)
             .map(Instance::state)
-            .ok_or_else(|| {
-                BrokerError::unknown(format!("no application instance {application_instance_id}"))
-            })
+            .ok_or_else(|| unknown_instance(application_instance_id))
     }
 
     /// Advances the binding revision, because the upstream owner or selected thread changed.
     ///
     /// Everything prepared against the old revision stops being authority at this moment: the
-    /// tokens are withdrawn, the source generation moves on, and a draft submitted against the old
-    /// revision is a conflict rather than a prompt into whatever is selected now.
+    /// tokens are withdrawn, the source generation moves on so an older frame cannot become a
+    /// resource, the evidence gathered through the old binding is invalidated, and the
+    /// conversation this instance owns moves with it, so the conversation it left is free and the
+    /// one it took is not.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance, and
+    /// [`BrokerError::Launch`] when another live execution already owns the conversation being
+    /// selected.
     pub fn advance_binding(
         &self,
         application_instance_id: ApplicationInstanceId,
         thread_id: Option<AgentThreadId>,
+        now: TimestampMs,
     ) -> Result<AgentBindingRevision> {
         let mut state = self.state();
+        if !state.instances.contains_key(&application_instance_id) {
+            return Err(unknown_instance(application_instance_id));
+        }
+        // The conversation moves first, because it is the check that can refuse. Advancing a
+        // revision and then finding the conversation taken would leave the instance at a revision
+        // whose thread it does not own.
+        if let Some(thread) = thread_id.as_ref() {
+            state
+                .profiles
+                .select_conversation(application_instance_id, thread.as_str())?;
+        } else {
+            state.profiles.leave_conversation(application_instance_id);
+        }
         let instance = state
             .instances
             .get_mut(&application_instance_id)
-            .ok_or_else(|| {
-                BrokerError::unknown(format!("no application instance {application_instance_id}"))
-            })?;
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
         instance.binding_revision =
             AgentBindingRevision::new(instance.binding_revision.get().saturating_add(1));
         instance.thread_id = thread_id;
         instance.turn_id = None;
-        if let Some(process) = instance.process.as_mut() {
-            process.advance_generation();
-        }
+        instance.advance_generation();
         let revision = instance.binding_revision;
         state.tokens.withdraw(application_instance_id);
         state.capabilities.invalidate_instance(
             application_instance_id,
-            kr_protocol::broker::CapabilityInvalidation::BindingChanged,
+            CapabilityInvalidation::BindingChanged,
             "the upstream owner or selected thread changed",
-            TimestampMs::new(0),
+            now,
         );
         Ok(revision)
+    }
+
+    /// Records the turn the upstream says is running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    pub fn set_turn(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        turn_id: Option<AgentTurnId>,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.turn_id = turn_id;
+        Ok(())
     }
 
     /// Suspends rich mutations until the binding can be verified.
@@ -340,9 +446,7 @@ impl Broker {
         let instance = state
             .instances
             .get_mut(&application_instance_id)
-            .ok_or_else(|| {
-                BrokerError::unknown(format!("no application instance {application_instance_id}"))
-            })?;
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
         instance.rich_suspension = Some(reason.into());
         Ok(())
     }
@@ -360,9 +464,7 @@ impl Broker {
         let instance = state
             .instances
             .get_mut(&application_instance_id)
-            .ok_or_else(|| {
-                BrokerError::unknown(format!("no application instance {application_instance_id}"))
-            })?;
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
         instance.rich_suspension = None;
         Ok(())
     }
@@ -377,7 +479,9 @@ impl Broker {
     /// Ends an instance, or does not, depending on what ended.
     ///
     /// Section 7 draws the line here and it is the line users notice: quitting the agent ends the
-    /// agent, and closing the window you were watching it through does not.
+    /// agent, and closing the window you were watching it through does not. The outcome names the
+    /// process to stop by its full identity, so the supervisor stops the process this host started
+    /// rather than whatever holds that identifier now.
     pub fn end(
         &self,
         application_instance_id: ApplicationInstanceId,
@@ -387,7 +491,7 @@ impl Broker {
         let Some(instance) = state.instances.get_mut(&application_instance_id) else {
             return StopOutcome {
                 instance_ended: false,
-                stop_backend: false,
+                backend: None,
                 attachments_remaining: 0,
             };
         };
@@ -396,22 +500,25 @@ impl Broker {
                 instance.attachments = instance.attachments.saturating_sub(1);
                 StopOutcome {
                     instance_ended: false,
-                    stop_backend: false,
+                    backend: None,
                     attachments_remaining: instance.attachments,
                 }
             }
             InstanceEnding::NativeExit => {
-                let stop_backend = instance
+                let backend = instance
                     .process
                     .as_ref()
-                    .is_some_and(|process| process.dedicated);
+                    .and_then(|process| process.dedicated.then(|| process.process.clone()));
                 state.instances.remove(&application_instance_id);
                 state.tokens.withdraw(application_instance_id);
                 state.profiles.release(application_instance_id);
                 state.capabilities.forget(application_instance_id);
+                state.bindings.retain(|_, binding| {
+                    binding.application_instance_id != application_instance_id
+                });
                 StopOutcome {
                     instance_ended: true,
-                    stop_backend,
+                    backend,
                     attachments_remaining: 0,
                 }
             }
@@ -424,8 +531,10 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Trust`] when a trust record breaks a rule and
-    /// [`BrokerError::LedgerUnavailable`] when the record cannot be written.
+    /// Returns [`BrokerError::Trust`] when a trust record breaks a rule,
+    /// [`BrokerError::PermissionDenied`] when the trust was granted to a different package or the
+    /// grant it depends on is absent, and [`BrokerError::LedgerUnavailable`] when the record
+    /// cannot be written.
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &self,
@@ -447,16 +556,25 @@ impl Broker {
                     "decoding trust needs the approval interpreter grant",
                 ));
             }
-            let _ = trust;
+            // And trust granted to one package is never another's. Without this check the ledger
+            // would record the bound package's identity beside an interpretation the trust was
+            // never granted for, which is the mismatch the ledger exists to make visible.
+            if !trust.belongs_to(&plugin_id, &publisher_id, &package_digest) {
+                return Err(BrokerError::denied(format!(
+                    "this decoding trust was granted to {} at another digest, not to {plugin_id}",
+                    trust.plugin_id
+                )));
+            }
         }
-        self.ledger().put_binding(&BindingRecord {
+        let mut state = self.state();
+        state.ledger.put_binding(&BindingRecord {
             binding_id,
             application_instance_id,
             grants: grants.clone(),
             trust: trust.clone(),
             bound_at: now,
         })?;
-        self.state().bindings.insert(
+        state.bindings.insert(
             binding_id,
             Binding {
                 binding_id,
@@ -482,7 +600,7 @@ impl Broker {
             .bindings
             .get(&binding_id)
             .map(|binding| binding.grants.clone())
-            .ok_or_else(|| BrokerError::unknown(format!("no binding {binding_id}")))
+            .ok_or_else(|| unknown_binding(binding_id))
     }
 
     /// Withdraws one grant from one binding, leaving the others exactly as they were.
@@ -495,24 +613,33 @@ impl Broker {
         let mut state = self.state();
         let binding = state
             .bindings
-            .get_mut(&binding_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no binding {binding_id}")))?;
-        binding.grants.remove(grant);
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        let mut grants = binding.grants.clone();
+        grants.remove(grant);
         // Withdrawing the interpreter grant withdraws what depended on it. Leaving the trust
         // record behind would leave a record the broker would refuse to act on anyway, and a
         // record nobody acts on is one somebody will eventually read as permission.
-        if grant == BrokerGrant::ApprovalInterpreter {
-            binding.trust = None;
-        }
+        let trust = if grant == BrokerGrant::ApprovalInterpreter {
+            None
+        } else {
+            binding.trust.clone()
+        };
         let record = BindingRecord {
             binding_id,
             application_instance_id: binding.application_instance_id,
-            grants: binding.grants.clone(),
-            trust: binding.trust.clone(),
+            grants: grants.clone(),
+            trust: trust.clone(),
             bound_at: TimestampMs::new(0),
         };
-        drop(state);
-        self.ledger().put_binding(&record)
+        state.ledger.put_binding(&record)?;
+        let binding = state
+            .bindings
+            .get_mut(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        binding.grants = grants;
+        binding.trust = trust;
+        Ok(())
     }
 
     /// Records that a component fault has disabled one binding's rich capabilities.
@@ -546,23 +673,17 @@ impl Broker {
         application_instance_id: ApplicationInstanceId,
         bytes: &[u8],
         now: TimestampMs,
-    ) -> Result<SourceFrame> {
+    ) -> Result<SourceEventHandle> {
         let mut state = self.state();
         let instance = state
             .instances
             .get_mut(&application_instance_id)
-            .ok_or_else(|| {
-                BrokerError::unknown(format!("no application instance {application_instance_id}"))
-            })?;
-        let generation = instance.process.as_ref().map_or_else(
-            || SourceGeneration::new(1),
-            |process| process.source_generation,
-        );
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
         let handle = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
             .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
-        let frame = SourceFrame::new(handle.clone(), generation, bytes, now)?;
-        instance.frames.insert(handle, frame.clone());
-        Ok(frame)
+        let frame = SourceFrame::new(handle.clone(), instance.source_generation, bytes, now)?;
+        instance.retain(frame);
+        Ok(handle)
     }
 
     /// Returns one recorded source frame.
@@ -584,37 +705,42 @@ impl Broker {
     ///
     /// The checks are made in this order, and the order is the argument:
     ///
-    /// 1. **Role.** Does this binding hold the approval-interpreter grant, and is there a trust
-    ///    record covering this exact method? A display-only component stops here.
-    /// 2. **Binding.** Is the frame from the instance this binding is bound to?
-    /// 3. **Source generation.** Is the frame from the execution that is bound *now*? A frame an
-    ///    earlier owner produced cannot become a resource against the current one.
-    /// 4. **Non-reuse.** Has this exact source event already been turned into a resource? A
-    ///    decoder gets one resource per frame, and the claim is durable so a restart does not
-    ///    reopen the question.
+    /// 1. **Role.** Does this binding hold the approval-interpreter grant, is there a trust record
+    ///    granted to this exact package, and does it cover this method? A display-only component
+    ///    stops here.
+    /// 2. **Schema policy.** Is the projection written against a schema version the trust covers,
+    ///    with decisions this trust permits? An interpretation outside the policy is not one this
+    ///    trust was granted for.
+    /// 3. **Binding and generation.** The frame is looked up by its handle in this binding's own
+    ///    instance, so nothing the caller says about its generation or digest is believed, and a
+    ///    frame from an execution that has gone is refused.
+    /// 4. **Non-reuse.** Consuming the source, recording the decoder and writing the pending row
+    ///    are one transaction, keyed by the broker's own event identity. A decoder gets one
+    ///    resource per event, and the claim is durable so a restart does not reopen the question.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Grant`] or [`BrokerError::PermissionDenied`] for a role the binding
-    /// does not have, [`BrokerError::UnknownSubject`] for a binding or instance this broker does
-    /// not hold, and [`BrokerError::PreconditionFailed`] for a stale generation or a reused source.
+    /// does not have, [`BrokerError::Trust`] for a projection outside the schema policy,
+    /// [`BrokerError::UnknownSubject`] for a binding, instance or frame this broker does not hold,
+    /// and [`BrokerError::PreconditionFailed`] for a stale generation or a reused source.
     #[allow(clippy::too_many_arguments)]
     pub fn offer_resource(
         &self,
         binding_id: BrokerBindingId,
-        frame: &SourceFrame,
-        request: kr_protocol::gateway::DownstreamRequestId,
+        handle: &SourceEventHandle,
+        request: DownstreamRequestId,
         method: UpstreamMethod,
         classification: NativeClassification,
-        offered_decisions: u64,
+        projection: DecodedProjection,
         deadline_ms: Option<TimestampMs>,
         now: TimestampMs,
     ) -> Result<PendingResource> {
-        let state = self.state();
+        let mut state = self.state();
         let binding = state
             .bindings
             .get(&binding_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no binding {binding_id}")))?;
+            .ok_or_else(|| unknown_binding(binding_id))?;
         if !binding.grants.holds(BrokerGrant::ApprovalInterpreter) {
             return Err(BrokerError::Grant(
                 kr_protocol::broker::GrantError::NotHeld {
@@ -622,64 +748,78 @@ impl Broker {
                 },
             ));
         }
-        if !binding.may_decode(&method) {
-            return Err(BrokerError::denied(format!(
-                "this binding is not trusted to decode {method}"
-            )));
-        }
         if let Some(reason) = binding.rich_disabled.as_ref() {
             return Err(BrokerError::UnsupportedCapability {
                 detail: format!("this binding's rich capabilities are disabled: {reason}"),
             });
         }
+        if !binding.may_decode(&method) {
+            return Err(BrokerError::denied(format!(
+                "this binding is not trusted to decode {method}"
+            )));
+        }
+        let trust = binding
+            .trust
+            .as_ref()
+            .ok_or_else(|| BrokerError::denied("this binding holds no decoding trust"))?;
+        trust.check_projection(&projection)?;
         let application_instance_id = binding.application_instance_id;
         let plugin_id = binding.plugin_id.clone();
         let publisher_id = binding.publisher_id.clone();
         let package_digest = binding.package_digest;
+
         let instance = state
             .instances
             .get(&application_instance_id)
-            .ok_or_else(|| {
-                BrokerError::unknown(format!("no application instance {application_instance_id}"))
-            })?;
-        let current_generation = instance.process.as_ref().map_or_else(
-            || SourceGeneration::new(1),
-            |process| process.source_generation,
-        );
-        if !instance.frames.contains_key(&frame.handle) {
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        // The frame is read from this binding's own instance, by handle. Nothing the caller says
+        // about its generation or its digest is believed, because both are how this host decides
+        // whether the event is fresh and whether it has already been used.
+        let frame = instance.frames.get(handle).cloned().ok_or_else(|| {
+            BrokerError::PreconditionFailed {
+                detail: format!(
+                    "source event {handle} is not one this binding's application produced, or it \
+                     has already been consumed"
+                ),
+            }
+        })?;
+        if frame.generation != instance.source_generation {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
-                    "source event {} does not belong to this binding's application",
-                    frame.handle
+                    "source event {handle} is from generation {} and the binding is at {}",
+                    frame.generation, instance.source_generation
                 ),
             });
         }
-        if frame.generation != current_generation {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "source event {} is from generation {} and the binding is at {current_generation}",
-                    frame.handle, frame.generation
-                ),
-            });
+        if state.arbitration.holds_request(&request) {
+            return Err(BrokerError::invalid(format!(
+                "{request} already names a pending resource"
+            )));
         }
-        let durability = state.volatile.mode().durability();
-        drop(state);
 
-        let ledger = self.ledger();
-        if !ledger.claim_source(binding_id, frame.generation, &frame.digest, now)? {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "source event {} has already produced a resource",
-                    frame.handle
-                ),
-            });
-        }
+        let durability = state.volatile.mode().durability();
+        let retained = frame.bytes().len().min(MAX_RETAINED_SOURCE_BYTES);
+        let entry = DecoderLedgerEntry {
+            binding_id,
+            plugin_id,
+            publisher_id,
+            package_digest,
+            method: method.clone(),
+            upstream_request_id: request.upstream.clone(),
+            source_generation: frame.generation,
+            source_digest: frame.digest,
+            source_bytes: Bytes::from(frame.bytes()[..retained].to_vec()),
+            source_truncated: retained < frame.bytes().len(),
+            projection,
+            deadline_ms: Nullable::from(deadline_ms),
+            decoded_at: now,
+        };
         let resource = PendingResource {
             resource_id: PendingResourceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes())),
             application_instance_id,
             request,
             kind: PendingKind::Approval,
-            method: method.clone(),
+            method,
             classification,
             source_generation: frame.generation,
             state: PendingState::Pending,
@@ -688,49 +828,54 @@ impl Broker {
             recorded_at: now,
             interpretation_verified: true,
         };
-        ledger.record_decoding(
-            resource.resource_id,
-            &DecoderLedgerEntry {
-                binding_id,
-                plugin_id,
-                publisher_id,
-                package_digest,
-                method,
-                source_generation: frame.generation,
-                source_digest: frame.digest,
-                offered_decisions: U64::new(offered_decisions),
-                deadline_ms: Nullable::from(deadline_ms),
-                decoded_at: now,
-            },
+        let admitted = state.ledger.admit_resource(
+            handle,
+            binding_id,
+            &entry,
+            &resource,
+            durability == Durability::Durable,
+            now,
         )?;
-        if durability == Durability::Durable {
-            ledger.put_pending(&resource)?;
+        if !admitted {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("source event {handle} has already produced a resource"),
+            });
         }
-        drop(ledger);
-        self.state().arbitration.record(resource.clone())?;
+        state
+            .arbitration
+            .record(resource.clone(), Some(binding_id))?;
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            instance.release(handle);
+        }
         Ok(resource)
     }
 
     /// Returns the decoder entry behind one pending resource.
     ///
     /// This is what a person is shown beside an approval: whose package interpreted which bytes,
-    /// and how many decisions it offered.
+    /// the bytes themselves, and the exact decisions it offered.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the record cannot be read.
     pub fn decoding(&self, resource_id: PendingResourceId) -> Result<Option<DecoderLedgerEntry>> {
-        self.ledger().decoding(resource_id)
+        self.state().ledger.decoding(resource_id)
     }
 
     // -- action tokens ------------------------------------------------------------------------
 
     /// Issues an action token for one invocation.
     ///
+    /// Everything the invocation names is checked against what this broker holds *now*: that the
+    /// binding is bound to the instance the invocation acts on, that the binding holds the grant,
+    /// that its rich capabilities are not disabled, that the instance is not suspended, and that
+    /// the revision the caller prepared against is the one in force.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when the binding is unknown and
-    /// [`BrokerError::Grant`] when it does not hold the grant the invocation names.
+    /// Returns [`BrokerError::UnknownSubject`] when the binding or instance is unknown,
+    /// [`BrokerError::Grant`] when the grant is not held, [`BrokerError::StaleBinding`] when the
+    /// revision has moved, and [`BrokerError::RichWorkFenced`] when rich work is fenced.
     pub fn issue_token(
         &self,
         binding_id: BrokerBindingId,
@@ -738,34 +883,40 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<ActionToken> {
         let mut state = self.state();
-        let grants = state
-            .bindings
-            .get(&binding_id)
-            .map(|binding| binding.grants.clone())
-            .ok_or_else(|| BrokerError::unknown(format!("no binding {binding_id}")))?;
-        state.tokens.issue(&grants, invocation, now)
+        state.volatile.require_rich_work()?;
+        let grants = state.check_invocation(binding_id, invocation)?;
+        state.tokens.issue(binding_id, &grants, invocation, now)
     }
 
     /// Spends an action token against a returned effect plan.
     ///
+    /// The bindings are checked, then the authority is checked again against the present: the
+    /// issuing binding still exists, still holds the grant it was issued under, is not disabled,
+    /// and the instance is still live, unsuspended and at the revision the token names.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Token`] when the token is unknown, spent, or bound to something
-    /// other than what was presented, and [`BrokerError::UnknownSubject`] when the instance has
-    /// gone.
+    /// other than what was presented, and the same authority failures [`Broker::issue_token`]
+    /// returns.
     pub fn spend_token(&self, claim: &ActionTokenClaim) -> Result<ActionToken> {
         let mut state = self.state();
-        let revision = state
-            .instances
-            .get(&claim.application_instance_id)
-            .map(|instance| instance.binding_revision)
-            .ok_or_else(|| {
-                BrokerError::unknown(format!(
-                    "no application instance {}",
-                    claim.application_instance_id
-                ))
-            })?;
-        state.tokens.spend(claim, revision)
+        state.volatile.require_rich_work()?;
+        let (token, binding_id, capability) = state.tokens.spend_checked(claim)?;
+        // The token has been consumed. Whatever follows, it cannot be spent again, so a failed
+        // authority check costs the caller its invocation rather than giving it another attempt.
+        let invocation = Invocation {
+            actor_id: token.actor_id.clone(),
+            grant: token.grant,
+            grant_id: token.grant_id,
+            application_instance_id: token.application_instance_id,
+            binding_revision: token.binding_revision,
+            action: token.action.clone(),
+            capability: capability.clone(),
+            parameters: Vec::new(),
+        };
+        state.check_invocation(binding_id, &invocation)?;
+        Ok(token)
     }
 
     // -- launch profiles ----------------------------------------------------------------------
@@ -782,11 +933,11 @@ impl Broker {
         against: ForegroundMark,
         saved_conversation: Option<String>,
     ) -> Result<LaunchIntent> {
-        let intent = self
-            .state()
+        let mut state = self.state();
+        let intent = state
             .profiles
             .prepare(profile, against, saved_conversation)?;
-        self.ledger().put_profile(&intent.profile, None)?;
+        state.ledger.put_profile(&intent.profile, None)?;
         Ok(intent)
     }
 
@@ -801,11 +952,12 @@ impl Broker {
         now: &ForegroundMark,
         application_instance_id: ApplicationInstanceId,
     ) -> Result<LaunchProfile> {
-        let profile = self
-            .state()
+        let mut state = self.state();
+        let profile = state
             .profiles
             .execute(intent, now, application_instance_id)?;
-        self.ledger()
+        state
+            .ledger
             .put_profile(&profile, Some(application_instance_id))?;
         Ok(profile)
     }
@@ -821,10 +973,12 @@ impl Broker {
         application_instance_id: ApplicationInstanceId,
         saved_conversation: Option<String>,
     ) -> Result<()> {
-        self.state()
+        let mut state = self.state();
+        state
             .profiles
             .adopt(profile.clone(), application_instance_id, saved_conversation);
-        self.ledger()
+        state
+            .ledger
             .put_profile(&profile, Some(application_instance_id))
     }
 
@@ -840,14 +994,21 @@ impl Broker {
             .cloned()
     }
 
+    /// Returns which instance owns the live execution of one saved conversation.
+    #[must_use]
+    pub fn conversation_owner(&self, saved_conversation: &str) -> Option<ApplicationInstanceId> {
+        self.state().profiles.owner_of(saved_conversation)
+    }
+
     // -- capability evidence ------------------------------------------------------------------
 
     /// Records one capability record.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Capability`] when the record breaks a rule.
-    pub fn record_capability(&self, record: kr_protocol::broker::CapabilityRecord) -> Result<()> {
+    /// Returns [`BrokerError::Capability`] when the record breaks a rule or is not newer than the
+    /// one held.
+    pub fn record_capability(&self, record: CapabilityRecord) -> Result<()> {
         self.state().capabilities.record(record)
     }
 
@@ -856,27 +1017,20 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the probe was not one the host would run.
-    pub fn record_probe(
-        &self,
-        probe: &Probe,
-        record: kr_protocol::broker::CapabilityRecord,
-    ) -> Result<()> {
+    pub fn record_probe(&self, probe: &Probe, record: CapabilityRecord) -> Result<()> {
         self.state().capabilities.record_probe(probe, record)
     }
 
     /// Returns one installation's capability map.
     #[must_use]
-    pub fn capabilities(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> kr_protocol::broker::CapabilityMap {
+    pub fn capabilities(&self, application_instance_id: ApplicationInstanceId) -> CapabilityMap {
         self.state().capabilities.map(application_instance_id)
     }
 
     /// Invalidates every record one change makes stale.
     pub fn invalidate_capabilities(
         &self,
-        change: kr_protocol::broker::CapabilityInvalidation,
+        change: CapabilityInvalidation,
         reason: &str,
         now: TimestampMs,
     ) -> usize {
@@ -892,8 +1046,8 @@ impl Broker {
     pub fn recheck_capability(
         &self,
         application_instance_id: ApplicationInstanceId,
-        capability_id: &kr_protocol::ids::CapabilityId,
-        read_at: Option<kr_protocol::ids::CapabilityRevision>,
+        capability_id: &CapabilityId,
+        read_at: Option<CapabilityRevision>,
     ) -> Result<()> {
         self.state()
             .capabilities
@@ -905,9 +1059,15 @@ impl Broker {
 
     /// Takes the claim on one pending resource.
     ///
+    /// The recheck covers everything that could have changed while the answer was being encoded:
+    /// the resource's own state, its deadline, the instance it belongs to, the generation that
+    /// produced it, and whether the decoder that interpreted it may still encode an answer.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Arbitration`] when the resource is already claimed or resolved.
+    /// Returns [`BrokerError::Arbitration`] when the resource is already claimed or resolved, and
+    /// [`BrokerError::PreconditionFailed`] or [`BrokerError::PermissionDenied`] when one of the
+    /// rechecks fails.
     pub fn claim(
         &self,
         resource_id: PendingResourceId,
@@ -915,22 +1075,35 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<Claim> {
         let mut state = self.state();
-        let claim = state.arbitration.claim(resource_id, actor_id, now)?;
-        let resource = state
-            .arbitration
-            .get(resource_id)
-            .map(|pending| pending.resource.clone());
-        let durable = state.volatile.mode().durability() == Durability::Durable;
-        drop(state);
-        if let Some(resource) = resource
-            && durable
-        {
-            self.ledger().settle_pending(&resource, now)?;
-        }
+        state.volatile.require_rich_work()?;
+        state.recheck_answerable(resource_id)?;
+        let transition = state.arbitration.plan_claim(resource_id, actor_id, now)?;
+        let claim = transition
+            .claim()
+            .cloned()
+            .ok_or_else(|| BrokerError::invalid("a claim transition carries a claim"))?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)?;
         Ok(claim)
     }
 
-    /// Resolves a claimed resource.
+    /// Commits the dispatch marker before the answer is written to the upstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when another claim holds the resource, and
+    /// [`BrokerError::LedgerUnavailable`] when the marker cannot be committed.
+    pub fn mark_dispatched(&self, claim: &Claim) -> Result<()> {
+        let mut state = self.state();
+        let transition = state.arbitration.plan_dispatch(claim)?;
+        if transition.resource.durability == Durability::Durable {
+            state.ledger.mark_dispatched(&transition.resource)?;
+        }
+        state.arbitration.commit(transition)?;
+        Ok(())
+    }
+
+    /// Resolves a claimed resource: the upstream confirmed the answer.
     ///
     /// # Errors
     ///
@@ -938,14 +1111,21 @@ impl Broker {
     /// requires.
     pub fn resolve(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let mut state = self.state();
-        state.arbitration.mark_dispatched(claim)?;
-        let resource = state.arbitration.resolve(claim)?;
-        let durable = state.volatile.mode().durability() == Durability::Durable;
-        drop(state);
-        if durable {
-            self.ledger().settle_pending(&resource, now)?;
-        }
-        Ok(resource)
+        let transition = state.arbitration.plan_resolve(claim)?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)
+    }
+
+    /// Leaves a claimed resource uncertain: an answer went and nothing confirmed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures [`Broker::resolve`] does.
+    pub fn uncertain(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+        let mut state = self.state();
+        let transition = state.arbitration.plan_uncertain(claim)?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)
     }
 
     /// Records that the upstream answered or withdrew a request itself.
@@ -956,50 +1136,31 @@ impl Broker {
     /// requires.
     pub fn upstream_resolved(
         &self,
-        request: &kr_protocol::gateway::DownstreamRequestId,
+        request: &DownstreamRequestId,
         now: TimestampMs,
     ) -> Result<PendingResource> {
         let mut state = self.state();
-        let resource = state.arbitration.upstream_resolved(request)?;
-        let durable = state.volatile.mode().durability() == Durability::Durable;
-        drop(state);
-        if durable {
-            self.ledger().settle_pending(&resource, now)?;
-        }
-        Ok(resource)
+        let transition = state.arbitration.plan_upstream_resolved(request)?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)
     }
 
-    /// Reconciles this host's records with what the upstream still has pending.
+    /// Reconciles one upstream's records with what it still has pending.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when a settled record cannot be written.
     pub fn reconcile(
         &self,
-        still_open: &[kr_protocol::gateway::DownstreamRequestId],
+        scope: ReconcileScope,
+        still_open: &[DownstreamRequestId],
         now: TimestampMs,
     ) -> Result<Reconciliation> {
         let mut state = self.state();
-        let reconciliation = state.arbitration.reconcile(still_open);
-        let changed: Vec<PendingResource> = reconciliation
-            .uncertain
-            .iter()
-            .chain(&reconciliation.withdrawn)
-            .chain(&reconciliation.released)
-            .filter_map(|resource_id| {
-                state
-                    .arbitration
-                    .get(*resource_id)
-                    .map(|pending| pending.resource.clone())
-            })
-            .collect();
-        let durable = state.volatile.mode().durability() == Durability::Durable;
-        drop(state);
-        if durable {
-            let ledger = self.ledger();
-            for resource in &changed {
-                ledger.settle_pending(resource, now)?;
-            }
+        let (reconciliation, transitions) = state.arbitration.plan_reconcile(scope, still_open);
+        for transition in transitions {
+            state.write_transition(&transition, now)?;
+            state.arbitration.commit(transition)?;
         }
         Ok(reconciliation)
     }
@@ -1023,6 +1184,79 @@ impl Broker {
             .collect()
     }
 
+    // -- volatile-native mode -----------------------------------------------------------------
+
+    /// Returns the gateway's current durability mode.
+    #[must_use]
+    pub fn mode(&self) -> kr_protocol::gateway::GatewayMode {
+        self.state().volatile.mode()
+    }
+
+    /// Returns the evidence gap that is open, while one is.
+    #[must_use]
+    pub fn gap(&self) -> Option<kr_protocol::gateway::EvidenceGap> {
+        self.state().volatile.gap().cloned()
+    }
+
+    /// Enters volatile-native mode, atomically.
+    ///
+    /// One operation fences the rich work, marks every unresolved resource volatile, counts the
+    /// identifiers that must never be answered twice and opens the gap. Nothing is admitted
+    /// between those steps because there are no steps between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the gateway is already fenced.
+    pub fn enter_volatile(
+        &self,
+        reason: impl Into<String>,
+        now: TimestampMs,
+    ) -> Result<VolatileTransition> {
+        let mut state = self.state();
+        let (carried, _) = state.arbitration.enter_volatile();
+        let transition = state.volatile.enter(reason, carried, now)?;
+        // The gap's own record is written if the ledger will take it. It usually will not, which
+        // is why the mode exists; a gap nobody could write is still exposed in memory and is
+        // committed when storage returns.
+        if let Ok(row) = state.ledger.open_gap(&transition.gap) {
+            state.volatile.set_row(row);
+        }
+        Ok(transition)
+    }
+
+    /// Commits the gap and reconciles what lived inside it, then restores rich work.
+    ///
+    /// Recovery is two steps because it can fail halfway. `begin` says storage is back; this
+    /// commits the gap and the resources that lived in it, and only then does rich work resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the gateway is not fenced, and
+    /// [`BrokerError::LedgerUnavailable`] when the gap cannot be committed, in which case the
+    /// gateway falls back to the fence rather than claiming to have recovered.
+    pub fn recover(&self, now: TimestampMs) -> Result<VolatileTransition> {
+        let mut state = self.state();
+        let beginning = state.volatile.begin_recovery(now)?;
+        let unresolved = state.arbitration.unresolved();
+        let commit = (|| -> Result<()> {
+            for (resource, decoder, dispatched) in &unresolved {
+                state.ledger.put_pending(resource, *decoder, *dispatched)?;
+            }
+            match state.volatile.row() {
+                Some(row) => state.ledger.commit_gap(row, &beginning.gap),
+                None => state.ledger.open_gap(&beginning.gap).map(|_| ()),
+            }
+        })();
+        if let Err(error) = commit {
+            let (carried, _) = state.arbitration.enter_volatile();
+            state
+                .volatile
+                .fall_back("storage failed again during recovery", carried, now)?;
+            return Err(error);
+        }
+        state.volatile.finish_recovery()
+    }
+
     // -- adapter checkpoints ------------------------------------------------------------------
 
     /// Records the last semantic cursor one adapter consumed.
@@ -1036,7 +1270,8 @@ impl Broker {
         cursor: StreamCursor,
         now: TimestampMs,
     ) -> Result<()> {
-        self.ledger()
+        self.state()
+            .ledger
             .put_checkpoint(application_instance_id, cursor, now)
     }
 
@@ -1049,7 +1284,7 @@ impl Broker {
         &self,
         application_instance_id: ApplicationInstanceId,
     ) -> Result<Option<StreamCursor>> {
-        self.ledger().checkpoint(application_instance_id)
+        self.state().ledger.checkpoint(application_instance_id)
     }
 
     /// Mints the next gateway connection identifier.
@@ -1067,8 +1302,118 @@ impl Broker {
     pub fn downstream(
         connection: GatewayConnectionId,
         upstream: UpstreamRequestId,
-    ) -> kr_protocol::gateway::DownstreamRequestId {
-        kr_protocol::gateway::DownstreamRequestId::new(connection, upstream)
+    ) -> DownstreamRequestId {
+        DownstreamRequestId::new(connection, upstream)
+    }
+}
+
+impl BrokerState {
+    /// Writes one planned transition durably, conditional on the state it expects to find.
+    ///
+    /// A volatile record is not written: that is what volatile means, and writing it would be the
+    /// manufactured durable history section 11 forbids.
+    fn write_transition(&self, transition: &Transition, now: TimestampMs) -> Result<()> {
+        if transition.resource.durability != Durability::Durable {
+            return Ok(());
+        }
+        self.ledger.settle_pending(
+            &transition.resource,
+            transition.from,
+            transition.resource.state == PendingState::Uncertain,
+            now,
+        )
+    }
+
+    /// Checks everything an invocation depends on against what this broker holds now.
+    fn check_invocation(
+        &self,
+        binding_id: BrokerBindingId,
+        invocation: &Invocation,
+    ) -> Result<BrokerGrants> {
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        if binding.application_instance_id != invocation.application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "binding {binding_id} is not bound to {}",
+                invocation.application_instance_id
+            )));
+        }
+        if let Some(reason) = binding.rich_disabled.as_ref() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!("this binding's rich capabilities are disabled: {reason}"),
+            });
+        }
+        binding.grants.require(invocation.grant)?;
+        let instance = self
+            .instances
+            .get(&invocation.application_instance_id)
+            .ok_or_else(|| unknown_instance(invocation.application_instance_id))?;
+        if let Some(reason) = instance.rich_suspension.as_ref() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("rich mutations are suspended: {reason}"),
+            });
+        }
+        if instance.binding_revision != invocation.binding_revision {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "this action was prepared at binding revision {} and the binding is at {}",
+                    invocation.binding_revision, instance.binding_revision
+                ),
+            });
+        }
+        // The capability is rechecked independently of the grant, because the two answer separate
+        // questions and either can have changed since the caller read it.
+        if let Some((capability_id, read_at)) = invocation.capability.as_ref() {
+            self.capabilities.recheck(
+                invocation.application_instance_id,
+                capability_id,
+                *read_at,
+            )?;
+        }
+        Ok(binding.grants.clone())
+    }
+
+    /// Checks that one pending resource is still one an answer may be dispatched for.
+    fn recheck_answerable(&self, resource_id: PendingResourceId) -> Result<()> {
+        let pending = self
+            .arbitration
+            .get(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        let instance = self
+            .instances
+            .get(&pending.resource.application_instance_id)
+            .ok_or_else(|| unknown_instance(pending.resource.application_instance_id))?;
+        if let Some(reason) = instance.rich_suspension.as_ref() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("rich mutations are suspended: {reason}"),
+            });
+        }
+        if pending.resource.source_generation != instance.source_generation {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "{resource_id} came from generation {} and the binding is at {}",
+                    pending.resource.source_generation, instance.source_generation
+                ),
+            });
+        }
+        // The decoder that interpreted this request is the one that would encode the answer. If
+        // its trust has been withdrawn, its package disabled, or it was never permitted to answer,
+        // there is nobody to encode with, and a claim would be a promise this host cannot keep.
+        if let Some(binding_id) = pending.decoder {
+            let binding = self
+                .bindings
+                .get(&binding_id)
+                .ok_or_else(|| unknown_binding(binding_id))?;
+            if !binding.may_encode(&pending.resource.method) {
+                return Err(BrokerError::denied(format!(
+                    "the decoder that interpreted {resource_id} may no longer answer {}",
+                    pending.resource.method
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1081,365 +1426,10 @@ pub fn action_name(text: &str) -> Result<ActionName> {
     ActionName::new(text).map_err(|error| BrokerError::invalid(format!("{text}: {error}")))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kr_protocol::gateway::{DownstreamRequestId, NativeMethodClass};
-    use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+fn unknown_instance(application_instance_id: ApplicationInstanceId) -> BrokerError {
+    BrokerError::unknown(format!("no application instance {application_instance_id}"))
+}
 
-    fn instance_id(byte: u8) -> ApplicationInstanceId {
-        ApplicationInstanceId::new(Uuid::from_bytes([byte; 16]))
-    }
-
-    fn binding_id(byte: u8) -> BrokerBindingId {
-        BrokerBindingId::new(Uuid::from_bytes([byte; 16]))
-    }
-
-    fn method() -> UpstreamMethod {
-        UpstreamMethod::new("session/request_permission").expect("valid")
-    }
-
-    fn trust(may_encode: bool) -> DecodingTrust {
-        DecodingTrust {
-            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
-            publisher_id: PublisherId::new("kalareach").expect("valid"),
-            package_digest: Digest256::from_bytes([5; 32]),
-            methods: [method()].into_iter().collect(),
-            may_encode_response: may_encode,
-            granted_at: TimestampMs::new(1),
-        }
-    }
-
-    fn managed(instance: ApplicationInstanceId) -> ManagedProcess {
-        let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
-        ManagedProcess::new(
-            instance,
-            process.clone(),
-            TransportHandle {
-                transport: BrokerTransport::PrivateSocket,
-                application_instance_id: instance,
-                executable_digest: Digest256::from_bytes([3; 32]),
-                process,
-            },
-            Credential::from_bytes([9; process::CREDENTIAL_BYTES]),
-            true,
-            TimestampMs::new(1),
-        )
-    }
-
-    fn broker_with_binding(grants: BrokerGrants, trust: Option<DecodingTrust>) -> Broker {
-        let broker = Broker::open(None).expect("the broker opens");
-        broker.register_instance(
-            instance_id(2),
-            IntegrationMode::Gateway,
-            None,
-            Some(managed(instance_id(2))),
-        );
-        broker
-            .bind(
-                binding_id(9),
-                instance_id(2),
-                PluginId::new("kalareach.codex").expect("valid"),
-                PublisherId::new("kalareach").expect("valid"),
-                Digest256::from_bytes([5; 32]),
-                grants,
-                trust,
-                TimestampMs::new(1),
-            )
-            .expect("the binding is recorded");
-        broker
-    }
-
-    fn request(id: &str) -> DownstreamRequestId {
-        DownstreamRequestId::new(
-            GatewayConnectionId::new(1),
-            UpstreamRequestId::new(id).expect("valid"),
-        )
-    }
-
-    #[test]
-    fn a_display_only_component_cannot_create_an_approval() {
-        let broker = broker_with_binding(BrokerGrants::granted([BrokerGrant::Observation]), None);
-        let frame = broker
-            .record_source(instance_id(2), b"{}", TimestampMs::new(2))
-            .expect("the frame is recorded");
-        let refusal = broker
-            .offer_resource(
-                binding_id(9),
-                &frame,
-                request("11"),
-                method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
-                None,
-                TimestampMs::new(3),
-            )
-            .expect_err("a display-only component is refused");
-        assert!(matches!(refusal, BrokerError::Grant(_)));
-    }
-
-    #[test]
-    fn a_decoder_trusted_for_another_method_is_refused() {
-        let broker = broker_with_binding(
-            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-            Some(trust(true)),
-        );
-        let frame = broker
-            .record_source(instance_id(2), b"{}", TimestampMs::new(2))
-            .expect("the frame is recorded");
-        let refusal = broker
-            .offer_resource(
-                binding_id(9),
-                &frame,
-                request("11"),
-                UpstreamMethod::new("fs/write_text_file").expect("valid"),
-                NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
-                None,
-                TimestampMs::new(3),
-            )
-            .expect_err("a method outside the trust record is refused");
-        assert!(matches!(refusal, BrokerError::PermissionDenied { .. }));
-    }
-
-    #[test]
-    fn one_source_event_becomes_one_resource() {
-        let broker = broker_with_binding(
-            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-            Some(trust(true)),
-        );
-        let frame = broker
-            .record_source(instance_id(2), b"{\"id\":11}", TimestampMs::new(2))
-            .expect("the frame is recorded");
-        broker
-            .offer_resource(
-                binding_id(9),
-                &frame,
-                request("11"),
-                method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
-                None,
-                TimestampMs::new(3),
-            )
-            .expect("the first offer is accepted");
-        let refusal = broker
-            .offer_resource(
-                binding_id(9),
-                &frame,
-                request("12"),
-                method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
-                None,
-                TimestampMs::new(4),
-            )
-            .expect_err("the same source event cannot produce a second resource");
-        assert!(matches!(refusal, BrokerError::PreconditionFailed { .. }));
-    }
-
-    #[test]
-    fn a_frame_from_an_earlier_execution_owner_is_refused() {
-        let broker = broker_with_binding(
-            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-            Some(trust(true)),
-        );
-        let frame = broker
-            .record_source(instance_id(2), b"{\"id\":11}", TimestampMs::new(2))
-            .expect("the frame is recorded");
-        broker
-            .advance_binding(instance_id(2), None)
-            .expect("the thread changed");
-        let refusal = broker
-            .offer_resource(
-                binding_id(9),
-                &frame,
-                request("11"),
-                method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
-                2,
-                None,
-                TimestampMs::new(5),
-            )
-            .expect_err("a frame from the previous owner is refused");
-        assert!(matches!(refusal, BrokerError::PreconditionFailed { .. }));
-    }
-
-    #[test]
-    fn the_ledger_says_whose_interpretation_an_approval_is() {
-        let broker = broker_with_binding(
-            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-            Some(trust(true)),
-        );
-        let frame = broker
-            .record_source(instance_id(2), b"{\"id\":11}", TimestampMs::new(2))
-            .expect("the frame is recorded");
-        let resource = broker
-            .offer_resource(
-                binding_id(9),
-                &frame,
-                request("11"),
-                method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
-                3,
-                Some(TimestampMs::new(500)),
-                TimestampMs::new(3),
-            )
-            .expect("the offer is accepted");
-        let entry = broker
-            .decoding(resource.resource_id)
-            .expect("the read succeeds")
-            .expect("the entry is recorded");
-        assert_eq!(entry.publisher_id.as_str(), "kalareach");
-        assert_eq!(entry.package_digest, Digest256::from_bytes([5; 32]));
-        assert_eq!(entry.method, method());
-        assert_eq!(entry.source_digest, frame.digest);
-        assert_eq!(entry.offered_decisions.get(), 3);
-        assert_eq!(entry.deadline_ms.as_ref().map(|at| at.get()), Some(500));
-    }
-
-    #[test]
-    fn withdrawing_the_interpreter_grant_leaves_the_others() {
-        let broker = broker_with_binding(
-            BrokerGrants::granted([
-                BrokerGrant::Observation,
-                BrokerGrant::UpstreamAction,
-                BrokerGrant::ApprovalInterpreter,
-            ]),
-            Some(trust(true)),
-        );
-        broker
-            .withdraw_grant(binding_id(9), BrokerGrant::ApprovalInterpreter)
-            .expect("the grant is withdrawn");
-        let grants = broker.grants(binding_id(9)).expect("the binding is there");
-        assert!(grants.holds(BrokerGrant::Observation));
-        assert!(grants.holds(BrokerGrant::UpstreamAction));
-        assert!(!grants.holds(BrokerGrant::ApprovalInterpreter));
-    }
-
-    #[test]
-    fn a_native_exit_stops_the_backend_and_closing_an_attachment_does_not() {
-        let broker = broker_with_binding(BrokerGrants::granted([BrokerGrant::Observation]), None);
-        broker.attach(instance_id(2));
-        broker.attach(instance_id(2));
-        let closed = broker.end(instance_id(2), InstanceEnding::AttachmentClosed);
-        assert!(!closed.instance_ended);
-        assert!(!closed.stop_backend);
-        assert_eq!(closed.attachments_remaining, 1);
-        assert!(broker.binding_state(instance_id(2)).is_ok());
-
-        let exited = broker.end(instance_id(2), InstanceEnding::NativeExit);
-        assert!(exited.instance_ended);
-        assert!(exited.stop_backend);
-        assert!(broker.binding_state(instance_id(2)).is_err());
-    }
-
-    #[test]
-    fn a_bypassed_backend_is_never_stopped_as_owned() {
-        let broker = Broker::open(None).expect("the broker opens");
-        broker.register_instance(instance_id(3), IntegrationMode::NativeTerminal, None, None);
-        let exited = broker.end(instance_id(3), InstanceEnding::NativeExit);
-        assert!(exited.instance_ended);
-        assert!(
-            !exited.stop_backend,
-            "a backend this host did not launch is never claimed or terminated as owned"
-        );
-    }
-
-    #[test]
-    fn a_binding_that_advanced_withdraws_the_tokens_prepared_against_it() {
-        let broker =
-            broker_with_binding(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
-        let invocation = Invocation {
-            actor_id: ActorId::new("device-1").expect("valid"),
-            grant: BrokerGrant::UpstreamAction,
-            grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([7; 16])),
-            application_instance_id: instance_id(2),
-            binding_revision: AgentBindingRevision::new(1),
-            action: action_name("prompt.submit").expect("valid"),
-            parameters: b"{}".to_vec(),
-        };
-        let token = broker
-            .issue_token(binding_id(9), &invocation, TimestampMs::new(2))
-            .expect("issued");
-        broker
-            .advance_binding(instance_id(2), None)
-            .expect("the thread changed");
-        assert!(
-            broker.spend_token(&ActionTokenClaim::from(&token)).is_err(),
-            "a token prepared against the old conversation is not authority over the new one"
-        );
-    }
-
-    #[test]
-    fn a_restart_recovers_what_was_unresolved() {
-        let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(&directory).expect("the directory is created");
-        let path = directory.join("session.sqlite");
-        let resource_id = {
-            let broker = Broker::open(Some(&path)).expect("the broker opens");
-            broker.register_instance(
-                instance_id(2),
-                IntegrationMode::Gateway,
-                None,
-                Some(managed(instance_id(2))),
-            );
-            broker
-                .bind(
-                    binding_id(9),
-                    instance_id(2),
-                    PluginId::new("kalareach.codex").expect("valid"),
-                    PublisherId::new("kalareach").expect("valid"),
-                    Digest256::from_bytes([5; 32]),
-                    BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-                    Some(trust(true)),
-                    TimestampMs::new(1),
-                )
-                .expect("the binding is recorded");
-            let frame = broker
-                .record_source(instance_id(2), b"{\"id\":11}", TimestampMs::new(2))
-                .expect("the frame is recorded");
-            let resource = broker
-                .offer_resource(
-                    binding_id(9),
-                    &frame,
-                    request("11"),
-                    method(),
-                    NativeClassification::declared(NativeMethodClass::Mutation),
-                    2,
-                    None,
-                    TimestampMs::new(3),
-                )
-                .expect("the offer is accepted");
-            broker
-                .claim(
-                    resource.resource_id,
-                    &ActorId::new("device-1").expect("valid"),
-                    TimestampMs::new(4),
-                )
-                .expect("claimed");
-            resource.resource_id
-        };
-
-        let restarted = Broker::open(Some(&path)).expect("the broker reopens");
-        let recovered = restarted
-            .pending(resource_id)
-            .expect("the resource came back");
-        assert_eq!(recovered.state, PendingState::Claimed);
-        let reconciliation = restarted
-            .reconcile(&[request("11")], TimestampMs::new(10))
-            .expect("the reconnect reconciles");
-        assert_eq!(reconciliation.uncertain, vec![resource_id]);
-        assert!(
-            restarted
-                .claim(
-                    resource_id,
-                    &ActorId::new("device-1").expect("valid"),
-                    TimestampMs::new(11)
-                )
-                .is_err(),
-            "a reconnect never reissues an uncertain response"
-        );
-        let _ = std::fs::remove_dir_all(&directory);
-    }
+fn unknown_binding(binding_id: BrokerBindingId) -> BrokerError {
+    BrokerError::unknown(format!("no binding {binding_id}"))
 }

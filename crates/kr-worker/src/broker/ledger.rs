@@ -28,9 +28,9 @@
 use kr_protocol::broker::{BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile};
 use kr_protocol::gateway::{Durability, EvidenceGap, PendingResource, PendingState};
 use kr_protocol::ids::{
-    ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceGeneration, StreamCursor,
+    ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceEventHandle, StreamCursor,
 };
-use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
+use kr_protocol::scalars::{TimestampMs, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::broker::error::{BrokerError, Result};
@@ -57,6 +57,20 @@ pub struct BindingRecord {
     pub trust: Option<DecodingTrust>,
     /// When the binding was recorded.
     pub bound_at: TimestampMs,
+}
+
+/// One resource a restart found unresolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedRecord {
+    /// The resource as it was last written.
+    pub resource: PendingResource,
+    /// True when an answer had already left this host for it.
+    ///
+    /// This is the dispatch marker read back. A resource with it set is never answered again: the
+    /// first answer may have been applied, and asking again would be the second.
+    pub dispatched: bool,
+    /// The binding whose decoder produced it, where one did.
+    pub decoder: Option<BrokerBindingId>,
 }
 
 /// The broker's durable records, in the worker's own journal file.
@@ -111,11 +125,13 @@ impl Ledger {
                      recorded_at_ms INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS broker_consumed_sources (
-                     binding_id        BLOB    NOT NULL,
-                     source_generation INTEGER NOT NULL,
-                     source_digest     BLOB    NOT NULL,
-                     consumed_at_ms    INTEGER NOT NULL,
-                     PRIMARY KEY (binding_id, source_generation, source_digest)
+                     application_instance_id BLOB    NOT NULL,
+                     source_handle           TEXT    NOT NULL,
+                     source_generation       INTEGER NOT NULL,
+                     source_digest           BLOB    NOT NULL,
+                     binding_id              BLOB    NOT NULL,
+                     consumed_at_ms          INTEGER NOT NULL,
+                     PRIMARY KEY (application_instance_id, source_handle)
                  );
                  CREATE TABLE IF NOT EXISTS broker_pending (
                      resource_id             BLOB PRIMARY KEY,
@@ -125,6 +141,8 @@ impl Ledger {
                      state                   TEXT NOT NULL,
                      durability              TEXT NOT NULL,
                      record                  BLOB NOT NULL,
+                     dispatched              INTEGER NOT NULL DEFAULT 0,
+                     decoder_binding_id      BLOB,
                      recorded_at_ms          INTEGER NOT NULL,
                      resolved_at_ms          INTEGER
                  );
@@ -349,58 +367,118 @@ impl Ledger {
             .transpose()
     }
 
-    /// Claims one source event handle for one binding, exactly once.
+    /// Admits one decoded resource: consumes its source, records the decoder and writes the
+    /// pending row, all in one transaction.
     ///
-    /// Returns true when this is the first claim. A second claim of the same handle returns false
-    /// and writes nothing, which is the non-reuse check section 11 requires the broker to make
-    /// before it believes a decoder.
+    /// The three writes are one because a crash between them would leave a source permanently
+    /// consumed with no resource to show for it, or a resource whose provenance nobody can read.
+    /// The source is consumed by the broker's own event identity, so a second decoder cannot
+    /// interpret the same event and two events with identical bytes are two events.
+    ///
+    /// Returns `false` without writing anything when the source has already been consumed.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails for any reason other than
-    /// the uniqueness constraint.
-    pub fn claim_source(
-        &self,
+    /// Returns [`BrokerError::LedgerUnavailable`] when any part of the transaction fails; the
+    /// whole of it goes back.
+    pub fn admit_resource(
+        &mut self,
+        source_handle: &SourceEventHandle,
         binding_id: BrokerBindingId,
-        generation: SourceGeneration,
-        digest: &Digest256,
+        entry: &DecoderLedgerEntry,
+        resource: &PendingResource,
+        durable: bool,
         now: TimestampMs,
     ) -> Result<bool> {
-        let inserted = self
-            .connection
+        let transaction = self.connection.transaction().map_err(BrokerError::ledger)?;
+        let consumed = transaction
             .execute(
                 "INSERT OR IGNORE INTO broker_consumed_sources
-                     (binding_id, source_generation, source_digest, consumed_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
+                     (application_instance_id, source_handle, source_generation, source_digest,
+                      binding_id, consumed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
+                    resource.application_instance_id.get().as_bytes().as_slice(),
+                    source_handle.as_str(),
+                    i64::try_from(entry.source_generation.get()).unwrap_or(i64::MAX),
+                    entry.source_digest.as_bytes().as_slice(),
                     binding_id.get().as_bytes().as_slice(),
-                    i64::try_from(generation.get()).unwrap_or(i64::MAX),
-                    digest.as_bytes().as_slice(),
                     i64::try_from(now.get()).unwrap_or(i64::MAX),
                 ],
             )
             .map_err(BrokerError::ledger)?;
-        Ok(inserted == 1)
+        if consumed != 1 {
+            // Nothing was written, and the rollback makes that true of the whole transaction
+            // rather than only of this statement.
+            transaction.rollback().map_err(BrokerError::ledger)?;
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO broker_decoder_entries
+                     (resource_id, entry, recorded_at_ms) VALUES (?1, ?2, ?3)",
+                params![
+                    resource.resource_id.get().as_bytes().as_slice(),
+                    encode(entry)?,
+                    i64::try_from(entry.decoded_at.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        if durable {
+            transaction
+                .execute(
+                    "INSERT INTO broker_pending
+                         (resource_id, application_instance_id, connection_id,
+                          upstream_request_id, state, durability, record, dispatched,
+                          decoder_binding_id, recorded_at_ms, resolved_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, NULL)",
+                    params![
+                        resource.resource_id.get().as_bytes().as_slice(),
+                        resource.application_instance_id.get().as_bytes().as_slice(),
+                        i64::try_from(resource.request.connection.get()).unwrap_or(i64::MAX),
+                        resource.request.upstream.as_str(),
+                        resource.state.as_str(),
+                        resource.durability.as_str(),
+                        encode(resource)?,
+                        binding_id.get().as_bytes().as_slice(),
+                        i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(BrokerError::ledger)?;
+        }
+        transaction.commit().map_err(BrokerError::ledger)?;
+        Ok(true)
     }
 
     // -- pending resources --------------------------------------------------------------------
 
-    /// Writes or replaces one pending resource.
+    /// Writes the record of a resource that was admitted while the journal was faulted.
+    ///
+    /// Section 11 requires the gap to be committed after storage recovers, and this is what
+    /// commits the resources that lived inside it. It is not a replay: the record says the
+    /// resource was volatile, and its state is whatever it actually reached.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn put_pending(&self, resource: &PendingResource) -> Result<()> {
+    pub fn put_pending(
+        &self,
+        resource: &PendingResource,
+        decoder: Option<BrokerBindingId>,
+        dispatched: bool,
+    ) -> Result<()> {
         self.connection
             .execute(
                 "INSERT INTO broker_pending
                      (resource_id, application_instance_id, connection_id, upstream_request_id,
-                      state, durability, record, recorded_at_ms, resolved_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+                      state, durability, record, dispatched, decoder_binding_id, recorded_at_ms,
+                      resolved_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
                  ON CONFLICT (resource_id) DO UPDATE SET
                      state = excluded.state,
                      durability = excluded.durability,
-                     record = excluded.record",
+                     record = excluded.record,
+                     dispatched = MAX(broker_pending.dispatched, excluded.dispatched)",
                 params![
                     resource.resource_id.get().as_bytes().as_slice(),
                     resource.application_instance_id.get().as_bytes().as_slice(),
@@ -409,6 +487,8 @@ impl Ledger {
                     resource.state.as_str(),
                     resource.durability.as_str(),
                     encode(resource)?,
+                    i64::from(dispatched),
+                    decoder.map(|binding| binding.get().as_bytes().to_vec()),
                     i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
                 ],
             )
@@ -416,29 +496,89 @@ impl Ledger {
         Ok(())
     }
 
-    /// Moves one pending resource to a new state, recording when it settled.
+    /// Moves one pending resource from the state it is in to the state it is going to.
+    ///
+    /// The update is conditional on `expected`, so a write built from a stale copy of the record
+    /// cannot put a resolved resource back to pending. A row that does not match is reported
+    /// rather than silently ignored, because the caller's memory and this ledger disagreeing is
+    /// exactly the condition that must not be papered over.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn settle_pending(&self, resource: &PendingResource, now: TimestampMs) -> Result<()> {
-        self.connection
+    /// Returns [`BrokerError::LedgerUnavailable`] when the row is not in the expected state or the
+    /// write fails.
+    pub fn settle_pending(
+        &self,
+        resource: &PendingResource,
+        expected: PendingState,
+        dispatched: bool,
+        now: TimestampMs,
+    ) -> Result<()> {
+        let updated = self
+            .connection
             .execute(
                 "UPDATE broker_pending
-                 SET state = ?2, durability = ?3, record = ?4,
-                     resolved_at_ms = CASE WHEN ?5 THEN ?6 ELSE resolved_at_ms END
-                 WHERE resource_id = ?1",
+                 SET state = ?3, durability = ?4, record = ?5,
+                     dispatched = MAX(dispatched, ?6),
+                     resolved_at_ms = CASE WHEN ?7 THEN ?8 ELSE resolved_at_ms END
+                 WHERE resource_id = ?1 AND state = ?2",
                 params![
                     resource.resource_id.get().as_bytes().as_slice(),
+                    expected.as_str(),
                     resource.state.as_str(),
                     resource.durability.as_str(),
                     encode(resource)?,
+                    i64::from(dispatched),
                     resource.state.is_terminal(),
                     i64::try_from(now.get()).unwrap_or(i64::MAX),
                 ],
             )
             .map_err(BrokerError::ledger)?;
-        Ok(())
+        if updated == 1 {
+            return Ok(());
+        }
+        let held: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT state FROM broker_pending WHERE resource_id = ?1",
+                params![resource.resource_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(BrokerError::ledger)?;
+        Err(BrokerError::ledger(format!(
+            "pending resource {} is {} in the ledger and the write expected {expected}",
+            resource.resource_id,
+            held.unwrap_or_else(|| "absent".to_owned())
+        )))
+    }
+
+    /// Records that an answer to one resource has left this host.
+    ///
+    /// This is the dispatch marker, and it is committed before the answer is written to the
+    /// upstream. A crash after it leaves a record that says an answer may already have been sent,
+    /// which is what stops a restart from sending a second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails or the row is not claimed.
+    pub fn mark_dispatched(&self, resource: &PendingResource) -> Result<()> {
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE broker_pending SET dispatched = 1
+                 WHERE resource_id = ?1 AND state = 'claimed'",
+                params![resource.resource_id.get().as_bytes().as_slice()],
+            )
+            .map_err(BrokerError::ledger)?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(BrokerError::ledger(format!(
+                "pending resource {} is not claimed in the ledger",
+                resource.resource_id
+            )))
+        }
     }
 
     /// Reads one pending resource.
@@ -467,20 +607,37 @@ impl Ledger {
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
-    pub fn unresolved(&self) -> Result<Vec<PendingResource>> {
+    pub fn unresolved(&self) -> Result<Vec<UnresolvedRecord>> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT record FROM broker_pending
+                "SELECT record, dispatched, decoder_binding_id FROM broker_pending
                  WHERE state IN ('pending', 'claimed') ORDER BY recorded_at_ms, resource_id",
             )
             .map_err(BrokerError::ledger)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            })
             .map_err(BrokerError::ledger)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(BrokerError::ledger)?;
-        rows.iter().map(|bytes| decode(bytes)).collect()
+        rows.into_iter()
+            .map(|(bytes, dispatched, decoder)| {
+                Ok(UnresolvedRecord {
+                    resource: decode(&bytes)?,
+                    dispatched: dispatched != 0,
+                    decoder: match decoder.as_deref() {
+                        Some(bytes) => Some(BrokerBindingId::new(uuid_from(bytes)?)),
+                        None => None,
+                    },
+                })
+            })
+            .collect()
     }
 
     // -- launch profiles ----------------------------------------------------------------------
@@ -685,14 +842,17 @@ fn uuid_from(bytes: &[u8]) -> Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_protocol::broker::{BrokerGrant, DecodingTrust};
+    use kr_protocol::broker::{
+        BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, OfferedDecision,
+    };
     use kr_protocol::gateway::{
         DownstreamRequestId, NativeClassification, NativeMethodClass, PendingKind,
     };
     use kr_protocol::ids::{
-        GatewayConnectionId, PluginId, PublisherId, UpstreamMethod, UpstreamRequestId,
+        GatewayConnectionId, PluginId, PublisherId, SourceGeneration, UpstreamMethod,
+        UpstreamRequestId,
     };
-    use kr_protocol::scalars::{Nullable, U64};
+    use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
 
     /// A journal file of this test's own, on the internal disk.
     fn ledger_path() -> std::path::PathBuf {
@@ -705,31 +865,78 @@ mod tests {
         ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
     }
 
+    fn binding() -> BrokerBindingId {
+        BrokerBindingId::new(Uuid::from_bytes([9; 16]))
+    }
+
+    fn method() -> UpstreamMethod {
+        UpstreamMethod::new("session/request_permission").expect("valid")
+    }
+
+    fn handle(name: &str) -> SourceEventHandle {
+        SourceEventHandle::new(name).expect("valid")
+    }
+
     fn trust() -> DecodingTrust {
         DecodingTrust {
             plugin_id: PluginId::new("kalareach.codex").expect("valid"),
             publisher_id: PublisherId::new("kalareach").expect("valid"),
             package_digest: Digest256::from_bytes([5; 32]),
-            methods: [UpstreamMethod::new("session/request_permission").expect("valid")]
-                .into_iter()
-                .collect(),
+            methods: [method()].into_iter().collect(),
+            schema_versions: ["kr-approval/1".to_owned()].into_iter().collect(),
+            max_decisions: U64::new(4),
             may_encode_response: true,
             granted_at: TimestampMs::new(1),
         }
     }
 
-    fn resource(state: PendingState) -> PendingResource {
+    fn projection() -> DecodedProjection {
+        DecodedProjection {
+            schema_version: "kr-approval/1".to_owned(),
+            summary: "the agent wants to write a file".to_owned(),
+            decisions: vec![
+                OfferedDecision {
+                    option_id: "allow".to_owned(),
+                    label: "Allow".to_owned(),
+                },
+                OfferedDecision {
+                    option_id: "deny".to_owned(),
+                    label: "Deny".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn entry(generation: u64) -> DecoderLedgerEntry {
+        DecoderLedgerEntry {
+            binding_id: binding(),
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            package_digest: Digest256::from_bytes([5; 32]),
+            method: method(),
+            upstream_request_id: UpstreamRequestId::new("11").expect("valid"),
+            source_generation: SourceGeneration::new(generation),
+            source_digest: Digest256::from_bytes([6; 32]),
+            source_bytes: Bytes::from(b"{\"id\":11}".to_vec()),
+            source_truncated: false,
+            projection: projection(),
+            deadline_ms: Nullable::null(),
+            decoded_at: TimestampMs::new(12),
+        }
+    }
+
+    fn resource(byte: u8, request: &str, state: PendingState) -> PendingResource {
         PendingResource {
-            resource_id: PendingResourceId::new(Uuid::from_bytes([7; 16])),
+            resource_id: PendingResourceId::new(Uuid::from_bytes([byte; 16])),
             application_instance_id: instance(),
             request: DownstreamRequestId::new(
                 GatewayConnectionId::new(1),
-                UpstreamRequestId::new("11").expect("valid"),
+                UpstreamRequestId::new(request).expect("valid"),
             ),
             kind: PendingKind::Approval,
-            method: UpstreamMethod::new("session/request_permission").expect("valid"),
+            method: method(),
             classification: NativeClassification::declared(NativeMethodClass::Mutation),
-            source_generation: SourceGeneration::new(3),
+            source_generation: SourceGeneration::new(1),
             state,
             durability: Durability::Durable,
             deadline_ms: Nullable::null(),
@@ -742,9 +949,9 @@ mod tests {
     fn a_binding_keeps_its_grants_and_its_trust_across_a_reopen() {
         let file = ledger_path();
         let record = BindingRecord {
-            binding_id: BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+            binding_id: binding(),
             application_instance_id: instance(),
-            grants: kr_protocol::broker::BrokerGrants::granted([
+            grants: BrokerGrants::granted([
                 BrokerGrant::Observation,
                 BrokerGrant::ApprovalInterpreter,
             ]),
@@ -766,126 +973,180 @@ mod tests {
     }
 
     #[test]
-    fn a_source_handle_is_claimed_once_and_the_claim_survives_a_reopen() {
+    fn admission_is_one_transaction_and_a_source_event_is_consumed_once() {
         let file = ledger_path();
-        let binding = BrokerBindingId::new(Uuid::from_bytes([9; 16]));
-        let digest = Digest256::from_bytes([4; 32]);
+        let first = resource(7, "11", PendingState::Pending);
         {
-            let ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            let mut ledger = Ledger::open(Some(&file)).expect("the ledger opens");
             assert!(
                 ledger
-                    .claim_source(
-                        binding,
-                        SourceGeneration::new(1),
-                        &digest,
-                        TimestampMs::new(1)
+                    .admit_resource(
+                        &handle("src-1"),
+                        binding(),
+                        &entry(1),
+                        &first,
+                        true,
+                        TimestampMs::new(11)
                     )
-                    .expect("the claim succeeds")
+                    .expect("the first admission succeeds")
             );
+            // The same event again, from the same binding or any other: refused, and nothing is
+            // written for the second attempt.
+            let second = resource(8, "12", PendingState::Pending);
             assert!(
                 !ledger
-                    .claim_source(
-                        binding,
-                        SourceGeneration::new(1),
-                        &digest,
-                        TimestampMs::new(2)
+                    .admit_resource(
+                        &handle("src-1"),
+                        BrokerBindingId::new(Uuid::from_bytes([10; 16])),
+                        &entry(1),
+                        &second,
+                        true,
+                        TimestampMs::new(12)
                     )
-                    .expect("the second claim is answered")
+                    .expect("the second admission is answered")
+            );
+            assert!(
+                ledger
+                    .pending(second.resource_id)
+                    .expect("the read succeeds")
+                    .is_none(),
+                "a refused admission writes no pending row"
+            );
+            assert!(
+                ledger
+                    .decoding(second.resource_id)
+                    .expect("the read succeeds")
+                    .is_none(),
+                "a refused admission writes no decoder entry"
             );
         }
-        let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
+        let mut reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
         assert!(
             !reopened
-                .claim_source(
-                    binding,
-                    SourceGeneration::new(1),
-                    &digest,
-                    TimestampMs::new(3)
+                .admit_resource(
+                    &handle("src-1"),
+                    binding(),
+                    &entry(1),
+                    &resource(9, "13", PendingState::Pending),
+                    true,
+                    TimestampMs::new(13)
                 )
-                .expect("the claim after a restart is answered"),
+                .expect("the admission after a restart is answered"),
             "a restart must not let the same source event be offered again"
         );
-        assert!(
-            reopened
-                .claim_source(
-                    binding,
-                    SourceGeneration::new(2),
-                    &digest,
-                    TimestampMs::new(4)
-                )
-                .expect("a later generation is a different handle"),
-            "the same bytes in a later generation are a different source event"
+        let entry = reopened
+            .decoding(first.resource_id)
+            .expect("the read succeeds")
+            .expect("the entry is there");
+        assert_eq!(entry.source_bytes.as_slice(), b"{\"id\":11}");
+        assert!(entry.offers("allow"));
+        assert!(!entry.offers("allow_always"));
+    }
+
+    #[test]
+    fn a_settle_built_from_a_stale_copy_is_refused() {
+        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        let pending = resource(7, "11", PendingState::Pending);
+        ledger
+            .admit_resource(
+                &handle("src-1"),
+                binding(),
+                &entry(1),
+                &pending,
+                true,
+                TimestampMs::new(11),
+            )
+            .expect("admitted");
+        let claimed = resource(7, "11", PendingState::Claimed);
+        ledger
+            .settle_pending(&claimed, PendingState::Pending, false, TimestampMs::new(12))
+            .expect("the claim is written");
+        let resolved = resource(7, "11", PendingState::Resolved);
+        ledger
+            .settle_pending(&resolved, PendingState::Claimed, true, TimestampMs::new(13))
+            .expect("the resolution is written");
+        // A writer holding the older copy tries to put it back. The row has moved on, and the
+        // write is refused rather than reversing a completed transition.
+        let stale =
+            ledger.settle_pending(&claimed, PendingState::Pending, false, TimestampMs::new(14));
+        assert!(stale.is_err());
+        assert_eq!(
+            ledger
+                .pending(pending.resource_id)
+                .expect("the read succeeds")
+                .expect("the record is there")
+                .state,
+            PendingState::Resolved
         );
     }
 
     #[test]
-    fn an_unresolved_resource_is_what_a_restart_reconciles_from() {
+    fn the_dispatch_marker_survives_a_restart_and_is_what_recovery_reads() {
         let file = ledger_path();
+        let claimed = resource(7, "11", PendingState::Claimed);
         {
-            let ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            let mut ledger = Ledger::open(Some(&file)).expect("the ledger opens");
             ledger
-                .put_pending(&resource(PendingState::Claimed))
-                .expect("the resource is written");
+                .admit_resource(
+                    &handle("src-1"),
+                    binding(),
+                    &entry(1),
+                    &resource(7, "11", PendingState::Pending),
+                    true,
+                    TimestampMs::new(11),
+                )
+                .expect("admitted");
+            ledger
+                .settle_pending(&claimed, PendingState::Pending, false, TimestampMs::new(12))
+                .expect("claimed");
+            let unresolved = ledger.unresolved().expect("the read succeeds");
+            assert_eq!(unresolved.len(), 1);
+            assert!(
+                !unresolved[0].dispatched,
+                "a claim on its own is not an answer that went"
+            );
+            ledger
+                .mark_dispatched(&claimed)
+                .expect("the marker is committed");
         }
         let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
         let unresolved = reopened.unresolved().expect("the read succeeds");
         assert_eq!(unresolved.len(), 1);
-        assert_eq!(unresolved[0].state, PendingState::Claimed);
-
-        let mut resolved = resource(PendingState::Uncertain);
-        resolved.state = PendingState::Uncertain;
-        reopened
-            .settle_pending(&resolved, TimestampMs::new(20))
-            .expect("the settle succeeds");
-        assert!(reopened.unresolved().expect("the read succeeds").is_empty());
-        assert_eq!(
-            reopened
-                .pending(resolved.resource_id)
-                .expect("the read succeeds")
-                .expect("the record is still there")
-                .state,
-            PendingState::Uncertain
-        );
+        assert!(unresolved[0].dispatched);
+        assert_eq!(unresolved[0].decoder, Some(binding()));
+        assert_eq!(unresolved[0].resource.state, PendingState::Claimed);
     }
 
     #[test]
     fn a_decoder_entry_outlives_the_binding_that_wrote_it() {
-        let ledger = Ledger::open(None).expect("the ledger opens");
-        let binding = BrokerBindingId::new(Uuid::from_bytes([9; 16]));
-        let entry = DecoderLedgerEntry {
-            binding_id: binding,
-            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
-            publisher_id: PublisherId::new("kalareach").expect("valid"),
-            package_digest: Digest256::from_bytes([5; 32]),
-            method: UpstreamMethod::new("session/request_permission").expect("valid"),
-            source_generation: SourceGeneration::new(3),
-            source_digest: Digest256::from_bytes([6; 32]),
-            offered_decisions: U64::new(2),
-            deadline_ms: Nullable::null(),
-            decoded_at: TimestampMs::new(12),
-        };
-        let resource_id = PendingResourceId::new(Uuid::from_bytes([7; 16]));
+        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        let pending = resource(7, "11", PendingState::Pending);
         ledger
-            .record_decoding(resource_id, &entry)
-            .expect("the entry is written");
+            .admit_resource(
+                &handle("src-1"),
+                binding(),
+                &entry(1),
+                &pending,
+                true,
+                TimestampMs::new(11),
+            )
+            .expect("admitted");
         ledger
             .put_binding(&BindingRecord {
-                binding_id: binding,
+                binding_id: binding(),
                 application_instance_id: instance(),
-                grants: kr_protocol::broker::BrokerGrants::granted([
-                    BrokerGrant::ApprovalInterpreter,
-                ]),
+                grants: BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
                 trust: Some(trust()),
                 bound_at: TimestampMs::new(5),
             })
             .expect("the binding is written");
-        ledger.remove_binding(binding).expect("the binding goes");
+        ledger.remove_binding(binding()).expect("the binding goes");
         assert_eq!(
             ledger
-                .decoding(resource_id)
+                .decoding(pending.resource_id)
                 .expect("the read succeeds")
                 .expect("the entry is still there"),
-            entry
+            entry(1)
         );
     }
 

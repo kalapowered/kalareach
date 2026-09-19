@@ -168,6 +168,44 @@ impl ProfileStore {
             .insert(application_instance_id, profile.profile_id);
     }
 
+    /// Moves one instance's conversation reservation to the thread it has just selected.
+    ///
+    /// Section 12 lets a native `/new`, `/resume` or thread selection change the active
+    /// conversation without changing the process. When that happens the reservation has to move
+    /// with it: the conversation the instance left is free for another execution, and the one it
+    /// took is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Launch`] when another live execution already owns the conversation
+    /// being selected.
+    pub fn select_conversation(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        conversation: &str,
+    ) -> Result<()> {
+        if let Some(owner) = self.conversations.get(conversation)
+            && *owner != application_instance_id
+        {
+            return Err(BrokerError::Launch(
+                LaunchRefusal::ConversationAlreadyLive {
+                    application_instance_id: *owner,
+                },
+            ));
+        }
+        self.conversations
+            .retain(|_, owner| *owner != application_instance_id);
+        self.conversations
+            .insert(conversation.to_owned(), application_instance_id);
+        Ok(())
+    }
+
+    /// Releases whatever conversation one instance owned, because it has selected none.
+    pub fn leave_conversation(&mut self, application_instance_id: ApplicationInstanceId) {
+        self.conversations
+            .retain(|_, owner| *owner != application_instance_id);
+    }
+
     /// Releases the conversation an instance owned, because the instance ended.
     pub fn release(&mut self, application_instance_id: ApplicationInstanceId) {
         self.conversations
@@ -352,6 +390,41 @@ mod tests {
         store
             .execute(&second, &ForegroundMark::idle(4), instance(3))
             .expect("the conversation is free once its execution has ended");
+    }
+
+    #[test]
+    fn a_thread_selection_moves_the_reservation_with_it() {
+        let mut store = ProfileStore::new();
+        let intent = store
+            .prepare(
+                profile(IntegrationMode::Gateway),
+                ForegroundMark::idle(4),
+                Some("thread-7".to_owned()),
+            )
+            .expect("prepared");
+        store
+            .execute(&intent, &ForegroundMark::idle(4), instance(2))
+            .expect("the launch runs");
+        assert_eq!(store.owner_of("thread-7"), Some(instance(2)));
+
+        store
+            .select_conversation(instance(2), "thread-8")
+            .expect("the instance selected another conversation");
+        assert_eq!(
+            store.owner_of("thread-7"),
+            None,
+            "the conversation it left is free for another execution"
+        );
+        assert_eq!(store.owner_of("thread-8"), Some(instance(2)));
+
+        // And the one it took is not available to anybody else.
+        assert!(store.select_conversation(instance(3), "thread-8").is_err());
+        store
+            .select_conversation(instance(2), "thread-8")
+            .expect("selecting the conversation it already owns is not a conflict");
+
+        store.leave_conversation(instance(2));
+        assert_eq!(store.owner_of("thread-8"), None);
     }
 
     #[test]

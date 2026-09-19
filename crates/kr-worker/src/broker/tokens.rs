@@ -16,7 +16,8 @@ use kr_protocol::broker::{
     ActionName, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants, TokenError,
 };
 use kr_protocol::ids::{
-    ActionTokenId, ActorId, AgentBindingRevision, ApplicationInstanceId, GrantId,
+    ActionTokenId, ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId,
+    CapabilityId, CapabilityRevision, GrantId,
 };
 use kr_protocol::scalars::{Digest256, TimestampMs};
 
@@ -44,14 +45,28 @@ pub struct Invocation {
     pub binding_revision: AgentBindingRevision,
     /// The declared action.
     pub action: ActionName,
+    /// The capability this action needs, and the revision the caller read it at.
+    ///
+    /// Section 11: "Every action rechecks its current capability revision and grant
+    /// independently." The two are separate fields because they answer separate questions: the
+    /// grant says whether this actor may, and the capability says whether it would work.
+    pub capability: Option<(CapabilityId, Option<CapabilityRevision>)>,
     /// The canonical bytes of the parameters.
     pub parameters: Vec<u8>,
+}
+
+/// One issued token and what the broker rechecks when it is spent.
+#[derive(Clone, Debug)]
+struct Unspent {
+    token: ActionToken,
+    binding_id: BrokerBindingId,
+    capability: Option<(CapabilityId, Option<CapabilityRevision>)>,
 }
 
 /// The tokens this broker has issued and not yet seen spent.
 #[derive(Debug, Default)]
 pub struct TokenStore {
-    unspent: BTreeMap<ActionTokenId, ActionToken>,
+    unspent: BTreeMap<ActionTokenId, Unspent>,
 }
 
 impl TokenStore {
@@ -80,6 +95,7 @@ impl TokenStore {
     /// many tokens are already outstanding.
     pub fn issue(
         &mut self,
+        binding_id: BrokerBindingId,
         grants: &BrokerGrants,
         invocation: &Invocation,
         now: TimestampMs,
@@ -103,7 +119,14 @@ impl TokenStore {
             parameter_hash: Digest256::from_bytes(kr_cbor::sha256(&invocation.parameters)),
             issued_at: now,
         };
-        self.unspent.insert(token_id, token.clone());
+        self.unspent.insert(
+            token_id,
+            Unspent {
+                token: token.clone(),
+                binding_id,
+                capability: invocation.capability.clone(),
+            },
+        );
         Ok(token)
     }
 
@@ -122,15 +145,37 @@ impl TokenStore {
         claim: &ActionTokenClaim,
         revision_in_force: AgentBindingRevision,
     ) -> Result<ActionToken> {
-        let token = self
+        let (token, _, _) = self.spend_checked(claim)?;
+        token.check_current_revision(revision_in_force)?;
+        Ok(token)
+    }
+
+    /// Spends one token, returning it with the binding it was issued against.
+    ///
+    /// The caller checks the present authority of that binding. This returns which binding it was
+    /// so the caller can, because a token whose issuing binding has lost its grant is no longer
+    /// authority whatever it says about itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Token`] for an unknown or spent handle or a binding that disagrees.
+    #[allow(clippy::type_complexity)]
+    pub fn spend_checked(
+        &mut self,
+        claim: &ActionTokenClaim,
+    ) -> Result<(
+        ActionToken,
+        BrokerBindingId,
+        Option<(CapabilityId, Option<CapabilityRevision>)>,
+    )> {
+        let unspent = self
             .unspent
             .remove(&claim.token_id)
             .ok_or(BrokerError::Token(TokenError::UnknownToken))?;
         // Removed before it is checked: a claim that fails has still consumed its one attempt, so
         // a component cannot probe the bindings one field at a time.
-        token.check(claim)?;
-        token.check_current_revision(revision_in_force)?;
-        Ok(token)
+        unspent.token.check(claim)?;
+        Ok((unspent.token, unspent.binding_id, unspent.capability))
     }
 
     /// Withdraws every token issued against one instance.
@@ -141,7 +186,7 @@ impl TokenStore {
         let withdrawn: Vec<ActionTokenId> = self
             .unspent
             .iter()
-            .filter(|(_, token)| token.application_instance_id == application_instance_id)
+            .filter(|(_, unspent)| unspent.token.application_instance_id == application_instance_id)
             .map(|(token_id, _)| token_id.clone())
             .collect();
         for token_id in &withdrawn {
@@ -164,8 +209,13 @@ mod tests {
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
             binding_revision: AgentBindingRevision::new(4),
             action: ActionName::new("prompt.submit").expect("valid"),
+            capability: None,
             parameters: b"{\"text\":\"hello\"}".to_vec(),
         }
+    }
+
+    fn binding() -> BrokerBindingId {
+        BrokerBindingId::new(Uuid::from_bytes([9; 16]))
     }
 
     fn grants() -> BrokerGrants {
@@ -178,7 +228,12 @@ mod tests {
         let observation_only = BrokerGrants::granted([BrokerGrant::Observation]);
         assert!(
             store
-                .issue(&observation_only, &invocation(), TimestampMs::new(1))
+                .issue(
+                    binding(),
+                    &observation_only,
+                    &invocation(),
+                    TimestampMs::new(1)
+                )
                 .is_err(),
             "reading output is not permission to submit input"
         );
@@ -189,7 +244,7 @@ mod tests {
     fn a_token_is_spent_once() {
         let mut store = TokenStore::new();
         let token = store
-            .issue(&grants(), &invocation(), TimestampMs::new(1))
+            .issue(binding(), &grants(), &invocation(), TimestampMs::new(1))
             .expect("issued");
         let claim = ActionTokenClaim::from(&token);
         store
@@ -205,7 +260,7 @@ mod tests {
     fn a_parameter_the_component_changed_does_not_spend_the_token() {
         let mut store = TokenStore::new();
         let token = store
-            .issue(&grants(), &invocation(), TimestampMs::new(1))
+            .issue(binding(), &grants(), &invocation(), TimestampMs::new(1))
             .expect("issued");
         let mut claim = ActionTokenClaim::from(&token);
         claim.parameter_hash = Digest256::from_bytes([0; 32]);
@@ -216,7 +271,7 @@ mod tests {
     fn a_thread_that_changed_while_the_component_worked_invalidates_the_token() {
         let mut store = TokenStore::new();
         let token = store
-            .issue(&grants(), &invocation(), TimestampMs::new(1))
+            .issue(binding(), &grants(), &invocation(), TimestampMs::new(1))
             .expect("issued");
         let claim = ActionTokenClaim::from(&token);
         assert!(
@@ -229,12 +284,12 @@ mod tests {
     fn withdrawing_an_instance_takes_its_tokens() {
         let mut store = TokenStore::new();
         store
-            .issue(&grants(), &invocation(), TimestampMs::new(1))
+            .issue(binding(), &grants(), &invocation(), TimestampMs::new(1))
             .expect("issued");
         let mut other = invocation();
         other.application_instance_id = ApplicationInstanceId::new(Uuid::from_bytes([3; 16]));
         store
-            .issue(&grants(), &other, TimestampMs::new(1))
+            .issue(binding(), &grants(), &other, TimestampMs::new(1))
             .expect("issued");
         assert_eq!(
             store.withdraw(ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))),
@@ -248,12 +303,12 @@ mod tests {
         let mut store = TokenStore::new();
         for _ in 0..MAX_UNSPENT_TOKENS {
             store
-                .issue(&grants(), &invocation(), TimestampMs::new(1))
+                .issue(binding(), &grants(), &invocation(), TimestampMs::new(1))
                 .expect("issued");
         }
         assert!(
             store
-                .issue(&grants(), &invocation(), TimestampMs::new(1))
+                .issue(binding(), &grants(), &invocation(), TimestampMs::new(1))
                 .is_err()
         );
     }

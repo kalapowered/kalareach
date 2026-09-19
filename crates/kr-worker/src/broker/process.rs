@@ -28,11 +28,19 @@ pub const MAX_SOURCE_FRAME_BYTES: usize = 1024 * 1024;
 /// Length in bytes of a launch credential.
 pub const CREDENTIAL_BYTES: usize = 32;
 
-/// A per-launch secret the broker holds and never gives back.
+/// The alphabet a credential is rendered in.
+const HEX: [u8; 16] = *b"0123456789abcdef";
+
+/// A per-launch secret the broker holds.
 ///
 /// It is generated once per launch, written into an owner-only registration file for the process
-/// the broker is about to start, and used to authenticate that process when it connects. Nothing
-/// reads it out: there is no `as_bytes`, no `Display` that prints it and no `Debug` that leaks it.
+/// the broker is about to start, and used to authenticate that process when it connects.
+///
+/// What this type guarantees, exactly: there is no accessor that returns the bytes, `Debug`
+/// redacts, and the value leaves the broker only through [`ManagedProcess::write_registration`],
+/// into a file the broker creates for the process it is about to start. What it does not
+/// guarantee is secrecy against a reader of this process's memory: the `Drop` overwrite is a
+/// tidiness measure that an optimiser is free to remove, and it is not offered as more than that.
 pub struct Credential {
     bytes: [u8; CREDENTIAL_BYTES],
 }
@@ -63,32 +71,25 @@ impl Credential {
 
     /// Returns true when the presented value is this credential.
     ///
-    /// The comparison does not stop at the first differing byte, so how much of a wrong value was
-    /// right is not something a caller can measure.
+    /// The comparison is the host's own constant-time one, so how much of a wrong value was right
+    /// is not something a caller can measure.
     #[must_use]
     pub fn authenticates(&self, presented: &[u8]) -> bool {
-        if presented.len() != CREDENTIAL_BYTES {
-            return false;
-        }
-        let mut difference = 0_u8;
-        for (held, offered) in self.bytes.iter().zip(presented) {
-            difference |= held ^ offered;
-        }
-        difference == 0
+        presented.len() == CREDENTIAL_BYTES && kr_crypto::constant_time_eq(&self.bytes, presented)
     }
 
     /// Renders the credential for the registration file the launched process reads.
     ///
-    /// The value leaves the broker exactly once, into a file the broker creates owner-only for the
-    /// process it is about to start. It never goes into an argument vector, an environment
-    /// variable, a URL or a diagnostic.
-    #[must_use]
-    pub fn to_registration_text(&self) -> String {
-        self.bytes.iter().fold(String::new(), |mut text, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(text, "{byte:02x}");
-            text
-        })
+    /// Private on purpose: the value leaves the broker through the registration file and nowhere
+    /// else. It never goes into an argument vector, an environment variable, a URL or a
+    /// diagnostic. The rendering is bytes rather than a `String` so the caller can overwrite it.
+    fn to_registration_bytes(&self) -> Vec<u8> {
+        let mut rendered = Vec::with_capacity(CREDENTIAL_BYTES * 2);
+        for byte in self.bytes {
+            rendered.push(HEX[usize::from(byte >> 4)]);
+            rendered.push(HEX[usize::from(byte & 0x0f)]);
+        }
+        rendered
     }
 
     /// Reads a credential back from its registration text.
@@ -232,8 +233,6 @@ pub struct ManagedProcess {
     /// Section 7: a native TUI's intentional exit ends the instance and stops its dedicated
     /// backend. A bypassed or shared backend is never claimed or terminated as owned.
     pub dedicated: bool,
-    /// The generation of the source frames this process is producing.
-    pub source_generation: SourceGeneration,
     /// When the broker started it.
     pub started_at: TimestampMs,
 }
@@ -255,7 +254,6 @@ impl ManagedProcess {
             handle,
             credential,
             dedicated,
-            source_generation: SourceGeneration::new(1),
             started_at,
         }
     }
@@ -269,49 +267,68 @@ impl ManagedProcess {
         self.credential.authenticates(presented) && self.process.matches(process)
     }
 
-    /// Advances the source generation, because the bound execution owner changed.
-    pub fn advance_generation(&mut self) {
-        self.source_generation =
-            SourceGeneration::new(self.source_generation.get().saturating_add(1));
-    }
-
     /// Writes the registration file the launched process reads its credential from.
     ///
-    /// The file is created owner-only and refused if it already exists, so a file another writer
-    /// planted is never written into and never read as though this host had written it.
+    /// The host's own owner-only publication is what writes it: the contents are complete before
+    /// the name exists, and the create refuses to replace a name already there, so a file another
+    /// writer planted is never written into and never read as though this host had written it.
+    ///
+    /// The parent directory is checked first. On Unix that check is the mode bits and the owning
+    /// user. On Windows the host has no mode bits to check and relies on the runtime directory
+    /// living under the user's own profile; the explicit protected access-control list is part of
+    /// the platform's own qualification pass, which this file inherits rather than duplicating.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the file cannot be created or written.
+    /// Returns [`BrokerError::LedgerUnavailable`] when the directory is not private or the file
+    /// cannot be created or written.
     pub fn write_registration(&self, path: &std::path::Path) -> Result<()> {
-        write_owner_only(path, &self.credential.to_registration_text())
-    }
-}
-
-/// Writes one owner-only file that must not already exist.
-fn write_owner_only(path: &std::path::Path, contents: &str) -> Result<()> {
-    use std::io::Write as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(|error| {
-        BrokerError::ledger(format!(
-            "could not create the registration file {}: {error}",
-            path.display()
-        ))
-    })?;
-    file.write_all(contents.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| {
+        let directory = path
+            .parent()
+            .ok_or_else(|| BrokerError::ledger(format!("{} names no directory", path.display())))?;
+        check_private_directory(directory)?;
+        let mut rendered = self.credential.to_registration_bytes();
+        let written = kr_ipc::paths::create_new_owner_only_file(path, &rendered);
+        // The rendering is a copy of the secret. It goes back to zero before the buffer is freed,
+        // for the same reason and with the same limits as the credential's own drop.
+        rendered.fill(0);
+        written.map_err(|error| {
             BrokerError::ledger(format!(
                 "could not write the registration file {}: {error}",
                 path.display()
             ))
         })
+    }
+}
+
+/// Checks that a directory is the owning user's and closed to everybody else.
+fn check_private_directory(directory: &std::path::Path) -> Result<()> {
+    let metadata = std::fs::metadata(directory).map_err(|error| {
+        BrokerError::ledger(format!(
+            "could not read the registration directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(BrokerError::ledger(format!(
+            "{} is not a directory",
+            directory.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != kr_ipc::paths::current_uid() || mode & 0o077 != 0 {
+            return Err(BrokerError::ledger(format!(
+                "{} is not owner-only (uid {}, mode {mode:o})",
+                directory.display(),
+                metadata.uid()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One immutable frame of upstream bytes.
@@ -403,7 +420,8 @@ mod tests {
     #[test]
     fn a_registration_round_trip_is_the_only_way_a_credential_moves() {
         let credential = Credential::from_bytes([9; CREDENTIAL_BYTES]);
-        let text = credential.to_registration_text();
+        let text =
+            String::from_utf8(credential.to_registration_bytes()).expect("the rendering is ASCII");
         let read = Credential::from_registration_text(&text).expect("the text is well formed");
         assert!(read.authenticates(&[9; CREDENTIAL_BYTES]));
         assert!(!read.authenticates(&[8; CREDENTIAL_BYTES]));
@@ -428,6 +446,12 @@ mod tests {
     fn a_registration_file_is_owner_only_and_never_overwrites() {
         let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&directory).expect("the directory is created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("the directory is made private");
+        }
         let path = directory.join("registration");
         let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
         managed
@@ -446,18 +470,25 @@ mod tests {
             managed.write_registration(&path).is_err(),
             "a registration file another writer planted is never written into"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let open = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+            std::fs::create_dir_all(&open).expect("the directory is created");
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
+                .expect("the directory is made readable by others");
+            assert!(
+                managed
+                    .write_registration(&open.join("registration"))
+                    .is_err(),
+                "a credential is never written into a directory other users can read"
+            );
+            let _ = std::fs::remove_dir_all(&open);
+        }
         let text = std::fs::read_to_string(&path).expect("the file reads");
         let read = Credential::from_registration_text(&text).expect("the text is well formed");
         assert!(read.authenticates(&[9; CREDENTIAL_BYTES]));
         let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn a_generation_advances_when_the_owner_changes() {
-        let mut managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
-        assert_eq!(managed.source_generation, SourceGeneration::new(1));
-        managed.advance_generation();
-        assert_eq!(managed.source_generation, SourceGeneration::new(2));
     }
 
     #[test]

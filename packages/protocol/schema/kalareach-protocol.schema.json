@@ -1083,7 +1083,7 @@
         "text": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/PromptText"
             },
             {
               "type": "null"
@@ -1207,8 +1207,8 @@
           "description": "What the steer acts on."
         },
         "text": {
-          "description": "The steering text.",
-          "type": "string"
+          "$ref": "#/$defs/PromptText",
+          "description": "The steering text."
         },
         "turn_id": {
           "$ref": "#/$defs/AgentTurnId",
@@ -3511,8 +3511,13 @@
           "type": "string"
         },
         {
-          "const": "profile_changed",
-          "description": "The launch profile changed.",
+          "const": "qualification_profile_changed",
+          "description": "The signed qualification profile in the catalogue changed.",
+          "type": "string"
+        },
+        {
+          "const": "launch_profile_changed",
+          "description": "The host's own launch profile changed.\n\nSeparate from the catalogue's qualification profile, because a record gathered under one\nargument vector says nothing about another and neither implies the other changed.",
           "type": "string"
         }
       ]
@@ -3581,6 +3586,10 @@
           "$ref": "#/$defs/CapabilityId",
           "description": "The versioned capability this record is about."
         },
+        "capability_version": {
+          "description": "The version of that capability the record is about.",
+          "type": "string"
+        },
         "disabled_reason": {
           "anyOf": [
             {
@@ -3623,6 +3632,7 @@
       },
       "required": [
         "capability_id",
+        "capability_version",
         "application_instance_id",
         "identity",
         "revision",
@@ -3752,6 +3762,11 @@
         {
           "const": "qualified_available",
           "description": "Qualified here and available now.",
+          "type": "string"
+        },
+        {
+          "const": "version_qualified",
+          "description": "This version was qualified, and nothing has established that this host can use it.\n\nA signed compatibility record establishes this and never [`CapabilityState::QualifiedAvailable`]:\nit is evidence about a version, not about this host's permission or live binding.",
           "type": "string"
         },
         {
@@ -3926,6 +3941,17 @@
           ],
           "description": "Whether the operating-system permission the capability needs was held."
         },
+        "plugin_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The package the evidence is about, where it is about one."
+        },
         "profile_id": {
           "anyOf": [
             {
@@ -3935,7 +3961,29 @@
               "type": "null"
             }
           ],
-          "description": "The launch profile the evidence was gathered under."
+          "description": "The host's launch profile the evidence was gathered under."
+        },
+        "publisher_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublisherId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The publisher whose signed record supplied the evidence, where one did."
+        },
+        "qualification_profile_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the signed qualification profile the evidence came from, where one did."
         },
         "schema_version": {
           "anyOf": [
@@ -3952,6 +4000,9 @@
       "required": [
         "binary_digest",
         "schema_version",
+        "plugin_id",
+        "publisher_id",
+        "qualification_profile_digest",
         "profile_id",
         "binding_id",
         "desktop_generation",
@@ -6496,6 +6547,33 @@
       ],
       "type": "object"
     },
+    "DecodedProjection": {
+      "additionalProperties": false,
+      "description": "What a decoder made of one native request.\n\nIt is a proposal. The broker checks it against the trust's schema policy before any of it\nbecomes an approval a person can answer.",
+      "properties": {
+        "decisions": {
+          "description": "The decisions offered, in the order the upstream offered them.",
+          "items": {
+            "$ref": "#/$defs/OfferedDecision"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "description": "The projection schema the decoder wrote this against.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "What the request is asking, for a person.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "summary",
+        "decisions"
+      ],
+      "type": "object"
+    },
     "DecoderLedgerEntry": {
       "additionalProperties": false,
       "description": "What a decoder offered, and every check the broker made before believing it.\n\nThis is the ledger row section 11 requires the broker to retain: \"the decoder/package hash,\noriginal source, native request ID, offered decisions, deadline and resolution state\". It\noutlives the plugin process, because a plugin-process failure cannot destroy the approval\nledger.",
@@ -6523,10 +6601,6 @@
           "$ref": "#/$defs/UpstreamMethod",
           "description": "The upstream method the original request named."
         },
-        "offered_decisions": {
-          "$ref": "#/$defs/U64",
-          "description": "How many decisions the decoder offered."
-        },
         "package_digest": {
           "$ref": "#/$defs/Digest256",
           "description": "The digest of the exact component bytes."
@@ -6535,17 +6609,33 @@
           "$ref": "#/$defs/PluginId",
           "description": "The package that binding runs."
         },
+        "projection": {
+          "$ref": "#/$defs/DecodedProjection",
+          "description": "The projection the decoder produced, with the exact decisions it offered."
+        },
         "publisher_id": {
           "$ref": "#/$defs/PublisherId",
           "description": "The publisher of that package, for a person reading the pending resource."
         },
+        "source_bytes": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The original source bytes, so the request can be shown as it arrived.\n\nA digest proves which bytes these are; it cannot reproduce them, and section 11 requires\nthe original source to be retained rather than merely identified."
+        },
         "source_digest": {
           "$ref": "#/$defs/Digest256",
-          "description": "The digest of those immutable source bytes, so the original is identifiable afterwards."
+          "description": "The digest of those immutable source bytes."
         },
         "source_generation": {
           "$ref": "#/$defs/SourceGeneration",
           "description": "The generation of the source frame the decoder read."
+        },
+        "source_truncated": {
+          "description": "True when the frame was larger than [`MAX_RETAINED_SOURCE_BYTES`] and was cut.",
+          "type": "boolean"
+        },
+        "upstream_request_id": {
+          "$ref": "#/$defs/UpstreamRequestId",
+          "description": "The native request identifier, exactly as the upstream wrote it."
         }
       },
       "required": [
@@ -6554,9 +6644,12 @@
         "publisher_id",
         "package_digest",
         "method",
+        "upstream_request_id",
         "source_generation",
         "source_digest",
-        "offered_decisions",
+        "source_bytes",
+        "source_truncated",
+        "projection",
         "deadline_ms",
         "decoded_at"
       ],
@@ -6569,6 +6662,10 @@
         "granted_at": {
           "$ref": "#/$defs/TimestampMs",
           "description": "When the trust was recorded."
+        },
+        "max_decisions": {
+          "$ref": "#/$defs/U64",
+          "description": "The most decisions a projection under this trust may offer."
         },
         "may_encode_response": {
           "description": "Whether the component may also encode an answer to those requests.\n\nDecoding and answering are separate capabilities in the package contract, and they stay\nseparate here.",
@@ -6593,6 +6690,14 @@
         "publisher_id": {
           "$ref": "#/$defs/PublisherId",
           "description": "The publisher that signed that package."
+        },
+        "schema_versions": {
+          "description": "The projection schema versions this trust covers.\n\nThis is the schema policy the broker checks before a decoded projection becomes an\nactionable approval. A projection that names a version outside this set is not one this\ntrust was granted for, whatever it contains.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -6600,6 +6705,8 @@
         "publisher_id",
         "package_digest",
         "methods",
+        "schema_versions",
+        "max_decisions",
         "may_encode_response",
         "granted_at"
       ],
@@ -14907,6 +15014,25 @@
         }
       ]
     },
+    "OfferedDecision": {
+      "additionalProperties": false,
+      "description": "One decision a decoder offers a person.",
+      "properties": {
+        "label": {
+          "description": "What the decision says, for a person.",
+          "type": "string"
+        },
+        "option_id": {
+          "description": "The identifier the upstream expects back. Answering is choosing one of these.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "option_id",
+        "label"
+      ],
+      "type": "object"
+    },
     "OfflineValidityPolicy": {
       "additionalProperties": false,
       "description": "A host owner's bounded offline-validity policy for personal remote access.\n\nSection 10 makes this optional and explicit. The default personal owner grant stays\naccount-free and non-expiring, so independent operation never depends on a cloud lease; an\nowner who wants a bound chooses one, and the host shows the feed status and the last successful\nsynchronisation beside it.",
@@ -17909,6 +18035,12 @@
     "PromptGeneration": {
       "description": "The prompt the root editor is at. It advances at every primary prompt.",
       "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "PromptText": {
+      "description": "Prompt or steering text carried inline, bounded at 64 KiB.",
+      "maxLength": 65536,
+      "minLength": 1,
       "type": "string"
     },
     "ProposedGrant": {
