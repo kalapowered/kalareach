@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
-use kr_crypto::store::open_store;
+use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
-use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
+use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId};
@@ -71,12 +71,13 @@ async fn host(shell_packages: Option<std::path::PathBuf>) -> Host {
         paths: environment.clone(),
         environment_id,
         identity: Box::new(move || {
-            let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
+            let store = open_store_in(&secrets).expect("a secret store");
             Ok(
                 ControllerIdentity::open(store.store.as_ref(), environment_id, false)
                     .expect("an identity"),
             )
         }),
+        secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
         supervisor: Box::new(NoWorkers),
         worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
@@ -111,6 +112,7 @@ fn create(
         dimensions: Nullable::null(),
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         environment_snapshot: Vec::new(),
+        palette: Nullable::null(),
     }
 }
 
@@ -682,7 +684,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
     );
     let controller_identity = {
         let secrets = environment.secrets_dir();
-        let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
+        let store = open_store_in(&secrets).expect("a secret store");
         ControllerIdentity::open(store.store.as_ref(), environment_id, false).expect("an identity")
     };
     let service = Arc::new(
@@ -696,6 +698,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
                 controller_public_key: *controller_identity.public_key(),
                 controller_generation: kr_protocol::ids::ControllerGeneration::new(1),
                 build_id: build(),
+                journal_path: Some(environment.journal_database(session_id)),
             },
         )
         .expect("a service"),
@@ -726,14 +729,14 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
         identity: Box::new({
             let secrets = environment.secrets_dir();
             move || {
-                let store =
-                    open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
+                let store = open_store_in(&secrets).expect("a secret store");
                 Ok(
                     ControllerIdentity::open(store.store.as_ref(), environment_id, false)
                         .expect("an identity"),
                 )
             }
         }),
+        secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
         supervisor: Box::new(NoWorkers),
         worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),

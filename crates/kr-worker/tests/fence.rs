@@ -264,6 +264,7 @@ async fn unpumped() -> Unpumped {
                 controller_public_key,
                 controller_generation: ControllerGeneration::new(1),
                 build_id: build(),
+                journal_path: Some(environment.journal_database(session_id)),
             },
         )
         .expect("a service"),
@@ -463,6 +464,7 @@ async fn wired_with(mode: ShellMode, register: bool) -> Wired {
                 controller_public_key,
                 controller_generation: ControllerGeneration::new(1),
                 build_id: build(),
+                journal_path: Some(environment.journal_database(session_id)),
             },
         )
         .expect("a service"),
