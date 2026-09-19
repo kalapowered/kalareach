@@ -56,7 +56,8 @@ use kr_protocol::scalars::{Digest256, Nullable, U64};
 use kr_transfer::{AuthorisedDirectory, ObjectPolicy, RelativeName};
 
 use crate::capture::{
-    IndexEntry, WorkingRead, read_index, read_object, read_status, read_working_tree,
+    IndexEntry, WorkingRead, read_differences, read_index, read_object, read_status,
+    read_working_tree,
 };
 use crate::error::{ChangeSetError, Result};
 use crate::objects::{digest_of, hex_of};
@@ -91,14 +92,34 @@ pub struct ApplyOrder<'a> {
     pub provenance: Provenance,
 }
 
-/// Where a test stops an apply, so the journal can be read as a crash leaves it.
+/// What a test does to an apply that is already running.
+///
+/// Two things a real apply meets and a test cannot otherwise reach: a daemon that dies part way
+/// through, and another writer that reaches the destination between this host's recheck and its
+/// rename. Compiled with the fault-injection feature; nothing in the service sets it.
 #[cfg(feature = "fault-injection")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Fault {
-    /// Stop once this many paths have been written and confirmed.
+    /// Act once exactly this many paths have been written and confirmed.
     pub after_paths: usize,
-    /// What the failure says.
+    /// What to do then, such as writing one of the destination's own files.
+    pub act: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Stop the apply there **without settling it**, exactly as a daemon that died would.
+    pub stop: bool,
+    /// What the failure says when it stops.
     pub detail: String,
+}
+
+#[cfg(feature = "fault-injection")]
+impl std::fmt::Debug for Fault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Fault")
+            .field("after_paths", &self.after_paths)
+            .field("acts", &self.act.is_some())
+            .field("stop", &self.stop)
+            .finish()
+    }
 }
 
 /// What one apply cannot promise, in this host's own words.
@@ -177,39 +198,44 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
         ));
     };
     let index = read_index(profile, &repository)?;
+    let differences = read_differences(profile, &repository, &head_revision)?;
     let status = read_status(profile, &repository, &FileGrant::default())?;
     let mut tracked = Vec::new();
     let mut untracked = Vec::new();
     for entry in &status {
-        let content_digest = match read_working_tree(&repository, &entry.path)? {
-            WorkingRead::Content { bytes, .. } => Some(digest_of(&bytes)),
-            _ => None,
+        // Each path is opened once. Reading it again for its length and again for its content
+        // class would let three readings describe three different files.
+        let (content_digest, byte_len, content) = match read_working_tree(&repository, &entry.path)?
+        {
+            WorkingRead::Content { bytes, .. } => (
+                Some(digest_of(&bytes)),
+                Some(U64::new(bytes.len() as u64)),
+                crate::capture::classify_content(&bytes),
+            ),
+            _ => (None, None, ContentClass::Unknown),
         };
-        let byte_len = content_digest.map(|_| ());
         let read = DiffEntry {
             path: entry.path.clone(),
             class: class_of(entry.class),
             change: entry.change,
-            content: content_digest.map_or(ContentClass::Unknown, |_| {
-                match read_working_tree(&repository, &entry.path) {
-                    Ok(WorkingRead::Content { ref bytes, .. }) => {
-                        crate::capture::classify_content(bytes)
-                    }
-                    _ => ContentClass::Unknown,
-                }
-            }),
-            byte_len: Nullable(byte_len.and_then(|()| {
-                match read_working_tree(&repository, &entry.path) {
-                    Ok(WorkingRead::Content { ref bytes, .. }) => {
-                        Some(U64::new(bytes.len() as u64))
-                    }
-                    _ => None,
-                }
-            })),
-            base_object_id: Nullable(index.get(&entry.path).map(|held| held.object_id.clone())),
+            content,
+            byte_len: Nullable(byte_len),
+            // The content revision of the base side: the object the **commit** holds, which is
+            // what the diff reports, rather than whatever the index happens to hold.
+            base_object_id: Nullable(
+                differences
+                    .get(&entry.path)
+                    .and_then(|difference| difference.base_object_id.clone())
+                    .or_else(|| {
+                        index
+                            .get(&entry.path)
+                            .filter(|_| !differences.contains_key(&entry.path))
+                            .map(|held| held.object_id.clone())
+                    }),
+            ),
             content_digest: Nullable(content_digest),
         };
-        if index.contains_key(&entry.path) {
+        if index.contains_key(&entry.path) || differences.contains_key(&entry.path) {
             tracked.push(read);
         } else {
             untracked.push(read);
@@ -338,7 +364,6 @@ fn count<'a>(
 /// [`ChangeSetError::OutcomeUnknown`] when an apply stopped and this host could not establish what
 /// the destination holds.
 pub fn apply(service: &ChangeSetService, order: &ApplyOrder<'_>) -> Result<DiffApplyResult> {
-    let record = service.record(order.version.change_set_id, Some(order.version.version))?;
     let manifest = service.manifest(order.version.change_set_id, order.version.version)?;
     let carried = carried_paths(&manifest, order)?;
     let limitations = limitations(order.destination);
@@ -361,12 +386,10 @@ pub fn apply(service: &ChangeSetService, order: &ApplyOrder<'_>) -> Result<DiffA
         }
     }
     match order.destination {
-        DestinationClass::Proposal => {
-            proposal(service, order, &record, &manifest, &carried, &limitations)
-        }
-        DestinationClass::VersionedReference => reference(service, order, &record, &limitations),
+        DestinationClass::Proposal => proposal(service, order, &manifest, &carried, &limitations),
+        DestinationClass::VersionedReference => reference(service, order, &limitations),
         DestinationClass::SharedExisting => {
-            direct(service, order, &record, &manifest, &carried, &limitations)
+            direct(service, order, &manifest, &carried, &limitations)
         }
     }
 }
@@ -515,7 +538,6 @@ fn preflight(
 fn proposal(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
-    record: &ChangeSetVersionRecord,
     manifest: &Manifest,
     carried: &[CapturedPath],
     limitations: &[String],
@@ -527,7 +549,7 @@ fn proposal(
     if order.preflight_only {
         return Ok(clean_preflight(order, limitations));
     }
-    let before = capture_destination(service, order, record)?;
+    let before = capture_destination(service, order, None, "before")?;
     let mut proposed = service.manifest(before.change_set_id, before.version)?;
     overlay(
         &mut proposed,
@@ -622,7 +644,6 @@ fn proposal(
 fn reference(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
-    _record: &ChangeSetVersionRecord,
     limitations: &[String],
 ) -> Result<DiffApplyResult> {
     let Some(expected) = order.expected_reference else {
@@ -718,7 +739,6 @@ fn read_reference(
 fn direct(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
-    record: &ChangeSetVersionRecord,
     manifest: &Manifest,
     carried: &[CapturedPath],
     limitations: &[String],
@@ -751,7 +771,7 @@ fn direct(
         }
     }
     let _ = manifest;
-    let before = capture_destination(service, order, record)?;
+    let before = capture_destination(service, order, None, "before")?;
     let now = kr_ipc::now_ms();
     let staged_name = format!("apply-{}", order.action_id);
     service.locked()?.begin_apply(&ApplyRow {
@@ -772,11 +792,18 @@ fn direct(
     // Staged and validated: every byte is written into a private directory of this host's own and
     // read back against its digest, so nothing half-written can reach the destination.
     let staging = stage(service, &staged_name, &content)?;
+    // Every path this apply plans is recorded **before any of them is attempted**, so a daemon
+    // that dies half way through leaves a row for each one. A row that still says `planned` means
+    // this host did not establish what became of that path, which is not the same as saying it
+    // did not write it; a run that stops on its own settles the ones it never reached as skipped,
+    // which is the stronger statement it can make.
+    for (path, _, _) in &content {
+        service.locked()?.plan_path(order.action_id, path)?;
+    }
     let mut progress: Vec<PathProgress> = Vec::new();
     let mut changed = Vec::new();
     let mut stopped: Option<(ApplyOutcomeClass, String)> = None;
     for (index, (path, bytes, executable)) in content.iter().enumerate() {
-        service.locked()?.plan_path(order.action_id, path)?;
         let expected = order
             .affected
             .iter()
@@ -861,14 +888,19 @@ fn direct(
         }
         #[cfg(feature = "fault-injection")]
         if let Some(fault) = service.fault()
-            && index + 1 >= fault.after_paths
+            && changed.len() == fault.after_paths
         {
-            // The apply stops here **without** settling, exactly as a daemon that died would leave
-            // it. The row stays undecided and the paths after this one keep no row at all, which
-            // is what `recover` reads.
-            return Err(ChangeSetError::OutcomeUnknown {
-                detail: fault.detail.into(),
-            });
+            if let Some(act) = &fault.act {
+                act();
+            }
+            if fault.stop {
+                // The apply stops here **without** settling, exactly as a daemon that died would
+                // leave it. The row stays undecided and the paths after this one keep no row at
+                // all, which is what `recover` reads.
+                return Err(ChangeSetError::OutcomeUnknown {
+                    detail: fault.detail.into(),
+                });
+            }
         }
         let _ = index;
     }
@@ -885,7 +917,7 @@ fn direct(
         service.locked()?.settle_path(order.action_id, &row)?;
         progress.push(wire_progress(&row));
     }
-    let after = capture_destination(service, order, record)?;
+    let after = capture_destination(service, order, Some(before.change_set_id), "after")?;
     let (outcome, detail) = stopped.unwrap_or_else(|| {
         (
             ApplyOutcomeClass::Applied,
@@ -1035,7 +1067,7 @@ fn install(
             })?;
     let mut here = clone_handle(repository.work_tree())?;
     for component in parents {
-        here = here.create_subdirectory(&RelativeName::parse(component)?)?;
+        here = descend_or_create(&here, &RelativeName::parse(component)?)?;
     }
     let leaf_name = RelativeName::parse(leaf)?;
     let staged = RelativeName::parse(&staged_name(path))?;
@@ -1084,6 +1116,31 @@ fn carry_permissions(
     Ok(())
 }
 
+/// Opens one directory of the destination, creating it when it is not there.
+///
+/// The user's own directories are the user's: this host neither requires nor imposes the
+/// owner-only permissions it uses for its **own** directories, because a repository whose `src` is
+/// readable by a group is an ordinary repository. What it does keep is the handle: every level is
+/// opened from the level above, so nothing resolves a path a second time.
+fn descend_or_create(
+    here: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> Result<AuthorisedDirectory> {
+    match here.subdirectory(name) {
+        Ok(directory) => Ok(directory),
+        Err(kr_transfer::Escape::NotFound { .. }) => {
+            match here.handle().create_dir(name.as_str()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(ChangeSetError::storage(error)),
+            }
+            here.sync()?;
+            Ok(here.subdirectory(name)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn clone_handle(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
     let handle = directory
         .handle()
@@ -1097,17 +1154,22 @@ fn clone_handle(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> 
 }
 
 /// Captures the destination as it stands, so there is a recoverable version of it.
+///
+/// It goes into a change set of its own rather than into the one being applied: the destination's
+/// own state is not a version of somebody else's work, and appending it there would make a reader
+/// of that change set's versions see readings of a tree it never asked about.
 fn capture_destination(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
-    record: &ChangeSetVersionRecord,
+    into: Option<kr_protocol::ids::ChangeSetId>,
+    what: &str,
 ) -> Result<ChangeSetVersionRecord> {
     let Some(workspace_id) = order.workspace_id else {
         return Err(ChangeSetError::InvalidArgument(
             "this destination names the workspace it writes to".into(),
         ));
     };
-    // Everything, because a recoverable "before" that left the user's untracked work out would not
+    // Everything, because a recoverable reading that left the user's untracked work out would not
     // be what was there.
     let policy = InclusionPolicy {
         dirty_files: InclusionChoice::Include,
@@ -1117,10 +1179,11 @@ fn capture_destination(
         generated_artefacts: InclusionChoice::Include,
     };
     let grant = FileGrant::default();
-    let order = crate::service::CaptureOrder {
+    let label = format!("the destination of action {}", order.action_id);
+    let captured = crate::service::CaptureOrder {
         workspace_id,
-        change_set_id: Some(record.change_set_id),
-        label: &record.label,
+        change_set_id: into,
+        label: &label,
         request: crate::capture::CaptureRequest {
             policy: &policy,
             grant: &grant,
@@ -1129,14 +1192,15 @@ fn capture_destination(
         },
         pin: false,
         provenance: Provenance {
-            derivation: "a reading of the destination taken so an apply has something recoverable \
-                         on each side of it"
-                .to_owned(),
+            derivation: format!(
+                "a reading of the destination {what} an apply, so the apply has something \
+                 recoverable on each side of it"
+            ),
             ..order.provenance.clone()
         },
     };
-    let (captured, _) = service.capture(&order)?;
-    Ok(captured)
+    let (record, _) = service.capture(&captured)?;
+    Ok(record)
 }
 
 /// Overlays one apply's content onto a manifest, without writing anything.

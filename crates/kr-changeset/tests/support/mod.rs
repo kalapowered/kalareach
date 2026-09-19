@@ -223,6 +223,64 @@ impl Fixture {
     }
 }
 
+/// The order one apply is performed under, with everything a test usually leaves alone.
+///
+/// # Panics
+///
+/// Panics when the version cannot be read.
+#[must_use]
+pub fn apply_order<'a>(
+    version: VersionRef,
+    destination: kr_protocol::changeset::DestinationClass,
+    workspace_id: WorkspaceId,
+    affected: &'a [kr_protocol::changeset::AffectedVersion],
+    acknowledged: &'a [String],
+) -> kr_changeset::apply::ApplyOrder<'a> {
+    kr_changeset::apply::ApplyOrder {
+        action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        version,
+        destination,
+        workspace_id: Some(workspace_id),
+        expected_reference: None,
+        affected,
+        paths: &[],
+        preflight_only: false,
+        acknowledged_limitations: acknowledged,
+        revert: false,
+        provenance: provenance(),
+    }
+}
+
+/// What the request expects each path to hold, read from the destination's own files.
+///
+/// A path that is not there is expected to be absent, which is what a request that adds a file
+/// says.
+#[must_use]
+pub fn expectations(root: &Path, paths: &[&str]) -> Vec<kr_protocol::changeset::AffectedVersion> {
+    paths
+        .iter()
+        .map(|path| kr_protocol::changeset::AffectedVersion {
+            path: (*path).to_owned(),
+            expected_worktree_digest: Nullable(
+                std::fs::read(root.join(path))
+                    .ok()
+                    .map(|bytes| kr_changeset::objects::digest_of(&bytes)),
+            ),
+            expected_index_object_id: Nullable(None),
+        })
+        .collect()
+}
+
+/// The digest of one file in one tree.
+///
+/// # Panics
+///
+/// Panics when the file cannot be read.
+#[must_use]
+pub fn digest_of_file(root: &Path, relative: &str) -> kr_protocol::scalars::Digest256 {
+    kr_changeset::objects::digest_of(&read_bytes(root, relative))
+}
+
 /// The provenance every test's capture carries.
 #[must_use]
 pub fn provenance() -> Provenance {
