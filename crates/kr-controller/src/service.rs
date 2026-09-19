@@ -650,7 +650,6 @@ impl Controller {
                 ClosureReason::WorkerCrash,
                 &identity,
                 &crate::archive::ArchiveService::nothing_fenced(reservation.session_id),
-                true,
             )
             .await?;
         }
@@ -3718,25 +3717,27 @@ impl Controller {
                 // The worker went with the boot it was in, so the recovery pass section 24 gives
                 // a session never ran for this one. It runs here instead, on a crash's terms: the
                 // kernel is asked whether the recorded process ended, and the session's stores are
-                // opened only once it has said so. The boot record is not enough on its own to
-                // open a store, because this boot may have handed that identifier to something
-                // else since. Where it answers "running", or declines, nothing of this session is
-                // opened at all - not by the recovery pass and not by the closure, which then
-                // writes what this daemon can see from outside. The archive is what reports a
-                // recovery that did not run, by reading the store when a reader asks.
+                // opened only once it has said so.
+                //
+                // Where it will not say, nothing is written either. A closure deletes the worker
+                // row, and that row is what every later read asks before it opens anything: a
+                // session with neither a row nor a confirmed death would read as a closed session
+                // whose store is free to open. So the row stays and this session keeps being
+                // refused until something can answer the question.
                 let archive = self.archive();
-                let validated = archive
-                    .take_ownership(row.session_id, row.display_number, &row.process_identity)
-                    .inspect(|ownership| {
-                        let _ = archive.recover_journal(ownership);
-                    })
-                    .is_ok();
+                let Ok(ownership) = archive.take_ownership(
+                    row.session_id,
+                    row.display_number,
+                    &row.process_identity,
+                ) else {
+                    continue;
+                };
+                let _ = archive.recover_journal(&ownership);
                 self.record_final(
                     row.session_id,
                     ClosureReason::HostShutdown,
                     &row.process_identity,
                     &crate::archive::ArchiveService::nothing_fenced(row.session_id),
-                    validated,
                 )
                 .await?;
             }
@@ -4554,7 +4555,6 @@ impl Controller {
                             reason,
                             &identity,
                             &crate::archive::ArchiveService::nothing_fenced(session_id),
-                            true,
                         )
                         .await;
                     // The closure this watcher was waiting on has finished, so what it was
@@ -4628,7 +4628,7 @@ impl Controller {
         };
         let fenced = archive.fence_owned(&ownership, &reported);
         let closure = self
-            .record_final(session_id, reason, &record.process_identity, &fenced, true)
+            .record_final(session_id, reason, &record.process_identity, &fenced)
             .await?;
         Ok(Some(closure))
     }
@@ -4713,7 +4713,6 @@ impl Controller {
         reason: ClosureReason,
         identity: &kr_protocol::identity::ProcessStartIdentity,
         fenced: &crate::archive::Fenced,
-        death_validated: bool,
     ) -> Result<ClosureRecord> {
         let _finalising = self.finalising.lock().await;
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
@@ -4723,12 +4722,13 @@ impl Controller {
         // root's exit status, what it stopped and how much of that it could account for; a record
         // written from outside knows none of those.
         //
-        // It is read only where the caller established that the worker has ended. A caller that
-        // did not, because the platform declined the question or answered that the recorded
-        // process is running, writes the outside record instead: opening a store a live process
-        // may own is the one thing recovery ownership exists to stop, and a closure is not a
-        // reason to make an exception.
-        if death_validated && let Some(recovered) = self.recovered_closure(session_id) {
+        // Every caller of this has established that the worker ended, by taking recovery
+        // ownership or by asking the kernel itself, and none writes a closure without one. That is
+        // a precondition rather than a parameter, because writing the closure deletes the worker
+        // row, and that row is what a later read asks before it opens anything: a session with
+        // neither a row nor a confirmed death would read as a closed session whose store is free
+        // to open.
+        if let Some(recovered) = self.recovered_closure(session_id) {
             self.write_closure(&recovered).await?;
             return Ok(recovered);
         }
