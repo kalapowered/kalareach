@@ -24,6 +24,46 @@ targetTemplates:
     settings:
       groups: [app]
 targets:
+  # The notification extension. It is a separate process with its own binary, started by the
+  # system when a notification arrives, with no application and no JavaScript context running.
+  KalaReachNotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ../../../native/ios/NotificationService
+      - path: ../../../native/ios/Shared
+    info:
+      path: ../../../native/ios/NotificationService/Info.plist
+    entitlements:
+      path: ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements
+    settings:
+      base:
+        PRODUCT_NAME: KalaReachNotificationService
+        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.companion.notifications
+        INFOPLIST_FILE: ../../../native/ios/NotificationService/Info.plist
+        CODE_SIGN_ENTITLEMENTS: ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements
+        SKIP_INSTALL: true
+
+  # The native decisions, built and run without the application, so the four cases the
+  # specification names are exercised by a test rather than by a device nobody has.
+  KalaReachNativeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: ../../../native/ios/Tests
+      - path: ../../../native/ios/Shared
+      - path: ../../../native/ios/KalaReachNative
+    settings:
+      base:
+        PRODUCT_NAME: KalaReachNativeTests
+        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.companion.native-tests
+        GENERATE_INFOPLIST_FILE: true
+    # Its own scheme, with no host application: these are decisions about a payload and a clock,
+    # and running them must not need the whole application to link first.
+    scheme:
+      testTargets:
+        - KalaReachNativeTests
+
   companion-tauri_iOS:
     type: application
     platform: iOS
@@ -32,6 +72,11 @@ targets:
       - path: Assets.xcassets
       - path: Externals
       - path: companion-tauri_iOS
+      # The native half of the application: push registration, secure keys, the audio session,
+      # the share sheet and the signing rule. Hand written, and kept outside this generated
+      # directory so regenerating the project never touches it.
+      - path: ../../../native/ios/KalaReachNative
+      - path: ../../../native/ios/Shared
       - path: assets
         buildPhase: resources
         type: folder
@@ -54,7 +99,7 @@ targets:
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
     entitlements:
-      path: companion-tauri_iOS/companion-tauri_iOS.entitlements
+      path: ../../../native/ios/App/companion-tauri_iOS.entitlements
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full
@@ -72,6 +117,9 @@ targets:
     dependencies:
       - framework: libapp.a
         embed: false
+      - target: KalaReachNotificationService
+      - sdk: AVFoundation.framework
+      - sdk: UserNotifications.framework
       - sdk: CoreGraphics.framework
       - sdk: Metal.framework
       - sdk: MetalKit.framework

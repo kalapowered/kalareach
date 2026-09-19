@@ -51,6 +51,11 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    sourceSets {
+        // The hand-written native half of this application, kept outside this generated directory
+        // so regenerating the project never touches it.
+        getByName("main").java.srcDir("../../../native/android/android/src/main/java")
+    }
 }
 
 rust {
@@ -58,6 +63,13 @@ rust {
 }
 
 dependencies {
+    // The decisions the receiver and the worker make, as plain Kotlin with its own tests.
+    implementation(project(":krnative"))
+    // Push, and the scheduler that runs what a message callback cannot finish in its budget.
+    implementation("com.google.firebase:firebase-messaging:24.1.2")
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
+    // Keys wrapped by the hardware-backed keystore, which is where a preview key belongs.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")

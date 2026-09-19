@@ -1,3 +1,8 @@
 include ':app'
 
+// The hand-written native half, kept outside this generated directory so regenerating the project
+// never touches it. Its decisions are plain Kotlin and its tests run without a device.
+include ':krnative'
+project(':krnative').projectDir = new File(settingsDir, '../../../native/android')
+
 apply from: 'tauri.settings.gradle'

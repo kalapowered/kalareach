@@ -7,50 +7,118 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		06B3AB8BA52A0737BE652DAC /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
 		0EDC15DCA7A4E554312092F4 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */; };
 		1128549C68FB9201F70F942C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 3CC3E46F612EC707E33F9F70 /* Assets.xcassets */; };
 		162D159780A61679A7269833 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 183BCF063CD995ED3E3B4C00 /* main.mm */; };
 		1A05E5428BA1AFDCFB0F6367 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 9763735ADB959CD6F7877892 /* assets */; };
 		1AABAD0361650C489DA8812E /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 66F54D2F258FCD3383A592D3 /* Metal.framework */; };
+		207DF065C5106CCE33A4F1F6 /* SecureKeys.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC81452583E1A11378351821 /* SecureKeys.swift */; };
+		23591009DB33BA0A6E6DF7A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
 		243B06B450728E7814F317FC /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 21EFF08FF9DFE8027EAA8B8F /* Security.framework */; };
+		261806B6F7A3AFFD7D57B70C /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
+		2649DEFDEEC785F1D317F0E7 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
+		4885115428043D10878AD99B /* PreviewDecisionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */; };
+		4E93831717B567BEBE15595F /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
 		5D27A11CFB87F37C191F9A5F /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 343C7C2C560F586215BF9C3F /* UIKit.framework */; };
+		5E149929F729886E49F1C45D /* KalaReachNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		70CE80D39ED8CF570A2B5323 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3121E24E1630B06FCF24ECAF /* QuartzCore.framework */; };
+		7999A20AD4AAB5D34E7ABE73 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
+		865E8AD7457D4A8EC288015A /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5AAECC7799B8A609EB72D33A /* AVFoundation.framework */; };
+		8C8D5305283EBB3006AE42A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
+		94997D5DBE6F90518D2BE6DD /* ShareSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF8072943115F58C78CD7C9 /* ShareSurface.swift */; };
+		9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
+		9F96FAB734A2805527D6C967 /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
+		A172223FB1A7B16D66A12CE6 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */; };
+		A223AB1550608EDAD2B5FFC9 /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
 		A8E17259F8663586A25787F6 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 2A45B1371EDD793B4134FF79 /* LaunchScreen.storyboard */; };
 		AA8AFDF8D79B4556939EC269 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 860B01BDA0495D0568077001 /* MetalKit.framework */; };
+		B04C06ED622904545BE168D8 /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
+		BA2F20C51EB97A9A2EA35674 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
+		C27F9176430AA311DB59212D /* PreviewDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */; };
+		C812EE43DA396FCF003C6ABE /* SecureKeys.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC81452583E1A11378351821 /* SecureKeys.swift */; };
+		CAB2C7432861A6D02761B7AB /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
 		D1FD9FFA3E55CF47F92920CB /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2DF4188C16A66634654971D /* WebKit.framework */; };
+		E0323C62307BEB4D7C24ED54 /* PreviewDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */; };
+		E8C021C2AAA31205088A0B5C /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
+		F04163155A595CF98164B6A6 /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
+		F4984261D3997326A7756045 /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 019E652DB2C27D9CDAB07505 /* UserNotifications.framework */; };
 		F683A3B4BC275D0384F922CF /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = E8C92E50E96FEA4B90C404F3 /* libapp.a */; };
+		F8EF4A8CBBF87EBEBC5CFD35 /* PreviewDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */; };
+		FF58E75D4698A18147FFD948 /* ShareSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF8072943115F58C78CD7C9 /* ShareSurface.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		5DE1D3E835626B23F1045E67 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 417D28560F7FCD23FD378F68 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = BD1EAF0048445C8E7F84FFB7;
+			remoteInfo = KalaReachNotificationService;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		73F895AB7359214937E99934 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				5E149929F729886E49F1C45D /* KalaReachNotificationService.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		019E652DB2C27D9CDAB07505 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
 		02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		15C964AFE64445D908AF5275 /* links.rs */ = {isa = PBXFileReference; path = links.rs; sourceTree = "<group>"; };
 		183BCF063CD995ED3E3B4C00 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
 		21EFF08FF9DFE8027EAA8B8F /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		233EDCC125C890EB364292DC /* state.rs */ = {isa = PBXFileReference; path = state.rs; sourceTree = "<group>"; };
 		2A45B1371EDD793B4134FF79 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSession.swift; sourceTree = "<group>"; };
 		3121E24E1630B06FCF24ECAF /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		343C7C2C560F586215BF9C3F /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		38E5231699C860EAF27439F4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		3CC3E46F612EC707E33F9F70 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		412BDBEDD8769295934D66CB /* export.rs */ = {isa = PBXFileReference; path = export.rs; sourceTree = "<group>"; };
 		44742EC6AF3996B2AFF2B07C /* connection.rs */ = {isa = PBXFileReference; path = connection.rs; sourceTree = "<group>"; };
 		45752446E12DEC199411BC9D /* companion-tauri_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "companion-tauri_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		472029203166C263A511B347 /* companion-tauri_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "companion-tauri_iOS.entitlements"; sourceTree = "<group>"; };
+		529A8B9ADD788615F4718EB0 /* PushRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushRegistration.swift; sourceTree = "<group>"; };
 		53DC9988B24BB9D8AF674AA2 /* commands.rs */ = {isa = PBXFileReference; path = commands.rs; sourceTree = "<group>"; };
+		5AAECC7799B8A609EB72D33A /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 		5DC0FEC180F00EA2178F4445 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		66F54D2F258FCD3383A592D3 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		69D5CF4D29D34D99D53D6F1F /* remote.rs */ = {isa = PBXFileReference; path = remote.rs; sourceTree = "<group>"; };
+		706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewDecisionTests.swift; sourceTree = "<group>"; };
+		7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewDecision.swift; sourceTree = "<group>"; };
 		8120C7D6C368D7D113319C7D /* error.rs */ = {isa = PBXFileReference; path = error.rs; sourceTree = "<group>"; };
 		860B01BDA0495D0568077001 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		867641E9571FFF4D300F4601 /* KalaReachNativeTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = KalaReachNativeTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		887BFCE065F103DCEEC3E5F7 /* verify.rs */ = {isa = PBXFileReference; path = verify.rs; sourceTree = "<group>"; };
 		9763735ADB959CD6F7877892 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		9BF8072943115F58C78CD7C9 /* ShareSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareSurface.swift; sourceTree = "<group>"; };
 		A9011D4AFA5E6579D9C0375B /* transfers.rs */ = {isa = PBXFileReference; path = transfers.rs; sourceTree = "<group>"; };
 		B2DF4188C16A66634654971D /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		BC81452583E1A11378351821 /* SecureKeys.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureKeys.swift; sourceTree = "<group>"; };
+		C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewKeyStore.swift; sourceTree = "<group>"; };
 		C64D4F0C05D1651BEE197024 /* target.rs */ = {isa = PBXFileReference; path = target.rs; sourceTree = "<group>"; };
+		C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		D806D2225CDFB68693658DC5 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		DA7F7F5739685BC591FB8A2D /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewEnvelope.swift; sourceTree = "<group>"; };
+		E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = KalaReachNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		E49D3EC99878D20FEB66A165 /* SigningGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SigningGate.swift; sourceTree = "<group>"; };
 		E72EF35F1A622C5769FD7219 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		E8C92E50E96FEA4B90C404F3 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		EFCAE40843BC63A27D3A8FF8 /* pairing.rs */ = {isa = PBXFileReference; path = pairing.rs; sourceTree = "<group>"; };
+		F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedClientPreviewOpener.swift; sourceTree = "<group>"; };
+		FA1ED7F1EC44C683626C13E6 /* KalaReachNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = KalaReachNotificationService.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -59,6 +127,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				F683A3B4BC275D0384F922CF /* libapp.a in Frameworks */,
+				865E8AD7457D4A8EC288015A /* AVFoundation.framework in Frameworks */,
+				F4984261D3997326A7756045 /* UserNotifications.framework in Frameworks */,
 				0EDC15DCA7A4E554312092F4 /* CoreGraphics.framework in Frameworks */,
 				1AABAD0361650C489DA8812E /* Metal.framework in Frameworks */,
 				AA8AFDF8D79B4556939EC269 /* MetalKit.framework in Frameworks */,
@@ -72,6 +142,18 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		054C6129FD7F7F3F67BFFCEB /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */,
+				DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */,
+				C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */,
+				F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */,
+			);
+			name = Shared;
+			path = ../../../native/ios/Shared;
+			sourceTree = "<group>";
+		};
 		3BDBEB386023E2D63A29DDD6 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
@@ -84,8 +166,23 @@
 			isa = PBXGroup;
 			children = (
 				45752446E12DEC199411BC9D /* companion-tauri_iOS.app */,
+				867641E9571FFF4D300F4601 /* KalaReachNativeTests.xctest */,
+				E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		759ED3EAF99DD6D22AC770CE /* KalaReachNative */ = {
+			isa = PBXGroup;
+			children = (
+				2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */,
+				529A8B9ADD788615F4718EB0 /* PushRegistration.swift */,
+				BC81452583E1A11378351821 /* SecureKeys.swift */,
+				9BF8072943115F58C78CD7C9 /* ShareSurface.swift */,
+				E49D3EC99878D20FEB66A165 /* SigningGate.swift */,
+			);
+			name = KalaReachNative;
+			path = ../../../native/ios/KalaReachNative;
 			sourceTree = "<group>";
 		};
 		8C72BD05AE26F57E26052278 /* Externals */ = {
@@ -116,6 +213,17 @@
 			path = ../../src;
 			sourceTree = "<group>";
 		};
+		9D3A5870D6FBA6CDB99C2560 /* NotificationService */ = {
+			isa = PBXGroup;
+			children = (
+				38E5231699C860EAF27439F4 /* Info.plist */,
+				FA1ED7F1EC44C683626C13E6 /* KalaReachNotificationService.entitlements */,
+				C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */,
+			);
+			name = NotificationService;
+			path = ../../../native/ios/NotificationService;
+			sourceTree = "<group>";
+		};
 		A8267576D0426DF97270ACD4 /* companion-tauri_iOS */ = {
 			isa = PBXGroup;
 			children = (
@@ -123,6 +231,15 @@
 				5DC0FEC180F00EA2178F4445 /* Info.plist */,
 			);
 			path = "companion-tauri_iOS";
+			sourceTree = "<group>";
+		};
+		A9A55303B287F5C61BAEEC6A /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */,
+			);
+			name = Tests;
+			path = ../../../native/ios/Tests;
 			sourceTree = "<group>";
 		};
 		AD937C991610E19AA57EC59C = {
@@ -133,8 +250,12 @@
 				2A45B1371EDD793B4134FF79 /* LaunchScreen.storyboard */,
 				A8267576D0426DF97270ACD4 /* companion-tauri_iOS */,
 				8C72BD05AE26F57E26052278 /* Externals */,
+				759ED3EAF99DD6D22AC770CE /* KalaReachNative */,
+				9D3A5870D6FBA6CDB99C2560 /* NotificationService */,
+				054C6129FD7F7F3F67BFFCEB /* Shared */,
 				3BDBEB386023E2D63A29DDD6 /* Sources */,
 				90C70160FE2670F1CB0A8CCE /* src */,
+				A9A55303B287F5C61BAEEC6A /* Tests */,
 				FCE3CC91FD2A97EE36BB262A /* Frameworks */,
 				5A54F39A1118D3FEAD667A9F /* Products */,
 			);
@@ -160,6 +281,7 @@
 		FCE3CC91FD2A97EE36BB262A /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				5AAECC7799B8A609EB72D33A /* AVFoundation.framework */,
 				02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */,
 				E8C92E50E96FEA4B90C404F3 /* libapp.a */,
 				66F54D2F258FCD3383A592D3 /* Metal.framework */,
@@ -167,9 +289,24 @@
 				3121E24E1630B06FCF24ECAF /* QuartzCore.framework */,
 				21EFF08FF9DFE8027EAA8B8F /* Security.framework */,
 				343C7C2C560F586215BF9C3F /* UIKit.framework */,
+				019E652DB2C27D9CDAB07505 /* UserNotifications.framework */,
 				B2DF4188C16A66634654971D /* WebKit.framework */,
 			);
 			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		"TEMP_DB6B6A3F-4348-4B15-A36A-D096B4E808EF" /* x86_64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = x86_64;
+			sourceTree = "<group>";
+		};
+		"TEMP_FCA55F1F-B80D-43B4-96C7-86BB51F8A4B8" /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = arm64;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -183,10 +320,12 @@
 				958437A792FBAA3490682CA4 /* Sources */,
 				BC7011A441F7F2439FF18D11 /* Resources */,
 				37C011F79B56D45FDE44BDC4 /* Frameworks */,
+				73F895AB7359214937E99934 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				353657B0D56D33E2C2CF6564 /* PBXTargetDependency */,
 			);
 			name = "companion-tauri_iOS";
 			packageProductDependencies = (
@@ -194,6 +333,40 @@
 			productName = "companion-tauri_iOS";
 			productReference = 45752446E12DEC199411BC9D /* companion-tauri_iOS.app */;
 			productType = "com.apple.product-type.application";
+		};
+		BD1EAF0048445C8E7F84FFB7 /* KalaReachNotificationService */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 33FC229353A86252B0AE792F /* Build configuration list for PBXNativeTarget "KalaReachNotificationService" */;
+			buildPhases = (
+				0A547776F6F5F89042441B44 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KalaReachNotificationService;
+			packageProductDependencies = (
+			);
+			productName = KalaReachNotificationService;
+			productReference = E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		F72D40A2DED4C3598444BD26 /* KalaReachNativeTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F1F4D89102687C7026A36134 /* Build configuration list for PBXNativeTarget "KalaReachNativeTests" */;
+			buildPhases = (
+				3668133642C5E24626AFA07B /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KalaReachNativeTests;
+			packageProductDependencies = (
+			);
+			productName = KalaReachNativeTests;
+			productReference = 867641E9571FFF4D300F4601 /* KalaReachNativeTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
 
@@ -220,6 +393,8 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+				BD1EAF0048445C8E7F84FFB7 /* KalaReachNotificationService */,
+				F72D40A2DED4C3598444BD26 /* KalaReachNativeTests */,
 				154621C0FD40E79EC835DB1C /* companion-tauri_iOS */,
 			);
 		};
@@ -263,17 +438,81 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		0A547776F6F5F89042441B44 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A172223FB1A7B16D66A12CE6 /* NotificationService.swift in Sources */,
+				F8EF4A8CBBF87EBEBC5CFD35 /* PreviewDecision.swift in Sources */,
+				F04163155A595CF98164B6A6 /* PreviewEnvelope.swift in Sources */,
+				A223AB1550608EDAD2B5FFC9 /* PreviewKeyStore.swift in Sources */,
+				7999A20AD4AAB5D34E7ABE73 /* SharedClientPreviewOpener.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		3668133642C5E24626AFA07B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */,
+				C27F9176430AA311DB59212D /* PreviewDecision.swift in Sources */,
+				4885115428043D10878AD99B /* PreviewDecisionTests.swift in Sources */,
+				B04C06ED622904545BE168D8 /* PreviewEnvelope.swift in Sources */,
+				E8C021C2AAA31205088A0B5C /* PreviewKeyStore.swift in Sources */,
+				8C8D5305283EBB3006AE42A4 /* PushRegistration.swift in Sources */,
+				C812EE43DA396FCF003C6ABE /* SecureKeys.swift in Sources */,
+				94997D5DBE6F90518D2BE6DD /* ShareSurface.swift in Sources */,
+				BA2F20C51EB97A9A2EA35674 /* SharedClientPreviewOpener.swift in Sources */,
+				4E93831717B567BEBE15595F /* SigningGate.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		958437A792FBAA3490682CA4 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CAB2C7432861A6D02761B7AB /* AudioSession.swift in Sources */,
+				E0323C62307BEB4D7C24ED54 /* PreviewDecision.swift in Sources */,
+				06B3AB8BA52A0737BE652DAC /* PreviewEnvelope.swift in Sources */,
+				9F96FAB734A2805527D6C967 /* PreviewKeyStore.swift in Sources */,
+				23591009DB33BA0A6E6DF7A4 /* PushRegistration.swift in Sources */,
+				207DF065C5106CCE33A4F1F6 /* SecureKeys.swift in Sources */,
+				FF58E75D4698A18147FFD948 /* ShareSurface.swift in Sources */,
+				2649DEFDEEC785F1D317F0E7 /* SharedClientPreviewOpener.swift in Sources */,
+				261806B6F7A3AFFD7D57B70C /* SigningGate.swift in Sources */,
 				162D159780A61679A7269833 /* main.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		353657B0D56D33E2C2CF6564 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = BD1EAF0048445C8E7F84FFB7 /* KalaReachNotificationService */;
+			targetProxy = 5DE1D3E835626B23F1045E67 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		0B172CCE49B18988F3404D39 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements;
+				INFOPLIST_FILE = ../../../native/ios/NotificationService/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.companion.notifications;
+				PRODUCT_NAME = KalaReachNotificationService;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = debug;
+		};
 		4510642D975077113407FC62 /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -282,7 +521,7 @@
 					arm64,
 				);
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "companion-tauri_iOS/companion-tauri_iOS.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "../../../native/ios/App/companion-tauri_iOS.entitlements";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				ENABLE_BITCODE = NO;
 				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
@@ -305,6 +544,23 @@
 			};
 			name = release;
 		};
+		4C0D2A46D801F1179D0839DB /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "to.kala.reach.companion.native-tests";
+				PRODUCT_NAME = KalaReachNativeTests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = debug;
+		};
 		8971E4B0800DAF17A6F48A09 /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -313,7 +569,7 @@
 					arm64,
 				);
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "companion-tauri_iOS/companion-tauri_iOS.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "../../../native/ios/App/companion-tauri_iOS.entitlements";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				ENABLE_BITCODE = NO;
 				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
@@ -335,6 +591,41 @@
 				VALID_ARCHS = arm64;
 			};
 			name = debug;
+		};
+		AFA473B15126C4F82D7950CC /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "to.kala.reach.companion.native-tests";
+				PRODUCT_NAME = KalaReachNativeTests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = release;
+		};
+		B541E7FCB1D838EF89ED1E5A /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements;
+				INFOPLIST_FILE = ../../../native/ios/NotificationService/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.companion.notifications;
+				PRODUCT_NAME = KalaReachNotificationService;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = release;
 		};
 		BBA8EAEA023702CDAB8A72B1 /* debug */ = {
 			isa = XCBuildConfiguration;
@@ -458,6 +749,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		33FC229353A86252B0AE792F /* Build configuration list for PBXNativeTarget "KalaReachNotificationService" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0B172CCE49B18988F3404D39 /* debug */,
+				B541E7FCB1D838EF89ED1E5A /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
 		4A18D63A280B4B762D6586DB /* Build configuration list for PBXProject "companion-tauri" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -472,6 +772,15 @@
 			buildConfigurations = (
 				8971E4B0800DAF17A6F48A09 /* debug */,
 				4510642D975077113407FC62 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		F1F4D89102687C7026A36134 /* Build configuration list for PBXNativeTarget "KalaReachNativeTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4C0D2A46D801F1179D0839DB /* debug */,
+				AFA473B15126C4F82D7950CC /* release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = debug;
