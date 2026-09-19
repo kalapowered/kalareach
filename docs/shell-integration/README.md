@@ -534,6 +534,77 @@ private key into the pseudo-terminal. That fallback is not a value a qualified d
 5. Answer within the 250 ms hold, or expect the worker to release the held input and ask again at the
    next entry, leave or idle callback.
 
+## What each reader can prove, and what it cannot
+
+The four packages answer one contract, and the mechanism table at the top of this document says
+which mechanism each of them answers it with. Two of those mechanisms are not a patched reader, so
+what they can and cannot establish is written out here rather than left to be discovered.
+
+### fish
+
+fish 4.x is a Rust shell, so the reader's own half of the bridge is Rust beside the reader and the
+shell-independent core is the same C every other package compiles. The published patch set does
+four things:
+
+- The bridge's endpoint joins the reader's own `select` set, so a fence, a cancellation or a launch
+  that arrives while the reader is blocked is answered then rather than at the person's next key.
+- The mailbox is read at every key-sequence boundary: after one complete sequence has been resolved
+  and before its binding runs, which is where the reader is between operations.
+- The end-of-file decision is a **named binding**, `kr-eof-decide`, in the reader's own command
+  table. The guarded entry under `conf.d` puts it on the configured gesture once the person's own
+  configuration has run, keeps whatever was bound there, and runs that outside the detach
+  condition. A person who binds the gesture key afterwards takes it back, which is theirs to do.
+- A cancellation ends a pending key wait through the reader's own interruption path, which returns
+  the part-read sequence, handles the interruption and leaves the edit buffer exactly as it was.
+
+Two things this reader does not have, and the package says so rather than claiming them: it
+accumulates no numeric argument, and it has no quoted insertion of its own. `get-key` waits for a
+literal key in the same way and the bridge reports that state, so a package that binds it is
+covered; nothing binds it by default. A vi operator here is a key sequence rather than a wait for a
+motion, which is why an unfinished operator reads as a pending multikey sequence.
+
+The gesture follows the terminal's own end-of-file character, read from the modes the shell hands
+to the programs it runs. The reader holds the terminal in the shell's own modes while it reads, and
+those keep their own control characters, so a `stty eof` of the person's own lands there and takes
+effect at the next prompt.
+
+### PSReadLine
+
+This package rebuilds no shell. PSReadLine is the editor the person already has, and the module
+binds into it: it wraps the host's own read-line entry point for the reader's boundaries, wraps the
+editor's own functions that run an inner read loop so the states they wait in are observable, and
+puts its end-of-file decision on the configured gesture in front of whatever was bound there.
+Nothing it wraps is replaced, and everything it installs comes off again with the module.
+
+What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
+3.0. The module declares the versions it found in its handshake and the worker refuses an editor
+ABI it was not qualified for. A build that does not keep the reader's own key queue where this
+package was qualified to find it is refused with a named error rather than registered.
+
+Section 7 says this package does not claim that the stock public API has an asynchronous editing
+method, and that is exactly what it cannot do:
+
+- **The reader is reached when it steps.** The module's queue is serviced on the reader's own
+  thread — at the read-line entry, inside every handler the module owns, and whenever the host
+  delivers the module's signal there. The host delivers that signal around the reader's own steps,
+  so a request that arrives at a reader parked in its key wait is answered at its next step rather
+  than immediately.
+- **A launch is installed where it is decided and accepted at the next step.** The decision, the
+  state check and the installation all happen on the reader's thread, inside the fence. The
+  acceptance is submitted to the editor's own accept and its own return key is put in the editor's
+  own key queue, which is drained before anything the terminal has; the editor completes it when it
+  next steps.
+- **A cancellation ends what the module owns.** The operations the module wraps come out at their
+  next key; an operation the editor runs inside its own nested read is left to finish, and the
+  report says nothing was ended rather than claiming otherwise. The worker then withholds the fence
+  until the queues drain, which is the fail-safe answer.
+- **The queues are the editor's own.** The reader's key queue is read directly, under the version
+  range this package was qualified against. Asking the console whether a key is available instead
+  would take the lock the editor's own read is holding, and the reader would wait for itself.
+
+Running the module on Windows, where the endpoint is a named pipe and the gesture is the configured
+chord rather than the line discipline's own character, is qualified separately.
+
 ## The scenarios
 
 `fixtures/shell-bridge/` holds 40 scenarios, one JSON file each. Every file names what it

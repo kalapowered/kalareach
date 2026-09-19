@@ -1,20 +1,32 @@
-# The managed Zsh and Bash packages
+# The managed shell packages
 
-[README.md](README.md) is the contract. This is what the two Unix packages do to keep it: which
-lines of Zsh and Bash change, what the added sources are, how the package is built and identified,
-and under which licence each part travels.
+[README.md](README.md) is the contract. This is what the packages do to keep it: which lines of
+each shell change, what the added sources are, how a package is built and identified, and under
+which licence each part travels.
 
-Both packages are built from an upstream release the manifest pins by URL and SHA-256. Nothing
+Three of the four are built from an upstream release the manifest pins by URL and SHA-256. Nothing
 upstream is copied into this repository. What lives here is the patch sets, the bridge sources the
 patches bring with them, the guarded startup entry and the manifest that ties them together:
 
 ```
-shells/zsh/                          shells/bash/
-  manifest.json                        manifest.json
-  LICENSE            (Zsh licence)     LICENSE            (GPL-3.0-or-later)
-  patches/*.patch                      patches/*.patch
-  src/*                                src/*
-  startup/kr-zshrc.zsh                 startup/kr-bashrc.bash
+shells/zsh/                          shells/bash/              shells/fish/
+  manifest.json                        manifest.json             manifest.json
+  LICENSE            (Zsh licence)     LICENSE  (GPL-3.0+)       LICENSE  (GPL-2.0-only)
+  patches/*.patch                      patches/*.patch           patches/*.patch
+  src/*                                src/*                     src/*
+  startup/kr-zshrc.zsh                 startup/kr-bashrc.bash    startup/kr-fish.fish
+```
+
+The fourth rebuilds no shell. PSReadLine is the editor the person already has, so what
+`shells/psreadline/` holds is a module of Kala Powered's own and the marked profile block that
+loads it:
+
+```
+shells/psreadline/
+  manifest.json      (the range it was qualified against, rather than a release to fetch)
+  LICENSE            (BSD 3-Clause, because nothing upstream is copied or patched)
+  module/*
+  startup/kr-profile.ps1
 ```
 
 ## Why a patched reader at all
@@ -122,6 +134,63 @@ The patch leaves Bash's parser alone on purpose. Bash ships a generated `y.tab.c
 carry. Calling the two functions Bash already exports costs nothing and keeps the build to a C
 compiler.
 
+## What fish changes
+
+Three patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half of the
+bridge is Rust beside it and the shell-independent core is the same C the other packages compile,
+built into the shell by the build script that already compiles C for the shell's own probes.
+
+| Patch | Files | What it adds |
+| --- | --- | --- |
+| `0001-fish-reader-event-bridge` | `src/input/input.rs`, `src/input/decode.rs`, `src/input/binding.rs`, `src/reader/input.rs`, `src/reader/mod.rs`, `src/reader/reader.rs` | The mailbox, the reader's boundaries, the named binding and the bridge's view of the reader |
+| `0002-fish-reader-state` | `src/input/binding.rs` | The states the detach condition needs that this reader keeps no flag for |
+| `0003-fish-bridge-activation` | `build.rs`, `src/bin/fish.rs`, `src/builtins/mod.rs`, `src/builtins/shared/misc.rs` | The core compiled in, the `kr-bridge` builtin, and the bridge loading before the startup files |
+
+The first patch does five things:
+
+- **The reader waits on the bridge as well as the terminal.** `next_input_event` already selects
+  over the input descriptor, the completion port and the universal-variable notifier; the bridge's
+  descriptor joins that set. The terminal is checked first, because what the person typed is theirs
+  and anything the worker asks for waits behind it.
+- **The mailbox is read at every key-sequence boundary and before every wait.** One call after
+  `binding_execute_matching_or_generic` has resolved a complete sequence and before its binding
+  runs, and one immediately before the reader blocks, which is also where a reader with nothing
+  left to read says so.
+- **`kr-eof-decide` joins the reader's own command table**, so the gesture is a named binding with
+  the actual reader context rather than a wrapper downstream of the decision.
+- **`readline` reports the reader's boundaries**: the entry after the prompt has been drawn and
+  before the read loop, and the leave with the reason the reader's own state gives.
+- **The bridge's view of the reader** is one small block of accessors: which reader is running, the
+  command line, whether a search is active, the two buffer operations a launch needs, the terminal's
+  own end-of-file character and printing one line above the prompt.
+
+The second patch adds what the exclusions need and the reader does not already keep: how many
+events a sequence has peeked and not resolved, an input function waiting for the target character
+it takes as an argument, `get-key` waiting for the literal key it reports, and where the character
+being judged came from.
+
+The guarded entry is a file of its own under `conf.d`. Files there run before the person's
+`config.fish`, so the entry registers a one-shot handler on the first prompt: by then the person's
+configuration and key bindings are in place, and the integration goes on top of them.
+
+## What the PSReadLine package qualifies
+
+Nothing is patched and nothing is rebuilt. The module wraps the host's own `PSConsoleHostReadLine`
+for the reader's boundaries, wraps the editor's own functions that run an inner read loop so the
+states they wait in are observable, and puts its end-of-file decision on the configured gesture in
+front of whatever was bound there. It calls the editor's published API and reads the editor's own
+key queue, which is what a fence rests on and what the editor publishes no count of.
+
+`Publish-KalaReachQualification` is what `scripts/build-shells.sh` is for the others: it checks the
+editor against the range the manifest pins, records what it found, installs the module and the
+marked profile block under the same cache layout, and writes the identity record beside them. The
+identity is a digest of the module, the manifest, the startup entry and the versions it qualified
+against, so a changed module is a different package.
+
+[README.md](README.md) states what this mechanism can and cannot establish. The short of it is that
+the reader is reached when it steps: the module's queue is serviced on the reader's own thread, and
+a request that arrives while the reader is parked in its key wait is answered at its next boundary.
+
 ## What the packages add
 
 Each package adds the same shell-independent bridge to its shell's source tree, plus a small
@@ -188,10 +257,14 @@ no fuzz at all, copies the bridge sources in, configures, compiles, runs the she
 and installs the result:
 
 ```bash
-scripts/build-shells.sh --zsh --bash     # both
-scripts/build-shells.sh --bash           # one
-scripts/build-shells.sh --zsh --bash --check-patches   # apply the patches and stop
+scripts/build-shells.sh --all            # every package it builds
+scripts/build-shells.sh --fish           # one
+scripts/build-shells.sh --all --check-patches          # apply the patches and stop
 ```
+
+fish is built through CMake rather than autotools, because that is what its own release ships with;
+the manifest says which, and the Rust toolchain and the environment the build pins join its
+identity for the same reason the C compiler joins the others'.
 
 The identity is a SHA-256 over the inputs: the upstream archive's digest, the manifest, this build
 script, every patch file, every added source, the startup entry, and the compiler and environment
@@ -231,13 +304,15 @@ what continuous integration uses on Linux.
 
 ## The licence position
 
-The repository is BSD 3-Clause. These two directories are not, because they are built from other
-people's shells:
+The repository is BSD 3-Clause. Three of these directories are not, because they are built from
+other people's shells:
 
 | Path | Licence |
 | --- | --- |
 | `shells/zsh/**` | The Zsh licence, in `shells/zsh/LICENSE` |
 | `shells/bash/**` | GNU GPL, version 3 or later, in `shells/bash/LICENSE` |
+| `shells/fish/**` | GNU GPL, version 2, in `shells/fish/LICENSE` |
+| `shells/psreadline/**` | BSD 3-Clause, because nothing upstream is copied or patched |
 | everything else, including `scripts/build-shells.sh` and this document | BSD 3-Clause |
 
 The patch files change each shell's own source, and the sources under `src/` are compiled into that
@@ -245,14 +320,14 @@ shell, so both travel under the licence of the work they join. Kala Powered hold
 the added sources and in the changes the patches make, and licenses them on those terms as part of
 each package.
 
-No code under either licence is compiled into a crate. The crates speak to these packages over a
+No code under any of those licences is compiled into a crate. The crates speak to these packages over a
 socket and share nothing but the wire format, and `crates/kr-shell-integration` is a pure contract
 library with no link-time dependency on either shell.
 
 ## What is not here
 
-Fish and PSReadLine are separate packages with their own reader mechanisms; this document covers
-the two Unix shells whose readers are patched. Windows is outside both of them.
+Running the PSReadLine module on Windows, where the endpoint is a named pipe and the gesture is the
+configured chord rather than the line discipline's own character, is qualified separately.
 
 Signing the built executables and modules, and qualifying the hardened-runtime loading
 configuration they are signed for, belongs to packaging rather than to the build script here.
