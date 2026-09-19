@@ -2675,6 +2675,10 @@ impl BrokerState {
         token: &ActionToken,
         capability: Option<CapabilityId>,
     ) -> Result<BrokerGrants> {
+        // Rich work is fenced while the journal is faulted, and carrying a component's effect is
+        // rich work. A fence that came down while the component was preparing its plan is the
+        // same refusal as a grant withdrawn while it was preparing one.
+        self.volatile.require_rich_work()?;
         let invocation = Invocation {
             actor_id: token.actor_id.clone(),
             grant: token.grant,

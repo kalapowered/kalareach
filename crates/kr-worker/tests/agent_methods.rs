@@ -1904,3 +1904,63 @@ fn kr_req_12_06_a_transport_that_cannot_carry_an_answer_gives_the_resource_back(
     assert_eq!(answered.state, PendingState::Resolved);
     assert_eq!(upstream.submitted().len(), 1);
 }
+
+/// KR-REQ-11.35 and KR-REQ-11.28: a plan that arrives while rich work is fenced is refused, and
+/// nothing carries it.
+#[test]
+fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("prompt.submit").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+            }],
+        )
+        .expect("the actions are registered");
+    let admitted = broker
+        .admit_plugin_action(
+            &caller(),
+            binding(),
+            &PluginActionInvokeParams {
+                target: target(1),
+                plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+                action: ActionName::new("prompt.submit").expect("valid"),
+                draft_id: Nullable::null(),
+                parameters: Bytes::from(b"{}".to_vec()),
+            },
+            TimestampMs::new(2),
+        )
+        .expect("the invocation is admitted");
+
+    // The journal faults while the component is preparing its plan.
+    broker
+        .enter_volatile("the journal could not be written", TimestampMs::new(3))
+        .expect("the fence comes down");
+    let refusal = broker
+        .validate_effect(
+            &admitted,
+            &kr_protocol::broker::PreparedEffect {
+                action: ActionName::new("prompt.submit").expect("valid"),
+                class: EffectClass::Write,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                draft_id: Nullable::null(),
+                argument_hash: arguments_digest(),
+            },
+        )
+        .expect_err("rich work is fenced");
+    assert_eq!(refusal.code(), ErrorCode::UpstreamUnavailable);
+    assert!(
+        broker
+            .record_plugin_action(&admitted, TimestampMs::new(4))
+            .is_err(),
+        "and nothing carries a plan this host did not validate"
+    );
+    assert!(upstream.submitted().is_empty());
+}

@@ -2951,6 +2951,7 @@ is not showing is neither drawn nor described: not its rows, not its saved curso
 negotiation. Attachment bytes are a second question from the attachment reference, and need their
 own `files.read`. An invitation may name current questions or approval requests explicitly, which
 permits those exact decisions and not the conversation they came from.
+
 ## The broker
 
 One worker owns one broker, and the broker owns everything an upstream application's meaning is
@@ -3100,10 +3101,11 @@ A frame is read strictly: it is bounded in both directions, it must be a top-lev
 frame that names a member twice is refused rather than resolved, because another participant in the
 same protocol may resolve it the other way.
 
-What reads and writes the bytes is not here. The declarative table says how a connector's protocol
-frames, and the driver that applies that framing to a real transport belongs to the connector: the
-bundled adapters are the plugins repository's. What this host supplies is everything that decides:
-the classification, the recording, the correlation, the arbitration and the admission.
+The declarative table says how a connector's protocol frames, and the worker reads and writes those
+bytes itself: the driver is core code, so a component fault cannot stall it. What a connector
+supplies is the qualified table, and the bundled adapters that drive their own upstreams are the
+plugins repository's. What this host supplies beside the bytes is everything that decides: the
+classification, the recording, the correlation, the arbitration and the admission.
 
 The rich method table is closed and versioned. A method with no entry is rejected; one listed as
 unsupported is rejected with its own reason. Both tables are pinned to an upstream protocol version
@@ -3200,11 +3202,11 @@ were answered at, and a snapshot says how many entries the history filter withhe
 range the reader asked for had been evicted. A gap is reported, never filled: nothing reconstructs an
 unobserved pending approval from a transcript or a screen.
 
-The shared host-side history filter is not here. A local caller reads the whole retained history,
-because its authority is the operating-system identity the listener authenticated and there is no
-grant to narrow — the same rule that draws a local attachment the whole screen. A *forwarded* read
-is refused rather than answered, because answering it without the filter would give a device more
-than its grant covers.
+An agent snapshot does not yet go through the shared host-side history filter. A local caller reads
+the whole retained history, because its authority is the operating-system identity the listener
+authenticated and there is no grant to narrow — the same rule that draws a local attachment the
+whole screen. A *forwarded* read is refused rather than answered, because answering it without the
+filter would give a device more than its grant covers.
 
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
@@ -3227,8 +3229,8 @@ a refusal this host could have made into an outcome nobody can establish. That i
 transport: whether this upstream has a method for the operation at all is settled at admission, not
 when the bytes were due. A marker this host could not write leaves nothing executable behind it:
 the admission is given up, an approval's reservation goes back and a plugin action's token is
-retired. What a refusal after the marker still covers is the transport's own failure, which is what
-`OUTCOME_UNKNOWN` is for.
+retired. What a refusal after the marker still covers is the transport's own failure and a broker
+marker this host could not commit, both of which are what `OUTCOME_UNKNOWN` is for.
 
 Reserving a resource and marking it dispatched are two moments. The admission reserves the
 resource's one transmission; the durable marker goes in immediately before the bytes. An answer
@@ -3236,8 +3238,8 @@ that is abandoned in between leaves the resource answerable, and a claim with no
 nothing: resolved and uncertain are both statements about an answer that went.
 
 What an admission carries is a permit, taken once. Taking it is what authorises the transmission,
-and for an answer it is also what authorises the settlement, so a second caller on one admission
-transmits nothing and settles nothing rather than recording the first caller's answer as uncertain.
+and it carries the answer's own claim with it, so a second caller on one admission transmits
+nothing and settles nothing rather than recording the first caller's answer as uncertain.
 An answer's transport is the one that speaks for the connection whose resource it resolves, chosen
 when the answer is admitted; a connection that has gone is `UPSTREAM_UNAVAILABLE` before anything
 is claimed. The transport work happens after the session boundary ends, because terminal ingestion
