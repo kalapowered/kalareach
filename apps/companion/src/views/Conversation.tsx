@@ -458,21 +458,34 @@ export function Conversation({
   const onScroll = useCallback(() => {
     const element = scroller.current
     if (!element) return
-    if (atLiveEnd(element)) {
-      update((current) => ({ ...current, conversation: setFollowing(current.conversation, true) }))
-      return
-    }
+    const atBottom = atScrollerEnd(element)
     const atTop = element.scrollTop < NEAR_TOP
     update((current) => {
-      const stopped = setFollowing(current.conversation, false)
-      if (!atTop || stopped.windowStart === 0) {
-        return { ...current, conversation: stopped }
+      const conversation = current.conversation
+      const last = lastWindowStart(conversation.nodes.length)
+
+      if (atBottom && conversation.windowStart >= last) {
+        // The bottom of the last window is the live end, and only there.
+        return { ...current, conversation: setFollowing(conversation, true) }
       }
-      anchor.current = anchorOf(element)
-      return {
-        ...current,
-        conversation: setWindowStart(stopped, Math.max(0, stopped.windowStart - WINDOW_STEP))
+
+      const stopped = setFollowing(conversation, false)
+      if (atBottom && stopped.windowStart < last) {
+        // The bottom of a window that is not the last is more document, not the end of it.
+        anchor.current = anchorOf(element)
+        return {
+          ...current,
+          conversation: setWindowStart(stopped, Math.min(last, stopped.windowStart + WINDOW_STEP))
+        }
       }
+      if (atTop && stopped.windowStart > 0) {
+        anchor.current = anchorOf(element)
+        return {
+          ...current,
+          conversation: setWindowStart(stopped, Math.max(0, stopped.windowStart - WINDOW_STEP))
+        }
+      }
+      return { ...current, conversation: stopped }
     })
   }, [update])
 
@@ -492,9 +505,14 @@ export function Conversation({
       const node = element.querySelector<HTMLElement>(`[data-node-id="${cssEscape(held.nodeId)}"]`)
       if (node) element.scrollTop += node.offsetTop - held.offsetTop
     }
-    if (atLiveEnd(element)) {
-      update((current) => ({ ...current, conversation: setFollowing(current.conversation, true) }))
-    }
+    update((current) => {
+      const atEnd =
+        atScrollerEnd(element) &&
+        current.conversation.windowStart >= lastWindowStart(current.conversation.nodes.length)
+      return atEnd
+        ? { ...current, conversation: setFollowing(current.conversation, true) }
+        : current
+    })
   }, [state.conversation.windowStart, state.conversation.nodes.length, update])
 
   return (
@@ -626,9 +644,14 @@ export function receiptTone(receipt: { state?: string } | null): 'success' | 'da
   return receipt.state === 'applied' ? 'success' : 'pending'
 }
 
-/** Whether the view is at the live end, which is what makes it follow. */
-function atLiveEnd(element: HTMLElement): boolean {
+/** Whether the view is at the bottom of what is rendered, which is not the same as the live end. */
+function atScrollerEnd(element: HTMLElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight < AT_END_SLACK
+}
+
+/** Where the window sits when it is showing the live end. */
+function lastWindowStart(total: number): number {
+  return Math.max(0, total - WINDOW_SIZE)
 }
 
 /**

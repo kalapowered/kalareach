@@ -146,10 +146,19 @@ test.describe('the semantic view', () => {
       .toBeGreaterThan(0)
     await expect(scroller).toHaveAttribute('data-following', 'false')
 
-    await scroller.evaluate((element) => {
-      element.scrollTop = element.scrollHeight
-    })
-    await expect(scroller).toHaveAttribute('data-following', 'true')
+    // Scrolling down brings the rest of the document in a window at a time. The view follows
+    // again when it reaches the live end, and not at the bottom of every window on the way.
+    await expect
+      .poll(
+        async () => {
+          await scroller.evaluate((element) => {
+            element.scrollTop = element.scrollHeight
+          })
+          return scroller.getAttribute('data-following')
+        },
+        { timeout: 15_000 }
+      )
+      .toBe('true')
   })
 })
 
