@@ -264,7 +264,34 @@ fn ownership_is_refused_while_the_worker_is_alive() {
 }
 
 #[test]
-fn ownership_fences_the_endpoint_before_it_is_taken() {
+fn a_live_workers_endpoint_is_not_fenced_by_an_enquiry_that_is_refused() {
+    // Fencing before validating would delete a working session's socket on the way to finding out
+    // that it was working. Death is validated first, so a refusal leaves everything where it was.
+    let (_temp, archive) = host();
+    let session_id = session();
+    let descriptor = archive.paths().descriptor_file(session_id);
+    std::fs::create_dir_all(descriptor.parent().expect("a parent")).expect("the directory");
+    std::fs::write(&descriptor, b"a descriptor").expect("writes it");
+    let endpoint = archive
+        .paths()
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    std::fs::create_dir_all(endpoint.as_path().parent().expect("a parent")).expect("the directory");
+    std::fs::write(endpoint.as_path(), b"a socket").expect("writes it");
+
+    let alive = kr_ipc::identity::current_process_start_identity().expect("an identity");
+    archive
+        .take_ownership(session_id, DisplayNumber::new(1), &alive)
+        .expect_err("a live worker's stores are not the archive's");
+    assert!(descriptor.exists(), "the descriptor is still published");
+    assert!(
+        endpoint.as_path().exists(),
+        "the live worker's endpoint is still there"
+    );
+}
+
+#[test]
+fn ownership_fences_the_endpoint_once_death_is_validated() {
     let (_temp, archive) = host();
     let session_id = session();
     // A descriptor and an endpoint, as a worker publishes them.

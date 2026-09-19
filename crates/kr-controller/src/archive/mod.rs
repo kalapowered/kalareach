@@ -6,9 +6,10 @@
 //! execution worker.* Four rules follow, and this module is each of them.
 //!
 //! * **Ownership is taken, and only after the worker is gone.** [`ArchiveService::take_ownership`]
-//!   fences the worker's endpoint and validates its death through the kernel's own answer before
-//!   it opens anything. A process the operating system declines to describe is not dead; it is
-//!   unanswered, and the archive waits rather than taking a journal a live worker is writing.
+//!   validates death through the kernel's own answer, then fences the worker's endpoint, and only
+//!   then is anything opened. A process the operating system declines to describe is not dead; it
+//!   is unanswered, and the archive leaves the session alone rather than taking a journal a live
+//!   worker is writing, or deleting the endpoint of one that is still serving.
 //! * **A reader cannot create a worker.** Every read here is a read of what is already on disk.
 //!   There is no path from a history request to a launch, and a retried create is answered from
 //!   the reservation the first one made rather than by starting a second execution.
@@ -257,11 +258,17 @@ impl ArchiveService {
 
     /// Takes exclusive recovery ownership of one session's stores.
     ///
-    /// The order is the contract, and both steps are here rather than in the caller so neither
-    /// can be skipped: the endpoint is fenced first, so nothing new reaches a worker that may be
-    /// part way through ending, and the kernel is then asked whether the recorded process is the
-    /// process that was recorded. Only a confirmed ending is death. A query the platform declines
-    /// leaves the session alone.
+    /// Death is validated first, and the endpoint is fenced only once it has been. Section 24
+    /// puts the fence before the journal is opened, which is what this keeps: nothing reaches the
+    /// stores until the endpoint is gone. What it must not do is fence first and ask afterwards,
+    /// because the answer can be *no*: a worker that is alive would then have had its published
+    /// endpoint deleted by the daemon that was only enquiring, and every client of a working
+    /// session would find nothing where its socket had been.
+    ///
+    /// Validation is the kernel's own answer, and both halves of it: the identifier and the start
+    /// value, because the kernel reuses identifiers and an unrelated program can hold the number
+    /// within milliseconds. Only a confirmed ending is death. A query the platform declines is
+    /// not death, and leaves the session alone.
     ///
     /// It never creates a worker, and there is no argument by which it could: what it takes is a
     /// directory and a database that already exist.
@@ -269,18 +276,19 @@ impl ArchiveService {
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] carrying an [`OwnershipRefusal`] when the
-    /// worker is alive or its death could not be validated.
+    /// worker is alive or its death could not be validated. Nothing has been fenced in either
+    /// case.
     pub fn take_ownership(
         &self,
         session_id: SessionId,
         display_number: kr_protocol::session::DisplayNumber,
         identity: &ProcessStartIdentity,
     ) -> Result<RecoveryOwnership> {
-        let fenced = self.fence_endpoint(session_id, display_number);
         let mut last = String::new();
         for _ in 0..DEATH_VALIDATION_ATTEMPTS {
             match kr_ipc::identity::process_state(identity) {
                 kr_ipc::identity::ProcessState::Ended => {
+                    let fenced = self.fence_endpoint(session_id, display_number);
                     return Ok(RecoveryOwnership {
                         session_id,
                         ended: identity.clone(),
@@ -313,7 +321,8 @@ impl ArchiveService {
     /// Fencing is not a message to the worker. A worker that has crashed cannot be told anything;
     /// what this does is stop a client finding a socket that no longer has a process behind it,
     /// and stop a restarted daemon rebuilding its directory from a descriptor for a session that
-    /// has ended.
+    /// has ended. It runs only after death is validated, because the endpoint it removes belongs
+    /// to a session that may still be serving.
     fn fence_endpoint(
         &self,
         session_id: SessionId,

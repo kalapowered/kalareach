@@ -1097,12 +1097,14 @@ days, so history pressure cannot delete a live dispatch barrier or a de-duplicat
 A closed or crashed session's history, final receipts and retained resource references belong to
 the environment archive service, which is a controller module and not a surviving worker.
 
-**Ownership is taken, and only after the worker is gone.** The archive fences the worker's
-published endpoint and descriptor first, so nothing new reaches a worker that may be part way
-through ending, and then asks the kernel whether the recorded process is the process that was
-recorded - both the identifier and the start value, because the kernel reuses identifiers. Only a
-confirmed ending is death. A query the platform declines is not death, and the archive waits
-rather than taking a journal a live worker may still be writing.
+**Ownership is taken, and only after the worker is gone.** The archive asks the kernel whether the
+recorded process is the process that was recorded - both the identifier and the start value,
+because the kernel reuses identifiers - and only a confirmed ending is death. Then it fences the
+worker's published endpoint and descriptor, and only then is anything opened, so nothing reaches
+the stores until the endpoint is gone. The order is that way round because the answer can be *no*:
+a daemon that fenced before it asked would delete a working session's socket on the way to finding
+out that it was working. A query the platform declines is not death either, and the archive leaves
+the session alone.
 
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the
