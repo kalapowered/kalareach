@@ -6,11 +6,13 @@
 # module binds into it: it wraps the host's read-line entry point for the reader's own boundaries,
 # it wraps the editor's own functions to observe the operations that wait for another key, and it
 # puts its end-of-file decision on the configured gesture in front of whatever was bound there.
-# Nothing it wraps is replaced, and everything it installs comes off again with the module.
+# A handler the person wrote themselves is never replaced, and everything this module installs
+# comes off again with it.
 #
-# The reader thread is where all of it runs. A timer raises an engine event, the host delivers that
-# event on the reader's own thread inside its read loop, and the mailbox is read there with the
-# editor's real buffer and invocation state in hand.
+# The reader thread is where all of it runs, and only where the reader is between operations: at
+# the read-line entry, after each of the editor's own operations has run, and in the gesture
+# handler. This editor publishes no asynchronous editing method, so a request that reaches a
+# parked reader is answered at its next step rather than at once.
 
 Set-StrictMode -Version 3.0
 
@@ -35,6 +37,10 @@ $script:Hooks = @{
 # The operations whose key wait this module observes by wrapping them. Each runs its own read loop
 # inside the handler, so being inside the wrapper is exactly being in the middle of the operation.
 # Everything else the editor has bound is wrapped too, but only to read the mailbox before it runs.
+# The editor's own ways of ending a read without a line: what follows them is a cancellation
+# rather than an accepted command.
+$script:Cancelling = @('CancelLine', 'CopyOrCancelLine', 'ViAcceptLineOrExit')
+
 $script:Observed = @(
     @{ Function = 'ReverseSearchHistory'; Pending = 'search' }
     @{ Function = 'ForwardSearchHistory'; Pending = 'search' }
@@ -187,9 +193,21 @@ function Initialize-KalaReachBridge {
 function Install-KrReadLineWrapper {
     $existing = Get-Command -Name 'PSConsoleHostReadLine' -CommandType Function -ErrorAction SilentlyContinue
     if ($null -ne $existing) { $script:Hooks.InnerReadLine = $existing.ScriptBlock }
+    # `$?` is the status of the command the person just ran, and this editor shows it. It is read
+    # here, as the host's own entry point does, because anything else run first would replace it.
     Set-Item -Path function:global:PSConsoleHostReadLine -Value {
-        Invoke-KalaReachReadLine
+        Invoke-KalaReachReadLine -LastStatus $?
     }
+}
+
+# True when the read-line entry point this module went in front of is this editor's own.
+#
+# A reader of somebody else's is a root-shell replacement rather than the editor this package was
+# qualified against, and it is reported by name instead of being bypassed.
+function Test-KrInnerReadLine {
+    $inner = $script:Hooks.InnerReadLine
+    if ($null -eq $inner) { return $true }
+    "$inner" -match 'PSConsoleReadLine\]::ReadLine'
 }
 
 # ---- the user-facing hooks, after the profile has run -----------------------------------------------
@@ -204,6 +222,15 @@ function Enable-KalaReachHooks {
 
     if ($script:Hooks.Activated -or -not $script:Kr.Registered) { return }
     $script:Hooks.Activated = $true
+
+    if (-not (Test-KrInnerReadLine)) {
+        # Somebody else's reader was already the host's entry point, so the editor this package
+        # was qualified against is not the one reading this shell.
+        Send-KrIntegrationLost 'post_startup_failure' 'another read-line entry point is installed'
+        Write-KrDiagnostic 'reader_replaced' 'another read-line entry point is installed'
+        Send-KrHooksActivated ([uint64]($script:State.PromptGeneration + 1))
+        return
+    }
 
     $installed = Install-KrObservedHandlers
     Write-KrTrace ("wrapped " + (@($installed) -join ' '))
@@ -231,22 +258,51 @@ function Install-KrObservedHandlers {
     $bound = try { Get-PSReadLineKeyHandler -Bound } catch { @() }
     $pendingFor = @{}
     foreach ($observed in $script:Observed) { $pendingFor[$observed.Function] = $observed.Pending }
+    # What the person wrote themselves, read from the editor's own table rather than from the
+    # description a handler carries: a script of theirs can be described by any name at all,
+    # including the name of one of the editor's own operations.
+    $theirs = Get-KrScriptChords
     foreach ($binding in @($bound)) {
         $name = "$($binding.Function)"
+        $chord = "$($binding.Key)"
         if ([string]::IsNullOrEmpty($name) -or $name -eq 'CustomAction') { continue }
-        $chord = $binding.Key
+        if ($theirs.PSBase.ContainsKey($chord)) { continue }
+        if ($null -eq [Microsoft.PowerShell.PSConsoleReadLine].GetMethod(
+                $name, [type[]]@([System.Nullable[System.ConsoleKeyInfo]], [object]))) {
+            # Not one of this editor's own operations, whatever it is called.
+            continue
+        }
         $pending = if ($pendingFor.PSBase.ContainsKey($name)) { $pendingFor[$name] } else { '' }
         $block = [scriptblock]::Create(
             "param(`$key, `$arg) Invoke-KalaReachPending -Function '$name' -Pending '$pending' -Key `$key -Argument `$arg")
         try {
             Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock $block `
                 -BriefDescription $name -Description "KalaReach: $name"
-            $wrapped.Add("$chord=$name")
+            $wrapped.Add(@{ Chord = $chord; Function = $name })
         } catch {
             Write-KrTrace "wrap failed $chord $name : $($_.Exception.Message)"
         }
     }
     $wrapped
+}
+
+# Puts back every operation of the editor's own that this module went in front of.
+#
+# Only the ones it still owns: a chord the person has bound since is theirs, and it stays as they
+# left it.
+function Restore-KrObservedHandlers {
+    foreach ($entry in @($script:Hooks.Wrapped)) {
+        $current = try {
+            Get-PSReadLineKeyHandler -Chord $entry.Chord -ErrorAction SilentlyContinue
+        } catch { $null }
+        if ($null -eq $current -or "$($current.Description)" -ne "KalaReach: $($entry.Function)") {
+            continue
+        }
+        try { Set-PSReadLineKeyHandler -Chord $entry.Chord -Function $entry.Function } catch {
+            Write-KrTrace "restore failed $($entry.Chord): $($_.Exception.Message)"
+        }
+    }
+    $script:Hooks.Wrapped = @()
 }
 
 # The named handler: this module's decision goes in front of whatever was on the gesture key.
@@ -285,20 +341,45 @@ function Install-KrGestureHandler {
     @{ Ok = $true; Reason = ''; Detail = '' }
 }
 
-# The script block behind a user's own handler, so it keeps running outside the detach condition.
-function Get-KrCustomHandler {
-    param([string]$Chord)
+# Every chord the person has put a script of their own on, with the script.
+function Get-KrScriptChords {
+    $chords = @{}
     try {
         $type = [Microsoft.PowerShell.PSConsoleReadLine]
         $singleton = $type.GetField('_singleton', 'NonPublic,Static').GetValue($null)
         $table = $type.GetField('_dispatchTable', 'NonPublic,Instance').GetValue($singleton)
         foreach ($entry in $table.GetEnumerator()) {
-            if ("$($entry.Key)" -eq $Chord -and $null -ne $entry.Value.ScriptBlock) {
-                return $entry.Value.ScriptBlock
-            }
+            if ($null -ne $entry.Value.ScriptBlock) { $chords["$($entry.Key)"] = $entry.Value.ScriptBlock }
         }
     } catch { }
+    $chords
+}
+
+# The script block behind a user's own handler, so it keeps running outside the detach condition.
+function Get-KrCustomHandler {
+    param([string]$Chord)
+    $chords = Get-KrScriptChords
+    if ($chords.PSBase.ContainsKey($Chord)) { return $chords[$Chord] }
     $null
+}
+
+# Moves the gesture to the key the terminal now names, keeping whatever was bound to either.
+#
+# A person who changes their terminal's own end-of-file character changes which key this decision
+# belongs on. The one it was on goes back to what it was doing before.
+function Sync-KrGestureHandler {
+    $wanted = if ($script:Kr.GestureDisabled) { $null } else {
+        if ($null -ne $script:Kr.GestureChord) { $script:Kr.GestureChord }
+        else { Get-KrChordForByte ([int]$script:Kr.GestureByte) }
+    }
+    if ("$wanted" -eq "$($script:Hooks.GestureChord)") { return }
+    Restore-KrGestureHandler
+    if ($null -eq $wanted) { return }
+    $gesture = Install-KrGestureHandler
+    if (-not $gesture.Ok) {
+        Send-KrIntegrationLost 'post_startup_failure' $gesture.Detail
+        Write-KrDiagnostic $gesture.Reason $gesture.Detail
+    }
 }
 
 function Restore-KrGestureHandler {
@@ -326,8 +407,9 @@ function Invoke-KalaReachReadLine {
     The host's read-line entry point, with the reader's own boundaries around it.
     #>
     [CmdletBinding()]
-    param()
+    param([bool]$LastStatus = $true)
 
+    $script:State.LastStatus = $LastStatus
     if (-not $script:Hooks.Activated) {
         # The profile has run by the time the host asks for a line, and the reader has not started.
         Enable-KalaReachHooks
@@ -337,7 +419,6 @@ function Invoke-KalaReachReadLine {
     $script:State.InsideReader++
     $script:State.Installed = ''
     $script:State.AcceptRequested = $false
-    $script:State.CancelRequested = $false
     $script:State.IdleReported = $false
     $script:State.InvokingKeys = [byte[]]::new(0)
     $script:State.Reading = $false
@@ -353,8 +434,11 @@ function Invoke-KalaReachReadLine {
 
     $accepted = $false
     try {
-        $line = [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($Host.Runspace, $ExecutionContext, $true)
-        $accepted = $null -ne $line
+        $line = [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine(
+            $Host.Runspace, $ExecutionContext, $script:State.LastStatus)
+        # This editor ends an interrupted read the same way it ends an accepted empty one, so what
+        # separates them is the operation the person's key ran.
+        $accepted = ($null -ne $line) -and -not $script:State.Cancelled
         $line
     } finally {
         $script:State.InsideReader--
@@ -419,9 +503,7 @@ function Invoke-KalaReachPending {
     # happens there, the key the person pressed still does what the editor says it does.
     # The editor is reading, which is what makes its buffer this reader's own.
     $script:State.Reading = $true
-    try { Invoke-KalaReachService } catch {
-        Write-KrTrace "the key boundary did not read the mailbox: $($_.Exception.Message)"
-    }
+    $script:State.Cancelled = $false
     if (-not [string]::IsNullOrEmpty($Pending)) { $script:Pending[$Pending]++ }
     $script:State.IdleReported = $false
     # The sequence that invoked this operation is what the reader is in the middle of, and it is
@@ -439,8 +521,15 @@ function Invoke-KalaReachPending {
     } finally {
         if (-not [string]::IsNullOrEmpty($Pending)) { $script:Pending[$Pending]-- }
         $script:State.InvokingKeys = $previousKeys
-        $script:State.CancelRequested = $false
         $script:State.IdleReported = $false
+        # The person's key has run and the reader is between operations, which is where its own
+        # queue is read. Nothing of the worker's is answered while a key of theirs is still
+        # waiting to run: what it would be told, and what it would install, is not what the
+        # reader is about to have.
+        $script:State.Cancelled = $script:Cancelling -contains $Function
+        try { Invoke-KalaReachService } catch {
+            Write-KrTrace "the key boundary did not read the mailbox: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -455,8 +544,11 @@ function Invoke-KalaReachGesture {
     # The editor is reading, which is what makes its buffer this reader's own.
     $script:State.Reading = $true
     # The mailbox is read first: the fence this decision rests on is the one the worker last
-    # published, and a frame already on the endpoint belongs before this key.
-    Invoke-KrService
+    # published, and a frame already on the endpoint belongs before this key. Whatever happens
+    # there, the key the person pressed still does what the editor says it does.
+    try { Invoke-KrService } catch {
+        Write-KrTrace "the gesture did not read the mailbox: $($_.Exception.Message)"
+    }
 
     $byte = 0
     if ($null -ne $Key -and $Key.KeyChar -ne [char]0) { $byte = [int]$Key.KeyChar }
@@ -660,10 +752,14 @@ function Remove-KalaReachHooks {
     [CmdletBinding()]
     param()
     Restore-KrGestureHandler
+    Restore-KrObservedHandlers
     if ($null -ne $script:Hooks.InnerReadLine) {
         Set-Item -Path function:global:PSConsoleHostReadLine -Value $script:Hooks.InnerReadLine
+    } else {
+        Remove-Item -Path function:global:PSConsoleHostReadLine -ErrorAction SilentlyContinue
     }
     $script:Hooks.Activated = $false
+    Disconnect-KrEndpoint
 }
 
 $ExecutionContext.SessionState.Module.OnRemove = { Remove-KalaReachHooks }

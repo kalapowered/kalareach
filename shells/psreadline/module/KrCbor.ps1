@@ -58,10 +58,19 @@ function Write-KrCborValue {
         return
     }
     if ($Value -is [hashtable]) {
-        # Canonical order: the shorter key first, then bytewise. The map is reached through its
-        # own base object, because a key named after one of its properties would otherwise answer
-        # in the property's place.
-        $entries = @($Value.PSBase.Keys | Sort-Object -Property @{ Expression = { "$_".Length } }, @{ Expression = { "$_" } })
+        # Canonical order: the shorter key first, then by the bytes themselves. Both are measured
+        # on the encoded bytes rather than on the text, because the text's own order depends on
+        # where the shell is running and a key outside ASCII is longer than it looks. The map is
+        # reached through its own base object, because a key named after one of its properties
+        # would otherwise answer in the property's place.
+        $entries = @($Value.PSBase.Keys | Sort-Object -Property @{
+            Expression = { [System.Text.Encoding]::UTF8.GetByteCount("$_") }
+        }, @{
+            Expression = {
+                ([System.Text.Encoding]::UTF8.GetBytes("$_") |
+                    ForEach-Object { $_.ToString('x2') }) -join ''
+            }
+        })
         Write-KrCborHead $Writer 5 ([uint64]$entries.Length)
         foreach ($key in $entries) {
             Write-KrCborValue $Writer ([string]$key)

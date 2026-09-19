@@ -586,9 +586,11 @@ effect at the next prompt.
 
 This package rebuilds no shell. PSReadLine is the editor the person already has, and the module
 binds into it: it wraps the host's own read-line entry point for the reader's boundaries, wraps the
-editor's own functions that run an inner read loop so the states they wait in are observable, and
-puts its end-of-file decision on the configured gesture in front of whatever was bound there.
-Nothing it wraps is replaced, and everything it installs comes off again with the module.
+editor's own operations so the reader has a boundary to answer at and the states they wait in are
+observable, and puts its end-of-file decision on the configured gesture in front of whatever was
+bound there. A handler the person wrote themselves is left exactly as it is, identified by what the
+editor holds rather than by the name a handler carries, and everything the module installs is put
+back when it is removed.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
@@ -604,17 +606,26 @@ method, and that is exactly what it cannot do:
   therefore answered at its next step rather than immediately, and until then the reader's last
   idle report is what the worker has to go on.
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
-  state check and the installation all happen on the reader's thread, inside the fence. The
-  acceptance is submitted to the editor's own accept and its own return key is put in the editor's
-  own key queue, which is drained before anything the terminal has; the editor completes it when it
-  next steps.
-- **A cancellation ends what the module owns.** The operations the module wraps come out at their
-  next key; an operation the editor runs inside its own nested read is left to finish, and the
-  report says nothing was ended rather than claiming otherwise. The worker then withholds the fence
-  until the queues drain, which is the fail-safe answer.
+  state check and the installation all happen on the reader's thread, inside the fence, at a point
+  where the reader is between operations: a key of the person's that has been read and not yet run
+  is never one the launch goes in front of. Inside the reader's own key dispatch the editor's own
+  accept ends the read; before the read has started there is nothing to end, so the editor's own
+  return key goes into its own key queue instead, which is drained before anything the terminal
+  has.
+- **A cancellation ends nothing here, and says so.** Every operation that waits for another key
+  runs this editor's own read loop, and nothing of the module's runs on the reader's thread while
+  one is running, so a cancellation arrives after the operation it was meant for has finished or
+  not at all. The report names nothing ended, discards nothing and leaves the line alone; the
+  worker then withholds the fence until the reader's own queues drain, which is the fail-safe
+  answer.
 - **The queues are the editor's own.** The reader's key queue is read directly, under the version
   range this package was qualified against. Asking the console whether a key is available instead
   would take the lock the editor's own read is holding, and the reader would wait for itself.
+- **What the reader cannot prove, it does not claim.** The editor decodes the terminal's bytes
+  inside its own key read, where nothing of the module's runs, so a sequence half-read there is
+  not in any queue the module can report. The module answers only between operations, which is
+  where that decoding has finished; a fence asked while the reader is blocked on a key is answered
+  at its next step, against the state it has then.
 - **The buffer belongs to the read that is in progress.** Between one line being accepted and the
   next read starting, the editor still holds the line that has gone; the module reports the buffer
   it is about to have, which is empty, and counts no change the person did not make.

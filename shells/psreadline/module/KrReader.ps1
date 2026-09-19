@@ -153,9 +153,10 @@ function Get-KrReaderState {
 
     Update-KrRevisions $State
     $text = $State.BufferSeen
+    # The keys this editor has read and not yet acted on. The module answers only where the
+    # reader is between operations, so there is never one selected and unrun on top of these.
     $queued = Get-KrQueuedKeys
     $typeahead = $queued
-    if ($State.KeySelected) { $typeahead++ }
     $modes = Get-KrEditorModes
 
     @{
@@ -223,16 +224,24 @@ function Invoke-KrRemoveInstalled {
 
 $script:KeyFromConsoleKey = $null
 
-# Accepts the installed line through the editor's own acceptance.
+# Accepts the installed line through the editor's own acceptance, once.
 #
-# The acceptance is submitted twice over, because this editor completes it at its own next step
-# rather than where it is asked: the editor's own accept is called, and its own return key goes
-# into its own key queue, which is drained before anything the terminal has. The module claims no
-# asynchronous editing method the editor does not have, so a line installed while the reader is
-# waiting for a key is accepted when the reader next steps.
+# Where the acceptance goes depends on where the reader is. Inside its own key dispatch the
+# editor's accept is what ends the read, and it takes effect when the operation returns. Before
+# the read has started there is nothing to end, so the editor's own return key goes into its own
+# key queue instead, which is drained before anything the terminal has. The module claims no
+# asynchronous editing method the editor does not have: a line installed at a parked reader is
+# accepted when the reader next steps.
 function Invoke-KrAcceptLine {
     param([hashtable]$State)
     $State.Installed = ''
+    if ($State.Reading) {
+        try { $script:Rl::AcceptLine() } catch {
+            Write-KrTrace "accept failed: $($_.Exception.Message)"
+            return $false
+        }
+        return $true
+    }
     try {
         if ($null -eq $script:KeyFromConsoleKey) {
             $keyInfo = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo')
@@ -241,46 +250,38 @@ function Invoke-KrAcceptLine {
                     'From', 'Public,NonPublic,Static', $null, [type[]]@([System.ConsoleKey]), $null)
             }
         }
-        if ($null -ne $script:KeyFromConsoleKey) {
-            $singleton = $script:SingletonField.GetValue($null)
-            $queue = $script:QueuedKeysField.GetValue($singleton)
-            $queue.Enqueue($script:KeyFromConsoleKey.Invoke($null, @([System.ConsoleKey]::Enter)))
-        }
+        if ($null -eq $script:KeyFromConsoleKey) { return $false }
+        $singleton = $script:SingletonField.GetValue($null)
+        $queue = $script:QueuedKeysField.GetValue($singleton)
+        $queue.Enqueue($script:KeyFromConsoleKey.Invoke($null, @([System.ConsoleKey]::Enter)))
     } catch {
         Write-KrTrace "queueing the acceptance failed: $($_.Exception.Message)"
-    }
-    try { $script:Rl::AcceptLine() } catch {
-        Write-KrTrace "accept failed: $($_.Exception.Message)"
         return $false
     }
     $true
 }
 
-# Ends a pending key wait without losing the edit buffer, reporting what it ended.
+# Reports what a cancellation ended here, which is nothing this editor is inside.
 #
-# Every operation this reader can be waiting inside runs its own read loop inside the wrapper this
-# module put in front of it, and each wrapper watches for the cancellation the same way. Nothing
-# here touches the line.
+# Every operation that waits for another key runs this editor's own read loop, and nothing of this
+# module's runs on the reader's thread while one of them is running: the mailbox is read between
+# operations, so a cancellation arrives after the operation it was meant for has finished or not
+# at all. There is no published way to bring this reader out of one from anywhere else.
+#
+# So this ends nothing and says so, which is the fail-safe answer: the worker withholds the fence
+# until the reader's own queues drain, and the person's line and their typed-ahead keys are left
+# exactly as they are.
 function Invoke-KrCancelKeyWait {
     param([hashtable]$State)
-    $ended = @{
+    @{
         partial_escape    = $false
-        quoted_insertion  = [bool]($script:Pending.quoted_insertion -gt 0)
-        vi_motion         = [bool]($script:Pending.vi_motion -gt 0)
-        multikey_sequence = [bool]($script:Pending.multikey_sequence -gt 0)
-        macro_input       = [bool]($script:Pending.macro_input -gt 0)
+        quoted_insertion  = $false
+        vi_motion         = $false
+        multikey_sequence = $false
+        macro_input       = $false
         buffer_preserved  = $true
         discarded_bytes   = [uint64]0
     }
-    $inside = $ended.quoted_insertion -or $ended.vi_motion -or $ended.multikey_sequence -or
-              $ended.macro_input -or ($script:Pending.search -gt 0) -or ($script:Pending.paste -gt 0)
-    if ($inside) {
-        # The wrappers watch this: the one that is running comes out at its next key, leaving the
-        # buffer as it found it.
-        $State.CancelRequested = $true
-        $ended.discarded_bytes = Get-KrQueuedKeys
-    }
-    $ended
 }
 
 # `argument` as one literal argument of this shell.
@@ -332,6 +333,8 @@ function Get-KrTerminalEof {
 # The chord a byte from the line discipline corresponds to, as this reader names its keys.
 function Get-KrChordForByte {
     param([int]$Byte)
+    if ($Byte -eq 127) { return 'Backspace' }
+    if ($Byte -ge 32 -and $Byte -le 126) { return [string][char]$Byte }
     if ($Byte -lt 1 -or $Byte -gt 31) { return $null }
     $letter = [char](64 + $Byte)
     'Ctrl+' + ([string]$letter).ToLowerInvariant()

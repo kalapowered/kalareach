@@ -4,9 +4,9 @@
 #
 # The contract is the same one every managed package answers; what is particular here is the
 # mechanism. This reader has no patch behind it and no asynchronous editing method of its own, so
-# the module supplies the queue and the signal: a timer raises an engine event, the host delivers
-# it on the reader's own thread inside its read loop, and everything below runs there. Nothing here
-# blocks the reader: the socket is non-blocking and the mailbox is read between operations.
+# the module supplies the queue and reads it where the editor reads its own: between the reader's
+# operations, on the reader's own thread. Nothing here blocks the reader; the socket is
+# non-blocking, and a request that arrives at a parked reader waits for its next step.
 
 Set-StrictMode -Version 3.0
 
@@ -60,10 +60,10 @@ $script:State = @{
     CwdSeen          = ''
     InsideReader     = 0
     InvokingKeys     = [byte[]]::new(0)
-    KeySelected      = $false
+    Cancelled        = $false
+    LastStatus       = $true
     Installed        = ''
     AcceptRequested  = $false
-    CancelRequested  = $false
     IdleReported     = $false
     Reading          = $false
     EditMode         = 'Emacs'
@@ -86,6 +86,15 @@ function Write-KrTrace {
 
 function Get-KrNowMs {
     [uint64][Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+}
+
+# Milliseconds on a clock that only goes forward, for the budgets a decision is measured against.
+#
+# The time of day can be set while a reader is waiting, and a launch's deadline is a duration
+# rather than a moment.
+function Get-KrTickMs {
+    [uint64]([System.Diagnostics.Stopwatch]::GetTimestamp() /
+        ([System.Diagnostics.Stopwatch]::Frequency / 1000))
 }
 
 function Get-KrProcessIdentity {
@@ -428,6 +437,9 @@ function Invoke-KrPromoteGesture {
     $script:Kr.GestureDisabled = $script:Kr.PendingDisabled
     $script:Kr.GestureByte = $script:Kr.PendingByte
     $script:Kr.PendingGesture = $false
+    # The decision belongs on the key the terminal now names, and the key it was on goes back to
+    # what it was doing.
+    if ($script:Hooks.Activated) { Sync-KrGestureHandler }
 }
 
 function Send-KrEditorEnter {
@@ -667,7 +679,7 @@ function Invoke-KrAnswerLaunch {
     $expectedBuffer = [uint64]$Request['expected_buffer_revision']
     $expectedCwd = [uint64]$Request['expected_cwd_revision']
     $deadline = [uint64]$Request['deadline_ms']
-    $waited = (Get-KrNowMs) - $script:Kr.FrameAtMs
+    $waited = (Get-KrTickMs) - $script:Kr.FrameAtMs
     $reader = Get-KrReaderState $script:State
 
     if ($Revoked) {
@@ -707,7 +719,7 @@ function Invoke-KrAnswerLaunch {
     }
     # Building the line took time of its own. Past the budget nothing is installed, which is what
     # makes "install no command" a fact rather than a hope.
-    if (((Get-KrNowMs) - $script:Kr.FrameAtMs) -ge $deadline) {
+    if (((Get-KrTickMs) - $script:Kr.FrameAtMs) -ge $deadline) {
         Send-KrLaunchRejection $Id $transaction $fenceId 'timeout' $reader; return
     }
     if (-not (Invoke-KrInstallCommand $script:State $text)) {
@@ -911,20 +923,17 @@ function Invoke-KrFrame {
 function Invoke-KrService {
     if (-not $script:Kr.Registered -or $null -eq $script:Kr.Socket) { return }
     if ($script:Kr.Servicing) { return }
-    if ($script:State.CancelRequested) {
-        # The reader has not come out of the operation the last cancellation ended. Whatever is
-        # waiting stays on the endpoint until it has.
-        return
-    }
     $script:Kr.Servicing = $true
     try {
         if (-not (Receive-KrAvailable)) { return }
+        # Every frame this read took off the endpoint arrived by now, so each one is judged
+        # against the time the reader reached them rather than the time its turn came.
+        $arrived = Get-KrTickMs
         while ($true) {
             $body = Read-KrFrame
             if ($null -eq $body -or -not $script:Kr.Registered) { break }
-            $script:Kr.FrameAtMs = Get-KrNowMs
+            $script:Kr.FrameAtMs = $arrived
             Invoke-KrFrame $body
-            if ($script:State.CancelRequested) { break }
         }
     } finally {
         $script:Kr.Servicing = $false
