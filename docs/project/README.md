@@ -698,10 +698,13 @@ work is the one a caller gets by asking for it plainly.
 
 An apply carries **operations**, not only content: a path the version holds is installed, and a
 path the version's working tree deleted is taken away. A deletion travels with the object its base
-revision held, its mode, and this host's own copy of that content, so a revert puts the file back
-without depending on the destination's repository still holding the object, and a version whose
-only change is a deletion reads as that change rather than as an empty diff. What the base held has
-to be file content: a deleted link or submodule is a revert this host refuses rather than writing
+revision held, its mode, and, for a version captured from a repository, this host's own copy of
+that content, so a revert puts the file back without depending on the destination's repository
+still holding the object. A version **derived** from a materialisation is read from a directory
+rather than from a repository, so its deletions carry the object and the mode but no content, and
+reverting one of those does read the destination's repository. A version whose only change is a
+deletion reads as that change rather than as an empty diff. What the base held has to be file
+content either way: a deleted link or submodule is a revert this host refuses rather than writing
 out as a regular file. A
 request that names no paths carries every one of them, and one that names paths carries exactly
 those.
@@ -734,8 +737,12 @@ replace. What it carries is the platform's mode bits. An access-control list bes
 **not** carry, and a destination that has one is a path it refuses rather than replaces, so the
 protection is never lost quietly. That is the answer on macOS, which keeps a list beside the mode
 bits, and on Linux, where the question is whether the file carries the extended attribute a list
-lives in: a file whose protection is its mode bits alone carries none. On a platform whose lists
-this host does not read, only the mode bits are carried. Content is written byte for
+lives in: a file whose protection is its mode bits alone carries none. A directory can also put a
+list on every file made inside it, so the copy this host stages is asked as well and, on Linux,
+that inherited list is taken off it before the mode is set; on macOS it is not, which is a limit
+this host states rather than one it closes. On a platform whose lists this host does not read,
+only the mode bits are carried. **Preserving** a destination's list is not implemented at all: a
+destination that has one is refused. Content is written byte for
 byte, so a line ending is whatever the version holds.
 
 An apply comes to one of five classes. **A preflight conflict is an error, not a result**:
