@@ -1228,33 +1228,59 @@ fn names_in(directory: &Path) -> Vec<String> {
 #[cfg(unix)]
 fn start_daemon(program: &Path, host: &kr_ipc::testing::TempHost) -> Daemon {
     let logs = host.root().join("daemon.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&logs)
-        .expect("opens the daemon's log");
-    std::process::Command::new(program)
-        // The daemon starts in a directory on the internal disk rather than inheriting this test's
-        // own, which is inside the checkout. A copied binary is a new program as far as the
-        // operating system's privacy rules are concerned, and a new program whose working directory
-        // is on a removable volume is one the system stops to ask the user about.
-        .current_dir(host.root())
-        .arg("--runtime-dir")
-        .arg(host.root().join("r"))
-        .arg("--state-dir")
-        .arg(host.root().join("s"))
-        .arg("--worker")
-        .arg(host.root().join("no-such-worker"))
-        // Its device keys belong to this run: they go in this environment's own secrets directory
-        // and leave with the temporary host, rather than into the person's credential store.
-        .arg("--secret-store")
-        .arg("file")
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone().expect("duplicates the log"))
-        .stderr(log)
-        .spawn()
-        .map(|child| Daemon(Some(child)))
-        .expect("starts the daemon")
+    // A bounded retry, for one race and nothing else. The tests in this binary run in threads of
+    // one process, and a child one of them forks inherits a copy of every descriptor open at that
+    // moment - including the one another test's copy of this daemon is being written through. Linux
+    // refuses to execute a file any process still holds open for writing, with ETXTBSY, and the
+    // window closes as soon as that child reaches its own exec. Nothing about the daemon or the
+    // copy is wrong when that happens, and it is not something a lock or serial tests would fix:
+    // the race is between processes rather than between these tests.
+    const ATTEMPTS: usize = 100;
+    const BETWEEN: std::time::Duration = std::time::Duration::from_millis(10);
+
+    let mut attempted = 0;
+    loop {
+        attempted += 1;
+        // Reopened for each attempt, because the handles go to the child rather than staying here.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&logs)
+            .expect("opens the daemon's log");
+        let started = std::process::Command::new(program)
+            // The daemon starts in a directory on the internal disk rather than inheriting this
+            // test's own, which is inside the checkout. A copied binary is a new program as far as
+            // the operating system's privacy rules are concerned, and a new program whose working
+            // directory is on a removable volume is one the system stops to ask the user about.
+            .current_dir(host.root())
+            .arg("--runtime-dir")
+            .arg(host.root().join("r"))
+            .arg("--state-dir")
+            .arg(host.root().join("s"))
+            .arg("--worker")
+            .arg(host.root().join("no-such-worker"))
+            // Its device keys belong to this run: they go in this environment's own secrets
+            // directory and leave with the temporary host, rather than into the person's
+            // credential store.
+            .arg("--secret-store")
+            .arg("file")
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("duplicates the log"))
+            .stderr(log)
+            .spawn();
+        match started {
+            Ok(child) => return Daemon(Some(child)),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempted < ATTEMPTS =>
+            {
+                std::thread::sleep(BETWEEN);
+            }
+            Err(error) => {
+                panic!("the daemon starts, after {attempted} attempts: {error:?}");
+            }
+        }
+    }
 }
 
 /// Waits for a daemon to answer on its control endpoint.
