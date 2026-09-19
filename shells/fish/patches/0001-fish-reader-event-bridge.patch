@@ -165,10 +165,16 @@
  use super::{
      binding::match_key_event_to_key,
      input::{
-@@ -43,6 +45,11 @@
+@@ -43,26 +45,58 @@
  
  trait InputEventQueuerExt: InputEventQueuer {
      fn on_byte_read(&mut self, read_byte: u8) {
++        if read_byte != b'\x1b' && self.paste_is_buffering() {
++            // A byte the paste is collecting belongs to the paste, not to a key this reader is
++            // still decoding: it is taken here before anything below holds it.
++            self.paste_push_char(read_byte);
++            return;
++        }
 +        // Bytes this reader has taken and not yet turned into a key are input it still owes the
 +        // buffer, so it is not between operations while it holds them. This covers the rest of a
 +        // character and the rest of an escape sequence alike, and the byte it starts with is
@@ -177,7 +183,14 @@
          let mut buffer = vec![read_byte];
          let escape_sequence = if read_byte == b'\x1b' {
              self.parse_escape_sequence(&mut buffer, false)
-@@ -57,12 +64,31 @@
+         } else {
+-            if self.paste_is_buffering() {
+-                self.paste_push_char(read_byte);
+-                return;
+-            }
+             EscapeSequenceParseResult {
+                 state: EscapeSequenceParseState::Incomplete,
+                 unconsumed_escapes: 0,
              }
          };
          let (decoded_buffer, mut is_err) = match decode_utf8_at_least_one(&mut buffer, |buffer| {
@@ -191,6 +204,11 @@
 +            // the bridge waits here alongside the terminal, and what it asks for is answered
 +            // before the character it interrupts is finished.
 +            let byte = loop {
++                if self.bridge_cancelled() {
++                    // A takeover has already ended this reader's wait, so the rest of this
++                    // character is not coming and nothing waits for it.
++                    break 0;
++                }
 +                match next_input_event(
 +                    self.get_in_fd(),
 +                    self.get_ioport_fd(),
@@ -212,10 +230,11 @@
 +                }
 +            };
 +            buffer.push(byte);
++            kr_bridge::note_partial_byte();
          }) {
              Ok(decoded) => (decoded, false),
              Err(evt) => {
-@@ -70,6 +96,13 @@
+@@ -70,6 +104,13 @@
                  (Default::default(), true)
              }
          };
@@ -229,7 +248,7 @@
          is_err |= matches!(escape_sequence.state, EscapeSequenceParseState::Error);
          let mut evt = (!is_err).then(|| {
              match escape_sequence.state {
-@@ -707,7 +740,9 @@
+@@ -707,7 +748,9 @@
  
  fn decode_utf8_at_least_one(
      buffer: &mut Vec<u8>,
