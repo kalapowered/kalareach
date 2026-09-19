@@ -281,7 +281,9 @@ reports an agent at work, a session waiting for a decision to be answered, or a 
 still stopping processes and draining their output. Work begins and ends without this daemon being
 told, so while the setting is on it looks at the question every fifteen seconds as well as whenever
 a session is created or closed and whenever it is asked; while the setting is off nothing looks at
-anything. Each session gets half a second to answer and the whole round two seconds, so the answer
+anything. A close that arrived over the network is the same outstanding work as a local one and
+reaches the same review, so a closure a device asked for keeps the machine awake while it finishes
+rather than releasing an assertion the host never took. Each session gets half a second to answer and the whole round two seconds, so the answer
 does not get slower as sessions are added. Host status, `kr status` and `kr doctor` each print what
 is held and why.
 
@@ -614,9 +616,13 @@ What a device reaches, in order:
 2. **Paired**, it gets an authorised connection whose actor the daemon constructs: `paired_device`
    ingress, the device, the grant and the revision it was validated at, the controller generation
    that admitted the connection, and the connection's own identity.
-3. **Reads the daemon owns** — the host, the environment, the session list and one session's
-   metadata — are answered by the daemon.
-4. **Everything a session owns** is forwarded to the worker over a link the daemon opened for that
+3. **Reads the daemon owns** — the host, the environment list, the environment's capability
+   records, the diagnostics, the session list, one session's metadata, and the repository and
+   workspace metadata — are answered by the daemon, out of the same call a local caller reaches.
+4. **Effects the daemon owns** — creating a session, and the repository and workspace mutations —
+   are performed by the daemon, on a task that outlives the connection that asked. They name no
+   session, so no worker owns them.
+5. **Everything a session owns** is forwarded to the worker over a link the daemon opened for that
    connection, under the verified envelope and the deadline the daemon accepted, through the same
    serial barrier a local caller's mutation passes through. That link declares itself a proxy before
    it presents a generation token, so a device's attachment, subscription and input lane belong to a
@@ -631,9 +637,12 @@ What the grant decides, for every request:
   admits. A listing names no session, so the *answer* is narrowed instead: a device is told about
   the sessions its grant admits and no others.
 * **Rights.** Every right the method requires unconditionally, and every conditional one whose
-  condition this request meets — a `session.attach` that claims geometry needs `terminal.geometry`,
-  whether or not the worker would have given it the capability. A condition the daemon cannot
-  decide is treated as holding, so the right is asked for rather than skipped.
+  condition this request meets — a `session.attach` whose `claim_geometry` registers a claim needs
+  `terminal.geometry`. A condition the daemon cannot decide is treated as holding, so the right is
+  asked for rather than skipped. *Asking for* a capability is not one of these conditions: it is a
+  request the host intersects, described below.
+* **Capabilities.** What an attachment is granted is what it asked for intersected with the rights
+  the grant carries, made where the attachment is admitted. See "What an attachment may do".
 * **History.** Retained history is not served to a device at all: its scope is the grant's lower
   bound, that bound is a moment in time and a history page is a byte range, and a host that cannot
   narrow content to a grant refuses it rather than serving more than the grant allows. The
@@ -672,6 +681,52 @@ bounded in bytes, not in messages, at section 9's send queue per peer; a device 
 bound loses its link, which takes its subscription and its attachment with it, and section 8 has it
 reconnect and resume from the cursor it holds. Holding the worker's own delivery task instead would
 make one slow device everybody's problem.
+
+### What an attachment may do
+
+Section 8 separates three things: observing a session, owning its size and holding its input. What
+an attachment is granted is what it asked for intersected with the rights of the grant the request
+was checked against, capability by capability:
+
+| Capability | The right that carries it |
+| --- | --- |
+| `observe_terminal` | `session.view` |
+| `observe_semantic` | `session.view` |
+| `input` | `terminal.input` |
+| `geometry` | `terminal.geometry` |
+
+The table is `kr_protocol::rights::attachment_capability_right`, beside the action vocabulary, so a
+right added to the vocabulary has to be decided for the capabilities rather than defaulting into
+one. The intersection is made in the worker, where the attachment is admitted, because that is
+where the attachment's own record is written: the summary the caller is given then says what it
+actually holds, and every later operation — resizing, transferring the size, acquiring the lease,
+writing input — is checked against that record rather than against the grant a second time.
+
+Asking for a capability the grant does not carry is not a refusal. A client that asks for
+everything it can use gets an attachment without the parts its grant does not reach, which is what
+an intersection is for; registering a geometry claim is the separate thing, and that does need the
+right before anything is admitted.
+
+Exactly one caller is not narrowed: a local caller on the worker's own socket holding no grant. Its
+peer credentials already proved it is this user and the worker's own authority covers its session.
+Everything else is narrowed, so a caller that reached the host some other way and named no grant
+receives nothing rather than everything.
+
+### Repositories and working copies over the network
+
+The registry admits a paired device to all ten project and workspace methods, and the daemon serves
+them through the same call a local caller reaches, so a device's `project.list` and the owner's are
+one answer. The mutations take the daemon's own path: the action's route is recorded with this host
+named as the owner of what it produces, the envelope is checked — a project acts on a repository or
+a working copy, so a target naming a session or an application is refused — and the effect runs on
+a task a dropped connection cannot cancel part way. `Controller::project_mutation` is the one place
+either door reaches the service from, and it asks about the admission the ingress recorded
+immediately before the write.
+
+What a device is additionally held to is its grant: `project.create` for initialising, cloning and
+adopting, `workspace.manage` for creating and removing a working copy. The four reads require no
+right of their own, so a grant that covers the environment reads the whole repository and workspace
+surface.
 
 ## What the host owes the transport
 

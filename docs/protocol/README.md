@@ -417,6 +417,41 @@ Reading the fields:
 - `input.write` is the only method with `ordered_stream` idempotency and an `input_lease` freshness
   context. Raw input is an ordered stream per connection, never replayed after a reconnect.
 
+### Rights and capabilities are not the same thing
+
+A right is what a grant permits. A capability is what a binding can currently do. Capability
+evidence never creates authority, and a role or configuration label never short-circuits a rights
+check: the entries above are the only thing that decides a method.
+
+The one place the two meet is the attachment capability set, and they meet as an intersection
+rather than as a substitution. `session.attach` carries the capabilities the attachment asks for,
+and what it is granted is those intersected with the rights of the grant the host checked the
+request against:
+
+| Capability | The right that carries it |
+| --- | --- |
+| `observe_terminal` | `session.view` |
+| `observe_semantic` | `session.view` |
+| `input` | `terminal.input` |
+| `geometry` | `terminal.geometry` |
+
+The table is `kr_protocol::rights::attachment_capability_right`, beside the action vocabulary in
+`crates/kr-protocol/src/rights.rs`, so a right added to the vocabulary has to be decided for the
+capabilities rather than defaulting into one; `permitted_attachment_capabilities` applies it.
+
+Three consequences follow, and they are the reason the mapping is one function rather than a
+convention:
+
+- **Asking is not holding.** A request for a capability the grant does not carry yields an
+  attachment without it. `AttachmentSummary.granted` reports what was actually given, and every
+  later operation on that attachment is checked against it.
+- **An attachment identifier is not permission.** It names an attachment; what that attachment may
+  do is the granted set, which the host wrote when it admitted it.
+- **A caller acting under no grant is not narrowed.** A locally authenticated caller's authority is
+  the operating-system identity the socket authenticated, so there is no grant to intersect with,
+  and it receives what it asked for. `ForwardedMutation.grant_rights` is how the rights reach the
+  component that admits the attachment; it is empty for such a caller.
+
 ## The root integration
 
 Six methods carry the trusted root shell's side of section 7, and `crates/kr-protocol/src/root.rs`
