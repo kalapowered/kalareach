@@ -37,6 +37,12 @@ async function capture(page: Page, name: string): Promise<void> {
  * somewhere else, which is what a machine running two checkouts of this package at once needs:
  * the preview port is fixed, and a run that reused the other checkout's server would be testing
  * the other checkout's interface.
+ *
+ * Pick the port with the fetch standard's blocked list in front of you. A browser refuses to
+ * navigate to one of those ports at all, and it refuses before anything reaches the server, so the
+ * run looks like a server that is not answering while `curl` fetches the same address happily. The
+ * engines do not block the same set: 4190 is on WebKit's list and not on Chromium's, which reads
+ * as one engine being broken when it is the one following the standard.
  */
 const HARNESS =
   (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
