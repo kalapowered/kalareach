@@ -3715,10 +3715,24 @@ impl Controller {
             };
             for row in rows {
                 self.directory.lock().await.remove(row.session_id);
+                // The worker went with the boot it was in, so the recovery pass section 24 gives
+                // a session never ran for this one. It runs here instead, on a crash's terms: the
+                // kernel is asked whether the recorded process ended, and the session's stores are
+                // opened only once it has said so. The boot record is not enough on its own to
+                // open a store, because this boot may have handed that identifier to something
+                // else since, and an identifier that answers "running" leaves the stores shut. The
+                // closure is recorded either way, and says whether this host reconciled the store
+                // behind it.
+                let archive = self.archive();
+                let recovered = archive
+                    .take_ownership(row.session_id, row.display_number, &row.process_identity)
+                    .is_ok_and(|ownership| archive.recover_journal(&ownership).is_ok());
                 self.record_final(
                     row.session_id,
                     ClosureReason::HostShutdown,
                     &row.process_identity,
+                    &crate::archive::ArchiveService::nothing_fenced(row.session_id),
+                    recovered,
                 )
                 .await?;
             }
