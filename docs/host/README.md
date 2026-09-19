@@ -3167,9 +3167,15 @@ where it does not. The directory's ownership and mode are checked before an addr
 handed out, and an address something other than this machine could reach is refused before it is
 published rather than filtered afterwards, which is what keeps the listener off iroh.
 
-Binding the socket and serving it is the worker's endpoint work and is not wired to this yet. What
-is here is everything that decides: which address may be published, which connection is refused,
-and what a registration must present.
+Binding the socket, accepting on it and serving what connects is one composition. It binds the
+endpoint, builds the registration from the address it actually bound, reads the connecting bridge's
+first frame under a deadline, refuses anything a browser would have added, authenticates the owner,
+the process and the private exchange, opens the gateway connection against the tables this host
+pinned, registers that connection's transport as the instance's own, subscribes the connection to
+the resolutions of the instance it speaks for, and serves both ends until one closes. Teardown
+takes the transport back, closes the connection and withdraws the subscription; a terminal this
+host started and that has exited stops its dedicated backend through the normal grace period, and a
+connection that closes while that terminal is running stops nothing.
 
 A connection carrying any header a browser adds — `origin`, `referer`, `sec-fetch-site`,
 `sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method` — is refused. A page that

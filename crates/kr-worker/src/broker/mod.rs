@@ -1019,6 +1019,20 @@ impl Broker {
     ) -> Result<(Forwarded, Option<PendingResource>)> {
         let mut state = self.state();
         let forwarded = state.gateway.forward_native(connection, frame)?;
+        // Before anything is counted, recorded or suspended. An upstream that mints an identifier
+        // in this host's own namespace is an upstream whose next response this host could not tell
+        // from an answer to a request of its own, and a refusal that left a resource, a ledger row
+        // and a retained source behind it would have made the ambiguity anyway.
+        if let Some(request) = forwarded.request.as_ref()
+            && crate::broker::duplex::is_host_minted(&request.upstream)
+        {
+            return Err(BrokerError::invalid(format!(
+                "{} begins with {}, which names the requests this host sends, and an upstream \
+                 request cannot be one of those",
+                request.upstream,
+                crate::broker::duplex::HOST_REQUEST_PREFIX
+            )));
+        }
         let application_instance_id = state
             .gateway
             .connection(connection)

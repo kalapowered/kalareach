@@ -948,18 +948,6 @@ impl Duplex {
             Err(_) => return self.upstream_response(frame, now),
         };
         let (forwarded, resource) = forwarded;
-        // An upstream that mints an identifier in this host's namespace is an upstream whose next
-        // response this host could not tell from an answer to its own request. It is refused here
-        // rather than allowed to create the ambiguity.
-        if let Some(request) = forwarded.request.as_ref()
-            && is_host_minted(&request.upstream)
-        {
-            return Err(BrokerError::invalid(format!(
-                "{} begins with {HOST_REQUEST_PREFIX}, which names the requests this host sends, \
-                 and an upstream request cannot be one of those",
-                request.upstream
-            )));
-        }
         // What the upstream asks this host to do is a separate contract with its own admission,
         // and nothing of it happens on this path.
         if let Some(operation) = self

@@ -436,10 +436,19 @@ impl NativeGateway {
                 // reach the socket even though the end that would have sent the next frame has
                 // closed. The writer is then joined rather than abandoned, so teardown does not
                 // race a frame that is still going out.
-                let writing = tokio::spawn(writes);
+                let mut writing = tokio::spawn(writes);
                 reading.await;
                 owner.shutdown();
-                let _ = tokio::time::timeout(TEARDOWN_DEADLINE, writing).await;
+                if tokio::time::timeout(TEARDOWN_DEADLINE, &mut writing)
+                    .await
+                    .is_err()
+                {
+                    // A writer that has not finished by now is writing to an end that has stopped
+                    // reading. It is ended rather than left detached, because a task nobody holds
+                    // is a task nothing can stop.
+                    writing.abort();
+                    let _ = (&mut writing).await;
+                }
                 let closure = ended_as(terminal.as_ref()).await;
                 broker.unbind_dispatch(application_instance_id, &carrying);
                 broker.close_connection(connection);

@@ -568,6 +568,9 @@ pub const BACKEND_GRACE: std::time::Duration = crate::session::GRACE_PERIOD;
 /// How often a stopping backend is looked at again.
 const BACKEND_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long this host waits for the kernel to agree that a forced stop happened.
+const FORCED_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What stopping one dedicated backend did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendStop {
@@ -614,7 +617,19 @@ pub async fn stop_backend(
         tokio::time::sleep(BACKEND_POLL).await;
     }
     signal(process, true);
-    settled(true, true, &kr_ipc::identity::process_state(process))
+    // A forced stop is not instant, and reading the state once the instant after it would report a
+    // process still running as a shutdown that did not happen. This waits for the kernel to agree,
+    // within a bound, and reports what it actually saw.
+    let confirm = tokio::time::Instant::now() + FORCED_CONFIRMATION;
+    loop {
+        let state = kr_ipc::identity::process_state(process);
+        if !matches!(state, kr_ipc::identity::ProcessState::Running)
+            || tokio::time::Instant::now() >= confirm
+        {
+            return settled(true, true, &state);
+        }
+        tokio::time::sleep(BACKEND_POLL).await;
+    }
 }
 
 /// Reads the last state this host saw as what it proves, and nothing more.
