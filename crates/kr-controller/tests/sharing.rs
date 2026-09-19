@@ -196,6 +196,133 @@ fn confirm_transfer_for(
     .expect("the owner confirmed this transfer")
 }
 
+/// A grant whose admission lapses while the store is waited for is not written.
+///
+/// The preview, the delegation checks and the wait for the store's own lock all take time. The
+/// check the caller hands in runs inside the transaction that writes, so a window that shut in the
+/// meantime leaves neither a grant nor an invitation behind.
+#[test]
+fn a_grant_that_loses_its_admission_at_the_store_writes_neither_grant_nor_invitation() {
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    let request = share(SessionRole::Viewer, 1);
+
+    let refused = service
+        .share(&request, || {
+            Err(kr_controller::error::ControllerError::WindowExpired {
+                detail: "the window shut while this waited for the store".to_owned(),
+            })
+        })
+        .expect_err("a lapsed admission writes nothing");
+    assert!(
+        refused.to_string().contains("window"),
+        "unexpected refusal: {refused}"
+    );
+    assert!(
+        service
+            .grants()
+            .record(request.grant_id)
+            .expect("readable")
+            .is_none(),
+        "no grant"
+    );
+    assert!(
+        service
+            .grants()
+            .invitation(request.invitation_id)
+            .expect("readable")
+            .is_none(),
+        "and no invitation, because the two are one commit"
+    );
+
+    // The same request, admitted, writes both.
+    service.share(&request, || Ok(())).expect("issued");
+}
+
+/// A confirmation that runs out while the store is waited for transfers nothing.
+#[test]
+fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
+    /// A clock that runs past the confirmation's deadline after its first reading.
+    ///
+    /// The transfer reads it once before it goes to the store and once inside the transaction,
+    /// which is exactly the interval a wait for the store's lock occupies.
+    #[derive(Debug, Default)]
+    struct Slipping {
+        readings: std::sync::atomic::AtomicU64,
+    }
+
+    impl kr_pairing::platform::PairingClock for Slipping {
+        fn monotonic_ms(&self) -> u64 {
+            let reading = self
+                .readings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let now = <Clock as kr_pairing::platform::PairingClock>::monotonic_ms(&Clock);
+            if reading == 0 {
+                now
+            } else {
+                now.saturating_add(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS + 1)
+            }
+        }
+
+        fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
+            <Clock as kr_pairing::platform::PairingClock>::boot_identity(&Clock)
+        }
+
+        fn wall_clock_ms(&self) -> u64 {
+            <Clock as kr_pairing::platform::PairingClock>::wall_clock_ms(&Clock)
+        }
+    }
+
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    let owner = service
+        .share(&share(SessionRole::Owner, 1), || Ok(()))
+        .expect("an owner");
+    service
+        .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .expect("the owner redeems it");
+
+    let plan = TransferPlan {
+        session_id: session_id(0xa0),
+        from_device_id: device_id(0xf1),
+        to_device_id: device_id(0xf2),
+        revoking_grant_id: owner.grant.grant_id,
+        issuing_grant_id: grant_id(9),
+        actions: transfer::transferable_actions(&owner.grant),
+    };
+    let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
+    let confirmed = confirm_transfer(&plan, &owner_key);
+
+    let refused = service
+        .transfer_control(
+            &plan,
+            &confirmed,
+            &Slipping::default(),
+            AuthorityRevision::new(1),
+            NOW + 2,
+        )
+        .expect_err("the confirmation ran out while this waited for the store");
+    assert!(
+        refused.to_string().contains("expired"),
+        "unexpected refusal: {refused}"
+    );
+    assert!(
+        service
+            .grants()
+            .record(plan.issuing_grant_id)
+            .expect("readable")
+            .is_none(),
+        "the recipient received nothing"
+    );
+    let source = service
+        .grants()
+        .record(plan.revoking_grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(
+        source.revoked_at_ms.is_none() && source.is_active(),
+        "and the transferring device kept the control it was handing over"
+    );
+}
+
 /// A confirmation keeps the challenge's own deadline, and dies with the boot it was accepted in.
 #[test]
 fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
@@ -463,7 +590,7 @@ fn each_role_compiles_to_explicit_actions_and_the_host_decides_from_those() {
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
 
     let viewer = service
-        .share(&share(SessionRole::Viewer, 1))
+        .share(&share(SessionRole::Viewer, 1), || Ok(()))
         .expect("a viewer");
     assert_eq!(
         viewer.grant.actions.iter().copied().collect::<Vec<_>>(),
@@ -472,10 +599,13 @@ fn each_role_compiles_to_explicit_actions_and_the_host_decides_from_those() {
     );
 
     let controller = service
-        .share(&ShareRequest {
-            recipient_device_id: device_id(0xf2),
-            ..share(SessionRole::Controller, 2)
-        })
+        .share(
+            &ShareRequest {
+                recipient_device_id: device_id(0xf2),
+                ..share(SessionRole::Controller, 2)
+            },
+            || Ok(()),
+        )
         .expect("a controller");
     assert!(controller.grant.permits(ActionRight::TerminalInput));
     assert!(controller.grant.permits(ActionRight::QuestionRespond));
@@ -524,10 +654,13 @@ fn only_controller_and_owner_answer_questions_without_an_explicit_option() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     for (byte, role) in [(1_u8, SessionRole::Viewer), (2, SessionRole::Reviewer)] {
         let plain = service
-            .share(&ShareRequest {
-                recipient_device_id: device_id(byte),
-                ..share(role, byte)
-            })
+            .share(
+                &ShareRequest {
+                    recipient_device_id: device_id(byte),
+                    ..share(role, byte)
+                },
+                || Ok(()),
+            )
             .expect("a plain invitation");
         assert!(
             !plain.grant.permits(ActionRight::QuestionRespond),
@@ -544,10 +677,13 @@ fn only_controller_and_owner_answer_questions_without_an_explicit_option() {
 
     for (byte, role) in [(3_u8, SessionRole::Controller), (4, SessionRole::Owner)] {
         let held = service
-            .share(&ShareRequest {
-                recipient_device_id: device_id(byte),
-                ..share(role, byte)
-            })
+            .share(
+                &ShareRequest {
+                    recipient_device_id: device_id(byte),
+                    ..share(role, byte)
+                },
+                || Ok(()),
+            )
             .expect("an invitation");
         assert!(held.grant.permits(ActionRight::QuestionRespond));
         assert!(
@@ -564,12 +700,15 @@ fn only_controller_and_owner_answer_questions_without_an_explicit_option() {
         ..RoleSelection::plain(SessionRole::Viewer)
     };
     let opted = service
-        .share(&ShareRequest {
-            recipient_device_id: device_id(9),
-            accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
-            selection,
-            ..share(SessionRole::Viewer, 9)
-        })
+        .share(
+            &ShareRequest {
+                recipient_device_id: device_id(9),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                ..share(SessionRole::Viewer, 9)
+            },
+            || Ok(()),
+        )
         .expect("an opted-in viewer");
     assert!(opted.grant.permits(ActionRight::QuestionRespond));
     assert!(
@@ -595,7 +734,7 @@ fn an_issuer_that_accepted_different_consequences_does_not_get_the_grant() {
         ..share(SessionRole::Controller, 1)
     };
     let error = service
-        .share(&softened)
+        .share(&softened, || Ok(()))
         .expect_err("the grant carries a consequence the issuer was not shown");
     assert!(
         error.to_string().contains("different set of consequences"),
@@ -619,7 +758,7 @@ fn an_issuer_that_accepted_different_consequences_does_not_get_the_grant() {
 fn an_invitation_is_single_use_and_expires() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let issued = service
-        .share(&share(SessionRole::Viewer, 1))
+        .share(&share(SessionRole::Viewer, 1), || Ok(()))
         .expect("issued");
     let first = issued.preview.invitation_id;
 
@@ -668,12 +807,15 @@ fn an_invitation_is_single_use_and_expires() {
 
     // An invitation nobody redeemed stops working at its deadline, and its proposal with it.
     let second = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(2),
-            grant_id: grant_id(2),
-            recipient_device_id: device_id(0xf4),
-            ..share(SessionRole::Viewer, 2)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(2),
+                grant_id: grant_id(2),
+                recipient_device_id: device_id(0xf4),
+                ..share(SessionRole::Viewer, 2)
+            },
+            || Ok(()),
+        )
         .expect("issued");
     let expires_at = second.preview.expires_at_ms.get();
     let error = service
@@ -687,12 +829,15 @@ fn an_invitation_is_single_use_and_expires() {
     // And withdrawing an invitation withdraws the proposal it carries, rather than leaving a
     // grant somebody could still be handed.
     let third = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(3),
-            grant_id: grant_id(3),
-            recipient_device_id: device_id(0xf5),
-            ..share(SessionRole::Viewer, 3)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(3),
+                grant_id: grant_id(3),
+                recipient_device_id: device_id(0xf5),
+                ..share(SessionRole::Viewer, 3)
+            },
+            || Ok(()),
+        )
         .expect("issued");
     service
         .cancel(third.preview.invitation_id, NOW + 5)
@@ -717,7 +862,7 @@ fn an_invitation_is_single_use_and_expires() {
 fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let owner = service
-        .share(&share(SessionRole::Owner, 1))
+        .share(&share(SessionRole::Owner, 1), || Ok(()))
         .expect("an owner");
     service
         .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
@@ -835,7 +980,7 @@ fn the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys() {
     assert!(preview.single_use);
     assert!(preview.history.include_live_screen);
 
-    let issued = service.share(&request).expect("issued");
+    let issued = service.share(&request, || Ok(())).expect("issued");
     assert_eq!(
         issued.preview, preview,
         "what was written is what was shown"
@@ -959,7 +1104,7 @@ fn an_invitation_names_nothing_the_issuer_was_not_shown() {
 fn an_invitation_is_scoped_to_the_session_it_shares() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let issued = service
-        .share(&share(SessionRole::Viewer, 1))
+        .share(&share(SessionRole::Viewer, 1), || Ok(()))
         .expect("issued");
     assert_eq!(
         issued.grant.session_selector,
@@ -990,7 +1135,7 @@ fn a_delegation_narrows_what_the_issuer_holds() {
     // Only an owner carries `session.share`, so only an owner can pass anything on. A reviewer
     // holding `files.read` does not thereby hold the authority to give it to somebody else.
     let owner = service
-        .share(&share(SessionRole::Owner, 1))
+        .share(&share(SessionRole::Owner, 1), || Ok(()))
         .expect("an owner");
     // Redeemed, because a proposal carries nothing to delegate: authority nobody has taken up is
     // not authority anybody can pass on.
@@ -1000,14 +1145,17 @@ fn a_delegation_narrows_what_the_issuer_holds() {
 
     // The owner delegates a viewer's grant to a third device: narrower, and accepted.
     let narrower = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(2),
-            grant_id: grant_id(2),
-            issuer_device_id: device_id(0xf1),
-            recipient_device_id: device_id(0xf2),
-            parent_grant_id: Some(owner.grant.grant_id),
-            ..share(SessionRole::Viewer, 2)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(2),
+                grant_id: grant_id(2),
+                issuer_device_id: device_id(0xf1),
+                recipient_device_id: device_id(0xf2),
+                parent_grant_id: Some(owner.grant.grant_id),
+                ..share(SessionRole::Viewer, 2)
+            },
+            || Ok(()),
+        )
         .expect("a narrower delegation");
     assert_eq!(
         narrower.grant.parent_grant_id.as_ref(),
@@ -1022,14 +1170,17 @@ fn a_delegation_narrows_what_the_issuer_holds() {
     // The viewer it just created tries to pass its own view on. It holds no `session.share`, so
     // it cannot, however narrow the thing it is offering.
     let error = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(3),
-            grant_id: grant_id(3),
-            issuer_device_id: device_id(0xf2),
-            recipient_device_id: device_id(0xf3),
-            parent_grant_id: Some(narrower.grant.grant_id),
-            ..share(SessionRole::Viewer, 3)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(3),
+                grant_id: grant_id(3),
+                issuer_device_id: device_id(0xf2),
+                recipient_device_id: device_id(0xf3),
+                parent_grant_id: Some(narrower.grant.grant_id),
+                ..share(SessionRole::Viewer, 3)
+            },
+            || Ok(()),
+        )
         .expect_err("holding a right is not authority to pass it on");
     assert!(
         error.to_string().contains("session.share"),
@@ -1038,14 +1189,17 @@ fn a_delegation_narrows_what_the_issuer_holds() {
 
     // A device that merely *names* the owner's grant cannot delegate from it either.
     let error = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(4),
-            grant_id: grant_id(4),
-            issuer_device_id: device_id(0xbb),
-            recipient_device_id: device_id(0xbc),
-            parent_grant_id: Some(owner.grant.grant_id),
-            ..share(SessionRole::Viewer, 4)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(4),
+                grant_id: grant_id(4),
+                issuer_device_id: device_id(0xbb),
+                recipient_device_id: device_id(0xbc),
+                parent_grant_id: Some(owner.grant.grant_id),
+                ..share(SessionRole::Viewer, 4)
+            },
+            || Ok(()),
+        )
         .expect_err("naming a grant is not holding one");
     assert!(
         error.to_string().contains("belongs to another device"),
@@ -1054,14 +1208,17 @@ fn a_delegation_narrows_what_the_issuer_holds() {
 
     // And nobody but this host issues a grant that delegates from nothing.
     let error = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(5),
-            grant_id: grant_id(5),
-            issuer_device_id: device_id(0xbb),
-            recipient_device_id: device_id(0xbc),
-            parent_grant_id: None,
-            ..share(SessionRole::Viewer, 5)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(5),
+                grant_id: grant_id(5),
+                issuer_device_id: device_id(0xbb),
+                recipient_device_id: device_id(0xbc),
+                parent_grant_id: None,
+                ..share(SessionRole::Viewer, 5)
+            },
+            || Ok(()),
+        )
         .expect_err("a device cannot write authority out of nothing");
     assert!(
         error.to_string().contains("only this host"),
@@ -1077,20 +1234,23 @@ fn a_delegation_narrows_what_the_issuer_holds() {
         ..RoleSelection::plain(SessionRole::Viewer)
     };
     let error = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(6),
-            grant_id: grant_id(6),
-            issuer_device_id: device_id(0xf1),
-            recipient_device_id: device_id(0xf4),
-            parent_grant_id: Some(owner.grant.grant_id),
-            accepted_notices: AuthorityNotice::for_actions(&beyond.actions()),
-            selection: beyond,
-            live_screen: Some(kr_protocol::sharing::LiveScreenPreview {
-                lines: vec!["$ ".to_owned()],
-                truncated: false,
-            }),
-            ..share(SessionRole::Viewer, 6)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(6),
+                grant_id: grant_id(6),
+                issuer_device_id: device_id(0xf1),
+                recipient_device_id: device_id(0xf4),
+                parent_grant_id: Some(owner.grant.grant_id),
+                accepted_notices: AuthorityNotice::for_actions(&beyond.actions()),
+                selection: beyond,
+                live_screen: Some(kr_protocol::sharing::LiveScreenPreview {
+                    lines: vec!["$ ".to_owned()],
+                    truncated: false,
+                }),
+                ..share(SessionRole::Viewer, 6)
+            },
+            || Ok(()),
+        )
         .expect_err("the parent's history scope does not include the live screen");
     assert!(
         error.to_string().contains("history"),
@@ -1099,7 +1259,7 @@ fn a_delegation_narrows_what_the_issuer_holds() {
 
     // Revoking the owner takes the delegation with it.
     let revocation = service
-        .revoke(owner.grant.grant_id, NOW + 10)
+        .revoke(owner.grant.grant_id, NOW + 10, || Ok(()))
         .expect("revoked");
     assert!(revocation.revoked.contains(&narrower.grant.grant_id));
 }
@@ -1108,7 +1268,7 @@ fn a_delegation_narrows_what_the_issuer_holds() {
 fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let owner = service
-        .share(&share(SessionRole::Owner, 1))
+        .share(&share(SessionRole::Owner, 1), || Ok(()))
         .expect("an owner");
     let plan = TransferPlan {
         session_id: session_id(0xa0),
@@ -1128,12 +1288,15 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
 
     // A controller holds no `session.share`, so it cannot transfer anything.
     let controller = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(3),
-            grant_id: grant_id(3),
-            recipient_device_id: device_id(0xf4),
-            ..share(SessionRole::Controller, 3)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(3),
+                grant_id: grant_id(3),
+                recipient_device_id: device_id(0xf4),
+                ..share(SessionRole::Controller, 3)
+            },
+            || Ok(()),
+        )
         .expect("a controller");
     let refused = TransferPlan {
         from_device_id: device_id(0xf4),
@@ -1178,7 +1341,7 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
 fn a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action_or_a_workflow() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let viewer = service
-        .share(&share(SessionRole::Viewer, 1))
+        .share(&share(SessionRole::Viewer, 1), || Ok(()))
         .expect("a viewer");
     let actor = viewer.grant.actions.clone();
 
@@ -1227,12 +1390,15 @@ fn a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action
     // The intersection bounds the other way too: a controller calling a plugin that declares only
     // reads obtains only reads.
     let controller = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(2),
-            grant_id: grant_id(2),
-            recipient_device_id: device_id(0xf2),
-            ..share(SessionRole::Controller, 2)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(2),
+                grant_id: grant_id(2),
+                recipient_device_id: device_id(0xf2),
+                ..share(SessionRole::Controller, 2)
+            },
+            || Ok(()),
+        )
         .expect("a controller");
     let reads_only = Intermediary::PluginAction {
         declared: [ActionRight::SessionView].into_iter().collect(),
@@ -1252,10 +1418,13 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
 
     // Parent rights: a delegation from a grant this host does not hold is refused.
     let error = service
-        .share(&ShareRequest {
-            parent_grant_id: Some(grant_id(0xcc)),
-            ..share(SessionRole::Viewer, 1)
-        })
+        .share(
+            &ShareRequest {
+                parent_grant_id: Some(grant_id(0xcc)),
+                ..share(SessionRole::Viewer, 1)
+            },
+            || Ok(()),
+        )
         .expect_err("a parent this host does not hold");
     assert!(
         error.to_string().contains("no such parent grant"),
@@ -1264,7 +1433,7 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
 
     // Expiry: every invitation has one, and it is inside the bound.
     let issued = service
-        .share(&share(SessionRole::Viewer, 2))
+        .share(&share(SessionRole::Viewer, 2), || Ok(()))
         .expect("issued");
     let GrantExpiry::At { expires_at_ms } = issued.grant.expiry else {
         panic!("an invitation expires");
@@ -1310,25 +1479,31 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
     // A grant this host issued to an owner, which that owner then delegates onward. The second
     // grant's issuer is the owner's device, not this host, so it is not in this host's own list.
     let owner = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(5),
-            grant_id: grant_id(5),
-            recipient_device_id: device_id(0xaa),
-            ..share(SessionRole::Owner, 5)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(5),
+                grant_id: grant_id(5),
+                recipient_device_id: device_id(0xaa),
+                ..share(SessionRole::Owner, 5)
+            },
+            || Ok(()),
+        )
         .expect("an owner");
     service
         .redeem(owner.preview.invitation_id, device_id(0xaa), NOW + 1)
         .expect("the owner redeems it");
     let other_issuer = service
-        .share(&ShareRequest {
-            invitation_id: invitation_id(4),
-            grant_id: grant_id(4),
-            issuer_device_id: device_id(0xaa),
-            recipient_device_id: device_id(0xab),
-            parent_grant_id: Some(owner.grant.grant_id),
-            ..share(SessionRole::Viewer, 4)
-        })
+        .share(
+            &ShareRequest {
+                invitation_id: invitation_id(4),
+                grant_id: grant_id(4),
+                issuer_device_id: device_id(0xaa),
+                recipient_device_id: device_id(0xab),
+                parent_grant_id: Some(owner.grant.grant_id),
+                ..share(SessionRole::Viewer, 4)
+            },
+            || Ok(()),
+        )
         .expect("the owner's own delegation");
     let listed = service
         .list_for_issuer(device_id(0xf0), None, false, NOW)
@@ -1350,7 +1525,7 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
 fn an_invitation_refused_as_expired_stays_expired() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let issued = service
-        .share(&share(SessionRole::Viewer, 1))
+        .share(&share(SessionRole::Viewer, 1), || Ok(()))
         .expect("issued");
     let expires_at = issued.preview.expires_at_ms.get();
 
@@ -1386,13 +1561,16 @@ async fn transferring_control_through_the_daemon_completes_through_the_barrier()
     let now_ms = kr_ipc::now_ms().get();
     let owner = controller
         .sharing()
-        .share(&ShareRequest {
-            environment_id,
-            issuer_device_id: host_device_id,
-            authority_revision: controller.policy().authority_revision(),
-            now_ms,
-            ..share(SessionRole::Owner, 1)
-        })
+        .share(
+            &ShareRequest {
+                environment_id,
+                issuer_device_id: host_device_id,
+                authority_revision: controller.policy().authority_revision(),
+                now_ms,
+                ..share(SessionRole::Owner, 1)
+            },
+            || Ok(()),
+        )
         .expect("the host shares a session");
     controller
         .sharing()
@@ -1504,12 +1682,15 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
 
     let issued = controller
         .sharing()
-        .share(&ShareRequest {
-            environment_id,
-            issuer_device_id: host_device_id,
-            authority_revision: controller.policy().authority_revision(),
-            ..share(SessionRole::Owner, 1)
-        })
+        .share(
+            &ShareRequest {
+                environment_id,
+                issuer_device_id: host_device_id,
+                authority_revision: controller.policy().authority_revision(),
+                ..share(SessionRole::Owner, 1)
+            },
+            || Ok(()),
+        )
         .expect("the host shares a session");
     controller
         .sharing()
@@ -1519,22 +1700,25 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
     // A delegation from it, so the revocation has a descendant to take with it.
     let delegated = controller
         .sharing()
-        .share(&ShareRequest {
-            environment_id,
-            invitation_id: invitation_id(2),
-            grant_id: grant_id(2),
-            issuer_device_id: device_id(0xf1),
-            recipient_device_id: device_id(0xf2),
-            parent_grant_id: Some(issued.grant.grant_id),
-            authority_revision: controller.policy().authority_revision(),
-            ..share(SessionRole::Viewer, 2)
-        })
+        .share(
+            &ShareRequest {
+                environment_id,
+                invitation_id: invitation_id(2),
+                grant_id: grant_id(2),
+                issuer_device_id: device_id(0xf1),
+                recipient_device_id: device_id(0xf2),
+                parent_grant_id: Some(issued.grant.grant_id),
+                authority_revision: controller.policy().authority_revision(),
+                ..share(SessionRole::Viewer, 2)
+            },
+            || Ok(()),
+        )
         .expect("a delegation");
 
     let before = controller.policy().authority_revision();
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(issued.grant.grant_id),
+        controller.revoke_grant(issued.grant.grant_id, None),
     )
     .await
     .expect("the revocation completes")

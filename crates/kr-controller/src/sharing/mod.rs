@@ -258,9 +258,17 @@ impl SharingService {
     /// # Errors
     ///
     /// Returns [`ControllerError::PermissionDenied`] when the issuer accepted a different set of
-    /// notices, when the delegation would exceed its parent, or when a persistent enlargement
-    /// arrives without owner confirmation.
-    pub fn share(&self, request: &ShareRequest) -> Result<GrantCreateResult> {
+    /// notices, when the delegation would exceed its parent, when a persistent enlargement arrives
+    /// without owner confirmation, or when `still_admitted` refuses.
+    ///
+    /// `still_admitted` is run inside the transaction that writes the grant, with the store's lock
+    /// held and before anything is written: the checks above and the wait for that lock both take
+    /// time, and a request admitted with a deadline can run out of it in between.
+    pub fn share(
+        &self,
+        request: &ShareRequest,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<GrantCreateResult> {
         let preview = self.preview(request)?;
 
         if request.accepted_notices != preview.notices {
@@ -380,6 +388,7 @@ impl SharingService {
             &preview,
             request.issuer_device_id,
             request.now_ms,
+            still_admitted,
         )?;
 
         Ok(GrantCreateResult {
@@ -517,11 +526,20 @@ impl SharingService {
 
     /// Revokes a grant and its descendants.
     ///
+    /// `still_admitted` is as [`Self::share`]: run inside the transaction, before anything is
+    /// withdrawn.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read or written.
-    pub fn revoke(&self, grant_id: GrantId, now_ms: u64) -> Result<GrantRevocation> {
-        self.grants.revoke(grant_id, now_ms)
+    /// Returns an error when the store cannot be read or written, or when `still_admitted`
+    /// refuses.
+    pub fn revoke(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<GrantRevocation> {
+        self.grants.revoke(grant_id, now_ms, still_admitted)
     }
 
     /// Lists the grants one issuer may see.

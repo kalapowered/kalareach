@@ -1208,18 +1208,38 @@ impl Controller {
     /// advances no revision. Advancing one would fence every live connection on the host for a
     /// retry that changed nothing.
     ///
+    /// `carried` is the admission of the mutation this revocation is performing, when it is
+    /// performing one. It is checked again inside the transaction that withdraws the rows, because
+    /// an admission has a deadline and the wait for the store's lock can outlast it. The local
+    /// owner's own revocation carries none.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the grant store or the registry cannot be read or written.
+    /// Returns an error when the grant store or the registry cannot be read or written, or when
+    /// the admission has lapsed by the time the rows would be withdrawn.
     pub async fn revoke_grant(
         &self,
         grant_id: kr_protocol::ids::GrantId,
+        carried: Option<&crate::authority::AdmittedMutation>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
         // The revocation writes its own fence debt inside the same transaction that revokes the
         // rows, so a failure afterwards leaves a record a retry can see. Nothing newly revoked is
         // not the same as nothing owed.
-        let revocation = self.sharing.revoke(grant_id, now_ms)?;
+        //
+        // The registry guard is held across the withdrawal and dropped before the fence, which
+        // takes it again. It is what the admission is checked against, so holding it through the
+        // write is what makes the check mean something at the moment of the write.
+        let revocation = match carried {
+            Some(carried) => {
+                let registry = self.registry.lock().await;
+                self.check_admission(&registry, carried)?;
+                self.sharing.revoke(grant_id, now_ms, || {
+                    self.check_admission(&registry, carried)
+                })?
+            }
+            None => self.sharing.revoke(grant_id, now_ms, || Ok(()))?,
+        };
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
     }
@@ -1234,15 +1254,34 @@ impl Controller {
     /// revision now in force, and the revoked device's record is already marked so it cannot be
     /// re-admitted at all.
     ///
+    /// `carried` is as [`Self::revoke_grant`]: the admission of the mutation this is performing,
+    /// checked again where the grants are withdrawn.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the grant store, the device record or the registry cannot be written.
+    /// Returns an error when the grant store, the device record or the registry cannot be written,
+    /// or when the admission has lapsed by the time the grants would be withdrawn.
     pub async fn revoke_device_authority(
         &self,
         device_id: kr_protocol::ids::DeviceId,
+        carried: Option<&crate::authority::AdmittedMutation>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
-        let revocation = self.sharing.grants().revoke_device(device_id, now_ms)?;
+        // Held across all three writes below and dropped before the fence, which takes it again.
+        let registry = match carried {
+            Some(carried) => {
+                let registry = self.registry.lock().await;
+                self.check_admission(&registry, carried)?;
+                Some(registry)
+            }
+            None => None,
+        };
+        let revocation = self.sharing.grants().revoke_device(device_id, now_ms, || {
+            match (registry.as_deref(), carried) {
+                (Some(registry), Some(carried)) => self.check_admission(registry, carried),
+                _ => Ok(()),
+            }
+        })?;
         // The device record is marked revoked before the revision advances, so nothing can be
         // authorised against it in between. The directory is a view on this daemon's own registry
         // database, which is the file the network half keeps its device records in.
@@ -1268,6 +1307,7 @@ impl Controller {
                 .owe_fence([kr_protocol::ids::GrantId::new(device_id.get())], now_ms)?;
         }
         self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
+        drop(registry);
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
     }
@@ -1321,11 +1361,14 @@ impl Controller {
         let covered = self.sharing.grants().fence_owed()?;
         if covered.is_empty() {
             // The work was already done and fenced. The answer is the revision in force and the
-            // barrier as it stands, with nothing newly withdrawn.
-            let authority_revision = self.policy().authority_revision();
+            // barrier as it stands, with nothing newly withdrawn. Both come from the barrier: it
+            // reads the registry, which is where a revision is allocated, and a second reading
+            // taken separately can be a different one — another revocation advances it, and so
+            // does the network half. An answer that named one revision and carried a barrier for
+            // another would be evidence of no single moment.
             let barrier = self.announce_authority_revision().await?;
             return Ok(kr_protocol::sharing::RevocationResult {
-                authority_revision,
+                authority_revision: barrier.authority_revision,
                 revoked_grants,
                 barrier,
             });
@@ -3070,12 +3113,15 @@ impl Controller {
             // therefore proposes the same grant with the same deadline rather than a newer one.
             now_ms: claimed_at_ms,
         };
-        // The admission is checked last, under the registry lock, so the grant is written against
-        // authority that still stands at the moment it is written rather than at the moment the
-        // request arrived.
+        // The admission is checked under the registry lock, and again inside the transaction that
+        // writes the grant. Between the two are the preview, the delegation checks and the wait
+        // for the grant store's own lock, and a window that was open when this began can be shut
+        // by the time the write happens.
         let registry = self.registry.lock().await;
         self.check_admission(&registry, &carried)?;
-        let result = self.sharing.share(&request)?;
+        let result = self
+            .sharing
+            .share(&request, || self.check_admission(&registry, &carried))?;
         drop(registry);
         encode(&result)
     }
@@ -3087,11 +3133,7 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
-        {
-            let registry = self.registry.lock().await;
-            self.check_admission(&registry, &carried)?;
-        }
-        encode(&self.revoke_grant(params.grant_id).await?)
+        encode(&self.revoke_grant(params.grant_id, Some(&carried)).await?)
     }
 
     /// Revokes a device, every grant it holds, and everything they were being used for.
@@ -3101,11 +3143,11 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
-        {
-            let registry = self.registry.lock().await;
-            self.check_admission(&registry, &carried)?;
-        }
-        encode(&self.revoke_device_authority(params.device_id).await?)
+        encode(
+            &self
+                .revoke_device_authority(params.device_id, Some(&carried))
+                .await?,
+        )
     }
 
     /// One identity derived from an action identifier and a purpose.

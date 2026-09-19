@@ -113,6 +113,73 @@ fn proposal(grant: Grant) -> GrantRecord {
     }
 }
 
+/// A withdrawal whose admission lapses while the store is waited for withdraws nothing.
+///
+/// The check a caller hands in runs inside the transaction, with the lock held, so what it decides
+/// is what is true at the moment of the write rather than at the moment the request arrived.
+#[test]
+fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    let second = Grant {
+        grant_id: grant_id(2),
+        ..grant(2, None, &[ActionRight::FilesRead], GrantExpiry::Never)
+    };
+    directory.issue(&record(held.clone())).expect("written");
+    directory.issue(&record(second.clone())).expect("written");
+
+    let lapsed = || {
+        Err(kr_controller::error::ControllerError::WindowExpired {
+            detail: "the window shut while this waited for the store".to_owned(),
+        })
+    };
+
+    let refused = directory
+        .revoke(held.grant_id, 4_000, lapsed)
+        .expect_err("a lapsed admission withdraws nothing");
+    assert!(
+        refused.to_string().contains("window"),
+        "unexpected refusal: {refused}"
+    );
+    let stored = directory
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(
+        stored.revoked_at_ms.is_none(),
+        "the grant this would have withdrawn still stands"
+    );
+    assert!(
+        directory.fence_owed().expect("readable").is_empty(),
+        "and nothing is owed a fence, because nothing was withdrawn"
+    );
+
+    // The same of a device's whole set: the read happens, the withdrawal does not.
+    let refused = directory
+        .revoke_device(held.recipient_device_id, 4_100, lapsed)
+        .expect_err("a lapsed admission withdraws nothing");
+    assert!(
+        refused.to_string().contains("window"),
+        "unexpected refusal: {refused}"
+    );
+    for grant_id in [held.grant_id, second.grant_id] {
+        assert!(
+            directory
+                .record(grant_id)
+                .expect("readable")
+                .expect("present")
+                .revoked_at_ms
+                .is_none(),
+            "every grant that device holds still stands"
+        );
+    }
+
+    // And with an admission that still stands, the same call withdraws.
+    directory
+        .revoke(held.grant_id, 4_200, || Ok(()))
+        .expect("revoked");
+}
+
 /// A fence a revocation owes survives the failure of the half that would have cleared it.
 #[test]
 fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
@@ -124,7 +191,9 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
         directory.fence_owed().expect("readable").is_empty(),
         "nothing is owed before anything is revoked"
     );
-    directory.revoke(held.grant_id, 4_000).expect("revoked");
+    directory
+        .revoke(held.grant_id, 4_000, || Ok(()))
+        .expect("revoked");
     let owed = directory.fence_owed().expect("readable");
     assert_eq!(
         owed,
@@ -136,7 +205,9 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     // fence covered must not retire the second one's debt.
     let second = grant(2, None, &[ActionRight::SessionView], GrantExpiry::Never);
     directory.issue(&record(second.clone())).expect("written");
-    directory.revoke(second.grant_id, 4_100).expect("revoked");
+    directory
+        .revoke(second.grant_id, 4_100, || Ok(()))
+        .expect("revoked");
     directory
         .fence_completed(&owed)
         .expect("the first fence finished");
@@ -475,7 +546,9 @@ fn revoking_a_parent_revokes_every_descendant() {
         directory.issue(&record(held.clone())).expect("written");
     }
 
-    let revocation = directory.revoke(root.grant_id, 4_000).expect("revoked");
+    let revocation = directory
+        .revoke(root.grant_id, 4_000, || Ok(()))
+        .expect("revoked");
     assert_eq!(
         revocation.revoked.len(),
         3,
@@ -661,7 +734,9 @@ fn an_owner_grant_stays_valid_until_it_is_revoked() {
     )
     .expect("an owner grant does not expire");
 
-    directory.revoke(owner.grant_id, far).expect("revoked");
+    directory
+        .revoke(owner.grant_id, far, || Ok(()))
+        .expect("revoked");
     let held = directory
         .record(owner.grant_id)
         .expect("read")
@@ -1618,7 +1693,7 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
 
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id),
+        controller.revoke_grant(held.grant_id, None),
     )
     .await
     .expect("the revocation completes")
@@ -1689,7 +1764,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
 
     let first = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id),
+        controller.revoke_grant(held.grant_id, None),
     )
     .await
     .expect("completes")
@@ -1698,7 +1773,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
 
     let second = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id),
+        controller.revoke_grant(held.grant_id, None),
     )
     .await
     .expect("completes")
@@ -1710,6 +1785,30 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
     assert_eq!(
         second.authority_revision, first.authority_revision,
         "so it advanced no revision, and fenced nobody"
+    );
+
+    // A revocation that withdraws nothing still answers with **one** revision. Something else
+    // advances the host's revision here, which is what the network half does when it revokes a
+    // device; the repeat that follows must not name one revision and carry a barrier for another.
+    controller
+        .revoke_authority()
+        .await
+        .expect("the host advances its own revision");
+    let third = tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(held.grant_id, None),
+    )
+    .await
+    .expect("completes")
+    .expect("succeeds");
+    assert!(third.revoked_grants.is_empty(), "still nothing to withdraw");
+    assert_eq!(
+        third.authority_revision, third.barrier.authority_revision,
+        "the answer and its barrier are the same moment"
+    );
+    assert!(
+        third.authority_revision.get() > first.authority_revision.get(),
+        "and it is the revision now in force, not the one this daemon last wrote down"
     );
 
     // The record of the first revocation is untouched: its moment and its ancestor stand.
@@ -1745,7 +1844,7 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_device_authority(recipient),
+        controller.revoke_device_authority(recipient, None),
     )
     .await
     .expect("the revocation completes")
@@ -1765,7 +1864,7 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
     // A second revocation of the same device withdraws nothing and advances nothing.
     let again = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_device_authority(recipient),
+        controller.revoke_device_authority(recipient, None),
     )
     .await
     .expect("completes")
@@ -1808,7 +1907,7 @@ fn issuing_and_revoking_one_subtree_at_once_leaves_a_consistent_store() {
     let revoking = {
         let directory = Arc::clone(&directory);
         let parent_id = parent.grant_id;
-        std::thread::spawn(move || directory.revoke(parent_id, 4_000))
+        std::thread::spawn(move || directory.revoke(parent_id, 4_000, || Ok(())))
     };
     let issuing = {
         let directory = Arc::clone(&directory);

@@ -334,8 +334,7 @@ impl GrantDirectory {
             connection
                 .query_row(
                     "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms,
-                            activated_at_ms
+             activated_at_ms
                      FROM grants WHERE grant_id = ?1",
                     params![key],
                     |row| Ok(read_row(row)),
@@ -354,8 +353,7 @@ impl GrantDirectory {
         let rows: Vec<Row> = self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms,
-                            activated_at_ms
+             activated_at_ms
                  FROM grants ORDER BY grant_id",
             )?;
             let rows = statement
@@ -376,8 +374,7 @@ impl GrantDirectory {
         let rows: Vec<Row> = self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms,
-                            activated_at_ms
+             activated_at_ms
                  FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
             )?;
             let rows = statement
@@ -394,15 +391,28 @@ impl GrantDirectory {
     /// under, so a repeated revocation cannot rewrite the record of the first one. A descendant
     /// that was already revoked on its own is left as it was, for the same reason.
     ///
+    /// `still_admitted` is run inside the transaction, once this call holds the store's lock and
+    /// before anything is written. A request is admitted with a deadline, and the wait for that
+    /// lock can outlast it, so a check made before the wait says only what was true before the
+    /// wait. A caller with nothing to re-check passes `|| Ok(())`.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the rows cannot be read or written, and
-    /// [`ControllerError::InvalidArgument`] when this host holds no such grant.
-    pub fn revoke(&self, grant_id: GrantId, now_ms: u64) -> Result<GrantRevocation> {
+    /// Returns an error when the rows cannot be read or written, when `still_admitted` refuses,
+    /// and [`ControllerError::InvalidArgument`] when this host holds no such grant.
+    pub fn revoke(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<GrantRevocation> {
         // The subtree is read and updated inside one transaction. A child written between the read
         // and the update would otherwise escape the cascade entirely, and a crash part way through
         // the loop would leave a subtree half revoked.
-        self.in_transaction(|connection| Self::revoke_within(connection, grant_id, now_ms))
+        self.in_transaction(|connection| {
+            still_admitted()?;
+            Self::revoke_within(connection, grant_id, now_ms)
+        })
     }
 
     /// Revokes every grant one device holds, and their descendants.
@@ -410,12 +420,21 @@ impl GrantDirectory {
     /// One transaction for the whole set, for the same reason one revocation is: a grant issued to
     /// that device between two of these would survive its own device's revocation.
     ///
+    /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, after the device's
+    /// grants are read and before the first of them is withdrawn.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the rows cannot be read or written.
-    pub fn revoke_device(&self, device_id: DeviceId, now_ms: u64) -> Result<GrantRevocation> {
+    /// Returns an error when the rows cannot be read or written, or when `still_admitted` refuses.
+    pub fn revoke_device(
+        &self,
+        device_id: DeviceId,
+        now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<GrantRevocation> {
         self.in_transaction(|connection| {
             let held = read_for_device(connection, device_id)?;
+            still_admitted()?;
             let mut merged = GrantRevocation {
                 grant_id: held.first().map_or_else(
                     || GrantId::new(kr_protocol::scalars::Uuid::NIL),
@@ -526,6 +545,9 @@ impl GrantDirectory {
     ///
     /// The grant is written **unactivated**: it authorises nothing until [`Self::redeem`] runs.
     ///
+    /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, after the parent is
+    /// checked and before the grant and its invitation are written.
+    ///
     /// # Errors
     ///
     /// As [`Self::issue`], plus [`ControllerError::InvalidArgument`] when the preview promises
@@ -537,6 +559,7 @@ impl GrantDirectory {
         preview: &InvitationPreview,
         issuer_device_id: DeviceId,
         now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         if preview.historical_attachment_keys {
             return Err(ControllerError::InvalidArgument(
@@ -566,6 +589,7 @@ impl GrantDirectory {
         let recipient = record.grant.recipient_device_id;
         self.in_transaction(|connection| {
             check_parent(connection, record)?;
+            still_admitted()?;
             write_grant(connection, record, &encoded_grant)?;
             let written = connection
                 .execute(
@@ -1272,8 +1296,7 @@ fn read_one(connection: &Connection, grant_id: GrantId) -> Result<Option<GrantRe
     let row: Option<Row> = connection
         .query_row(
             "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms,
-                            activated_at_ms
+             activated_at_ms
              FROM grants WHERE grant_id = ?1",
             params![grant_id.get().as_bytes().as_slice()],
             |row| Ok(read_row(row)),
@@ -1288,8 +1311,7 @@ fn read_all(connection: &Connection) -> Result<Vec<GrantRecord>> {
     let mut statement = connection
         .prepare(
             "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms,
-                            activated_at_ms
+             activated_at_ms
              FROM grants ORDER BY grant_id",
         )
         .map_err(ControllerError::registry)?;
@@ -1306,8 +1328,7 @@ fn read_for_device(connection: &Connection, device_id: DeviceId) -> Result<Vec<G
     let mut statement = connection
         .prepare(
             "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms,
-                            activated_at_ms
+             activated_at_ms
              FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
         )
         .map_err(ControllerError::registry)?;
