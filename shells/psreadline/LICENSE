@@ -1,0 +1,11 @@
+The KalaReach qualified PSReadLine package
+==========================================
+
+This package rebuilds no shell and copies no upstream source. It is a PowerShell module of Kala
+Powered's own, which binds into the PSReadLine the person already has, and it is distributed under
+the BSD 3-Clause Licence in the repository root like the rest of the crates, scripts and
+documentation.
+
+Nothing of PowerShell's or PSReadLine's source is copied, patched or redistributed here, so this
+directory carries no upstream licence of its own. The module calls PSReadLine's published API and
+wraps the handlers the person has bound; it replaces neither.

@@ -1,0 +1,64 @@
+{
+  "shell": "powershell",
+  "integration_version": "1",
+  "editor_abi": "psreadline-2.4",
+  "mailbox_mechanism": "reader_thread_queue",
+  "pre_eof_mechanism": "reader_state_handler",
+  "build_system": "qualification",
+  "upstream": {
+    "version": "7.4",
+    "revision": "powershell-7.4",
+    "archive": "",
+    "url": "https://github.com/PowerShell/PowerShell",
+    "sha256": "",
+    "directory": ""
+  },
+  "qualified": {
+    "powershell_from": "7.4.0",
+    "psreadline_from": "2.3.4",
+    "psreadline_before": "3.0.0",
+    "reason": "This package rebuilds no shell. PSReadLine is the line editor the person already has, so what is pinned is the range the module was qualified against rather than a release to fetch and patch; the module declares the versions it found in its handshake and the worker refuses an editor ABI it was not qualified for."
+  },
+  "configure": [],
+  "cflags": [],
+  "binary": "",
+  "module_directory": "modules",
+  "source_directory": "module",
+  "modules": [
+    "KalaReach.ShellBridge",
+    "PSReadLine"
+  ],
+  "patches": [],
+  "sources": [
+    {
+      "file": "module/KalaReach.ShellBridge.psd1",
+      "install": "modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1"
+    },
+    {
+      "file": "module/KalaReach.ShellBridge.psm1",
+      "install": "modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psm1"
+    },
+    {
+      "file": "module/KrBridge.ps1",
+      "install": "modules/KalaReach.ShellBridge/KrBridge.ps1"
+    },
+    {
+      "file": "module/KrCbor.ps1",
+      "install": "modules/KalaReach.ShellBridge/KrCbor.ps1"
+    },
+    {
+      "file": "module/KrReader.ps1",
+      "install": "modules/KalaReach.ShellBridge/KrReader.ps1"
+    }
+  ],
+  "startup": {
+    "file": "startup/kr-profile.ps1",
+    "target": "$PROFILE.CurrentUserCurrentHost",
+    "marker": "# >>> kalareach shell integration >>>",
+    "end_marker": "# <<< kalareach shell integration <<<"
+  },
+  "upstream_tests": {
+    "command": "",
+    "reason": "this package builds no shell"
+  }
+}
