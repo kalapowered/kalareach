@@ -1221,7 +1221,28 @@ fn administrative_target(
             .iter()
             .map(|part| part.to_string_lossy().into_owned())
             .collect();
-        return Ok(Some(rest.join("/")));
+        let candidate = rest.join("/");
+        // Arithmetic on a path says where the name points, not what is there. A component of it
+        // could be a link, and then the exclusion would name the link while the repository's data
+        // sat somewhere else entirely. The working tree's own handle settles it: it descends
+        // component by component and refuses a link, so a name it reaches is a real directory
+        // inside this tree and the exclusion is of the right place.
+        let Ok(name) = RelativeName::parse(&candidate) else {
+            return Err(unplaceable(directory));
+        };
+        return match tree.probe(&name) {
+            // A directory, reached component by component without following anything: this name
+            // is the place, and excluding it excludes that repository's own data.
+            Ok(kr_transfer::authority::ObjectKind::Directory) => Ok(Some(candidate)),
+            // A link at the end of it. What it points at is where the data really is, and this
+            // host does not follow one to find out.
+            Ok(_) => Err(unplaceable(directory)),
+            // Nothing is there, so there is nothing of it to capture either.
+            Err(kr_transfer::Escape::NotFound { .. }) => Ok(None),
+            // A link on the way to it, or a name this host could not walk. Either way it cannot
+            // say where that repository's data actually is.
+            Err(_) => Err(unplaceable(directory)),
+        };
     }
     if !absolute {
         // A relative target that reduces to nothing inside the tree points above it, which is
@@ -1231,14 +1252,23 @@ fn administrative_target(
     // An absolute target that does not match this tree's own spelling may still be this tree,
     // reached through a link or another mount. This host cannot tell, and a capture that might
     // hold another repository's configuration is not one it takes.
-    Err(ChangeSetError::Unsupported {
+    Err(unplaceable(directory))
+}
+
+/// The refusal for a nested repository whose own data this host could not place.
+///
+/// Said the same way wherever it is decided: a capture that might hold another repository's
+/// configuration, which holds its remotes and can hold a credential, is not one this host takes on
+/// the chance that it does not.
+fn unplaceable(directory: &str) -> ChangeSetError {
+    ChangeSetError::Unsupported {
         detail: format!(
-            "a repository nested at {} keeps its own data at a path this host cannot place \
-             inside or outside this working tree, so it did not read the tree at all",
+            "a repository nested at {} keeps its own data somewhere this host could not place \
+             inside this working tree, so it did not read the tree at all",
             kr_project::git::redact(directory)
         )
         .into(),
-    })
+    }
 }
 
 /// Reduces one path to its components without touching the filesystem.

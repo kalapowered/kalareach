@@ -1028,6 +1028,46 @@ fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
     }
 }
 
+/// KR-REQ-14.33: a nested repository whose data this host cannot place refuses the capture.
+///
+/// A `.git` file can name its target through a link, and arithmetic on a path says where the name
+/// points rather than what is there. A capture that might hold another repository's configuration
+/// is not one this host takes on the chance that it does not.
+#[test]
+fn a_nested_repository_this_host_cannot_place_refuses_the_capture() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "aliased-tree");
+    let nested = path.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("a directory");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    git_raw(
+        &nested,
+        [
+            "remote",
+            "add",
+            "origin",
+            "https://user:a-secret-token@example.invalid/x.git",
+        ],
+    );
+    write(&nested, "inner.txt", "inner content\n");
+    // The data beside the tree, and the `.git` file naming it through a link.
+    std::fs::rename(nested.join(".git"), path.join("vendor/repo-data"))
+        .expect("the data moves beside the nested tree");
+    std::os::unix::fs::symlink("repo-data", path.join("vendor/git-alias")).expect("a link to it");
+    std::fs::write(nested.join(".git"), b"gitdir: ../git-alias\n").expect("and points through it");
+
+    let workspace = fixture.workspace("aliased-tree");
+    let policy = include_everything();
+    let grant = kr_protocol::changeset::FileGrant::default();
+    let failure = fixture
+        .capture_with(workspace, &policy, &grant, None, None)
+        .expect_err("a capture this host cannot place another repository's data in is refused");
+    assert!(
+        failure.to_string().contains("could not place"),
+        "the refusal says why: {failure}"
+    );
+}
+
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
 /// because nothing this host can reach holds a working tree still for the whole of a read.
 #[test]
