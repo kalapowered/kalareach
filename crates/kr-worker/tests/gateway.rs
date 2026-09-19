@@ -1016,6 +1016,7 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
         // this host answered is uncertain and is never answered again. Rich work returns with it.
         let (reconciliation, finished) = broker
             .reconcile_recovered(
+                broker.recovery_generation(),
                 ReconcileScope {
                     application_instance_id: instance(2),
                     connection: GatewayConnectionId::new(1),
@@ -1159,6 +1160,7 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
 
     let (_, finished) = broker
         .reconcile_recovered(
+            broker.recovery_generation(),
             ReconcileScope {
                 application_instance_id: instance(2),
                 connection: GatewayConnectionId::new(1),
@@ -1183,6 +1185,7 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
 
     let (_, finished) = broker
         .reconcile_recovered(
+            broker.recovery_generation(),
             ReconcileScope {
                 application_instance_id: instance(3),
                 connection: GatewayConnectionId::new(2),
@@ -1345,4 +1348,113 @@ fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_take
         broker.pending(third.resource_id).expect("recorded").state,
         PendingState::Uncertain
     );
+}
+
+/// KR-REQ-11.37: a reconciliation belongs to one recovery, and a scope that appears during a
+/// recovery joins what it owes.
+///
+/// Two windows closed here. A storage failure during recovery opens a new recovery, and an
+/// acknowledgement in flight from the one that failed must not finish it. And an upstream whose
+/// first request arrives while the recovery is running has not said what it holds, so rich work
+/// does not come back over it.
+#[test]
+fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_it_owes() {
+    let directory = std::env::temp_dir().join(format!("kr-recovery-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&directory).expect("the directory is created");
+    let journal = directory.join("worker.db");
+    let broker = gateway(Some(&journal));
+    let first = approval(&broker, "1", 2).expect("interpreted");
+
+    broker
+        .enter_volatile("the journal could not be written", TimestampMs::new(3))
+        .expect("the fence is entered");
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    let first_recovery = broker.recovery_generation();
+
+    // Storage fails again. The fence goes back over the same gap, and the recovery that will
+    // close it is a new one.
+    broker
+        .enter_volatile("the journal faulted again", TimestampMs::new(5))
+        .expect("the fence goes back");
+    broker
+        .recover(TimestampMs::new(6))
+        .expect("the gap is committed again");
+    let second_recovery = broker.recovery_generation();
+    assert_ne!(first_recovery, second_recovery);
+
+    // The acknowledgement prepared under the first recovery is about a moment that has passed.
+    let stale = broker
+        .reconcile_recovered(
+            first_recovery,
+            ReconcileScope {
+                application_instance_id: instance(2),
+                connection: GatewayConnectionId::new(1),
+            },
+            &[],
+            TimestampMs::new(7),
+        )
+        .expect_err("a reconciliation from the recovery that failed finishes nothing");
+    assert_eq!(stale.code(), ErrorCode::InvalidArgument);
+    assert!(
+        broker
+            .claim(first.resource_id, &actor("device-1"), TimestampMs::new(8))
+            .is_err(),
+        "rich work has not come back"
+    );
+
+    // A second upstream records its first request while the recovery is running. It has not said
+    // what it holds either, so it joins what this recovery owes and finishing the first one does
+    // not lift the fence.
+    broker
+        .open_native_connection(
+            GatewayConnectionId::new(2),
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            table(),
+            rich(),
+            "1",
+        )
+        .expect("a second native connection is authenticated");
+    broker
+        .forward_native(
+            GatewayConnectionId::new(2),
+            frame("7", "session/request_permission").as_bytes(),
+            TimestampMs::new(9),
+        )
+        .expect("the native path continues through a recovery");
+
+    let (_, waiting) = broker
+        .reconcile_recovered(
+            second_recovery,
+            ReconcileScope {
+                application_instance_id: instance(2),
+                connection: GatewayConnectionId::new(1),
+            },
+            &[],
+            TimestampMs::new(10),
+        )
+        .expect("the first upstream reconciles");
+    assert!(
+        waiting.is_none(),
+        "a scope that appeared during the recovery is one the recovery owes"
+    );
+    assert_eq!(broker.mode(), GatewayMode::Recovering);
+
+    let (_, finished) = broker
+        .reconcile_recovered(
+            second_recovery,
+            ReconcileScope {
+                application_instance_id: instance(2),
+                connection: GatewayConnectionId::new(2),
+            },
+            &[],
+            TimestampMs::new(11),
+        )
+        .expect("and the upstream that appeared reconciles too");
+    assert!(finished.is_some());
+    assert_eq!(broker.mode(), GatewayMode::Normal);
+    let _ = std::fs::remove_dir_all(&directory);
 }

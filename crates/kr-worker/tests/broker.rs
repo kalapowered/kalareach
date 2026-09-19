@@ -1417,6 +1417,7 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
         );
         broker
             .reconcile_recovered(
+                broker.recovery_generation(),
                 scope(instance(2), 1),
                 &[Broker::downstream(
                     GatewayConnectionId::new(1),

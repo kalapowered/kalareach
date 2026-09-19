@@ -94,7 +94,7 @@ pub use crate::broker::process::{
 pub use crate::broker::profiles::{ForegroundMark, LaunchIntent, ProfileStore, new_profile_id};
 pub use crate::broker::semantic::{GrantLowerBound, HistoryFilter, Replay, SemanticLog};
 pub use crate::broker::tokens::{Invocation, TokenStore};
-pub use crate::broker::volatile::{VolatileState, VolatileTransition};
+pub use crate::broker::volatile::{RecoveryGeneration, VolatileState, VolatileTransition};
 
 /// How many source frames one instance holds while it waits for a decoder to read them.
 ///
@@ -947,6 +947,9 @@ impl Broker {
         state
             .arbitration
             .record(resource.clone(), None, Some(source))?;
+        // A request recorded while a recovery is running belongs to an upstream that has not said
+        // what it still holds, so it joins what that recovery owes.
+        state.volatile.owe_one(application_instance_id, connection);
         if let Some(instance) = state.instances.get_mut(&application_instance_id) {
             instance.retain(source_frame);
         }
@@ -1529,22 +1532,7 @@ impl Broker {
         still_open: &[DownstreamRequestId],
         now: TimestampMs,
     ) -> Result<Reconciliation> {
-        self.reconcile_within(scope, still_open, now)
-    }
-
-    fn reconcile_within(
-        &self,
-        scope: ReconcileScope,
-        still_open: &[DownstreamRequestId],
-        now: TimestampMs,
-    ) -> Result<Reconciliation> {
-        let mut state = self.state();
-        let (reconciliation, transitions) = state.arbitration.plan_reconcile(scope, still_open);
-        for transition in transitions {
-            state.write_transition(&transition, now)?;
-            state.arbitration.commit(transition)?;
-        }
-        Ok(reconciliation)
+        self.state().reconcile_in(scope, still_open, now)
     }
 
     /// Returns one binding as it stands now.
@@ -1608,6 +1596,15 @@ impl Broker {
     #[must_use]
     pub fn mode(&self) -> kr_protocol::gateway::GatewayMode {
         self.state().volatile.mode()
+    }
+
+    /// Returns which recovery is running, or which one last ran.
+    ///
+    /// A reconciliation names it, so an acknowledgement prepared under one recovery cannot finish
+    /// another that a second storage failure opened in the meantime.
+    #[must_use]
+    pub fn recovery_generation(&self) -> RecoveryGeneration {
+        self.state().volatile.generation()
     }
 
     /// Returns the evidence gap that is open, while one is.
@@ -1709,34 +1706,42 @@ impl Broker {
     /// the reconciliation's own writes refuse.
     pub fn reconcile_recovered(
         &self,
+        generation: RecoveryGeneration,
         scope: ReconcileScope,
         still_open: &[DownstreamRequestId],
         now: TimestampMs,
     ) -> Result<(Reconciliation, Option<VolatileTransition>)> {
-        {
-            let state = self.state();
-            if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
-                return Err(BrokerError::invalid(format!(
-                    "the gateway is {} and this finishes a recovery",
-                    state.volatile.mode()
-                )));
-            }
-        }
-        let reconciliation = self.reconcile_within(scope, still_open, now)?;
+        // One lock covers the whole of it. Validating the mode, reconciling the upstream and
+        // finishing the recovery under separate locks left two windows: a scope could be added to
+        // the owed set between them, and a late acknowledgement could remove one from a recovery
+        // it was never about. The generation closes the second, and this closes the first.
         let mut state = self.state();
+        if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
+            return Err(BrokerError::invalid(format!(
+                "the gateway is {} and this finishes a recovery",
+                state.volatile.mode()
+            )));
+        }
+        let reconciliation = state.reconcile_in(scope, still_open, now)?;
         // This upstream is reconciled. Rich work comes back when every one that owed a
         // reconciliation has given it, and not before.
         if state
             .volatile
-            .reconciled(scope.application_instance_id, scope.connection)
+            .reconciled(generation, scope.application_instance_id, scope.connection)?
             > 0
         {
             return Ok((reconciliation, None));
         }
+        // The gap accounting is written before the fence is lifted. A gap whose final counts were
+        // never recorded is one nobody can read afterwards to see what the fault cost.
         if let Some(row) = state.volatile.row() {
+            let gap = state.volatile.gap().cloned();
+            if let Some(gap) = gap.as_ref() {
+                state.ledger.commit_gap(row, gap)?;
+            }
             state.ledger.finish_recovery(row)?;
         }
-        let finished = state.volatile.finish_recovery()?;
+        let finished = state.volatile.finish_recovery(generation)?;
         Ok((reconciliation, Some(finished)))
     }
 
@@ -2286,6 +2291,22 @@ impl BrokerState {
             capability,
             now,
         ))
+    }
+
+    /// Reconciles one upstream's records with what it still has pending. See
+    /// [`Broker::reconcile`].
+    fn reconcile_in(
+        &mut self,
+        scope: ReconcileScope,
+        still_open: &[DownstreamRequestId],
+        now: TimestampMs,
+    ) -> Result<Reconciliation> {
+        let (reconciliation, transitions) = self.arbitration.plan_reconcile(scope, still_open);
+        for transition in transitions {
+            self.write_transition(&transition, now)?;
+            self.arbitration.commit(transition)?;
+        }
+        Ok(reconciliation)
     }
 
     /// Returns one pending resource, or says this broker does not hold it.
