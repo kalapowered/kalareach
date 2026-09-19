@@ -1681,7 +1681,7 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
     // fixed number of lines and waiting. What is under test is that the session keeps reading
     // after the slow client's queue fills, and an application that had stopped printing by then
     // stands still for a reason that has nothing to do with the session: everything before the
-    // reading - attaching, a window of collection, waiting for a queue to fill - takes as long as
+    // reading - attaching, the first collection, waiting for a queue to fill - takes as long as
     // the machine takes, and a producer with a life measured in seconds is a race against it. This
     // one stops when the session does, which is at the end of this test.
     let host = host_with(
@@ -2137,8 +2137,7 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
     );
     assert!(
         !rendered.contains("after-the-handoff"),
-        "and nothing from after that cursor, which the application had already written by the \
-         time this arrived: {}",
+        "and nothing from after the cursor it was taken at: {}",
         rendered.escape_debug()
     );
     let live: Vec<u8> = batches
