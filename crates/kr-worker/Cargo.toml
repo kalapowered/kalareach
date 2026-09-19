@@ -61,6 +61,9 @@ serde_json.workspace = true
 # What an earlier build of this host wrote is a stored shape, so the tests that prove a journal
 # migrates and that retention keeps what it must write those rows themselves.
 rusqlite = { workspace = true, features = ["bundled"] }
+# A session that launches a real shell package needs a home directory on the internal disk that is
+# removed with the test, because nothing a launched process opens may be in the workspace.
+tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that waits on the terminal's own descriptor
 # cannot honour. This crate denies it instead and allows it in exactly two modules:

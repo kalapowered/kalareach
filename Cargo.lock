@@ -4354,6 +4354,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "windows-sys 0.61.2",

@@ -45,6 +45,7 @@ use kr_shell_integration::contract::requests::{
 };
 use kr_shell_integration::contract::transport::{HandshakeOutcome, WorkerExpectation};
 use kr_shell_integration::host::endpoint::HostEndpoint;
+use kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE;
 use kr_shell_integration::host::scripted::{
     ReferenceShell, ScriptedBridge, ToBridge, qualified_hello,
 };
@@ -966,6 +967,177 @@ async fn a_gesture_with_a_stale_fence_is_refused_rather_than_becoming_an_end_of_
     };
     assert_eq!(refusal.code, ErrorCode::EditorBusy);
     wired.close().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-07.16, KR-REQ-07.17, KR-REQ-07.44: a real qualified package, launched by this host.
+// --------------------------------------------------------------------------------------------
+
+/// KR-REQ-07.16, KR-REQ-07.17, KR-REQ-07.44.
+///
+/// Everything this test touches is on the internal disk: the package is the installed build, and
+/// the session's home, runtime directory, endpoint and working directory are all under the
+/// platform temporary directory. Nothing a launched process opens is in the workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint() {
+    let Some(package) = installed_package() else {
+        // The machine's package cache is not this suite's to depend on. A run that names
+        // KR_SHELL_PACKAGES has the built packages and drives one; a run that does not, skips.
+        eprintln!(
+            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so \
+             there is no built package to launch"
+        );
+        return;
+    };
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    // The shell's own home, on the internal disk, with the package's guarded entry in the startup
+    // file the person would have. The entry is what activates the integration after the user's own
+    // configuration has run, which is the ordering section 7 requires.
+    let home = tempfile::Builder::new()
+        .prefix("kr-package-home-")
+        .tempdir()
+        .expect("a home directory on the internal disk");
+    let entry = std::fs::read_to_string(package.startup_entry()).expect("the package's own entry");
+    let startup = match package.kind() {
+        ShellKind::Zsh => home.path().join(".zshrc"),
+        _ => home.path().join(".bashrc"),
+    };
+    std::fs::write(
+        &startup,
+        format!("HISTFILE=\nKR_TEST_USER_CONFIGURATION=1\n\n{entry}"),
+    )
+    .expect("the startup file");
+
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let host_endpoint = HostEndpoint::open_for_session(
+        environment.runtime_root(),
+        environment.runtime_dir(),
+        session_id,
+    )
+    .expect("binds the bridge");
+    let address = host_endpoint.address().clone();
+    let bootstrap = host_endpoint.bootstrap();
+
+    let mut config = configuration(&temp, ShellMode::Managed);
+    config.session_id = session_id;
+    config.journal_path = Some(environment.journal_database(session_id));
+    config.spool_directory = Some(environment.session_spool(session_id));
+    let mut variables = vec![
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        ("LANG".to_owned(), "C".to_owned()),
+        ("HOME".to_owned(), home.path().display().to_string()),
+        ("ZDOTDIR".to_owned(), home.path().display().to_string()),
+        (
+            kr_worker::environment::SESSION_VARIABLE.to_owned(),
+            session_id.to_string(),
+        ),
+    ];
+    variables.extend(
+        bootstrap
+            .exported_variables()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value)),
+    );
+    config.shell = ShellCommand {
+        program: package.executable().display().to_string(),
+        arguments: package.arguments(kr_shell_integration::host::package::StartupMode::Interactive),
+        cwd: home.path().display().to_string(),
+        environment: variables,
+    };
+
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the packaged shell");
+    let root_process = session
+        .root_identity()
+        .expect("the launched shell has a process identity");
+    let identity = package.identity();
+    session.install_fence(FenceDriver::new(
+        session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::new(SystemContinuousClock::new()),
+    ));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
+    let expectation = WorkerExpectation {
+        session_id,
+        root_process,
+        supported_editor_abis: vec![identity.editor_abi.clone()],
+        supported_integration_versions: vec![identity.integration_version.clone()],
+        launched_package: Some(package.declaration()),
+        already_registered: false,
+        gesture: EofGesture::default(),
+    };
+    let bridge_task = tokio::spawn(
+        kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            host_endpoint,
+            expectation,
+        )
+        .serve(),
+    );
+
+    // The package connects to the endpoint it was given, proves itself over the bootstrap secret
+    // and is registered; then its own entry reports that the hooks are live after the startup
+    // files, which is what qualifies the session.
+    let qualified = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            {
+                let session = runtime.session();
+                if let Some(driver) = session.fence()
+                    && driver.phase().reports_ready()
+                {
+                    return driver.phase().shell();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the {} package at {} did not register and qualify on this host's endpoint at {}",
+            package.kind().as_str(),
+            package.directory.display(),
+            address.path
+        )
+    });
+    assert_eq!(
+        qualified,
+        Some(package.kind()),
+        "the session's registered root integration is the package this host launched"
+    );
+    assert_eq!(
+        runtime.session().config().shell.program,
+        package.executable().display().to_string(),
+        "and the executable it launched is the package's own binary"
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+    bridge_task.abort();
+}
+
+/// Returns the qualified package this run may launch, or nothing.
+///
+/// Only a run that names [`PACKAGE_ROOT_VARIABLE`] launches one: the machine's own package cache is
+/// not this suite's to depend on, and an ordinary acceptance run must not vary with it.
+fn installed_package() -> Option<kr_shell_integration::host::package::ShellPackage> {
+    let root = std::env::var_os(PACKAGE_ROOT_VARIABLE)?;
+    let set =
+        kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
+    let package = set
+        .select(None)
+        .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"))
+        .clone();
+    Some(package)
 }
 
 // --------------------------------------------------------------------------------------------
