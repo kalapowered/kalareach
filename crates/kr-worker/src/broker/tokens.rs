@@ -195,6 +195,16 @@ impl TokenStore {
         Ok((unspent.token, unspent.binding_id, unspent.capability))
     }
 
+    /// Retires one token nobody will spend.
+    ///
+    /// An invocation that is abandoned after its token was issued — a fence that came down, a
+    /// check that refused, a component that will never answer — leaves a record that holds a slot
+    /// against every later invocation. Retiring it is what keeps the bound a bound on outstanding
+    /// work rather than on work that was ever started.
+    pub fn retire(&mut self, token_id: &ActionTokenId) -> bool {
+        self.unspent.remove(token_id).is_some()
+    }
+
     /// Withdraws every token issued against one instance.
     ///
     /// The binding revision advancing already invalidates them; this removes the records so the

@@ -3217,25 +3217,37 @@ against the retained list before the claim is taken, and it happens once.
 Every refusal named above is decided before the dispatch marker, so a request this host can refuse
 leaves a rejection rather than an outcome nobody can establish. That includes an instance with no
 transport bound and one whose every component has had its rich capabilities disabled: both are
-refused before anything is marked, for a plugin action as well as for the five mutations. A plugin action's own authority is checked
-too: its grant, its binding revision, its capability and the room to issue its token are all
-checked before the marker rather than when the token is issued. What a refusal after the marker still covers is the transport's own
-failure, which is what `OUTCOME_UNKNOWN` is for, and the narrow window between the last check and
-the submission: the checks and the submission take the broker's lock separately, so a fence, a
-suspension or a capability invalidation that lands between them is still discovered during
-dispatch. Making those one admission is the work that finishes it, and the service has no receipt
-test for either case yet.
+refused before anything is marked, for a plugin action as well as for the five mutations. A plugin
+action's own authority is checked too: its grant, its binding revision, its capability and the room
+to issue its token are all checked before the marker rather than when the token is issued.
 
-What carries an admitted mutation to the upstream is the connector's own transport. The broker
-holds it under `UpstreamDispatch` and submits while the session lock is held, so a transport that
-does not return promptly holds up the session it belongs to; giving the submission its own deadline
-and moving it outside that lock is the work that finishes this.
+The admission itself crosses the marker. The broker admits the mutation before the marker is
+written and the same admission is what the effect carries out, so a fence, a suspension, a turn
+change or a capability invalidation cannot land between the check and the transmission. A marker
+this host could not write leaves nothing executable behind it: the admission is given up, an
+approval's claim goes back and a plugin action's token is retired. What a refusal after the marker
+still covers is the transport's own failure, which is what `OUTCOME_UNKNOWN` is for.
+
+What an admission carries is a permit, taken once. Taking it is what authorises the transmission,
+and for an answer it is also what authorises the settlement, so a second caller on one admission
+transmits nothing and settles nothing rather than recording the first caller's answer as uncertain.
+An answer's transport is the one that speaks for the connection whose resource it resolves, chosen
+when the answer is admitted; a connection that has gone is `UPSTREAM_UNAVAILABLE` before anything
+is claimed. The transport work happens after the session boundary ends, because terminal ingestion
+needs that boundary and an upstream that is slow to answer must not stop a person typing.
 
 `plugin.action.invoke` validates the registered action, the grant that action declares, its effect
 class and whether a draft the action needs was named, and then issues the action token that
-authorises the one invocation that follows. Resolving the draft itself — that it exists, whose it
-is and at which revision — is the draft store's, and this host checks the presence of the name
-until that is joined up.
+authorises the one invocation that follows. The declaration is read inside the admission, so a
+registration that replaces it cannot land between the read and the dispatch that depends on it, and
+the plan the component returns is checked against the declaration in force when it arrives. The
+draft is resolved before the admission takes its lock and the snapshot is what the admission binds
+to. The arguments a plan is for are the arguments that will execute: the host computes their digest
+itself and compares it with the token's, because a hash a component supplied says only that the
+component can write a hash. What transmits is the plan that was validated, carried in the permit
+rather than attested by a flag beside it. Resolving the draft itself — that it exists, whose it is
+and at which revision — is the draft store's, and this host checks the name and the snapshot's
+identity until that is joined up.
 
 An adapter checkpoints the cursor it consumed, and the cursor survives a restart. A restart resumes
 the numbering after it, so a new entry never takes a cursor an adapter has already passed and a

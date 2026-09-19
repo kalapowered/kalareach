@@ -1462,7 +1462,7 @@ fn kr_req_11_25_a_tables_digest_names_the_semantics_it_declares() {
     let mut reframed = qualified.clone();
     reframed.framing = NativeFraming::ContentLength;
     let mut reclassified = qualified.clone();
-    reclassified.entries[2].class = NativeMethodClass::Observation;
+    reclassified.entries[0].class = NativeMethodClass::Observation;
     let mut reversed = qualified.clone();
     reversed.entries[0].reverse = Nullable::some(ReverseOperation::FilesystemWrite);
     for (what, altered) in [
@@ -1496,4 +1496,75 @@ fn kr_req_11_25_a_tables_digest_names_the_semantics_it_declares() {
         )
         .expect_err("nothing is pinned for that package");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+}
+
+/// KR-REQ-11.26 and KR-REQ-12.06: restoring a connection checks every resource it retained, in
+/// whichever order they are read.
+#[test]
+fn kr_req_11_26_a_restoration_checks_every_resource_the_connection_retained() {
+    let mut stale_first = 0_usize;
+    let mut stale_second = 0_usize;
+    // Resources are identified by random handles, so the order a connection's retained resources
+    // are read in is not the order they were created in. The refusal has to hold either way, so
+    // the scenario runs until both orders have been seen.
+    for _ in 0..200 {
+        let broker = gateway(None);
+        let connection = GatewayConnectionId::new(1);
+        let current = broker
+            .forward_native(
+                connection,
+                frame("1", "session/request_permission").as_bytes(),
+                TimestampMs::new(2),
+            )
+            .expect("forwarded")
+            .1
+            .expect("it expects a response")
+            .resource_id;
+        // The upstream owner changes, and a request recorded after it belongs to the execution
+        // that is running now.
+        broker
+            .advance_binding(instance(2), None, TimestampMs::new(3))
+            .expect("the binding advances");
+        let newer = broker
+            .forward_native(
+                connection,
+                frame("2", "session/request_permission").as_bytes(),
+                TimestampMs::new(4),
+            )
+            .expect("forwarded")
+            .1
+            .expect("it expects a response")
+            .resource_id;
+        broker.close_connection(connection);
+
+        let order: Vec<_> = broker
+            .pending_resources()
+            .into_iter()
+            .filter(|resource| resource.request.connection == connection)
+            .map(|resource| resource.resource_id)
+            .collect();
+        assert_eq!(order.len(), 2);
+        if order[0] == current {
+            stale_first += 1;
+        } else {
+            assert_eq!(order[0], newer);
+            stale_second += 1;
+        }
+
+        let refusal = broker
+            .restore_native_connection(
+                connection,
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect_err("a connection holding an old execution's resources is not restored");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        if stale_first > 0 && stale_second > 0 {
+            return;
+        }
+    }
+    panic!("both read orders should have occurred: {stale_first} and {stale_second}");
 }

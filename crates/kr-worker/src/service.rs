@@ -2653,25 +2653,29 @@ impl WorkerService {
             })
             // And last, what the effect itself would have refused. Last, because that is where the
             // effect asked it: moving a refusal before the marker must not move it in front of a
-            // precondition the caller stated or a deadline this host accepted.
+            // precondition the caller stated or a deadline this host accepted. For a mutation the
+            // broker owns, what comes back is the admission itself.
             .and_then(|()| self.decidable(&session, mutation, method, caller));
-        if let Err(error) = revalidated {
-            if let Some(journal) = session.journal_mut() {
-                let reason = if matches!(error, WorkerError::WindowExpired { .. }) {
-                    kr_protocol::receipt::RejectionReason::Expired
-                } else {
-                    kr_protocol::receipt::RejectionReason::StalePreconditions
-                };
-                let _ = journal.reject(
-                    actor_id,
-                    mutation.action_id,
-                    reason,
-                    Some(error.to_protocol_error()),
-                    kr_ipc::now_ms(),
-                );
+        let prepared = match revalidated {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(journal) = session.journal_mut() {
+                    let reason = if matches!(error, WorkerError::WindowExpired { .. }) {
+                        kr_protocol::receipt::RejectionReason::Expired
+                    } else {
+                        kr_protocol::receipt::RejectionReason::StalePreconditions
+                    };
+                    let _ = journal.reject(
+                        actor_id,
+                        mutation.action_id,
+                        reason,
+                        Some(error.to_protocol_error()),
+                        kr_ipc::now_ms(),
+                    );
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         if admitted && let Some(journal) = session.journal_mut() {
             // The dispatch marker is committed before the effect. A stop whose marker cannot be
             // written proceeds on the worker's current authority and reports volatile durability,
@@ -2680,13 +2684,19 @@ impl WorkerService {
                 journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())
             {
                 if !volatile_permitted {
+                    // A marker that was not written leaves nothing executable behind it. The
+                    // admission is abandoned here, so the operation it authorised cannot be
+                    // transmitted by anything that still holds a reference to it.
+                    if let Some(prepared) = prepared {
+                        prepared.abandon();
+                    }
                     return Err(error);
                 }
                 session.note_journal_failure(error.to_string());
             }
         }
 
-        let outcome = self.apply(&mut session, state, mutation, method, caller);
+        let outcome = self.apply(&mut session, state, mutation, method, caller, prepared);
         // A launch that reached the reader has no outcome yet, so none is recorded: it is settled
         // when the reader answers, outside this boundary. An admitted upstream operation is the
         // same shape for the same reason: its effect is the admission, and its outcome is what the
@@ -3405,6 +3415,19 @@ impl WorkerService {
         }
     }
 
+    /// Wraps one broker admission as the work that happens once the session boundary ends.
+    fn handoff(
+        &self,
+        admitted: crate::broker::MutationAdmission,
+        kind: UpstreamKind,
+    ) -> UpstreamHandoff {
+        UpstreamHandoff {
+            broker: Arc::clone(&self.broker),
+            admitted,
+            kind,
+        }
+    }
+
     /// Refuses, before the dispatch marker, everything the effect itself would refuse.
     ///
     /// Section 9 makes a refusal this host can decide a rejection rather than an outcome nobody
@@ -3418,7 +3441,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
-    ) -> Result<()> {
+    ) -> Result<Option<UpstreamHandoff>> {
         // Whether this session is still running, for the methods that need it to be. Each of those
         // effects asks this first, so this does too.
         if matches!(
@@ -3448,29 +3471,33 @@ impl WorkerService {
                 // Everything the attachment table would refuse: the session's attachment limit, a
                 // semantic attachment claiming geometry, a terminal attachment with no dimensions,
                 // and dimensions this host does not serve.
-                session.attachable(&params)
+                session.attachable(&params).map(|()| None)
             }
             Method::AttachmentConfigure => {
                 let params: AttachmentConfigureParams = parse(&mutation.params)?;
                 // Whether this attachment can hold a claim at all, which a semantic one cannot.
-                session.configurable(params.attachment_id, params.claim_geometry)
+                session
+                    .configurable(params.attachment_id, params.claim_geometry)
+                    .map(|()| None)
             }
             Method::TerminalResize => {
                 let params: TerminalResizeParams = parse(&mutation.params)?;
                 // The size, the ownership and the epoch, in the order the resize asks them: an
                 // impossible size is an impossible size before it is anybody's to set.
-                session.resizable(
-                    params.attachment_id,
-                    params.dimensions,
-                    params.expected_geometry_epoch.get(),
-                )
+                session
+                    .resizable(
+                        params.attachment_id,
+                        params.dimensions,
+                        params.expected_geometry_epoch.get(),
+                    )
+                    .map(|()| None)
             }
             Method::TerminalGeometryTransfer => {
                 let params: kr_protocol::attachment::TerminalGeometryTransferParams =
                     parse(&mutation.params)?;
                 // The epoch and then the claim, which is the order the transfer asks them.
                 Self::check_geometry_epoch(session, params.expected_geometry_epoch)?;
-                session.transferable(params.attachment_id)
+                session.transferable(params.attachment_id).map(|()| None)
             }
             Method::InputAcquire => {
                 let params: InputAcquireParams = parse(&mutation.params)?;
@@ -3479,24 +3506,28 @@ impl WorkerService {
                 if let Some(epoch) = params.expected_epoch.as_ref() {
                     Self::check_lease_epoch(session, *epoch)?;
                 }
-                session.input_compatible(params.attachment_id)
+                session
+                    .input_compatible(params.attachment_id)
+                    .map(|()| None)
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(&mutation.params)?;
                 // Whether this attachment holds the lease at the epoch it names, which is what the
                 // release itself answers.
-                Self::check_lease_holder(session, params.attachment_id, params.epoch)
+                Self::check_lease_holder(session, params.attachment_id, params.epoch).map(|()| None)
             }
             Method::InputInterrupt => {
                 let params: InputInterruptParams = parse(&mutation.params)?;
-                Self::check_lease_holder(session, params.attachment_id, params.epoch)
+                Self::check_lease_holder(session, params.attachment_id, params.epoch).map(|()| None)
             }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(&mutation.params)?;
                 // The size this window reports, whether this attachment is shown a terminal at
                 // all, and whether it may put its window where the report asks. A semantic
                 // attachment has no viewport to report.
-                session.viewportable(params.attachment_id, params.dimensions, params.position.0)
+                session
+                    .viewportable(params.attachment_id, params.dimensions, params.position.0)
+                    .map(|()| None)
             }
             // Everything about a review, a visit or a quiet-hours window this host can decide
             // about. A subject this session never held, a version nobody produced, a counter the
@@ -3504,90 +3535,69 @@ impl WorkerService {
             // and one more actor than the store admits are refusals rather than outcomes nobody
             // can establish, so they are answered here, before the dispatch marker, rather than
             // failing inside the effect and settling as an outcome nobody can establish.
-            Method::AttentionAcknowledge => self.attention.check_actor(&caller.actor_id),
+            Method::AttentionAcknowledge => {
+                self.attention.check_actor(&caller.actor_id).map(|()| None)
+            }
             Method::ReviewAcknowledge => {
                 let params: kr_protocol::attention::ReviewAcknowledgeParams =
                     parse(&mutation.params)?;
                 self.attention.check_actor(&caller.actor_id)?;
-                self.attention.check_review(&params)
+                self.attention.check_review(&params).map(|()| None)
             }
             Method::AttentionQuietHours => {
                 let params: kr_protocol::attention::AttentionQuietHoursParams =
                     parse(&mutation.params)?;
-                crate::attention::Attention::check_quiet_hours(&params)
+                crate::attention::Attention::check_quiet_hours(&params).map(|()| None)
             }
             Method::VisitAcknowledge => {
                 let params: kr_protocol::attention::VisitAcknowledgeParams =
                     parse(&mutation.params)?;
                 self.attention.check_actor(&caller.actor_id)?;
-                crate::attention::Attention::check_visit(&params)
+                crate::attention::Attention::check_visit(&params).map(|()| None)
             }
-            // The agent mutations and the plugin action. Everything the broker can decide about
-            // them is decided here, before the dispatch marker: section 9 makes a refusal this
-            // host can decide a rejection rather than an outcome nobody can establish, and all of
-            // these are decidable without touching the upstream.
+            // The agent mutations and the plugin action. The broker admits each one here,
+            // before the dispatch marker: section 9 makes a refusal this host can decide a
+            // rejection rather than an outcome nobody can establish, and everything the broker
+            // decides is decidable without touching the upstream. What comes back is the
+            // admission itself, and it crosses the marker with the mutation, so nothing the
+            // admission checked can move between the check and the transmission.
             Method::AgentPromptSubmit | Method::AgentPromptQueue => {
                 let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
-                params
-                    .validate()
-                    .map_err(|detail| WorkerError::InvalidArgument((*detail).to_owned()))?;
-                let capability = if method == Method::AgentPromptQueue {
-                    "agent.prompt.queue"
-                } else {
-                    "agent.prompt"
-                };
-                self.broker.check_mutation(
+                let admitted = self.broker.admit_prompt(
                     &Self::broker_caller(caller),
-                    &params.target,
-                    capability,
-                    kr_protocol::gateway::RichOperation::PromptSubmit,
-                    None,
+                    &params,
+                    method == Method::AgentPromptQueue,
                     kr_ipc::now_ms(),
                 )?;
-                Ok(())
+                Ok(Some(self.handoff(admitted, UpstreamKind::Mutation)))
             }
             Method::AgentTurnSteer => {
                 let params: kr_protocol::agent::AgentSteerParams = parse(&mutation.params)?;
-                self.broker.check_mutation(
+                let admitted = self.broker.admit_steer(
                     &Self::broker_caller(caller),
-                    &params.target,
-                    "agent.steer",
-                    kr_protocol::gateway::RichOperation::TurnSteer,
-                    Some(params.turn_id.clone()),
+                    &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok(())
+                Ok(Some(self.handoff(admitted, UpstreamKind::Mutation)))
             }
             Method::AgentTurnCancel => {
                 let params: kr_protocol::agent::AgentCancelParams = parse(&mutation.params)?;
-                self.broker.check_mutation(
+                let admitted = self.broker.admit_cancel(
                     &Self::broker_caller(caller),
-                    &params.target,
-                    "agent.cancel",
-                    kr_protocol::gateway::RichOperation::TurnCancel,
-                    Some(params.turn_id.clone()),
+                    &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok(())
+                Ok(Some(self.handoff(admitted, UpstreamKind::Mutation)))
             }
             Method::AgentApprovalRespond => {
                 let params: kr_protocol::agent::AgentApprovalRespondParams =
                     parse(&mutation.params)?;
-                self.broker.check_mutation(
+                let admitted = self.broker.admit_approval(
                     &Self::broker_caller(caller),
-                    &params.target,
-                    "agent.approval",
-                    kr_protocol::gateway::RichOperation::ApprovalRespond,
-                    None,
+                    &params,
                     kr_ipc::now_ms(),
                 )?;
-                self.broker.check_answerable(
-                    &params.target,
-                    params.resource_id,
-                    &params.option_id,
-                    kr_ipc::now_ms(),
-                )?;
-                Ok(())
+                Ok(Some(self.handoff(admitted, UpstreamKind::Approval)))
             }
             Method::PluginActionInvoke => {
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(&mutation.params)?;
@@ -3641,9 +3651,9 @@ impl WorkerService {
                         params.action_id, receipt.state
                     )));
                 }
-                Ok(())
+                Ok(None)
             }
-            _ => Ok(()),
+            _ => Ok(None),
         }
     }
 
@@ -4201,6 +4211,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
+        prepared: Option<UpstreamHandoff>,
     ) -> Result<(ParamsValue, AfterEffect)> {
         let params = &mutation.params;
         match method {
@@ -4522,92 +4533,33 @@ impl WorkerService {
                     .acknowledge_visit(&caller.actor_id, &params)?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
-            // The five agent mutations and the plugin action call. The broker admits each one
-            // under its own lock, and the admission is what leaves this boundary: the transport
-            // work happens after the session mutex is released, because terminal ingestion needs
-            // that mutex and an upstream that is slow to answer must not stop a person typing.
-            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
-                let params: kr_protocol::agent::AgentPromptParams = parse(params)?;
-                let queued = method == Method::AgentPromptQueue;
-                let admitted = self.broker.admit_prompt(
-                    &Self::broker_caller(caller),
-                    &params,
-                    queued,
-                    kr_ipc::now_ms(),
-                )?;
+            // The five agent mutations and the plugin action call. The broker admitted each one
+            // before the dispatch marker, and the admission it made is what arrives here: the
+            // same permit crossed the marker, so nothing it was checked against could move in
+            // between. What leaves this boundary is that permit, because the transport work
+            // happens after the session mutex is released — terminal ingestion needs that mutex,
+            // and an upstream that is slow to answer must not stop a person typing.
+            Method::AgentPromptSubmit
+            | Method::AgentPromptQueue
+            | Method::AgentTurnSteer
+            | Method::AgentTurnCancel
+            | Method::AgentApprovalRespond => {
+                let handoff = prepared.ok_or_else(|| {
+                    WorkerError::InvalidArgument(format!(
+                        "{} reached its effect without the admission that authorises it",
+                        method.as_str()
+                    ))
+                })?;
                 Ok((
                     ParamsValue::empty(),
-                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
-                        broker: Arc::clone(&self.broker),
-                        admitted,
-                        kind: UpstreamKind::Mutation,
-                    })),
-                ))
-            }
-            Method::AgentTurnSteer => {
-                let params: kr_protocol::agent::AgentSteerParams = parse(params)?;
-                let admitted = self.broker.admit_steer(
-                    &Self::broker_caller(caller),
-                    &params,
-                    kr_ipc::now_ms(),
-                )?;
-                Ok((
-                    ParamsValue::empty(),
-                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
-                        broker: Arc::clone(&self.broker),
-                        admitted,
-                        kind: UpstreamKind::Mutation,
-                    })),
-                ))
-            }
-            Method::AgentTurnCancel => {
-                let params: kr_protocol::agent::AgentCancelParams = parse(params)?;
-                let admitted = self.broker.admit_cancel(
-                    &Self::broker_caller(caller),
-                    &params,
-                    kr_ipc::now_ms(),
-                )?;
-                Ok((
-                    ParamsValue::empty(),
-                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
-                        broker: Arc::clone(&self.broker),
-                        admitted,
-                        kind: UpstreamKind::Mutation,
-                    })),
-                ))
-            }
-            Method::AgentApprovalRespond => {
-                let params: kr_protocol::agent::AgentApprovalRespondParams = parse(params)?;
-                let admitted = self.broker.admit_approval(
-                    &Self::broker_caller(caller),
-                    &params,
-                    kr_ipc::now_ms(),
-                )?;
-                Ok((
-                    ParamsValue::empty(),
-                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
-                        broker: Arc::clone(&self.broker),
-                        admitted,
-                        kind: UpstreamKind::Approval,
-                    })),
+                    AfterEffect::Upstream(Box::new(handoff)),
                 ))
             }
             Method::PluginActionInvoke => {
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(params)?;
-                let binding_id = self.broker.binding_for(
-                    &params.plugin_id,
-                    params.target.subject.application_instance_id,
-                )?;
                 // The refusal above is decided before the marker, so nothing reaches this arm.
-                // It stays as the one place that would admit the invocation once the component's
+                // It stays as the one place that would carry the invocation once the component's
                 // prepared effect reaches this broker.
-                let admitted = self.broker.admit_plugin_action(
-                    &Self::broker_caller(caller),
-                    binding_id,
-                    &params,
-                    kr_ipc::now_ms(),
-                )?;
-                let _ = admitted;
                 Err(crate::broker::BrokerError::UnsupportedCapability {
                     detail: format!(
                         "{} has no prepared effect this broker validated",
@@ -5422,6 +5374,14 @@ pub struct UpstreamHandoff {
 }
 
 impl UpstreamHandoff {
+    /// Gives the admission up without transmitting.
+    ///
+    /// A dispatch marker this host could not write leaves no executable permit behind it: what
+    /// the admission authorised is retired here rather than left for something else to send.
+    fn abandon(self) {
+        self.broker.abandon(&self.admitted);
+    }
+
     /// Carries the admitted operation to its upstream and encodes what it answered.
     ///
     /// Nothing of this worker's is held while this runs. The admission already carries everything

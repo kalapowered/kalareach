@@ -966,7 +966,12 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
 fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
     let broker = Broker::open(None, session()).expect("the broker opens");
     broker
-        .register_instance(instance(2), IntegrationMode::Gateway, None, None)
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(2), true)),
+        )
         .expect("the instance is registered");
 
     let undisclosed = Probe {
@@ -1168,10 +1173,20 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
 fn kr_req_01_02_the_capability_map_is_per_installation() {
     let broker = Broker::open(None, session()).expect("the broker opens");
     broker
-        .register_instance(instance(2), IntegrationMode::Gateway, None, None)
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(2), true)),
+        )
         .expect("the instance is registered");
     broker
-        .register_instance(instance(3), IntegrationMode::NativeTerminal, None, None)
+        .register_instance(
+            instance(3),
+            IntegrationMode::NativeTerminal,
+            None,
+            Some(managed(instance(3), true)),
+        )
         .expect("the instance is registered");
     broker
         .record_capability(evidence(

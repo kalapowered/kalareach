@@ -221,6 +221,14 @@ impl UpstreamDispatch for RecordingUpstream {
     }
 }
 
+/// The digest of the parameters every invocation in this suite is made with.
+///
+/// A plan is checked against the arguments that will execute, so a test that supplies a hash of
+/// its own is testing nothing: this is what the host itself computes.
+fn arguments_digest() -> Digest256 {
+    Digest256::from_bytes(kr_cbor::sha256(b"{}"))
+}
+
 /// A draft store that holds exactly the drafts it was told about.
 #[derive(Debug)]
 struct KnownDrafts {
@@ -228,9 +236,15 @@ struct KnownDrafts {
 }
 
 impl kr_worker::broker::DraftResolver for KnownDrafts {
-    fn resolve(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<(), BrokerError> {
+    fn resolve(
+        &self,
+        draft_id: &kr_protocol::ids::DraftId,
+    ) -> Result<kr_worker::broker::DraftSnapshot, BrokerError> {
         if self.known.contains(draft_id) {
-            Ok(())
+            Ok(kr_worker::broker::DraftSnapshot {
+                draft_id: *draft_id,
+                revision: kr_protocol::scalars::U64::new(1),
+            })
         } else {
             Err(BrokerError::PreconditionFailed {
                 detail: format!("no draft {draft_id}"),
@@ -243,8 +257,11 @@ impl kr_worker::broker::DraftResolver for KnownDrafts {
 fn agent_broker_with(upstream: std::sync::Arc<RecordingUpstream>) -> Broker {
     let broker = agent_broker();
     broker
-        .bind_dispatch(instance(), upstream)
+        .bind_dispatch(instance(), std::sync::Arc::clone(&upstream) as _)
         .expect("the transport is bound");
+    // An answer goes out on the connection whose resource it resolves, so the connection has its
+    // own transport as well as the instance.
+    broker.bind_connection_dispatch(GatewayConnectionId::new(1), upstream);
     broker
 }
 
@@ -626,11 +643,9 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
         ActionProvenance::UpstreamTypedRpc
     );
     assert_eq!(
-        admission
-            .approval()
-            .expect("the admission carries the approval it answers")
-            .upstream_request_id,
-        UpstreamRequestId::new("11").expect("valid")
+        admission.resource_id(),
+        Some(resource.resource_id),
+        "the admission names the resource it answered"
     );
 
     // And once.
@@ -777,7 +792,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                 kr_protocol::broker::PreparedOperation::UpstreamSubmit
             },
             draft_id: draft,
-            argument_hash: Digest256::from_bytes([8; 32]),
+            argument_hash: arguments_digest(),
         }
     };
     let invoke = |action: &str, draft: Nullable<kr_protocol::ids::DraftId>| {
@@ -1047,7 +1062,7 @@ fn kr_req_11_22_one_admission_carries_every_check_and_the_transport_it_will_use(
         "the admission names what it rechecked"
     );
     assert_eq!(
-        admitted.request().operation,
+        admitted.operation(),
         kr_protocol::gateway::RichOperation::PromptSubmit
     );
     assert!(
@@ -1210,7 +1225,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
             }],
         )
         .expect("the actions are registered");
-    let mut admitted = broker
+    let admitted = broker
         .admit_plugin_action(
             &caller(),
             binding(),
@@ -1225,7 +1240,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
         )
         .expect("the invocation is admitted");
     assert!(
-        !admitted.effect_validated(),
+        !admitted.carries_a_validated_plan(),
         "nothing is validated until a plan arrives"
     );
 
@@ -1238,14 +1253,14 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
             class,
             operation,
             draft_id,
-            argument_hash: Digest256::from_bytes([8; 32]),
+            argument_hash: arguments_digest(),
         }
     };
     let attachment = kr_protocol::broker::PreparedOperation::UpstreamAttachment;
 
     broker
         .validate_effect(
-            &mut admitted,
+            &admitted,
             &plan(
                 "draft.attach",
                 EffectClass::Write,
@@ -1259,7 +1274,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert!(matches!(
         broker
             .validate_effect(
-                &mut admitted,
+                &admitted,
                 &plan(
                     "prompt.submit",
                     EffectClass::Write,
@@ -1275,7 +1290,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert!(
         broker
             .validate_effect(
-                &mut admitted,
+                &admitted,
                 &plan(
                     "draft.attach",
                     EffectClass::Read,
@@ -1291,7 +1306,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert_eq!(
         broker
             .validate_effect(
-                &mut admitted,
+                &admitted,
                 &plan(
                     "draft.attach",
                     EffectClass::Write,
@@ -1311,7 +1326,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert!(matches!(
         broker
             .validate_effect(
-                &mut admitted,
+                &admitted,
                 &plan(
                     "draft.attach",
                     EffectClass::Write,
@@ -1322,4 +1337,343 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
             .expect_err("a grant withdrawn while the component worked is not a grant"),
         BrokerError::Grant(_)
     ));
+}
+
+/// KR-REQ-11.27 and KR-REQ-11.33: one admission carries one transmission, and a caller that
+/// arrives second transmits nothing and settles nothing.
+#[test]
+fn kr_req_11_27_a_second_caller_on_one_admission_transmits_nothing_and_settles_nothing() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let opaque = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            br#"{"id":11,"method":"session/request_permission"}"#,
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let resource = broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("interpreted");
+
+    let admitted = broker
+        .admit_approval(
+            &caller(),
+            &AgentApprovalRespondParams {
+                target: target(1),
+                resource_id: resource.resource_id,
+                option_id: "allow".to_owned(),
+            },
+            TimestampMs::new(4),
+        )
+        .expect("the answer is admitted");
+    let answered = broker
+        .record_approval(&admitted, TimestampMs::new(5))
+        .expect("the winner transmits");
+    assert_eq!(answered.state, PendingState::Resolved);
+    assert_eq!(upstream.submitted().len(), 1);
+
+    // The loser finds the permit gone. It does not transmit, and it does not reach the
+    // arbitration at all, so the answer the winner settled stays settled.
+    let loser = broker
+        .record_approval(&admitted, TimestampMs::new(6))
+        .expect_err("one admission carries one answer");
+    assert!(matches!(loser, BrokerError::AlreadyTransmitted));
+    assert_eq!(upstream.submitted().len(), 1, "and it wrote nothing");
+    assert_eq!(
+        broker
+            .recorded(resource.resource_id)
+            .expect("readable")
+            .expect("retained")
+            .state,
+        PendingState::Resolved,
+        "the winner's resolution is untouched"
+    );
+    assert!(!admitted.executable());
+}
+
+/// KR-REQ-11.28 and KR-REQ-23.30: an invocation whose prepared effect was never validated
+/// transmits nothing, whichever public route is asked to carry it.
+#[test]
+fn kr_req_11_28_an_unvalidated_effect_transmits_on_no_route() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("prompt.submit").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+            }],
+        )
+        .expect("the actions are registered");
+    let invoke = || PluginActionInvokeParams {
+        target: target(1),
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        action: ActionName::new("prompt.submit").expect("valid"),
+        draft_id: Nullable::null(),
+        parameters: Bytes::from(b"{}".to_vec()),
+    };
+
+    // The generic dispatch route, which any consumer of the broker can reach.
+    let admitted = broker
+        .admit_plugin_action(&caller(), binding(), &invoke(), TimestampMs::new(2))
+        .expect("the invocation is admitted");
+    assert!(
+        broker
+            .dispatch_mutation(&admitted, TimestampMs::new(3))
+            .is_err(),
+        "a plugin action with no validated plan is not a mutation to dispatch"
+    );
+
+    // And the plugin route.
+    let admitted = broker
+        .admit_plugin_action(&caller(), binding(), &invoke(), TimestampMs::new(4))
+        .expect("the invocation is admitted");
+    assert!(
+        broker
+            .record_plugin_action(&admitted, TimestampMs::new(5))
+            .is_err(),
+        "nor is it one to record"
+    );
+    assert!(upstream.submitted().is_empty(), "and nothing was written");
+
+    // A plan whose arguments are not the ones that will execute is not this invocation's plan,
+    // whatever hash it carries.
+    let admitted = broker
+        .admit_plugin_action(&caller(), binding(), &invoke(), TimestampMs::new(6))
+        .expect("the invocation is admitted");
+    assert!(
+        broker
+            .validate_effect(
+                &admitted,
+                &kr_protocol::broker::PreparedEffect {
+                    action: ActionName::new("prompt.submit").expect("valid"),
+                    class: EffectClass::Write,
+                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                    draft_id: Nullable::null(),
+                    argument_hash: Digest256::from_bytes([8; 32]),
+                },
+            )
+            .is_err(),
+        "a hash a component wrote is not evidence about the arguments"
+    );
+    assert!(
+        broker
+            .record_plugin_action(&admitted, TimestampMs::new(7))
+            .is_err()
+    );
+    assert!(upstream.submitted().is_empty());
+}
+
+/// KR-REQ-23.30: the action declaration an admission checks is the one in force when it admits,
+/// and a registration that replaces it afterwards does not reach back into what was admitted.
+#[test]
+fn kr_req_23_30_an_admission_checks_the_declaration_in_force_when_it_admits() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("prompt.submit").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+            }],
+        )
+        .expect("the actions are registered");
+    let invoke = PluginActionInvokeParams {
+        target: target(1),
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        action: ActionName::new("prompt.submit").expect("valid"),
+        draft_id: Nullable::null(),
+        parameters: Bytes::from(b"{}".to_vec()),
+    };
+    let admitted = broker
+        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(2))
+        .expect("the invocation is admitted");
+
+    // The package re-registers the same action as a read. The invocation already admitted is not
+    // re-decided by it, and the plan it prepares is still checked against a declaration.
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("prompt.submit").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Read,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+            }],
+        )
+        .expect("the package registers its actions");
+    assert!(
+        broker
+            .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(3))
+            .is_err(),
+        "the declaration in force now is a read, and this is the write path"
+    );
+    assert!(
+        broker
+            .validate_effect(
+                &admitted,
+                &kr_protocol::broker::PreparedEffect {
+                    action: ActionName::new("prompt.submit").expect("valid"),
+                    class: EffectClass::Write,
+                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                    draft_id: Nullable::null(),
+                    argument_hash: arguments_digest(),
+                },
+            )
+            .is_err(),
+        "and a plan is checked against the declaration, not against the admission's memory of it"
+    );
+}
+
+/// KR-REQ-11.33 and KR-REQ-12.13: an answer goes out on the connection whose resource it
+/// resolves, and one instance's two connections never answer each other's.
+#[test]
+fn kr_req_12_13_each_connection_answers_its_own_resource() {
+    let first = std::sync::Arc::new(RecordingUpstream::default());
+    let second = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&first));
+    let other = broker
+        .open_native_connection(
+            instance(),
+            &CREDENTIAL,
+            &process_identity(),
+            &package(),
+            "1",
+        )
+        .expect("a second native connection is authenticated");
+    broker.bind_connection_dispatch(other, std::sync::Arc::clone(&second) as _);
+
+    let answer = |connection: GatewayConnectionId, id: &str, at: u64| {
+        let opaque = broker
+            .forward_native(
+                connection,
+                format!(r#"{{"id":{id},"method":"session/request_permission"}}"#).as_bytes(),
+                TimestampMs::new(at),
+            )
+            .expect("forwarded")
+            .1
+            .expect("it expects a response");
+        let resource = broker
+            .interpret(
+                binding(),
+                opaque.resource_id,
+                projection(),
+                None,
+                TimestampMs::new(at + 1),
+            )
+            .expect("interpreted");
+        broker
+            .agent_approval_respond(
+                &caller(),
+                &AgentApprovalRespondParams {
+                    target: target(1),
+                    resource_id: resource.resource_id,
+                    option_id: "allow".to_owned(),
+                },
+                TimestampMs::new(at + 2),
+            )
+            .expect("the answer is applied")
+    };
+
+    answer(GatewayConnectionId::new(1), "11", 2);
+    assert_eq!(first.submitted().len(), 1);
+    assert!(
+        second.submitted().is_empty(),
+        "the other connection was not written to"
+    );
+
+    answer(other, "12", 10);
+    assert_eq!(second.submitted().len(), 1, "its own connection carries it");
+    assert_eq!(first.submitted().len(), 1, "and the first is untouched");
+}
+
+/// KR-REQ-11.33: when the native answer wins the race, the rich answer writes no frame and the
+/// resource keeps the one resolution it already has.
+#[test]
+fn kr_req_11_33_a_native_answer_that_wins_leaves_the_rich_answer_nothing_to_send() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let opaque = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            br#"{"id":11,"method":"session/request_permission"}"#,
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let resource = broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("interpreted");
+
+    // The person answers in the terminal first. Its answer takes the resource's one transmission
+    // admission, commits the marker and goes.
+    let mut carried = Vec::new();
+    broker
+        .native_answer_through(
+            GatewayConnectionId::new(1),
+            br#"{"id":11,"result":{"outcome":"allow"}}"#,
+            TimestampMs::new(4),
+            |bytes| {
+                carried.push(bytes.to_vec());
+                Ok(())
+            },
+        )
+        .expect("the native answer is arbitrated");
+    assert_eq!(carried.len(), 1);
+
+    // The rich answer arrives a moment later. It is refused at admission, before a claim, before
+    // a marker and before any byte, and what the upstream already has is what stands.
+    let refusal = broker
+        .admit_approval(
+            &caller(),
+            &AgentApprovalRespondParams {
+                target: target(1),
+                resource_id: resource.resource_id,
+                option_id: "allow".to_owned(),
+            },
+            TimestampMs::new(5),
+        )
+        .expect_err("one resource takes one answer");
+    assert_eq!(refusal.code(), ErrorCode::QuestionResolved);
+    assert!(
+        upstream.submitted().is_empty(),
+        "the rich path wrote no frame"
+    );
+    assert_eq!(
+        broker
+            .recorded(resource.resource_id)
+            .expect("readable")
+            .expect("retained")
+            .state,
+        PendingState::Resolved,
+        "and the resolution the native answer made is the one that stands"
+    );
 }

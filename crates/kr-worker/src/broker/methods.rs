@@ -156,6 +156,34 @@ pub enum Responsible {
     Binding(BrokerBindingId),
 }
 
+/// The one transmission an admission authorises, and everything that authorises it.
+///
+/// It is private and it is consumed. A caller that takes it holds the only authority to transmit
+/// this operation and, where the operation answers a pending resource, the only authority to
+/// settle it. That is the difference a flag cannot make: a boolean says something was checked, and
+/// this *is* the checked operation, with the bytes, the transport, the claim and the effect plan
+/// that were admitted together.
+#[derive(Debug)]
+struct ExecutionPermit {
+    /// The exact operation, with the arguments and resources it will execute.
+    request: UpstreamRequest,
+    /// What carries it, chosen when it was admitted.
+    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    /// The claim that settles the resource this answer resolves, for the caller that transmits it.
+    settlement: Option<Claim>,
+    /// The approval it answers, as the broker admitted it.
+    approval: Option<DispatchAdmission>,
+    /// The token this invocation runs under.
+    token: Option<ActionToken>,
+    /// The draft this invocation was admitted against, as it stood then.
+    draft: Option<crate::broker::DraftSnapshot>,
+    /// The effect plan the component prepared, as validated against that token.
+    ///
+    /// A plugin action without one is not executable. The permit carries the plan rather than a
+    /// flag saying one was seen, so what transmits is what was validated.
+    plan: Option<kr_protocol::broker::PreparedEffect>,
+}
+
 /// Permission to carry one agent mutation to its upstream, and everything it was admitted against.
 ///
 /// Only [`Broker::admit_mutation`] and its two siblings make one, under the broker's own lock, in
@@ -166,24 +194,27 @@ pub enum Responsible {
 ///
 /// It carries the transport rather than naming it, so the submission does not have to go back to
 /// the broker to find one, which is what lets a caller release its own locks before it transmits.
+///
+/// What it holds is an [`ExecutionPermit`], taken once. Everything else on it is a fact a caller
+/// may read and none of it is authority.
 #[derive(Debug)]
 pub struct MutationAdmission {
-    request: UpstreamRequest,
-    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    permit: std::sync::Mutex<Option<ExecutionPermit>>,
+    application_instance_id: ApplicationInstanceId,
+    binding_revision: AgentBindingRevision,
+    operation: RichOperation,
     responsible: Responsible,
     capability: Option<CapabilityId>,
     admitted_at: TimestampMs,
     provenance: ActionProvenance,
-    approval: Option<(Claim, DispatchAdmission)>,
-    token: Option<ActionToken>,
-    /// True once the effect this admission carries has been validated against its invocation.
-    effect_validated: bool,
-    /// Spent when the operation is transmitted, so one admission carries one transmission.
-    spent: std::sync::atomic::AtomicBool,
+    /// The resource this answer resolves, where it answers one.
+    resource_id: Option<kr_protocol::ids::PendingResourceId>,
+    /// The action this invocation runs, where it runs one.
+    action: Option<ActionName>,
 }
 
 impl MutationAdmission {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         request: UpstreamRequest,
         dispatch: std::sync::Arc<dyn UpstreamDispatch>,
         responsible: Responsible,
@@ -191,60 +222,107 @@ impl MutationAdmission {
         admitted_at: TimestampMs,
     ) -> Self {
         Self {
-            request,
-            dispatch,
+            application_instance_id: request.application_instance_id,
+            binding_revision: request.binding_revision,
+            operation: request.operation,
             responsible,
             capability,
             admitted_at,
             provenance: ActionProvenance::UpstreamTypedRpc,
-            approval: None,
-            token: None,
-            effect_validated: false,
-            spent: std::sync::atomic::AtomicBool::new(false),
+            resource_id: None,
+            action: None,
+            permit: std::sync::Mutex::new(Some(ExecutionPermit {
+                request,
+                dispatch,
+                settlement: None,
+                approval: None,
+                token: None,
+                draft: None,
+                plan: None,
+            })),
         }
     }
 
-    pub(crate) fn with_body(mut self, body: UpstreamBody) -> Self {
-        self.request.body = body;
+    fn held(&self) -> std::sync::MutexGuard<'_, Option<ExecutionPermit>> {
+        self.permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn with_body(self, body: UpstreamBody) -> Self {
+        if let Some(permit) = self.held().as_mut() {
+            permit.request.body = body;
+        }
         self
     }
 
     pub(crate) fn with_approval(mut self, claim: Claim, admission: DispatchAdmission) -> Self {
         self.provenance = admission.provenance;
-        self.approval = Some((claim, admission));
+        self.resource_id = Some(admission.resource.resource_id);
+        if let Some(permit) = self.held().as_mut() {
+            permit.settlement = Some(claim);
+            permit.approval = Some(admission);
+        }
+        self
+    }
+
+    pub(crate) fn with_draft(self, draft: Option<crate::broker::DraftSnapshot>) -> Self {
+        if let Some(permit) = self.held().as_mut() {
+            permit.draft = draft;
+        }
         self
     }
 
     pub(crate) fn with_action_token(mut self, token: ActionToken) -> Self {
-        // The token reaches the component that prepares the effect, so it travels with the body
-        // the connector encodes rather than beside it.
-        if let UpstreamBody::PluginAction { token: carried, .. } = &mut self.request.body {
-            *carried = Some(token.clone());
+        self.action = Some(token.action.clone());
+        if let Some(permit) = self.held().as_mut() {
+            // The token reaches the component that prepares the effect, so it travels with the
+            // body the connector encodes rather than beside it.
+            if let UpstreamBody::PluginAction { token: carried, .. } = &mut permit.request.body {
+                *carried = Some(token.clone());
+            }
+            permit.token = Some(token);
         }
-        self.token = Some(token);
         self
     }
 
-    pub(crate) fn claim(&self) -> Option<&Claim> {
-        self.approval.as_ref().map(|(claim, _)| claim)
-    }
-
-    /// Returns the prepared operation, as it will reach the upstream.
-    #[must_use]
-    pub const fn request(&self) -> &UpstreamRequest {
-        &self.request
+    /// Takes this admission's one execution permit.
+    ///
+    /// The second caller gets [`BrokerError::AlreadyTransmitted`] and nothing else: it does not
+    /// transmit, and it does not settle the resource the first caller is answering. That is what
+    /// keeps a losing concurrent call from recording the winner's answer as uncertain.
+    fn take(&self) -> Result<ExecutionPermit> {
+        let permit = self.held().take().ok_or(BrokerError::AlreadyTransmitted)?;
+        // A plugin action transmits the plan this broker validated, and nothing else. An
+        // invocation whose component returned a plan that was never checked has no permit to
+        // execute, whatever else it holds.
+        if matches!(permit.request.body, UpstreamBody::PluginAction { .. }) && permit.plan.is_none()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: "this invocation's prepared effect has not been validated against the \
+                         invocation it was prepared under"
+                    .to_owned(),
+            });
+        }
+        Ok(permit)
     }
 
     /// Returns the instance this mutation acts on.
     #[must_use]
     pub const fn application_instance_id(&self) -> ApplicationInstanceId {
-        self.request.application_instance_id
+        self.application_instance_id
     }
 
     /// Returns the binding revision it was admitted at.
     #[must_use]
     pub const fn binding_revision(&self) -> AgentBindingRevision {
-        self.request.binding_revision
+        self.binding_revision
+    }
+
+    /// Returns the operation it carries.
+    #[must_use]
+    pub const fn operation(&self) -> RichOperation {
+        self.operation
     }
 
     /// Returns which component is answerable for it.
@@ -271,54 +349,30 @@ impl MutationAdmission {
         self.provenance
     }
 
-    /// Returns the dispatch admission of the approval this carries, when it carries one.
+    /// Returns the resource this answer resolves, where it answers one.
     #[must_use]
-    pub fn approval(&self) -> Option<&DispatchAdmission> {
-        self.approval.as_ref().map(|(_, admission)| admission)
+    pub const fn resource_id(&self) -> Option<kr_protocol::ids::PendingResourceId> {
+        self.resource_id
     }
 
-    /// Returns the action token this invocation was admitted under, when it has one.
+    /// Returns the action this invocation runs, where it runs one.
     #[must_use]
-    pub const fn token(&self) -> Option<&ActionToken> {
-        self.token.as_ref()
+    pub const fn action(&self) -> Option<&ActionName> {
+        self.action.as_ref()
     }
 
-    /// Carries the operation to the upstream and returns what it answered.
-    ///
-    /// Nothing is held while this runs. That is the point of separating admission from
-    /// transmission: the caller has already committed everything a crash would need, so the
-    /// transport work happens with no lock of the broker's or the session's held.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever the transport refuses.
-    pub fn submit(&self) -> Result<UpstreamOutcome> {
-        // One admission, one transmission. A caller that submitted and then submitted again would
-        // send one operation twice, and the second send would discover the resolved state only
-        // after its bytes had gone.
-        if self.spent.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Err(BrokerError::invalid(
-                "this admission has already been transmitted, and one admission carries one \
-                 operation",
-            ));
-        }
-        self.dispatch.submit(&self.request)
-    }
-
-    /// Returns true when the effect this admission carries has been validated.
+    /// Returns true when the permit has not been taken.
     #[must_use]
-    pub const fn effect_validated(&self) -> bool {
-        self.effect_validated
+    pub fn executable(&self) -> bool {
+        self.held().is_some()
     }
 
-    /// Returns true when this invocation is one a component prepares an effect for.
+    /// Returns true when this invocation carries a validated effect plan.
     #[must_use]
-    pub const fn prepares_an_effect(&self) -> bool {
-        self.token.is_some()
-    }
-
-    pub(crate) const fn mark_effect_validated(&mut self) {
-        self.effect_validated = true;
+    pub fn carries_a_validated_plan(&self) -> bool {
+        self.held()
+            .as_ref()
+            .is_some_and(|permit| permit.plan.is_some())
     }
 }
 
@@ -454,6 +508,7 @@ impl Broker {
             turn_id,
             Responsible::Transport,
             body,
+            None,
             now,
         )
     }
@@ -643,6 +698,21 @@ impl Broker {
             .map_or(Responsible::Transport, Responsible::Binding);
         let capability_id = CapabilityId::new("agent.approval")
             .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;
+        // The answer goes out on the connection whose resource it resolves, so the transport is
+        // chosen from the resource here rather than being whichever one the instance last bound.
+        // A connection that has gone is `UPSTREAM_UNAVAILABLE` before anything is claimed, not a
+        // mismatch a writer finds after the marker.
+        let connection = resource.request.connection;
+        let transport = state
+            .connection_dispatch
+            .get(&connection)
+            .cloned()
+            .ok_or_else(|| BrokerError::UpstreamUnavailable {
+                detail: format!(
+                    "{} was asked on {connection} and nothing carries an answer out on it now",
+                    params.resource_id
+                ),
+            })?;
         let admitted = state.admit_mutation_in(
             &params.target,
             Some(capability_id),
@@ -650,6 +720,7 @@ impl Broker {
             None,
             responsible,
             UpstreamBody::Cancel,
+            Some(transport),
             now,
         )?;
         let claim = state.claim_in(params.resource_id, &caller.actor_id, now)?;
@@ -699,20 +770,24 @@ impl Broker {
         admitted: &MutationAdmission,
         now: TimestampMs,
     ) -> Result<AgentApprovalRespondResult> {
-        let dispatch = admitted.approval().ok_or_else(|| {
+        // The permit is taken first, and taking it is what makes this caller the one that
+        // settles. A second caller gets `AlreadyTransmitted` here and never reaches the transport
+        // or the arbitration, so it cannot record the winner's answer as uncertain.
+        let permit = admitted.take()?;
+        let dispatch = permit.approval.ok_or_else(|| {
             BrokerError::invalid("this admission does not carry an approval to answer")
         })?;
-        let claim = admitted
-            .claim()
+        let claim = permit
+            .settlement
             .ok_or_else(|| BrokerError::invalid("this admission holds no claim"))?;
-        let outcome = match admitted.submit() {
+        let outcome = match permit.dispatch.submit(&permit.request) {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = self.uncertain(claim, now);
+                let _ = self.uncertain(&claim, now);
                 return Err(error);
             }
         };
-        let resolved = self.resolve(claim, now)?;
+        let resolved = self.resolve(&claim, now)?;
         Ok(AgentApprovalRespondResult {
             mutation: AgentMutationResult {
                 binding_revision: admitted.binding_revision(),
@@ -747,9 +822,24 @@ impl Broker {
         params: &PluginActionInvokeParams,
         now: TimestampMs,
     ) -> Result<MutationAdmission> {
-        let registered = self.check_action(binding_id, params)?;
-        let invocation = Self::invocation_for(caller, &registered, params);
+        // The draft is resolved before the lock, because the draft store is not the broker's and
+        // calling it under the broker's lock would hold every other caller behind it. What comes
+        // back is a snapshot, and the admission binds to that.
+        let draft = match params.draft_id.as_ref() {
+            Some(draft_id) => Some(self.resolve_draft(draft_id)?),
+            None => None,
+        };
         let mut state = self.state();
+        // The declaration is read *inside* the admission. Reading it before the lock would let
+        // `register_actions` replace it in between, so the grant, the effect class and the draft
+        // requirement checked would belong to an action that is no longer registered.
+        let registered = state.check_action_in(binding_id, params)?;
+        if registered.needs_draft && draft.is_none() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("{} acts on a draft and this call named none", params.action),
+            });
+        }
+        let invocation = Self::invocation_for(caller, &registered, params);
         let admitted = state.admit_mutation_in(
             &params.target,
             registered.capability.clone(),
@@ -763,15 +853,21 @@ impl Broker {
                 parameters: params.parameters.as_slice().to_vec(),
                 token: None,
             },
+            None,
             now,
         )?;
         let token = state.issue_token_in(binding_id, &invocation, now)?;
         // The token is spent here, before the effect: spending is what rechecks the binding, the
         // grant, the revision and the capability against the present, and doing it afterwards
         // would refuse an action that had already happened. Spending it under the same lock the
-        // rest of the admission took is what leaves no window between the two.
-        let spent = state.spend_token_in(&kr_protocol::broker::ActionTokenClaim::from(&token))?;
-        Ok(admitted.with_action_token(spent))
+        // rest of the admission took is what leaves no window between the two. A refusal retires
+        // the record rather than leaving a token nobody will spend.
+        let spent = state
+            .spend_token_in(&kr_protocol::broker::ActionTokenClaim::from(&token))
+            .inspect_err(|_| {
+                state.tokens.retire(&token.token_id);
+            })?;
+        Ok(admitted.with_action_token(spent).with_draft(draft))
     }
 
     /// Applies `plugin.action.invoke`.
@@ -787,8 +883,8 @@ impl Broker {
         effect: &kr_protocol::broker::PreparedEffect,
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
-        let mut admitted = self.admit_plugin_action(caller, binding_id, params, now)?;
-        self.validate_effect(&mut admitted, effect)?;
+        let admitted = self.admit_plugin_action(caller, binding_id, params, now)?;
+        self.validate_effect(&admitted, effect)?;
         self.record_plugin_action(&admitted, now)
     }
 
@@ -803,21 +899,14 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
         let _ = now;
-        // An invocation that prepared an effect transmits the effect this broker validated, and
-        // nothing else. An admission whose component returned a plan that was never checked is
-        // one this host will not spend.
-        if admitted.prepares_an_effect() && !admitted.effect_validated() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: "this invocation's prepared effect has not been validated against the \
-                         invocation it was prepared under"
-                    .to_owned(),
-            });
-        }
-        let token = admitted
-            .token()
-            .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?
-            .clone();
-        let outcome = admitted.submit()?;
+        // Taking the permit is what refuses an invocation whose component returned a plan nobody
+        // validated: an admission with no validated plan has no permit to take.
+        let permit = admitted.take()?;
+        let token = permit
+            .token
+            .clone()
+            .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
+        let outcome = permit.dispatch.submit(&permit.request)?;
         Ok(PluginActionInvokeResult {
             mutation: AgentMutationResult {
                 binding_revision: token.binding_revision,
@@ -827,6 +916,24 @@ impl Broker {
             },
             action: token.action,
         })
+    }
+
+    /// Gives up one admission without transmitting it.
+    ///
+    /// The permit is taken and dropped, so nothing can execute the operation afterwards. What the
+    /// admission reserved is given back with it: an approval's claim is released, and a plugin
+    /// action's token is retired. A caller that abandons an admission leaves the resource exactly
+    /// as it found it.
+    pub fn abandon(&self, admitted: &MutationAdmission) {
+        let Ok(permit) = admitted.take() else {
+            return;
+        };
+        if let Some(claim) = permit.settlement.as_ref() {
+            let _ = self.release_claim(claim, admitted.admitted_at());
+        }
+        if let Some(token) = permit.token.as_ref() {
+            self.state().tokens.retire(&token.token_id);
+        }
     }
 
     /// Checks everything one agent mutation would be refused for, without admitting it.
@@ -877,6 +984,7 @@ impl Broker {
                 None,
                 Responsible::Transport,
                 UpstreamBody::Cancel,
+                None,
                 TimestampMs::new(0),
             )
             .map(|_| ())
@@ -1007,6 +1115,7 @@ impl Broker {
             None,
             Responsible::Binding(binding_id),
             UpstreamBody::Cancel,
+            None,
             now,
         )?;
         state.check_invocation(binding_id, &invocation)?;
@@ -1053,12 +1162,43 @@ impl Broker {
     /// invocation named or is one this host cannot resolve.
     pub fn validate_effect(
         &self,
-        admitted: &mut MutationAdmission,
+        admitted: &MutationAdmission,
         effect: &kr_protocol::broker::PreparedEffect,
     ) -> Result<()> {
-        let token = admitted
-            .token()
+        let mut held = admitted.held();
+        let permit = held.as_mut().ok_or(BrokerError::AlreadyTransmitted)?;
+        let token = permit
+            .token
+            .clone()
             .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
+        // The arguments this plan is for are the arguments that will execute. The digest is
+        // computed from them here rather than read from the plan: a hash a component supplied
+        // says only that the component can write a hash.
+        let arguments = match &permit.request.body {
+            UpstreamBody::PluginAction { parameters, .. } => parameters.clone(),
+            _ => {
+                return Err(BrokerError::invalid(
+                    "an effect plan belongs to a plugin action and this admission carries another \
+                     operation",
+                ));
+            }
+        };
+        let computed =
+            kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(arguments.as_slice()));
+        if computed != token.parameter_hash {
+            return Err(BrokerError::Token(
+                kr_protocol::broker::TokenError::Mismatch {
+                    field: "parameter_hash",
+                },
+            ));
+        }
+        if effect.argument_hash != computed {
+            return Err(BrokerError::Token(
+                kr_protocol::broker::TokenError::Mismatch {
+                    field: "argument_hash",
+                },
+            ));
+        }
         if effect.action != token.action {
             return Err(BrokerError::Token(
                 kr_protocol::broker::TokenError::Mismatch { field: "action" },
@@ -1084,6 +1224,14 @@ impl Broker {
             return Err(BrokerError::invalid(format!(
                 "{} is declared as {} and this plan prepares {}",
                 token.action, registered.operation, effect.operation
+            )));
+        }
+        // And the class the declaration carries now. A package that re-registered the action as a
+        // read while its component was working has withdrawn the write this plan asks for.
+        if registered.effect != effect.class {
+            return Err(BrokerError::invalid(format!(
+                "{} is declared {:?} and this plan declares it {:?}",
+                token.action, registered.effect, effect.class
             )));
         }
         // The operation's own grant, checked against the binding as it stands rather than against
@@ -1134,7 +1282,25 @@ impl Broker {
                     effect.operation
                 )));
             }
-            self.resolve_draft(named)?;
+            // The draft this invocation was admitted against, as it was resolved then. Asking the
+            // draft store again here would answer about a moment after the admission.
+            let snapshot =
+                permit
+                    .draft
+                    .as_ref()
+                    .ok_or_else(|| BrokerError::PreconditionFailed {
+                        detail: format!(
+                            "this plan acts on {named} and the invocation resolved no draft"
+                        ),
+                    })?;
+            if &snapshot.draft_id != named {
+                return Err(BrokerError::PreconditionFailed {
+                    detail: format!(
+                        "this plan acts on {named} and the invocation was admitted against {}",
+                        snapshot.draft_id
+                    ),
+                });
+            }
         } else if registered.needs_draft {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
@@ -1143,7 +1309,9 @@ impl Broker {
                 ),
             });
         }
-        admitted.mark_effect_validated();
+        // The plan itself goes into the permit. What transmits is now the plan that was checked,
+        // rather than an operation beside a flag saying a plan was seen.
+        permit.plan = Some(effect.clone());
         Ok(())
     }
 
@@ -1159,43 +1327,7 @@ impl Broker {
         binding_id: BrokerBindingId,
         params: &PluginActionInvokeParams,
     ) -> Result<RegisteredAction> {
-        let registered = self
-            .registered_action(binding_id, &params.action)?
-            .ok_or_else(|| {
-                BrokerError::unknown(format!(
-                    "{} is not an action {} registered",
-                    params.action, params.plugin_id
-                ))
-            })?;
-        if registered.effect != EffectClass::Write {
-            return Err(BrokerError::invalid(format!(
-                "{} is a read, and this is the write path",
-                params.action
-            )));
-        }
-        if registered.needs_draft {
-            // A draft-dependent action names a draft *and* the draft is one this host can
-            // resolve. Checking only that an identifier was given would send an operation against
-            // a draft that may have moved or gone, which is the outcome nobody can establish that
-            // section 9 refuses to produce.
-            let draft_id =
-                params
-                    .draft_id
-                    .as_ref()
-                    .ok_or_else(|| BrokerError::PreconditionFailed {
-                        detail: format!(
-                            "{} acts on a draft and this call named none",
-                            params.action
-                        ),
-                    })?;
-            self.resolve_draft(draft_id)?;
-        } else if params.draft_id.is_present() {
-            return Err(BrokerError::invalid(format!(
-                "{} acts on no draft and this call named one",
-                params.action
-            )));
-        }
-        Ok(registered)
+        self.state().check_action_in(binding_id, params)
     }
 
     /// Carries one admitted mutation to the upstream, and records what it answered.
@@ -1213,8 +1345,9 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<AgentMutationResult> {
         let _ = now;
-        let turn_id = admitted.request().turn_id.clone();
-        let outcome = admitted.submit()?;
+        let permit = admitted.take()?;
+        let turn_id = permit.request.turn_id.clone();
+        let outcome = permit.dispatch.submit(&permit.request)?;
         Ok(AgentMutationResult {
             binding_revision: admitted.binding_revision(),
             provenance: outcome.provenance,

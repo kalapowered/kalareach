@@ -309,18 +309,32 @@ pub struct NativeAnswer {
     pub frame: Vec<u8>,
 }
 
+/// One draft as it stood when an invocation was admitted against it.
+///
+/// The admission binds to this rather than to a resolver call, so what the effect plan is checked
+/// against is the draft the invocation was admitted for and not whatever the store answers a
+/// moment later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftSnapshot {
+    /// The draft.
+    pub draft_id: kr_protocol::ids::DraftId,
+    /// Its revision when the snapshot was taken.
+    pub revision: kr_protocol::scalars::U64,
+}
+
 /// What resolves a draft the broker is asked to act on.
 ///
 /// The draft store is not the broker's, so this is a seam. What the broker needs of it is one
-/// answer: is this draft one an operation may act on now? A draft that has gone, or that moved
-/// since the invocation named it, is `DRAFT_CONFLICT` rather than an operation sent hopefully.
+/// answer: is this draft one an operation may act on now, and at which revision? A draft that has
+/// gone, or that moved since the invocation named it, is `DRAFT_CONFLICT` rather than an operation
+/// sent hopefully.
 pub trait DraftResolver: Send + Sync + core::fmt::Debug {
-    /// Answers whether one draft can be acted on now.
+    /// Answers whether one draft can be acted on now, and returns it as it stands.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PreconditionFailed`] when the draft has gone or has moved.
-    fn resolve(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<()>;
+    fn resolve(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<DraftSnapshot>;
 }
 
 /// What stopping an instance actually does.
@@ -355,6 +369,13 @@ struct BrokerState {
     next_connection: u64,
     /// What resolves a draft this host is asked to act on, where anything does.
     drafts: Option<std::sync::Arc<dyn DraftResolver>>,
+    /// What carries an answer out on each live connection.
+    ///
+    /// An answer resolves a resource one connection created, and it goes back on that connection.
+    /// Holding the transports by connection is what lets the admission choose the right one, so a
+    /// mismatch is not something a writer discovers after the resource has been claimed.
+    connection_dispatch:
+        BTreeMap<GatewayConnectionId, std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>>,
     /// The declarative tables this host pinned at installation, by instance and package.
     ///
     /// Section 11: "Tables are pinned and qualified against the installed protocol version under
@@ -435,6 +456,7 @@ impl Broker {
                 volatile,
                 next_connection,
                 drafts: None,
+                connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
             }),
         })
@@ -640,7 +662,31 @@ impl Broker {
         Ok(())
     }
 
-    /// Returns what carries operations to one instance's upstream, where anything does.
+    /// Registers what carries answers out on one live connection.
+    ///
+    /// A resource is created by a connection and answered on it. This is what the admission looks
+    /// the transport up in, so the answer's transport is chosen from the resource rather than from
+    /// the instance, which may have several connections open.
+    pub fn bind_connection_dispatch(
+        &self,
+        connection: GatewayConnectionId,
+        dispatch: std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>,
+    ) {
+        self.state()
+            .connection_dispatch
+            .insert(connection, dispatch);
+    }
+
+    /// Returns what carries answers out on one connection, where anything does.
+    #[must_use]
+    pub fn connection_dispatch(
+        &self,
+        connection: GatewayConnectionId,
+    ) -> Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>> {
+        self.state().connection_dispatch.get(&connection).cloned()
+    }
+
+    /// Returns what carries an instance's own operations, where anything does.
     #[must_use]
     pub fn dispatch_for(
         &self,
@@ -1311,7 +1357,7 @@ impl Broker {
     ///
     /// Returns [`BrokerError::PreconditionFailed`] when nothing resolves drafts here, and whatever
     /// the resolver refuses for a draft that has gone or moved.
-    pub fn resolve_draft(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<()> {
+    pub fn resolve_draft(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<DraftSnapshot> {
         let drafts = self.state().drafts.clone();
         let drafts = drafts.ok_or_else(|| BrokerError::PreconditionFailed {
             detail: format!(
@@ -2025,21 +2071,28 @@ impl Broker {
                 "{connection} is a live connection, and a restoration is not a replacement"
             )));
         }
-        let retained = state
-            .arbitration
-            .iter()
-            .find(|pending| pending.resource.request.connection == connection);
         let instance_generation = state
             .instances
             .get(&application_instance_id)
             .map(|instance| instance.source_generation);
-        match retained {
-            Some(pending)
-                if pending.resource.application_instance_id == application_instance_id
-                    && Some(pending.resource.source_generation) == instance_generation => {}
-            Some(pending)
-                if pending.resource.application_instance_id == application_instance_id =>
-            {
+        // Every retained resource of this connection, not the first one found. A connection can
+        // hold resources from both sides of a binding change, and checking one of them would
+        // restore the rest of them with it.
+        let mut retained = 0_usize;
+        for pending in state
+            .arbitration
+            .iter()
+            .filter(|pending| pending.resource.request.connection == connection)
+        {
+            retained += 1;
+            if pending.resource.application_instance_id != application_instance_id {
+                return Err(BrokerError::denied(format!(
+                    "{connection} holds resources of {} and this restoration names \
+                     {application_instance_id}",
+                    pending.resource.application_instance_id
+                )));
+            }
+            if Some(pending.resource.source_generation) != instance_generation {
                 return Err(BrokerError::denied(format!(
                     "{connection} holds resources from generation {} and this instance is at \
                      another, so restoring it would expose an old execution's resources to a new \
@@ -2047,17 +2100,11 @@ impl Broker {
                     pending.resource.source_generation
                 )));
             }
-            Some(pending) => {
-                return Err(BrokerError::denied(format!(
-                    "{connection} holds resources of {} and this restoration names {application_instance_id}",
-                    pending.resource.application_instance_id
-                )));
-            }
-            None => {
-                return Err(BrokerError::denied(format!(
-                    "{connection} names no retained resource, so there is nothing to restore"
-                )));
-            }
+        }
+        if retained == 0 {
+            return Err(BrokerError::denied(format!(
+                "{connection} names no retained resource, so there is nothing to restore"
+            )));
         }
         let instance = state
             .instances
@@ -2122,7 +2169,9 @@ impl Broker {
     /// The pending resources it produced stay exactly where they are: a connection ending is not
     /// an answer, and a reconnect is what reconciles them.
     pub fn close_connection(&self, connection: GatewayConnectionId) {
-        self.state().gateway.close(connection);
+        let mut state = self.state();
+        state.gateway.close(connection);
+        state.connection_dispatch.remove(&connection);
     }
 
     /// Admits one rich invocation against the closed method table.
@@ -2447,8 +2496,12 @@ impl BrokerState {
 
     /// Spends an action token against a returned effect plan. See [`Broker::spend_token`].
     fn spend_token_in(&mut self, claim: &ActionTokenClaim) -> Result<ActionToken> {
+        // The record is consumed before anything is checked. A token whose spending is refused —
+        // by the fence, by a withdrawn grant, by a revision that moved — is a token nobody will
+        // spend, and leaving it in the store would hold a slot against every later invocation.
+        let spent = self.tokens.spend_checked(claim);
         self.volatile.require_rich_work()?;
-        let (token, binding_id, capability) = self.tokens.spend_checked(claim)?;
+        let (token, binding_id, capability) = spent?;
         // The token has been consumed. Whatever follows, it cannot be spent again, so a failed
         // authority check costs the caller its invocation rather than giving it another attempt.
         let invocation = Invocation {
@@ -2483,6 +2536,7 @@ impl BrokerState {
         turn_id: Option<AgentTurnId>,
         responsible: crate::broker::methods::Responsible,
         body: crate::broker::methods::UpstreamBody,
+        transport: Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>>,
         now: TimestampMs,
     ) -> Result<crate::broker::methods::MutationAdmission> {
         let application_instance_id = target.subject.application_instance_id;
@@ -2505,17 +2559,17 @@ impl BrokerState {
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         // Nothing carries an operation to an instance with no transport bound. Section 9 makes a
         // refusal this host can decide a rejection rather than an outcome nobody can establish.
-        let dispatch =
-            instance
-                .dispatch
-                .clone()
-                .ok_or_else(|| BrokerError::UnsupportedCapability {
-                    detail: format!(
-                        "nothing carries a {operation} to {application_instance_id}: this instance \
+        // An answer names the transport of the connection whose resource it resolves; everything
+        // else takes the instance's own.
+        let dispatch = transport
+            .or_else(|| instance.dispatch.clone())
+            .ok_or_else(|| BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "nothing carries a {operation} to {application_instance_id}: this instance \
                      has no upstream transport bound, so the operation is refused rather than \
                      reported as applied"
-                    ),
-                })?;
+                ),
+            })?;
         if let Some(reason) = instance.rich_suspension.as_ref() {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!("rich mutations are suspended: {reason}"),
@@ -2576,6 +2630,44 @@ impl BrokerState {
             self.arbitration.commit(transition)?;
         }
         Ok(reconciliation)
+    }
+
+    /// Reads one action's current declaration and checks what the call says about it.
+    ///
+    /// It reads the declaration under the broker's own lock, which is what keeps a replacement
+    /// registration from landing between the read and the admission that depends on it.
+    fn check_action_in(
+        &self,
+        binding_id: BrokerBindingId,
+        params: &kr_protocol::agent::PluginActionInvokeParams,
+    ) -> Result<crate::broker::methods::RegisteredAction> {
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        let registered = binding
+            .actions
+            .get(&params.action)
+            .cloned()
+            .ok_or_else(|| {
+                BrokerError::unknown(format!(
+                    "{} is not an action {} registered",
+                    params.action, params.plugin_id
+                ))
+            })?;
+        if registered.effect != kr_protocol::authority::EffectClass::Write {
+            return Err(BrokerError::invalid(format!(
+                "{} is a read, and this is the write path",
+                params.action
+            )));
+        }
+        if !registered.needs_draft && params.draft_id.is_present() {
+            return Err(BrokerError::invalid(format!(
+                "{} acts on no draft and this call named one",
+                params.action
+            )));
+        }
+        Ok(registered)
     }
 
     /// Returns the tables this host pinned for one installation's package.
