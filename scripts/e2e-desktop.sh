@@ -127,19 +127,21 @@ echo "starting the control daemon"
 # Started from the run's own root rather than from this checkout. A daemon's working directory is
 # what the workers it launches inherit, and a launched process that reaches the workspace volume
 # makes the operating system ask the person at the machine for permission.
+# The daemon keeps its signing key in a file store under this run's own directory. The platform's
+# credential store is one file for the whole login, and a demonstration that used it would queue
+# behind every other host on the machine for a key it throws away at the end.
 (cd "$run_root" && exec "$run_root/bin/kr-controller" \
   --runtime-dir "$run_root/r" \
   --state-dir "$run_root/s" \
+  --secret-store file \
   --worker "$run_root/bin/kr-worker") \
   >"$run_root/evidence/controller.log" 2>&1 &
 started_pids+=("$!")
 # Three minutes of asking, because this is a real daemon on a real machine: it opens its registry,
-# builds or reads its signing identity through the platform's credential store, and publishes its
-# socket. The credential store is the slow one, and it is not this host's to hurry: the platform's
-# keychain is one file for the whole login, locked while anything writes to it, so a machine where
-# something else is also starting a host waits its turn there. The wall clock is what is reported,
-# not the waiting, so a start that is merely slow reads as slow rather than as broken. It is an
-# allowance rather than a deadline: the last question is answered or refused however long it takes.
+# builds its signing identity in this run's own file store, and publishes its socket, on a machine
+# that may be running several builds at once. The wall clock is what is reported, not the waiting,
+# so a start that is merely slow reads as slow rather than as broken. It is an allowance rather
+# than a deadline: the last question is answered or refused however long it takes.
 daemon_started_at="$(date +%s)"
 daemon_deadline=$((daemon_started_at + 180))
 while [ "$(date +%s)" -lt "$daemon_deadline" ]; do
@@ -163,14 +165,11 @@ if [ "$answered" -eq 0 ]; then
   echo "--- what kr said ---"
   tail -5 "$run_root/evidence/doctor.json" || true
   # A daemon that printed nothing at all has not reached the line it prints once it is serving.
-  # Where it stopped before that is not established from an empty file: the longest of those steps
-  # is opening this platform's credential store for its own signing key, which another process
-  # writing to the store can hold and which on a platform that prompts can wait on the person at
-  # the machine, but saying so takes looking at the process itself.
+  # Where it stopped before that is not established from an empty file, and saying so takes
+  # looking at the process itself.
   if [ ! -s "$run_root/evidence/controller.log" ]; then
     echo "the daemon printed nothing, so it never reached the line it prints once it is serving;"
-    echo "where it stopped takes looking at the process, and its longest step is opening this"
-    echo "platform's credential store"
+    echo "where it stopped takes looking at the process"
   fi
   exit 1
 fi

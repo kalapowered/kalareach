@@ -20,10 +20,10 @@ use std::time::Duration;
 use kr_controller::desktop::power::{self, Demand, Inhibitor};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::DetachedSupervisor;
-use kr_crypto::store::open_store;
+use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
-use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
+use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::desktop::{
     CapabilityEvidenceSource, CapabilityState, ContainerEnvironment, DesktopAvailability,
     DesktopSessionKind, DisplayServer, InhibitionReason, LogoutPersistence, PowerSource,
@@ -98,13 +98,16 @@ impl Host {
                 paths: environment.clone(),
                 environment_id,
                 identity: Box::new(move || {
-                    let store =
-                        open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
+                    let store = open_store_in(&secrets).expect("a secret store");
                     Ok(
                         ControllerIdentity::open(store.store.as_ref(), environment_id, false)
                             .expect("an identity"),
                     )
                 }),
+                // A suite's own store, in its own directory: nothing here touches the login
+                // keychain, which is one file for the whole login and which every other suite on
+                // this machine would queue behind.
+                secret_store: StoreSelection::File,
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
                 supervisor: Box::new(DetachedSupervisor::new()),
                 worker_program: self.worker.clone(),
@@ -198,6 +201,7 @@ fn create_params(
         cwd: Nullable::some(cwd.display().to_string()),
         dimensions: Nullable::null(),
         worker_profile: profile,
+        palette: Nullable::null(),
         environment_snapshot: vec![
             kr_protocol::session::EnvironmentVariable {
                 name: "PATH".to_owned(),
