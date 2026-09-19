@@ -51,7 +51,7 @@ use kr_protocol::sharing::MembershipRefusal;
 pub use durable::{StoredFeed, StoredPolicy};
 pub use feed::{AuthorityFeed, FeedRefusal, RetainedRevocation};
 pub use policy::{HostPolicy, LeaseRefused, PolicyIntersection};
-pub use store::{GrantDirectory, GrantRecord, GrantRevocation};
+pub use store::{ActionClaim, GrantDirectory, GrantRecord, GrantRevocation};
 pub use vocabulary::{rights_for, unconditional_rights_for};
 
 /// One request, as the intersection sees it.
@@ -100,6 +100,11 @@ pub enum Refusal {
     },
     /// The grant has been revoked.
     Revoked {
+        /// The grant.
+        grant_id: GrantId,
+    },
+    /// The invitation that carries this grant has not been redeemed, so it authorises nothing.
+    NotRedeemed {
         /// The grant.
         grant_id: GrantId,
     },
@@ -162,6 +167,9 @@ impl Refusal {
                 format!("{method} is not reachable from this caller")
             }
             Self::Revoked { .. } => "this grant has been revoked".to_owned(),
+            Self::NotRedeemed { .. } => {
+                "the invitation that carries this grant has not been redeemed".to_owned()
+            }
             Self::ParentRevoked { .. } => {
                 "the grant this one was delegated from has been revoked".to_owned()
             }
@@ -251,8 +259,8 @@ impl Permitted {
 ///
 /// 1. The method has to be in the registry and reachable from this ingress class. An unlisted
 ///    method is denied whatever the caller holds.
-/// 2. The grant has to be live: not revoked, no revoked ancestor, not expired, and issued under a
-///    revision this host has not replaced.
+/// 2. The grant has to be live: not revoked, no revoked ancestor, redeemed, not expired, and
+///    claiming no revision this host has not issued.
 /// 3. The host's own policy has to permit the grant to be used at all: the organisation lease it
 ///    requires, and the bounded offline-validity policy when the owner chose one.
 /// 4. The selectors have to admit the environment and the session the request names.
@@ -265,7 +273,7 @@ impl Permitted {
 pub fn decide(
     grant: &Grant,
     record: &GrantRecord,
-    policy: &HostPolicy,
+    policy: &mut HostPolicy,
     request: AccessRequest,
 ) -> std::result::Result<Permitted, Refusal> {
     let AuthorityDecision::Listed(entry) =
@@ -289,7 +297,15 @@ pub fn decide(
     // must not revive an expiry this host has already decided against, and section 24 asks for
     // expiry to be revalidated after a wake rather than re-derived from whatever the clock now
     // says.
+    // Raised here rather than by the caller. A floor a caller has to remember to advance is a
+    // floor that is not there the one time it matters.
+    policy.observe_utc(request.now_ms);
     let now_ms = policy.settled_now(request.now_ms);
+    if !record.is_active() {
+        return Err(Refusal::NotRedeemed {
+            grant_id: grant.grant_id,
+        });
+    }
     if !grant.expiry.is_valid_at(now_ms) {
         let expired_at_ms = match grant.expiry {
             kr_protocol::grant::GrantExpiry::Never => now_ms,
@@ -318,14 +334,18 @@ pub fn decide(
     let mut unresolved: Vec<RequiredAuthority> = Vec::new();
     for required in entry.required_rights {
         if !condition_holds(required.when, &request) {
-            // A conditional requirement the host cannot decide is not skipped quietly: the subject
-            // decides it, and the answer says so.
-            if matches!(
-                required.when,
-                RightCondition::OwnSubject | RightCondition::OtherActor
-            ) && request.own_subject.is_none()
-                && !unresolved.contains(&required.authority)
-            {
+            // A conditional requirement the host cannot decide is not skipped quietly: the
+            // subject decides it, and the answer says so. The pair `own_subject`/`other_actor` is
+            // unresolved only while the host has not resolved the subject; the pairing pair is
+            // always the pairing surface's to answer, from the transcript rather than a grant.
+            let undecided = match required.when {
+                RightCondition::OwnSubject | RightCondition::OtherActor => {
+                    request.own_subject.is_none()
+                }
+                RightCondition::CandidateEndpoint | RightCondition::IssuingOwner => true,
+                RightCondition::Always | RightCondition::GeometryClaim => false,
+            };
+            if undecided && !unresolved.contains(&required.authority) {
                 unresolved.push(required.authority);
             }
             continue;

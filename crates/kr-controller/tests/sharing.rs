@@ -97,11 +97,13 @@ fn request(method: Method, now_ms: u64) -> AccessRequest {
     }
 }
 
+/// A grant as it stands once its invitation has been redeemed.
 fn stored(grant: &Grant) -> GrantRecord {
     GrantRecord {
         grant: grant.clone(),
         session_id: Some(session_id(0xa0)),
         issued_at_ms: NOW,
+        activated_at_ms: Some(NOW),
         revoked_at_ms: None,
         revoked_by_parent: None,
     }
@@ -114,7 +116,7 @@ fn stored(grant: &Grant) -> GrantRecord {
 #[test]
 fn each_role_compiles_to_explicit_actions_and_the_host_decides_from_those() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
-    let policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
 
     let viewer = service
         .share(&share(SessionRole::Viewer, 1))
@@ -139,7 +141,7 @@ fn each_role_compiles_to_explicit_actions_and_the_host_decides_from_those() {
         decide(
             &viewer.grant,
             &stored(&viewer.grant),
-            &policy,
+            &mut policy,
             request(Method::InputWrite, NOW)
         ),
         Err(Refusal::MissingRight {
@@ -149,7 +151,7 @@ fn each_role_compiles_to_explicit_actions_and_the_host_decides_from_those() {
     decide(
         &controller.grant,
         &stored(&controller.grant),
-        &policy,
+        &mut policy,
         request(Method::InputWrite, NOW),
     )
     .expect("a controller holds terminal input");
@@ -275,44 +277,172 @@ fn an_invitation_is_single_use_and_expires() {
     let issued = service
         .share(&share(SessionRole::Viewer, 1))
         .expect("issued");
-    let invitation_id = issued.preview.invitation_id;
+    let first = issued.preview.invitation_id;
 
-    let redeemed = service
-        .invitations()
-        .redeem(invitation_id, device_id(0xf1), NOW + 1_000)
-        .expect("the first redemption succeeds");
-    assert_eq!(redeemed.redeemed_by, Some(device_id(0xf1)));
+    // Until it is redeemed the grant authorises nothing, whatever it says.
+    let written = service
+        .grants()
+        .record(issued.grant.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(
+        !written.is_active(),
+        "a grant is a proposal until it is redeemed"
+    );
 
+    // A device the invitation was not issued to cannot redeem it.
     let error = service
-        .invitations()
-        .redeem(invitation_id, device_id(0xf3), NOW + 1_100)
-        .expect_err("a second device cannot redeem the same invitation");
+        .redeem(first, device_id(0xf9), NOW + 1_000)
+        .expect_err("the invitation names one device");
+    assert!(
+        error.to_string().contains("another device"),
+        "unexpected refusal: {error}"
+    );
+
+    let activated = service
+        .redeem(first, device_id(0xf1), NOW + 1_000)
+        .expect("the named device redeems it");
+    assert_eq!(activated.grant_id, issued.grant.grant_id);
+    assert!(
+        service
+            .grants()
+            .record(issued.grant.grant_id)
+            .expect("readable")
+            .expect("present")
+            .is_active(),
+        "redemption is what makes the grant live"
+    );
+
+    // Not even the device that redeemed it can do so twice.
+    let error = service
+        .redeem(first, device_id(0xf1), NOW + 1_200)
+        .expect_err("single use means once");
     assert!(
         error.to_string().contains("already been redeemed"),
         "unexpected refusal: {error}"
     );
-    // Not even the device that redeemed it can do so twice.
-    service
-        .invitations()
-        .redeem(invitation_id, device_id(0xf1), NOW + 1_200)
-        .expect_err("single use means once");
 
-    // And an invitation nobody redeemed stops working at its deadline.
+    // An invitation nobody redeemed stops working at its deadline, and its proposal with it.
     let second = service
         .share(&ShareRequest {
+            invitation_id: invitation_id(2),
+            grant_id: grant_id(2),
             recipient_device_id: device_id(0xf4),
             ..share(SessionRole::Viewer, 2)
         })
         .expect("issued");
     let expires_at = second.preview.expires_at_ms.get();
     let error = service
-        .invitations()
         .redeem(second.preview.invitation_id, device_id(0xf4), expires_at)
         .expect_err("an expired invitation is refused");
     assert!(
         error.to_string().contains("expired"),
         "unexpected refusal: {error}"
     );
+
+    // And withdrawing an invitation withdraws the proposal it carries, rather than leaving a
+    // grant somebody could still be handed.
+    let third = service
+        .share(&ShareRequest {
+            invitation_id: invitation_id(3),
+            grant_id: grant_id(3),
+            recipient_device_id: device_id(0xf5),
+            ..share(SessionRole::Viewer, 3)
+        })
+        .expect("issued");
+    service
+        .cancel(third.preview.invitation_id, NOW + 5)
+        .expect("withdrawn");
+    assert!(
+        service
+            .grants()
+            .record(third.grant.grant_id)
+            .expect("readable")
+            .expect("present")
+            .revoked_at_ms
+            .is_some(),
+        "a withdrawn invitation leaves no proposal behind"
+    );
+    service
+        .redeem(third.preview.invitation_id, device_id(0xf5), NOW + 6)
+        .expect_err("a withdrawn invitation activates nothing");
+}
+
+/// Transferring control issues the recipient's authority and revokes the transferring device's.
+#[test]
+fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    let owner = service
+        .share(&share(SessionRole::Owner, 1))
+        .expect("an owner");
+    service
+        .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .expect("the owner redeems it");
+
+    let plan = transfer::TransferPlan {
+        session_id: session_id(0xa0),
+        from_device_id: device_id(0xf1),
+        to_device_id: device_id(0xf2),
+        revoking_grant_id: owner.grant.grant_id,
+        issuing_grant_id: grant_id(9),
+        actions: transfer::transferable_actions(&owner.grant),
+    };
+
+    // Without the owner's confirmation it does not happen at all.
+    let error = service
+        .transfer_control(
+            &plan,
+            false,
+            AuthorityRevision::new(1),
+            environment_id(0xe0),
+            NOW + 2,
+        )
+        .expect_err("a transfer changes who holds authority");
+    assert!(
+        error.to_string().contains("confirmation"),
+        "unexpected refusal: {error}"
+    );
+    assert!(
+        service
+            .grants()
+            .record(grant_id(9))
+            .expect("readable")
+            .is_none(),
+        "and nothing was written"
+    );
+
+    let done = service
+        .transfer_control(
+            &plan,
+            true,
+            AuthorityRevision::new(1),
+            environment_id(0xe0),
+            NOW + 2,
+        )
+        .expect("the owner confirmed it");
+
+    // The recipient holds active authority immediately: there is no invitation left to redeem.
+    let received = service
+        .grants()
+        .record(done.issued.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(received.is_active());
+    assert_eq!(received.grant.recipient_device_id, device_id(0xf2));
+    assert!(received.grant.permits(ActionRight::SessionShare));
+
+    // And the transferring device has given it up.
+    assert!(
+        service
+            .grants()
+            .record(owner.grant.grant_id)
+            .expect("readable")
+            .expect("present")
+            .revoked_at_ms
+            .is_some(),
+        "a transfer is not a delegation: the issuer does not keep what it hands over"
+    );
+    assert!(done.revoked.revoked.contains(&owner.grant.grant_id));
 }
 
 #[test]
@@ -397,13 +527,18 @@ fn an_invitation_is_scoped_to_the_session_it_shares() {
         },
         "an invitation shares one session, not the host"
     );
-    let policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
     let elsewhere = AccessRequest {
         session_id: Some(session_id(0xb0)),
         ..request(Method::SessionRead, NOW)
     };
     assert_eq!(
-        decide(&issued.grant, &stored(&issued.grant), &policy, elsewhere),
+        decide(
+            &issued.grant,
+            &stored(&issued.grant),
+            &mut policy,
+            elsewhere
+        ),
         Err(Refusal::SessionOutsideGrant)
     );
 }

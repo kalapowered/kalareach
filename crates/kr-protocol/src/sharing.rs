@@ -446,6 +446,8 @@ impl fmt::Display for InvitationState {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum GrantState {
+    /// Written down and checked, and authorising nothing until its invitation is redeemed.
+    Pending,
     /// Valid now.
     Active,
     /// Its expiry passed. It never revives.
@@ -459,6 +461,7 @@ impl GrantState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Active => "active",
             Self::Expired => "expired",
             Self::Revoked => "revoked",

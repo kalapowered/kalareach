@@ -25,7 +25,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use kr_protocol::ids::{DeviceId, InvitationId};
+use kr_protocol::ids::{DeviceId, GrantId, InvitationId};
 use kr_protocol::sharing::{InvitationPreview, InvitationState};
 
 use crate::error::{ControllerError, Result};
@@ -37,6 +37,10 @@ pub struct InvitationRecord {
     pub preview: InvitationPreview,
     /// The device that issued it.
     pub issuer_device_id: DeviceId,
+    /// The grant this invitation carries, which redemption activates.
+    pub grant_id: GrantId,
+    /// The device it was issued to. Only that device can redeem it.
+    pub recipient_device_id: DeviceId,
     /// Where it is in its life.
     pub state: InvitationState,
     /// The device that redeemed it, when one has.
@@ -97,13 +101,15 @@ impl InvitationLedger {
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS session_invitations (
-                     invitation_id    BLOB PRIMARY KEY NOT NULL,
-                     issuer_device_id BLOB NOT NULL,
-                     preview          BLOB NOT NULL,
-                     state            TEXT NOT NULL,
-                     redeemed_by      BLOB,
-                     issued_at_ms     INTEGER NOT NULL,
-                     expires_at_ms    INTEGER NOT NULL
+                     invitation_id       BLOB PRIMARY KEY NOT NULL,
+                     issuer_device_id    BLOB NOT NULL,
+                     grant_id            BLOB NOT NULL,
+                     recipient_device_id BLOB NOT NULL,
+                     preview             BLOB NOT NULL,
+                     state               TEXT NOT NULL,
+                     redeemed_by         BLOB,
+                     issued_at_ms        INTEGER NOT NULL,
+                     expires_at_ms       INTEGER NOT NULL
                  );",
             )
             .map_err(ControllerError::registry)?;
@@ -130,6 +136,8 @@ impl InvitationLedger {
         &self,
         preview: &InvitationPreview,
         issuer_device_id: DeviceId,
+        grant_id: GrantId,
+        recipient_device_id: DeviceId,
         now_ms: u64,
     ) -> Result<()> {
         if preview.historical_attachment_keys {
@@ -152,12 +160,14 @@ impl InvitationLedger {
         let written = self.with(|connection| {
             connection.execute(
                 "INSERT OR IGNORE INTO session_invitations (
-                     invitation_id, issuer_device_id, preview, state, redeemed_by,
-                     issued_at_ms, expires_at_ms
-                 ) VALUES (?1, ?2, ?3, 'open', NULL, ?4, ?5)",
+                     invitation_id, issuer_device_id, grant_id, recipient_device_id, preview,
+                     state, redeemed_by, issued_at_ms, expires_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'open', NULL, ?6, ?7)",
                 params![
                     preview.invitation_id.get().as_bytes().as_slice(),
                     issuer_device_id.get().as_bytes().as_slice(),
+                    grant_id.get().as_bytes().as_slice(),
+                    recipient_device_id.get().as_bytes().as_slice(),
                     encoded,
                     i64::try_from(now_ms).unwrap_or(i64::MAX),
                     i64::try_from(preview.expires_at_ms.get()).unwrap_or(i64::MAX),
@@ -182,7 +192,8 @@ impl InvitationLedger {
         let row: Option<Result<InvitationRecord>> = self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT preview, issuer_device_id, state, redeemed_by, issued_at_ms
+                    "SELECT preview, issuer_device_id, state, redeemed_by, issued_at_ms,
+                            grant_id, recipient_device_id
                      FROM session_invitations WHERE invitation_id = ?1",
                     params![key],
                     |row| Ok(read_row(row)),
@@ -215,6 +226,11 @@ impl InvitationLedger {
                 "this host holds no such invitation".to_owned(),
             ));
         };
+        if record.recipient_device_id != device_id {
+            return Err(ControllerError::PermissionDenied {
+                detail: "that invitation was issued to another device".to_owned(),
+            });
+        }
         match record.state_at(now_ms) {
             InvitationState::Open => {}
             InvitationState::Redeemed => {
@@ -277,6 +293,27 @@ impl InvitationLedger {
         Ok(())
     }
 
+    /// Puts a redeemed invitation back to open.
+    ///
+    /// Only for the case where the redemption consumed the row and then could not activate the
+    /// grant: a ledger saying `redeemed` beside a proposal nobody holds describes something that
+    /// did not happen.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn reopen(&self, invitation_id: InvitationId) -> Result<()> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE session_invitations SET state = 'open', redeemed_by = NULL
+                      WHERE invitation_id = ?1 AND state = 'redeemed'",
+                    params![invitation_id.get().as_bytes().as_slice()],
+                )
+                .map(|_| ())
+        })
+    }
+
     fn settle(&self, invitation_id: InvitationId, state: InvitationState) -> Result<()> {
         self.with(|connection| {
             connection
@@ -299,6 +336,8 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<InvitationRecord> {
     let state: String = row.get(2).map_err(ControllerError::registry)?;
     let redeemed: Option<Vec<u8>> = row.get(3).map_err(ControllerError::registry)?;
     let issued: i64 = row.get(4).map_err(ControllerError::registry)?;
+    let grant: Vec<u8> = row.get(5).map_err(ControllerError::registry)?;
+    let recipient: Vec<u8> = row.get(6).map_err(ControllerError::registry)?;
     Ok(InvitationRecord {
         preview,
         issuer_device_id: DeviceId::new(uuid_of(&issuer).ok_or_else(|| {
@@ -309,6 +348,12 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<InvitationRecord> {
         })?,
         redeemed_by: redeemed.as_deref().and_then(uuid_of).map(DeviceId::new),
         issued_at_ms: u64::try_from(issued).unwrap_or_default(),
+        grant_id: GrantId::new(uuid_of(&grant).ok_or_else(|| {
+            ControllerError::InvalidArgument("a stored grant identity is malformed".to_owned())
+        })?),
+        recipient_device_id: DeviceId::new(uuid_of(&recipient).ok_or_else(|| {
+            ControllerError::InvalidArgument("a stored recipient identity is malformed".to_owned())
+        })?),
     })
 }
 

@@ -1182,7 +1182,7 @@ impl Controller {
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
         let revocation = self.sharing.revoke(grant_id, now_ms)?;
-        self.complete_revocation(revocation.revoked.iter().copied().collect())
+        self.complete_revocation(revocation.revoked.iter().copied().collect(), false, now_ms)
             .await
     }
 
@@ -1208,47 +1208,49 @@ impl Controller {
         // The device record is marked revoked before the revision advances, so nothing can be
         // authorised against it in between. The directory is a view on this daemon's own registry
         // database, which is the file the network half keeps its device records in.
+        // A device can hold its grant in the pairing record and have no row here, so the device
+        // record changing is a withdrawal in its own right. Reading only the grant rows would let
+        // exactly that device keep a live connection.
         let withdrawn = self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
-        if !withdrawn && revocation.revoked.is_empty() {
-            // Nothing was withdrawn: no live grant and no live device record. Advancing the
-            // revision would fence the whole host for a retry that changed nothing.
-            // The guard is taken and released before the announcement, because an announcement
-            // waits on every worker and a lock held across that wait is a lock held for seconds.
-            let authority_revision = self.policy().authority_revision();
-            let barrier = self.announce_authority_revision().await?;
-            return Ok(kr_protocol::sharing::RevocationResult {
-                authority_revision,
-                revoked_grants: kr_protocol::scalars::CanonicalSet::from_iter([]),
-                barrier,
-            });
-        }
-        self.complete_revocation(revocation.revoked.iter().copied().collect())
-            .await
+        self.complete_revocation(
+            revocation.revoked.iter().copied().collect(),
+            withdrawn,
+            now_ms,
+        )
+        .await
     }
 
     /// Advances the revision, fences what was admitted under it, and reports the barrier.
     ///
     /// Shared by both revocation paths so the order cannot drift between them.
+    ///
+    /// "Nothing changed" is not the same as "nothing is owed". A revocation that wrote its rows and
+    /// then failed before the revision advanced leaves revoked grants and no fence, and a retry
+    /// would see an empty set of *newly* revoked rows. So the store keeps the moment a fence last
+    /// completed, and a revocation recorded after it is still owed one.
     async fn complete_revocation(
         &self,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
+        device_withdrawn: bool,
+        now_ms: u64,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
-        if revoked_grants.is_empty() {
-            // Idempotent: the work was already done, so the answer is the revision in force and
-            // the barrier as it stands, with nothing newly withdrawn.
+        let owed =
+            !revoked_grants.is_empty() || device_withdrawn || self.sharing.grants().fence_owed()?;
+        if !owed {
+            // The work was already done and fenced. The answer is the revision in force and the
+            // barrier as it stands, with nothing newly withdrawn.
+            let authority_revision = self.policy().authority_revision();
             let barrier = self.announce_authority_revision().await?;
             return Ok(kr_protocol::sharing::RevocationResult {
-                authority_revision: barrier.authority_revision,
+                authority_revision,
                 revoked_grants,
                 barrier,
             });
         }
         let barrier = self.revoke_authority().await?;
-        {
-            let mut policy = self.policy();
+        self.update_policy(|policy| {
             policy.advance_authority_revision(barrier.authority_revision);
-            self.sharing.grants().store_policy(&policy.snapshot())?;
-        }
+        })?;
         {
             // The feed numbers its entries from the same sequence the registry does, so a feed
             // entry cannot later claim a revision a local revocation has already used.
@@ -1256,11 +1258,38 @@ impl Controller {
             feed.note_revision(barrier.authority_revision);
             self.sharing.grants().store_feed(&feed.snapshot())?;
         }
+        // Last, because it is the record that this revocation's fence finished. Writing it before
+        // the fence would let a failure in between look like completed work.
+        self.sharing.grants().note_fenced_through(now_ms)?;
         Ok(kr_protocol::sharing::RevocationResult {
             authority_revision: barrier.authority_revision,
             revoked_grants,
             barrier,
         })
+    }
+
+    /// Changes this host's policy and writes the result down.
+    ///
+    /// Every accepted change goes through here. A policy that could be changed without being
+    /// persisted would come back as the previous one after an ordinary restart, which is the same
+    /// failure as accepting a restored old policy by a different route.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the policy cannot be written.
+    pub fn update_policy<T>(
+        &self,
+        change: impl FnOnce(&mut crate::grants::HostPolicy) -> T,
+    ) -> Result<T> {
+        let snapshot;
+        let value = {
+            let mut policy = self.policy();
+            let value = change(&mut policy);
+            snapshot = policy.snapshot();
+            value
+        };
+        self.sharing.grants().store_policy(&snapshot)?;
+        Ok(value)
     }
 
     /// The reading this daemon decides expiry from.
@@ -1270,9 +1299,16 @@ impl Controller {
     /// revive a grant this host has already refused.
     fn settled_now_ms(&self) -> u64 {
         let now_ms = kr_ipc::now_ms().get();
-        let mut policy = self.policy();
-        policy.observe_utc(now_ms);
-        policy.settled_now(now_ms)
+        self.update_policy(|policy| {
+            policy.observe_utc(now_ms);
+            policy.settled_now(now_ms)
+        })
+        .unwrap_or_else(|_| {
+            // The floor could not be written down. The reading this host has already decided from
+            // is still the one to use: failing to persist it is a reason to keep the stricter
+            // answer, not to fall back to a clock that may have gone backwards.
+            self.policy().settled_now(now_ms)
+        })
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.
@@ -1309,15 +1345,7 @@ impl Controller {
                 .retained_installation(actor_id, mutation, connection_id)
                 .await;
         }
-        // An authority change is exactly the effect a retry must not repeat: two `grant.revoke`
-        // calls under one action identifier would otherwise advance the revision twice and fence
-        // the host twice for one withdrawal.
-        if matches!(
-            method,
-            Method::GrantCreate | Method::GrantRevoke | Method::DeviceRevoke
-        ) {
-            return self.retained_authority_change(actor_id, mutation);
-        }
+
         if method != Method::SessionCreate {
             return None;
         }
@@ -2717,54 +2745,48 @@ impl Controller {
         respond(mutation.request_id, outcome)
     }
 
-    /// Answers an authority change this host has already performed for this caller.
+    /// What a claim on one authority change found.
     ///
-    /// The de-duplication key is the actor and the action together, and the payload digest decides
-    /// whether it is the same action or a reused identifier. A reused identifier carrying different
-    /// parameters is an `ID_CONFLICT`, not a second withdrawal of authority.
-    fn retained_authority_change(
+    /// Either this caller now holds the claim, with the moment it was made, or the change already
+    /// happened and this is what it produced.
+    fn claim_authority_change(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> Option<ControlFrame> {
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
-        match self
-            .sharing
-            .grants()
-            .retained_result(actor_id, mutation.action_id, &digest)
-        {
-            Ok(Some(result)) => {
-                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT).ok()?;
-                Some(ControlFrame::Response(Response {
-                    request_id: mutation.request_id,
-                    outcome: Outcome::Ok(ParamsValue::new(value)),
-                }))
+    ) -> Result<std::result::Result<u64, ParamsValue>> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        match self.sharing.grants().claim_action(
+            actor_id,
+            mutation.action_id,
+            &digest,
+            kr_ipc::now_ms().get(),
+        )? {
+            crate::grants::ActionClaim::Claimed { claimed_at_ms } => Ok(Ok(claimed_at_ms)),
+            crate::grants::ActionClaim::Answered { result } => {
+                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                Ok(Err(ParamsValue::new(value)))
             }
-            Ok(None) => None,
-            Err(error) => Some(respond(mutation.request_id, Err(error))),
         }
     }
 
-    /// Records what an authority change produced, so a retry is answered rather than repeated.
+    /// Records what a claimed authority change produced. A completed receipt is never replaced.
     fn retain_authority_change(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         result: &ParamsValue,
     ) -> Result<()> {
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let encoded = kr_cbor::encode(result.as_value());
         self.sharing.grants().retain_result(
             actor_id,
             mutation.action_id,
-            &digest,
-            &encoded,
+            &kr_cbor::encode(result.as_value()),
             kr_ipc::now_ms().get(),
         )
     }
 
-    /// Lists the grants this host's owner may see.
+    /// Lists the grants this host's owner may see.    /// Lists the grants this host's owner may see.    /// Lists the grants this host's owner may see.
     ///
     /// A local caller is the operating-system owner of this environment, so the issuer it lists
     /// grants for is this host itself: the grants it issued, and everything delegated from them.
@@ -2815,7 +2837,12 @@ impl Controller {
         })
     }
 
-    /// Performs one authority change and records its result for a retry.
+    /// Performs one authority change under a durable claim, and records what it produced.
+    ///
+    /// The claim comes first. An authority change is exactly the effect a retry must not repeat:
+    /// two `grant.revoke` calls under one action identifier would otherwise advance the revision
+    /// twice and fence the host twice for one withdrawal. A claim this host already answered is
+    /// answered again from its record rather than performed a second time.
     async fn authority_change(
         &self,
         actor_id: &ActorId,
@@ -2823,8 +2850,12 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
+        let claimed_at_ms = match self.claim_authority_change(actor_id, mutation)? {
+            Ok(claimed_at_ms) => claimed_at_ms,
+            Err(answered) => return Ok(answered),
+        };
         let result = match method {
-            Method::GrantCreate => self.grant_create(mutation, carried).await?,
+            Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await?,
             Method::GrantRevoke => self.grant_revoke(mutation, carried).await?,
             Method::DeviceRevoke => self.device_revoke(mutation, carried).await?,
             _ => {
@@ -2834,10 +2865,6 @@ impl Controller {
                 )));
             }
         };
-        // The record is written after the effect, so a retry that arrives before it is recorded
-        // repeats the effect rather than skipping it. For these three that is safe: a repeated
-        // revocation withdraws nothing and advances nothing, and a repeated create is refused by
-        // the identity its parameters already carry.
         self.retain_authority_change(actor_id, mutation, &result)?;
         Ok(result)
     }
@@ -2847,6 +2874,7 @@ impl Controller {
         &self,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
+        claimed_at_ms: u64,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantCreateParams = parse(&mutation.params)?;
         if params.owner_confirmation.is_present() {
@@ -2890,7 +2918,9 @@ impl Controller {
             named_approvals: Vec::new(),
             authority_revision: self.policy().authority_revision(),
             owner_confirmed: false,
-            now_ms: kr_ipc::now_ms().get(),
+            // The moment the claim was made, not the moment this attempt reached here. A retry
+            // therefore proposes the same grant with the same deadline rather than a newer one.
+            now_ms: claimed_at_ms,
         };
         // The admission is checked last, under the registry lock, so the grant is written against
         // authority that still stands at the moment it is written rather than at the moment the

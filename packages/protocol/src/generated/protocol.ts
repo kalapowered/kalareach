@@ -6225,7 +6225,7 @@ export interface GrantSummary {
   /**
    * Where it stands now.
    */
-  state: 'active' | 'expired' | 'revoked'
+  state: 'pending' | 'active' | 'expired' | 'revoked'
 }
 /**
  * The grant itself.

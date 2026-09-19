@@ -93,14 +93,51 @@ fn grant(id: u8, parent: Option<GrantId>, actions: &[ActionRight], expiry: Grant
     }
 }
 
+/// A grant whose invitation has been redeemed, which is what a live grant is.
 fn record(grant: Grant) -> GrantRecord {
     GrantRecord {
         session_id: Some(session_id(0xa0)),
         grant,
         issued_at_ms: 1_000,
+        activated_at_ms: Some(1_000),
         revoked_at_ms: None,
         revoked_by_parent: None,
     }
+}
+
+/// A grant nobody has redeemed yet.
+fn proposal(grant: Grant) -> GrantRecord {
+    GrantRecord {
+        activated_at_ms: None,
+        ..record(grant)
+    }
+}
+
+/// A grant that was written and never redeemed authorises nothing.
+#[test]
+fn a_grant_whose_invitation_was_never_redeemed_decides_nothing() {
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    assert_eq!(
+        decide(
+            &held,
+            &proposal(held.clone()),
+            &mut policy,
+            request(Method::SessionRead, 1_000)
+        ),
+        Err(Refusal::NotRedeemed {
+            grant_id: held.grant_id
+        }),
+        "a proposal is not authority"
+    );
+    // The same grant, redeemed, decides.
+    decide(
+        &held,
+        &record(held.clone()),
+        &mut policy,
+        request(Method::SessionRead, 1_000),
+    )
+    .expect("a redeemed grant decides");
 }
 
 fn account() -> AccountId {
@@ -232,7 +269,7 @@ fn the_host_intersects_the_grant_with_policy_on_every_request() {
     let permitted = decide(
         &held,
         &stored,
-        &HostPolicy::personal(AuthorityRevision::new(1)),
+        &mut HostPolicy::personal(AuthorityRevision::new(1)),
         request(Method::InputWrite, 5_000),
     )
     .expect("the personal grant carries terminal input");
@@ -241,7 +278,7 @@ fn the_host_intersects_the_grant_with_policy_on_every_request() {
     let refused = decide(
         &organisation_grant,
         &record(organisation_grant.clone()),
-        &policy,
+        &mut policy,
         request(Method::InputWrite, 5_000),
     )
     .expect_err("the organisation's maximum does not reach terminal input");
@@ -361,7 +398,7 @@ fn revoking_a_parent_revokes_every_descendant() {
     let error = decide(
         &grandchild,
         &grandchild_record,
-        &HostPolicy::personal(AuthorityRevision::new(1)),
+        &mut HostPolicy::personal(AuthorityRevision::new(1)),
         request(Method::SessionRead, 5_000),
     )
     .expect_err("a revoked descendant decides nothing");
@@ -406,7 +443,7 @@ fn a_method_is_decided_from_the_registry_table_and_never_from_a_capability() {
     let error = decide(
         &viewer,
         &record(viewer.clone()),
-        &HostPolicy::personal(AuthorityRevision::new(1)),
+        &mut HostPolicy::personal(AuthorityRevision::new(1)),
         request(Method::InputWrite, 5_000),
     )
     .expect_err("a viewer cannot write input");
@@ -433,13 +470,13 @@ fn a_permitted_decision_names_the_requirements_it_could_not_answer() {
         GrantExpiry::Never,
     );
     let stored = record(owner.clone());
-    let policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
 
     // `session.read` needs one right and nothing the subject has to resolve.
     let plain = decide(
         &owner,
         &stored,
-        &policy,
+        &mut policy,
         request(Method::SessionRead, 1_000),
     )
     .expect("permitted");
@@ -451,8 +488,13 @@ fn a_permitted_decision_names_the_requirements_it_could_not_answer() {
 
     // `action.read` needs the subject's own answer as well, and says so rather than letting a
     // caller read `Ok` as the whole answer.
-    let receipt = decide(&owner, &stored, &policy, request(Method::ActionRead, 1_000))
-        .expect("permitted so far");
+    let receipt = decide(
+        &owner,
+        &stored,
+        &mut policy,
+        request(Method::ActionRead, 1_000),
+    )
+    .expect("permitted so far");
     assert!(
         !receipt.is_complete(),
         "an authority the subject resolves is still owed"
@@ -472,7 +514,7 @@ fn a_permitted_decision_names_the_requirements_it_could_not_answer() {
         ..request(Method::ActionRead, 1_000)
     };
     let no_view = grant(2, None, &[ActionRight::HostManage], GrantExpiry::Never);
-    decide(&no_view, &record(no_view.clone()), &policy, host_scope)
+    decide(&no_view, &record(no_view.clone()), &mut policy, host_scope)
         .expect("a host effect's receipt is not a session read");
 
     // The same method for a session subject does need it.
@@ -480,7 +522,7 @@ fn a_permitted_decision_names_the_requirements_it_could_not_answer() {
         decide(
             &no_view,
             &record(no_view.clone()),
-            &policy,
+            &mut policy,
             request(Method::ActionRead, 1_000)
         ),
         Err(Refusal::MissingRight {
@@ -503,7 +545,7 @@ fn an_owner_grant_stays_valid_until_it_is_revoked() {
         GrantExpiry::Never,
     );
     directory.issue(&record(owner.clone())).expect("written");
-    let policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
 
     // A year later, with no feed anywhere, it still decides: independent operation does not depend
     // on a cloud lease.
@@ -512,8 +554,13 @@ fn an_owner_grant_stays_valid_until_it_is_revoked() {
         .record(owner.grant_id)
         .expect("read")
         .expect("present");
-    decide(&owner, &held, &policy, request(Method::SessionRead, far))
-        .expect("an owner grant does not expire");
+    decide(
+        &owner,
+        &held,
+        &mut policy,
+        request(Method::SessionRead, far),
+    )
+    .expect("an owner grant does not expire");
 
     directory.revoke(owner.grant_id, far).expect("revoked");
     let held = directory
@@ -524,7 +571,7 @@ fn an_owner_grant_stays_valid_until_it_is_revoked() {
         decide(
             &owner,
             &held,
-            &policy,
+            &mut policy,
             request(Method::SessionRead, far + 1)
         ),
         Err(Refusal::Revoked {
@@ -599,12 +646,12 @@ fn the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen() {
     let stored = record(owner.clone());
 
     // Off by default: the non-expiring owner grant is account-free and needs no feed.
-    let default = HostPolicy::personal(AuthorityRevision::new(1));
+    let mut default = HostPolicy::personal(AuthorityRevision::new(1));
     assert!(default.offline_validity().is_none());
     decide(
         &owner,
         &stored,
-        &default,
+        &mut default,
         request(Method::SessionRead, 900_000),
     )
     .expect("no feed dependency by default");
@@ -619,7 +666,7 @@ fn the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen() {
     decide(
         &owner,
         &stored,
-        &bounded,
+        &mut bounded,
         request(Method::SessionRead, 150_000),
     )
     .expect("inside the bound");
@@ -627,7 +674,7 @@ fn the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen() {
         decide(
             &owner,
             &stored,
-            &bounded,
+            &mut bounded,
             request(Method::SessionRead, 160_001)
         ),
         Err(Refusal::OfflineValidityLapsed {
@@ -648,12 +695,12 @@ fn an_expired_grant_is_refused_rather_than_downgraded_to_view_only() {
         },
     );
     let stored = record(controller.clone());
-    let policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
 
     decide(
         &controller,
         &stored,
-        &policy,
+        &mut policy,
         request(Method::SessionRead, 4_999),
     )
     .expect("valid up to the deadline");
@@ -663,7 +710,7 @@ fn an_expired_grant_is_refused_rather_than_downgraded_to_view_only() {
         decide(
             &controller,
             &stored,
-            &policy,
+            &mut policy,
             request(Method::SessionRead, 5_000)
         ),
         Err(Refusal::Expired {
@@ -676,7 +723,7 @@ fn an_expired_grant_is_refused_rather_than_downgraded_to_view_only() {
         decide(
             &controller,
             &stored,
-            &policy,
+            &mut policy,
             request(Method::InputWrite, 5_000)
         ),
         Err(Refusal::Expired {
@@ -719,12 +766,18 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
         .expect("the lease is inside every rule section 17 states");
 
     // Nothing about the transport changes between these two. Only the clock does.
-    decide(&held, &stored, &policy, request(Method::SessionRead, 9_999)).expect("inside the lease");
+    decide(
+        &held,
+        &stored,
+        &mut policy,
+        request(Method::SessionRead, 9_999),
+    )
+    .expect("inside the lease");
     assert_eq!(
         decide(
             &held,
             &stored,
-            &policy,
+            &mut policy,
             request(Method::SessionRead, 10_000)
         ),
         Err(Refusal::MembershipUnusable {
@@ -733,7 +786,12 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
         "a connected transport does not extend a lease"
     );
     assert_eq!(
-        decide(&held, &stored, &policy, request(Method::InputWrite, 10_000)),
+        decide(
+            &held,
+            &stored,
+            &mut policy,
+            request(Method::InputWrite, 10_000)
+        ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::LeaseExpired
         }),
@@ -760,7 +818,7 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
         decide(
             &held,
             &stored,
-            &mismatched,
+            &mut mismatched,
             request(Method::SessionRead, 1_000)
         ),
         Err(Refusal::MembershipUnusable {
@@ -794,7 +852,7 @@ fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusivel
     decide(
         &personal,
         &stored,
-        &ordinary,
+        &mut ordinary,
         request(Method::SessionRead, 900_000),
     )
     .expect("a personal grant is untouched by an organisation outage");
@@ -815,7 +873,7 @@ fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusivel
         decide(
             &personal,
             &stored,
-            &exclusive,
+            &mut exclusive,
             request(Method::SessionRead, 900_000)
         ),
         Err(Refusal::MembershipUnusable {
@@ -874,8 +932,13 @@ fn expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_au
     let stored = record(held.clone());
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
 
-    decide(&held, &stored, &policy, request(Method::SessionRead, 1_000))
-        .expect("valid before the machine sleeps");
+    decide(
+        &held,
+        &stored,
+        &mut policy,
+        request(Method::SessionRead, 1_000),
+    )
+    .expect("valid before the machine sleeps");
 
     // The machine sleeps through the deadline. Waking is where expiry is decided again, and the
     // clock is what decides it: nothing is carried over from before the gap.
@@ -885,7 +948,7 @@ fn expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_au
         decide(
             &held,
             &stored,
-            &policy,
+            &mut policy,
             request(Method::SessionRead, 900_000)
         ),
         Err(Refusal::Expired {
@@ -914,7 +977,7 @@ fn expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_au
     decide(
         &older,
         &record(older.clone()),
-        &policy,
+        &mut policy,
         request(Method::SessionRead, 1_000),
     )
     .expect("an untouched grant survives somebody else's revocation");
@@ -929,7 +992,7 @@ fn expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_au
         decide(
             &invented,
             &record(invented.clone()),
-            &policy,
+            &mut policy,
             request(Method::SessionRead, 1_000)
         ),
         Err(Refusal::UnissuedAuthority {
@@ -956,7 +1019,12 @@ fn a_clock_that_goes_backwards_does_not_revive_an_expiry_the_host_already_decide
     // The host decides at 6,000 and refuses: the deadline has passed.
     policy.observe_utc(6_000);
     assert_eq!(
-        decide(&held, &stored, &policy, request(Method::SessionRead, 6_000)),
+        decide(
+            &held,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 6_000)
+        ),
         Err(Refusal::Expired {
             expired_at_ms: 5_000
         })
@@ -966,7 +1034,12 @@ fn a_clock_that_goes_backwards_does_not_revive_an_expiry_the_host_already_decide
     // not change.
     assert_eq!(policy.settled_now(4_000), 6_000);
     assert_eq!(
-        decide(&held, &stored, &policy, request(Method::SessionRead, 4_000)),
+        decide(
+            &held,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 4_000)
+        ),
         Err(Refusal::Expired {
             expired_at_ms: 5_000
         }),
@@ -1061,7 +1134,12 @@ fn one_members_lease_does_not_sustain_another_members_access() {
         .expect("the lease is installed");
 
     assert_eq!(
-        decide(&held, &stored, &policy, request(Method::SessionRead, 1_000)),
+        decide(
+            &held,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 1_000)
+        ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::NoLease
         }),
@@ -1078,11 +1156,21 @@ fn one_members_lease_does_not_sustain_another_members_access() {
             &[ActionRight::SessionView],
         ))
         .expect("the lease is installed");
-    decide(&held, &stored, &policy, request(Method::SessionRead, 1_000))
-        .expect("this member's own lease answers");
+    decide(
+        &held,
+        &stored,
+        &mut policy,
+        request(Method::SessionRead, 1_000),
+    )
+    .expect("this member's own lease answers");
     policy.drop_lease(organisation_id, &account());
     assert_eq!(
-        decide(&held, &stored, &policy, request(Method::SessionRead, 1_000)),
+        decide(
+            &held,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 1_000)
+        ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::NoLease
         })
@@ -1094,7 +1182,7 @@ fn one_members_lease_does_not_sustain_another_members_access() {
         ..request(Method::SessionRead, 1_000)
     };
     assert_eq!(
-        decide(&held, &stored, &policy, unattributed),
+        decide(&held, &stored, &mut policy, unattributed),
         Err(Refusal::MembershipUnattributed)
     );
 }
@@ -1125,7 +1213,7 @@ fn a_grant_naming_another_policy_revision_is_refused() {
         decide(
             &held,
             &record(held.clone()),
-            &policy,
+            &mut policy,
             request(Method::SessionRead, 1_000)
         ),
         Err(Refusal::MembershipUnusable {
@@ -1463,7 +1551,7 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
         decide(
             &held,
             &stored,
-            &HostPolicy::personal(before),
+            &mut HostPolicy::personal(before),
             request(Method::SessionRead, 1_000)
         ),
         Err(Refusal::Revoked {

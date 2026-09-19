@@ -3423,7 +3423,7 @@ impl WorkerService {
                     // caller's scope is section 10's live-screen exception, and asking the filter
                     // rather than naming the scope here is what keeps that decision in one place.
                     let filter = crate::history_filter::HistoryFilter::new(
-                        crate::history_filter::ViewerScope::forwarded(),
+                        crate::history_filter::ViewerScope::forwarded(kr_ipc::now_ms().get()),
                     );
                     session.narrow_content(attachment_id, filter.screen_scope());
                     self.remote_attachments

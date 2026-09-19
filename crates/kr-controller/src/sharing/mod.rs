@@ -313,19 +313,26 @@ impl SharingService {
                 authority_revision: request.authority_revision,
             });
         }
+        // The grant is written as a **proposal**: it authorises nothing until the device it names
+        // redeems the invitation that carries it. That is what makes the ordering safe. If the
+        // invitation cannot be recorded, what is left behind is a proposal nobody can redeem
+        // rather than authority nobody previewed, and the compensating revocation below tidies it
+        // away rather than being the thing that keeps the host correct.
         self.grants.issue(&GrantRecord {
             grant: grant.clone(),
             session_id: Some(request.session_id),
             issued_at_ms: request.now_ms,
+            activated_at_ms: None,
             revoked_at_ms: None,
             revoked_by_parent: None,
         })?;
-        // The invitation is recorded after the grant, and its failure takes the grant with it: an
-        // invitation nobody can redeem is recoverable, a grant nobody previewed is not.
-        if let Err(error) =
-            self.invitations
-                .issue(&preview, request.issuer_device_id, request.now_ms)
-        {
+        if let Err(error) = self.invitations.issue(
+            &preview,
+            request.issuer_device_id,
+            grant.grant_id,
+            request.recipient_device_id,
+            request.now_ms,
+        ) {
             self.grants.revoke(grant.grant_id, request.now_ms)?;
             return Err(error);
         }
@@ -334,6 +341,141 @@ impl SharingService {
             grant,
             preview,
             authority_revision: request.authority_revision,
+        })
+    }
+
+    /// Redeems an invitation and activates the grant it carries, once.
+    ///
+    /// Section 25: an invitation is single use. Redemption is where that is true of the *grant*:
+    /// the ledger's row and the grant's activation move together, the redeeming device has to be
+    /// the one the invitation names, and a second attempt by anybody finds the work done. An
+    /// invitation that was withdrawn or has expired activates nothing, so cancelling one is a
+    /// complete answer rather than a note beside a live grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such invitation, and
+    /// [`ControllerError::PermissionDenied`] when it was withdrawn, has expired, has already been
+    /// redeemed, or names another device.
+    pub fn redeem(
+        &self,
+        invitation_id: InvitationId,
+        device_id: DeviceId,
+        now_ms: u64,
+    ) -> Result<Grant> {
+        let record = self.invitations.redeem(invitation_id, device_id, now_ms)?;
+        match self.grants.activate(record.grant_id, device_id, now_ms) {
+            Ok(grant) => Ok(grant),
+            Err(error) => {
+                // The invitation was consumed and the grant was not. Leaving the ledger saying
+                // "redeemed" beside a proposal nobody holds would be worse than saying nothing, so
+                // the row goes back to open for the deadline it has left.
+                self.invitations.reopen(invitation_id)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Withdraws an invitation, and with it the proposal it carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] when it is no longer open.
+    pub fn cancel(&self, invitation_id: InvitationId, now_ms: u64) -> Result<()> {
+        let Some(record) = self.invitations.record(invitation_id)? else {
+            return Err(ControllerError::InvalidArgument(
+                "this host holds no such invitation".to_owned(),
+            ));
+        };
+        self.invitations.cancel(invitation_id)?;
+        // A proposal whose invitation is withdrawn is withdrawn with it. It was never active, so
+        // this revokes rather than fences: there is nothing to fence.
+        self.grants.revoke(record.grant_id, now_ms)?;
+        Ok(())
+    }
+
+    /// Transfers control of a session from one device to another.
+    ///
+    /// Two effects that have to happen together: the recipient receives the transferring device's
+    /// authority over the session, and the transferring device's grant is revoked. It is not a
+    /// delegation — the issuer does not keep what it hands over — so it is its own operation, and
+    /// section 23 requires an owner's confirmation for it because it changes who holds authority.
+    ///
+    /// The grant it issues is active immediately. There is no invitation to redeem: the owner
+    /// confirming the transfer *is* the ceremony, and a transfer that left the recipient holding a
+    /// proposal would leave the session with nobody in control.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] when the owner has not confirmed, when the
+    /// transferring device does not hold the grant it names, or when the plan hands over more than
+    /// that grant carries.
+    pub fn transfer_control(
+        &self,
+        plan: &TransferPlan,
+        owner_confirmed: bool,
+        authority_revision: AuthorityRevision,
+        environment_id: EnvironmentId,
+        now_ms: u64,
+    ) -> Result<ControlTransfer> {
+        if !owner_confirmed {
+            return Err(ControllerError::PermissionDenied {
+                detail: "transferring control changes who holds authority, and needs the owner's \
+                         confirmation"
+                    .to_owned(),
+            });
+        }
+        let holding = self.grants.record(plan.revoking_grant_id)?.ok_or_else(|| {
+            ControllerError::PermissionDenied {
+                detail: "this host holds no such grant".to_owned(),
+            }
+        })?;
+        if !holding.is_active() {
+            return Err(ControllerError::PermissionDenied {
+                detail: "a grant nobody has redeemed carries no control to transfer".to_owned(),
+            });
+        }
+        if holding.revoked_at_ms.is_some() || !holding.grant.expiry.is_valid_at(now_ms) {
+            return Err(ControllerError::PermissionDenied {
+                detail: "that grant is no longer valid, so there is no control to transfer"
+                    .to_owned(),
+            });
+        }
+        transfer::check_transfer(plan, &holding.grant)?;
+
+        let issued = Grant {
+            grant_id: plan.issuing_grant_id,
+            parent_grant_id: holding.grant.parent_grant_id,
+            issuer_device_id: plan.from_device_id,
+            recipient_device_id: plan.to_device_id,
+            authority_revision,
+            environment_selector: kr_protocol::grant::EnvironmentSelector::These {
+                environment_ids: [environment_id].into_iter().collect(),
+            },
+            session_selector: kr_protocol::grant::SessionSelector::These {
+                session_ids: [plan.session_id].into_iter().collect(),
+            },
+            actions: plan.actions.clone(),
+            history: holding.grant.history.clone(),
+            expiry: holding.grant.expiry,
+            organisation: holding.grant.organisation,
+        };
+        self.grants.issue(&GrantRecord {
+            grant: issued.clone(),
+            session_id: Some(plan.session_id),
+            issued_at_ms: now_ms,
+            // Active on issue. The confirmation is the ceremony; there is nothing left to redeem.
+            activated_at_ms: Some(now_ms),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        })?;
+        // And the transferring device gives it up. Its descendants go with it, which is the point:
+        // control that was passed on from the old grant does not survive the transfer either.
+        let revoked = self.grants.revoke(plan.revoking_grant_id, now_ms)?;
+        Ok(ControlTransfer {
+            plan: plan.clone(),
+            issued,
+            revoked,
         })
     }
 
@@ -387,7 +529,15 @@ impl SharingService {
             .filter(|record| visible.contains(&record.grant.grant_id))
             .filter(|record| session_id.is_none_or(|named| record.session_id == Some(named)))
             .filter(|record| {
-                include_resolved || record.state(now_ms) == kr_protocol::sharing::GrantState::Active
+                // "Resolved" is expired or revoked. A proposal nobody has redeemed is neither: it
+                // is the thing an issuer most wants to see in this list, because it is the one
+                // still waiting for somebody.
+                include_resolved
+                    || matches!(
+                        record.state(now_ms),
+                        kr_protocol::sharing::GrantState::Active
+                            | kr_protocol::sharing::GrantState::Pending
+                    )
             })
             .map(|record| record.summary(now_ms))
             .collect();

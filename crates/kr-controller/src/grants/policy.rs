@@ -432,7 +432,8 @@ impl HostPolicy {
                 // host is exclusively organisation-managed, in which case there is no personal
                 // path left to continue on.
                 if self.exclusively_managed
-                    && let Some(refusal) = self.first_unusable_lease(now_ms)
+                    && let Some(refusal) =
+                        self.unusable_for(request.recipient_account.as_ref(), now_ms)
                 {
                     return Err(Refusal::MembershipUnusable { refusal });
                 }
@@ -459,24 +460,43 @@ impl HostPolicy {
         }
     }
 
-    /// The first reason a lease this host holds is unusable, for the exclusively-managed path.
+    /// Why this host, being exclusively organisation-managed, cannot answer for one account.
     ///
-    /// An enrolment with no lease at all is as unusable as an expired one: a host that is
-    /// exclusively organisation-managed and holds nothing has nothing to work under.
-    fn first_unusable_lease(&self, now_ms: u64) -> Option<MembershipRefusal> {
-        for enrolment in self.enrolments.values() {
-            if enrolment.leases.is_empty() {
-                return Some(MembershipRefusal::NoLease);
-            }
-            for lease in enrolment.leases.values() {
-                if lease.payload.key_revision != enrolment.pinned_key_revision {
-                    return Some(MembershipRefusal::WrongAuthority);
-                }
-                if !lease.payload.is_valid_at(now_ms) {
-                    return Some(MembershipRefusal::LeaseExpired);
-                }
-            }
+    /// The question is about **this** actor, not about every member. One member's lease lapsing
+    /// must not stop another member working, and a host with no enrolment at all that is
+    /// nevertheless marked exclusively managed has no organisation to answer for it, which is its
+    /// own refusal rather than a pass.
+    fn unusable_for(
+        &self,
+        account_id: Option<&AccountId>,
+        now_ms: u64,
+    ) -> Option<MembershipRefusal> {
+        let Some(account_id) = account_id else {
+            // The host answers only under an organisation, and cannot tell whose lease would
+            // answer. Refusing is the only honest outcome.
+            return Some(MembershipRefusal::NoLease);
+        };
+        if self.enrolments.is_empty() {
+            return Some(MembershipRefusal::NoLease);
         }
-        None
+        let mut seen = None;
+        for enrolment in self.enrolments.values() {
+            let Some(lease) = enrolment.leases.get(account_id) else {
+                seen = Some(MembershipRefusal::NoLease);
+                continue;
+            };
+            if lease.payload.key_revision != enrolment.pinned_key_revision {
+                seen = Some(MembershipRefusal::WrongAuthority);
+                continue;
+            }
+            if !lease.payload.is_valid_at(now_ms) {
+                seen = Some(MembershipRefusal::LeaseExpired);
+                continue;
+            }
+            // One usable lease is enough: this actor is a member in good standing somewhere this
+            // host answers to.
+            return None;
+        }
+        seen.or(Some(MembershipRefusal::NoLease))
     }
 }

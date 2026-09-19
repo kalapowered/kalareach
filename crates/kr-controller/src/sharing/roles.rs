@@ -66,6 +66,14 @@ pub fn compile(
                 .to_owned(),
         ));
     }
+    // A viewer sees the selected live screen **and future events**. So an invitation with no
+    // earlier cursor starts at the moment it is issued rather than at nothing: a null lower bound
+    // means "no retained history at all", which for a session invitation would exclude the events
+    // that have not happened yet as well as the ones that have.
+    let mut history = selection.history();
+    if history.lower_bound_ms.as_ref().is_none() {
+        history.lower_bound_ms = Nullable::some(TimestampMs::new(now_ms));
+    }
     Ok(ProposedGrant {
         parent_grant_id: Nullable::null(),
         environment_selector: EnvironmentSelector::Any,
@@ -73,7 +81,7 @@ pub fn compile(
             session_ids: [session_id].into_iter().collect(),
         },
         actions: selection.actions(),
-        history: selection.history(),
+        history,
         expiry: GrantExpiry::At {
             expires_at_ms: TimestampMs::new(now_ms.saturating_add(lifetime)),
         },

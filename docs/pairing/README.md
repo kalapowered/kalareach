@@ -311,7 +311,7 @@ own, so a different version could be a different profile.
 
 This crate issues grants and validates the rules for the kind being issued. What happens to a grant
 after it exists belongs to the control daemon, and `docs/host/README.md` states it: the intersection
-the host takes on every request, the revocation cascade along the parent link, the per-worker
+it takes when it decides a request, the revocation cascade along the parent link, the per-worker
 dispatch barrier a revocation completes through, the organisation lease that stops a grant while the
 transport stays connected, and the bounded offline-validity policy an owner may choose.
 
@@ -323,7 +323,9 @@ ever accepted as a floor, so a restored old policy cannot revive authority that 
 withdrawn.
 
 **Owner confirmation is for persistent enlargement.** Both halves of that phrase are checked: the
-grant never expires, *and* it carries a right the recipient does not already hold. A bounded session
-invitation is not a persistent enlargement however wide it is, and re-issuing what a device already
-holds enlarges nothing. Transfer of control is separate and always confirmed, because it changes who
-holds authority.
+grant never expires, *and* no live grant the recipient already holds reaches everything it would.
+Comparing the rights by name alone would miss the case that matters most, where a device with a
+one-hour view of one session is handed a permanent view of every session. A bounded session
+invitation is not a persistent enlargement however wide it is. Transfer of control is separate and
+confirmed every time, because it changes who holds authority rather than adding to what somebody
+has.

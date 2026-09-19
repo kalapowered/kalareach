@@ -1168,18 +1168,19 @@ A grant is the authority a request is decided against. It names its issuer and i
 authority revision it was issued under, the environments and sessions it covers, the actions it
 permits, how far back it may see, when it stops and which organisation membership it requires.
 
-Two paths reach a grant. A paired device's session request is decided at the network boundary,
-against the grant its pairing recorded and the session and environment that grant covers. The
-sharing and device method groups, and every authority question this daemon answers about a grant it
-issued, are decided by `grants::decide` in `crates/kr-controller/src/grants/`. The two share the
-method registry's required-rights column, so neither invents a right the other does not ask for.
+Two stores hold grants. A pairing writes its grant into the device record, and a paired device's
+session request is decided at the network boundary against that grant, the session and environment
+it covers, and the rights the method registry requires. `crates/kr-controller/src/grants/` holds the
+grants this daemon issues through the sharing method group, and `grants::decide` is the intersection
+those are decided by. Both read the registry's required-rights column, so neither invents a right
+the other does not ask for.
 
 `grants::decide` takes the intersection in this order:
 
 1. The method has to be in the registry and reachable from the caller's ingress class. An unlisted
    name is denied whatever the caller holds.
-2. The grant has to be live: not revoked, no revoked ancestor, not expired, and issued under a
-   revision this host has not replaced.
+2. The grant has to be live: not revoked, no revoked ancestor, redeemed, not expired, and claiming
+   no revision this host has never issued.
 3. The host's own policy has to permit it: the organisation lease it requires, and the bounded
    offline-validity policy when the owner chose one.
 4. The selectors have to admit the environment and the session the request names.
@@ -1223,10 +1224,23 @@ that writes the grant, and refuses the request when the notices the issuer state
 not the ones the grant carries. A shared live screen can hold text printed long before the
 invitation, so the preview shows the text. A new recipient receives no historical attachment keys.
 
-**Invitations are single use and they expire.** The default is `session.view` for one hour; the
-issuer may choose less or extend it to at most 30 days. A lifetime past the bound is refused rather
-than clamped, because a silently shortened invitation is one whose issuer believes something untrue
-about it. Persistent co-owner access is explicit owner pairing, not a longer invitation.
+**Invitations are single use and they expire.** The default is `session.view` for one hour, from the
+moment the invitation is issued: the recipient sees the selected live screen and what happens next,
+and earlier history is a separate choice. The issuer may choose less than an hour or extend it to at
+most 30 days. A lifetime past the bound is refused rather than clamped, because a silently shortened
+invitation is one whose issuer believes something untrue about it. Persistent co-owner access is
+explicit owner pairing, not a longer invitation.
+
+**A grant is a proposal until its invitation is redeemed.** `grant.create` writes the grant and its
+invitation together and the grant authorises nothing; redemption activates it, for exactly the
+device the invitation names, once. A second redemption by anybody finds the work done. Withdrawing
+an invitation withdraws the proposal with it, so cancelling is a complete answer rather than a note
+beside live authority.
+
+**Transfer of control is not a delegation.** The transferring device does not keep what it hands
+over: the recipient receives an active grant over the session and the transferring device's grant is
+revoked, with its descendants. It changes who holds authority, so it needs the owner's confirmation
+every time, and it can hand over no more than the transferring grant carries.
 
 **Nothing is lent through an intermediary.** What an actor may do through a plugin action, an
 attachment action or a workflow is the *intersection* of what the actor holds and what the
@@ -1267,17 +1281,22 @@ registration on its own belongs to the network half, which owns those registrati
 
 ### The remote authority feed
 
-A remote owner publishes a signed revocation **request**, which carries no revision. This host
-validates it and issues the ordered revision itself, because a device that could number its own
-request would be assigning itself a place in the host's order. A record at or below the revision
-this host has accepted is refused, so replaying an old feed entry cannot put authority back.
+A remote owner publishes a signed revocation **request**, which carries no revision. Only the target
+host numbers it, from the same sequence its own revocations use, because a device that could number
+its own request would be assigning itself a place in the host's order. A record at or below the
+revision this host has accepted is refused, so replaying an old feed entry cannot put authority back,
+and a different request wearing an identity this host has already applied is refused rather than
+answered with somebody else's revision.
 
 Revocation records are retained until every enrolled host has acknowledged them or that host is
-explicitly removed; they do not share mailbox expiry or notification coalescing. `device.list` shows
+explicitly removed; they do not share mailbox expiry or notification coalescing. A settled record is
+kept rather than deleted, because its revision is what a device list reports as that host's last
+acknowledgement and its identity is what stops the request being applied again. `device.list` shows
 each host's last acknowledgement beside the feed's own staleness, because an offline host cannot
 apply a revocation it has not received and a list that looked current because nothing had
-contradicted it would be worse than no list. A host synchronises at reconnect before it serves
-affected remote work, and polls every 30 seconds while online.
+contradicted it would be worse than no list. The feed records that a synchronisation is owed from
+the moment a connection is established until one has happened on it, and an unreachable feed is
+reported stale rather than current.
 
 ### What the host policy holds
 

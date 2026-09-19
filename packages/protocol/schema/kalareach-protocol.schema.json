@@ -6819,6 +6819,11 @@
       "description": "Where a grant is in its life.",
       "oneOf": [
         {
+          "const": "pending",
+          "description": "Written down and checked, and authorising nothing until its invitation is redeemed.",
+          "type": "string"
+        },
+        {
           "const": "active",
           "description": "Valid now.",
           "type": "string"

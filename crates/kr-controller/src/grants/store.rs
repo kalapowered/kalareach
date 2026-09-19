@@ -48,6 +48,13 @@ pub struct GrantRecord {
     pub session_id: Option<SessionId>,
     /// When it was issued, in UTC milliseconds.
     pub issued_at_ms: u64,
+    /// When its invitation was redeemed, when it has been.
+    ///
+    /// A grant with no activation is a **proposal**: it is written down, its issuer's authority has
+    /// been checked against it, and it authorises nothing until the device it names redeems the
+    /// invitation that carries it. Section 25's "invitations are single-use" is that redemption, and
+    /// a grant that was live before anybody redeemed it would make the word meaningless.
+    pub activated_at_ms: Option<u64>,
     /// When it was revoked, when it has been.
     pub revoked_at_ms: Option<u64>,
     /// The ancestor whose revocation revoked it, when it was revoked as a descendant.
@@ -55,11 +62,22 @@ pub struct GrantRecord {
 }
 
 impl GrantRecord {
+    /// Returns true when this grant's invitation has been redeemed.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.activated_at_ms.is_some()
+    }
+
     /// Where this grant stands at `now_ms`.
+    ///
+    /// A proposal nobody has redeemed reads as `Pending`: it is not active, and calling it expired
+    /// or revoked would be saying something untrue about why it authorises nothing.
     #[must_use]
     pub fn state(&self, now_ms: u64) -> GrantState {
         if self.revoked_at_ms.is_some() {
             GrantState::Revoked
+        } else if !self.is_active() {
+            GrantState::Pending
         } else if self.grant.expiry.is_valid_at(now_ms) {
             GrantState::Active
         } else {
@@ -77,6 +95,21 @@ impl GrantRecord {
             revoked_by_parent: Nullable(self.revoked_by_parent),
         }
     }
+}
+
+/// What a claim on one action found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionClaim {
+    /// This caller now holds the claim, from the moment it was made.
+    Claimed {
+        /// When the claim was made. A retry rebuilds its proposal from this.
+        claimed_at_ms: u64,
+    },
+    /// This action already happened, and here is what it produced.
+    Answered {
+        /// The encoded result.
+        result: Vec<u8>,
+    },
 }
 
 /// What one revocation did.
@@ -152,6 +185,7 @@ impl GrantDirectory {
                      session_id        BLOB,
                      grant             BLOB NOT NULL,
                      issued_at_ms      INTEGER NOT NULL,
+                     activated_at_ms   INTEGER,
                      revoked_at_ms     INTEGER,
                      revoked_by_parent BLOB
                  );
@@ -161,8 +195,9 @@ impl GrantDirectory {
                      actor_id       TEXT NOT NULL,
                      action_id      BLOB NOT NULL,
                      payload_digest BLOB NOT NULL,
-                     result         BLOB NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL,
+                     claimed_at_ms  INTEGER NOT NULL,
+                     result         BLOB,
+                     recorded_at_ms INTEGER,
                      PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS host_authority (
@@ -186,33 +221,28 @@ impl GrantDirectory {
 
     /// Runs one read-then-write sequence as a single immediate transaction.
     ///
-    /// `BEGIN IMMEDIATE` rather than the default deferred begin, so the write lock is taken before
-    /// the first read rather than when the first write happens: a deferred transaction that read a
+    /// `Immediate` rather than the default deferred begin, so the write lock is taken before the
+    /// first read rather than when the first write happens: a deferred transaction that read a
     /// subtree and then failed to upgrade would have to be retried, and retrying an authority
-    /// change is exactly where a caller stops paying attention. A failure rolls the whole thing
-    /// back, so a subtree is never half revoked.
+    /// change is exactly where a caller stops paying attention.
+    ///
+    /// The transaction rolls back when it is dropped, which covers the three ways a closure can
+    /// end without committing: it returned an error, the commit itself failed, or it panicked.
+    /// A connection left inside a transaction would hold this database's writer lock, and the
+    /// registry and the device directory write to the same file.
     fn in_transaction<T>(&self, body: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(ControllerError::registry)?;
-        match body(&connection) {
-            Ok(value) => {
-                connection
-                    .execute_batch("COMMIT")
-                    .map_err(ControllerError::registry)?;
-                Ok(value)
-            }
-            Err(error) => {
-                // The rollback's own failure is not what the caller asked about, and reporting it
-                // instead would hide the reason the transaction was abandoned.
-                let _ = connection.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(ControllerError::registry)?;
+        let value = body(&transaction)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(value)
     }
 
     /// Writes a grant.
@@ -263,8 +293,8 @@ impl GrantDirectory {
                 .execute(
                     "INSERT OR IGNORE INTO grants (
                      grant_id, parent_grant_id, recipient_device_id, session_id, grant,
-                     issued_at_ms, revoked_at_ms, revoked_by_parent
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+                     issued_at_ms, activated_at_ms, revoked_at_ms, revoked_by_parent
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
                     params![
                         record.grant.grant_id.get().as_bytes().as_slice(),
                         record
@@ -278,6 +308,9 @@ impl GrantDirectory {
                             .map(|session| session.get().as_bytes().to_vec()),
                         encoded,
                         i64::try_from(record.issued_at_ms).unwrap_or(i64::MAX),
+                        record
+                            .activated_at_ms
+                            .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     ],
                 )
                 .map_err(ControllerError::registry)
@@ -300,7 +333,9 @@ impl GrantDirectory {
         let row: Option<Row> = self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent
+                    "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
+             activated_at_ms,
+                            activated_at_ms
                      FROM grants WHERE grant_id = ?1",
                     params![key],
                     |row| Ok(read_row(row)),
@@ -318,7 +353,9 @@ impl GrantDirectory {
     pub fn records(&self) -> Result<Vec<GrantRecord>> {
         let rows: Vec<Row> = self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent
+                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
+             activated_at_ms,
+                            activated_at_ms
                  FROM grants ORDER BY grant_id",
             )?;
             let rows = statement
@@ -338,7 +375,9 @@ impl GrantDirectory {
         let key = device_id.get().as_bytes().to_vec();
         let rows: Vec<Row> = self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent
+                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
+             activated_at_ms,
+                            activated_at_ms
                  FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
             )?;
             let rows = statement
@@ -467,47 +506,177 @@ impl GrantDirectory {
         })
     }
 
+    /// Activates a proposal, once, for exactly the device it names.
+    ///
+    /// The precondition is the whole of the `WHERE` clause, so two devices arriving at the same
+    /// moment produce one activation and one refusal rather than two live grants. The invitation
+    /// row and this one are changed inside one transaction by the caller, which is what makes
+    /// "single use" a fact about the grant and not only about the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such grant, and
+    /// [`ControllerError::PermissionDenied`] when it is revoked, expired, already active, or
+    /// belongs to another device.
+    pub fn activate(&self, grant_id: GrantId, device_id: DeviceId, now_ms: u64) -> Result<Grant> {
+        self.in_transaction(|connection| {
+            let record = read_one(connection, grant_id)?.ok_or_else(|| {
+                ControllerError::InvalidArgument("this host holds no such grant".to_owned())
+            })?;
+            if record.grant.recipient_device_id != device_id {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "that invitation was issued to another device".to_owned(),
+                });
+            }
+            if record.revoked_at_ms.is_some() {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "that invitation's grant has been revoked".to_owned(),
+                });
+            }
+            if !record.grant.expiry.is_valid_at(now_ms) {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "that invitation has expired".to_owned(),
+                });
+            }
+            let changed = connection
+                .execute(
+                    "UPDATE grants SET activated_at_ms = ?2
+                      WHERE grant_id = ?1 AND activated_at_ms IS NULL AND revoked_at_ms IS NULL",
+                    params![
+                        grant_id.get().as_bytes().as_slice(),
+                        i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            if changed == 0 {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "that invitation has already been redeemed".to_owned(),
+                });
+            }
+            Ok(record.grant)
+        })
+    }
+
+    // --- The fence watermark --------------------------------------------------------------
+
+    /// The moment up to which a revocation's fence has completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be read.
+    pub fn fenced_through_ms(&self) -> Result<u64> {
+        Ok(self
+            .stored::<TimestampMs>("fenced_through")?
+            .map_or(0, |at| at.get()))
+    }
+
+    /// Records that a fence has completed for every revocation up to `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn note_fenced_through(&self, now_ms: u64) -> Result<()> {
+        let held = self.fenced_through_ms()?;
+        if now_ms > held {
+            self.store("fenced_through", &TimestampMs::new(now_ms))?;
+        }
+        Ok(())
+    }
+
+    /// Returns true when a revocation was recorded that no fence has covered.
+    ///
+    /// A revocation that wrote its rows and then failed before the revision advanced leaves
+    /// exactly this: revoked grants and no fence. A retry that saw an empty set of *newly* revoked
+    /// rows would otherwise read the work as done and never fence at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn fence_owed(&self) -> Result<bool> {
+        let through = i64::try_from(self.fenced_through_ms()?).unwrap_or(i64::MAX);
+        let owed: i64 = self.with(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM grants WHERE revoked_at_ms > ?1",
+                params![through],
+                |row| row.get(0),
+            )
+        })?;
+        Ok(owed > 0)
+    }
+
     // --- Retained results -------------------------------------------------------------------
 
-    /// Returns the result this host already recorded for one actor's action, if it has one.
+    /// Claims one actor's action before its effect, or reports what already happened under it.
     ///
     /// Section 9's de-duplication key is the actor and the action together, and the payload digest
-    /// decides whether it is the same action or a reused identifier. An authority change is exactly
-    /// the kind of effect a retry must not repeat: two `grant.revoke` calls under one action
-    /// identifier must not advance the revision twice.
+    /// decides whether it is the same action or a reused identifier. The claim is written **first**,
+    /// in one statement whose `WHERE` clause carries the whole precondition, because a host that
+    /// recorded only afterwards would let two concurrent requests under one identifier both reach
+    /// their effects before either noticed the other.
+    ///
+    /// The claim carries the moment it was made. A retry rebuilds its proposal from that moment
+    /// rather than from the clock, so the grant it asks for a second time is the grant it asked for
+    /// the first time rather than one with a later deadline.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::IdConflict`] when the identifier was reused with a different
-    /// payload, and a storage error when the row cannot be read.
-    pub fn retained_result(
+    /// payload, and a storage error when the row cannot be read or written.
+    pub fn claim_action(
         &self,
         actor_id: &ActorId,
         action_id: ActionId,
         payload_digest: &Digest256,
-    ) -> Result<Option<Vec<u8>>> {
-        let held: Option<(Vec<u8>, Vec<u8>)> = self.with(|connection| {
-            connection
+        now_ms: u64,
+    ) -> Result<ActionClaim> {
+        self.in_transaction(|connection| {
+            let held: Option<(Vec<u8>, i64, Option<Vec<u8>>)> = connection
                 .query_row(
-                    "SELECT payload_digest, result FROM authority_receipts
+                    "SELECT payload_digest, claimed_at_ms, result FROM authority_receipts
                       WHERE actor_id = ?1 AND action_id = ?2",
                     params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
-        })?;
-        let Some((digest, result)) = held else {
-            return Ok(None);
-        };
-        if digest.as_slice() != payload_digest.as_bytes() {
-            return Err(ControllerError::IdConflict {
-                token: action_id.to_string(),
-            });
-        }
-        Ok(Some(result))
+                .map_err(ControllerError::registry)?;
+            if let Some((digest, claimed_at_ms, result)) = held {
+                if digest.as_slice() != payload_digest.as_bytes() {
+                    return Err(ControllerError::IdConflict {
+                        token: action_id.to_string(),
+                    });
+                }
+                return Ok(match result {
+                    Some(result) => ActionClaim::Answered { result },
+                    None => ActionClaim::Claimed {
+                        claimed_at_ms: u64::try_from(claimed_at_ms).unwrap_or_default(),
+                    },
+                });
+            }
+            connection
+                .execute(
+                    "INSERT INTO authority_receipts
+                         (actor_id, action_id, payload_digest, claimed_at_ms, result,
+                          recorded_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                    params![
+                        actor_id.as_str(),
+                        action_id.get().as_bytes().as_slice(),
+                        payload_digest.as_bytes().as_slice(),
+                        i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            Ok(ActionClaim::Claimed {
+                claimed_at_ms: now_ms,
+            })
+        })
     }
 
-    /// Records the result of one actor's action, so a retry is answered rather than repeated.
+    /// Records the result of a claimed action, once.
+    ///
+    /// A completed receipt is immutable: the `WHERE` clause writes only into a row that has no
+    /// result yet, so a second answer to one action cannot replace the first one a caller was
+    /// given.
     ///
     /// # Errors
     ///
@@ -516,20 +685,17 @@ impl GrantDirectory {
         &self,
         actor_id: &ActorId,
         action_id: ActionId,
-        payload_digest: &Digest256,
         result: &[u8],
         now_ms: u64,
     ) -> Result<()> {
         self.with(|connection| {
             connection
                 .execute(
-                    "INSERT OR REPLACE INTO authority_receipts
-                         (actor_id, action_id, payload_digest, result, recorded_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4
+                      WHERE actor_id = ?1 AND action_id = ?2 AND result IS NULL",
                     params![
                         actor_id.as_str(),
                         action_id.get().as_bytes().as_slice(),
-                        payload_digest.as_bytes().as_slice(),
                         result,
                         i64::try_from(now_ms).unwrap_or(i64::MAX),
                     ],
@@ -616,7 +782,9 @@ type Row = Result<GrantRecord>;
 fn read_one(connection: &Connection, grant_id: GrantId) -> Result<Option<GrantRecord>> {
     let row: Option<Row> = connection
         .query_row(
-            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent
+            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
+             activated_at_ms,
+                            activated_at_ms
              FROM grants WHERE grant_id = ?1",
             params![grant_id.get().as_bytes().as_slice()],
             |row| Ok(read_row(row)),
@@ -630,7 +798,9 @@ fn read_one(connection: &Connection, grant_id: GrantId) -> Result<Option<GrantRe
 fn read_all(connection: &Connection) -> Result<Vec<GrantRecord>> {
     let mut statement = connection
         .prepare(
-            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent
+            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
+             activated_at_ms,
+                            activated_at_ms
              FROM grants ORDER BY grant_id",
         )
         .map_err(ControllerError::registry)?;
@@ -646,7 +816,9 @@ fn read_all(connection: &Connection) -> Result<Vec<GrantRecord>> {
 fn read_for_device(connection: &Connection, device_id: DeviceId) -> Result<Vec<GrantRecord>> {
     let mut statement = connection
         .prepare(
-            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent
+            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
+             activated_at_ms,
+                            activated_at_ms
              FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
         )
         .map_err(ControllerError::registry)?;
@@ -701,10 +873,12 @@ fn read_row(row: &rusqlite::Row<'_>) -> Row {
     let issued: i64 = row.get(2).map_err(ControllerError::registry)?;
     let revoked: Option<i64> = row.get(3).map_err(ControllerError::registry)?;
     let by_parent: Option<Vec<u8>> = row.get(4).map_err(ControllerError::registry)?;
+    let activated: Option<i64> = row.get(5).map_err(ControllerError::registry)?;
     Ok(GrantRecord {
         grant,
         session_id: session.as_deref().and_then(uuid_of).map(SessionId::new),
         issued_at_ms: u64::try_from(issued).unwrap_or_default(),
+        activated_at_ms: activated.map(|moment| u64::try_from(moment).unwrap_or_default()),
         revoked_at_ms: revoked.map(|moment| u64::try_from(moment).unwrap_or_default()),
         revoked_by_parent: by_parent.as_deref().and_then(uuid_of).map(GrantId::new),
     })
