@@ -105,13 +105,15 @@ fn this_runs_name() -> String {
 ///
 /// The removal follows the read rather than merely coming after it. A shell that could not run the
 /// read at all, or whose read was ended by a signal, has learned nothing about this process, and a
-/// watcher that has learned nothing leaves the directory for a later run to answer for.
+/// watcher that has learned nothing leaves the directory for a later run to answer for. The path it
+/// is given has to be there and has to say something: a removal whose argument came out empty would
+/// be a removal of the working directory, and the shell refuses it rather than running it.
 fn take_it_away_when_this_run_ends(root: &Path) {
     static HELD: Mutex<Vec<std::process::ChildStdin>> = Mutex::new(Vec::new());
 
     let Ok(mut watching) = std::process::Command::new("sh")
         .arg("-c")
-        .arg(r#"cat >/dev/null && rm -rf -- "$1""#)
+        .arg(r#"cat >/dev/null && rm -rf -- "${1:?}""#)
         .arg("sh")
         .arg(root)
         .stdin(std::process::Stdio::piped())
