@@ -254,6 +254,10 @@ pub struct Session {
     pub hello: BridgeHello,
     pub accepted: BridgeAccepted,
     pub prompt: String,
+    /// The primary reader an entry last named, for a fence asked while it is mid-operation.
+    pub last_entry: Option<RootEditorEnterParams>,
+    /// How far into the terminal's output a drawn prompt has already been typed at.
+    mark: usize,
     stream: UnixStream,
     /// True once the worker's end has gone, after which nothing is written or read.
     closed: bool,
@@ -409,6 +413,8 @@ impl Session {
             hello: placeholder_hello(session_id),
             accepted: placeholder_accept(session_id),
             prompt,
+            mark: 0,
+            last_entry: None,
             stream,
             closed: false,
             pending: Vec::new(),
@@ -520,6 +526,9 @@ impl Session {
                 Err(error) => panic!("writing to the bridge: {error}"),
             }
         }
+        // An editor that reaches its own queue only when the reader steps is given that step here,
+        // which is the one a person at the keyboard gives it by typing at all.
+        self.nudge();
     }
 
     fn read_frame(&mut self, within: Duration) -> Option<BridgeFrame> {
@@ -681,22 +690,20 @@ impl Session {
     pub fn ask(&mut self, request: WorkerRequest) -> RequestId {
         let id = RequestId::new(self.next_request);
         self.next_request += 1;
-        self.nudge();
         self.write_frame(&BridgeFrame::Request { id, request });
-        self.nudge();
         id
     }
 
     /// Gives a reader that reaches its own queue only when it steps one step to take.
     ///
-    /// The key is one the editor has nothing bound to and the line discipline makes nothing of, so
-    /// the step is the whole of its effect: the buffer, the revisions and the queues are where
-    /// they were. A person at the keyboard gives the reader the same step by typing at all.
+    /// The key is one the editor has a binding for, because that is where this package's own
+    /// wrapper sits, and one whose binding moves the cursor and touches nothing else. A person at
+    /// the keyboard gives the reader the same step by typing at all.
     pub fn nudge(&mut self) {
         if !dialect(self.package_kind).answers_at_the_next_step {
             return;
         }
-        self.type_bytes(&[0x1e]);
+        self.type_bytes(&[0x06]);
         // The step is over before anything is asked of the reader: a key it has not taken yet is
         // input of the person's, and the contract puts that ahead of anything the worker asks for.
         std::thread::sleep(Duration::from_millis(60));
@@ -747,11 +754,37 @@ impl Session {
         writer.flush().expect("the terminal flushes");
     }
 
-    /// Types a line and its return.
+    /// Types a line and its return, at a prompt where this editor needs one.
     pub fn type_line(&mut self, line: &str) {
+        if dialect(self.package_kind).types_at_the_prompt {
+            self.wait_for_prompt();
+        }
         let mut bytes = line.as_bytes().to_vec();
         bytes.push(b'\r');
         self.type_bytes(&bytes);
+        self.mark = self.output.lock().expect("the output lock").len();
+    }
+
+    /// Waits until the shell has drawn a prompt that nothing has been typed at yet.
+    ///
+    /// This is where a person types: a line given to a shell that is still running the last one
+    /// reaches the reader through the terminal's own line discipline rather than as the keys it
+    /// was typed as. A prompt that never comes is left to the assertion that follows.
+    fn wait_for_prompt(&mut self) -> bool {
+        let deadline = Instant::now() + REPLY;
+        loop {
+            {
+                let output = self.output.lock().expect("the output lock");
+                let mark = self.mark.min(output.len());
+                if find(&output[mark..], self.prompt.as_bytes()) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(Duration::from_millis(25));
+        }
     }
 
     /// Everything the terminal has shown so far.

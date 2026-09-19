@@ -38,7 +38,9 @@ impl Session {
         let (_, event) = self.expect_event("the first editor entry", |event| {
             matches!(event, BridgeEvent::EditorEnter(_))
         });
-        as_enter(&event).clone()
+        let entry = as_enter(&event).clone();
+        self.last_entry = Some(entry.clone());
+        entry
     }
 
     /// Waits for the next primary reader.
@@ -50,7 +52,9 @@ impl Session {
                     if params.reader_context == kr_protocol::root::ReaderContext::Primary
             )
         });
-        as_enter(&event).clone()
+        let entry = as_enter(&event).clone();
+        self.last_entry = Some(entry.clone());
+        entry
     }
 
     /// Runs one fence exchange against the reader and returns what it acknowledged.
@@ -577,8 +581,10 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     // keymap, which is the person's own setting, so it is put back afterwards.
     if let Some((vi_mode, emacs_mode)) = vi_keymap_commands(kind) {
         session.clear_line();
+        session.forget_events();
         session.type_line(vi_mode);
         assert!(session.wait_for_output("kr-vi-on", REPLY));
+        let vi_prompt = session.next_prompt();
         std::thread::sleep(Duration::from_millis(300));
         session.forget_events();
         session.type_bytes(ESCAPE);
@@ -597,6 +603,33 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         driven.push(DetachExclusion::ViMotion);
         session.type_bytes(CTRL_C);
         std::thread::sleep(Duration::from_millis(150));
+
+        // A count being accumulated for the command that follows it is the same kind of state.
+        // The editor's own answer to the gesture in this keymap is to end the shell, which is
+        // exactly what the contract says it may do outside the detach condition, so what is
+        // asserted here is the state the reader reports rather than what the key would do: the
+        // condition is evaluated against that state, and the corpus says what it decides.
+        if speech.vi_counts {
+            session.type_bytes(ESCAPE);
+            std::thread::sleep(Duration::from_millis(120));
+            session.type_bytes(b"2");
+            std::thread::sleep(Duration::from_millis(200));
+            let held = session.fence_exchange(&vi_prompt, fence_id(22));
+            assert!(
+                held.editor.pending.numeric_argument,
+                "a reader accumulating a count reported nothing pending: {:?}",
+                held.editor.pending
+            );
+            assert!(
+                !held.queues.partial_key_drained,
+                "a reader accumulating a count reported its partial-key queue clear"
+            );
+            driven.push(DetachExclusion::NumericArgument);
+            session.type_bytes(ESCAPE);
+            std::thread::sleep(Duration::from_millis(120));
+            session.type_bytes(b"i");
+            std::thread::sleep(Duration::from_millis(150));
+        }
         session.type_line(emacs_mode);
         assert!(session.wait_for_output("kr-vi-off", REPLY));
     }
@@ -675,9 +708,12 @@ fn vi_keymap_commands(kind: ShellKind) -> Option<(&'static str, &'static str)> {
     match kind {
         ShellKind::Zsh => Some(("bindkey -v; echo kr-vi-on", "bindkey -e; echo kr-vi-off")),
         ShellKind::Bash => Some(("set -o vi; echo kr-vi-on", "set -o emacs; echo kr-vi-off")),
-        // This editor resolves a vi operator as a key sequence rather than as a wait for a motion,
-        // so the state a jump waits in is what the drives above put it into.
-        _ => None,
+        ShellKind::Fish => Some((
+            "fish_vi_key_bindings; echo kr-vi-on",
+            "fish_default_key_bindings; echo kr-vi-off",
+        )),
+        // This editor's vi mode is the host's own and its operators take their keys themselves.
+        ShellKind::PowerShell => None,
     }
 }
 
@@ -1400,6 +1436,14 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
         "the cancellation reported that it ended nothing: {:?}",
         report.cancelled
     );
+    if let Some(discarded) = wait.discarded_bytes {
+        assert_eq!(
+            report.discarded_bytes.get(),
+            u64::from(discarded),
+            "the cancellation did not count the bytes it dropped for {:?}",
+            wait.enter
+        );
+    }
 
     // And the reader recovers at the same prompt: it reports itself idle again, which is the
     // retry point a withheld fence needs, and its queues are clear.

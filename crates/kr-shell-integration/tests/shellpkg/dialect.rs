@@ -30,6 +30,8 @@ pub struct PendingWait {
     pub flag: PendingFlag,
     /// Whether the partial-key queue is the one that holds the input.
     pub partial_key_queue: bool,
+    /// The bytes a cancellation reports dropping here, where this session owns what is counted.
+    pub discarded_bytes: Option<u32>,
 }
 
 /// One state the detach condition excludes, and how this shell is put into it.
@@ -78,6 +80,8 @@ pub struct Dialect {
     /// after the cancellations, and what the shell prints. The answer is in neither half of the
     /// typing, so seeing it proves the line ran rather than that the keystrokes were echoed.
     pub arithmetic: (&'static str, &'static str, &'static str),
+    /// Whether this editor's vi bindings accumulate a count of their own.
+    pub vi_counts: bool,
     /// How many of the corpus's exclusions this reader can actually be put into.
     pub driven_exclusions: usize,
     /// Whether this editor reaches its own reader-thread queue only when the reader steps.
@@ -88,6 +92,13 @@ pub struct Dialect {
     /// answered at its next step and a line installed there is accepted at the same one. The
     /// session gives the reader that step, which a person at the keyboard gives it by typing.
     pub answers_at_the_next_step: bool,
+    /// Whether a line this editor is not yet reading is lost to it.
+    ///
+    /// An editor that takes the terminal out of its own line mode reads a typed return as the key
+    /// it binds. A line typed before it takes the terminal goes through the terminal's own line
+    /// discipline instead, which delivers a line feed, and this editor binds nothing to that. A
+    /// person types at a drawn prompt, and against such an editor this session does the same.
+    pub types_at_the_prompt: bool,
 }
 
 /// The child probe: the same package started as a child of the managed root shell.
@@ -129,8 +140,10 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             veof_disable: Some("stty eof undef; echo kr-veof-undef"),
             launch_expectation: "kr launch ok|$(echo substituted)|",
             arithmetic: ("echo kr-$((6*7))", "-ok", "kr-42-ok"),
+            vi_counts: false,
             driven_exclusions: 9,
             answers_at_the_next_step: false,
+            types_at_the_prompt: false,
         },
         ShellKind::Bash => Dialect {
             bootstrap_probe: "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
@@ -148,8 +161,10 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             veof_disable: Some("stty eof undef; echo kr-veof-undef"),
             launch_expectation: "kr launch ok|$(echo substituted)|",
             arithmetic: ("echo kr-$((6*7))", "-ok", "kr-42-ok"),
+            vi_counts: false,
             driven_exclusions: 9,
             answers_at_the_next_step: false,
+            types_at_the_prompt: false,
         },
         ShellKind::Fish => Dialect {
             bootstrap_probe: "echo \"kr-endpoint=[$(set -q KR_SHELL_BRIDGE; and echo $KR_SHELL_BRIDGE; or echo unset)] kr-secret=[$(set -q KR_SHELL_BRIDGE_SECRET; and echo $KR_SHELL_BRIDGE_SECRET; or echo unset)]\"",
@@ -165,8 +180,10 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             veof_disable: Some("stty eof undef; echo kr-veof-undef"),
             launch_expectation: "kr launch ok|(echo substituted)|",
             arithmetic: ("echo kr-(math 6 x 7)", "-ok", "kr-42-ok"),
-            driven_exclusions: 5,
+            vi_counts: true,
+            driven_exclusions: 7,
             answers_at_the_next_step: false,
+            types_at_the_prompt: false,
         },
         ShellKind::PowerShell => Dialect {
             // Short on purpose: every character of a command is drawn again by this editor as it
@@ -183,8 +200,10 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             veof_disable: None,
             launch_expectation: "kr launch ok|$(echo substituted)|",
             arithmetic: ("Write-Output \"kr-$(6*7)", "-ok\"", "kr-42-ok"),
+            vi_counts: false,
             driven_exclusions: 1,
             answers_at_the_next_step: true,
+            types_at_the_prompt: true,
         },
     }
 }
@@ -278,6 +297,8 @@ pub fn pending_wait(kind: ShellKind) -> Option<PendingWait> {
             enter: ESCAPE,
             flag: PendingFlag::MultikeySequence,
             partial_key_queue: true,
+            // What these two readers count is their own package's, and asserted with it.
+            discarded_bytes: None,
         }),
         // This reader resolves a lone escape on its own timer, so the sequence it waits inside
         // indefinitely is one the person bound.
@@ -286,6 +307,8 @@ pub fn pending_wait(kind: ShellKind) -> Option<PendingWait> {
             enter: b"j",
             flag: PendingFlag::MultikeySequence,
             partial_key_queue: true,
+            // The one key the sequence is waiting behind, which arrived as one byte.
+            discarded_bytes: Some(1),
         }),
         // This editor runs its own nested read for the operations that wait for another key, and
         // nothing of this package's runs on the reader's thread while one of them is running: the
@@ -305,6 +328,7 @@ pub fn quoted_wait(kind: ShellKind) -> Option<PendingWait> {
             enter: CTRL_V,
             flag: PendingFlag::QuotedInsertion,
             partial_key_queue: false,
+            discarded_bytes: None,
         }),
         // This editor has no quoted insertion of its own. `get-key` waits for a literal key in
         // the same way and the bridge reports that state, but nothing in this session puts the
@@ -337,7 +361,6 @@ pub fn not_constructible_here(kind: ShellKind, exclusion: DetachExclusion) -> Op
             _ => None,
         },
         DetachExclusion::NumericArgument => match kind {
-            ShellKind::Fish => Some("this editor accumulates no numeric argument"),
             // Its numeric argument is a state between keys rather than a wait, and the key that
             // follows it is the one the argument applies to.
             ShellKind::PowerShell => Some("a numeric argument is not a wait"),
@@ -373,10 +396,6 @@ pub fn not_constructible_here(kind: ShellKind, exclusion: DetachExclusion) -> Op
             // Its character search takes the keys it needs before any handler of this package's
             // sees them, so the state it waits in is not one this session can offer a gesture to.
             ShellKind::PowerShell => Some("the character search reads its own keys"),
-            // This editor resolves a vi operator as a key sequence rather than as a wait for a
-            // motion, and the jump that does wait for its target is reached through the vi keymap
-            // rather than through a binding this session can put on a key of its own.
-            ShellKind::Fish => Some("a vi operator here is a key sequence"),
             _ => None,
         },
         _ => None,
