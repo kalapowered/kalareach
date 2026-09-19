@@ -44,6 +44,13 @@
       "file": "patches/0002-zle-reader-state.patch",
       "revision": "1",
       "purpose": "The reader states the detach condition and the cancellation report are evaluated against: a quoted insertion waiting for its character, a numeric argument being accumulated, and an open bracketed paste."
+    },
+    {
+      "name": "terminfo-variable-checks",
+      "file": "patches/0003-terminfo-variable-checks.patch",
+      "revision": "1",
+      "upstream_revision": "4c89849c98172c951a9def3690e8647dae76308f",
+      "purpose": "The published upstream fix for the terminfo capability-name probes, zsh commit 4c89849c98172c951a9def3690e8647dae76308f (workers/52383), which is after the 5.9 release this package pins. Without it a compiler that rejects a discarded qualifier fails the probe, the shell defines its own copy of an array the terminal header already declares, and the termcap module does not compile."
     }
   ],
   "sources": [

@@ -1,0 +1,110 @@
+Subject: [PATCH 3/3] configure: avoid incompatible pointer types in the terminfo variable checks
+
+The published upstream fix, zsh commit 4c89849c98172c951a9def3690e8647dae76308f (workers/52383,
+"Avoid incompatible pointer types in terminfo global variable checks", Florian Weimer,
+2023-12-08), which is after the 5.9 release this package pins.
+
+Each of the six terminfo capability-name arrays is `const char * const []` in ncurses, and the
+configure probe assigned one to a `char **`. A compiler that rejects a discarded qualifier rather
+than warning about it fails the probe, so the shell is built as though the array were absent and
+defines its own — which then conflicts with the declaration in the terminal header, and the
+module does not compile at all. The upstream fix casts in the probe, so the probe measures whether
+the symbol is there rather than how its type is spelled.
+
+The release tarball ships a generated `configure` beside `configure.ac`, and the build runs that
+script rather than regenerating it, so the same six lines are corrected in both.
+
+This patch is a derivative work of Zsh and carries the Zsh licence; see shells/zsh/LICENSE.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -1761,27 +1761,27 @@
+   fi
+ 
+   AC_MSG_CHECKING(if boolcodes is available)
+-  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = boolcodes; puts(*test);]])],[AC_DEFINE(HAVE_BOOLCODES) boolcodes=yes],[boolcodes=no])
++  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = (char **)boolcodes; puts(*test);]])],[AC_DEFINE(HAVE_BOOLCODES) boolcodes=yes],[boolcodes=no])
+   AC_MSG_RESULT($boolcodes)
+ 
+   AC_MSG_CHECKING(if numcodes is available)
+-  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = numcodes; puts(*test);]])],[AC_DEFINE(HAVE_NUMCODES) numcodes=yes],[numcodes=no])
++  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = (char **)numcodes; puts(*test);]])],[AC_DEFINE(HAVE_NUMCODES) numcodes=yes],[numcodes=no])
+   AC_MSG_RESULT($numcodes)
+ 
+   AC_MSG_CHECKING(if strcodes is available)
+-  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = strcodes; puts(*test);]])],[AC_DEFINE(HAVE_STRCODES) strcodes=yes],[strcodes=no])
++  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = (char **)strcodes; puts(*test);]])],[AC_DEFINE(HAVE_STRCODES) strcodes=yes],[strcodes=no])
+   AC_MSG_RESULT($strcodes)
+ 
+   AC_MSG_CHECKING(if boolnames is available)
+-  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = boolnames; puts(*test);]])],[AC_DEFINE(HAVE_BOOLNAMES) boolnames=yes],[boolnames=no])
++  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = (char **)boolnames; puts(*test);]])],[AC_DEFINE(HAVE_BOOLNAMES) boolnames=yes],[boolnames=no])
+   AC_MSG_RESULT($boolnames)
+ 
+   AC_MSG_CHECKING(if numnames is available)
+-  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = numnames; puts(*test);]])],[AC_DEFINE(HAVE_NUMNAMES) numnames=yes],[numnames=no])
++  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = (char **)numnames; puts(*test);]])],[AC_DEFINE(HAVE_NUMNAMES) numnames=yes],[numnames=no])
+   AC_MSG_RESULT($numnames)
+ 
+   AC_MSG_CHECKING(if strnames is available)
+-  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = strnames; puts(*test);]])],[AC_DEFINE(HAVE_STRNAMES) strnames=yes],[strnames=no])
++  AC_LINK_IFELSE([AC_LANG_PROGRAM([[$term_includes]], [[char **test = (char **)strnames; puts(*test);]])],[AC_DEFINE(HAVE_STRNAMES) strnames=yes],[strnames=no])
+   AC_MSG_RESULT($strnames)
+ 
+   dnl There are apparently defective terminal library headers on some
+--- a/configure
++++ b/configure
+@@ -11055,7 +11055,7 @@
+ int
+ main (void)
+ {
+-char **test = boolcodes; puts(*test);
++char **test = (char **)boolcodes; puts(*test);
+   ;
+   return 0;
+ }
+@@ -11080,7 +11080,7 @@
+ int
+ main (void)
+ {
+-char **test = numcodes; puts(*test);
++char **test = (char **)numcodes; puts(*test);
+   ;
+   return 0;
+ }
+@@ -11105,7 +11105,7 @@
+ int
+ main (void)
+ {
+-char **test = strcodes; puts(*test);
++char **test = (char **)strcodes; puts(*test);
+   ;
+   return 0;
+ }
+@@ -11130,7 +11130,7 @@
+ int
+ main (void)
+ {
+-char **test = boolnames; puts(*test);
++char **test = (char **)boolnames; puts(*test);
+   ;
+   return 0;
+ }
+@@ -11155,7 +11155,7 @@
+ int
+ main (void)
+ {
+-char **test = numnames; puts(*test);
++char **test = (char **)numnames; puts(*test);
+   ;
+   return 0;
+ }
+@@ -11180,7 +11180,7 @@
+ int
+ main (void)
+ {
+-char **test = strnames; puts(*test);
++char **test = (char **)strnames; puts(*test);
+   ;
+   return 0;
+ }
