@@ -161,8 +161,10 @@ pub trait SecretStore: Send + Sync {
 
 /// The operating system's own credential store, through the `keyring` crate.
 ///
-/// macOS and iOS use Keychain Services, Windows uses the Credential Manager and other Unix systems
-/// use the Secret Service.
+/// macOS uses Keychain Services, Windows uses the Credential Manager and other Unix systems use
+/// the Secret Service. This `keyring` version reports iOS and Android as unsupported, which is the
+/// same answer section 10 gives: those keys belong to the platform layer of the companion
+/// application, and this crate does not hold them.
 #[derive(Debug, Clone)]
 pub struct PlatformStore {
     service: String,
@@ -392,9 +394,18 @@ impl SecretStore for FileStore {
         }
     }
 
+    #[cfg(unix)]
     fn describe(&self) -> String {
         format!(
             "the 0700 fallback directory at {} (protected only by OS account isolation and disk encryption)",
+            self.directory.display()
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn describe(&self) -> String {
+        format!(
+            "the directory at {} (protected only by the access-control list it inherits)",
             self.directory.display()
         )
     }
@@ -635,8 +646,8 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<()> {
 /// Windows has no mode bits, so there is nothing to set.
 ///
 /// A directory reached through [`open_store_in`] there carries the access-control list it inherits
-/// from the one the caller named it under. Section 10 offers no directory fallback on Windows for
-/// that reason, and [`FileStore::open`] keeps refusing.
+/// from its parent. Section 10 offers no directory fallback on Windows for that reason, and
+/// [`FileStore::open`] keeps refusing.
 #[cfg(not(unix))]
 pub(crate) fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
@@ -817,19 +828,21 @@ impl StoreSelection {
     }
 }
 
-/// Opens the 0700 directory store at `directory`, on any platform, because the caller said so.
+/// Opens a directory store at the directory the caller names, on any platform.
 ///
-/// [`open_store`] answers "which store belongs to this host": it offers the directory only where
-/// section 10 allows it, and on macOS, iOS, Android and Windows it never returns anything but the
-/// platform's own credential store. This answers a different question, "use this directory", and
-/// the caller has to have named it. That is what a test harness, a bench and a daemon started with
-/// `--secret-store file` use, so a run writes its device keys into a directory it owns and throws
-/// away rather than into the person's own credential store.
+/// [`open_store`] decides which store belongs to a host and offers the directory only where
+/// section 10 allows it, so on macOS, iOS, Android and Windows it returns the platform's own
+/// credential store or it fails. This takes the directory as an argument instead, and it is the
+/// only way to reach a [`FileStore`] on those platforms. A test harness, a bench and a daemon
+/// started with `--secret-store file` use it, so a run keeps its device keys in a directory it
+/// owns and throws away rather than in the person's own credential store.
 ///
-/// The directory itself must not be a link, is created with mode 0700 where the platform has mode
-/// bits, has to be owner-only, and every path below it is checked against a link on every use. Its
-/// ancestors are checked for nothing and the caller vouches for them, which is what lets a run keep
-/// its secrets under the system temporary directory.
+/// The directory must not be a link, and every path below it is checked against a link on every
+/// use. On Unix it is created with mode 0700 and refused unless it belongs to this account.
+/// Windows has no mode bits and this crate sets no access-control list, so a directory there
+/// carries the one it inherits and the caller is the one protecting it; that is part of why
+/// section 10 offers no fallback on Windows. The directory's ancestors are checked for nothing on
+/// any platform, which is what lets a run keep its secrets under the system temporary directory.
 ///
 /// It records nothing in the directory. The `.store-kind` marker is [`open_store`]'s record of a
 /// choice it made for a host; this choice is not made once and remembered, it is passed in at
@@ -838,8 +851,8 @@ impl StoreSelection {
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::SecretStore`] when the directory is a link, belongs to another account
-/// or cannot be created owner-only.
+/// Returns [`CryptoError::SecretStore`] when the directory is a link, cannot be created, or on
+/// Unix belongs to another account or cannot be made owner-only.
 pub fn open_store_in(directory: &Path) -> Result<OpenedStore> {
     Ok(OpenedStore {
         store: Box::new(FileStore::at(directory)?),
@@ -1253,7 +1266,6 @@ mod tests {
     }
 
     /// A directory only this test uses, under the system temporary directory.
-    #[cfg(unix)]
     fn scratch_directory(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "kr-crypto-{name}-{}-{:?}",
@@ -1288,10 +1300,10 @@ mod tests {
 
     /// The seam a test, a bench or a demonstration run keeps its secrets in.
     ///
-    /// It has to work on macOS as well, because that is the platform whose credential store the
-    /// runs were filling. It also has to leave no `.store-kind` record: a later `open_store` on
-    /// the same directory answers about this host, not about a run that named a directory once.
-    #[cfg(unix)]
+    /// It has to work on every platform the host runs on, including the two whose credential store
+    /// section 10 makes the only one a host may use. It also has to leave no `.store-kind` record:
+    /// a later `open_store` on the same directory answers about this host, not about a run that
+    /// named a directory once.
     #[test]
     fn a_named_directory_is_a_store_on_every_platform() {
         let base = scratch_directory("named");

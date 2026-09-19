@@ -186,12 +186,14 @@ anything is decrypted.
 
 `SecretStore` has three implementations:
 
-- `PlatformStore` uses the `keyring` crate, which selects Keychain Services on macOS and iOS, the
-  Credential Manager on Windows and the Secret Service on other Unix systems.
-- `FileStore` is the documented fallback, and **only** on a Unix system that is not macOS, iOS or
-  Android: those platforms always have a protected store, so a missing one is an error rather than a
-  downgrade to files. iOS and Android keys belong to the companion application's platform layer,
-  which owns Keychain and Keystore access.
+- `PlatformStore` uses the `keyring` crate, which selects Keychain Services on macOS, the
+  Credential Manager on Windows and the Secret Service on other Unix systems. It reports iOS and
+  Android as unsupported.
+- `FileStore` is the documented fallback, and as a fallback **only** on a Unix system that is not
+  macOS, iOS or Android: those platforms always have a protected store, so a missing one is an
+  error rather than a downgrade to files. iOS and Android keys belong to the companion
+  application's platform layer, which owns Keychain and Keystore access. `open_store_in` reaches a
+  `FileStore` on any platform, and the next section is what that is for.
 
   The directory is mode 0700, owned by this account, and neither it nor any component of its path
   is a symbolic link. Every secret is created
@@ -205,24 +207,26 @@ anything is decrypted.
 
 ### Where a test keeps its secrets
 
-`open_store` answers which store belongs to a host. On macOS, iOS, Android and Windows the only
-answer it can give is the platform's credential store: where there is none it fails, and on iOS and
-Android this `keyring` version reports the platform as unsupported, which is why those keys belong
-to the companion application's platform layer. `open_store_in(directory)` answers a different
-question, "use this directory", and it is the only way to reach `FileStore` where the fallback is
-compiled out. A test, a bench or a demonstration run calls it with a directory of its own, and a
-daemon one of them starts is given `--secret-store file`, which makes the same choice on the
-command line. Items written to a person's credential store outlive the run that made them and
-nothing collects them, so a run that wrote there would leave its keys behind every time.
+`open_store` decides which store belongs to a host. On macOS, iOS, Android and Windows it returns
+the platform's credential store or it fails. `open_store_in(directory)` takes the directory as an
+argument instead, and it is the only way to reach a `FileStore` where the fallback is compiled out.
+A test, a bench or a demonstration run calls it with a directory of its own, and a daemon one of
+them starts is given `--secret-store file`, which makes the same choice on the command line. An
+item written to a person's credential store belongs to the account rather than to the run and
+outlives it, and nothing collects it, so a run that wrote there would leave its keys behind every
+time.
 
-The named directory carries the rules the fallback root carries: it is not a link, it is owner-only
-and it gets mode 0700 where the platform has mode bits, and every path below it is checked against
-a link on each read, write and deletion. Its ancestors are checked for nothing and the caller is the
-one vouching for them, which is what lets a run keep its secrets under the system temporary
-directory: on macOS that is below `/var`, a link to `/private/var`, and the strict rule refuses it.
-The name is reduced to its components first, so `store/` and `store/.` cannot slip a link past the
-check on the directory itself. Windows has no mode bits, and a directory opened this way carries the
-access-control list it inherits; that is one of the reasons section 10 offers no fallback there.
+The named directory must not be a link, and every path below it is checked against a link on each
+read, write and deletion. On Unix it is created mode 0700 and refused unless it belongs to this
+account, which are the rules the fallback root carries. Windows has no mode bits and this crate
+sets no access-control list there, so a directory carries the one it inherits and the caller is the
+one protecting it; that is part of why section 10 offers no fallback on Windows.
+
+The directory's ancestors are checked for nothing on any platform, and the caller is the one
+vouching for them. That is what lets a run keep its secrets under the system temporary directory:
+on macOS that is below `/var`, a link to `/private/var`, which the fallback's own rule refuses. The
+name is reduced to its components first, so `store/` and `store/.` cannot slip a link past the
+check on the directory itself.
 
 `open_store_in` records nothing. The `.store-kind` marker is `open_store`'s record of a choice made
 once for a host, and this choice is passed in at every start.

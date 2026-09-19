@@ -90,22 +90,28 @@ release a session identity while its worker was still running.
 
 ### Where the daemon keeps its keys
 
-The controller identity and this host's network device keys come out of one store, opened once at
-startup after the singleton lock is held. `kr-controller --secret-store` chooses it:
+`kr-controller --secret-store` chooses where the controller identity and this host's network
+device keys go. One selection covers both:
 
 | Value | Store | Who uses it |
 | --- | --- | --- |
 | `platform` (the default) | the operating system's credential store, with the owner-only directory where section 10 offers it | an installed host |
 | `file` | this environment's own `secrets` directory | a test, a bench or a demonstration run |
 
-A run's keys belong to that run. `file` names where they go and nothing else: it creates no
-directory of its own and removes nothing, so a run that wants its keys to disappear gives the
-daemon a state directory it owns and throws away. That is what the harnesses do, and it is why
-nothing a test or a measurement does reaches the person's own credential store; the in-process
-suites call `kr_crypto::store::open_store_in` for the same reason. An installed host is never
-started that way: it takes `platform`, which is `open_store` and the choice that host recorded. The
-daemon names the store it opened in its first line of output, so a run's log says where its keys
-went.
+The two key sets are opened separately, because the identity is opened at startup, behind the
+singleton lock, and the network keys only when the environment selects a network. Under `platform`
+each takes the store it always took: the identity follows the `.store-kind` record this host made,
+and the network keys take the platform's credential store where there is one and the owner-only
+directory where there is not. On a Linux host whose secret service appeared after it recorded the
+directory, that is two different stores, which is what an installed host has today.
+
+Under `file` both go in the environment's own `secrets` directory. `file` names where the keys go
+and nothing else: it allocates no directory and deletes nothing afterwards, so a run that wants its
+keys to disappear gives the daemon a state directory it owns and throws away. That is what the
+harnesses do, and it is why nothing a test or a measurement does reaches the person's own
+credential store; the in-process suites call `kr_crypto::store::open_store_in` for the same reason.
+The daemon names the store it opened in its first line of output, so a run's log says where its
+keys went.
 
 ## Supervision
 
