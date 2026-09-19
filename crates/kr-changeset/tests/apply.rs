@@ -366,7 +366,13 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
     let action = order.action_id;
     let result = apply::apply(fixture.service(), &order).expect("the apply runs");
 
-    assert_eq!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "{}: {:?}",
+        result.detail,
+        result.progress
+    );
     assert_eq!(result.changed_paths.len(), 2);
     assert!(result.unresolved_paths.is_empty());
     assert!(result.conflicts.is_empty());

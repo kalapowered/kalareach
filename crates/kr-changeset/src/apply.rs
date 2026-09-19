@@ -1842,7 +1842,19 @@ fn carry_permissions(
             // An access-control list is protection this host cannot carry across a replacement,
             // and losing it silently is exactly what preserving permissions forbids. A destination
             // that has one is left alone and reported.
-            if has_extended_access_control(&file, destination, leaf)? {
+            #[cfg(target_os = "linux")]
+            let has_list = carries_access_control(&file);
+            #[cfg(target_os = "macos")]
+            let has_list = {
+                let _ = &file;
+                carries_access_control_at(destination, leaf)
+            };
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+            let has_list = {
+                let _ = &file;
+                false
+            };
+            if has_list {
                 return Ok(None);
             }
             match file.handle().metadata() {
@@ -1863,7 +1875,13 @@ fn carry_permissions(
     // file created inside it. The copy this host just made would then reach the destination
     // carrying protection the file it replaces never had, and the mode bits alone would not say
     // so. It is taken off the copy before the mode is set, or the path is left alone.
-    if !clear_inherited_access_control(staged, destination, temporary) {
+    #[cfg(target_os = "linux")]
+    let carried_across = clear_inherited_access_control(staged);
+    #[cfg(target_os = "macos")]
+    let carried_across = clear_inherited_access_control(destination, temporary);
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+    let carried_across = clear_inherited_access_control(staged);
+    if !carried_across {
         return Ok(None);
     }
     // Through the handle this host created a moment ago, not through the name: a name reopened is
@@ -1873,54 +1891,6 @@ fn carry_permissions(
         .set_permissions(cap_std::fs::Permissions::from_mode(mode))
         .map_err(ChangeSetError::storage)?;
     Ok(Some(mode))
-}
-
-/// Takes any inherited access-control list off the copy this host staged.
-///
-/// Returns false when the copy carries one this host could not take off, because publishing it
-/// would give the destination protection the file it replaces never had.
-#[cfg(target_os = "linux")]
-fn clear_inherited_access_control(
-    staged: &kr_transfer::AuthorisedFile,
-    _destination: &AuthorisedDirectory,
-    _temporary: &RelativeName,
-) -> bool {
-    match rustix::fs::fremovexattr(staged.handle(), "system.posix_acl_access") {
-        // There was one and it is off.
-        Ok(()) => true,
-        // There was none to take off, which is the ordinary case.
-        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => true,
-        Err(_) => false,
-    }
-}
-
-/// Returns false when the copy this host staged inherited an access-control list.
-///
-/// A directory can carry an inheritable entry, and every file made inside it then carries a list
-/// the file being replaced never had. `exacl` reads by path, so this is asked of a name, and it is
-/// asked only to **refuse**: a copy that answers "there is a list" ends the operation and the
-/// destination is left exactly as it was. Nothing is written back through that name.
-#[cfg(target_os = "macos")]
-fn clear_inherited_access_control(
-    _staged: &kr_transfer::AuthorisedFile,
-    destination: &AuthorisedDirectory,
-    temporary: &RelativeName,
-) -> bool {
-    let path = destination.host_path(temporary);
-    match exacl::getfacl(&path, None) {
-        Ok(entries) => entries.is_empty(),
-        Err(_) => false,
-    }
-}
-
-/// Returns true: this platform has no list for a new file to inherit.
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn clear_inherited_access_control(
-    _staged: &kr_transfer::AuthorisedFile,
-    _destination: &AuthorisedDirectory,
-    _temporary: &RelativeName,
-) -> bool {
-    true
 }
 
 /// Returns true when the published file carries the permissions this host set on the copy it
@@ -1945,51 +1915,84 @@ fn published_with(_directory: &AuthorisedDirectory, _name: &RelativeName, _mode:
     true
 }
 
-/// Returns true when one destination file carries protection beyond its mode bits.
-#[cfg(target_os = "macos")]
-fn has_extended_access_control(
-    _file: &kr_transfer::AuthorisedFile,
-    destination: &AuthorisedDirectory,
-    leaf: &RelativeName,
-) -> Result<bool> {
-    // `exacl` reads a path rather than a descriptor, so this is the one question here that is
-    // asked of a name. It is asked only to **refuse**: a name that answers "there is a list" ends
-    // the operation, and a name that answers otherwise is still replaced through the handle. An
-    // Apple platform keeps its list beside the mode bits, so any list at all is protection a
-    // replacement would lose.
-    let path = destination.host_path(leaf);
-    match exacl::getfacl(&path, None) {
-        Ok(entries) => Ok(!entries.is_empty()),
-        // A file whose list this host could not read is one whose protection it cannot say it can
-        // carry across.
-        Err(_) => Ok(true),
+/// The extended attribute a POSIX platform keeps a file's access-control list in.
+#[cfg(target_os = "linux")]
+const ACCESS_CONTROL_ATTRIBUTE: &str = "system.posix_acl_access";
+
+/// Returns true when one open file carries a POSIX access-control list.
+///
+/// A POSIX list includes the mode bits themselves, and the kernel writes the attribute only when
+/// there is something a mode cannot say. So the attribute being there is the answer, asked of the
+/// **descriptor** this host holds rather than of a name, and a file it could not ask about is one
+/// whose protection it cannot say it can carry across.
+#[cfg(target_os = "linux")]
+fn carries_access_control(file: &kr_transfer::AuthorisedFile) -> bool {
+    match rustix::fs::fgetxattr(file.handle(), ACCESS_CONTROL_ATTRIBUTE, &mut [0_u8; 0][..]) {
+        // There is one, and this asked for its length rather than reading it.
+        Ok(_) | Err(rustix::io::Errno::RANGE) => true,
+        Err(error) if no_such_attribute(error) => false,
+        Err(_) => true,
     }
 }
 
-/// Returns true when one destination file carries a POSIX access-control list.
-///
-/// A POSIX list includes the mode bits themselves, and a file with nothing beyond them carries no
-/// list at all: the kernel keeps an extended one in `system.posix_acl_access` and writes that
-/// attribute only when there is something a mode cannot say. So the question is whether the
-/// attribute is there, asked of the **descriptor** this host already holds rather than of a name.
+/// Returns true when one extended-attribute call answered "there is no such attribute".
 #[cfg(target_os = "linux")]
-fn has_extended_access_control(
-    file: &kr_transfer::AuthorisedFile,
-    _destination: &AuthorisedDirectory,
-    _leaf: &RelativeName,
-) -> Result<bool> {
-    match rustix::fs::fgetxattr(file.handle(), "system.posix_acl_access", &mut [0_u8; 0][..]) {
-        // There is a list, and this reports its length rather than reading it.
-        Ok(_) => Ok(true),
-        // The buffer is too small for a list that is there, which is the ordinary answer for a
-        // file that has one.
-        Err(rustix::io::Errno::RANGE) => Ok(true),
-        // No such attribute: the mode bits are the whole of this file's protection.
-        Err(rustix::io::Errno::NODATA) | Err(rustix::io::Errno::NOTSUP) => Ok(false),
-        // A file whose protection this host could not ask about is one it cannot say it can carry
-        // across.
-        Err(_) => Ok(true),
+fn no_such_attribute(error: rustix::io::Errno) -> bool {
+    error == rustix::io::Errno::NODATA
+        || error == rustix::io::Errno::NOTSUP
+        || error == rustix::io::Errno::OPNOTSUPP
+}
+
+/// Returns true when one file carries an access-control list, asked of a name.
+///
+/// This platform keeps a list where nothing reads it through a descriptor: the attribute it lives
+/// in is the kernel's own and refuses every call, and the library that reads one takes a path. So
+/// this is the one question in an apply that is asked of a name, and it is bracketed: the object
+/// the name reaches is read before and after, and an answer that did not come from one object is
+/// no answer. What that leaves is stated as a limit rather than closed.
+#[cfg(target_os = "macos")]
+fn carries_access_control_at(directory: &AuthorisedDirectory, name: &RelativeName) -> bool {
+    let Ok(before) = directory.open_read(name, ObjectPolicy::ReadableFile) else {
+        return true;
+    };
+    let answer = match exacl::getfacl(directory.host_path(name), None) {
+        Ok(entries) => !entries.is_empty(),
+        Err(_) => true,
+    };
+    match directory.open_read(name, ObjectPolicy::ReadableFile) {
+        Ok(after) if after.identity() == before.identity() => answer,
+        _ => true,
     }
+}
+
+/// Takes any inherited access-control list off the copy this host staged.
+///
+/// Returns false when the copy carries one this host could not take off, because publishing it
+/// would give the destination protection the file it replaces never had. A directory can carry an
+/// inheritable entry, and every file made inside it then starts with a list of its own.
+#[cfg(target_os = "linux")]
+fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool {
+    match rustix::fs::fremovexattr(staged.handle(), ACCESS_CONTROL_ATTRIBUTE) {
+        // There was one and it is off.
+        Ok(()) => true,
+        // There was none to take off, which is the ordinary case.
+        Err(error) if no_such_attribute(error) => true,
+        Err(_) => false,
+    }
+}
+
+/// Returns false when the copy this host staged inherited an access-control list.
+///
+/// This platform keeps a file's list where nothing may write it through a descriptor, so the list
+/// cannot be taken off the copy here. What is established instead is whether there is one, and a
+/// copy that has one ends the operation: the destination is left exactly as it was rather than
+/// replaced by a file carrying protection it never had.
+#[cfg(target_os = "macos")]
+fn clear_inherited_access_control(
+    destination: &AuthorisedDirectory,
+    temporary: &RelativeName,
+) -> bool {
+    !carries_access_control_at(destination, temporary)
 }
 
 /// Returns false: this platform's extended access control is not read here.
@@ -1997,24 +2000,14 @@ fn has_extended_access_control(
 /// The mode bits are carried and anything beside them is not. A host that needs more refuses the
 /// replacement the way the platforms above do, which is work for the platform task.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn has_extended_access_control(
-    _file: &kr_transfer::AuthorisedFile,
-    _destination: &AuthorisedDirectory,
-    _leaf: &RelativeName,
-) -> Result<bool> {
-    Ok(false)
+fn carries_access_control(_file: &kr_transfer::AuthorisedFile) -> bool {
+    false
 }
 
-/// Does nothing: this platform has no mode bits to carry across.
-#[cfg(not(unix))]
-fn carry_permissions(
-    _destination: &AuthorisedDirectory,
-    _leaf: &RelativeName,
-    _temporary: &RelativeName,
-    _staged: &kr_transfer::AuthorisedFile,
-    _executable: bool,
-) -> Result<Option<u32>> {
-    Ok(Some(0))
+/// Returns true: this platform has no list for a new file to inherit.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn clear_inherited_access_control(_staged: &kr_transfer::AuthorisedFile) -> bool {
+    true
 }
 
 fn clone_handle(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {

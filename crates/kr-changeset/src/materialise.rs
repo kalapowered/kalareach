@@ -98,6 +98,24 @@ pub fn materialise(
         }
     })?;
     let directory = parent.subdirectory(&name)?;
+    // And empty when it is adopted. Between the create and the open lies one window this platform
+    // gives no way to close: there is no "open the directory I just made". What closes the harm is
+    // this: a directory substituted in that window would have to hold nothing to be adopted, so
+    // everything beneath this name afterwards is this host's own writing and whatever the run it
+    // serves puts there, and the release that empties it takes away nothing that was there first.
+    if directory
+        .handle()
+        .entries()
+        .map_err(ChangeSetError::storage)?
+        .next()
+        .is_some()
+    {
+        return Err(ChangeSetError::StorageUnavailable {
+            detail: "the directory this host had just made for a materialisation already holds \
+                     something, so it wrote nothing and made no materialisation"
+                .into(),
+        });
+    }
     let identity = directory.identity();
     let created_at_ms = kr_ipc::now_ms();
     let mut held = MaterialisationRecord {

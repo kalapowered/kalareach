@@ -50,7 +50,7 @@
 //! No filesystem this service runs on offers an unprivileged atomic snapshot of a directory tree,
 //! so there is no fourth mechanism and no capture is described as one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Read as _;
 
@@ -106,6 +106,13 @@ pub const MAX_CAPTURE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 struct Scope<'a> {
     request: &'a CaptureRequest<'a>,
     administrative_prefix: Option<&'a str>,
+    /// Every place a repository **nested in this tree** keeps its own data, as a path relative to
+    /// the working tree.
+    ///
+    /// Worked out from each nested repository's own `.git`, which is a directory beside its tree
+    /// or a file pointing anywhere it can reach. A path under one of these is that repository's
+    /// configuration, which holds its remotes and can hold a credential, or its object database.
+    nested: &'a BTreeSet<String>,
 }
 
 impl<'a> std::ops::Deref for Scope<'a> {
@@ -217,9 +224,11 @@ pub fn capture(
     // Where this repository actually keeps its administrative data, read from the repository this
     // capture opened rather than assumed to be `.git`.
     let administrative = administrative_prefix(repository);
+    let nested = BTreeSet::new();
     let request = Scope {
         request,
         administrative_prefix: administrative.as_deref(),
+        nested: &nested,
     };
     if request.required_consistency == Some(SourceConsistency::AtomicSnapshot) {
         return snapshot(profile, repository, store, request);
@@ -233,6 +242,14 @@ pub fn capture(
             request.administrative_prefix,
         )?;
         let quiet_before = quiet()?;
+        // Where every repository nested in this tree keeps its own data, worked out from the
+        // directories this reading names. It has to be done before anything is planned, because a
+        // path under one of them is never content whatever else decides about it.
+        let nested = nested_repositories(repository, &before)?;
+        let request = Scope {
+            nested: &nested,
+            ..request
+        };
         let planned = plan(&before, request);
         let read = read_content(profile, repository, store, &planned, request);
         let manifest = match read {
@@ -1079,6 +1096,157 @@ fn store_base_content(
     store.put(&bytes).map(Some)
 }
 
+/// Returns every place a repository nested in this tree keeps its own data.
+///
+/// A nested repository is found by its `.git`, which the walk meets as a directory beside its
+/// tree or as a file pointing anywhere it can reach: beside it, above it, or under another name
+/// entirely. Both the nested tree and whatever its `.git` names are answered, as paths relative to
+/// this working tree, so nothing under either is ever planned as content. What a reading does not
+/// name, this does not find: a repository in a directory no path of this capture goes near is one
+/// the capture never reaches either.
+fn nested_repositories(
+    repository: &OpenedRepository,
+    reading: &Reading,
+) -> Result<BTreeSet<String>> {
+    let mut directories: BTreeSet<&str> = BTreeSet::new();
+    let paths = reading
+        .index
+        .keys()
+        .chain(reading.differences.keys())
+        .map(String::as_str)
+        .chain(reading.status.iter().map(|entry| entry.path.as_str()));
+    for path in paths {
+        let path = path.trim_end_matches('/');
+        let mut at = path;
+        while let Some((parent, _)) = at.rsplit_once('/') {
+            if !directories.insert(parent) {
+                break;
+            }
+            at = parent;
+        }
+        // A whole directory the status reported is one to ask about itself as well.
+        if path.ends_with('/') || !reading.index.contains_key(path) {
+            directories.insert(path);
+        }
+    }
+    let tree = repository.work_tree();
+    let mut found = BTreeSet::new();
+    let mut budget = MAX_WALK_ENTRIES;
+    for directory in directories {
+        if directory.is_empty() {
+            continue;
+        }
+        budget =
+            budget.checked_sub(1).ok_or_else(|| {
+                ChangeSetError::QuotaExceeded {
+            detail: format!(
+                "this capture names more than {MAX_WALK_ENTRIES} directories to ask about, which \
+                 is more than one capture reads"
+            )
+            .into(),
+        }
+            })?;
+        let Ok(name) =
+            RelativeName::parse(&format!("{directory}/{}", grant::ADMINISTRATIVE_DIRECTORY))
+        else {
+            continue;
+        };
+        let Ok(held) = tree.probe(&name) else {
+            continue;
+        };
+        found.insert(directory.to_owned());
+        if !matches!(held, kr_transfer::authority::ObjectKind::File) {
+            continue;
+        }
+        if let Some(target) = administrative_target(tree, &name, directory) {
+            found.insert(target);
+        }
+    }
+    Ok(found)
+}
+
+/// Returns where one nested repository's `.git` **file** points, relative to this working tree.
+///
+/// The line is `gitdir: <path>`, and Git accepts every spelling of one place. Each is resolved
+/// against the directory the file is in, by arithmetic on the path rather than by asking the
+/// filesystem, and answered only when it lands inside this working tree. A target outside it is
+/// one this capture never reaches.
+fn administrative_target(
+    tree: &kr_transfer::AuthorisedDirectory,
+    name: &RelativeName,
+    directory: &str,
+) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut file = tree.open_read(name, ObjectPolicy::ReadableFile).ok()?;
+    if file.byte_len() > MAX_GIT_FILE_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    file.handle_mut()
+        .take(MAX_GIT_FILE_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let target = text.trim().strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let root = tree.display_path();
+    let absolute = std::path::Path::new(target).is_absolute();
+    let resolved = if absolute {
+        lexical(std::path::Path::new(target))
+    } else {
+        let mut parts = lexical(std::path::Path::new(root));
+        parts.extend(lexical(std::path::Path::new(directory)));
+        parts.extend(lexical(std::path::Path::new(target)));
+        lexical_parts(parts)
+    };
+    let inside = lexical(std::path::Path::new(root));
+    if resolved.len() <= inside.len() || resolved[..inside.len()] != inside[..] {
+        return None;
+    }
+    let rest: Vec<String> = resolved[inside.len()..]
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    Some(rest.join("/"))
+}
+
+/// Reduces one path to its components without touching the filesystem.
+fn lexical(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    lexical_parts(
+        path.components()
+            .map(|part| match part {
+                std::path::Component::Normal(part) => part.to_owned(),
+                std::path::Component::CurDir => std::ffi::OsString::from("."),
+                std::path::Component::ParentDir => std::ffi::OsString::from(".."),
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    std::ffi::OsString::from("/")
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Cancels `.` and `..` in a component list, and starts it again at a root.
+fn lexical_parts(parts: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    for part in parts {
+        if part == "." {
+        } else if part == ".." {
+            out.pop();
+        } else if part == "/" {
+            out.clear();
+        } else {
+            out.push(part);
+        }
+    }
+    out
+}
+
+/// The most a `.git` file is read for the one line it holds.
+const MAX_GIT_FILE_BYTES: u64 = 4096;
+
 /// Returns true when one path is this repository's own administrative data.
 ///
 /// Two rules: any `.git` component, whatever its case, and the directory this repository actually
@@ -1092,6 +1260,18 @@ fn administrative(request: Scope<'_>, path: &str) -> bool {
 
 /// Returns the refusal a grant or a secret rule makes, when it makes one.
 fn refused_here(request: Scope<'_>, path: &str) -> Option<Plan> {
+    if request
+        .nested
+        .iter()
+        .any(|prefix| grant::under(path, prefix))
+    {
+        return Some(Plan::Exclude {
+            reason: ExclusionReason::Unsupported,
+            detail: "this path is a repository nested in this tree, or its own administrative \
+                     data, rather than this repository's content"
+                .to_owned(),
+        });
+    }
     if administrative(request, path) {
         return Some(Plan::Exclude {
             reason: ExclusionReason::Unsupported,
@@ -1915,9 +2095,12 @@ mod tests {
     }
 
     fn scope<'a>(request: &'a CaptureRequest<'a>) -> Scope<'a> {
+        static NESTED: std::sync::LazyLock<BTreeSet<String>> =
+            std::sync::LazyLock::new(BTreeSet::new);
         Scope {
             request,
             administrative_prefix: None,
+            nested: &NESTED,
         }
     }
 

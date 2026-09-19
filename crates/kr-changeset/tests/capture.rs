@@ -992,6 +992,18 @@ fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
                 .collect::<Vec<_>>()
         );
         assert!(
+            manifest
+                .paths
+                .iter()
+                .all(|entry| !entry.path.contains("repo-data")),
+            "and neither is its own data, wherever this spelling put it: {:?}",
+            manifest
+                .paths
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
             record
                 .exclusions
                 .iter()
