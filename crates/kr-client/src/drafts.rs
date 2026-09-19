@@ -1095,17 +1095,29 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
 /// establish that the path survives a crash, and saying so is better than returning success that
 /// means less than it looks.
 ///
-/// The path is resolved first, so what is flushed is the names the filesystem actually holds rather
-/// than the ones the caller spelled. A symbolic link in the way leads to its target, and the
-/// target's ancestors are what a draft under it depends on.
+/// Two paths are walked: the one the filesystem resolves to, and the one the caller spelled. A
+/// symbolic link leads to its target, and the target's ancestors are what a draft under it lives
+/// in; but the link is a name too, and the directory holding it is what the *path* to that draft
+/// lives in. Losing either leaves a store nothing reaches.
 fn flush_path_names(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let resolved = std::fs::canonicalize(directory)?;
-        let mut level = resolved.as_path();
-        while let Some(parent) = level.parent() {
-            sync_directory(parent)?;
-            level = parent;
+        let supplied = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(directory)
+        };
+        let mut flushed: Vec<PathBuf> = Vec::new();
+        for path in [resolved.as_path(), supplied.as_path()] {
+            let mut level = path;
+            while let Some(parent) = level.parent() {
+                if !flushed.iter().any(|done| done == parent) {
+                    sync_directory(parent)?;
+                    flushed.push(parent.to_path_buf());
+                }
+                level = parent;
+            }
         }
     }
     #[cfg(not(unix))]
@@ -1501,6 +1513,31 @@ mod tests {
                 "through a link"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_store_says_so_when_it_cannot_make_its_own_path_durable() {
+        // A directory a caller can walk through but not open is a directory this store cannot
+        // establish a name in, and it says that rather than returning a success that means less
+        // than it looks. Reaching the refusal is also what shows the walk covers the path the
+        // caller supplied and not only the deepest level.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let outer = directory.path().join("outer");
+        let store_path = outer.join("drafts");
+        std::fs::create_dir_all(&store_path).expect("the tree");
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o111))
+            .expect("search but not read");
+
+        let outcome = DraftStore::open(&store_path, device());
+        // Restore it first, so the temporary directory can be cleaned up whatever the assertion
+        // does.
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700))
+            .expect("readable again");
+        let error = outcome.expect_err("a directory this store cannot open for reading");
+        assert!(error.to_string().contains("could not be used"), "{error}");
     }
 
     #[test]
