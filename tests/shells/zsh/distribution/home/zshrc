@@ -1,0 +1,33 @@
+# What a distribution's own first-run helper writes: history, completion and the key bindings that
+# make a terminal's Home, End and Delete keys work. Every one of these binds keys in the reader
+# this integration hooks.
+print -r -- user-top >> "$KR_TEST_ORDER"
+
+PROMPT='KR> '
+HISTFILE=
+HISTSIZE=1000
+SAVEHIST=1000
+setopt no_beep
+setopt hist_ignore_dups
+setopt extended_glob
+unsetopt zle_rprompt_indent 2>/dev/null
+
+bindkey -e
+autoload -Uz compinit
+compinit -u -d "$HOME/.zcompdump"
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
+
+bindkey '^[[H' beginning-of-line
+bindkey '^[[F' end-of-line
+bindkey '^[[3~' delete-char
+bindkey '^[[1;5C' forward-word
+bindkey '^[[1;5D' backward-word
+print -r -- stack >> "$KR_TEST_ORDER"
+
+kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=$#BUFFER }
+zle -N kr-user-widget
+bindkey '^[q' kr-user-widget
+
+print -r -- user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

@@ -1,0 +1,16 @@
+{
+  "id": "fish-plain",
+  "shell": "fish",
+  "stack": "none",
+  "title": "the packaged fish with the person's own configuration and nothing else",
+  "supported": true,
+  "requires": [],
+  "order": ["conf-d", "user-top", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87", "KR-REQ-07.85"],
+  "home": [
+    { "file": "order.fish", "path": ".config/fish/conf.d/00-kr-order.fish" },
+    { "file": "config.fish", "path": ".config/fish/config.fish" }
+  ]
+}

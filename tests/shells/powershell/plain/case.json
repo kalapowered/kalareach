@@ -1,0 +1,16 @@
+{
+  "id": "powershell-plain",
+  "shell": "powershell",
+  "stack": "none",
+  "title": "the qualified PSReadLine with the person's own profiles and nothing else",
+  "supported": true,
+  "requires": [],
+  "order": ["all-hosts", "user-top", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer", "profile_once"],
+  "covers": ["KR-REQ-07.87", "KR-REQ-07.85"],
+  "home": [
+    { "file": "profile.ps1", "path": ".config/powershell/profile.ps1" },
+    { "file": "host-profile.ps1", "path": ".config/powershell/Microsoft.PowerShell_profile.ps1" }
+  ]
+}

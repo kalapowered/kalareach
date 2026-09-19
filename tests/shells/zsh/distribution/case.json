@@ -1,0 +1,13 @@
+{
+  "id": "zsh-distribution",
+  "shell": "zsh",
+  "stack": "distribution",
+  "title": "an ordinary distribution startup customisation: completion, history and terminal key bindings",
+  "supported": true,
+  "requires": [],
+  "order": ["user-top", "stack", "user-bottom"],
+  "binding": "kr-user-widget",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [{ "file": "zshrc", "path": ".zshrc" }]
+}

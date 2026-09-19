@@ -1,0 +1,16 @@
+# The person's own configuration. The integration goes on top of it and replaces none of it.
+print -r -- user-top >> "$KR_TEST_ORDER"
+
+PROMPT='KR> '
+setopt no_beep
+unsetopt zle_rprompt_indent 2>/dev/null
+HISTFILE=
+typeset -g KR_TEST_USER_CONFIGURATION=1
+
+# A binding of the person's own, on a key nothing in the integration claims.
+kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=$#BUFFER }
+zle -N kr-user-widget
+bindkey '^[q' kr-user-widget
+
+print -r -- user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

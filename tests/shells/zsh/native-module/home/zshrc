@@ -1,0 +1,25 @@
+print -r -- user-top >> "$KR_TEST_ORDER"
+
+PROMPT='KR> '
+setopt no_beep
+unsetopt zle_rprompt_indent 2>/dev/null
+HISTFILE=
+typeset -g KR_TEST_USER_CONFIGURATION=1
+
+# A native module of the person's own, ahead of the shell's own module path. This build cannot
+# load it, and what the person gets is the loader saying so rather than a shell that carries on as
+# though the module were there.
+module_path=("$HOME/modules" $module_path)
+if zmodload kr_wrong_abi 2>"$HOME/module-error"; then
+  print -r -- kr-module-loaded >> "$KR_TEST_ORDER"
+else
+  print -r -- kr-module-refused >> "$KR_TEST_ORDER"
+fi
+print -r -- stack >> "$KR_TEST_ORDER"
+
+kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=$#BUFFER }
+zle -N kr-user-widget
+bindkey '^[q' kr-user-widget
+
+print -r -- user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

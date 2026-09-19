@@ -1,0 +1,14 @@
+printf '%s\n' user-top >> "$KR_TEST_ORDER"
+
+HISTFILE=
+KR_TEST_USER_CONFIGURATION=1
+
+export STARSHIP_CONFIG="$HOME/.config/starship.toml"
+export STARSHIP_CACHE="$HOME/.cache/starship"
+eval "$("$KR_STACK_STARSHIP/starship" init bash)"
+printf '%s\n' stack >> "$KR_TEST_ORDER"
+
+bind '"\eq": "kr-user-binding-ran"'
+
+printf '%s\n' user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

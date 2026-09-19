@@ -1,0 +1,12 @@
+{
+  "shell": "powershell",
+  "unsupported": [
+    { "stack": "zsh-autosuggestions", "reason": "the plugin is written against ZLE; this editor predicts from its own history instead" },
+    { "stack": "zsh-syntax-highlighting", "reason": "the plugin wraps ZLE widgets; this editor colours the line it is editing itself" },
+    { "stack": "powerlevel10k", "reason": "the theme is a Zsh theme built on ZLE and gitstatus, and publishes no PowerShell form" },
+    { "stack": "oh-my-zsh", "reason": "the framework is Zsh's; its plugins and themes are Zsh scripts" },
+    { "stack": "fzf", "reason": "the release publishes shell integration for Bash, Zsh and fish only; the PowerShell bindings people use are a separate project this set does not pin" },
+    { "stack": "fzf-shell", "reason": "the release publishes shell integration for Bash, Zsh and fish only; the PowerShell bindings people use are a separate project this set does not pin" },
+    { "stack": "atuin", "reason": "the release's init command offers Zsh, Bash, fish, Nu and Xonsh, and no PowerShell form" }
+  ]
+}

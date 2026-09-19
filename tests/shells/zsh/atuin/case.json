@@ -1,0 +1,16 @@
+{
+  "id": "zsh-atuin",
+  "shell": "zsh",
+  "stack": "atuin",
+  "title": "atuin, which replaces the history search and adds a pre-execution hook",
+  "supported": true,
+  "requires": ["atuin"],
+  "order": ["user-top", "stack", "user-bottom"],
+  "binding": "kr-user-widget",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "zshrc", "path": ".zshrc" },
+    { "file": "config.toml", "path": ".config/atuin/config.toml" }
+  ]
+}

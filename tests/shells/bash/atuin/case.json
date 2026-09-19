@@ -1,0 +1,16 @@
+{
+  "id": "bash-atuin",
+  "shell": "bash",
+  "stack": "atuin",
+  "title": "atuin on the packaged Bash, which binds the history search and hooks every command",
+  "supported": true,
+  "requires": ["atuin"],
+  "order": ["user-top", "stack", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "bashrc", "path": ".bashrc" },
+    { "file": "config.toml", "path": ".config/atuin/config.toml" }
+  ]
+}

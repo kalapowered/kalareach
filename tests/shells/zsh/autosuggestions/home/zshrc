@@ -1,0 +1,22 @@
+# The person's own configuration, then the plugin, then the integration's marked entry.
+print -r -- user-top >> "$KR_TEST_ORDER"
+
+PROMPT='KR> '
+setopt no_beep
+unsetopt zle_rprompt_indent 2>/dev/null
+HISTFILE=
+typeset -g KR_TEST_USER_CONFIGURATION=1
+
+# The suggestion this plugin draws is written into the reader's own line and taken out again on
+# every keystroke, which is the state section 7 says a prompt hook cannot tell from an empty one.
+ZSH_AUTOSUGGEST_STRATEGY=(history)
+ZSH_AUTOSUGGEST_MANUAL_REBIND=1
+source "$KR_STACK_ZSH_AUTOSUGGESTIONS/zsh-autosuggestions.zsh"
+print -r -- stack >> "$KR_TEST_ORDER"
+
+kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=$#BUFFER }
+zle -N kr-user-widget
+bindkey '^[q' kr-user-widget
+
+print -r -- user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

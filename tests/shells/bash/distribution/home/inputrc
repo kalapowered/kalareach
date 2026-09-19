@@ -1,0 +1,5 @@
+# The reader's own configuration file, which a distribution ships and a person edits.
+set bell-style none
+set colored-stats on
+"\e[1;5C": forward-word
+"\e[1;5D": backward-word

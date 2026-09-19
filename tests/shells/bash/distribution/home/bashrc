@@ -1,0 +1,23 @@
+# What a distribution ships in its own skeleton: history options, a prompt command and the
+# terminal key bindings a desktop expects, every one of them inside the reader this integration
+# hooks.
+printf '%s\n' user-top >> "$KR_TEST_ORDER"
+
+PS1='KR> '
+HISTFILE=
+HISTSIZE=1000
+HISTCONTROL=ignoreboth
+shopt -s checkwinsize
+shopt -s histappend
+
+bind 'set completion-ignore-case on'
+bind 'set show-all-if-ambiguous on'
+bind '"\e[H": beginning-of-line'
+bind '"\e[F": end-of-line'
+bind '"\e[3~": delete-char'
+printf '%s\n' stack >> "$KR_TEST_ORDER"
+
+bind '"\eq": "kr-user-binding-ran"'
+
+printf '%s\n' user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

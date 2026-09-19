@@ -1,0 +1,14 @@
+# The theme's own configuration, cut to what this qualification needs: one fixed prompt, the
+# instant prompt on, and no background daemon of the theme's own.
+typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
+typeset -g POWERLEVEL9K_DISABLE_GITSTATUS=true
+typeset -g POWERLEVEL9K_DISABLE_HOT_RELOAD=true
+typeset -g POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(prompt_char)
+typeset -g POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=()
+typeset -g POWERLEVEL9K_PROMPT_ADD_NEWLINE=false
+typeset -g POWERLEVEL9K_MODE=ascii
+typeset -g POWERLEVEL9K_PROMPT_CHAR_OK_{VIINS,VICMD,VIVIS,VIOWR}_CONTENT_EXPANSION='KR>'
+typeset -g POWERLEVEL9K_PROMPT_CHAR_ERROR_{VIINS,VICMD,VIVIS,VIOWR}_CONTENT_EXPANSION='KR>'
+typeset -g POWERLEVEL9K_PROMPT_CHAR_FOREGROUND=
+typeset -g POWERLEVEL9K_PROMPT_CHAR_LEFT_{LEFT,RIGHT}_WHITESPACE=
+typeset -g POWERLEVEL9K_PROMPT_CHAR_RIGHT_{LEFT,RIGHT}_WHITESPACE=' '

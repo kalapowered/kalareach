@@ -1,0 +1,13 @@
+{
+  "id": "bash-fzf",
+  "shell": "bash",
+  "stack": "fzf",
+  "title": "fzf's widgets on the packaged Bash, which rebind Readline keys through a macro",
+  "supported": true,
+  "requires": ["fzf", "fzf-shell"],
+  "order": ["user-top", "stack", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [{ "file": "bashrc", "path": ".bashrc" }]
+}

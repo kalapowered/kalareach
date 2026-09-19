@@ -1,0 +1,17 @@
+{
+  "id": "fish-fzf",
+  "shell": "fish",
+  "stack": "fzf",
+  "title": "fzf's key bindings on the packaged fish, which claim keys in every bind mode",
+  "supported": true,
+  "requires": ["fzf", "fzf-shell"],
+  "order": ["conf-d", "stack", "user-top", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "order.fish", "path": ".config/fish/conf.d/00-kr-order.fish" },
+    { "file": "fzf.fish", "path": ".config/fish/conf.d/10-fzf.fish" },
+    { "file": "config.fish", "path": ".config/fish/config.fish" }
+  ]
+}

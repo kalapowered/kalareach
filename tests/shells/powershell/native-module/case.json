@@ -1,0 +1,22 @@
+{
+  "id": "powershell-native-module",
+  "shell": "powershell",
+  "stack": "native-module",
+  "title": "a binary module this runtime cannot load, diagnosed rather than loaded silently",
+  "supported": true,
+  "requires": [],
+  "order": ["all-hosts", "user-top", "kr-module-refused", "stack", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "native_module", "profile_once"],
+  "native_module": {
+    "name": "KrWrongAbi",
+    "marker": "kr-module-refused",
+    "note": "A binary module built against another runtime ABI cannot be produced from a fixture, so what this case ships is an assembly file this runtime refuses to load. What it proves is the diagnosis: the profile records that the import failed, the module is absent from the loaded list, and the integration is still qualified afterwards."
+  },
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "profile.ps1", "path": ".config/powershell/profile.ps1" },
+    { "file": "host-profile.ps1", "path": ".config/powershell/Microsoft.PowerShell_profile.ps1" },
+    { "file": "KrWrongAbi.dll", "path": "modules/KrWrongAbi/KrWrongAbi.dll" }
+  ]
+}

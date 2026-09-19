@@ -1,0 +1,28 @@
+Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'user-top'
+
+function global:prompt { 'KR> ' }
+$global:KR_TEST_USER_CONFIGURATION = 1
+Set-PSReadLineOption -HistorySaveStyle SaveNothing
+Set-PSReadLineOption -PredictionSource None
+Set-PSReadLineKeyHandler -Chord Ctrl+j -Function AcceptLine
+
+# A binary module of the person's own, ahead of this runtime's own module path. It cannot be
+# loaded here, and what the person gets is the runtime saying so rather than a session that
+# carries on as though the module were there.
+$env:PSModulePath = (Join-Path $HOME 'modules') + [System.IO.Path]::PathSeparator + $env:PSModulePath
+try {
+    Import-Module KrWrongAbi -ErrorAction Stop
+    Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'kr-module-loaded'
+} catch {
+    Set-Content -LiteralPath (Join-Path $HOME 'module-error') -Value $_.Exception.Message
+    Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'kr-module-refused'
+}
+Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'stack'
+
+Set-PSReadLineKeyHandler -Chord Alt+q -BriefDescription 'kr-user-binding' -LongDescription 'the person own binding' -ScriptBlock {
+    [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+    [Microsoft.PowerShell.PSConsoleReadLine]::Insert('kr-user-binding-ran')
+}
+
+Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'user-bottom'
+# {kalareach-entry}

@@ -1,0 +1,4 @@
+This file is named like a binary module and is not one. A session that treated a module it could
+not load as loaded would run with commands and handlers that are not there, which is what section
+7 means by diagnosing an incompatible native module rather than loading ordinary startup files and
+calling that proof.

@@ -1,0 +1,15 @@
+printf '%s\n' user-top >> "$KR_TEST_ORDER"
+
+PS1='KR> '
+HISTFILE=
+KR_TEST_USER_CONFIGURATION=1
+
+PATH="$KR_STACK_FZF:$PATH"
+source "$KR_STACK_FZF_SHELL/shell/completion.bash"
+source "$KR_STACK_FZF_SHELL/shell/key-bindings.bash"
+printf '%s\n' stack >> "$KR_TEST_ORDER"
+
+bind '"\eq": "kr-user-binding-ran"'
+
+printf '%s\n' user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

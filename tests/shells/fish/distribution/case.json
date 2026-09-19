@@ -1,0 +1,16 @@
+{
+  "id": "fish-distribution",
+  "shell": "fish",
+  "stack": "distribution",
+  "title": "an ordinary distribution startup customisation: abbreviations, variables and key bindings",
+  "supported": true,
+  "requires": [],
+  "order": ["conf-d", "user-top", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "order.fish", "path": ".config/fish/conf.d/00-kr-order.fish" },
+    { "file": "config.fish", "path": ".config/fish/config.fish" }
+  ]
+}

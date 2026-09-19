@@ -1,0 +1,13 @@
+{
+  "id": "zsh-autosuggestions",
+  "shell": "zsh",
+  "stack": "zsh-autosuggestions",
+  "title": "zsh-autosuggestions, which rewrites the line the reader is holding on every keystroke",
+  "supported": true,
+  "requires": ["zsh-autosuggestions"],
+  "order": ["user-top", "stack", "user-bottom"],
+  "binding": "kr-user-widget",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [{ "file": "zshrc", "path": ".zshrc" }]
+}

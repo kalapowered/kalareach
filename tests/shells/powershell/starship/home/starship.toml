@@ -1,0 +1,4 @@
+# One fixed prompt, so what a case reads back from the terminal is the same on every host.
+format = "KR> "
+right_format = ""
+add_newline = false

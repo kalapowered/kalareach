@@ -1,0 +1,16 @@
+{
+  "id": "bash-starship",
+  "shell": "bash",
+  "stack": "starship",
+  "title": "starship on the packaged Bash, with its prompt command and its own trap",
+  "supported": true,
+  "requires": ["starship"],
+  "order": ["user-top", "stack", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "bashrc", "path": ".bashrc" },
+    { "file": "starship.toml", "path": ".config/starship.toml" }
+  ]
+}

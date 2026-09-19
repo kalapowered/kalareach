@@ -1,0 +1,27 @@
+# The framework's own layout: its tree is read-only here, so its cache goes under this home.
+print -r -- user-top >> "$KR_TEST_ORDER"
+
+PROMPT='KR> '
+setopt no_beep
+unsetopt zle_rprompt_indent 2>/dev/null
+HISTFILE=
+typeset -g KR_TEST_USER_CONFIGURATION=1
+
+export ZSH="$KR_STACK_OH_MY_ZSH"
+export ZSH_CACHE_DIR="$HOME/.cache/oh-my-zsh"
+mkdir -p "$ZSH_CACHE_DIR/completions"
+ZSH_THEME=""
+DISABLE_AUTO_UPDATE=true
+DISABLE_UPDATE_PROMPT=true
+ZSH_DISABLE_COMPFIX=true
+plugins=(colored-man-pages history)
+source "$ZSH/oh-my-zsh.sh"
+PROMPT='KR> '
+print -r -- stack >> "$KR_TEST_ORDER"
+
+kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=$#BUFFER }
+zle -N kr-user-widget
+bindkey '^[q' kr-user-widget
+
+print -r -- user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

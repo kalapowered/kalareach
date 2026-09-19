@@ -1,0 +1,17 @@
+{
+  "id": "powershell-starship",
+  "shell": "powershell",
+  "stack": "starship",
+  "title": "starship on the qualified PSReadLine, which replaces the prompt function",
+  "supported": true,
+  "requires": ["starship"],
+  "order": ["all-hosts", "user-top", "stack", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer", "profile_once"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "profile.ps1", "path": ".config/powershell/profile.ps1" },
+    { "file": "host-profile.ps1", "path": ".config/powershell/Microsoft.PowerShell_profile.ps1" },
+    { "file": "starship.toml", "path": ".config/starship.toml" }
+  ]
+}

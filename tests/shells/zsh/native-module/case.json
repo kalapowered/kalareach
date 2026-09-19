@@ -1,0 +1,21 @@
+{
+  "id": "zsh-native-module",
+  "shell": "zsh",
+  "stack": "native-module",
+  "title": "a user native module this build cannot load, diagnosed rather than loaded silently",
+  "supported": true,
+  "requires": [],
+  "order": ["user-top", "kr-module-refused", "stack", "user-bottom"],
+  "binding": "kr-user-widget",
+  "checks": ["identity", "profile_order", "user_bindings", "native_module"],
+  "native_module": {
+    "name": "kr_wrong_abi",
+    "marker": "kr-module-refused",
+    "note": "A module built against another Zsh ABI cannot be produced from a fixture, so what this case ships is a module file this build's loader refuses. What it proves is the diagnosis: the shell names the module it would not load, the module is absent from the loaded list, and the integration is still qualified afterwards."
+  },
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "zshrc", "path": ".zshrc" },
+    { "file": "kr_wrong_abi.so", "path": "modules/kr_wrong_abi.so" }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "shell": "fish",
+  "unsupported": [
+    { "stack": "zsh-autosuggestions", "reason": "this shell suggests from its own history inside the reader, and the plugin is a Zsh one" },
+    { "stack": "zsh-syntax-highlighting", "reason": "this shell colours the line it is editing itself, and the plugin wraps ZLE widgets" },
+    { "stack": "powerlevel10k", "reason": "the theme is a Zsh theme built on ZLE and gitstatus, and publishes no fish form" },
+    { "stack": "oh-my-zsh", "reason": "the framework is Zsh's; its plugins and themes are Zsh scripts" }
+  ]
+}

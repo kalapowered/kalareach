@@ -1,0 +1,4 @@
+This file is named like a loadable module and is not one. A reader that treated a module it could
+not load as loaded would run with bindings and widgets that are not there, which is what section 7
+means by diagnosing an incompatible native module rather than loading ordinary startup files and
+calling that proof.

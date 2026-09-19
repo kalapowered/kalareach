@@ -1,0 +1,24 @@
+# The instant prompt block goes at the very top, which is where this theme's own instructions put
+# it: it draws a prompt from a cache of the last run before the rest of this file has run at all.
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  print -r -- instant-prompt >> "$KR_TEST_ORDER"
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+
+print -r -- user-top >> "$KR_TEST_ORDER"
+
+setopt no_beep
+unsetopt zle_rprompt_indent 2>/dev/null
+HISTFILE=
+typeset -g KR_TEST_USER_CONFIGURATION=1
+
+source "$KR_STACK_POWERLEVEL10K/powerlevel10k.zsh-theme"
+[[ -r ~/.p10k.zsh ]] && source ~/.p10k.zsh
+print -r -- stack >> "$KR_TEST_ORDER"
+
+kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=$#BUFFER }
+zle -N kr-user-widget
+bindkey '^[q' kr-user-widget
+
+print -r -- user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

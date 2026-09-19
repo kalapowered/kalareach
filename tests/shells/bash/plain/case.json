@@ -1,0 +1,13 @@
+{
+  "id": "bash-plain",
+  "shell": "bash",
+  "stack": "none",
+  "title": "the packaged Bash with the person's own configuration and nothing else",
+  "supported": true,
+  "requires": [],
+  "order": ["user-top", "user-bottom"],
+  "binding": "kr-user-binding",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87", "KR-REQ-07.85"],
+  "home": [{ "file": "bashrc", "path": ".bashrc" }]
+}

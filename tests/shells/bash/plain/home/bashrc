@@ -1,0 +1,12 @@
+# The person's own configuration. The integration goes on top of it and replaces none of it.
+printf '%s\n' user-top >> "$KR_TEST_ORDER"
+
+PS1='KR> '
+HISTFILE=
+KR_TEST_USER_CONFIGURATION=1
+
+# A binding of the person's own, on a key nothing in the integration claims.
+bind '"\eq": "kr-user-binding-ran"'
+
+printf '%s\n' user-bottom >> "$KR_TEST_ORDER"
+# {kalareach-entry}

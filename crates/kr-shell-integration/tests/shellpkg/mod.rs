@@ -1390,6 +1390,13 @@ fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
 
 mod cases;
 mod dialect;
+mod stacks;
 
+// Each test binary that includes this module uses one part of it: the four package suites use the
+// cases and the dialects, and the qualification uses the corpus. What the other one does not name
+// is still part of the module it shares.
+#[allow(unused_imports)]
 pub use cases::*;
 pub use dialect::*;
+#[allow(unused_imports)]
+pub use stacks::*;

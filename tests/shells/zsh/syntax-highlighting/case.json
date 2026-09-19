@@ -1,0 +1,13 @@
+{
+  "id": "zsh-syntax-highlighting",
+  "shell": "zsh",
+  "stack": "zsh-syntax-highlighting",
+  "title": "zsh-syntax-highlighting, which wraps every reader widget and loads after the integration",
+  "supported": true,
+  "requires": ["zsh-syntax-highlighting"],
+  "order": ["user-top", "user-bottom", "stack"],
+  "binding": "kr-user-widget",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [{ "file": "zshrc", "path": ".zshrc" }]
+}

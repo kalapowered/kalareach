@@ -1,0 +1,16 @@
+{
+  "id": "zsh-powerlevel10k",
+  "shell": "zsh",
+  "stack": "powerlevel10k",
+  "title": "Powerlevel10k with its instant prompt, which draws a reader before the startup file finishes",
+  "supported": true,
+  "requires": ["powerlevel10k"],
+  "order": ["user-top", "stack", "user-bottom"],
+  "binding": "kr-user-widget",
+  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
+  "covers": ["KR-REQ-07.87"],
+  "home": [
+    { "file": "zshrc", "path": ".zshrc" },
+    { "file": "p10k.zsh", "path": ".p10k.zsh" }
+  ]
+}
