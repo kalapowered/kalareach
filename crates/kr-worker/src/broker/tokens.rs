@@ -82,6 +82,25 @@ impl TokenStore {
         self.unspent.len()
     }
 
+    /// Checks that there is room to issue one more token.
+    ///
+    /// Separate from [`Tokens::issue`] so the same refusal can be made before anything is marked.
+    /// A full table is not a state a caller changed, so discovering it during dispatch would turn
+    /// a refusal this host can always make into an outcome nobody can establish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the unspent tokens are already at their
+    /// limit.
+    pub fn check_capacity(&self) -> Result<()> {
+        if self.unspent.len() >= MAX_UNSPENT_TOKENS {
+            return Err(BrokerError::invalid(format!(
+                "this broker holds {MAX_UNSPENT_TOKENS} unspent action tokens already"
+            )));
+        }
+        Ok(())
+    }
+
     /// Issues one token for one invocation.
     ///
     /// The grant is checked here rather than at dispatch, because a callback that should never
@@ -91,8 +110,7 @@ impl TokenStore {
     /// # Errors
     ///
     /// Returns [`BrokerError::Grant`] when the binding does not hold the grant the invocation
-    /// names, and [`BrokerError::QuotaExceeded`]-shaped [`BrokerError::InvalidArgument`] when too
-    /// many tokens are already outstanding.
+    /// names, and [`BrokerError::InvalidArgument`] when too many tokens are already outstanding.
     pub fn issue(
         &mut self,
         binding_id: BrokerBindingId,
@@ -101,11 +119,7 @@ impl TokenStore {
         now: TimestampMs,
     ) -> Result<ActionToken> {
         grants.require(invocation.grant)?;
-        if self.unspent.len() >= MAX_UNSPENT_TOKENS {
-            return Err(BrokerError::invalid(format!(
-                "this broker holds {MAX_UNSPENT_TOKENS} unspent action tokens already"
-            )));
-        }
+        self.check_capacity()?;
         let token_id = ActionTokenId::new(format!("act-{}", kr_ipc::new_uuid()))
             .map_err(|error| BrokerError::invalid(format!("token handle: {error}")))?;
         let token = ActionToken {

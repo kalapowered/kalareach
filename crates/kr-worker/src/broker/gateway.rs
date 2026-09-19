@@ -30,7 +30,8 @@ use kr_protocol::gateway::{
 };
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
-    ApplicationInstanceId, EnvironmentId, GatewayConnectionId, UpstreamMethod, UpstreamRequestId,
+    ApplicationInstanceId, EnvironmentId, GatewayConnectionId, MAX_OPAQUE_ID_LEN, UpstreamMethod,
+    UpstreamRequestId,
 };
 
 use crate::broker::error::{BrokerError, Result};
@@ -338,14 +339,19 @@ impl Gateway {
         // neither is not an answer, and one that says both is two answers to one request; neither
         // resolves a pending resource on the strength of a matching identifier alone.
         let succeeded = body.contains_key(&held.table.result_field);
-        let failed = body.contains_key(&held.table.error_field);
-        if succeeded == failed {
+        let failure = body.get(&held.table.error_field);
+        if succeeded == failure.is_some() {
             return Err(BrokerError::invalid(format!(
                 "a response names exactly one of {} and {}, and this frame names {}",
                 held.table.result_field,
                 held.table.error_field,
                 if succeeded { "both" } else { "neither" }
             )));
+        }
+        // A failure has to say what failed. A null or empty error member is a frame that resolves
+        // a resource while telling a person nothing, which is worse than no answer at all.
+        if let Some(error) = failure {
+            check_error_payload(error, &held.table.error_field)?;
         }
         let upstream =
             read_identifier(&body, &held.table.response_id_field).ok_or_else(|| {
@@ -427,18 +433,56 @@ impl Gateway {
     }
 }
 
+/// Checks that an error member carries an error.
+///
+/// JSON-RPC 2.0 §5.1: an error is an object with a numeric `code` and a `message` string. A member
+/// that is null, empty or shaped differently is not a failure this host can report, and it is not
+/// a reason to resolve a pending resource.
+fn check_error_payload(error: &serde_json::Value, field: &str) -> Result<()> {
+    let object = error.as_object().ok_or_else(|| {
+        BrokerError::invalid(format!(
+            "{field} is not an object, so it reports no failure"
+        ))
+    })?;
+    if !object.get("code").is_some_and(serde_json::Value::is_i64) {
+        return Err(BrokerError::invalid(format!(
+            "{field} carries no integer code, so it reports no failure"
+        )));
+    }
+    if !object
+        .get("message")
+        .is_some_and(serde_json::Value::is_string)
+    {
+        return Err(BrokerError::invalid(format!(
+            "{field} carries no message, so there is nothing to tell a person"
+        )));
+    }
+    Ok(())
+}
+
 /// Reads one JSON member as an upstream request identifier.
 ///
 /// A JSON-RPC identifier is a string or a number, and an upstream identifier never becomes a
 /// KalaReach identifier: it is carried rather than converted. What is carried is the member's own
 /// JSON form, so the string `"11"` and the number `11` stay two identifiers. Writing both as the
 /// text `11` would let a response to one resolve the other's resource.
+///
+/// The length an upstream may choose is the length of the value, which is bounded here before it
+/// is encoded. What encoding costs is `kr_protocol::ids::MAX_UPSTREAM_REQUEST_ID_LEN`'s business,
+/// so a quote or a backslash never refuses an identifier a person could have written.
 fn read_identifier(
     body: &serde_json::Map<String, serde_json::Value>,
     field: &str,
 ) -> Option<Result<UpstreamRequestId>> {
     let member = body.get(field)?;
     let text = match member {
+        serde_json::Value::String(value) if value.len() > MAX_OPAQUE_ID_LEN => {
+            return Some(Err(BrokerError::invalid(format!(
+                "{field} is {} bytes and an upstream request identifier is at most \
+                 {MAX_OPAQUE_ID_LEN}",
+                value.len()
+            ))));
+        }
         serde_json::Value::String(_) | serde_json::Value::Number(_) => {
             match serde_json::to_string(member) {
                 Ok(text) => text,

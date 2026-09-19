@@ -690,12 +690,38 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
         PendingState::Pending,
         "nothing a request could not answer moved it"
     );
+    // An error member that reports no failure is not a failure either.
+    for not_a_failure in [
+        r#"{"id":"11","error":null}"#,
+        r#"{"id":"11","error":{}}"#,
+        r#"{"id":"11","error":{"code":-32601}}"#,
+        r#"{"id":"11","error":{"message":"no such method"}}"#,
+    ] {
+        assert!(
+            broker
+                .native_answer(
+                    GatewayConnectionId::new(1),
+                    not_a_failure.as_bytes(),
+                    TimestampMs::new(7),
+                )
+                .is_err(),
+            "an error carries a code and a message or it resolves nothing"
+        );
+    }
+    assert_eq!(
+        broker
+            .pending(text.resource_id)
+            .expect("the string request is still held")
+            .state,
+        PendingState::Pending
+    );
+
     // The upstream's own failure is an answer.
     let failed = broker
         .native_answer(
             GatewayConnectionId::new(1),
-            r#"{"id":"11","error":{"code":-32601}}"#.as_bytes(),
-            TimestampMs::new(7),
+            r#"{"id":"11","error":{"code":-32601,"message":"no such method"}}"#.as_bytes(),
+            TimestampMs::new(8),
         )
         .expect("an error response correlates");
     assert_eq!(failed.resource_id, text.resource_id);

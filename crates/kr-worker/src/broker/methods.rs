@@ -736,7 +736,11 @@ impl Broker {
         let registered = self.check_action(binding_id, params)?;
         self.check_dispatchable(&params.target)?;
         let invocation = Self::invocation_for(caller, &registered, params);
-        self.state().check_invocation(binding_id, &invocation)?;
+        let state = self.state();
+        state.check_invocation(binding_id, &invocation)?;
+        // And there has to be a token to issue. A full table refuses every invocation whatever
+        // the caller does, so it is refused here rather than after the marker.
+        state.tokens.check_capacity()?;
         Ok(())
     }
 

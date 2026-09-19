@@ -3076,9 +3076,10 @@ upstream's own identifier is carried in the JSON form it wrote: a string identif
 quotes, so the number `11` and the string `"11"` stay two requests, and the 256-byte bound is on
 that text. An upstream identifier never becomes a KalaReach identifier. One resource takes one
 response transition, and a response has to be one: a frame that names the table's method member is
-a request, and a frame that names both or neither of the table's result and error members is
-neither an answer nor two of them. None of those resolves a resource on the strength of a matching
-identifier.
+a request, a frame that names both or neither of the table's result and error members is neither an
+answer nor two of them, and an error that carries no code and message reports no failure. None of
+those resolves a resource on the strength of a matching identifier. A table names those members,
+and no two of them may share a name.
 
 A frame is read strictly: it is bounded in both directions, it must be a top-level object, and a
 frame that names a member twice is refused rather than resolved, because another participant in the
@@ -3194,8 +3195,8 @@ Every refusal named above is decided before the dispatch marker, so a request th
 leaves a rejection rather than an outcome nobody can establish. That includes an instance with no
 transport bound and one whose every component has had its rich capabilities disabled: both are
 refused before anything is marked, for a plugin action as well as for the five mutations. A plugin action's own authority is checked
-too: its grant, its binding revision and its capability are rechecked before the marker rather than
-when its token is issued. What a refusal after the marker still covers is the transport's own
+too: its grant, its binding revision, its capability and the room to issue its token are all
+checked before the marker rather than when the token is issued. What a refusal after the marker still covers is the transport's own
 failure, which is what `OUTCOME_UNKNOWN` is for, and the narrow window between the last check and
 the submission: the checks and the submission take the broker's lock separately, so a fence, a
 suspension or a capability invalidation that lands between them is still discovered during

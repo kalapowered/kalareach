@@ -22,6 +22,14 @@ use crate::scalars::{U64, Uuid, UuidParseError};
 /// allocation through an identifier field.
 pub const MAX_OPAQUE_ID_LEN: usize = 256;
 
+/// The longest an upstream request identifier may be, in bytes of its JSON form.
+///
+/// An upstream identifier is carried as JSON, so its value is bounded by [`MAX_OPAQUE_ID_LEN`] and
+/// its text by what encoding that value can cost: two quotes, and a backslash before every byte in
+/// the worst case. The gateway checks the value against [`MAX_OPAQUE_ID_LEN`] before it encodes,
+/// so this bound is never what refuses an identifier a person chose.
+pub const MAX_UPSTREAM_REQUEST_ID_LEN: usize = 2 * MAX_OPAQUE_ID_LEN + 2;
+
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident, $description:literal) => {
         $(#[$meta])*
@@ -128,6 +136,9 @@ macro_rules! counter_id {
 
 macro_rules! opaque_id {
     ($(#[$meta:meta])* $name:ident, $description:literal) => {
+        opaque_id!($(#[$meta])* $name, $description, MAX_OPAQUE_ID_LEN);
+    };
+    ($(#[$meta:meta])* $name:ident, $description:literal, $limit:expr) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
@@ -138,11 +149,11 @@ macro_rules! opaque_id {
             ///
             /// # Errors
             ///
-            /// Returns [`OpaqueIdError`] when the text is empty, longer than
-            /// [`MAX_OPAQUE_ID_LEN`] bytes or contains a control character.
+            /// Returns [`OpaqueIdError`] when the text is empty, longer than this
+            /// identifier's own limit, or contains a control character.
             pub fn new(value: impl Into<String>) -> Result<Self, OpaqueIdError> {
                 let value = value.into();
-                validate_opaque_id(&value)?;
+                validate_opaque_id(&value, $limit)?;
                 Ok(Self(value))
             }
 
@@ -187,7 +198,7 @@ macro_rules! opaque_id {
                 json_schema!({
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": MAX_OPAQUE_ID_LEN,
+                    "maxLength": $limit,
                     "description": $description
                 })
             }
@@ -207,12 +218,12 @@ impl fmt::Display for OpaqueIdError {
 
 impl std::error::Error for OpaqueIdError {}
 
-fn validate_opaque_id(value: &str) -> Result<(), OpaqueIdError> {
+fn validate_opaque_id(value: &str, limit: usize) -> Result<(), OpaqueIdError> {
     if value.is_empty() {
         return Err(OpaqueIdError("identifier must not be empty"));
     }
-    if value.len() > MAX_OPAQUE_ID_LEN {
-        return Err(OpaqueIdError("identifier is longer than 256 bytes"));
+    if value.len() > limit {
+        return Err(OpaqueIdError("identifier is longer than its limit"));
     }
     if value.chars().any(char::is_control) {
         return Err(OpaqueIdError(
@@ -758,12 +769,15 @@ opaque_id!(
     /// An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in.
     ///
     /// A JSON-RPC identifier is a string or a number, and the two are different identifiers, so
-    /// what is carried is the member's own JSON text: the string eleven is `"11"` and the number
-    /// eleven is `11`. The 256-byte bound is on that text, which is what an upstream wrote, so a
-    /// string identifier spends two bytes on its quotes and more on any character JSON escapes.
-    /// It is correlation data. An upstream identifier never becomes a KalaReach identifier.
+    /// what is carried is the member's JSON form: the string eleven is `"11"` and the number
+    /// eleven is `11`. The form is this host's own encoding of the value, so two spellings of one
+    /// string, `"a"` and `"\u0061"`, are one identifier, which is what a correlation key has to
+    /// be. The value keeps the 256-byte bound every opaque identifier has, and
+    /// [`MAX_UPSTREAM_REQUEST_ID_LEN`] is what encoding that value can cost. It is correlation
+    /// data. An upstream identifier never becomes a KalaReach identifier.
     UpstreamRequestId,
-    "An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority."
+    "An upstream JSON-RPC request identifier, in its JSON form: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.",
+    MAX_UPSTREAM_REQUEST_ID_LEN
 );
 opaque_id!(
     /// An upstream method name, as a connector's table names it.

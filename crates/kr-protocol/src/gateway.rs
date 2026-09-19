@@ -227,6 +227,18 @@ pub struct DeclarativeTable {
 }
 
 impl DeclarativeTable {
+    /// Returns one of the members a frame is read by, named as `validate` names it.
+    fn member(&self, field: &str) -> &str {
+        match field {
+            "request_id_field" => &self.request_id_field,
+            "response_id_field" => &self.response_id_field,
+            "method_field" => &self.method_field,
+            "result_field" => &self.result_field,
+            "error_field" => &self.error_field,
+            _ => "",
+        }
+    }
+
     /// Classifies one upstream method.
     ///
     /// A method the table does not list is presumed mutation-capable. That is the conservative
@@ -283,6 +295,22 @@ impl DeclarativeTable {
                 return Err(TableError::MissingField { field });
             }
         }
+        // A request and a response may name their identifier the same way, as JSON-RPC does. The
+        // other four say different things about a frame, so sharing a name would make one frame
+        // two things at once: a table whose result member is also its identifier member turns
+        // every bare identifier into a successful answer.
+        for (first, second) in [
+            ("response_id_field", "method_field"),
+            ("response_id_field", "result_field"),
+            ("response_id_field", "error_field"),
+            ("method_field", "result_field"),
+            ("method_field", "error_field"),
+            ("result_field", "error_field"),
+        ] {
+            if self.member(first) == self.member(second) {
+                return Err(TableError::RepeatedField { first, second });
+            }
+        }
         if !self
             .entries
             .windows(2)
@@ -332,6 +360,14 @@ pub enum TableError {
     MissingField {
         /// Which field was missing.
         field: &'static str,
+    },
+    /// Two members that say different things about a frame were given one name.
+    #[error("a table's {first} and {second} must name different members")]
+    RepeatedField {
+        /// The first of the pair.
+        first: &'static str,
+        /// The second.
+        second: &'static str,
     },
     /// The entries were not in ascending method order.
     #[error("a table's entries must be in ascending method order")]
@@ -971,6 +1007,33 @@ mod tests {
         let mut table = table();
         table.entries.reverse();
         assert_eq!(table.validate(), Err(TableError::Unordered));
+    }
+
+    #[test]
+    fn a_table_whose_members_collide_is_refused() {
+        // A request and a response may name their identifier the same way; JSON-RPC does.
+        let shared = table();
+        assert_eq!(shared.request_id_field, shared.response_id_field);
+        assert!(shared.validate().is_ok());
+
+        // The rest say different things about a frame, and one name for two of them makes one
+        // frame two things at once.
+        for (field, value) in [
+            ("result_field", "id"),
+            ("error_field", "method"),
+            ("method_field", "result"),
+        ] {
+            let mut collided = table();
+            match field {
+                "result_field" => collided.result_field = value.to_owned(),
+                "error_field" => collided.error_field = value.to_owned(),
+                _ => collided.method_field = value.to_owned(),
+            }
+            assert!(
+                matches!(collided.validate(), Err(TableError::RepeatedField { .. })),
+                "{field} named {value} collides"
+            );
+        }
     }
 
     #[test]
