@@ -159,7 +159,6 @@ pub struct Session {
     history: OutputHistory,
     hub: OutputHub,
     journal: Option<Journal>,
-    journal_failure: Option<String>,
     /// The durability condition this session publishes.
     ///
     /// It is the journal's own seam when there is a journal, and a seam of this session's own,
@@ -423,7 +422,6 @@ impl Session {
             history,
             hub: OutputHub::new(),
             journal,
-            journal_failure,
             health,
             time,
             closure: None,
@@ -494,7 +492,7 @@ impl Session {
                 if let Some(journal) = self.journal.as_mut()
                     && let Err(error) = journal.record_session(&summary)
                 {
-                    self.journal_failure = Some(error.to_string());
+                    self.note_journal_failure(error);
                 }
                 Ok(())
             }
@@ -2866,14 +2864,12 @@ impl Session {
             return None;
         }
         let now = kr_ipc::now_ms();
-        let recovered = self
-            .journal
+        // The journal clears the condition itself, once it has written the gap down and, for a
+        // store whose content it could not read, once the store says its pages are sound. There
+        // is nothing else here to clear: what this session reports is that same condition.
+        self.journal
             .as_mut()
-            .and_then(|journal| journal.recover(now).ok().flatten());
-        if recovered.is_some() {
-            self.journal_failure = None;
-        }
-        recovered
+            .and_then(|journal| journal.recover(now).ok().flatten())
     }
 
     /// Applies section 20's output retention, on the host's own maintenance cadence.
@@ -2955,8 +2951,11 @@ impl Session {
 
     /// Returns why the journal is unavailable, when it is.
     #[must_use]
-    pub fn journal_failure(&self) -> Option<&str> {
-        self.journal_failure.as_deref()
+    pub fn journal_failure(&self) -> Option<String> {
+        self.health
+            .condition()
+            .fault()
+            .map(|fault| fault.detail.clone())
     }
 
     /// Returns the final closure record once the session has closed.
@@ -3213,7 +3212,7 @@ impl Session {
         match journal.record_closure(record) {
             Ok(()) => Durability::Durable,
             Err(error) => {
-                self.journal_failure = Some(error.to_string());
+                self.note_journal_failure(error);
                 Durability::Volatile
             }
         }
@@ -3225,22 +3224,22 @@ impl Session {
     /// records in it are still the session's. What changes is the answer the host gives about
     /// durability, which stops being a claim the session cannot support.
     pub fn note_journal_failure(&mut self, detail: impl std::fmt::Display) {
-        let detail = detail.to_string();
-        // The journal's own paths classify from the store's result code and have already
-        // published. This covers what reaches the session another way: an open that failed, and a
-        // caller that decided a write had failed from the refusal it was given.
+        // There is one durability state, and it is the seam: what this session reports and what a
+        // subsystem reads to fence rich work are the same answer. The journal's own paths
+        // classify from the store's result code and have already published; this covers what
+        // reaches the session another way, which is a caller that decided a write had failed from
+        // the refusal it was given.
         self.health
             .note_fault(crate::persistence::fault::JournalFault {
                 kind: crate::persistence::fault::FaultKind::WriteFailed,
-                detail: detail.clone(),
+                detail: detail.to_string(),
                 observed_at_ms: kr_ipc::now_ms(),
                 durable_through: self.health.durable_through(),
             });
-        self.journal_failure = Some(detail);
     }
 
-    const fn durability(&self) -> Durability {
-        if self.journal.is_some() && self.journal_failure.is_none() {
+    fn durability(&self) -> Durability {
+        if self.journal.is_some() && self.health.condition().is_healthy() {
             Durability::Durable
         } else {
             Durability::Volatile

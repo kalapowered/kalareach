@@ -31,8 +31,17 @@ pub enum Retention {
     SessionLifetime,
     /// Kept for a fixed period.
     Period(Duration),
-    /// Kept until a byte cap forces the oldest out.
-    ByteCapped,
+    /// Kept for a fixed period *and* under a byte cap, whichever applies first.
+    ///
+    /// Section 20's retained output is this: seven days, a host cap and a session cap, all upper
+    /// bounds at once. A store declared only `ByteCapped` would be one nothing ever expired from.
+    PeriodOrByteCap(Duration),
+    /// Kept until every consumer that has registered a cursor has taken it, and then past a
+    /// period of its own.
+    ///
+    /// The outbox is this: an event goes when it is older than the period and below every
+    /// registered consumer's cursor, so collection can never take work a consumer still owes.
+    UntilDeliveredThenPeriod(Duration),
     /// Kept until the thing it belongs to is gone.
     UntilSubjectGone,
 }
@@ -178,7 +187,7 @@ pub static STORES: &[StoreDescriptor] = &[
         name: "outbox",
         holds: "the event each state transition committed with, waiting for its consumers",
         durability: Durability::CrashDurable,
-        retention: Retention::UntilSubjectGone,
+        retention: Retention::UntilDeliveredThenPeriod(RECEIPT_RETENTION),
         content: ContentClass::Metadata,
         protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
@@ -322,7 +331,7 @@ pub static STORES: &[StoreDescriptor] = &[
         name: "output spool",
         holds: "retained terminal output, in fixed segments named by the cursor they start at",
         durability: Durability::BestEffortFile,
-        retention: Retention::ByteCapped,
+        retention: Retention::PeriodOrByteCap(crate::persistence::retention::OUTPUT_RETENTION),
         content: ContentClass::TerminalContent,
         protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
@@ -334,7 +343,7 @@ pub static STORES: &[StoreDescriptor] = &[
         name: "resident history",
         holds: "the most recent output, in memory, ahead of the spool",
         durability: Durability::ProcessMemory,
-        retention: Retention::ByteCapped,
+        retention: Retention::PeriodOrByteCap(crate::persistence::retention::OUTPUT_RETENTION),
         content: ContentClass::TerminalContent,
         protection: Protection::ProcessMemory,
         cleanup: Cleanup::ProcessExit,

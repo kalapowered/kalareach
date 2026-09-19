@@ -372,11 +372,12 @@ fn no_commit_point_shares_a_flush_and_the_writes_that_may_are_named() {
 }
 
 #[test]
-fn a_transition_its_event_and_its_outbox_row_share_one_flush_or_none() {
-    // KR-REQ-24.03's grouping, and KR-REQ-24.20's "same local transaction", proved together and
-    // by failure rather than by success: the outbox insert is the last write of the transaction,
-    // and a store that refuses it leaves the receipt where it was and the event unwritten. Three
-    // rows share one flush, and either all three are durable or none of them is.
+fn a_transition_its_event_and_its_outbox_row_go_back_together_when_one_fails() {
+    // KR-REQ-24.20's "same local transaction", proved by failure rather than by success: the
+    // outbox insert is the last write of the transaction, and a store that refuses it leaves the
+    // receipt where it was and the event unwritten. What that establishes is the transaction
+    // boundary, which is what lets the three rows share one commit; it does not count flushes,
+    // and the store's own settings are what the pragma test above holds it to.
     let path = journal_path("one-transaction");
     let mut journal = Journal::open(&path).expect("opens");
     journal.accept(&submission(4, 4)).expect("accepts");
@@ -508,7 +509,8 @@ fn a_consumer_that_dies_before_it_records_its_cursor_applies_each_event_once() {
     for record in &fresh {
         consumer.note_applied(record);
     }
-    // It dies here, before `note_outbox_consumed`, so it is handed the same page again.
+    // The cursor write fails here, so the same page is asked for again inside this process: the
+    // window is what suppresses it.
     let again = journal.outbox_after(0, 64).expect("a page");
     assert!(consumer.fresh(&again).is_empty());
     assert_eq!(consumer.applied(), 3);
@@ -528,8 +530,10 @@ fn a_consumer_that_dies_before_it_records_its_cursor_applies_each_event_once() {
             .is_empty()
     );
 
-    // A restarted consumer remembers nothing, and the cursor is what stops it replaying the
-    // journal: it is handed what it has not recorded as taken, and nothing before it.
+    // A consumer that restarted remembers nothing, and the recorded cursor is what stops it
+    // replaying the journal: it is handed what it has not recorded as taken, and nothing before
+    // it. A record applied but not recorded before the restart would be applied again, which is
+    // the consumer's own to close and is named in this task's handoff.
     let mut restarted = Fanout::new();
     let resumed = journal.outbox_after(recorded.cursor, 64).expect("a page");
     assert!(restarted.fresh(&resumed).is_empty());
@@ -613,7 +617,9 @@ async fn no_terminal_body_and_no_provider_key_reaches_the_control_log() {
             .record_host_event(&effect, TimestampMs::new(1_500))
             .expect("records the host event");
     }
-    // Every commit point this session can reach, so the search covers what a running host writes.
+    // The acceptance and dispatch commit points as well, so the search covers the mutation path
+    // and not only the output one. The checkpoint moves the write-ahead log into the file, so
+    // what is searched is everything this session has written rather than what has been merged.
     {
         let mut session = host.runtime.session();
         let journal = session.journal_mut().expect("a journal");
@@ -809,6 +815,86 @@ fn a_fault_fences_rich_work_and_recovery_writes_the_interval_down_before_it_clea
             .recover(TimestampMs::new(9_200))
             .expect("recovers")
             .is_none()
+    );
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn the_mark_a_gap_starts_from_survives_receipt_collection() {
+    // Collection removes events. A mark taken from what the journal still holds would go
+    // backwards every time it ran, and a gap would then claim an interval that reached back
+    // before work this host had certainly written.
+    let path = journal_path("mark-survives-collection");
+    let mut journal = Journal::open(&path).expect("opens");
+    for action in 1..=3 {
+        journal
+            .accept(&submission(action, action))
+            .expect("accepts");
+    }
+    // A record of an earlier boot needs no window guard, which is what lets a live journal
+    // collect it at all: retention keeps a record of *this* boot while a window could still admit
+    // its action.
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute("UPDATE receipts SET created_boot = NULL", [])
+        .expect("marks the records as an earlier boot's");
+    let later = TimestampMs::new(kr_ipc::now_ms().get() + RETENTION_MS + 60_000);
+    assert!(journal.prune(later).expect("prunes") > 0);
+    assert_eq!(
+        journal.event_high_water().expect("reads"),
+        0,
+        "collection took every event"
+    );
+    // Reopening over the collected store still starts the mark where the store got to.
+    drop(journal);
+    let mut journal = Journal::open(&path).expect("reopens");
+    let failure = fill_the_store(&mut journal);
+    assert!(failure.to_string().contains("full"), "{failure}");
+    let condition = journal.health().condition();
+    let fault = condition.fault().expect("a fault");
+    assert!(
+        fault.durable_through >= 3,
+        "the mark is what the store allocated, not what it still holds: {}",
+        fault.durable_through
+    );
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_store_whose_content_cannot_be_read_stays_faulted_until_its_pages_are_sound() {
+    // Section 24: a lost or corrupt journal produces an explicit incomplete archive rather than
+    // an invented success. A write that happens to succeed says nothing about a row this build
+    // could not decode, so it does not clear the condition.
+    let path = journal_path("corrupt-stays-faulted");
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.accept(&submission(1, 1)).expect("accepts");
+    // A stored value this build cannot read.
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute(
+            "UPDATE outbox SET stream = 'a stream no build writes' WHERE cursor = 1",
+            [],
+        )
+        .expect("writes an undecodable row");
+    let refused = journal.outbox_after(0, 64);
+    assert!(refused.is_err(), "the row cannot be decoded");
+    assert_eq!(
+        journal.health().condition().fault().map(|fault| fault.kind),
+        Some(FaultKind::Corrupt)
+    );
+
+    // Recovery asks the store whether its pages are sound. They are: what this build cannot read
+    // is a value rather than a page, so the condition clears and the next read of that row faults
+    // again. What matters is that the *decision* is the store's rather than the write's.
+    let recovered = journal.recover(TimestampMs::new(7_000)).expect("recovers");
+    assert!(recovered.is_some());
+    assert!(journal.outbox_after(0, 64).is_err());
+    assert_eq!(
+        journal.health().condition().fault().map(|fault| fault.kind),
+        Some(FaultKind::Corrupt),
+        "the undecodable row faults again the next time it is read"
     );
     drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
@@ -1103,6 +1189,125 @@ fn the_resident_window_is_collected_by_age_as_well_as_the_spool() {
         page.gap.0.expect("a gap").cause,
         Some(HistoryGapCause::Retention)
     );
+}
+
+#[test]
+fn a_window_whose_newest_byte_is_not_expired_keeps_the_whole_interval() {
+    // The marks say when the *newest* byte in each interval arrived, so a range goes only when
+    // this host can say every byte in it had expired. Output written a moment ago is kept even
+    // when the interval it belongs to began before the deadline.
+    let mut history = kr_worker::history::OutputHistory::in_memory(4096);
+    history.append(&[b'x'; 32]);
+    let cutoff_just_past = TimestampMs::new(kr_ipc::now_ms().get() + 1);
+    let taken = history.apply_retention(
+        OutputRetention::new(std::time::Duration::from_millis(1), 1 << 30, 1 << 30),
+        32,
+        cutoff_just_past,
+        true,
+    );
+    assert!(
+        taken.is_empty(),
+        "the interval's newest byte is younger than the deadline"
+    );
+    assert_eq!(history.oldest_retained_cursor(), 0);
+}
+
+#[test]
+fn the_spool_writes_its_boundary_before_it_deletes_what_supports_it() {
+    // A crash between the delete and the write would put the spool back in the condition the
+    // boundary exists to prevent, so the file is on disk first. A reader of the directory after
+    // an eviction therefore finds a boundary that already covers what went.
+    let directory = std::env::temp_dir().join(format!("kr-persist-order-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    for _ in 0..4 {
+        history.append(&[b'x'; 8]);
+    }
+    let retention =
+        OutputRetention::new(std::time::Duration::from_secs(7 * 24 * 60 * 60), 1 << 30, 0);
+    let taken = history.apply_retention(retention, 32, kr_ipc::now_ms(), true);
+    assert!(!taken.is_empty());
+    let recorded: u64 = std::fs::read_to_string(directory.join("boundary"))
+        .expect("the boundary is on disk")
+        .trim()
+        .parse()
+        .expect("a number");
+    assert_eq!(recorded, 32, "it covers everything the spool was given");
+    assert!(
+        !directory.join("boundary.writing").exists(),
+        "the staging file does not survive the rename"
+    );
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_boundary_this_host_cannot_read_is_reported_rather_than_guessed_at() {
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-unreadable-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&directory).expect("the directory");
+    std::fs::write(directory.join("boundary"), "not a cursor").expect("an unreadable boundary");
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    history.append(&[b'x'; 16]);
+    let page = history.page(0, 64).expect("a page");
+    assert_eq!(
+        page.gap.0.and_then(|gap| gap.cause),
+        None,
+        "nothing is missing yet"
+    );
+    // Once something is missing, the reason is the one this host can actually say.
+    let taken = history.apply_retention(
+        OutputRetention::new(std::time::Duration::from_secs(7 * 24 * 60 * 60), 1 << 30, 0),
+        16,
+        kr_ipc::now_ms(),
+        true,
+    );
+    assert!(!taken.is_empty());
+    assert_eq!(
+        history
+            .page(0, 64)
+            .expect("a page")
+            .gap
+            .0
+            .and_then(|gap| gap.cause),
+        Some(HistoryGapCause::SpoolUnavailable)
+    );
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_output_spool_is_owner_only_like_every_other_state_directory() {
+    // KR-REQ-24.26. The spool holds the terminal's own output, so its mode is not a decision this
+    // host leaves to the process umask.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = host().await;
+    {
+        let mut session = host.runtime.session();
+        session.ingest_output(b"hello\r\n");
+    }
+    let spool = host
+        .journal_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the environment state directory")
+        .join("spool");
+    let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&spool)
+        .expect("the spool directory exists")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    assert!(!entries.is_empty(), "this session has a spool of its own");
+    for entry in entries {
+        let mode = std::fs::metadata(&entry)
+            .expect("the directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{} is {mode:o}", entry.display());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -249,11 +249,12 @@ impl Journal {
                 .map(|boot| boot.value.as_slice().to_vec()),
         };
         journal.migrate()?;
-        // The mark describes the store rather than this process, so it starts at what the store
-        // already holds. Starting at nought would make the first fault of a restarted host claim
-        // a gap back to the beginning of the session.
-        let high_water = journal.event_high_water()?;
-        journal.health.note_durable_through(high_water);
+        // The mark describes the store rather than this process, so it starts at the highest
+        // sequence the store has ever allocated. Starting at nought would make the first fault of
+        // a restarted host claim a gap back to the beginning of the session, and starting at what
+        // the store still holds would move it backwards every time collection ran.
+        let allocated = journal.allocated_event_sequence()?;
+        journal.health.note_durable_through(allocated);
         Ok(journal)
     }
 
@@ -2351,6 +2352,30 @@ impl Journal {
         })
     }
 
+    /// Returns the highest event sequence this journal has ever written.
+    ///
+    /// It is not [`Self::event_high_water`], which is the newest event still *held*: collection
+    /// removes events, and a mark taken from what is held would go backwards every time it ran.
+    /// What a recovery gap is measured from has to be a boundary collection cannot reduce, and
+    /// the store keeps one of its own: `receipt_events` is an `AUTOINCREMENT` table, so SQLite
+    /// retains its largest allocated sequence whatever is deleted from it.
+    fn allocated_event_sequence(&self) -> Result<u64> {
+        let allocated: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'receipt_events'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| faulted(&self.health, error))?;
+        match allocated {
+            Some(sequence) => Ok(u64::try_from(sequence).unwrap_or(0)),
+            // A table that has never had a row has no entry, and its high water is what it holds.
+            None => self.event_high_water(),
+        }
+    }
+
     /// Reports a stored value this build cannot read, and returns the refusal.
     ///
     /// A row the store returned that this build cannot decode is not a decoding preference: it is
@@ -2508,7 +2533,14 @@ impl Journal {
         let Some(fault) = self.health.condition().fault().cloned() else {
             return Ok(None);
         };
-        let resumed_at = self.event_high_water()?;
+        // A store whose content cannot be read back is not one a successful write speaks for. It
+        // stays faulted until the store itself says its pages are sound, which is what section
+        // 24's explicit incomplete archive is built on: a corrupt journal is reported rather than
+        // recovered from.
+        if fault.kind == crate::persistence::fault::FaultKind::Corrupt && !self.pages_are_sound()? {
+            return Ok(None);
+        }
+        let resumed_at = self.allocated_event_sequence()?;
         let gap = crate::persistence::fault::RecoveryGap {
             kind: fault.kind,
             detail: fault.detail.clone(),
@@ -2533,7 +2565,22 @@ impl Journal {
             )
             .map_err(|error| faulted(&self.health, error))?;
         self.health.note_recovered();
+        self.health.note_durable_through(resumed_at);
         Ok(Some(gap))
+    }
+
+    /// Asks the store whether its own pages are sound.
+    ///
+    /// `quick_check` is the check SQLite offers that does not read every index, which is what a
+    /// host running its own maintenance can afford. A store that fails it is corrupt whatever
+    /// else it can still do; a store that passes it can still hold a row this build cannot
+    /// decode, and the next read of that row faults again.
+    fn pages_are_sound(&self) -> Result<bool> {
+        let answer: String = self
+            .connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(answer.eq_ignore_ascii_case("ok"))
     }
 
     /// Returns every interval durable writing was unavailable, oldest first.
@@ -2570,7 +2617,7 @@ impl Journal {
                 row.map_err(|error| faulted(&self.health, error))?;
             gaps.push(crate::persistence::fault::RecoveryGap {
                 kind: crate::persistence::fault::FaultKind::from_stored(&kind).ok_or_else(
-                    || unavailable_detail("a stored fault kind is not one this build writes"),
+                    || self.corrupt("a stored fault kind is not one this build writes"),
                 )?,
                 detail,
                 faulted_at_ms: TimestampMs::new(u64::try_from(faulted_at).unwrap_or(0)),
@@ -2775,8 +2822,10 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         encoded
             .map(|bytes| {
+                // A record this store returned that this build cannot decode is a store whose
+                // content cannot be trusted, which the archive has to be told about.
                 kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
-                    .map_err(|error| unavailable_detail_owned(error.to_string()))
+                    .map_err(|_| self.corrupt("a stored record cannot be decoded"))
             })
             .transpose()
     }
@@ -2822,8 +2871,10 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         encoded
             .map(|bytes| {
+                // A record this store returned that this build cannot decode is a store whose
+                // content cannot be trusted, which the archive has to be told about.
                 kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
-                    .map_err(|error| unavailable_detail_owned(error.to_string()))
+                    .map_err(|_| self.corrupt("a stored record cannot be decoded"))
             })
             .transpose()
     }
@@ -2866,8 +2917,10 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         encoded
             .map(|bytes| {
+                // A record this store returned that this build cannot decode is a store whose
+                // content cannot be trusted, which the archive has to be told about.
                 kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
-                    .map_err(|error| unavailable_detail_owned(error.to_string()))
+                    .map_err(|_| self.corrupt("a stored record cannot be decoded"))
             })
             .transpose()
     }

@@ -137,15 +137,23 @@ pub const REMEMBERED_EVENT_IDS: usize = 256;
 /// window that covers it.
 pub const MAX_OUTBOX_PAGE: u64 = REMEMBERED_EVENT_IDS as u64;
 
-/// A consumer's de-duplication of the page it is handed.
-///
-/// This is the consumer's side of at-least-once delivery, and it is deliberately here rather than
-/// in each consumer: a consumer that wrote its own would be a consumer that could get it wrong.
+/// A consumer's de-duplication of the page it is handed, within one process.
 ///
 /// The order is the contract. [`Self::fresh`] says what has not been applied and remembers
 /// nothing; [`Self::note_applied`] is called *after* the effect, and is what makes the next
 /// answer different. A helper that remembered a record before its effect ran would suppress it
 /// after the effect failed, which is the one thing at-least-once delivery exists to prevent.
+///
+/// **What this does not do**, stated because the difference decides whether a consumer is
+/// correct. It is process memory, so a consumer that applies a record and then dies before
+/// recording its cursor is handed that record again and applies it again. Closing *that* window
+/// needs the de-duplication record committed in the same transaction as the effect, which only
+/// the consumer can do because only the consumer's store holds the effect. A consumer whose
+/// effect leaves this host cannot do even that, and needs the destination to be idempotent.
+///
+/// So this helper covers one thing exactly: the page in hand. A consumer records its cursor
+/// before it asks for the next page, and what this stops is the same page being applied twice
+/// inside one process.
 #[derive(Clone, Debug, Default)]
 pub struct Fanout {
     seen: std::collections::VecDeque<Uuid>,
