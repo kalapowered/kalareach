@@ -2184,6 +2184,47 @@ impl Controller {
         }
     }
 
+    /// Performs one project or workspace mutation under the admission its ingress recorded.
+    ///
+    /// Both doors reach the project service through here, so the checks the daemon owes such a
+    /// mutation are made once rather than once per ingress: a local caller and a paired device get
+    /// the same answer to the same request, and neither can drift away from the other.
+    ///
+    /// Everything between the envelope check and this point can wait: for this task to be
+    /// scheduled, for the registry's lock, for a blocking thread. So the admission is asked about
+    /// here, where the waiting ends, and the registry lock is held across the answer for the
+    /// reason [`Self::check_admission`] states.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the admission or the project service decided.
+    pub(crate) async fn project_mutation(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+    ) -> std::result::Result<ParamsValue, ProtocolError> {
+        // A mutation carrying no freshness at all is a retry of an action this host may already
+        // hold: section 9 keeps its record readable after the window that admitted it is gone, and
+        // the project service's own retained record is where such a retry is answered from above.
+        // What it may not do is perform the action again.
+        if carried.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this action carries no freshness, so it may be answered from what this \
+                         host holds and may not be performed"
+                    .to_owned(),
+            }
+            .to_protocol_error());
+        }
+        {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)
+                .map_err(|error| error.to_protocol_error())?;
+        }
+        self.project.write(actor_id, mutation, method).await
+    }
+
     async fn read_method(self: &Arc<Self>, actor_id: &ActorId, request: &Request) -> ControlFrame {
         let Some(method) = request.method.method() else {
             return error_reply(
@@ -2265,30 +2306,26 @@ impl Controller {
             return self.transfer.write_frame(actor_id, mutation, method).await;
         }
         if crate::project::ProjectModule::serves(method) {
-            // Everything between the envelope check and this point can wait: for this task to be
-            // scheduled and for a blocking thread. An action whose accepted deadline passed while
-            // it queued does not go on to write, and neither does one whose connection lost its
-            // authority in the meantime. A mutation carrying no freshness at all is refused here
-            // for the reason the transfer service refuses one: this service answers its own
-            // retained actions above, so anything still travelling is a first admission.
-            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
-                return respond(
-                    mutation.request_id,
-                    Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
-                );
-            }
-            if let Err(error) = self.authorised(connection_id) {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
-            }
-            return self.project.write_frame(actor_id, mutation, method).await;
+            let admitted_revision = match self.admitted_revision(connection_id) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    return error_reply(
+                        mutation.request_id,
+                        ErrorCode::PermissionDenied,
+                        error.to_string(),
+                    );
+                }
+            };
+            let carried = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline: accepted.map(|accepted| accepted.deadline),
+            };
+            return crate::project::frame(
+                mutation.request_id,
+                self.project_mutation(actor_id, mutation, method, carried)
+                    .await,
+            );
         }
         // The admission the mutation carries into its transaction: the deadline this daemon
         // accepted, the authority revision it was admitted under, and the connection it arrived

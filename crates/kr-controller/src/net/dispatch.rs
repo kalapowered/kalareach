@@ -576,6 +576,14 @@ impl RemoteConnection {
             Method::HostInfo | Method::EnvironmentList | Method::HostDoctor => {
                 self.controller.read_method(&actor_id, request).await
             }
+            // The project and workspace metadata reads. They name no session, so the grant's
+            // environment selector and the rights the registry lists are the whole of what
+            // narrows them, and the service answers a device exactly as it answers this user's
+            // own client.
+            Method::ProjectList
+            | Method::ProjectRead
+            | Method::WorkspaceList
+            | Method::WorkspaceRead => self.controller.read_method(&actor_id, request).await,
             // The daemon answers these itself, and what it answers with is narrowed to the grant:
             // a list is every session this actor may observe, not every session this host runs.
             Method::SessionList | Method::SessionRead => {
@@ -641,11 +649,22 @@ impl RemoteConnection {
         ) {
             return failure(mutation.request_id, error);
         }
-        if let Some(retained) = self
+        // Every store that retains an action is asked in turn, in the order the local ingress asks
+        // them: the daemon's own reservations first, then the project service's own record. A
+        // project mutation's receipt lives with the project service, so a retry of one that lost
+        // its reply is answered there rather than dispatched again.
+        let mut held = self
             .controller
             .retained(&actor_id, mutation, entry.method, self.connection_id)
-            .await
-        {
+            .await;
+        if held.is_none() && crate::project::ProjectModule::serves(entry.method) {
+            held = self
+                .controller
+                .project
+                .retained(&actor_id, mutation, entry.method)
+                .await;
+        }
+        if let Some(retained) = held {
             // The daemon's own retained answer is a read of what an earlier submission produced,
             // and a create's names the session it made. Section 23 wants present view authority
             // over that subject before either half of a retained result goes back, and the subject
@@ -794,6 +813,48 @@ impl RemoteConnection {
                     Ok(Ok(Err(error))) => failure(request_id, error.to_protocol_error()),
                     // The close is running on a task that outlives this connection, so a wait
                     // that ended says the outcome is not known rather than that it failed.
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
+            }
+            // The project and workspace mutations. Like a create, they are the daemon's own
+            // effect: no session owns them, so they go to the project service rather than to a
+            // worker proxy, and the admission travels with them so the service asks about it
+            // again where its own waiting ends.
+            _ if crate::project::ProjectModule::serves(entry.method) => {
+                // A project mutation claims its action identity the way every other mutation
+                // does, with this host named as the owner of what it produces. Storage that
+                // cannot record the route refuses it: only section 7's stop goes on without one.
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                // On a task that outlives this connection, because a clone reaches the network and
+                // a materialisation copies files: dropping that future part way through is a
+                // cancellation, and what it would leave behind is exactly what an action identity
+                // exists to make recoverable.
+                let effect = tokio::spawn(async move {
+                    controller
+                        .project_mutation(&actor_id, &mutation, method, carried)
+                        .await
+                });
+                match tokio::time::timeout(EFFECT_WAIT, effect).await {
+                    Ok(Ok(outcome)) => ControlFrame::Response(Response {
+                        request_id,
+                        outcome: match outcome {
+                            Ok(value) => Outcome::Ok(value),
+                            Err(error) => Outcome::Error(error),
+                        },
+                    }),
+                    // The effect is still running, so a wait that ended says the outcome is not
+                    // known rather than that the action failed.
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
@@ -1323,6 +1384,14 @@ impl RemoteConnection {
                     self.controller.paths().environment_id()
                 ),
             ));
+        }
+        // A project acts on a repository or a working copy. Its own subject check is the one the
+        // local ingress makes: a target naming a session or an application is refused rather than
+        // producing a receipt against something the effect never touched, and a destination
+        // environment in the parameters has to be the one the target names.
+        if crate::project::ProjectModule::serves(entry.method) {
+            crate::project::ProjectModule::check_subject(entry.method, mutation)
+                .map_err(|error| error.to_protocol_error())?;
         }
         // The target and the parameters have to name the same subject. One that pointed at a
         // session the grant admits and carried another in its parameters would act on the one

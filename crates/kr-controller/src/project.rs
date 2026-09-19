@@ -375,7 +375,7 @@ where
     })
 }
 
-fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {
+pub(crate) fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {
     ControlFrame::Response(Response {
         request_id,
         outcome: match outcome {
