@@ -490,18 +490,15 @@
   font-family: var(--font-mono);
   font-size: 0.875rem;
   cursor: pointer;
-  /* A key is pressed over and over, so it gives feedback and nothing else. */
-  transition:
-    transform var(--press) var(--ease-out),
-    background-color var(--press) var(--ease-out);
+  /*
+   * A terminal key is pressed several times a second. Its feedback is instant: no travel at
+   * all, and no settling colour either, because 120 ms between every key and the person
+   * seeing that it landed is 120 ms the person feels.
+   */
+  transition: none;
   -webkit-tap-highlight-color: transparent;
 }
 
-/*
- * A terminal key is pressed over and over, sometimes several times a second. It gets colour on the
- * press, which is instant, and no travel at all: a scale that has to settle is a delay between
- * every key and the next.
- */
 .m-key:active {
   background: var(--subtle);
 }
@@ -605,7 +602,6 @@
 @media (prefers-reduced-motion: reduce) {
   .m-row,
   .m-filter,
-  .m-key,
   .m-tab {
     transition-property: background-color, color;
   }

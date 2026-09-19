@@ -6,8 +6,8 @@
 	<string>development</string>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)to.kala.reach.companion.shared</string>
 		<string>$(AppIdentifierPrefix)to.kala.reach.companion</string>
+		<string>$(AppIdentifierPrefix)to.kala.reach.companion.shared</string>
 	</array>
 </dict>
 </plist>

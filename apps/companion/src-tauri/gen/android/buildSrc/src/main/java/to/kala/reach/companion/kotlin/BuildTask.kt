@@ -53,6 +53,17 @@ open class BuildTask : DefaultTask() {
         project.exec {
             workingDir(File(project.projectDir, rootDirRel))
             executable(executable)
+            // A dependency that builds a C library from source runs the archive tools it finds on
+            // the path, and on a developer's machine those are the host's. The host's archiver
+            // produces an empty archive for this target, the shared library then loads with
+            // undefined symbols, and the application fails at start with nothing in the build
+            // output to say why. Naming the toolchain's own tools is what stops that.
+            archiveTools()?.let { tools ->
+                environment("AR", File(tools, "llvm-ar").absolutePath)
+                environment("RANLIB", File(tools, "llvm-ranlib").absolutePath)
+                environment("NM", File(tools, "llvm-nm").absolutePath)
+                environment("STRIP", File(tools, "llvm-strip").absolutePath)
+            }
             args(args)
             if (project.logger.isEnabled(LogLevel.DEBUG)) {
                 args("-vv")
@@ -64,5 +75,20 @@ open class BuildTask : DefaultTask() {
             }
             args(listOf("--target", target))
         }.assertNormalExitValue()
+    }
+
+    /// The toolchain's own binaries, or null when this build cannot find the toolchain.
+    ///
+    /// Null is not a failure here: the build is about to run the command line tool, which reports
+    /// a missing toolchain far better than this task could.
+    fun archiveTools(): File? {
+        val ndk = System.getenv("NDK_HOME")
+            ?: System.getenv("ANDROID_NDK_HOME")
+            ?: System.getenv("ANDROID_NDK_ROOT")
+            ?: return null
+        val prebuilt = File(ndk, "toolchains/llvm/prebuilt")
+        val host = prebuilt.listFiles()?.firstOrNull { File(it, "bin/llvm-ar").exists() }
+            ?: return null
+        return File(host, "bin")
     }
 }

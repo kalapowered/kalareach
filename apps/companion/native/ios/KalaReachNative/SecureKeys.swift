@@ -25,10 +25,25 @@ enum StoredKeyPurpose: String {
 /// Writes and removes keys the application owns.
 struct SecureKeys {
     /// The group the extension shares, or nil when this build states none.
-    let accessGroup: String?
+    let sharedGroup: String?
+    /// This application's own group, which the extension is not entitled to.
+    let privateGroup: String?
 
-    init(accessGroup: String? = PreviewKeyLocation.shared.accessGroup) {
-        self.accessGroup = accessGroup
+    init(
+        sharedGroup: String? = PreviewKeyLocation.shared.accessGroup,
+        privateGroup: String? = PreviewKeyLocation.resolvedPrivateGroup()
+    ) {
+        self.sharedGroup = sharedGroup
+        self.privateGroup = privateGroup
+    }
+
+    /// The group one purpose's key belongs in.
+    ///
+    /// Every write names one. A write that named none would be filed in whichever group the
+    /// entitlement happens to list first, which is a decision about who can read a key being made
+    /// by the order of two lines in a build description.
+    func group(for purpose: StoredKeyPurpose) -> String? {
+        purpose == .notificationPreview ? sharedGroup : privateGroup
     }
 
     /// Stores one key, replacing whatever was filed under the same account.
@@ -43,16 +58,15 @@ struct SecureKeys {
             // machine nobody authorised.
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        // Only the preview key is shared with the extension. The authorisation key stays in the
-        // application's own keychain, where an extension cannot reach it at all.
-        if purpose == .notificationPreview {
-            guard let accessGroup else {
-                // Writing it into this process's own group would put a key where the extension
-                // cannot read it, and the person would see generic alerts with no explanation.
-                return errSecMissingEntitlement
-            }
-            item[kSecAttrAccessGroup as String] = accessGroup
+        // Only the preview key is shared with the extension. The authorisation key goes in this
+        // application's own group, where an extension cannot reach it at all. Both are named:
+        // leaving one out files it wherever the entitlement list happens to begin.
+        guard let group = group(for: purpose) else {
+            // Without a group there is nowhere this key can be filed that the right reader will
+            // look in, and filing it in the wrong one is worse than not filing it.
+            return errSecMissingEntitlement
         }
+        item[kSecAttrAccessGroup as String] = group
         SecItemDelete(item as CFDictionary)
         return SecItemAdd(item as CFDictionary, nil)
     }
@@ -64,8 +78,8 @@ struct SecureKeys {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: purpose.rawValue,
         ]
-        if purpose == .notificationPreview, let accessGroup {
-            query[kSecAttrAccessGroup as String] = accessGroup
+        if let group = group(for: purpose) {
+            query[kSecAttrAccessGroup as String] = group
         }
         return SecItemDelete(query as CFDictionary)
     }

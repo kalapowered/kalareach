@@ -29,14 +29,25 @@ Two things a build needs to know:
   pages and refuse a library linked for 4 KB ones, so `app/build.gradle.kts` names NDK 28, whose
   linker aligns to 16 KB by default. Point `NDK_HOME` at the same one: the Rust half of the build
   reads that variable and Gradle reads the setting.
+- **An Android build needs the toolchain's archive tools in its environment.** One dependency
+  builds a C library from source and runs whatever `ar`, `ranlib` and `nm` it finds. On a
+  developer's machine those are the host's, the host's archiver produces an *empty* archive for
+  this target, and the application then installs and fails at start with an undefined symbol and
+  nothing in the build output to explain it. The Gradle task sets them for a build started from
+  Android Studio; a build started from the command line needs them stated:
+
+  ```sh
+  export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+  tools="$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+  AR="$tools/llvm-ar" RANLIB="$tools/llvm-ranlib" NM="$tools/llvm-nm" \
+    pnpm -C apps/companion exec tauri android build --debug --target aarch64
+  ```
 - **An iOS build writes into `src-tauri/gen/apple/build` and will not write over itself.** A second
   run in the same tree stops at "Directory not empty"; remove that directory first.
 
-**The Android application does not start on a device yet**, and the reason is the one thing in the
-graph that does not cross-compile: libsodium. Its build produces an empty archive for
-`aarch64-linux-android`, so the shared library loads with `sodium_init` undefined and the activity
-fails at launch. The application's own code, the Kotlin half and the packaging are all in place;
-what is missing is a libsodium the Android linker can use.
+Both applications install and start on a simulator: the iOS one on an iPhone 17 Pro running iOS
+26.5, the Android one on an API 36 emulator. Each opens on the attention inbox and says there is no
+host on this device, which is the truth about a phone that has not been paired with one.
 
 ## One bundle, two shells
 
@@ -139,10 +150,12 @@ both places, is:
 4. A preview that does not decrypt shows the generic alert.
 5. Only a key that opened a live envelope addressed to this device replaces the alert.
 
-The key is a limited preview key and nothing else: on iOS it belongs in a Keychain access group the
-extension is entitled to and the device authorisation key is not, and on Android it is wrapped by
-the hardware-backed keystore. The iOS group is named but not yet resolved from the build, so on a
-device the extension finds no key and shows the generic alert. Nothing here can decrypt yet either:
+The key is a limited preview key and nothing else. On iOS it is in a Keychain access group the
+extension is entitled to; the device authorisation key is in this application's own group, which is
+listed first so that a write naming no group cannot land in the shared one. Both groups carry the
+team prefix the build resolves, and a build that states none refuses to read or write rather than
+searching its own default group. On Android the key is wrapped by the hardware-backed keystore.
+Nothing here can decrypt yet:
 the sealing construction belongs to the shared client library and neither the extension nor the
 worker links it, so every preview falls back to the generic alert, which is the specified
 behaviour for a preview that cannot be opened. Neither the extension nor the background worker can sign anything —

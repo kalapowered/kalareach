@@ -27,7 +27,6 @@
 		7999A20AD4AAB5D34E7ABE73 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
 		865E8AD7457D4A8EC288015A /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5AAECC7799B8A609EB72D33A /* AVFoundation.framework */; };
 		8C8D5305283EBB3006AE42A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
-		8CE20AA17B4AA21E1A84B19E /* libapp.a in Resources */ = {isa = PBXBuildFile; fileRef = D2F94BCB7283BE2B071B831A /* libapp.a */; };
 		94997D5DBE6F90518D2BE6DD /* ShareSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF8072943115F58C78CD7C9 /* ShareSurface.swift */; };
 		9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
 		9F96FAB734A2805527D6C967 /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
@@ -314,7 +313,7 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		"TEMP_42D3DF53-7B1C-4A4B-BA72-538DD4F56879" /* x86_64 */ = {
+		"TEMP_AA18E364-5857-48D6-99AB-9216162E3DBD" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -420,7 +419,6 @@
 				1128549C68FB9201F70F942C /* Assets.xcassets in Resources */,
 				A8E17259F8663586A25787F6 /* LaunchScreen.storyboard in Resources */,
 				1A05E5428BA1AFDCFB0F6367 /* assets in Resources */,
-				8CE20AA17B4AA21E1A84B19E /* libapp.a in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

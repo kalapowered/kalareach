@@ -89,7 +89,11 @@ targets:
     sources:
       - path: Sources
       - path: Assets.xcassets
+      # The Rust archive is linked, not carried: naming the directory as a source makes the
+      # generator put every archive it finds into the application's resources, which is most of a
+      # gigabyte of a file the application never opens.
       - path: Externals
+        buildPhase: none
       - path: companion-tauri_iOS
       # The native half of the application: push registration, secure keys, the audio session,
       # the share sheet and the signing rule. Hand written, and kept outside this generated
@@ -138,9 +142,13 @@ targets:
       path: companion-tauri_iOS/companion-tauri_iOS.entitlements
       properties:
         aps-environment: development
+        # This application's own group first, and that order is the point: the platform adds an
+        # item with no group named to the *first* group in this list. The extension is entitled to
+        # the shared one, so a default write into it would put the device authorisation key where
+        # the extension could read it.
         keychain-access-groups:
-          - $(AppIdentifierPrefix)to.kala.reach.companion.shared
           - $(AppIdentifierPrefix)to.kala.reach.companion
+          - $(AppIdentifierPrefix)to.kala.reach.companion.shared
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

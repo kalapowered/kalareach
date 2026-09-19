@@ -693,8 +693,7 @@ mod platform {
     use super::{BootIdentity, ProcessStartIdentity, ProcessStartSource, Result, unavailable};
 
     /// What every refusal in this module says, after the name of what was asked for.
-    const SANDBOXED: &str =
-        "this Apple system sandboxes an application away from process and boot identity; there is \
+    const SANDBOXED: &str = "this Apple system sandboxes an application away from process and boot identity; there is \
          no host on this device to identify";
 
     pub(super) fn boot_identity() -> Result<BootIdentity> {
@@ -709,7 +708,10 @@ mod platform {
     }
 
     pub(super) fn processes_in_group(group: u32) -> Result<Vec<u32>> {
-        Err(unavailable("process group", format!("group {group}: {SANDBOXED}")))
+        Err(unavailable(
+            "process group",
+            format!("group {group}: {SANDBOXED}"),
+        ))
     }
 
     pub(super) fn processes_on_terminal(terminal: u32) -> Result<Vec<u32>> {

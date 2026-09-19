@@ -36,8 +36,11 @@ struct PreviewKeyLocation {
     /// The service the item is filed under.
     let service: String
 
-    /// The key the build writes the resolved group under.
+    /// The key the build writes the shared group under.
     static let groupKey = "KRSharedKeychainGroup"
+
+    /// The key the build writes this application's own group under.
+    static let privateGroupKey = "KRPrivateKeychainGroup"
 
     /// The location this build uses.
     ///
@@ -51,7 +54,16 @@ struct PreviewKeyLocation {
 
     /// Reads the group the build resolved, refusing anything still carrying a build variable.
     static func resolvedGroup(bundle: Bundle = .main) -> String? {
-        guard let stated = bundle.object(forInfoDictionaryKey: groupKey) as? String,
+        group(named: groupKey, in: bundle)
+    }
+
+    /// Reads this application's own group, which the extension is not entitled to.
+    static func resolvedPrivateGroup(bundle: Bundle = .main) -> String? {
+        group(named: privateGroupKey, in: bundle)
+    }
+
+    private static func group(named key: String, in bundle: Bundle) -> String? {
+        guard let stated = bundle.object(forInfoDictionaryKey: key) as? String,
             !stated.isEmpty,
             !stated.contains("$(")
         else {
