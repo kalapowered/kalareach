@@ -1247,10 +1247,22 @@ fn operation_for(
                             .to_owned(),
                     ));
                 };
+                // The same rule a deletion's revert is under: what the base holds has to be file
+                // content. A path whose base is a link or a submodule reaches here when a version
+                // holds content at a name the base recorded as something else, and writing that
+                // object out as a regular file would put back what the base never held.
+                let mode = entry.base_mode.0.as_deref().unwrap_or("100644");
+                if !crate::capture::REGULAR_MODES.contains(&mode) {
+                    return Ok(Operation::Refuse(
+                        "what the base revision holds for this path is not file content, so this \
+                         host does not write it out as a regular file"
+                            .to_owned(),
+                    ));
+                }
                 let bytes = read_object(service.project().profile(), repository, object_id)?;
                 Ok(Operation::Install {
                     bytes,
-                    executable: entry.executable,
+                    executable: mode == "100755",
                 })
             } else {
                 Ok(Operation::Install {
@@ -1564,7 +1576,7 @@ fn install(
             .handle_mut()
             .sync_all()
             .map_err(ChangeSetError::storage)?;
-        let carried = match carry_permissions(&here, &leaf_name, &staged, executable)? {
+        let carried = match carry_permissions(&here, &leaf_name, &temporary, &staged, executable)? {
             Some(mode) => mode,
             None => {
                 return Ok(Installed::Unresolved(
@@ -1820,6 +1832,7 @@ const PERMISSION_BITS: u32 = 0o7777;
 fn carry_permissions(
     destination: &AuthorisedDirectory,
     leaf: &RelativeName,
+    temporary: &RelativeName,
     staged: &kr_transfer::AuthorisedFile,
     executable: bool,
 ) -> Result<Option<u32>> {
@@ -1850,7 +1863,7 @@ fn carry_permissions(
     // file created inside it. The copy this host just made would then reach the destination
     // carrying protection the file it replaces never had, and the mode bits alone would not say
     // so. It is taken off the copy before the mode is set, or the path is left alone.
-    if !clear_inherited_access_control(staged) {
+    if !clear_inherited_access_control(staged, destination, temporary) {
         return Ok(None);
     }
     // Through the handle this host created a moment ago, not through the name: a name reopened is
@@ -1867,7 +1880,11 @@ fn carry_permissions(
 /// Returns false when the copy carries one this host could not take off, because publishing it
 /// would give the destination protection the file it replaces never had.
 #[cfg(target_os = "linux")]
-fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool {
+fn clear_inherited_access_control(
+    staged: &kr_transfer::AuthorisedFile,
+    _destination: &AuthorisedDirectory,
+    _temporary: &RelativeName,
+) -> bool {
     match rustix::fs::fremovexattr(staged.handle(), "system.posix_acl_access") {
         // There was one and it is off.
         Ok(()) => true,
@@ -1877,19 +1894,32 @@ fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool 
     }
 }
 
-/// Returns true: an inherited list is not taken off the staged copy on this platform.
+/// Returns false when the copy this host staged inherited an access-control list.
 ///
-/// `exacl` reads and writes by path, and the staged copy's name is the one name here this host
-/// must not resolve a second time. A directory with an inheritable entry therefore publishes a
-/// copy carrying it, which is a stated limit rather than something this host establishes.
+/// A directory can carry an inheritable entry, and every file made inside it then carries a list
+/// the file being replaced never had. `exacl` reads by path, so this is asked of a name, and it is
+/// asked only to **refuse**: a copy that answers "there is a list" ends the operation and the
+/// destination is left exactly as it was. Nothing is written back through that name.
 #[cfg(target_os = "macos")]
-fn clear_inherited_access_control(_staged: &kr_transfer::AuthorisedFile) -> bool {
-    true
+fn clear_inherited_access_control(
+    _staged: &kr_transfer::AuthorisedFile,
+    destination: &AuthorisedDirectory,
+    temporary: &RelativeName,
+) -> bool {
+    let path = destination.host_path(temporary);
+    match exacl::getfacl(&path, None) {
+        Ok(entries) => entries.is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// Returns true: this platform has no list for a new file to inherit.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn clear_inherited_access_control(_staged: &kr_transfer::AuthorisedFile) -> bool {
+fn clear_inherited_access_control(
+    _staged: &kr_transfer::AuthorisedFile,
+    _destination: &AuthorisedDirectory,
+    _temporary: &RelativeName,
+) -> bool {
     true
 }
 
@@ -1980,6 +2010,7 @@ fn has_extended_access_control(
 fn carry_permissions(
     _destination: &AuthorisedDirectory,
     _leaf: &RelativeName,
+    _temporary: &RelativeName,
     _staged: &kr_transfer::AuthorisedFile,
     _executable: bool,
 ) -> Result<Option<u32>> {

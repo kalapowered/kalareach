@@ -906,23 +906,12 @@ pub fn release(
                         .into(),
                 });
             }
-            // The identity alone says this is the object whose identity was recorded; it does not
-            // say the recording was of a directory this host made rather than one substituted
-            // between its creation and its opening. What says that is the **content**: every file
-            // this materialisation wrote is still the object it wrote, at the path it wrote it.
-            // A directory somebody else put there does not hold them, and nothing is removed from
-            // it.
-            let record: MaterialisationRecord = decode_stored(&row.record)?;
-            if let Some(missing) = unwritten_by_this_host(&directory, &record) {
-                return Err(ChangeSetError::StorageUnavailable {
-                    detail: format!(
-                        "the directory at this materialisation's name does not hold what this \
-                         host wrote into it ({missing}), so nothing was removed and nothing is \
-                         recorded as released"
-                    )
-                    .into(),
-                });
-            }
+            // The identity is what establishes it, together with the two things the creation
+            // established: the name was **made** rather than opened, and what the open reached
+            // was **empty**. Everything beneath it is therefore this host's own writing and
+            // whatever the run it served put there. Nothing is asked about the content, because a
+            // run that rewrote, replaced or removed a file this host wrote is the ordinary case a
+            // materialisation exists for.
             empty(&directory, 0)?;
             // The name goes last, and only as an empty-directory removal, which takes nothing that
             // holds anything. What is left is the limit every removal by name has: an empty
@@ -945,58 +934,6 @@ pub fn release(
         .locked()?
         .release_materialisation(materialisation_id, &encode_stored(&record)?, now)?;
     Ok(record)
-}
-
-/// Returns the first thing this host wrote that the directory does not hold any more.
-///
-/// Ownership, established from content rather than from a name: a materialisation records the
-/// device, the file number and the length of every file it wrote, and a directory that still holds
-/// all of them is the directory this host wrote into. One substituted for it between the creation
-/// and the opening holds none of them, and nothing is taken out of it.
-///
-/// A materialisation that wrote nothing at all has nothing to establish this with, and answers
-/// that: an empty version's directory is released on its recorded identity alone.
-fn unwritten_by_this_host(
-    directory: &AuthorisedDirectory,
-    record: &MaterialisationRecord,
-) -> Option<String> {
-    for observed in &record.observed {
-        let Ok(name) = RelativeName::parse(&observed.path) else {
-            return Some(observed.path.clone());
-        };
-        let mut here = match clone_handle(directory) {
-            Ok(handle) => handle,
-            Err(_) => return Some(observed.path.clone()),
-        };
-        let components = name.components();
-        let Some((leaf, parents)) = components.split_last() else {
-            return Some(observed.path.clone());
-        };
-        for component in parents {
-            let Ok(part) = RelativeName::parse(component) else {
-                return Some(observed.path.clone());
-            };
-            match here.subdirectory(&part) {
-                Ok(next) => here = next,
-                Err(_) => return Some(observed.path.clone()),
-            }
-        }
-        let Ok(part) = RelativeName::parse(leaf) else {
-            return Some(observed.path.clone());
-        };
-        match here.open_read(&part, ObjectPolicy::ReadableFile) {
-            Ok(file) => {
-                let identity = file.identity();
-                if identity.device != observed.device.get()
-                    || identity.file_id != observed.file_id.get()
-                {
-                    return Some(observed.path.clone());
-                }
-            }
-            Err(_) => return Some(observed.path.clone()),
-        }
-    }
-    None
 }
 
 /// Empties one directory through its own open handle.

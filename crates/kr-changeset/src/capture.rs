@@ -123,9 +123,6 @@ impl<'a> std::ops::Deref for Scope<'a> {
 /// would make a materialisation a different tree, so both are named and left out.
 pub(crate) const REGULAR_MODES: &[&str] = &["100644", "100755"];
 
-/// The most a `.git` file is read for the one line it holds.
-const MAX_GIT_FILE_BYTES: u64 = 4096;
-
 /// What the capture is asked to read.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureRequest<'a> {
@@ -613,10 +610,11 @@ fn exactly<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str> {
 /// Expands one directory entry into the files it holds.
 ///
 /// The walk goes through the authorised directory handle, so nothing outside the working tree is
-/// reached and a link is neither followed nor counted as content. Three things stop it: a
-/// directory the grant excludes, a directory a secret rule covers, and a directory named `.git`,
-/// which holds a repository's own administrative data including its remotes and any credential a
-/// configuration file carries.
+/// reached and a link is neither followed nor counted as content. Four things stop it: a directory
+/// the grant excludes, a directory a secret rule covers, a directory named `.git`, which holds a
+/// repository's own administrative data including its remotes and any credential a configuration
+/// file carries, and a directory that **holds** a `.git` entry, which is another repository's tree
+/// and is never read inside.
 #[allow(clippy::too_many_arguments)]
 fn walk(
     tree: &kr_transfer::AuthorisedDirectory,
@@ -671,12 +669,26 @@ fn walk(
         });
         return Ok(());
     };
-    // Another repository nested in this tree keeps its administrative data wherever its own `.git`
-    // says. The name rule catches a `.git` directory; it cannot catch a `.git` **file** that points
-    // at a directory of any other name beside it, and reading that directory would reach that
-    // repository's configuration, which holds its remotes and can hold a credential, and its
-    // object database. So the location is resolved here and refused by name in this directory.
-    let nested = nested_administrative_directory(&directory);
+    // A directory holding a `.git` entry of any kind is **another repository's tree**, and this
+    // host never reads inside one. The name rule catches a `.git` directory, but a `.git` file
+    // points that repository's data at a directory of any name, by any spelling, anywhere it can
+    // reach: beside it, above it, or through a link. Nothing this walk could resolve would answer
+    // every one of those, and reading the wrong answer means capturing a repository's
+    // configuration, which holds its remotes and can hold a credential, and its object database.
+    // So the whole tree is one entry and this walk stops at it, which is what it already does for
+    // a submodule.
+    if directory
+        .handle()
+        .symlink_metadata(grant::ADMINISTRATIVE_DIRECTORY)
+        .is_ok()
+    {
+        out.push(kr_project::workspace::StatusEntry {
+            path: prefix.to_owned(),
+            class,
+            change: ChangeKind::Present,
+        });
+        return Ok(());
+    }
     let entries = directory
         .handle()
         .entries()
@@ -692,16 +704,6 @@ fn walk(
         })?;
         let child = format!("{prefix}/{file_name}");
         let kind = entry.file_type().map_err(ChangeSetError::storage)?;
-        if nested.as_deref() == Some(file_name.as_str()) {
-            // One entry for the whole of it, so the content read records the exclusion with its
-            // reason rather than the path going missing. Nothing beneath it is listed.
-            out.push(kr_project::workspace::StatusEntry {
-                path: child,
-                class,
-                change: ChangeKind::Present,
-            });
-            continue;
-        }
         if *budget == 0 {
             return Err(ChangeSetError::QuotaExceeded {
                 detail: format!(
@@ -1075,69 +1077,6 @@ fn store_base_content(
     let bytes = read_object(profile, repository, object_id)?;
     budget.charge(bytes.len() as u64)?;
     store.put(&bytes).map(Some)
-}
-
-/// Returns the entry of this directory a nested repository keeps its own data under.
-///
-/// A `.git` file holds one line, `gitdir: <path>`, and Git accepts many spellings of one place:
-/// `repo-data`, `./repo-data`, `data/repo-data`, or the whole absolute path. Each is resolved
-/// against this directory's own location and reduced to **the first component**, which is the
-/// entry this walk must not descend into. A target that resolves outside this directory is one
-/// the walk never reaches from here, so it answers nothing.
-fn nested_administrative_directory(directory: &kr_transfer::AuthorisedDirectory) -> Option<String> {
-    use std::io::Read as _;
-
-    let name = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY).ok()?;
-    let mut file = directory
-        .open_read(&name, ObjectPolicy::ReadableFile)
-        .ok()?;
-    if file.byte_len() > MAX_GIT_FILE_BYTES {
-        return None;
-    }
-    let mut text = String::new();
-    file.handle_mut()
-        .take(MAX_GIT_FILE_BYTES)
-        .read_to_string(&mut text)
-        .ok()?;
-    let target = text.trim().strip_prefix("gitdir:")?.trim();
-    if target.is_empty() {
-        return None;
-    }
-    let here = directory.host_path(&name);
-    let here = here.parent()?;
-    let resolved = if std::path::Path::new(target).is_absolute() {
-        std::path::PathBuf::from(target)
-    } else {
-        here.join(target)
-    };
-    let resolved = lexical_components(&resolved);
-    let inside = lexical_components(here);
-    if resolved.len() <= inside.len() || resolved[..inside.len()] != inside[..] {
-        return None;
-    }
-    resolved
-        .get(inside.len())
-        .and_then(|part| part.clone().into_string().ok())
-}
-
-/// Reduces one path to its components without touching the filesystem.
-///
-/// `.` goes, `..` cancels the component before it, and a root or prefix starts the list again. No
-/// name is resolved: this is arithmetic on a path, used only to decide which entry of one
-/// directory another path names.
-fn lexical_components(path: &std::path::Path) -> Vec<std::ffi::OsString> {
-    let mut parts: Vec<std::ffi::OsString> = Vec::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                parts.pop();
-            }
-            std::path::Component::Normal(part) => parts.push(part.to_owned()),
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => parts.clear(),
-        }
-    }
-    parts
 }
 
 /// Returns true when one path is this repository's own administrative data.

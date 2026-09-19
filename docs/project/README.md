@@ -637,14 +637,14 @@ which is a mechanism the workflow service owns rather than this one.
 The grant and the rules decide before anything is opened, in this order, and a path any of them
 removes is never opened at all:
 
-1. A repository's own administrative data, by name and by where a repository actually keeps it.
-   `.git` in any component is refused whatever its case; so is the directory **this** repository
-   resolves its own data to, which a `.git` file can point at under any name inside the same tree;
-   and so is the same directory of any repository nested in the tree, resolved from that
-   repository's own `.git` as the walk meets it. Git reports an untracked nested repository as one
-   directory, and descending into it would reach its configuration, which holds its remotes and can
-   hold a credential, and its object database, which holds every version of every file in it. The
-   nested repository's **content** is captured; only its own data is not.
+1. A repository's own administrative data, and any other repository's whole tree. `.git` in any
+   component is refused whatever its case; so is the directory **this** repository resolves its own
+   data to, which a `.git` file can point at under any name inside the same tree; and a directory
+   that **holds** a `.git` entry is another repository, which this host does not read inside at
+   all. A `.git` file points a repository's data anywhere it can reach, under any name and by any
+   spelling, so the tree is what is refused rather than a location guessed from it. What is inside
+   would otherwise be that repository's configuration, which holds its remotes and can hold a
+   credential, and its object database, which holds every version of every file in it.
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field
    turns them off, and the version records that they were applied.
@@ -701,8 +701,9 @@ path the version's working tree deleted is taken away. A deletion travels with t
 revision held, its mode, and, for a version captured from a repository, this host's own copy of
 that content, so a revert puts the file back without depending on the destination's repository
 still holding the object. A version **derived** from a materialisation is read from a directory
-rather than from a repository, so its deletions carry the object and the mode but no content, and
-reverting one of those does read the destination's repository. A version whose only change is a
+rather than from a repository, so a deletion it records for the first time carries the object and
+the mode but no content, and reverting that one does read the destination's repository. A deletion
+it carries forward from the version it came from keeps whatever that version held for it. A version whose only change is a
 deletion reads as that change rather than as an empty diff. What the base held has to be file
 content either way: a deleted link or submodule is a revert this host refuses rather than writing
 out as a regular file. A
@@ -737,12 +738,12 @@ replace. What it carries is the platform's mode bits. An access-control list bes
 **not** carry, and a destination that has one is a path it refuses rather than replaces, so the
 protection is never lost quietly. That is the answer on macOS, which keeps a list beside the mode
 bits, and on Linux, where the question is whether the file carries the extended attribute a list
-lives in: a file whose protection is its mode bits alone carries none. A directory can also put a
-list on every file made inside it, so the copy this host stages is asked as well and, on Linux,
-that inherited list is taken off it before the mode is set; on macOS it is not, which is a limit
-this host states rather than one it closes. On a platform whose lists this host does not read,
-only the mode bits are carried. **Preserving** a destination's list is not implemented at all: a
-destination that has one is refused. Content is written byte for
+lives in: a file whose protection is its mode bits alone carries none. A directory can also put a list on every file made
+inside it, so the copy this host stages is asked as well: on Linux that inherited list is taken off
+it before the mode is set, and on macOS a copy that has one ends the operation and the destination
+is left exactly as it was. On a platform whose lists this host does not read, only the mode bits
+are carried. **Preserving** a destination's own list is not implemented at all: a destination that
+has one is refused. Content is written byte for
 byte, so a line ending is whatever the version holds.
 
 An apply comes to one of five classes. **A preflight conflict is an error, not a result**:

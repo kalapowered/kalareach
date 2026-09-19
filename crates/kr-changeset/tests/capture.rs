@@ -921,21 +921,26 @@ fn a_nested_repository_s_own_data_is_never_captured() {
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>()
     );
-    // The nested repository's own content is captured; its administrative data is not.
-    assert!(manifest.path("vendor/inner/inner.txt").is_some());
+    // The nested repository is another repository's tree, and this host does not read inside one:
+    // neither its administrative data nor its content reaches the version, and the whole of it is
+    // named as one thing this host would not capture.
+    assert!(manifest.path("vendor/inner/inner.txt").is_none());
     assert!(
-        record.exclusions.iter().any(
-            |entry| entry.path.contains(".git") && entry.reason == ExclusionReason::Unsupported
-        ),
+        record
+            .exclusions
+            .iter()
+            .any(|entry| entry.path == "vendor/inner"
+                && entry.reason == ExclusionReason::Unsupported),
         "the exclusion names it: {:?}",
         record.exclusions
     );
 }
 
-/// KR-REQ-14.33: a nested repository that keeps its data under another name is refused too.
+/// KR-REQ-14.33: a nested repository is refused however it keeps its own data.
 ///
-/// A `.git` **file** points a repository's administrative data at a directory of any name inside
-/// the same tree. The name rule cannot see that one, so the location is resolved and refused.
+/// A `.git` **file** points a repository's administrative data at a directory of any name, by any
+/// spelling, anywhere it can reach. Nothing the walk could resolve would answer every one of them,
+/// so the answer is the tree itself: this host does not read inside another repository.
 #[test]
 fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
     let fixture = Fixture::create();
@@ -953,66 +958,48 @@ fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
         ],
     );
     write(&nested, "inner.txt", "inner content\n");
-    // Exactly what a repository made with a separate Git directory looks like from the tree, in
-    // the spelling Git itself writes for a relative one.
     std::fs::rename(nested.join(".git"), nested.join("repo-data"))
         .expect("the repository keeps its data under another name");
-    std::fs::write(nested.join(".git"), b"gitdir: ./repo-data\n").expect("and points at it");
-
     let workspace = fixture.workspace("renamed-tree");
-    let record = fixture.capture(workspace, &include_everything());
-    let manifest = fixture
-        .service()
-        .manifest(record.change_set_id, record.version)
-        .expect("its manifest");
-    assert!(
-        manifest
-            .paths
-            .iter()
-            .all(|entry| !entry.path.contains("vendor/inner/repo-data")),
-        "nothing of the nested repository's own data is captured: {:?}",
-        manifest
-            .paths
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        manifest.path("vendor/inner/inner.txt").is_some(),
-        "and the nested repository's content still is"
-    );
-    assert!(
-        record
-            .exclusions
-            .iter()
-            .any(|entry| entry.path == "vendor/inner/repo-data"),
-        "the exclusion names it: {:?}",
-        record.exclusions
-    );
 
-    // And the same repository pointed at by its whole absolute path, which Git also accepts.
-    std::fs::write(
-        nested.join(".git"),
-        format!("gitdir: {}\n", nested.join("repo-data").display()).as_bytes(),
-    )
-    .expect("the absolute spelling of the same place");
-    let record = fixture.capture(workspace, &include_everything());
-    let manifest = fixture
-        .service()
-        .manifest(record.change_set_id, record.version)
-        .expect("its manifest");
-    assert!(
-        manifest
-            .paths
-            .iter()
-            .all(|entry| !entry.path.contains("vendor/inner/repo-data")),
-        "the spelling does not decide it: {:?}",
-        manifest
-            .paths
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect::<Vec<_>>()
-    );
+    // Every spelling Git accepts for the same place, including one that points above the nested
+    // tree and one that names the whole absolute path.
+    for target in [
+        "repo-data".to_owned(),
+        "./repo-data".to_owned(),
+        nested.join("repo-data").display().to_string(),
+    ] {
+        std::fs::write(
+            nested.join(".git"),
+            format!("gitdir: {target}\n").as_bytes(),
+        )
+        .expect("and points at it");
+        let record = fixture.capture(workspace, &include_everything());
+        let manifest = fixture
+            .service()
+            .manifest(record.change_set_id, record.version)
+            .expect("its manifest");
+        assert!(
+            manifest
+                .paths
+                .iter()
+                .all(|entry| !entry.path.starts_with("vendor/inner/")),
+            "nothing inside another repository is captured under {target}: {:?}",
+            manifest
+                .paths
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            record
+                .exclusions
+                .iter()
+                .any(|entry| entry.path == "vendor/inner"),
+            "the exclusion names the tree under {target}: {:?}",
+            record.exclusions
+        );
+    }
 }
 
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
