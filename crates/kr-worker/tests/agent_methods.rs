@@ -257,6 +257,28 @@ impl kr_worker::broker::DraftResolver for KnownDrafts {
     }
 }
 
+/// A transport that will not admit the operation it is offered.
+///
+/// A connector whose qualified tables name no method for an operation is this: the refusal
+/// belongs to admission, before anything is claimed or marked.
+#[derive(Debug, Default)]
+struct RefusingUpstream;
+
+impl UpstreamDispatch for RefusingUpstream {
+    fn admit(&self, _request: &kr_worker::broker::UpstreamRequest) -> Result<(), BrokerError> {
+        Err(BrokerError::UnsupportedCapability {
+            detail: "this upstream names no method for it".to_owned(),
+        })
+    }
+
+    fn submit(
+        &self,
+        _request: &kr_worker::broker::UpstreamRequest,
+    ) -> Result<kr_worker::broker::UpstreamOutcome, BrokerError> {
+        panic!("a transport that admits nothing is never asked to carry anything")
+    }
+}
+
 /// A broker with every capability the agent mutations need, and a transport that records.
 fn agent_broker_with(upstream: std::sync::Arc<RecordingUpstream>) -> Broker {
     let broker = agent_broker();
@@ -1820,4 +1842,65 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
         "and nothing carries a plan this host did not validate"
     );
     assert_eq!(upstream.submitted().len(), 1, "nothing more was written");
+}
+
+/// KR-REQ-12.06 and KR-REQ-11.27: a transport that cannot carry an answer refuses it at
+/// admission, gives the resource back, and lets the next answer through.
+#[test]
+fn kr_req_12_06_a_transport_that_cannot_carry_an_answer_gives_the_resource_back() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let opaque = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            br#"{"id":11,"method":"session/request_permission"}"#,
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let resource = broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("interpreted");
+    let params = AgentApprovalRespondParams {
+        target: target(1),
+        resource_id: resource.resource_id,
+        option_id: "allow".to_owned(),
+    };
+
+    // The connection's transport cannot carry this answer.
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        std::sync::Arc::new(RefusingUpstream) as _,
+    );
+    let refusal = broker
+        .admit_approval(&caller(), &params, TimestampMs::new(4))
+        .expect_err("nothing carries this answer");
+    assert_eq!(refusal.code(), ErrorCode::UnsupportedCapability);
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .expect("retained")
+            .state,
+        PendingState::Pending,
+        "and the resource is still answerable"
+    );
+
+    // A transport that can carry it answers it, which is what proves the claim went back.
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        std::sync::Arc::clone(&upstream) as _,
+    );
+    let answered = broker
+        .agent_approval_respond(&caller(), &params, TimestampMs::new(5))
+        .expect("the next answer is applied")
+        .0;
+    assert_eq!(answered.state, PendingState::Resolved);
+    assert_eq!(upstream.submitted().len(), 1);
 }

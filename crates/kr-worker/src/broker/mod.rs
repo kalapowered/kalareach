@@ -1924,38 +1924,6 @@ impl Broker {
 
     // -- the gateway --------------------------------------------------------------------------
 
-    /// Rechecks one invocation's own authority against what this broker holds now.
-    ///
-    /// The token was spent when the component was invited to prepare its plan, so nothing about
-    /// it is proof by the time the plan arrives. This asks again: the binding, its grant, the
-    /// instance's suspension, the revision in force and the capability, all as they stand.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::Grant`], [`BrokerError::StaleBinding`],
-    /// [`BrokerError::UnsupportedCapability`] or [`BrokerError::PreconditionFailed`] as the
-    /// present state requires.
-    pub fn recheck_invocation(
-        &self,
-        binding_id: BrokerBindingId,
-        token: &ActionToken,
-        capability: Option<CapabilityId>,
-    ) -> Result<()> {
-        let invocation = Invocation {
-            actor_id: token.actor_id.clone(),
-            grant: token.grant,
-            grant_id: token.grant_id.as_ref().copied(),
-            application_instance_id: token.application_instance_id,
-            binding_revision: token.binding_revision,
-            action: token.action.clone(),
-            draft_id: token.draft_id.as_ref().copied(),
-            capability: capability.map(|capability| (capability, None)),
-            parameters: Vec::new(),
-        };
-        self.state().check_invocation(binding_id, &invocation)?;
-        Ok(())
-    }
-
     /// Pins one connector's qualified tables for one installation.
     ///
     /// A table is qualified at installation, under the publisher's semantic trust grant, and this
@@ -2685,6 +2653,40 @@ impl BrokerState {
             self.arbitration.commit(transition)?;
         }
         Ok(reconciliation)
+    }
+
+    /// Returns one action's current declaration, under the lock this state is read with.
+    fn registered_action_in(
+        &self,
+        binding_id: BrokerBindingId,
+        action: &ActionName,
+    ) -> Result<Option<crate::broker::methods::RegisteredAction>> {
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        Ok(binding.actions.get(action).cloned())
+    }
+
+    /// Rechecks one spent token's own authority, under the lock this state is read with.
+    fn check_invocation_for(
+        &self,
+        binding_id: BrokerBindingId,
+        token: &ActionToken,
+        capability: Option<CapabilityId>,
+    ) -> Result<BrokerGrants> {
+        let invocation = Invocation {
+            actor_id: token.actor_id.clone(),
+            grant: token.grant,
+            grant_id: token.grant_id.as_ref().copied(),
+            application_instance_id: token.application_instance_id,
+            binding_revision: token.binding_revision,
+            action: token.action.clone(),
+            draft_id: token.draft_id.as_ref().copied(),
+            capability: capability.map(|capability| (capability, None)),
+            parameters: Vec::new(),
+        };
+        self.check_invocation(binding_id, &invocation)
     }
 
     /// Reads one action's current declaration and checks what the call says about it.

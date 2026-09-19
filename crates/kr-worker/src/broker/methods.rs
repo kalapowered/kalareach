@@ -806,9 +806,11 @@ impl Broker {
             .with_body(body)
             .with_approval(claim.clone(), dispatch);
         // The transport is asked about the answer it will actually be given, which is the frame
-        // the core just prepared. A transport that cannot carry it gives the resource back.
+        // the core just prepared. A transport that cannot carry it gives the resource back, under
+        // the lock this admission already holds: going back to the broker for it here would be a
+        // second acquisition of a lock this frame never let go of.
         if let Err(error) = admitted.check_transport() {
-            let _ = self.release_claim(&claim, now);
+            let _ = state.release_claim_in(&claim, now);
             return Err(error);
         }
         Ok(admitted)
@@ -1223,24 +1225,41 @@ impl Broker {
         admitted: &MutationAdmission,
         effect: &kr_protocol::broker::PreparedEffect,
     ) -> Result<()> {
-        let mut held = admitted.held();
-        let permit = held.as_mut().ok_or(BrokerError::AlreadyTransmitted)?;
-        let token = permit
-            .token
-            .clone()
-            .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
-        // The arguments this plan is for are the arguments that will execute. The digest is
-        // computed from them here rather than read from the plan: a hash a component supplied
-        // says only that the component can write a hash.
-        let arguments = match &permit.request.body {
-            UpstreamBody::PluginAction { parameters, .. } => parameters.clone(),
-            _ => {
+        // Everything this invocation was admitted with, read once. The permit's lock is held only
+        // for the read: what follows calls out to the draft store and then takes the broker's own
+        // lock, and holding two locks across either would make the order they are taken in matter.
+        let (token, declared, draft, arguments) = {
+            let held = admitted.held();
+            let permit = held.as_ref().ok_or(BrokerError::AlreadyTransmitted)?;
+            let UpstreamBody::PluginAction { parameters, .. } = &permit.request.body else {
                 return Err(BrokerError::invalid(
                     "an effect plan belongs to a plugin action and this admission carries another \
                      operation",
                 ));
+            };
+            (
+                permit.token.clone().ok_or_else(|| {
+                    BrokerError::invalid("this admission carries no action token")
+                })?,
+                permit.declared.clone().ok_or_else(|| {
+                    BrokerError::invalid("this admission carries no action declaration")
+                })?,
+                permit.draft.clone(),
+                parameters.clone(),
+            )
+        };
+        let binding_id = match admitted.responsible() {
+            Responsible::Binding(binding_id) => binding_id,
+            Responsible::Transport => {
+                return Err(BrokerError::invalid(
+                    "an effect plan belongs to a component invocation and this admission names \
+                     none",
+                ));
             }
         };
+        // The arguments this plan is for are the arguments that will execute. The digest is
+        // computed from them here rather than read from the plan: a hash a component supplied
+        // says only that the component can write a hash.
         let computed =
             kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(arguments.as_slice()));
         if computed != token.parameter_hash {
@@ -1262,66 +1281,6 @@ impl Broker {
                 kr_protocol::broker::TokenError::Mismatch { field: "action" },
             ));
         }
-        let binding_id = match admitted.responsible() {
-            Responsible::Binding(binding_id) => binding_id,
-            Responsible::Transport => {
-                return Err(BrokerError::invalid(
-                    "an effect plan belongs to a component invocation and this admission names \
-                     none",
-                ));
-            }
-        };
-        // The declaration this invocation was admitted against, and the one in force now. They
-        // have to be the same declaration: a package that replaced the action while its component
-        // was working has withdrawn the invitation, and the capability and grant the admission
-        // checked belonged to the declaration it read.
-        let admitted_declaration = permit
-            .declared
-            .clone()
-            .ok_or_else(|| BrokerError::invalid("this admission carries no action declaration"))?;
-        let registered = self
-            .registered_action(binding_id, &token.action)?
-            .ok_or_else(|| {
-                BrokerError::unknown(format!("{} is no longer a registered action", token.action))
-            })?;
-        if registered != admitted_declaration {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{} was admitted under one declaration and another is registered now",
-                    token.action
-                ),
-            });
-        }
-        // And the invocation's own authority, as it stands now. The token was spent to invite the
-        // component to prepare this plan, so it is not proof of anything by the time the plan
-        // arrives: a grant withdrawn, a thread selection advanced or a capability invalidated
-        // while the component was working is a plan this host will not carry.
-        self.recheck_invocation(binding_id, &token, registered.capability.clone())?;
-        if registered.operation != effect.operation {
-            return Err(BrokerError::invalid(format!(
-                "{} is declared as {} and this plan prepares {}",
-                token.action, registered.operation, effect.operation
-            )));
-        }
-        // And the class the declaration carries now. A package that re-registered the action as a
-        // read while its component was working has withdrawn the write this plan asks for.
-        if registered.effect != effect.class {
-            return Err(BrokerError::invalid(format!(
-                "{} is declared {:?} and this plan declares it {:?}",
-                token.action, registered.effect, effect.class
-            )));
-        }
-        // The operation's own grant, checked against the binding as it stands rather than against
-        // the grant the token was issued under: a grant withdrawn while the component was working
-        // is not a grant. An operation no plugin grant covers is refused outright.
-        let needed = effect.operation.grant().ok_or_else(|| {
-            BrokerError::denied(format!(
-                "{} is not something a component grant carries, so no effect plan may ask for it",
-                effect.operation
-            ))
-        })?;
-        let grants = self.grants(binding_id)?;
-        grants.require(needed)?;
         // A read cannot arrive on the write path, and an operation that changes the upstream is
         // not a read whatever the plan calls it.
         if effect.class != EffectClass::Write || !effect.operation.writes() {
@@ -1330,13 +1289,9 @@ impl Broker {
                 effect.operation, effect.class
             )));
         }
-        // And the draft. An operation that acts on one acts on the invocation's own, and a draft
-        // this host cannot resolve is a precondition nobody has established rather than one to
-        // assume.
         // The draft. A plan that names one names the invocation's own, whether the manifest
         // required a draft or not: a component invited to act on nothing cannot acquire a draft by
-        // putting one in its plan. And a draft this host cannot resolve is a precondition nobody
-        // has established rather than one to assume.
+        // putting one in its plan.
         if effect.draft_id.as_ref() != token.draft_id.as_ref() {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
@@ -1352,6 +1307,8 @@ impl Broker {
                 ),
             });
         }
+        // The draft store is not the broker's, so it is asked before the broker's lock is taken
+        // and its answer is what the transaction below is given.
         if let Some(named) = effect.draft_id.as_ref() {
             if !effect.operation.may_act_on_a_draft() {
                 return Err(BrokerError::invalid(format!(
@@ -1359,17 +1316,9 @@ impl Broker {
                     effect.operation
                 )));
             }
-            // The draft this invocation was admitted against, as it was resolved then. Asking the
-            // draft store again here would answer about a moment after the admission.
-            let snapshot =
-                permit
-                    .draft
-                    .as_ref()
-                    .ok_or_else(|| BrokerError::PreconditionFailed {
-                        detail: format!(
-                            "this plan acts on {named} and the invocation resolved no draft"
-                        ),
-                    })?;
+            let snapshot = draft.ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: format!("this plan acts on {named} and the invocation resolved no draft"),
+            })?;
             if &snapshot.draft_id != named {
                 return Err(BrokerError::PreconditionFailed {
                     detail: format!(
@@ -1381,19 +1330,18 @@ impl Broker {
             // And the revision it stood at. A draft that moved while the component was preparing
             // its plan is `DRAFT_CONFLICT`: the plan was made against a draft that is not there
             // any more.
-            let revision = snapshot.revision;
             let current = self.resolve_draft(named)?;
-            if current.revision != revision {
+            if current.revision != snapshot.revision {
                 return Err(BrokerError::PreconditionFailed {
                     detail: format!(
                         "{named} was at revision {} when this invocation was admitted and is at \
                          {} now",
-                        revision.get(),
+                        snapshot.revision.get(),
                         current.revision.get()
                     ),
                 });
             }
-        } else if registered.needs_draft {
+        } else if declared.needs_draft {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
                     "{} acts on a draft and this plan named none",
@@ -1401,9 +1349,57 @@ impl Broker {
                 ),
             });
         }
+        // And then one transaction. The declaration in force, the grant the operation needs and
+        // the invocation's own authority are read together, and the plan becomes executable in
+        // the same operation, so nothing any of them depends on can move between the last check
+        // and the moment the permit will carry the plan.
+        let state = self.state();
+        let registered = state
+            .registered_action_in(binding_id, &token.action)?
+            .ok_or_else(|| {
+                BrokerError::unknown(format!("{} is no longer a registered action", token.action))
+            })?;
+        if registered != declared {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{} was admitted under one declaration and another is registered now",
+                    token.action
+                ),
+            });
+        }
+        if registered.operation != effect.operation {
+            return Err(BrokerError::invalid(format!(
+                "{} is declared as {} and this plan prepares {}",
+                token.action, registered.operation, effect.operation
+            )));
+        }
+        if registered.effect != effect.class {
+            return Err(BrokerError::invalid(format!(
+                "{} is declared {:?} and this plan declares it {:?}",
+                token.action, registered.effect, effect.class
+            )));
+        }
+        // The operation's own grant, checked against the binding as it stands rather than against
+        // the grant the token was issued under: a grant withdrawn while the component was working
+        // is not a grant. An operation no plugin grant covers is refused outright.
+        let needed = effect.operation.grant().ok_or_else(|| {
+            BrokerError::denied(format!(
+                "{} is not something a component grant carries, so no effect plan may ask for it",
+                effect.operation
+            ))
+        })?;
+        // The invocation's own authority, as it stands now. The token was spent to invite the
+        // component to prepare this plan, so it is not proof of anything by the time the plan
+        // arrives: a grant withdrawn, a thread selection advanced or a capability invalidated
+        // while the component was working is a plan this host will not carry.
+        let grants =
+            state.check_invocation_for(binding_id, &token, registered.capability.clone())?;
+        grants.require(needed)?;
         // The plan itself goes into the permit, and the operation it prepares goes into the body
         // that will be transmitted. What reaches the upstream is therefore the plan that was
         // checked, rather than an operation beside a flag saying a plan was seen.
+        let mut held = admitted.held();
+        let permit = held.as_mut().ok_or(BrokerError::AlreadyTransmitted)?;
         if let UpstreamBody::PluginAction { operation, .. } = &mut permit.request.body {
             *operation = Some(effect.operation);
         }
