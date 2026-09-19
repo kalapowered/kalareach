@@ -445,6 +445,8 @@ function Invoke-KrPromoteGesture {
 function Send-KrEditorEnter {
     if (-not $script:Kr.Registered) { return }
     $reader = Get-KrReaderState $script:State
+    # A gesture the person changed takes effect at the prompt it named, which is this one.
+    Invoke-KrPromoteGesture $reader.prompt_generation
     Update-KrGesture $reader.prompt_generation
     Send-KrEvent 'editor_enter' @{
         editor            = New-KrEditor $reader

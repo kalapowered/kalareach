@@ -589,8 +589,8 @@ binds into it: it wraps the host's own read-line entry point for the reader's bo
 editor's own operations so the reader has a boundary to answer at and the states they wait in are
 observable, and puts its end-of-file decision on the configured gesture in front of whatever was
 bound there. A handler the person wrote themselves is left exactly as it is, identified by what the
-editor holds rather than by the name a handler carries, and everything the module installs is put
-back when it is removed.
+editor holds rather than by the name a handler carries, and what the module installed is put back
+when it is removed, except where the person has since bound that key themselves.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
@@ -608,10 +608,10 @@ method, and that is exactly what it cannot do:
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
   state check and the installation all happen on the reader's thread, inside the fence, at a point
   where the reader is between operations: a key of the person's that has been read and not yet run
-  is never one the launch goes in front of. Inside the reader's own key dispatch the editor's own
-  accept ends the read; before the read has started there is nothing to end, so the editor's own
-  return key goes into its own key queue instead, which is drained before anything the terminal
-  has.
+  is never one the launch goes in front of. The editor's own accept is what ends the read, and it
+  ends it when the operation the module answered from returns. Nothing is decided before the read
+  starts, because the editor clears its buffer there and a line installed then is one nobody would
+  run.
 - **A cancellation ends nothing here, and says so.** Every operation that waits for another key
   runs this editor's own read loop, and nothing of the module's runs on the reader's thread while
   one is running, so a cancellation arrives after the operation it was meant for has finished or
@@ -622,10 +622,11 @@ method, and that is exactly what it cannot do:
   range this package was qualified against. Asking the console whether a key is available instead
   would take the lock the editor's own read is holding, and the reader would wait for itself.
 - **What the reader cannot prove, it does not claim.** The editor decodes the terminal's bytes
-  inside its own key read, where nothing of the module's runs, so a sequence half-read there is
-  not in any queue the module can report. The module answers only between operations, which is
-  where that decoding has finished; a fence asked while the reader is blocked on a key is answered
-  at its next step, against the state it has then.
+  inside its own key read, where nothing of the module's runs. What the module reports is the
+  editor's own key queue and the operations it is inside; a sequence the editor has begun to
+  decode and not finished is in neither, so the queue proof here is as good as that queue and no
+  better. A fence asked while the reader is blocked on a key is answered at its next step,
+  against the state it has then.
 - **The buffer belongs to the read that is in progress.** Between one line being accepted and the
   next read starting, the editor still holds the line that has gone; the module reports the buffer
   it is about to have, which is empty, and counts no change the person did not make.

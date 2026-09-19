@@ -222,40 +222,22 @@ function Invoke-KrRemoveInstalled {
     $true
 }
 
-$script:KeyFromConsoleKey = $null
 
 # Accepts the installed line through the editor's own acceptance, once.
 #
-# Where the acceptance goes depends on where the reader is. Inside its own key dispatch the
-# editor's accept is what ends the read, and it takes effect when the operation returns. Before
-# the read has started there is nothing to end, so the editor's own return key goes into its own
-# key queue instead, which is drained before anything the terminal has. The module claims no
-# asynchronous editing method the editor does not have: a line installed at a parked reader is
-# accepted when the reader next steps.
+# The editor's own accept is what ends a read, and it takes effect when the operation it was
+# called from returns. Everything this module answers is answered inside that dispatch, which is
+# why there is one path here and not two: a line installed before the read starts would be
+# cleared by the editor's own initialisation, so no launch is decided there at all.
 function Invoke-KrAcceptLine {
     param([hashtable]$State)
     $State.Installed = ''
-    if ($State.Reading) {
-        try { $script:Rl::AcceptLine() } catch {
-            Write-KrTrace "accept failed: $($_.Exception.Message)"
-            return $false
-        }
-        return $true
+    if (-not $State.Reading) {
+        Write-KrTrace 'the acceptance was asked for outside the reader'
+        return $false
     }
-    try {
-        if ($null -eq $script:KeyFromConsoleKey) {
-            $keyInfo = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo')
-            if ($null -ne $keyInfo) {
-                $script:KeyFromConsoleKey = $keyInfo.GetMethod(
-                    'From', 'Public,NonPublic,Static', $null, [type[]]@([System.ConsoleKey]), $null)
-            }
-        }
-        if ($null -eq $script:KeyFromConsoleKey) { return $false }
-        $singleton = $script:SingletonField.GetValue($null)
-        $queue = $script:QueuedKeysField.GetValue($singleton)
-        $queue.Enqueue($script:KeyFromConsoleKey.Invoke($null, @([System.ConsoleKey]::Enter)))
-    } catch {
-        Write-KrTrace "queueing the acceptance failed: $($_.Exception.Message)"
+    try { $script:Rl::AcceptLine() } catch {
+        Write-KrTrace "accept failed: $($_.Exception.Message)"
         return $false
     }
     $true
