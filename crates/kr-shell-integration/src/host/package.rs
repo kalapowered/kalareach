@@ -127,44 +127,48 @@ impl ShellPackage {
 
     /// Returns a path the record names, as this package's own copy of it.
     ///
-    /// A build records the paths it installed, which are absolute and inside a directory named for
-    /// the package's own identity. A package that was copied somewhere else carries paths that
-    /// point back at the original, and launching that original would be launching a package this
-    /// one only describes. So a recorded path inside this directory is taken as it is, one that is
-    /// not absolute is taken under it, and one that is absolute keeps whatever follows the identity
-    /// component: the layout inside the package is the build's, and where the package is, is this
-    /// installation's. [`PackageSet::discover`] refuses a record whose paths say neither.
+    /// A build records the paths it installed, which are absolute and inside the directory it
+    /// installed the package in. A package that was copied somewhere else carries paths that point
+    /// back at the original, and launching that original would be launching a package this one
+    /// only describes. So where a recorded path sits *inside its package* is the build's business
+    /// and where the package sits is this installation's: the one is taken from the other.
+    /// [`PackageSet::discover`] refuses a record whose paths say neither.
     fn own(&self, recorded: &Path) -> PathBuf {
-        if recorded.starts_with(&self.directory) {
-            return recorded.to_path_buf();
-        }
-        if !recorded.is_absolute() {
-            return self.directory.join(recorded);
-        }
-        match inside_identity(recorded, &self.manifest.identity) {
+        match self.inside(recorded) {
             Some(tail) => self.directory.join(tail),
             None => recorded.to_path_buf(),
         }
     }
 
+    /// Returns where one recorded path sits inside the package, when it sits inside one.
+    fn inside(&self, recorded: &Path) -> Option<PathBuf> {
+        if let Ok(tail) = recorded.strip_prefix(&self.directory) {
+            return contained(tail).then(|| tail.to_path_buf());
+        }
+        if !recorded.is_absolute() {
+            return contained(recorded).then(|| recorded.to_path_buf());
+        }
+        inside_package(recorded, self.kind(), &self.manifest.identity)
+    }
+
     /// Returns whether every path this record names is one this package can answer for.
+    ///
+    /// A record that names something outside the package describes some other installation, and a
+    /// path that climbs out of the package with `..` names one too.
     fn owns_its_paths(&self) -> bool {
-        std::iter::once(self.manifest.shell.executable.as_path())
-            .chain(
-                self.manifest
-                    .shell
-                    .modules
-                    .iter()
-                    .map(|module| Path::new(&module.search_path)),
-            )
-            .chain(std::iter::once(Path::new(
-                &self.manifest.startup_entry.file,
-            )))
-            .all(|recorded| {
-                !recorded.is_absolute()
-                    || recorded.starts_with(&self.directory)
-                    || inside_identity(recorded, &self.manifest.identity).is_some()
-            })
+        !self.manifest.identity.is_empty()
+            && std::iter::once(self.manifest.shell.executable.as_path())
+                .chain(
+                    self.manifest
+                        .shell
+                        .modules
+                        .iter()
+                        .map(|module| Path::new(&module.search_path)),
+                )
+                .chain(std::iter::once(Path::new(
+                    &self.manifest.startup_entry.file,
+                )))
+                .all(|recorded| self.inside(recorded).is_some())
     }
 
     /// Returns the guarded startup entry this package installs.
@@ -548,23 +552,42 @@ fn manifest_candidates(directory: &Path) -> Result<Vec<PathBuf>, PackageFault> {
     Ok(nested)
 }
 
-/// Returns what an installed path holds after the directory named for a package's identity.
+/// Returns where an installed path sits inside the package a build wrote it for.
 ///
-/// The build puts everything a package is under one directory of that name, so what follows it is
-/// where a file sits inside the package however many components deep that is: `bin/zsh`,
-/// `lib/zsh/5.9`, `startup/kr-zshrc.zsh`.
-fn inside_identity(recorded: &Path, identity: &str) -> Option<PathBuf> {
+/// A build installs a package at `<root>/<shell>/<identity>`, so the ancestor whose own name is
+/// that identity and whose parent's name is that shell is the package's own directory, and what
+/// follows it is where the file sits inside it however many components deep: `bin/zsh`,
+/// `lib/zsh/5.9`, `startup/kr-zshrc.zsh`. The deepest such ancestor, because an installation root
+/// may hold a directory of either name and the one nearest the file is the one that installed it.
+fn inside_package(recorded: &Path, kind: ShellKind, identity: &str) -> Option<PathBuf> {
     if identity.is_empty() {
         return None;
     }
-    let mut components = recorded.components();
-    while let Some(component) = components.next() {
-        if component.as_os_str() == identity {
-            let tail: PathBuf = components.collect();
-            return (!tail.as_os_str().is_empty()).then_some(tail);
+    let mut ancestor = recorded.parent();
+    while let Some(directory) = ancestor {
+        let named = directory.file_name().is_some_and(|name| name == identity);
+        let under = directory
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == kind.as_str());
+        if named && under {
+            let tail = recorded.strip_prefix(directory).ok()?;
+            return contained(tail).then(|| tail.to_path_buf());
         }
+        ancestor = directory.parent();
     }
     None
+}
+
+/// Returns whether a relative path stays inside whatever it is joined onto.
+///
+/// Nothing empty, nothing rooted and nothing that climbs: a path with `..` in it names a place
+/// outside the package however it is joined.
+fn contained(tail: &Path) -> bool {
+    !tail.as_os_str().is_empty()
+        && tail
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 /// Returns the alternative name a shell's binary is installed under.
@@ -763,19 +786,41 @@ mod tests {
             "the module tree is the copy's too, all the way down"
         );
 
-        // A record that names paths belonging to neither is not a package this host can answer for.
-        let stray = tempfile::tempdir().expect("a directory");
-        let elsewhere = stray.path().join("zsh/identity-1");
-        std::fs::create_dir_all(elsewhere.join("bin")).expect("creates it");
-        record.shell.executable = PathBuf::from("/opt/somebody-elses/bin/zsh");
-        std::fs::write(
-            elsewhere.join(MANIFEST_BASENAME),
-            serde_json::to_string(&record).expect("encodes"),
-        )
-        .expect("writes the record");
-        std::fs::write(stray.path().join("zsh/current"), "identity-1").expect("names one");
-        let fault = PackageSet::discover(stray.path()).expect_err("refused");
-        assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+        // Two records this host cannot answer for: one naming somebody else's installation, and one
+        // that climbs out of the package with `..`. Each would resolve to a file this package does
+        // not contain.
+        for stray_path in [
+            PathBuf::from("/opt/somebody-elses/bin/zsh"),
+            installed.join("../another/bin/zsh"),
+        ] {
+            let stray = tempfile::tempdir().expect("a directory");
+            let elsewhere = stray.path().join("zsh/identity-1");
+            std::fs::create_dir_all(elsewhere.join("bin")).expect("creates it");
+            let mut astray = record.clone();
+            astray.shell.executable = stray_path.clone();
+            std::fs::write(
+                elsewhere.join(MANIFEST_BASENAME),
+                serde_json::to_string(&astray).expect("encodes"),
+            )
+            .expect("writes the record");
+            std::fs::write(stray.path().join("zsh/current"), "identity-1").expect("names one");
+            match PackageSet::discover(stray.path()) {
+                Err(PackageFault::Unreadable { .. }) => {}
+                other => panic!("{} was admitted: {other:?}", stray_path.display()),
+            }
+        }
+
+        // And one this host can: the identity appears in the installation root as well, so a search
+        // that took the first component of that name would have kept the wrong tail.
+        assert_eq!(
+            inside_package(
+                Path::new("/opt/identity-1/shells/zsh/identity-1/bin/zsh"),
+                ShellKind::Zsh,
+                "identity-1"
+            ),
+            Some(PathBuf::from("bin/zsh")),
+            "the package's own directory is the one nearest the file"
+        );
     }
 
     #[test]
