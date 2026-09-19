@@ -6222,6 +6222,10 @@
           },
           "type": "array"
         },
+        "error_field": {
+          "description": "The member a failed response carries its error in.\n\nA response names exactly one of these two. A frame that names both, or neither, is not a\nresponse this host will correlate: it would otherwise resolve a pending resource on the\nstrength of nothing but a matching identifier.",
+          "type": "string"
+        },
         "framing": {
           "$ref": "#/$defs/NativeFraming",
           "description": "How the protocol frames."
@@ -6246,6 +6250,10 @@
           "description": "The member of a frame that carries the identifier a response correlates to.",
           "type": "string"
         },
+        "result_field": {
+          "description": "The member a successful response carries its result in.",
+          "type": "string"
+        },
         "table_version": {
           "$ref": "#/$defs/MethodTableVersion",
           "description": "The version of the table itself."
@@ -6265,6 +6273,8 @@
         "request_id_field",
         "response_id_field",
         "method_field",
+        "result_field",
+        "error_field",
         "entries"
       ],
       "type": "object"

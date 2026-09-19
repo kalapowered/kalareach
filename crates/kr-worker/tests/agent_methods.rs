@@ -123,6 +123,8 @@ fn table() -> DeclarativeTable {
         request_id_field: "id".to_owned(),
         response_id_field: "id".to_owned(),
         method_field: "method".to_owned(),
+        result_field: "result".to_owned(),
+        error_field: "error".to_owned(),
         entries: vec![DeclarativeEntry {
             method: method("session/request_permission"),
             class: NativeMethodClass::Mutation,
@@ -764,6 +766,27 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
     let refusal = invoke("prompt.submit", Nullable::null())
         .expect_err("an action needs the grant it declares");
     assert!(matches!(refusal, BrokerError::Grant(_)));
+    // And the same refusal is reachable before anything is marked, so it is a rejection rather
+    // than an outcome nobody can establish.
+    assert!(
+        matches!(
+            broker
+                .check_invocable(
+                    &caller(),
+                    binding(),
+                    &PluginActionInvokeParams {
+                        target: target(1),
+                        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+                        action: ActionName::new("prompt.submit").expect("valid"),
+                        draft_id: Nullable::null(),
+                        parameters: Bytes::from(b"{}".to_vec()),
+                    },
+                )
+                .expect_err("the withdrawn grant is found before the marker"),
+            BrokerError::Grant(_)
+        ),
+        "the invocation's own authority is checked before the receipt marker"
+    );
 
     // And the capability an action needs is separate from the observation beside it: withdrawing
     // the evidence refuses the action while the read still answers.

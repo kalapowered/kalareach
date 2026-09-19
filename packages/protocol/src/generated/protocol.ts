@@ -7161,6 +7161,14 @@ export interface DeclarativeTable {
    */
   entries: DeclarativeEntry[]
   /**
+   * The member a failed response carries its error in.
+   *
+   * A response names exactly one of these two. A frame that names both, or neither, is not a
+   * response this host will correlate: it would otherwise resolve a pending resource on the
+   * strength of nothing but a matching identifier.
+   */
+  error_field: string
+  /**
    * How the protocol frames.
    */
   framing: 'json_lines' | 'length_prefixed' | 'content_length'
@@ -7184,6 +7192,10 @@ export interface DeclarativeTable {
    * The member of a frame that carries the identifier a response correlates to.
    */
   response_id_field: string
+  /**
+   * The member a successful response carries its result in.
+   */
+  result_field: string
   /**
    * The version of the table itself.
    */

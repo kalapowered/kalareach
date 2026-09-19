@@ -476,19 +476,7 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
         let registered = self.check_action(binding_id, params)?;
-        let invocation = Invocation {
-            actor_id: caller.actor_id.clone(),
-            grant: registered.grant,
-            grant_id: caller.grant_id,
-            application_instance_id: params.target.subject.application_instance_id,
-            binding_revision: params.target.binding_revision,
-            action: params.action.clone(),
-            capability: registered
-                .capability
-                .clone()
-                .map(|capability| (capability, None)),
-            parameters: params.parameters.as_slice().to_vec(),
-        };
+        let invocation = Self::invocation_for(caller, &registered, params);
         let dispatch = self
             .dispatch_for(params.target.subject.application_instance_id)
             .ok_or_else(|| BrokerError::UnsupportedCapability {
@@ -657,17 +645,17 @@ impl Broker {
     /// Everything this checks is checked before the receipt marker is written, so a refusal the
     /// host can make deterministically is a rejection rather than an outcome nobody can
     /// establish. It checks the resource's owner, that it is still open, that the upstream's own
-    /// deadline has not passed, that the interpretation came from a decoder still permitted to
-    /// create approvals at the generation it read, and that the decision is one that
-    /// interpretation actually offered.
+    /// deadline has not passed, everything the claim itself rechecks, and that the decision is one
+    /// the recorded interpretation actually offered.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when the resource is not one this broker holds,
-    /// [`BrokerError::PermissionDenied`] when it belongs to another instance or its decoder no
-    /// longer holds the approval-interpreter grant, [`BrokerError::QuestionResolved`] when it has
-    /// already been answered, and [`BrokerError::PreconditionFailed`] when the deadline has
-    /// passed, the source generation has moved or the decision is not one the request offered.
+    /// [`BrokerError::PermissionDenied`] when it belongs to another instance or its decoder may no
+    /// longer answer, [`BrokerError::Arbitration`] when it has already been answered,
+    /// [`BrokerError::StaleBinding`] when the source generation has moved, and
+    /// [`BrokerError::PreconditionFailed`] when the deadline has passed, rich work is suspended or
+    /// the decision is not one the request offered.
     pub fn check_answerable(
         &self,
         target: &AgentMutationTarget,
@@ -693,8 +681,10 @@ impl Broker {
                 },
             ));
         }
+        // The same bound the claim uses: at the deadline the answer is already too late, so an
+        // answer admitted here would be refused a moment later, after the marker.
         if let Some(deadline) = resource.deadline_ms.as_ref()
-            && now.get() > deadline.get()
+            && deadline.get() <= now.get()
         {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
@@ -711,35 +701,62 @@ impl Broker {
                     "{resource_id} has no recorded interpretation, so there is nothing to answer"
                 ),
             })?;
-        // The interpretation is only worth acting on while the decoder that produced it still
-        // holds the grant that let it, and while the frame it read is still the current one.
-        // Withdrawing the grant or a newer source frame both make the offered decisions stale.
-        let decoder = self.binding_record(entry.binding_id).ok_or_else(|| {
-            BrokerError::denied(format!(
-                "the component that interpreted {resource_id} is no longer bound"
-            ))
-        })?;
-        if !decoder.grants.holds(BrokerGrant::ApprovalInterpreter) {
-            return Err(BrokerError::denied(format!(
-                "the component that interpreted {resource_id} no longer holds the \
-                 approval-interpreter grant"
-            )));
-        }
-        if entry.source_generation != resource.source_generation {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{resource_id} was interpreted at source generation {} and the request is at \
-                     {}",
-                    entry.source_generation, resource.source_generation
-                ),
-            });
-        }
+        // The rest is exactly what the claim rechecks: the instance's rich work is not suspended,
+        // the request's generation is still the instance's own, and the decoder that interpreted
+        // it may still encode the answer. Sharing that check is what keeps this from admitting
+        // something the claim would refuse a moment later, after the marker.
+        self.state().recheck_answerable(resource_id)?;
         if entry.offers(option_id) {
             Ok(())
         } else {
             Err(BrokerError::PreconditionFailed {
                 detail: format!("{option_id} is not one of the decisions this request offered"),
             })
+        }
+    }
+
+    /// Checks everything a plugin action call can be refused for before anything is marked.
+    ///
+    /// This is the same work `plugin.action.invoke` does up to the point of issuing the token: the
+    /// registered action, the instance's fence and transport, and the invocation's own authority,
+    /// which is the grant, the binding revision and the capability. Running it first is what keeps
+    /// a withdrawn grant from being discovered after the receipt marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Broker::check_action`] and [`Broker::check_dispatchable`] return, and
+    /// [`BrokerError::Grant`], [`BrokerError::StaleBinding`] or
+    /// [`BrokerError::UnsupportedCapability`] when the invocation's own authority does not hold.
+    pub fn check_invocable(
+        &self,
+        caller: &Caller,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+    ) -> Result<()> {
+        let registered = self.check_action(binding_id, params)?;
+        self.check_dispatchable(&params.target)?;
+        let invocation = Self::invocation_for(caller, &registered, params);
+        self.state().check_invocation(binding_id, &invocation)?;
+        Ok(())
+    }
+
+    fn invocation_for(
+        caller: &Caller,
+        registered: &RegisteredAction,
+        params: &PluginActionInvokeParams,
+    ) -> Invocation {
+        Invocation {
+            actor_id: caller.actor_id.clone(),
+            grant: registered.grant,
+            grant_id: caller.grant_id,
+            application_instance_id: params.target.subject.application_instance_id,
+            binding_revision: params.target.binding_revision,
+            action: params.action.clone(),
+            capability: registered
+                .capability
+                .clone()
+                .map(|capability| (capability, None)),
+            parameters: params.parameters.as_slice().to_vec(),
         }
     }
 

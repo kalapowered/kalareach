@@ -334,6 +334,19 @@ impl Gateway {
                 held.table.method_field
             )));
         }
+        // And a response says exactly one thing: it succeeded or it failed. A frame that says
+        // neither is not an answer, and one that says both is two answers to one request; neither
+        // resolves a pending resource on the strength of a matching identifier alone.
+        let succeeded = body.contains_key(&held.table.result_field);
+        let failed = body.contains_key(&held.table.error_field);
+        if succeeded == failed {
+            return Err(BrokerError::invalid(format!(
+                "a response names exactly one of {} and {}, and this frame names {}",
+                held.table.result_field,
+                held.table.error_field,
+                if succeeded { "both" } else { "neither" }
+            )));
+        }
         let upstream =
             read_identifier(&body, &held.table.response_id_field).ok_or_else(|| {
                 BrokerError::invalid(format!(
@@ -557,6 +570,8 @@ mod tests {
             request_id_field: "id".to_owned(),
             response_id_field: "id".to_owned(),
             method_field: "method".to_owned(),
+            result_field: "result".to_owned(),
+            error_field: "error".to_owned(),
             entries: vec![
                 DeclarativeEntry {
                     method: method("fs/write_text_file"),

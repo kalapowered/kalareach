@@ -3489,8 +3489,8 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
-                self.broker.check_action(binding_id, &params)?;
-                self.broker.check_dispatchable(&params.target)?;
+                self.broker
+                    .check_invocable(&Self::broker_caller(caller), binding_id, &params)?;
                 Ok(())
             }
             Method::ActionCancel => {

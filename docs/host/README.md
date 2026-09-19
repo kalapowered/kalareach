@@ -3073,9 +3073,11 @@ Downstream request identifiers are namespaced by connection, so two connections 
 their first request `1` are two different pending resources, and a restarted worker numbers its
 connections above every identifier its ledger holds rather than starting again at one. The
 upstream's own identifier is carried in the JSON form it wrote: a string identifier keeps its
-quotes, so the number `11` and the string `"11"` stay two requests. An upstream identifier never
-becomes a KalaReach identifier. One resource takes one response transition, and a frame that names
-a method is a request rather than a response, so it resolves nothing even when it carries a live
+quotes, so the number `11` and the string `"11"` stay two requests, and the 256-byte bound is on
+that text. An upstream identifier never becomes a KalaReach identifier. One resource takes one
+response transition, and a response has to be one: a frame that names the table's method member is
+a request, and a frame that names both or neither of the table's result and error members is
+neither an answer nor two of them. None of those resolves a resource on the strength of a matching
 identifier.
 
 A frame is read strictly: it is bounded in both directions, it must be a top-level object, and a
@@ -3191,12 +3193,14 @@ against the retained list before the claim is taken, and it happens once.
 Every refusal named above is decided before the dispatch marker, so a request this host can refuse
 leaves a rejection rather than an outcome nobody can establish. That includes an instance with no
 transport bound and one whose every component has had its rich capabilities disabled: both are
-refused before anything is marked, for a plugin action as well as for the five mutations. What a
-refusal after the marker still covers is the transport's own failure, which is what
-`OUTCOME_UNKNOWN` is for, and the narrow window between the last check and the submission: the
-checks and the submission take the broker's lock separately, so a fence, a suspension or a
-capability invalidation that lands between them is still discovered during dispatch. Making that
-one admission is the work that finishes it.
+refused before anything is marked, for a plugin action as well as for the five mutations. A plugin action's own authority is checked
+too: its grant, its binding revision and its capability are rechecked before the marker rather than
+when its token is issued. What a refusal after the marker still covers is the transport's own
+failure, which is what `OUTCOME_UNKNOWN` is for, and the narrow window between the last check and
+the submission: the checks and the submission take the broker's lock separately, so a fence, a
+suspension or a capability invalidation that lands between them is still discovered during
+dispatch. Making those one admission is the work that finishes it, and the service has no receipt
+test for either case yet.
 
 What carries an admitted mutation to the upstream is the connector's own transport. The broker
 holds it under `UpstreamDispatch` and submits while the session lock is held, so a transport that

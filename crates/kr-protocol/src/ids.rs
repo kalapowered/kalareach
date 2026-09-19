@@ -759,8 +759,9 @@ opaque_id!(
     ///
     /// A JSON-RPC identifier is a string or a number, and the two are different identifiers, so
     /// what is carried is the member's own JSON text: the string eleven is `"11"` and the number
-    /// eleven is `11`. It is correlation data. An upstream identifier never becomes a KalaReach
-    /// identifier.
+    /// eleven is `11`. The 256-byte bound is on that text, which is what an upstream wrote, so a
+    /// string identifier spends two bytes on its quotes and more on any character JSON escapes.
+    /// It is correlation data. An upstream identifier never becomes a KalaReach identifier.
     UpstreamRequestId,
     "An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority."
 );

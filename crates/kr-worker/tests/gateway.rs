@@ -110,6 +110,8 @@ fn table() -> DeclarativeTable {
         request_id_field: "id".to_owned(),
         response_id_field: "id".to_owned(),
         method_field: "method".to_owned(),
+        result_field: "result".to_owned(),
+        error_field: "error".to_owned(),
         entries: vec![
             DeclarativeEntry {
                 method: method("fs/write_text_file"),
@@ -663,6 +665,40 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
             .is_err(),
         "a frame that names a method is a request and resolves nothing"
     );
+    // And a frame that says neither that it succeeded nor that it failed is not an answer, nor is
+    // one that says both.
+    for not_a_response in [
+        r#"{"id":"11"}"#,
+        r#"{"id":"11","result":{"outcome":"allow"},"error":{"code":-1}}"#,
+    ] {
+        assert!(
+            broker
+                .native_answer(
+                    GatewayConnectionId::new(1),
+                    not_a_response.as_bytes(),
+                    TimestampMs::new(6),
+                )
+                .is_err(),
+            "a response names exactly one of its result and its error"
+        );
+    }
+    assert_eq!(
+        broker
+            .pending(text.resource_id)
+            .expect("the string request is still held")
+            .state,
+        PendingState::Pending,
+        "nothing a request could not answer moved it"
+    );
+    // The upstream's own failure is an answer.
+    let failed = broker
+        .native_answer(
+            GatewayConnectionId::new(1),
+            r#"{"id":"11","error":{"code":-32601}}"#.as_bytes(),
+            TimestampMs::new(7),
+        )
+        .expect("an error response correlates");
+    assert_eq!(failed.resource_id, text.resource_id);
 }
 
 /// KR-REQ-12.16: a reverse filesystem or terminal request runs in the agent's own host

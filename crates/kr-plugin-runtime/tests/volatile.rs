@@ -46,6 +46,8 @@ fn table() -> DeclarativeTable {
         request_id_field: "id".to_owned(),
         response_id_field: "id".to_owned(),
         method_field: "method".to_owned(),
+        result_field: "result".to_owned(),
+        error_field: "error".to_owned(),
         entries: vec![
             DeclarativeEntry {
                 method: method("fs/write_text_file"),

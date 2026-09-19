@@ -214,6 +214,14 @@ pub struct DeclarativeTable {
     pub response_id_field: String,
     /// The member of a frame that carries its method name.
     pub method_field: String,
+    /// The member a successful response carries its result in.
+    pub result_field: String,
+    /// The member a failed response carries its error in.
+    ///
+    /// A response names exactly one of these two. A frame that names both, or neither, is not a
+    /// response this host will correlate: it would otherwise resolve a pending resource on the
+    /// strength of nothing but a matching identifier.
+    pub error_field: String,
     /// The entries, ordered by method so the table encodes deterministically.
     pub entries: Vec<DeclarativeEntry>,
 }
@@ -267,6 +275,8 @@ impl DeclarativeTable {
             ("request_id_field", &self.request_id_field),
             ("response_id_field", &self.response_id_field),
             ("method_field", &self.method_field),
+            ("result_field", &self.result_field),
+            ("error_field", &self.error_field),
             ("upstream_protocol_version", &self.upstream_protocol_version),
         ] {
             if value.is_empty() {
@@ -914,6 +924,8 @@ mod tests {
             request_id_field: "id".to_owned(),
             response_id_field: "id".to_owned(),
             method_field: "method".to_owned(),
+            result_field: "result".to_owned(),
+            error_field: "error".to_owned(),
             entries: vec![
                 DeclarativeEntry {
                     method: method("session/request_permission"),
