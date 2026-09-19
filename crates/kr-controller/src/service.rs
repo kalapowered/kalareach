@@ -3720,19 +3720,23 @@ impl Controller {
                 // kernel is asked whether the recorded process ended, and the session's stores are
                 // opened only once it has said so. The boot record is not enough on its own to
                 // open a store, because this boot may have handed that identifier to something
-                // else since, and an identifier that answers "running" leaves the stores shut. The
-                // closure is recorded either way, and says whether this host reconciled the store
-                // behind it.
+                // else since. Where it answers "running", or declines, nothing of this session is
+                // opened at all - not by the recovery pass and not by the closure, which then
+                // writes what this daemon can see from outside. The archive is what reports a
+                // recovery that did not run, by reading the store when a reader asks.
                 let archive = self.archive();
-                let recovered = archive
+                let validated = archive
                     .take_ownership(row.session_id, row.display_number, &row.process_identity)
-                    .is_ok_and(|ownership| archive.recover_journal(&ownership).is_ok());
+                    .inspect(|ownership| {
+                        let _ = archive.recover_journal(ownership);
+                    })
+                    .is_ok();
                 self.record_final(
                     row.session_id,
                     ClosureReason::HostShutdown,
                     &row.process_identity,
                     &crate::archive::ArchiveService::nothing_fenced(row.session_id),
-                    recovered,
+                    validated,
                 )
                 .await?;
             }
@@ -4623,13 +4627,7 @@ impl Controller {
         };
         let fenced = archive.fence_owned(&ownership, &reported);
         let closure = self
-            .record_final(
-                session_id,
-                reason,
-                &record.process_identity,
-                &fenced,
-                recovered.is_ok(),
-            )
+            .record_final(session_id, reason, &record.process_identity, &fenced, true)
             .await?;
         Ok(Some(closure))
     }
@@ -4671,6 +4669,7 @@ impl Controller {
         &self,
         session_id: SessionId,
     ) -> Option<kr_protocol::identity::DesktopBinding> {
+        self.archive().bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         let journal = kr_worker::journal::Journal::open_read_only(path).ok()?;
         journal
@@ -4713,7 +4712,7 @@ impl Controller {
         reason: ClosureReason,
         identity: &kr_protocol::identity::ProcessStartIdentity,
         fenced: &crate::archive::Fenced,
-        recovered: bool,
+        death_validated: bool,
     ) -> Result<ClosureRecord> {
         let _finalising = self.finalising.lock().await;
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
@@ -4721,9 +4720,14 @@ impl Controller {
         }
         // The worker's own journal is the authority on how its session ended. It recorded the
         // root's exit status, what it stopped and how much of that it could account for; a record
-        // written from outside knows none of those. This is read only after the worker is
-        // confirmed gone, so nothing is still writing to it.
-        if let Some(recovered) = self.recovered_closure(session_id) {
+        // written from outside knows none of those.
+        //
+        // It is read only where the caller established that the worker has ended. A caller that
+        // did not, because the platform declined the question or answered that the recorded
+        // process is running, writes the outside record instead: opening a store a live process
+        // may own is the one thing recovery ownership exists to stop, and a closure is not a
+        // reason to make an exception.
+        if death_validated && let Some(recovered) = self.recovered_closure(session_id) {
             self.write_closure(&recovered).await?;
             return Ok(recovered);
         }
@@ -4755,11 +4759,11 @@ impl Controller {
             // discovered every application that worker may have started, and a recovery or a
             // fence that could not finish is another thing it cannot account for.
             ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
-            durability: if recovered {
-                kr_protocol::session::Durability::Durable
-            } else {
-                kr_protocol::session::Durability::Volatile
-            },
+            // Section 23 defines this as whether the *record* was written durably, which is what
+            // `write_closure` below does or fails doing. It says nothing about whether the
+            // session's own store was reconciled: a recovery pass that was skipped or failed is
+            // reported by the archive, which reads the store rather than this record.
+            durability: kr_protocol::session::Durability::Durable,
             closed_at_ms: kr_ipc::now_ms(),
         };
         self.write_closure(&record).await?;
@@ -4860,6 +4864,7 @@ impl Controller {
 
     /// Reads the closure a worker wrote for itself, when one survived it.
     fn recovered_closure(&self, session_id: SessionId) -> Option<ClosureRecord> {
+        self.archive().bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         let journal = kr_worker::journal::Journal::open_read_only(&path).ok()?;
         journal.read_closure(session_id).ok().flatten()
@@ -4867,6 +4872,11 @@ impl Controller {
 
     /// Reads the session a worker described, when its journal survived it.
     fn recovered_summary(&self, session_id: SessionId) -> Option<SessionSummary> {
+        // A session that closed before this build shipped wrote an earlier schema. The archive
+        // brings such a store forward once, under this daemon's ownership of a session with no
+        // worker, so the shell, the directory, the geometry and the creation time it holds are
+        // still what a person is shown.
+        self.archive().bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         let journal = kr_worker::journal::Journal::open_read_only(&path).ok()?;
         journal.read_session(session_id).ok().flatten()
