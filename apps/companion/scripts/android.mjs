@@ -59,17 +59,31 @@ function cargoTargetDirectory() {
   }
 }
 
-/** The targets this invocation will build, which is all of them unless it names some. */
+/**
+ * The targets this invocation will build, which is all of them unless it names some.
+ *
+ * A target can be named in three ways -- `--target aarch64`, `--target=aarch64`, and several after
+ * one `--target` -- and an option that read only the first would check one target and leave the
+ * others' archives unexamined, which is the failure this whole file exists to prevent.
+ */
 function requestedTargets(args) {
   const named = []
   for (let index = 0; index < args.length; index += 1) {
-    if (args[index] !== '--target' && args[index] !== '-t') continue
+    const argument = args[index]
+    const joined =
+      argument.startsWith('--target=') || argument.startsWith('-t=') ? argument.split('=')[1] : null
+    if (joined) {
+      const triple = ANDROID_TARGETS[joined]
+      if (triple) named.push(triple)
+      continue
+    }
+    if (argument !== '--target' && argument !== '-t') continue
     for (let next = index + 1; next < args.length && !args[next].startsWith('-'); next += 1) {
       const triple = ANDROID_TARGETS[args[next]]
       if (triple) named.push(triple)
     }
   }
-  return named.length > 0 ? named : Object.values(ANDROID_TARGETS)
+  return named.length > 0 ? [...new Set(named)] : Object.values(ANDROID_TARGETS)
 }
 
 /** Archives a previous run left empty, which this build must not link against. */
