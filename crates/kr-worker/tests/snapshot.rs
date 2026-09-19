@@ -52,9 +52,6 @@ struct Host {
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
-    /// What the session recorded about the shell it started, so this fixture can stop that one
-    /// process and no other.
-    shell: Option<kr_protocol::identity::ProcessStartIdentity>,
 }
 
 impl Host {
@@ -86,34 +83,22 @@ impl Drop for Host {
     /// process left forking a hundred times a second is what the next run of this binary would be
     /// competing with.
     ///
-    /// What is signalled is named rather than matched: the identity this session recorded when it
-    /// started the shell. The kernel is asked what holds that number now, and nothing is signalled
-    /// unless the answer is still that same process. A number belongs to a process only while the
-    /// process is alive, so the moment between that answer and the signal is the limit of naming a
-    /// process by its number; it is why the ordinary way to stop one of these is `Host::end`, and
-    /// why this is one call rather than two.
+    /// Nothing is named by number here. `Session::force_close` is the host's own forced stop, and
+    /// it signals through the handle the session holds, under the lock that keeps the session from
+    /// collecting the shell at the same moment. A number can be given to another process the
+    /// instant its first owner is collected, so a fixture that read a number, asked whether it was
+    /// still the shell and then signalled it would have a window between the answer and the signal
+    /// however few calls it made. Going through the owner closes that window rather than narrowing
+    /// it, and the session already refuses to signal anything it cannot still confirm.
+    ///
+    /// A session whose lock is poisoned is the one case nothing can be stopped from here: an
+    /// earlier panic left the state it holds untrustworthy, which is exactly when `session()`
+    /// refuses to hand it over. That refusal is caught rather than raised, because a panic while
+    /// this one is unwinding would take the whole test binary down and tell nobody why.
     fn drop(&mut self) {
-        let Some(started) = self.shell.as_ref() else {
-            return;
-        };
-        let Ok(pid) = u32::try_from(started.pid.get()) else {
-            return;
-        };
-        let Ok(now) = kr_ipc::identity::started_process_identity(pid) else {
-            return;
-        };
-        if !now.matches(started) {
-            return;
-        }
-        // The group the shell leads, rather than the shell alone: the terminal gives it a session
-        // of its own, so the application's own children are in that group with it. The answer is
-        // not acted on - a shell that has gone in the meantime is not an error here.
-        let _ = std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pid}"))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.runtime.session().force_close();
+        }));
     }
 }
 
@@ -188,7 +173,6 @@ async fn host_with(
             .expect("the palette is chosen before the session produces anything");
     }
     session.launch().expect("launches the shell");
-    let shell = session.root_identity();
     let runtime = Arc::new(
         SessionRuntime::start(
             session,
@@ -225,7 +209,6 @@ async fn host_with(
         session_id,
         environment_id,
         endpoint,
-        shell,
     }
 }
 
