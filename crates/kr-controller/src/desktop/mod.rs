@@ -305,7 +305,7 @@ mod tests {
         );
         assert!(
             headless.persistence != LogoutPersistence::SurvivesLogout
-                || headless.detail.contains("lingering"),
+                || headless.detail.to_lowercase().contains("lingering"),
             "a claim that a headless session survives logout says what makes it survive"
         );
     }
