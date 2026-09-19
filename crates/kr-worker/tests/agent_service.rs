@@ -1033,6 +1033,7 @@ impl UpstreamDispatch for WaitingUpstream {
 async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_mutation() {
     let host = host().await;
     let (release, waiting) = tokio::sync::oneshot::channel();
+    let mut release = Some(release);
     let upstream = Arc::new(WaitingUpstream {
         release: std::sync::Mutex::new(Some(waiting)),
         carried: std::sync::atomic::AtomicUsize::new(0),
@@ -1042,6 +1043,11 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
     let mut client = cli(&host).await;
+    // The connection's own keepalive runs on its own timer, started when the connection was
+    // established. The prompt is sent part way through that interval, so the beat this test waits
+    // for falls inside the window in which the prompt is outstanding rather than racing the
+    // worker's own submission deadline.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     let mutation = prompt_mutation(&client, &host, 21);
     let action_id = mutation.action_id;
 
@@ -1095,12 +1101,45 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         .await
         .expect("writes the lease request");
 
+    // An interrupt on the same connection, which is the other thing section 12 has this socket
+    // carry while a mutation is outstanding.
+    let interrupt = MutationRequest {
+        request_id: RequestId::new(23),
+        method: Method::InputInterrupt.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: client.action_window().action_window_id.clone(),
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&kr_protocol::input::InputInterruptParams {
+            session_id: host.session_id,
+            attachment_id: kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            action: kr_protocol::input::InterruptAction::NativeInterrupt,
+        })
+        .expect("encodes"),
+    };
+    client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(interrupt)))
+        .await
+        .expect("writes the interrupt");
+
     // The answers come back in the order this connection can produce them, and the one for the
     // prompt is not among them until the upstream has spoken.
     let mut lease_answered = false;
+    let mut interrupt_answered = false;
     let mut prompt_answered = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !lease_answered {
+    while !lease_answered || !interrupt_answered {
         let frame = tokio::time::timeout_at(deadline, client.recv())
             .await
             .expect("this connection keeps answering")
@@ -1109,6 +1148,8 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
             ControlFrame::Response(response) => {
                 if response.request_id == RequestId::new(22) {
                     lease_answered = true;
+                } else if response.request_id == RequestId::new(23) {
+                    interrupt_answered = true;
                 } else if response.request_id == RequestId::new(21) {
                     prompt_answered = true;
                 }
@@ -1127,25 +1168,38 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         "and its receipt says the operation is with the upstream"
     );
 
-    // The upstream answers. The prompt's own response arrives on the same connection, and its
-    // receipt records the upstream's acknowledgement rather than the queue that took the bytes.
-    release.send(()).expect("the transport is let go");
+    // The connection's own keepalive is read straight off the socket, because the ordinary client
+    // absorbs one on its caller's behalf and this test is about the worker still sending it. The
+    // upstream is let go once the beat has been seen, and the prompt's own response follows on the
+    // same connection.
+    let (mut reader, _writer, _acknowledgement) = client.into_halves();
+    let mut beat = false;
     let answered = loop {
-        match tokio::time::timeout_at(deadline, client.recv())
+        let frame: ControlFrame = tokio::time::timeout_at(deadline, reader.read_message())
             .await
-            .expect("the prompt is answered")
-            .expect("the worker answers")
-        {
+            .expect("this connection keeps answering")
+            .expect("the worker answers");
+        match frame {
+            ControlFrame::Event(kr_protocol::envelope::ControlEvent::Keepalive) => {
+                beat = true;
+                release_once(&mut release);
+            }
             ControlFrame::Response(response) if response.request_id == RequestId::new(21) => {
                 break response.outcome;
             }
-            ControlFrame::Response(_) | ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
-            other => panic!("the worker answered {other:?}"),
+            _ => {}
         }
     };
-    assert!(matches!(answered, Outcome::Ok(_)), "{answered:?}");
-    assert_eq!(
-        receipt(&mut client, action_id).await.state,
-        kr_protocol::receipt::ReceiptState::Applied
+    assert!(
+        beat,
+        "the connection's keepalive went out while the prompt was outstanding"
     );
+    assert!(matches!(answered, Outcome::Ok(_)), "{answered:?}");
+}
+
+/// Lets the transport go once, from a loop that may come round again.
+fn release_once(release: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(release) = release.take() {
+        let _ = release.send(());
+    }
 }

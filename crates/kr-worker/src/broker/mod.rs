@@ -82,11 +82,11 @@ use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 pub use crate::broker::arbitration::{
     Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
-pub use crate::broker::attach::{Attached, NativeGateway, NativeLaunch, hello_frame};
+pub use crate::broker::attach::{Attached, Ended, NativeGateway, NativeLaunch, hello_frame};
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{
     Carried, Closure, Delivery, Dispatch, Duplex, Observations, Observatory, Queued,
-    ResourceTransition, Sink, UpstreamReply,
+    ResourceTransition, Sink, UpstreamFailure, UpstreamReply,
 };
 pub use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 pub use crate::broker::error::{BrokerError, Result};
@@ -414,6 +414,12 @@ pub struct PinnedTable {
 #[derive(Debug)]
 pub struct Broker {
     state: Mutex<BrokerState>,
+    /// Where a settled resource is announced, when this host has somewhere to announce it.
+    ///
+    /// It is outside the broker's lock on purpose: publication reads the connections of an
+    /// instance and then writes to bounded queues, and doing either under the lock would put a
+    /// slow observer in front of every other decision this broker makes.
+    watchers: Mutex<Option<crate::broker::duplex::Observatory>>,
 }
 
 impl Broker {
@@ -471,11 +477,18 @@ impl Broker {
                 connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
             }),
+            watchers: Mutex::new(None),
         })
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, BrokerState> {
-        self.state.lock().expect("the broker lock is not poisoned")
+        // A poisoned lock means a caller panicked mid-decision. Every write here is planned
+        // against the state, written to the ledger and only then applied, so what a panic leaves
+        // behind is the state as it was rather than half a transition, and continuing is what
+        // lets a cleanup that runs while unwinding still settle what it holds.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // -- instances ----------------------------------------------------------------------------
@@ -687,6 +700,30 @@ impl Broker {
         self.state()
             .connection_dispatch
             .insert(connection, dispatch);
+    }
+
+    /// Takes back the transport one instance's rich mutations were going out over.
+    ///
+    /// A connection that has ended is not a route to the upstream any more, and an instance left
+    /// pointing at one would admit a mutation against a transport nothing is reading. Only the
+    /// transport that is still bound is withdrawn, so a connection that replaced this one keeps
+    /// its own.
+    pub fn unbind_dispatch(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        dispatch: &std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>,
+    ) {
+        let mut state = self.state();
+        let Some(instance) = state.instances.get_mut(&application_instance_id) else {
+            return;
+        };
+        if instance
+            .dispatch
+            .as_ref()
+            .is_some_and(|held| std::sync::Arc::ptr_eq(held, dispatch))
+        {
+            instance.dispatch = None;
+        }
     }
 
     /// Returns what carries answers out on one connection, where anything does.
@@ -1109,6 +1146,7 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PendingResource> {
         self.settle_native(answer, PendingState::Resolved, now)
+            .map(|resource| self.announce(resource))
     }
 
     /// Commits the dispatch marker for one claim, immediately before its bytes go.
@@ -1143,6 +1181,7 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PendingResource> {
         self.settle_native(answer, PendingState::Uncertain, now)
+            .map(|resource| self.announce(resource))
     }
 
     fn settle_native(
@@ -1597,10 +1636,13 @@ impl Broker {
     /// Returns [`BrokerError::Arbitration`] or [`BrokerError::PermissionDenied`] as the claim
     /// requires.
     fn resolve(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        let mut state = self.state();
-        let transition = state.arbitration.plan_resolve(claim)?;
-        state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition)
+        let settled = {
+            let mut state = self.state();
+            let transition = state.arbitration.plan_resolve(claim)?;
+            state.write_transition(&transition, now)?;
+            state.arbitration.commit(transition)?
+        };
+        Ok(self.announce(settled))
     }
 
     /// Gives a claim back, because nothing was dispatched under it.
@@ -1612,7 +1654,8 @@ impl Broker {
     ///
     /// Returns [`BrokerError::Arbitration`] when an answer has already gone for the resource.
     fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        self.state().release_claim_in(claim, now)
+        let released = self.state().release_claim_in(claim, now)?;
+        Ok(self.announce(released))
     }
 
     /// Leaves a claimed resource uncertain: an answer went and nothing confirmed it.
@@ -1621,10 +1664,13 @@ impl Broker {
     ///
     /// Returns the same failures [`Broker::resolve`] does.
     fn uncertain(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        let mut state = self.state();
-        let transition = state.arbitration.plan_uncertain(claim)?;
-        state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition)
+        let settled = {
+            let mut state = self.state();
+            let transition = state.arbitration.plan_uncertain(claim)?;
+            state.write_transition(&transition, now)?;
+            state.arbitration.commit(transition)?
+        };
+        Ok(self.announce(settled))
     }
 
     /// Records that the upstream answered or withdrew a request itself.
@@ -1638,10 +1684,13 @@ impl Broker {
         request: &DownstreamRequestId,
         now: TimestampMs,
     ) -> Result<PendingResource> {
-        let mut state = self.state();
-        let transition = state.arbitration.plan_upstream_resolved(request)?;
-        state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition)
+        let settled = {
+            let mut state = self.state();
+            let transition = state.arbitration.plan_upstream_resolved(request)?;
+            state.write_transition(&transition, now)?;
+            state.arbitration.commit(transition)?
+        };
+        Ok(self.announce(settled))
     }
 
     /// Reconciles one upstream's records with what it still has pending.
@@ -2180,7 +2229,9 @@ impl Broker {
         }
         let transition = state.arbitration.plan_upstream_resolved(&request)?;
         state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition).map(Some)
+        let settled = state.arbitration.commit(transition)?;
+        drop(state);
+        Ok(Some(self.announce(settled)))
     }
 
     /// Closes one gateway connection.
@@ -2236,6 +2287,41 @@ impl Broker {
             environment_id,
             os_user,
         )
+    }
+
+    /// Announces every settled resource of this broker to the observers that watch its instance.
+    ///
+    /// Section 12 fans resolutions out to every authorised observer, and section 24 makes the
+    /// state transition and the event one contract. So this is bound once, and every transition
+    /// the broker commits goes through it rather than through whichever caller happened to make
+    /// it: a resolution a rich client caused and one the person caused in the terminal reach the
+    /// same watchers.
+    pub fn observe_transitions(&self, watchers: crate::broker::duplex::Observatory) {
+        *self
+            .watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(watchers);
+    }
+
+    /// Announces one committed transition, outside the broker's own lock.
+    fn announce(&self, resource: PendingResource) -> PendingResource {
+        let watchers = self
+            .watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(watchers) = watchers {
+            let authorised = self.observers(resource.application_instance_id);
+            watchers.publish(
+                &authorised,
+                &crate::broker::duplex::ResourceTransition {
+                    application_instance_id: resource.application_instance_id,
+                    resource_id: resource.resource_id,
+                    state: resource.state,
+                },
+            );
+        }
+        resource
     }
 
     /// Returns every connection that observes one instance, so a resolution is fanned out to all

@@ -275,6 +275,44 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Deli
     }
 }
 
+/// What the upstream said went wrong with one operation.
+///
+/// An error answer is an answer, so the operation reached the upstream. Whether it *did* anything
+/// is a different question, and the protocol answers it for exactly one family of errors: the ones
+/// that say the frame was never a call this upstream could make. Everything else — an internal
+/// error, an application code of the upstream's own — may have happened before the error, so
+/// section 9 records it as an outcome nobody can establish rather than as a refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamFailure {
+    /// The code the upstream used.
+    pub code: i64,
+    /// What it said.
+    pub message: String,
+}
+
+impl UpstreamFailure {
+    /// Turns the upstream's error into the refusal or the uncertainty it actually proves.
+    #[must_use]
+    pub fn into_failure(self) -> BrokerError {
+        // The reserved codes that describe the frame rather than its effect: a frame that was not
+        // parsed, was not a request, named no such method, or carried parameters the method does
+        // not take, was not acted on.
+        const NOT_ACTED_ON: [i64; 4] = [-32_700, -32_600, -32_601, -32_602];
+        if NOT_ACTED_ON.contains(&self.code) {
+            return BrokerError::UpstreamRefused {
+                detail: self.message,
+            };
+        }
+        BrokerError::UpstreamUnavailable {
+            detail: format!(
+                "the upstream answered with {} ({}), which says the operation failed and not that \
+                 it did not happen",
+                self.code, self.message
+            ),
+        }
+    }
+}
+
 /// What the upstream answered one of this host's own requests with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamReply {
@@ -282,8 +320,8 @@ pub struct UpstreamReply {
     pub upstream_request_id: UpstreamRequestId,
     /// The turn the upstream named in its answer, where it named one.
     pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
-    /// What the upstream said went wrong, when it refused.
-    pub refusal: Option<String>,
+    /// What the upstream said went wrong, when it did not succeed.
+    pub refusal: Option<UpstreamFailure>,
 }
 
 /// The requests this host has sent one upstream and not yet had answered.
@@ -296,6 +334,13 @@ struct Outstanding {
     next: AtomicU64,
     waiting:
         std::sync::Mutex<BTreeMap<UpstreamRequestId, tokio::sync::oneshot::Sender<UpstreamReply>>>,
+    /// The requests the native client made, by the identifier this host sent them under.
+    ///
+    /// The client mints its own identifiers and so does the upstream, so a client request is
+    /// forwarded under an identifier of this host's and the client's own is kept here. The
+    /// upstream's answer comes back under this host's identifier and is written to the client
+    /// under the client's, which is what "preserve upstream IDs" means from the other side.
+    forwarded: std::sync::Mutex<BTreeMap<UpstreamRequestId, serde_json::Value>>,
 }
 
 impl Outstanding {
@@ -311,10 +356,18 @@ impl Outstanding {
     }
 
     /// Records that this host is waiting for one identifier to be answered.
-    fn expect(&self, id: &UpstreamRequestId) -> tokio::sync::oneshot::Receiver<UpstreamReply> {
+    ///
+    /// What comes back forgets the identifier when it is dropped, however it is dropped: a caller
+    /// that gave up, an outer deadline, a connection that ended. Nothing about this connection
+    /// grows because a reply never came.
+    fn expect(self: &Arc<Self>, id: &UpstreamRequestId) -> Waiting {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.held().insert(id.clone(), sender);
-        receiver
+        Waiting {
+            outstanding: Arc::clone(self),
+            id: id.clone(),
+            reply: receiver,
+        }
     }
 
     /// Gives one reply to whatever is waiting for it, and says whether anything was.
@@ -330,6 +383,22 @@ impl Outstanding {
         self.held().remove(id);
     }
 
+    /// Records that one identifier this host minted carries a request of the client's.
+    fn forwarding(&self, id: &UpstreamRequestId, client: serde_json::Value) {
+        self.mapped().insert(id.clone(), client);
+    }
+
+    /// Returns the client's own identifier for one request this host forwarded.
+    fn client_identifier(&self, id: &UpstreamRequestId) -> Option<serde_json::Value> {
+        self.mapped().remove(id)
+    }
+
+    fn mapped(&self) -> std::sync::MutexGuard<'_, BTreeMap<UpstreamRequestId, serde_json::Value>> {
+        self.forwarded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn held(
         &self,
     ) -> std::sync::MutexGuard<
@@ -339,6 +408,33 @@ impl Outstanding {
         self.waiting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One identifier this host is waiting for the upstream to answer.
+///
+/// It is a handle rather than a bare channel so that the entry cannot outlive the wait: the only
+/// way to stop waiting is to drop this, and dropping it is what removes the entry.
+#[derive(Debug)]
+struct Waiting {
+    outstanding: Arc<Outstanding>,
+    id: UpstreamRequestId,
+    reply: tokio::sync::oneshot::Receiver<UpstreamReply>,
+}
+
+impl Waiting {
+    /// Waits for the reply, or says nothing arrived within the bound.
+    async fn within(mut self, deadline: std::time::Duration) -> Option<UpstreamReply> {
+        match tokio::time::timeout(deadline, &mut self.reply).await {
+            Ok(Ok(reply)) => Some(reply),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.outstanding.forget(&self.id);
     }
 }
 
@@ -364,8 +460,6 @@ pub struct ResourceTransition {
     pub resource_id: PendingResourceId,
     /// What it became.
     pub state: PendingState,
-    /// The connection whose answer it was.
-    pub connection: GatewayConnectionId,
 }
 
 /// Where one authorised observer reads the resolutions of the instance it watches.
@@ -415,21 +509,20 @@ impl Observatory {
         self.held().remove(&connection);
     }
 
-    /// Delivers one resolution to every authorised observer of its instance.
+    /// Delivers one transition to every authorised observer of its instance.
     ///
-    /// The authority is the broker's: a connection is told about an instance only if the broker
-    /// says it observes that instance. A subscriber that has fallen [`MAX_QUEUED_OBSERVATIONS`]
+    /// Who is authorised is the broker's answer and the broker passes it: a connection is told
+    /// about an instance only if it is one of that instance's own connections. A subscriber that has fallen [`MAX_QUEUED_OBSERVATIONS`]
     /// behind is withdrawn rather than allowed to grow, because a queue that cannot be bounded is
     /// a queue that ends the session it belongs to.
-    pub fn publish(&self, broker: &Broker, transition: &ResourceTransition) {
-        let authorised = broker.observers(transition.application_instance_id);
+    pub fn publish(&self, authorised: &[GatewayConnectionId], transition: &ResourceTransition) {
         let mut held = self.held();
         for connection in authorised {
-            let Some(sender) = held.get(&connection) else {
+            let Some(sender) = held.get(connection) else {
                 continue;
             };
             if sender.try_send(transition.clone()).is_err() {
-                held.remove(&connection);
+                held.remove(connection);
             }
         }
     }
@@ -633,37 +726,25 @@ impl Dispatch {
         // The waiter is registered before the bytes are queued. Registering it afterwards would
         // leave a window in which the upstream's answer arrived and nothing was listening for it.
         let answered = self.outstanding.expect(&upstream_request_id);
-        let queued = match self.upstream.queue(&body) {
-            Ok(queued) => queued,
-            Err(error) => {
-                self.outstanding.forget(&upstream_request_id);
-                return Err(error);
-            }
-        };
-        let outstanding = Arc::clone(&self.outstanding);
+        let queued = self.upstream.queue(&body)?;
         let turn_id = request.turn_id.clone();
         Ok(PendingTransmission::carried(async move {
             if let Some(refusal) = queued.delivered().await.refusal() {
-                outstanding.forget(&upstream_request_id);
                 return Err(refusal);
             }
             // The bytes went. What the upstream did with them is the upstream's to say, and until
             // it says so the operation is not one this host can record as applied.
-            let reply = match tokio::time::timeout(ACKNOWLEDGEMENT_DEADLINE, answered).await {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(_)) | Err(_) => {
-                    outstanding.forget(&upstream_request_id);
-                    return Err(BrokerError::UpstreamUnavailable {
-                        detail: format!(
-                            "the operation reached the upstream and it did not answer within {} \
-                             seconds, so whether it acted on it cannot be established",
-                            ACKNOWLEDGEMENT_DEADLINE.as_secs()
-                        ),
-                    });
-                }
+            let Some(reply) = answered.within(ACKNOWLEDGEMENT_DEADLINE).await else {
+                return Err(BrokerError::UpstreamUnavailable {
+                    detail: format!(
+                        "the operation reached the upstream and it did not answer within {} \
+                         seconds, so whether it acted on it cannot be established",
+                        ACKNOWLEDGEMENT_DEADLINE.as_secs()
+                    ),
+                });
             };
             if let Some(refusal) = reply.refusal {
-                return Err(BrokerError::UpstreamRefused { detail: refusal });
+                return Err(refusal.into_failure());
             }
             Ok(UpstreamOutcome {
                 upstream_request_id: Some(upstream_request_id),
@@ -709,6 +790,20 @@ pub enum Carried {
         /// Whether this host could do it.
         performed: bool,
     },
+    /// A request the client made of the upstream, forwarded under an identifier of this host's.
+    ClientRequest {
+        /// The identifier this host sent it under.
+        upstream_request_id: UpstreamRequestId,
+    },
+    /// A notification the client sent, forwarded as it is.
+    ClientNotification,
+    /// A reply the upstream sent to a request the client made, returned to the client.
+    ClientReply {
+        /// The identifier this host had sent it under.
+        upstream_request_id: UpstreamRequestId,
+        /// True when the reply was queued for the client.
+        returned: bool,
+    },
     /// The client's own answer, admitted and forwarded to the upstream.
     ClientAnswer {
         /// The resource it resolved.
@@ -752,7 +847,6 @@ pub struct Duplex {
     upstream: Sink,
     client: Sink,
     outstanding: Arc<Outstanding>,
-    observatory: Observatory,
     site: kr_protocol::ids::EnvironmentId,
     os_user: String,
     stopping: Arc<tokio::sync::Notify>,
@@ -771,7 +865,6 @@ impl Duplex {
         framing: Framing,
         upstream: U,
         client: C,
-        observatory: Observatory,
         site: kr_protocol::ids::EnvironmentId,
         os_user: impl Into<String>,
     ) -> (Arc<Self>, impl std::future::Future<Output = ()> + Send)
@@ -788,7 +881,6 @@ impl Duplex {
             upstream: to_upstream,
             client: to_client,
             outstanding: Arc::new(Outstanding::default()),
-            observatory,
             site,
             os_user: os_user.into(),
             stopping: Arc::new(tokio::sync::Notify::new()),
@@ -901,6 +993,15 @@ impl Duplex {
         // host asked for never reaches the arbitration, whatever identifier the upstream's own
         // pending requests happen to be using.
         if is_host_minted(&request.upstream) {
+            // A reply to something the client asked for goes back to the client, under the
+            // identifier the client used. It is never an answer to a request of this host's, and
+            // it never reaches the arbitration.
+            if let Some(client_identifier) = self.outstanding.client_identifier(&request.upstream) {
+                return Ok(Carried::ClientReply {
+                    upstream_request_id: request.upstream,
+                    returned: self.return_to_client(frame, &client_identifier)?,
+                });
+            }
             let reply = read_reply(
                 self.broker.as_ref(),
                 self.connection,
@@ -928,41 +1029,127 @@ impl Duplex {
     /// Returns whatever the broker refuses, including the refusal of a second answer to one
     /// request.
     pub async fn from_client(&self, frame: &[u8], now: TimestampMs) -> Result<Carried> {
-        let answer = self
-            .broker
-            .admit_native_answer(self.connection, frame, now)?;
-        let queued = match self.upstream.queue(&answer.frame) {
-            Ok(queued) => queued,
-            Err(error) => {
-                let _ = self.broker.native_answer_uncertain(&answer, now);
-                return Err(error);
-            }
+        // A frame that names a method is the client asking the upstream for something, not the
+        // client answering the upstream. Reading every client frame as an answer would leave the
+        // native terminal's own requests and notifications with nowhere to go.
+        if let Some(named) = self.client_request(frame)? {
+            return self.forward_to_upstream(named).await;
+        }
+        // The admission is held by a guard for the whole of the wait. This runs inside a reader
+        // that a connection ending cancels, and an admitted answer whose caller went away is one
+        // nobody can establish rather than one that never happened.
+        let mut admitted = AdmittedAnswer {
+            broker: self.broker.as_ref(),
+            answer: Some(
+                self.broker
+                    .admit_native_answer(self.connection, frame, now)?,
+            ),
         };
-        let settled = match queued.delivered().await.refusal() {
+        let queued = self.upstream.queue(admitted.frame())?;
+        let delivered = queued.delivered().await;
+        let answer = admitted.take();
+        let now = kr_ipc::now_ms();
+        let settled = match delivered.refusal() {
             None => self.broker.native_answer_sent(&answer, now)?,
             Some(error) => {
                 let _ = self.broker.native_answer_uncertain(&answer, now);
                 return Err(error);
             }
         };
-        self.publish(&settled);
         Ok(Carried::ClientAnswer {
             resource_id: settled.resource_id,
             state: settled.state,
         })
     }
 
-    /// Tells every authorised observer of the instance what one resource became.
-    pub fn publish(&self, resource: &crate::broker::PendingResource) {
-        self.observatory.publish(
-            self.broker.as_ref(),
-            &ResourceTransition {
-                application_instance_id: resource.application_instance_id,
-                resource_id: resource.resource_id,
-                state: resource.state,
-                connection: self.connection,
-            },
-        );
+    /// Reads one frame the client sent, when it is a request or a notification of its own.
+    fn client_request(&self, frame: &[u8]) -> Result<Option<ClientRequest>> {
+        let held = self.broker.connection(self.connection).ok_or_else(|| {
+            BrokerError::unknown(format!("no gateway connection {}", self.connection))
+        })?;
+        let body: serde_json::Value = serde_json::from_slice(frame).map_err(|error| {
+            BrokerError::invalid(format!("this frame is not readable: {error}"))
+        })?;
+        let Some(members) = body.as_object() else {
+            return Err(BrokerError::invalid("a native frame is a JSON object"));
+        };
+        if !members.contains_key(&held.table.method_field) {
+            return Ok(None);
+        }
+        // The client is not the upstream, and it does not get to mint identifiers in this host's
+        // namespace either: an identifier that looked like one of this host's would come back as
+        // an answer to something this host asked for.
+        let identifier = members.get(&held.table.request_id_field).cloned();
+        if let Some(raw) = identifier.as_ref()
+            && serde_json::to_string(raw)
+                .ok()
+                .and_then(|text| UpstreamRequestId::new(text).ok())
+                .is_some_and(|id| is_host_minted(&id))
+        {
+            return Err(BrokerError::invalid(format!(
+                "{raw} begins with {HOST_REQUEST_PREFIX}, which names the requests this host \
+                 sends, and a client request cannot be one of those"
+            )));
+        }
+        Ok(Some(ClientRequest {
+            body,
+            identifier,
+            request_id_field: held.table.request_id_field.clone(),
+        }))
+    }
+
+    /// Carries one request or notification of the client's to the upstream.
+    ///
+    /// A notification is written as it is: there is nothing to correlate. A request is rewritten
+    /// under an identifier of this host's own and the client's identifier is kept, so that the
+    /// upstream's answer comes back to the client under the identifier the client used.
+    async fn forward_to_upstream(&self, named: ClientRequest) -> Result<Carried> {
+        let ClientRequest {
+            mut body,
+            identifier,
+            request_id_field,
+            ..
+        } = named;
+        let Some(client_identifier) = identifier else {
+            let queued = self
+                .upstream
+                .queue(&serde_json::to_vec(&body).map_err(|error| {
+                    BrokerError::invalid(format!("this notification will not encode: {error}"))
+                })?)?;
+            if let Some(refusal) = queued.delivered().await.refusal() {
+                return Err(refusal);
+            }
+            return Ok(Carried::ClientNotification);
+        };
+        let upstream_request_id = self.outstanding.allocate()?;
+        let minted: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
+            .map_err(|error| {
+                BrokerError::invalid(format!("this identifier will not encode: {error}"))
+            })?;
+        let Some(members) = body.as_object_mut() else {
+            return Err(BrokerError::invalid("a native frame is a JSON object"));
+        };
+        members.insert(request_id_field, minted);
+        let encoded = serde_json::to_vec(&body).map_err(|error| {
+            BrokerError::invalid(format!("this request will not encode: {error}"))
+        })?;
+        // The mapping goes in before the bytes, so an answer that arrives at once finds it.
+        self.outstanding
+            .forwarding(&upstream_request_id, client_identifier);
+        let queued = match self.upstream.queue(&encoded) {
+            Ok(queued) => queued,
+            Err(error) => {
+                self.outstanding.client_identifier(&upstream_request_id);
+                return Err(error);
+            }
+        };
+        if let Some(refusal) = queued.delivered().await.refusal() {
+            self.outstanding.client_identifier(&upstream_request_id);
+            return Err(refusal);
+        }
+        Ok(Carried::ClientRequest {
+            upstream_request_id,
+        })
     }
 
     /// Refuses one reverse request, before anything of it could have an effect.
@@ -1020,6 +1207,33 @@ impl Duplex {
         Ok(false)
     }
 
+    /// Writes one upstream reply back to the client under the identifier the client used.
+    fn return_to_client(
+        &self,
+        frame: &[u8],
+        client_identifier: &serde_json::Value,
+    ) -> Result<bool> {
+        let held = self.broker.connection(self.connection).ok_or_else(|| {
+            BrokerError::unknown(format!("no gateway connection {}", self.connection))
+        })?;
+        let mut body: serde_json::Value = serde_json::from_slice(frame).map_err(|error| {
+            BrokerError::invalid(format!("this reply is not readable: {error}"))
+        })?;
+        let Some(members) = body.as_object_mut() else {
+            return Err(BrokerError::invalid("a native frame is a JSON object"));
+        };
+        members.insert(
+            held.table.response_id_field.clone(),
+            client_identifier.clone(),
+        );
+        let encoded = serde_json::to_vec(&body).map_err(|error| {
+            BrokerError::invalid(format!("this reply will not encode: {error}"))
+        })?;
+        // Queued, not awaited: this runs inside the upstream reader, and waiting here for the
+        // client to drain would hold every frame behind it.
+        self.client.queue(&encoded).map(|_| true)
+    }
+
     /// Reads one end for as long as it has frames, carrying each one.
     ///
     /// `upstream` says which end this is. The loop ends when the end closes, when the owner is
@@ -1074,6 +1288,47 @@ impl Duplex {
     }
 }
 
+/// One frame the native client sent that is a request or a notification of its own.
+#[derive(Debug)]
+struct ClientRequest {
+    body: serde_json::Value,
+    identifier: Option<serde_json::Value>,
+    request_id_field: String,
+}
+
+/// One admitted native answer, held until something says what happened to it.
+///
+/// Dropping it without saying leaves the resource uncertain, which is what an answer whose fate
+/// nobody established is. That covers the reader being cancelled mid-write as well as a caller
+/// that returns early.
+struct AdmittedAnswer<'a> {
+    broker: &'a Broker,
+    answer: Option<crate::broker::NativeAnswer>,
+}
+
+impl AdmittedAnswer<'_> {
+    fn frame(&self) -> &[u8] {
+        self.answer
+            .as_ref()
+            .map_or(&[][..], |answer| answer.frame.as_slice())
+    }
+
+    fn take(&mut self) -> crate::broker::NativeAnswer {
+        self.answer.take().expect("the admission is taken once")
+    }
+}
+
+impl Drop for AdmittedAnswer<'_> {
+    fn drop(&mut self) {
+        let Some(answer) = self.answer.take() else {
+            return;
+        };
+        let _ = self
+            .broker
+            .native_answer_uncertain(&answer, kr_ipc::now_ms());
+    }
+}
+
 /// Reads one reply to a request this host sent.
 fn read_reply(
     broker: &Broker,
@@ -1086,12 +1341,18 @@ fn read_reply(
         .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
     let body: serde_json::Value = serde_json::from_slice(frame)
         .map_err(|error| BrokerError::invalid(format!("this reply is not readable: {error}")))?;
-    let refusal = body.get(&held.table.error_field).map(|error| {
-        error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map_or_else(|| error.to_string(), ToOwned::to_owned)
-    });
+    let refusal = body
+        .get(&held.table.error_field)
+        .map(|error| UpstreamFailure {
+            code: error
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-32_603),
+            message: error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| error.to_string(), ToOwned::to_owned),
+        });
     let turn_id = body
         .get(&held.table.result_field)
         .and_then(|result| result.get("turn_id"))

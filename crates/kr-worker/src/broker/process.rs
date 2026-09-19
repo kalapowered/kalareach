@@ -579,8 +579,13 @@ pub struct BackendStop {
     pub asked: bool,
     /// True when the grace period ended with the process still running, so it was forced.
     pub forced: bool,
-    /// True when the process this host started is no longer running.
+    /// True when the kernel says the process this host started has gone.
     pub ended: bool,
+    /// True when the kernel would not say whether it has gone.
+    ///
+    /// It is neither running nor known to have ended, and section 7 does not let this host report
+    /// a shutdown it cannot establish.
+    pub unresolved: bool,
 }
 
 /// Stops one dedicated backend through the normal grace period.
@@ -592,46 +597,38 @@ pub async fn stop_backend(
     process: &ProcessStartIdentity,
     grace: std::time::Duration,
 ) -> BackendStop {
-    if !running(process) {
-        return BackendStop {
-            asked: false,
-            forced: false,
-            ended: true,
-        };
+    let mut state = kr_ipc::identity::process_state(process);
+    if !matches!(state, kr_ipc::identity::ProcessState::Running) {
+        return settled(false, false, &state);
     }
     signal(process, false);
     let deadline = tokio::time::Instant::now() + grace;
-    while tokio::time::Instant::now() < deadline {
-        if !running(process) {
-            return BackendStop {
-                asked: true,
-                forced: false,
-                ended: true,
-            };
+    loop {
+        state = kr_ipc::identity::process_state(process);
+        if !matches!(state, kr_ipc::identity::ProcessState::Running) {
+            return settled(true, false, &state);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(BACKEND_POLL).await;
     }
-    if !running(process) {
-        return BackendStop {
-            asked: true,
-            forced: false,
-            ended: true,
-        };
-    }
     signal(process, true);
-    BackendStop {
-        asked: true,
-        forced: true,
-        ended: !running(process),
-    }
+    settled(true, true, &kr_ipc::identity::process_state(process))
 }
 
-/// Returns true when the process this host recorded is the one running under that identifier.
-fn running(process: &ProcessStartIdentity) -> bool {
-    matches!(
-        kr_ipc::identity::process_state(process),
-        kr_ipc::identity::ProcessState::Running
-    )
+/// Reads the last state this host saw as what it proves, and nothing more.
+///
+/// `Ended` is the kernel saying the process has gone. `Unknown` is the kernel saying it cannot
+/// tell, which is not the same thing and is never recorded as one: a caller that read `ended` for
+/// it would believe a backend had stopped on evidence nobody has.
+fn settled(asked: bool, forced: bool, state: &kr_ipc::identity::ProcessState) -> BackendStop {
+    BackendStop {
+        asked,
+        forced,
+        ended: matches!(state, kr_ipc::identity::ProcessState::Ended),
+        unresolved: matches!(state, kr_ipc::identity::ProcessState::Unknown { .. }),
+    }
 }
 
 #[cfg(unix)]

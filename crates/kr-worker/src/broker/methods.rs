@@ -519,7 +519,6 @@ pub struct AnswerInFlight<'a> {
     binding_revision: AgentBindingRevision,
     upstream_request_id: kr_protocol::ids::UpstreamRequestId,
     resource_id: kr_protocol::ids::PendingResourceId,
-    admitted_at: TimestampMs,
 }
 
 impl AnswerInFlight<'_> {
@@ -535,10 +534,23 @@ impl AnswerInFlight<'_> {
     ///
     /// Returns whatever the transport could not establish, after leaving the resource uncertain.
     pub async fn settled(mut self, now: TimestampMs) -> Result<AgentApprovalRespondResult> {
-        let (Some(claim), Some(pending)) = (self.claim.take(), self.pending.take()) else {
+        let _ = now;
+        let Some(pending) = self.pending.take() else {
             return Err(BrokerError::AlreadyTransmitted);
         };
-        let outcome = match pending.outcome().await {
+        // The claim stays on `self` for the whole of the wait. A caller whose task is cancelled
+        // here — an outer deadline, a connection ending — drops this object mid-await, and what
+        // drops it finds the claim and leaves the resource uncertain. Taking the claim first
+        // would lose it exactly in the case that most needs it.
+        let outcome = pending.outcome().await;
+        let Some(claim) = self.claim.take() else {
+            return Err(BrokerError::AlreadyTransmitted);
+        };
+        // The settlement time is now, not when the admission was taken: the wait is what happened
+        // in between, and a record that dated it to the admission would say the answer settled
+        // before it went.
+        let now = kr_ipc::now_ms();
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 let _ = self.broker.uncertain(&claim, now);
@@ -564,7 +576,10 @@ impl Drop for AnswerInFlight<'_> {
         let Some(claim) = self.claim.take() else {
             return;
         };
-        let _ = self.broker.uncertain(&claim, self.admitted_at);
+        // Nobody waited, or whoever did was cancelled. The marker is committed, so the answer may
+        // have gone and nothing can establish whether it did. The time is now, because that is
+        // when this host gave up on learning.
+        let _ = self.broker.uncertain(&claim, kr_ipc::now_ms());
     }
 }
 
@@ -1077,7 +1092,6 @@ impl Broker {
             binding_revision: admitted.binding_revision(),
             upstream_request_id: dispatch.upstream_request_id.clone(),
             resource_id: dispatch.resource.resource_id,
-            admitted_at: admitted.admitted_at(),
         })
     }
 

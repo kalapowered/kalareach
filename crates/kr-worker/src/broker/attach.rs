@@ -46,11 +46,30 @@ use crate::broker::process::ManagedProcess;
 /// endpoint that waits for it indefinitely is an endpoint one stalled process closes.
 pub const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a connection's own writes are given to finish once both ends have stopped reading.
+pub const TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a terminal that has closed its connection is given to end before this host decides.
+///
+/// A socket reaching end of file and the process behind it exiting are two events, and the socket
+/// wins the race often enough that reading the process once would call an ordinary exit a detach.
+pub const EXIT_SETTLES_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What one launched agent's bridge must satisfy, and what its connection is read with.
 #[derive(Clone, Debug)]
 pub struct NativeLaunch {
-    /// The registration this launch published, which names the process this host expects.
-    pub registration: Registration,
+    /// The launch profile this registration belongs to.
+    pub profile_id: kr_protocol::ids::LaunchProfileId,
+    /// The bridge process this host expects on the connection.
+    pub expected_process: ProcessStartIdentity,
+    /// The native terminal this host started, where it started one.
+    ///
+    /// Section 7 draws its line between two processes: the terminal the person is typing in, and
+    /// the backend that serves it. The terminal ending is the intentional native exit that ends
+    /// the instance and stops that backend; the connection closing is not, and an attachment
+    /// closing is not. Where this host started no terminal of its own — a bypassed or shared
+    /// backend — it is absent, and no closure is read as an exit.
+    pub native_terminal: Option<ProcessStartIdentity>,
     /// The instance the connection speaks for.
     pub application_instance_id: ApplicationInstanceId,
     /// The connector package whose pinned tables read this connection's frames.
@@ -92,6 +111,52 @@ struct Hello {
     headers: BTreeMap<String, String>,
 }
 
+/// What one connection's ending meant, and what it stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ended {
+    /// Why the connection ended.
+    pub closure: Closure,
+    /// What stopping the dedicated backend did, where an intentional native exit stopped one.
+    pub stopped: Option<crate::broker::process::BackendStop>,
+}
+
+/// Decides what one connection's ending was, from the terminal this host started.
+async fn ended_as(terminal: Option<&ProcessStartIdentity>) -> Closure {
+    let Some(terminal) = terminal else {
+        // This host started no terminal of its own, so nothing about this connection is that
+        // terminal exiting. A bypassed or shared backend is never claimed or ended as owned.
+        return Closure::Detached;
+    };
+    let deadline = tokio::time::Instant::now() + EXIT_SETTLES_WITHIN;
+    loop {
+        if matches!(
+            kr_ipc::identity::process_state(terminal),
+            kr_ipc::identity::ProcessState::Ended
+        ) {
+            return Closure::NativeExit;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Closure::Detached;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Ends the instance an intentional native exit ends, and stops the backend it stops.
+async fn stop_what_ended(
+    broker: &Broker,
+    application_instance_id: ApplicationInstanceId,
+) -> Option<crate::broker::process::BackendStop> {
+    let outcome = broker.end(
+        application_instance_id,
+        crate::broker::InstanceEnding::NativeExit,
+    );
+    let backend = outcome.backend?;
+    Some(
+        crate::broker::process::stop_backend(&backend, crate::broker::process::BACKEND_GRACE).await,
+    )
+}
+
 /// One connection this host admitted, served by its own supervised owner.
 #[derive(Debug)]
 pub struct Attached {
@@ -102,7 +167,7 @@ pub struct Attached {
     /// Where this connection's authorised observer reads resolutions.
     pub observations: Observations,
     /// The task driving the owner's own writes and reads.
-    served: tokio::task::JoinHandle<Closure>,
+    served: tokio::task::JoinHandle<Ended>,
 }
 
 impl Attached {
@@ -112,7 +177,7 @@ impl Attached {
     ///
     /// Returns [`BrokerError::UpstreamUnavailable`] when the task that served the connection could
     /// not be joined, which leaves why it ended unestablished.
-    pub async fn served(self) -> Result<Closure> {
+    pub async fn served(self) -> Result<Ended> {
         self.served
             .await
             .map_err(|error| BrokerError::UpstreamUnavailable {
@@ -125,7 +190,7 @@ impl Attached {
     /// # Errors
     ///
     /// Returns what [`Attached::served`] does.
-    pub async fn shutdown(self) -> Result<Closure> {
+    pub async fn shutdown(self) -> Result<Ended> {
         self.owner.shutdown();
         self.served().await
     }
@@ -138,6 +203,7 @@ pub struct NativeGateway {
     endpoint: BoundEndpoint,
     observatory: Observatory,
     launch: NativeLaunch,
+    registration: Registration,
 }
 
 impl NativeGateway {
@@ -153,11 +219,23 @@ impl NativeGateway {
         launch: NativeLaunch,
     ) -> Result<Self> {
         let endpoint = BoundEndpoint::bind(runtime_directory)?;
+        // The registration is built from the address this host bound, never from one a caller
+        // supplied. A launched process is told where to connect, and telling it anywhere but the
+        // socket that exists is telling it nothing.
+        let registration = Registration::new(
+            endpoint.address().clone(),
+            launch.profile_id.clone(),
+            launch.application_instance_id,
+            launch.expected_process.clone(),
+        );
+        // Every settled resource of this broker reaches the observers watching its instance.
+        broker.observe_transitions(observatory.clone());
         Ok(Self {
             broker,
             endpoint,
             observatory,
             launch,
+            registration,
         })
     }
 
@@ -170,7 +248,7 @@ impl NativeGateway {
     /// Returns the registration file a launched process reads.
     #[must_use]
     pub fn registration(&self) -> String {
-        self.launch.registration.to_file()
+        self.registration.to_file()
     }
 
     /// Accepts one bridge, authenticates it, admits it and starts its owner.
@@ -263,9 +341,7 @@ impl NativeGateway {
             process: read,
             environment_session_id: hello.session.clone(),
         };
-        self.launch
-            .registration
-            .authenticate(&presented, &peer, process)?;
+        self.registration.authenticate(&presented, &peer, process)?;
         // The identity the connection is admitted under is the kernel's where there is one. The
         // presented one is only ever used where the platform names no peer, which is the case the
         // authentication above has already established.
@@ -277,9 +353,9 @@ impl NativeGateway {
             &self.launch.plugin_id,
             &self.launch.installed_protocol_version,
         )?;
+        let _ = identity;
         self.serve(
             connection,
-            identity,
             upstream_reader,
             upstream_writer,
             client_reader,
@@ -293,7 +369,6 @@ impl NativeGateway {
     fn serve<UR, UW, CR, CW>(
         &self,
         connection: GatewayConnectionId,
-        identity: ProcessStartIdentity,
         upstream_reader: UR,
         upstream_writer: UW,
         client_reader: CR,
@@ -312,7 +387,6 @@ impl NativeGateway {
             self.launch.framing,
             upstream_writer,
             client_writer,
-            self.observatory.clone(),
             self.launch.site,
             self.launch.os_user.clone(),
         );
@@ -326,12 +400,26 @@ impl NativeGateway {
                 return Err(error);
             }
         };
-        self.broker.bind_connection_dispatch(connection, dispatch);
+        let carrying: Arc<dyn crate::broker::methods::UpstreamDispatch> = dispatch;
+        self.broker
+            .bind_connection_dispatch(connection, Arc::clone(&carrying));
+        // And the instance's own transport, which is what an ordinary rich mutation goes out
+        // over. A connection admitted without it would take prompts, steers and cancellations and
+        // have nowhere to carry them.
+        if let Err(error) = self
+            .broker
+            .bind_dispatch(self.launch.application_instance_id, Arc::clone(&carrying))
+        {
+            self.broker.close_connection(connection);
+            return Err(error);
+        }
         let observations = self.observatory.subscribe(connection);
         let served = {
             let owner = Arc::clone(&owner);
             let broker = Arc::clone(&self.broker);
             let observatory = self.observatory.clone();
+            let terminal = self.launch.native_terminal.clone();
+            let application_instance_id = self.launch.application_instance_id;
             tokio::spawn(async move {
                 let reading = {
                     let upstream = Arc::clone(&owner);
@@ -343,23 +431,28 @@ impl NativeGateway {
                         }
                     }
                 };
-                // The writes outlive the reads by exactly as long as it takes to finish what was
-                // already queued: an answer this host admitted must reach the socket even though
-                // the end that would have sent the next frame has closed.
+                // The writes run beside the reads and outlive them by exactly as long as it
+                // takes to finish what was already queued: an answer this host admitted must
+                // reach the socket even though the end that would have sent the next frame has
+                // closed. The writer is then joined rather than abandoned, so teardown does not
+                // race a frame that is still going out.
                 let writing = tokio::spawn(writes);
                 reading.await;
                 owner.shutdown();
-                let closure = match kr_ipc::identity::process_state(&identity) {
-                    // Section 7: the native TUI's intentional exit ends the instance. A connection
-                    // that closed while the process this host launched is still running is an
-                    // attachment closing, and that ends nothing.
-                    kr_ipc::identity::ProcessState::Ended => Closure::NativeExit,
-                    _ => Closure::Detached,
-                };
+                let _ = tokio::time::timeout(TEARDOWN_DEADLINE, writing).await;
+                let closure = ended_as(terminal.as_ref()).await;
+                broker.unbind_dispatch(application_instance_id, &carrying);
                 broker.close_connection(connection);
                 observatory.withdraw(connection);
-                drop(writing);
-                closure
+                // Section 7: only the native terminal's own exit ends the instance and stops its
+                // dedicated backend. A connection closing while that terminal is still running is
+                // an attachment closing, and that ends nothing.
+                let stopped = if closure == Closure::NativeExit {
+                    stop_what_ended(&broker, application_instance_id).await
+                } else {
+                    None
+                };
+                Ended { closure, stopped }
             })
         };
         Ok(Attached {
@@ -368,29 +461,6 @@ impl NativeGateway {
             observations,
             served,
         })
-    }
-
-    /// Ends what one connection's closure ends, and stops what it stops.
-    ///
-    /// Section 7 draws the line here: the native TUI's intentional exit ends the instance and
-    /// stops its dedicated backend through the normal grace period, and closing a KR attachment
-    /// ends nothing. A backend this host did not start, or one a bypassed launch shares, is never
-    /// claimed or terminated as owned — the broker answers which of those it is, and it answers
-    /// with the full process identity so that what stops is the process this host started rather
-    /// than whatever holds that identifier now.
-    pub async fn ended(&self, closure: Closure) -> Option<crate::broker::process::BackendStop> {
-        if closure != Closure::NativeExit {
-            return None;
-        }
-        let outcome = self.broker.end(
-            self.launch.application_instance_id,
-            crate::broker::InstanceEnding::NativeExit,
-        );
-        let backend = outcome.backend?;
-        Some(
-            crate::broker::process::stop_backend(&backend, crate::broker::process::BACKEND_GRACE)
-                .await,
-        )
     }
 
     /// Reads the one frame a bridge writes before it is authenticated.
@@ -402,16 +472,19 @@ impl NativeGateway {
 
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 1024];
+        // One deadline for the whole hello. A deadline per read would let a peer that dribbles a
+        // byte at a time hold the endpoint for as long as it liked.
+        let deadline = tokio::time::Instant::now() + HELLO_DEADLINE;
         let body = loop {
             if let Some(body) = self.launch.framing.decode(&mut buffer)? {
                 break body;
             }
-            let read = tokio::time::timeout(HELLO_DEADLINE, reader.read(&mut chunk))
+            let read = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
                 .await
                 .map_err(|_| {
                     BrokerError::denied(format!(
-                        "this connection said nothing within {} seconds, so there is nothing to \
-                         authenticate it by",
+                        "this connection did not say who it is within {} seconds, so there is \
+                         nothing to authenticate it by",
                         HELLO_DEADLINE.as_secs()
                     ))
                 })?
