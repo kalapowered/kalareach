@@ -3062,8 +3062,8 @@
     {
       "capability": {
         "required": {
-          "capability_id": "changeset",
-          "revision": "change_set_version"
+          "capability_id": "review",
+          "revision": "review_subject_version"
         }
       },
       "confirmation": "none",
@@ -3178,7 +3178,7 @@
         {
           "authority": {
             "right": {
-              "right": "session.view"
+              "right": "host.manage"
             }
           },
           "when": "always"

@@ -2910,6 +2910,13 @@ export interface AttentionItem {
    */
   session_id: SessionId | null
   /**
+   * The retained source the condition was observed in.
+   *
+   * It is what a gap is weighed against: a range that retention took from this source is a
+   * range that could have resolved this item, and a range taken from another source is not.
+   */
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic'
+  /**
    * One line naming the subject.
    */
   summary: string
@@ -2990,9 +2997,17 @@ export interface AttentionQuietHoursResult {
  */
 export interface AttentionReadParams {
   /**
+   * The key to continue after, or null to start at the oldest item.
+   */
+  after: AttentionKey | null
+  /**
    * Whether items this actor has already acknowledged are included.
    */
   include_acknowledged: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_items: string
   /**
    * One KalaReach terminal session.
    */
@@ -3003,6 +3018,10 @@ export interface AttentionReadParams {
  */
 export interface AttentionReadResult {
   /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  dropped: string
+  /**
    * The ranges of retained events the host can no longer read.
    */
   gaps: AttentionGap[]
@@ -3010,6 +3029,10 @@ export interface AttentionReadResult {
    * The items, oldest first.
    */
   items: AttentionItem[]
+  /**
+   * Whether more items remain after the last one in this page.
+   */
+  more: boolean
   /**
    * The configured quiet hours, when there are any.
    */
@@ -7364,6 +7387,7 @@ export interface MethodEntry {
             | 'question_revision'
             | 'draft_revision'
             | 'change_set_version'
+            | 'review_subject_version'
             | 'authority_revision'
             | 'device_key_revision'
             | 'package_hash'

@@ -6,11 +6,14 @@ use std::collections::BTreeSet;
 use kr_attention::engine::Outcome;
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, SourceEvent};
 use kr_attention::host::summary_of;
+use kr_attention::key::DERIVED_MARKER;
 use kr_attention::rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rule};
 use kr_attention::{Attention, HostReading};
 use kr_protocol::attention::{
-    AttentionKey, AttentionLevel, AttentionRouting, AttentionRule, AttentionSource,
-    IDLE_REMINDER_MS, LogViewState, NotificationState, QuietHours, ReviewSubject,
+    AttentionItem, AttentionKey, AttentionLevel, AttentionReadParams, AttentionRouting,
+    AttentionRule, AttentionSource, IDLE_REMINDER_MS, LogViewState, MAX_ATTENTION_SUMMARY_LEN,
+    MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS, NotificationState, QuietHours,
+    ReviewSubject,
 };
 use kr_protocol::ids::{
     ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
@@ -36,10 +39,13 @@ fn reading(continuous_ms: u64) -> HostReading {
     HostReading::new(continuous_ms, NOON + continuous_ms, true)
 }
 
+/// Builds an event `at_ms` after noon, so every recorded moment and every reading are on one
+/// clock. A host records an event and reads its own wall clock from the same source; a fixture
+/// that mixed two scales would make a five-minute interval look like half a day.
 fn event(source: AttentionSource, sequence: u64, at_ms: u64, kind: EventKind) -> SourceEvent {
     SourceEvent::new(
         EventCursor::new(source, sequence),
-        TimestampMs::new(at_ms),
+        TimestampMs::new(NOON + at_ms),
         kind,
     )
 }
@@ -68,6 +74,19 @@ fn approval_resolved(sequence: u64, at_ms: u64, request: &str) -> SourceEvent {
     )
 }
 
+fn command(sequence: u64, at_ms: u64, line: &str, exit_code: i32) -> SourceEvent {
+    event(
+        AttentionSource::Receipts,
+        sequence,
+        at_ms,
+        EventKind::CommandCompleted {
+            session_id: session(1),
+            command: line.to_owned(),
+            exit_code,
+        },
+    )
+}
+
 fn pending_question(
     sequence: u64,
     at_ms: u64,
@@ -83,7 +102,7 @@ fn pending_question(
             question_id: id,
             session_id: session(1),
             verified,
-            pending_since_ms: TimestampMs::new(pending_since_ms),
+            pending_since_ms: TimestampMs::new(NOON + pending_since_ms),
             summary: "which branch?".to_owned(),
         },
     )
@@ -102,6 +121,19 @@ fn notice(sequence: u64, at_ms: u64, body: &str, lease_held: bool) -> SourceEven
                 body: body.to_owned(),
                 lease_held,
             },
+        },
+    )
+}
+
+fn adapter_failed(sequence: u64, at_ms: u64) -> SourceEvent {
+    event(
+        AttentionSource::Semantic,
+        sequence,
+        at_ms,
+        EventKind::AdapterFailed {
+            plugin_id: PluginId::new("git").expect("an identifier"),
+            session_id: Some(session(1)),
+            detail: "the helper exited".to_owned(),
         },
     )
 }
@@ -134,6 +166,10 @@ fn engine() -> Attention {
     Attention::in_memory(reading(0)).expect("an in-memory feature store")
 }
 
+fn whole_inbox(attention: &Attention) -> Vec<AttentionItem> {
+    attention.inbox(&actor("local:501"), true)
+}
+
 // ----- The rule set ------------------------------------------------------------------------
 
 #[test]
@@ -141,64 +177,40 @@ fn every_rule_in_the_set_is_raised_by_the_typed_event_it_covers() {
     let mut attention = engine();
     let mut seen = BTreeSet::new();
     let mut at = 0;
-    let mut step = |events: Vec<SourceEvent>, attention: &mut Attention, seen: &mut BTreeSet<_>| {
-        for source in events {
-            at += 60_001;
-            let outcomes = attention
-                .apply(&source, reading(at))
-                .expect("the store records the decision");
-            seen.extend(raised(&outcomes));
-        }
-    };
-    step(
-        vec![
-            approval(1, 1_000, "req-1"),
-            event(
-                AttentionSource::Receipts,
-                2,
-                2_000,
-                EventKind::CommandCompleted {
-                    session_id: session(1),
-                    command: "cargo test".to_owned(),
-                    exit_code: 101,
-                },
-            ),
-            pending_question(1, 3_000, question(9), true, 3_000),
-            event(
-                AttentionSource::Semantic,
-                1,
-                4_000,
-                EventKind::TurnCompleted {
-                    session_id: session(1),
-                    turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
-                    version: 1,
-                    change_set: None,
-                    summary: "rewrote the parser".to_owned(),
-                },
-            ),
-            event(
-                AttentionSource::Semantic,
-                2,
-                5_000,
-                EventKind::AdapterFailed {
-                    plugin_id: PluginId::new("git").expect("an identifier"),
-                    session_id: Some(session(1)),
-                    detail: "the helper exited".to_owned(),
-                },
-            ),
-            event(
-                AttentionSource::Semantic,
-                3,
-                6_000,
-                EventKind::HostContactLost {
-                    detail: "the relay closed".to_owned(),
-                },
-            ),
-            notice(1, 7_000, "build finished", false),
-        ],
-        &mut attention,
-        &mut seen,
-    );
+    let events = vec![
+        approval(1, 1_000, "req-1"),
+        command(2, 2_000, "cargo test", 101),
+        pending_question(1, 3_000, question(9), true, 3_000),
+        event(
+            AttentionSource::Semantic,
+            1,
+            4_000,
+            EventKind::TurnCompleted {
+                session_id: session(1),
+                turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
+                version: 1,
+                change_set: None,
+                summary: "rewrote the parser".to_owned(),
+            },
+        ),
+        adapter_failed(2, 5_000),
+        event(
+            AttentionSource::Semantic,
+            3,
+            6_000,
+            EventKind::HostContactLost {
+                detail: "the relay closed".to_owned(),
+            },
+        ),
+        notice(1, 7_000, "build finished", false),
+    ];
+    for source in events {
+        at += 60_001;
+        let outcomes = attention
+            .apply(&source, reading(at))
+            .expect("the store records the decision");
+        seen.extend(raised(&outcomes));
+    }
     // The idle reminder is the one rule a timer raises rather than an event.
     let outcomes = attention
         .tick(reading(at + IDLE_REMINDER_MS))
@@ -213,22 +225,10 @@ fn every_rule_in_the_set_is_raised_by_the_typed_event_it_covers() {
 fn a_command_that_succeeded_raises_nothing() {
     let mut attention = engine();
     let outcomes = attention
-        .apply(
-            &event(
-                AttentionSource::Receipts,
-                1,
-                1_000,
-                EventKind::CommandCompleted {
-                    session_id: session(1),
-                    command: "true".to_owned(),
-                    exit_code: 0,
-                },
-            ),
-            reading(0),
-        )
+        .apply(&command(1, 1_000, "true", 0), reading(0))
         .expect("the store records the decision");
     assert!(outcomes.is_empty());
-    assert!(attention.inbox(&actor("local:501"), true).is_empty());
+    assert!(whole_inbox(&attention).is_empty());
 }
 
 #[test]
@@ -237,12 +237,67 @@ fn a_condition_that_ends_leaves_the_inbox() {
     attention
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    assert_eq!(attention.inbox(&actor("local:501"), true).len(), 1);
+    assert_eq!(whole_inbox(&attention).len(), 1);
     let outcomes = attention
         .apply(&approval_resolved(2, 2_000, "req-1"), reading(1_000))
         .expect("the store records the decision");
     assert!(matches!(outcomes.as_slice(), [Outcome::Resolved { .. }]));
-    assert!(attention.inbox(&actor("local:501"), true).is_empty());
+    assert!(whole_inbox(&attention).is_empty());
+}
+
+#[test]
+fn a_subject_a_key_cannot_carry_still_reaches_attention() {
+    let mut attention = engine();
+    let long = "cargo test ".repeat(200);
+    attention
+        .apply(&command(1, 1_000, "make\nall", 2), reading(0))
+        .expect("the store records the decision");
+    attention
+        .apply(&command(2, 2_000, &long, 3), reading(61_000))
+        .expect("the store records the decision");
+    attention
+        .apply(&notice(1, 3_000, &"body ".repeat(300), false), reading(0))
+        .expect("the store records the decision");
+    let items = whole_inbox(&attention);
+    assert_eq!(items.len(), 3, "nothing was consumed and then dropped");
+    for item in &items {
+        assert!(
+            item.summary.len() <= MAX_ATTENTION_SUMMARY_LEN,
+            "the display text is bounded"
+        );
+    }
+    assert!(
+        items
+            .iter()
+            .filter(|item| item.rule == AttentionRule::CommandFailed)
+            .all(|item| item.key.as_str().contains(DERIVED_MARKER)),
+        "a subject a key cannot carry is derived rather than refused"
+    );
+}
+
+#[test]
+fn a_record_no_rule_covers_moves_the_cursor_and_nothing_else() {
+    let mut attention = engine();
+    let outcomes = attention
+        .apply(
+            &event(AttentionSource::Receipts, 1, 1_000, EventKind::Observed),
+            reading(0),
+        )
+        .expect("the store records the decision");
+    assert!(outcomes.is_empty());
+    assert_eq!(
+        attention.engine().consumed(AttentionSource::Receipts),
+        Some(1)
+    );
+    let next = attention
+        .apply(&approval(2, 2_000, "req-1"), reading(1_000))
+        .expect("the store records the decision");
+    assert!(
+        !next
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::GapRecorded { .. })),
+        "a consumed record is not a gap: {next:?}"
+    );
 }
 
 // ----- De-duplication ----------------------------------------------------------------------
@@ -266,7 +321,7 @@ fn a_repeat_inside_the_sixty_second_window_is_counted_rather_than_announced() {
         inside.as_slice(),
         [Outcome::Repeated { occurrences: 2, .. }]
     ));
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
+    let item = whole_inbox(&attention).remove(0);
     assert_eq!(item.occurrences, U64::new(2));
     assert_eq!(item.notification, NotificationState::Suppressed);
 
@@ -278,8 +333,7 @@ fn a_repeat_inside_the_sixty_second_window_is_counted_rather_than_announced() {
         1,
         "the window has passed, so the condition is announced again"
     );
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
-    assert_eq!(item.occurrences, U64::new(3));
+    assert_eq!(whole_inbox(&attention).remove(0).occurrences, U64::new(3));
 }
 
 // ----- Quiet hours -------------------------------------------------------------------------
@@ -311,7 +365,7 @@ fn an_announcement_inside_quiet_hours_is_deferred_and_released_when_they_end() {
     );
 
     // The item is in the inbox throughout, at the level its rule asks for.
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
+    let item = whole_inbox(&attention).remove(0);
     assert_eq!(item.level, AttentionLevel::Urgent);
     assert_eq!(item.notification, NotificationState::Deferred);
 
@@ -327,8 +381,84 @@ fn an_announcement_inside_quiet_hours_is_deferred_and_released_when_they_end() {
             .any(|outcome| matches!(outcome, Outcome::Released { .. })),
         "the held announcement is released rather than dropped: {released:?}"
     );
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
-    assert_eq!(item.notification, NotificationState::Delivered);
+    assert_eq!(
+        whole_inbox(&attention).remove(0).notification,
+        NotificationState::Delivered
+    );
+}
+
+#[test]
+fn a_repeat_that_falls_inside_quiet_hours_is_deferred_once_rather_than_on_every_tick() {
+    let mut attention = engine();
+    attention
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()), reading(1_000))
+        .expect("the store records the window");
+
+    let due = attention
+        .tick(reading(REMINDER_INTERVAL_MS))
+        .expect("the store records the decision");
+    assert!(
+        matches!(due.as_slice(), [Outcome::Deferred { .. }]),
+        "the repeat is held: {due:?}"
+    );
+    // The deadline is the end of the window rather than an interval that has already run, so the
+    // host waits for the release instead of waking on every tick.
+    let deadline = attention
+        .engine()
+        .next_deadline(reading(REMINDER_INTERVAL_MS))
+        .expect("a deferred item waits for the window to end");
+    assert!(
+        deadline > REMINDER_INTERVAL_MS,
+        "the next wake is the release, not an expired repeat"
+    );
+    for step in 1..4 {
+        let again = attention
+            .tick(reading(REMINDER_INTERVAL_MS + step))
+            .expect("the store records the decision");
+        assert!(again.is_empty(), "nothing is re-decided: {again:?}");
+    }
+}
+
+#[test]
+fn an_item_that_escalated_and_was_released_is_announced_once() {
+    let mut attention = engine();
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()), reading(0))
+        .expect("the store records the window");
+    attention
+        .apply(&adapter_failed(1, 1_000), reading(0))
+        .expect("the store records the decision");
+    // Long enough for the ladder, and past the end of the window.
+    let after = HostReading::new(3_600_000, NOON + 3_600_000, true);
+    let outcomes = attention
+        .tick(after)
+        .expect("the store records the decision");
+    let announcements = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome,
+                Outcome::Notified { .. } | Outcome::Deferred { .. } | Outcome::Released { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        announcements, 1,
+        "one decision per item per tick: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::Released {
+                level: AttentionLevel::Urgent,
+                ..
+            }
+        )),
+        "and it goes out at the level the item now stands at: {outcomes:?}"
+    );
 }
 
 #[test]
@@ -362,7 +492,7 @@ fn quiet_hours_are_not_enforced_on_a_clock_this_host_cannot_prove() {
         1,
         "an unprovable clock delivers rather than withholds: {outcomes:?}"
     );
-    let read = attention.read(&actor("local:501"), true, unproven);
+    let read = attention.read(&actor("local:501"), &page(), unproven);
     assert!(!read.quiet_hours_provable);
     assert!(!read.quiet_now);
     assert!(
@@ -386,19 +516,7 @@ fn the_idle_reminder_counts_from_the_request_rather_than_from_the_last_output() 
     // Output keeps arriving, which is not what the interval counts.
     for (sequence, at) in [(2_u64, 60_000_u64), (3, 120_000), (4, 180_000)] {
         attention
-            .apply(
-                &event(
-                    AttentionSource::Receipts,
-                    sequence,
-                    1_000 + at,
-                    EventKind::CommandCompleted {
-                        session_id: session(1),
-                        command: "true".to_owned(),
-                        exit_code: 0,
-                    },
-                ),
-                reading(at),
-            )
+            .apply(&command(sequence, 1_000 + at, "true", 0), reading(at))
             .expect("the store records the decision");
     }
 
@@ -414,8 +532,7 @@ fn the_idle_reminder_counts_from_the_request_rather_than_from_the_last_output() 
         .tick(reading(IDLE_REMINDER_MS))
         .expect("the store records the decision");
     assert!(raised(&due).contains(&AttentionRule::InputIdleReminder));
-    let reminder = attention
-        .inbox(&actor("local:501"), true)
+    let reminder = whole_inbox(&attention)
         .into_iter()
         .find(|item| item.rule == AttentionRule::InputIdleReminder)
         .expect("the reminder is in the inbox");
@@ -472,7 +589,7 @@ fn an_answered_request_is_never_reminded_about() {
         .tick(reading(IDLE_REMINDER_MS * 2))
         .expect("the store records the decision");
     assert!(raised(&due).is_empty(), "nothing is waiting: {due:?}");
-    assert!(attention.inbox(&actor("local:501"), true).is_empty());
+    assert!(whole_inbox(&attention).is_empty());
 }
 
 #[test]
@@ -494,23 +611,15 @@ fn an_unverified_request_never_becomes_attention_work() {
 // ----- Escalation --------------------------------------------------------------------------
 
 #[test]
-fn an_unattended_adapter_failure_climbs_to_urgent_and_an_acknowledged_one_does_not() {
+fn an_unattended_adapter_failure_climbs_to_urgent() {
     let mut attention = engine();
-    let failure = event(
-        AttentionSource::Semantic,
-        1,
-        1_000,
-        EventKind::AdapterFailed {
-            plugin_id: PluginId::new("git").expect("an identifier"),
-            session_id: Some(session(1)),
-            detail: "the helper exited".to_owned(),
-        },
-    );
     attention
-        .apply(&failure, reading(0))
+        .apply(&adapter_failed(1, 1_000), reading(0))
         .expect("the store records the decision");
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
-    assert_eq!(item.level, AttentionLevel::Notable);
+    assert_eq!(
+        whole_inbox(&attention).remove(0).level,
+        AttentionLevel::Notable
+    );
 
     let climbed = attention
         .tick(reading(ADAPTER_ESCALATION_MS))
@@ -526,23 +635,39 @@ fn an_unattended_adapter_failure_climbs_to_urgent_and_an_acknowledged_one_does_n
         )),
         "the failure climbed its ladder: {climbed:?}"
     );
+}
 
-    // A second failure, acknowledged straight away, never climbs.
+#[test]
+fn one_actor_s_acknowledgement_does_not_silence_the_host_s_reminder() {
     let mut attention = engine();
     attention
-        .apply(&failure, reading(0))
+        .apply(&adapter_failed(1, 1_000), reading(0))
         .expect("the store records the decision");
     attention
         .acknowledge(
-            &actor("local:501"),
+            &actor("device:phone"),
             &[key(AttentionRule::AdapterFailed, "git")],
             reading(1),
         )
         .expect("the store records the acknowledgement");
-    let quiet = attention
+    let climbed = attention
         .tick(reading(ADAPTER_ESCALATION_MS))
         .expect("the store records the decision");
-    assert!(quiet.is_empty(), "somebody has seen it: {quiet:?}");
+    assert!(
+        climbed.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::Escalated {
+                to: AttentionLevel::Urgent,
+                ..
+            }
+        )),
+        "the condition still stands, so the ladder still climbs: {climbed:?}"
+    );
+    assert_eq!(
+        attention.inbox(&actor("local:501"), false).len(),
+        1,
+        "and another actor still has it to look at"
+    );
 }
 
 #[test]
@@ -592,13 +717,12 @@ fn an_application_notice_is_untrusted_and_is_never_a_pending_approval() {
         raised(&outcomes),
         BTreeSet::from([AttentionRule::ApplicationNotice])
     );
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
+    let item = whole_inbox(&attention).remove(0);
     assert!(!item.trusted, "any process can print one");
     assert_eq!(item.level, AttentionLevel::Informational);
     assert_eq!(item.rule, AttentionRule::ApplicationNotice);
     assert!(
-        !attention
-            .inbox(&actor("local:501"), true)
+        !whole_inbox(&attention)
             .iter()
             .any(|item| item.rule == AttentionRule::PendingApproval),
         "nothing a notice says makes it an approval"
@@ -611,21 +735,22 @@ fn a_notice_with_no_lease_holder_goes_to_the_owner_policy_and_stays_in_attention
     attention
         .apply(&notice(1, 1_000, "build finished", false), reading(0))
         .expect("the store records the decision");
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
-    assert_eq!(item.routing, AttentionRouting::OwnerPolicy);
+    assert_eq!(
+        whole_inbox(&attention).remove(0).routing,
+        AttentionRouting::OwnerPolicy
+    );
 
     let mut attention = engine();
     attention
         .apply(&notice(1, 1_000, "build finished", true), reading(0))
         .expect("the store records the decision");
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
     assert_eq!(
-        item.routing,
+        whole_inbox(&attention).remove(0).routing,
         AttentionRouting::LeaseHolder,
         "a lease holder is the destination section 8 gives it"
     );
     assert_eq!(
-        attention.inbox(&actor("local:501"), true).len(),
+        whole_inbox(&attention).len(),
         1,
         "it is retained in Attention either way"
     );
@@ -640,8 +765,10 @@ fn an_untrusted_notice_never_reaches_an_urgent_level_however_long_it_waits() {
     attention
         .tick(reading(IDLE_REMINDER_MS * 12))
         .expect("the store records the decision");
-    let item = attention.inbox(&actor("local:501"), true).remove(0);
-    assert_eq!(item.level, AttentionLevel::Informational);
+    assert_eq!(
+        whole_inbox(&attention).remove(0).level,
+        AttentionLevel::Informational
+    );
     assert_eq!(rule(AttentionRule::ApplicationNotice).repeat_ms, None);
 }
 
@@ -660,7 +787,8 @@ fn an_acknowledgement_affects_only_the_actor_that_made_it() {
             reading(1_000),
         )
         .expect("the store records the acknowledgement");
-    assert_eq!(acknowledged.len(), 1);
+    assert_eq!(acknowledged.acknowledged.len(), 1);
+    assert_eq!(acknowledged.revision, U64::new(1));
     assert!(attention.inbox(&actor("device:phone"), false).is_empty());
     assert_eq!(
         attention.inbox(&actor("local:501"), false).len(),
@@ -703,7 +831,99 @@ fn acknowledging_a_key_the_host_holds_no_item_for_records_nothing() {
             reading(0),
         )
         .expect("the store records the acknowledgement");
-    assert!(acknowledged.is_empty());
+    assert!(acknowledged.acknowledged.is_empty());
+}
+
+// ----- The inbox bound and its page ---------------------------------------------------------
+
+fn page() -> AttentionReadParams {
+    AttentionReadParams {
+        session_id: session(1),
+        include_acknowledged: true,
+        max_items: U64::new(50),
+        after: Nullable::null(),
+    }
+}
+
+#[test]
+fn the_inbox_stays_inside_its_bound_and_says_how_much_it_let_go_of() {
+    let mut attention = engine();
+    let bound = MAX_RETAINED_ATTENTION_ITEMS;
+    for index in 0..bound + 10 {
+        attention
+            .apply(
+                &notice(index + 1, 1_000 + index, &format!("notice {index}"), false),
+                reading(index * 61_000),
+            )
+            .expect("the store records the decision");
+    }
+    let items = whole_inbox(&attention);
+    assert_eq!(items.len(), usize::try_from(bound).expect("a small bound"));
+    let read = attention.read(&actor("local:501"), &page(), reading(0));
+    assert_eq!(read.dropped, U64::new(10), "and it says what it let go of");
+    assert!(
+        read.more,
+        "a page of fifty is not the whole of five hundred"
+    );
+    assert_eq!(read.items.len(), 50);
+}
+
+#[test]
+fn a_page_continues_after_the_key_it_was_given() {
+    let mut attention = engine();
+    for index in 0..5 {
+        attention
+            .apply(
+                &notice(index + 1, 1_000 + index, &format!("notice {index}"), false),
+                reading(index * 61_000),
+            )
+            .expect("the store records the decision");
+    }
+    let first = attention.read(
+        &actor("local:501"),
+        &AttentionReadParams {
+            max_items: U64::new(2),
+            ..page()
+        },
+        reading(0),
+    );
+    assert_eq!(first.items.len(), 2);
+    assert!(first.more);
+    let next = attention.read(
+        &actor("local:501"),
+        &AttentionReadParams {
+            max_items: U64::new(2),
+            after: Nullable::some(first.items[1].key.clone()),
+            ..page()
+        },
+        reading(0),
+    );
+    assert_eq!(next.items.len(), 2);
+    assert_ne!(next.items[0].key, first.items[0].key);
+    assert_ne!(next.items[0].key, first.items[1].key);
+}
+
+#[test]
+fn an_urgent_item_outlives_an_informational_one_when_the_bound_bites() {
+    let mut attention = engine();
+    attention
+        .apply(&approval(1, 500, "req-1"), reading(0))
+        .expect("the store records the decision");
+    let bound = MAX_RETAINED_ATTENTION_ITEMS;
+    for index in 0..bound {
+        attention
+            .apply(
+                &notice(index + 1, 1_000 + index, &format!("notice {index}"), false),
+                reading((index + 1) * 61_000),
+            )
+            .expect("the store records the decision");
+    }
+    assert!(
+        whole_inbox(&attention)
+            .iter()
+            .any(|item| item.rule == AttentionRule::PendingApproval),
+        "the oldest item is kept because it is the most urgent"
+    );
 }
 
 // ----- Review state ------------------------------------------------------------------------
@@ -717,7 +937,7 @@ fn turn_completed(sequence: u64, at_ms: u64, version: u64) -> SourceEvent {
             session_id: session(1),
             turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
             version,
-            change_set: Some(ChangeSetId::new(Uuid::from_bytes([5; 16]))),
+            change_set: Some((ChangeSetId::new(Uuid::from_bytes([5; 16])), version)),
             summary: "rewrote the parser".to_owned(),
         },
     )
@@ -736,11 +956,15 @@ fn a_review_acknowledgement_binds_the_version_it_was_made_against() {
     attention
         .apply(&turn_completed(1, 1_000, 1), reading(0))
         .expect("the store records the decision");
-    let state = attention
+    let answer = attention
         .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
         .expect("the version is one the host holds");
-    assert_eq!(state.acknowledged_version, Nullable::some(U64::new(1)));
-    assert!(!state.outstanding);
+    assert_eq!(
+        answer.review.acknowledged_version,
+        Nullable::some(U64::new(1))
+    );
+    assert!(!answer.review.outstanding);
+    assert_eq!(answer.revision, U64::new(1));
 
     attention
         .apply(&turn_completed(2, 2_000, 2), reading(2_000))
@@ -755,6 +979,36 @@ fn a_review_acknowledgement_binds_the_version_it_was_made_against() {
     assert!(
         turn.outstanding,
         "a new change is new review work the old acknowledgement does not cover"
+    );
+}
+
+#[test]
+fn completing_a_review_takes_its_waiting_item_out_of_that_actor_s_inbox() {
+    let mut attention = engine();
+    attention
+        .apply(&turn_completed(1, 1_000, 1), reading(0))
+        .expect("the store records the decision");
+    assert_eq!(attention.inbox(&actor("local:501"), false).len(), 1);
+    attention
+        .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
+        .expect("the version is one the host holds");
+    assert!(
+        attention.inbox(&actor("local:501"), false).is_empty(),
+        "review state and the inbox say one thing"
+    );
+    assert_eq!(
+        attention.inbox(&actor("device:phone"), false).len(),
+        1,
+        "and only for the actor that reviewed it"
+    );
+
+    attention
+        .apply(&turn_completed(2, 200_000, 2), reading(120_000))
+        .expect("the store records the decision");
+    assert_eq!(
+        attention.inbox(&actor("local:501"), false).len(),
+        1,
+        "a later version is work again"
     );
 }
 
@@ -776,6 +1030,11 @@ fn a_review_acknowledgement_names_a_version_the_host_holds() {
             .is_err(),
         "version two was never presented"
     );
+    assert_eq!(
+        attention.revision(&actor("local:501")),
+        0,
+        "a refused acknowledgement records nothing"
+    );
 }
 
 #[test]
@@ -796,17 +1055,65 @@ fn a_review_acknowledgement_is_per_actor() {
 }
 
 #[test]
-fn a_turn_that_captured_a_change_set_gives_both_subjects_the_same_version() {
+fn a_change_set_captured_outside_a_turn_is_review_work_of_its_own() {
     let mut attention = engine();
     attention
-        .apply(&turn_completed(1, 1_000, 3), reading(0))
+        .apply(
+            &event(
+                AttentionSource::Semantic,
+                1,
+                1_000,
+                EventKind::ChangeSetCaptured {
+                    session_id: session(1),
+                    change_set_id: ChangeSetId::new(Uuid::from_bytes([7; 16])),
+                    version: 4,
+                    summary: "captured the workspace".to_owned(),
+                },
+            ),
+            reading(0),
+        )
+        .expect("the store records the decision");
+    let subject = ReviewSubject::ChangeSet {
+        session_id: session(1),
+        change_set_id: ChangeSetId::new(Uuid::from_bytes([7; 16])),
+    };
+    let state = attention
+        .reviews()
+        .state(&actor("local:501"), &subject)
+        .expect("the change set is a subject");
+    assert_eq!(state.current_version, U64::new(4));
+    assert!(state.outstanding);
+    attention
+        .acknowledge_review(&actor("local:501"), &subject, 4, reading(1_000))
+        .expect("the version is one the host holds");
+}
+
+#[test]
+fn a_turn_s_change_set_carries_its_own_version() {
+    let mut attention = engine();
+    attention
+        .apply(
+            &event(
+                AttentionSource::Semantic,
+                1,
+                1_000,
+                EventKind::TurnCompleted {
+                    session_id: session(1),
+                    turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
+                    version: 2,
+                    change_set: Some((ChangeSetId::new(Uuid::from_bytes([5; 16])), 9)),
+                    summary: "rewrote the parser".to_owned(),
+                },
+            ),
+            reading(0),
+        )
         .expect("the store records the decision");
     let states = attention.review_states(&actor("local:501"), session(1));
-    assert_eq!(states.len(), 2);
-    for state in states {
-        assert_eq!(state.current_version, U64::new(3));
-        assert!(state.outstanding);
-    }
+    let versions: Vec<_> = states
+        .iter()
+        .map(|state| state.current_version.get())
+        .collect();
+    assert_eq!(versions, vec![2, 9], "each subject is at its own version");
 }
 
 // ----- Changed since the last visit --------------------------------------------------------
@@ -858,8 +1165,8 @@ fn a_visit_cursor_never_goes_backwards() {
     let visit = attention
         .acknowledge_visit(&actor("local:501"), 0, Vec::new())
         .expect("the store records the visit");
-    assert_eq!(visit.cursor, 2);
-    assert_eq!(visit.revision, 2, "each visit is its own revision");
+    assert_eq!(visit.acknowledged_cursor, U64::new(2));
+    assert_eq!(visit.revision, U64::new(2), "each visit is a revision");
 }
 
 #[test]
@@ -890,6 +1197,40 @@ fn a_summary_travels_beside_the_events_and_names_the_interval_it_came_from() {
     );
 }
 
+#[test]
+fn a_range_a_retained_source_lost_is_shown_in_what_changed_since_a_visit() {
+    let mut attention = engine();
+    attention
+        .apply(&turn_completed(1, 1_000, 1), reading(0))
+        .expect("the store records the decision");
+    // Semantic sequences two to eight were evicted before the host could read them.
+    attention
+        .apply(&turn_completed(9, 9_000, 2), reading(120_000))
+        .expect("the store records the decision");
+    let changed = attention.changed_since(&actor("local:501"), 100, 0);
+    let omitted = changed
+        .omitted
+        .iter()
+        .find(|gap| gap.source == AttentionSource::Semantic && gap.from_sequence == U64::new(2))
+        .expect("the missing range is stated rather than closed over");
+    assert_eq!(omitted.to_sequence, U64::new(9));
+    assert!(
+        !changed.changes.is_empty(),
+        "and what did survive is still shown"
+    );
+
+    // An actor that has already visited past the gap is not told about it again.
+    attention
+        .acknowledge_visit(&actor("local:501"), changed.to_cursor, Vec::new())
+        .expect("the store records the visit");
+    assert!(
+        attention
+            .changed_since(&actor("local:501"), 100, 0)
+            .omitted
+            .is_empty()
+    );
+}
+
 // ----- Gaps --------------------------------------------------------------------------------
 
 #[test]
@@ -908,8 +1249,7 @@ fn a_gap_in_the_retained_events_is_never_an_answered_approval() {
             .any(|outcome| matches!(outcome, Outcome::GapRecorded { .. })),
         "the missing range is stated: {outcomes:?}"
     );
-    let first = attention
-        .inbox(&actor("local:501"), true)
+    let first = whole_inbox(&attention)
         .into_iter()
         .find(|item| item.key == key(AttentionRule::PendingApproval, "req-1"))
         .expect("the first approval is still in the inbox");
@@ -935,14 +1275,46 @@ fn a_gap_in_one_source_does_not_cast_doubt_on_another_source_s_items() {
     attention
         .apply(&notice(9, 9_000, "build failed", false), reading(1_000))
         .expect("the store records the decision");
-    let approval_item = attention
-        .inbox(&actor("local:501"), true)
+    let approval_item = whole_inbox(&attention)
         .into_iter()
         .find(|item| item.rule == AttentionRule::PendingApproval)
         .expect("the approval is in the inbox");
     assert!(
         !approval_item.uncertain,
         "a range of terminal notices says nothing about an approval"
+    );
+    assert_eq!(approval_item.source, AttentionSource::Receipts);
+}
+
+#[test]
+fn a_first_record_past_the_start_of_a_source_says_what_it_missed() {
+    let mut attention = engine();
+    let outcomes = attention
+        .apply(&approval(9, 9_000, "req-9"), reading(0))
+        .expect("the store records the decision");
+    let gap = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            Outcome::GapRecorded { gap } => Some(*gap),
+            _ => None,
+        })
+        .expect("the missing prefix is stated");
+    assert_eq!(gap.from_sequence, U64::new(1));
+    assert_eq!(gap.to_sequence, U64::new(9));
+
+    // A host that knows the engine is starting partway through says so instead.
+    let mut attention = engine();
+    attention
+        .start_from(AttentionSource::Receipts, 8)
+        .expect("the store records the cursor");
+    let outcomes = attention
+        .apply(&approval(9, 9_000, "req-9"), reading(0))
+        .expect("the store records the decision");
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::GapRecorded { .. })),
+        "nothing was missed: {outcomes:?}"
     );
 }
 
@@ -965,14 +1337,14 @@ fn replaying_the_retained_events_twice_gives_one_inbox() {
     attention
         .rebuild(&events, reading(0))
         .expect("the store records the rebuild");
-    let once = attention.inbox(&actor("local:501"), true);
+    let once = whole_inbox(&attention);
     let changes_once = attention.changed_since(&actor("local:501"), 100, 0).changes;
 
     let again = attention
         .rebuild(&events, reading(1_000))
         .expect("the store records the rebuild");
     assert!(again.is_empty(), "nothing was consumed twice: {again:?}");
-    assert_eq!(attention.inbox(&actor("local:501"), true), once);
+    assert_eq!(whole_inbox(&attention), once);
     assert_eq!(
         attention.changed_since(&actor("local:501"), 100, 0).changes,
         changes_once
@@ -980,7 +1352,35 @@ fn replaying_the_retained_events_twice_gives_one_inbox() {
 }
 
 #[test]
-fn a_rebuild_from_nothing_lands_where_the_live_engine_did() {
+fn a_rebuild_announces_nothing_and_keeps_each_item_s_own_age() {
+    let mut attention = engine();
+    // The events are an hour old by the time the host reads them back.
+    let now = reading(3_600_000);
+    let outcomes = attention
+        .rebuild(&replayable_events(), now)
+        .expect("the store records the rebuild");
+    assert!(
+        !outcomes.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::Notified { .. } | Outcome::Deferred { .. } | Outcome::Released { .. }
+        )),
+        "history is not a notification: {outcomes:?}"
+    );
+    for item in whole_inbox(&attention) {
+        assert_eq!(item.notification, NotificationState::Pending);
+    }
+    // And the first tick after it decides what still needs saying.
+    let decided = attention.tick(now).expect("the store records the decision");
+    assert!(
+        decided
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Notified { .. })),
+        "the approval that is still outstanding is announced: {decided:?}"
+    );
+}
+
+#[test]
+fn a_rebuild_from_nothing_holds_the_same_items_as_the_live_engine() {
     let mut live = engine();
     let events = replayable_events();
     for source in &events {
@@ -993,13 +1393,20 @@ fn a_rebuild_from_nothing_lands_where_the_live_engine_did() {
         .rebuild(&events, reading(0))
         .expect("the store records the rebuild");
 
-    assert_eq!(
-        rebuilt.inbox(&actor("local:501"), true),
-        live.inbox(&actor("local:501"), true)
-    );
+    let keys = |attention: &Attention| -> Vec<AttentionKey> {
+        whole_inbox(attention)
+            .into_iter()
+            .map(|item| item.key)
+            .collect()
+    };
+    assert_eq!(keys(&rebuilt), keys(&live));
     assert_eq!(
         rebuilt.review_states(&actor("local:501"), session(1)),
         live.review_states(&actor("local:501"), session(1))
+    );
+    assert_eq!(
+        rebuilt.changed_since(&actor("local:501"), 100, 0).changes,
+        live.changed_since(&actor("local:501"), 100, 0).changes
     );
 }
 
@@ -1047,12 +1454,13 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
         attention
             .set_quiet_hours(Some(quiet_over_noon()), reading(1_000))
             .expect("the store records the window");
-        items = attention.inbox(&actor("local:501"), true);
+        items = whole_inbox(&attention);
         states = attention.review_states(&actor("local:501"), session(1));
+        assert_eq!(attention.revision(&actor("local:501")), 2);
     }
 
     let reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
-    assert_eq!(reopened.inbox(&actor("local:501"), true), items);
+    assert_eq!(whole_inbox(&reopened), items);
     assert_eq!(
         reopened.review_states(&actor("local:501"), session(1)),
         states
@@ -1066,6 +1474,111 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
         reopened.engine().consumed(AttentionSource::Receipts),
         Some(3),
         "the consumed cursors survive, so a replay is still idempotent"
+    );
+    assert_eq!(
+        reopened.revision(&actor("local:501")),
+        2,
+        "and so does the per-actor revision"
+    );
+}
+
+#[test]
+fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&adapter_failed(1, 0), reading(0))
+            .expect("the store records the decision");
+        assert_eq!(
+            whole_inbox(&attention).remove(0).level,
+            AttentionLevel::Notable
+        );
+    }
+    // The machine restarted; the failure had already stood for the whole escalation interval.
+    let after_restart = HostReading::new(1_000, NOON + ADAPTER_ESCALATION_MS, true);
+    let mut reopened = Attention::open(&path, after_restart).expect("the feature store reopens");
+    let climbed = reopened
+        .tick(after_restart)
+        .expect("the store records the decision");
+    assert!(
+        climbed.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::Escalated {
+                to: AttentionLevel::Urgent,
+                ..
+            }
+        )),
+        "the ladder is where the wall clock says it should be: {climbed:?}"
+    );
+}
+
+#[test]
+fn a_write_that_fails_leaves_the_engine_where_it_was() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+    attention
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    let before = whole_inbox(&attention);
+
+    // Somebody else is holding the store for writing.
+    let blocker = rusqlite::Connection::open(&path).expect("a second connection");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("the lock is taken");
+
+    let refused = attention.apply(&approval(2, 2_000, "req-2"), reading(61_000));
+    assert!(
+        refused.is_err(),
+        "the write could not happen, so neither could the decision"
+    );
+    assert_eq!(
+        whole_inbox(&attention),
+        before,
+        "a decision this host could not write down did not happen"
+    );
+    assert_eq!(
+        attention.engine().consumed(AttentionSource::Receipts),
+        Some(1),
+        "so the same record can be offered again"
+    );
+
+    blocker
+        .execute_batch("COMMIT")
+        .expect("the lock is released");
+    let outcomes = attention
+        .apply(&approval(2, 2_000, "req-2"), reading(61_000))
+        .expect("the store records the decision the second time");
+    assert_eq!(
+        raised(&outcomes),
+        BTreeSet::from([AttentionRule::PendingApproval]),
+        "and the retry raises what the refused attempt would have: {outcomes:?}"
+    );
+}
+
+#[test]
+fn a_stored_value_this_build_cannot_read_back_exactly_is_refused() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&turn_completed(1, 1_000, 1), reading(0))
+            .expect("the store records the decision");
+    }
+    // A version no unsigned reader wrote. Reading it back as nought would close review work the
+    // host had not done, so the store refuses it.
+    let connection = rusqlite::Connection::open(&path).expect("a second connection");
+    connection
+        .execute("UPDATE review_subjects SET version = -3", [])
+        .expect("the row is written");
+    drop(connection);
+    assert!(
+        Attention::open(&path, reading(0)).is_err(),
+        "a value that cannot come back as it went in is refused"
     );
 }
 
@@ -1137,6 +1650,48 @@ fn switching_to_another_view_loses_neither_one_s_position() {
 }
 
 #[test]
+fn the_view_a_client_used_last_is_the_one_the_bound_keeps() {
+    let mut attention = engine();
+    let bound = usize::try_from(MAX_RETAINED_LOG_VIEWS).expect("a small bound");
+    for index in 0..bound {
+        attention
+            .acknowledge_visit(
+                &actor("local:501"),
+                0,
+                vec![view(&format!("view-{index}"), index as u64, "")],
+            )
+            .expect("the store records the visit");
+    }
+    // The oldest view is used again, and then one more view is opened.
+    attention
+        .acknowledge_visit(
+            &actor("local:501"),
+            0,
+            vec![view("view-0", 500, "level=warn")],
+        )
+        .expect("the store records the visit");
+    attention
+        .acknowledge_visit(&actor("local:501"), 0, vec![view("view-new", 1, "")])
+        .expect("the store records the visit");
+
+    let changed = attention.changed_since(&actor("local:501"), 100, 0);
+    let ids: Vec<_> = changed
+        .views
+        .iter()
+        .map(|retained| retained.view.view_id.clone())
+        .collect();
+    assert_eq!(ids.len(), bound);
+    assert!(
+        ids.contains(&"view-0".to_owned()),
+        "the view the client just used is kept: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"view-1".to_owned()),
+        "the least used one goes"
+    );
+}
+
+#[test]
 fn a_view_whose_range_retention_took_is_served_from_the_oldest_byte_and_told_about_the_gap() {
     let mut attention = engine();
     attention
@@ -1171,7 +1726,7 @@ fn the_inbox_read_carries_the_escalation_the_quiet_window_and_the_gaps_together(
     attention
         .apply(&approval(9, 9_000, "req-9"), reading(1_000))
         .expect("the store records the decision");
-    let read = attention.read(&actor("local:501"), true, reading(1_000));
+    let read = attention.read(&actor("local:501"), &page(), reading(1_000));
     assert_eq!(read.items.len(), 2);
     assert!(read.quiet_now);
     assert!(read.quiet_hours_provable);

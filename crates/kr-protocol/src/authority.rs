@@ -223,6 +223,12 @@ pub enum RevisionBinding {
     DraftRevision,
     /// The exact change-set version.
     ChangeSetVersion,
+    /// The exact version of the subject a review acknowledgement names.
+    ///
+    /// A review binds to a completed turn as well as to a captured change set, and a turn has no
+    /// change-set version to be bound to. This is the version of whichever subject the
+    /// acknowledgement names, which is what section 14 requires an acknowledgement to carry.
+    ReviewSubjectVersion,
     /// The host authority revision.
     AuthorityRevision,
     /// The device's authorisation or preview key revision.

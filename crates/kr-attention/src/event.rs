@@ -65,6 +65,12 @@ pub struct ApplicationNotice {
 /// What one typed event says happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventKind {
+    /// A retained record the host consumed that no rule covers.
+    ///
+    /// The retained sources carry more than the attention engine has rules for. Without a way to
+    /// say "I read this and it was nothing", the cursor would stay behind and the next record the
+    /// engine does have a rule for would look like a gap. This is that way.
+    Observed,
     /// An upstream agent asked for an approval decision.
     ApprovalRequested {
         /// The request.
@@ -124,9 +130,25 @@ pub enum EventKind {
         /// acknowledgement to the version it was made against, so a later version is new review
         /// work rather than work an earlier acknowledgement covered.
         version: u64,
-        /// The change set the turn captured, when it captured one. It carries the same version.
-        change_set: Option<ChangeSetId>,
+        /// The change set the turn captured, and that change set's own version.
+        ///
+        /// A change set has a version of its own: capturing the same workspace twice in one turn
+        /// produces two versions, and a change set captured outside a turn has no turn version to
+        /// borrow. Carrying both is what lets a review acknowledgement bind the version it was
+        /// actually made against.
+        change_set: Option<(ChangeSetId, u64)>,
         /// One line naming what the turn did.
+        summary: String,
+    },
+    /// A change set was captured outside a turn.
+    ChangeSetCaptured {
+        /// The session it was captured in.
+        session_id: SessionId,
+        /// The change set.
+        change_set_id: ChangeSetId,
+        /// Its version.
+        version: u64,
+        /// One line naming what it holds.
         summary: String,
     },
     /// An adapter failed.

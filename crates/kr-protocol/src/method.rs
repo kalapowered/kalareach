@@ -1032,7 +1032,7 @@ methods! {
     ReviewAcknowledge = "review.acknowledge", ReviewAndAttention,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
     selectors: [Session, ChangeSet],
-    history: NotApplicable, capability: cap("changeset", ChangeSetVersion),
+    history: NotApplicable, capability: cap("review", ReviewSubjectVersion),
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "Acknowledge review of one version. It affects only this actor and mutates no code.";
 
@@ -1051,7 +1051,7 @@ methods! {
     doc: "Acknowledge an attention item for this actor only.";
 
     AttentionQuietHours = "attention.quiet_hours", ReviewAndAttention,
-    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
     selectors: [Environment, Session],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,

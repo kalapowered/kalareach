@@ -8,6 +8,7 @@
 //! | --- | --- |
 //! | [`time`] | The host time contract's answer, as the engine receives it. Nothing here reads a clock |
 //! | [`event`] | The typed events the engine runs from, and the cursors that make a replay safe |
+//! | [`key`] | Deriving an item's key from the subject its condition is about |
 //! | [`rule`] | The rule set, each rule's escalation ladder and its de-duplication window |
 //! | [`engine`] | The inbox: raising, de-duplicating, deferring, escalating, resolving and acknowledging |
 //! | [`review`] | Review acknowledgements, bound to versions, per actor |
@@ -81,6 +82,7 @@ pub mod engine;
 pub mod error;
 pub mod event;
 pub mod host;
+pub mod key;
 pub mod review;
 pub mod rule;
 pub mod store;

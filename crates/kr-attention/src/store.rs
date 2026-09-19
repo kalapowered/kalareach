@@ -8,21 +8,36 @@
 //!
 //! # Why the whole state is written at once
 //!
-//! Every write here replaces the stored state in one transaction. The state is bounded by design:
-//! a few hundred items, at most a thousand retained changes, a bounded set of views per actor.
-//! Writing all of it costs a few kilobytes and buys two properties that matter more than the
-//! saving. There is no partial write to reason about, so a crash leaves the store at the last
-//! complete state rather than at half of two. And storing the state is then the same operation as
-//! reconstructing it, so a rebuild from the retained events and an ordinary write cannot drift.
+//! Every write here replaces the stored state in one transaction. What makes that affordable is
+//! that every part of the state is bounded and the bounds are enforced where the state is built:
+//! [`kr_protocol::attention::MAX_RETAINED_ATTENTION_ITEMS`] items, each with a summary bounded by
+//! [`kr_protocol::attention::MAX_ATTENTION_SUMMARY_LEN`];
+//! [`crate::visit::MAX_RETAINED_CHANGES`] changes; [`crate::visit::MAX_OMITTED_RANGES`] omitted
+//! ranges; [`kr_protocol::attention::MAX_RETAINED_SUMMARIES`] summaries;
+//! [`kr_protocol::attention::MAX_RETAINED_REVIEW_SUBJECTS`] review subjects; and
+//! [`kr_protocol::attention::MAX_RETAINED_LOG_VIEWS`] views per actor.
+//!
+//! Writing all of it buys two properties that matter more than the saving. There is no partial
+//! write to reason about, so a crash leaves the store at the last complete state rather than at
+//! half of two. And storing the state is then the same operation as reconstructing it, so a
+//! rebuild from the retained events and an ordinary write cannot drift.
 //!
 //! # What is durable, and what is re-anchored
 //!
 //! Every interval the engine measures is measured on the boot-scoped continuous clock, which means
 //! nothing after a restart. So the store records the wall-clock moments instead - when an item was
-//! first seen, when a request became pending - and [`crate::host::Attention::open`] re-anchors each
-//! interval against the reading it opened at. A host that can prove its wall clock keeps an item's
-//! escalation where it was; one that cannot starts the intervals again, which is the conservative
-//! answer rather than a ladder climbed by arithmetic on a clock nobody can vouch for.
+//! first seen, when it was last announced, when a request became pending - and
+//! [`crate::host::Attention::open`] re-anchors each interval against the reading it opened at. A
+//! host that can prove its wall clock keeps an item's escalation where it was, including an
+//! interval that is already overdue; one that cannot starts the intervals again, which is the
+//! conservative answer rather than arithmetic on a clock nobody can vouch for.
+//!
+//! # What a stored value may not do
+//!
+//! It may not come back as a different value. Every integer is written and read without clamping,
+//! and a row this build cannot read exactly is [`Error::StoreUnreadable`] rather than a plausible
+//! substitute: a current version that collapsed onto an acknowledged one would close review work
+//! nobody had done.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -40,7 +55,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::engine::{Item, ItemAck, PendingInput};
 use crate::error::{Error, Result};
 use crate::review::{ReviewAck, Subject, subject_key};
-use crate::visit::Visit;
+use crate::time::{Elapsed, HostReading};
+use crate::visit::{Omitted, Visit};
 
 /// The schema this build writes and reads.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -52,10 +68,14 @@ pub struct StoredState {
     pub items: Vec<Item>,
     /// Each actor's acknowledgements of items.
     pub item_acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
+    /// Each actor's acknowledgement revision.
+    pub revisions: BTreeMap<ActorId, u64>,
     /// The highest sequence consumed from each source.
     pub consumed: BTreeMap<AttentionSource, u64>,
     /// The ranges of retained events the host can no longer read.
     pub gaps: Vec<AttentionGap>,
+    /// How many items the host has let go of to stay inside its bound.
+    pub dropped: u64,
     /// The questions waiting for an answer.
     pub pending_inputs: BTreeMap<QuestionId, PendingInput>,
     /// The configured quiet-hours window.
@@ -68,8 +88,8 @@ pub struct StoredState {
     pub changes: VecDeque<SemanticChange>,
     /// The cursor the next change is recorded at.
     pub next_cursor: u64,
-    /// The ranges of semantic changes retention has taken.
-    pub omitted: Vec<AttentionGap>,
+    /// The ranges that are missing from what a visit can be shown.
+    pub omitted: Vec<Omitted>,
     /// The model summaries the host holds.
     pub summaries: Vec<ChangeSummary>,
     /// Each actor's visit and the views it had open.
@@ -98,6 +118,7 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS items (
         key TEXT PRIMARY KEY,
         rule TEXT NOT NULL,
+        source TEXT NOT NULL,
         session_id TEXT,
         summary TEXT NOT NULL,
         routing TEXT NOT NULL,
@@ -107,10 +128,17 @@ const SCHEMA: &str = "
         first_seen_ms INTEGER NOT NULL,
         last_seen_ms INTEGER NOT NULL,
         notification TEXT NOT NULL,
+        last_notified_ms INTEGER,
         uncertain INTEGER NOT NULL,
-        attended INTEGER NOT NULL,
-        deferred INTEGER NOT NULL,
-        notified INTEGER NOT NULL
+        deferred INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS actors (
+        actor TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS dropped (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        items INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS item_acks (
         actor TEXT NOT NULL,
@@ -159,8 +187,12 @@ const SCHEMA: &str = "
         next_cursor INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS omitted (
-        from_cursor INTEGER PRIMARY KEY,
-        to_cursor INTEGER NOT NULL
+        at_cursor INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        from_sequence INTEGER NOT NULL,
+        to_sequence INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        PRIMARY KEY (at_cursor, source, from_sequence)
     );
     CREATE TABLE IF NOT EXISTS summaries (
         from_cursor INTEGER PRIMARY KEY,
@@ -185,16 +217,46 @@ const SCHEMA: &str = "
     );
 ";
 
+/// Every table the state lives in, which one write replaces together.
+const TABLES: &[&str] = &[
+    "consumed",
+    "gaps",
+    "items",
+    "actors",
+    "dropped",
+    "item_acks",
+    "pending_inputs",
+    "quiet_hours",
+    "review_subjects",
+    "review_acks",
+    "changes",
+    "change_head",
+    "omitted",
+    "summaries",
+    "visits",
+    "log_views",
+];
+
 fn unreadable(field: &'static str) -> Error {
     Error::StoreUnreadable { field }
 }
 
-fn as_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+/// Returns `value` as the integer SQLite stores, refusing one it cannot hold.
+///
+/// Clamping would be worse than refusing. A version, a cursor or an occurrence count that came
+/// back as a different number would read as valid state, and a current version that collapsed onto
+/// an acknowledged one would close review work nobody had done.
+fn as_i64(value: u64, field: &'static str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| unreadable(field))
 }
 
-fn as_u64(value: i64) -> u64 {
-    u64::try_from(value).unwrap_or_default()
+/// Returns a stored integer as the unsigned value it was written from, refusing a negative one.
+fn as_u64(value: i64, field: &'static str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| unreadable(field))
+}
+
+fn as_index(value: usize, field: &'static str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| unreadable(field))
 }
 
 impl Store {
@@ -226,7 +288,11 @@ impl Store {
              PRAGMA synchronous=FULL;
              PRAGMA foreign_keys=ON;",
         )?;
-        connection.execute_batch(SCHEMA)?;
+        // The recorded version is read before anything is created, because a table that is already
+        // there is left alone and would tell this build nothing about which build wrote it.
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+        )?;
         let recorded: Option<i64> = connection
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
                 row.get(0)
@@ -242,6 +308,7 @@ impl Store {
                 )?;
             }
         }
+        connection.execute_batch(SCHEMA)?;
         Ok(Self { connection })
     }
 
@@ -250,23 +317,9 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`Error::StoreUnavailable`] when a read fails and [`Error::StoreUnreadable`] when a
-    /// stored value is not one this build can read back.
+    /// stored value is not one this build can read back exactly.
     pub fn load(&self) -> Result<StoredState> {
-        let mut state = StoredState {
-            items: self.load_items()?,
-            item_acks: self.load_item_acks()?,
-            consumed: self.load_consumed()?,
-            gaps: self.load_gaps()?,
-            pending_inputs: self.load_pending()?,
-            quiet: self.load_quiet()?,
-            subjects: self.load_subjects()?,
-            review_acks: self.load_review_acks()?,
-            changes: self.load_changes()?,
-            next_cursor: 0,
-            omitted: self.load_omitted()?,
-            summaries: self.load_summaries()?,
-            visits: self.load_visits()?,
-        };
+        let changes = self.load_changes()?;
         let head: Option<i64> = self
             .connection
             .query_row(
@@ -275,48 +328,56 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        state.next_cursor = head.map_or_else(
-            || {
-                state
-                    .changes
-                    .back()
-                    .map_or(0, |change| change.cursor.get().saturating_add(1))
+        let next_cursor = match head {
+            Some(value) => as_u64(value, "change head")?,
+            None => changes
+                .back()
+                .map_or(0, |change| change.cursor.get().saturating_add(1)),
+        };
+        let dropped: Option<i64> = self
+            .connection
+            .query_row("SELECT items FROM dropped WHERE id = 0", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(StoredState {
+            items: self.load_items()?,
+            item_acks: self.load_item_acks()?,
+            revisions: self.load_revisions()?,
+            consumed: self.load_consumed()?,
+            gaps: self.load_gaps()?,
+            dropped: match dropped {
+                Some(value) => as_u64(value, "dropped count")?,
+                None => 0,
             },
-            as_u64,
-        );
-        Ok(state)
+            pending_inputs: self.load_pending()?,
+            quiet: self.load_quiet()?,
+            subjects: self.load_subjects()?,
+            review_acks: self.load_review_acks()?,
+            changes,
+            next_cursor,
+            omitted: self.load_omitted()?,
+            summaries: self.load_summaries()?,
+            visits: self.load_visits()?,
+        })
     }
 
     /// Replaces the stored state with `state`, in one transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreUnavailable`] when the transaction cannot be committed. Nothing is
+    /// Returns [`Error::StoreUnavailable`] when the transaction cannot be committed and
+    /// [`Error::StoreUnreadable`] when a value cannot be stored without changing it. Nothing is
     /// left half written: the store is either at the previous state or at this one.
     pub fn save(&mut self, state: &StoredState) -> Result<()> {
         let transaction = self.connection.transaction()?;
-        for table in [
-            "consumed",
-            "gaps",
-            "items",
-            "item_acks",
-            "pending_inputs",
-            "quiet_hours",
-            "review_subjects",
-            "review_acks",
-            "changes",
-            "change_head",
-            "omitted",
-            "summaries",
-            "visits",
-            "log_views",
-        ] {
+        for table in TABLES {
             transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
         for (source, sequence) in &state.consumed {
             transaction.execute(
                 "INSERT INTO consumed (source, sequence) VALUES (?1, ?2)",
-                params![source.as_str(), as_i64(*sequence)],
+                params![source.as_str(), as_i64(*sequence, "consumed cursor")?],
             )?;
         }
         for (position, gap) in state.gaps.iter().enumerate() {
@@ -325,47 +386,60 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
                     gap.source.as_str(),
-                    as_i64(gap.from_sequence.get()),
-                    as_i64(gap.to_sequence.get()),
-                    as_i64(position as u64)
+                    as_i64(gap.from_sequence.get(), "gap start")?,
+                    as_i64(gap.to_sequence.get(), "gap end")?,
+                    as_index(position, "gap position")?
                 ],
             )?;
         }
         for item in &state.items {
             transaction.execute(
                 "INSERT INTO items (
-                     key, rule, session_id, summary, routing, level, steps_taken, occurrences,
-                     first_seen_ms, last_seen_ms, notification, uncertain, attended, deferred,
-                     notified
+                     key, rule, source, session_id, summary, routing, level, steps_taken,
+                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
+                     uncertain, deferred
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     item.key.as_str(),
                     item.rule.as_str(),
+                    item.source.as_str(),
                     item.session_id.map(|session| session.to_string()),
                     item.summary,
                     item.routing.as_str(),
                     item.level.as_str(),
-                    as_i64(item.steps_taken as u64),
-                    as_i64(item.occurrences),
-                    as_i64(item.first_seen_ms.get()),
-                    as_i64(item.last_seen_ms.get()),
+                    as_index(item.steps_taken, "escalation step")?,
+                    as_i64(item.occurrences, "occurrence count")?,
+                    as_i64(item.first_seen_ms.get(), "first seen")?,
+                    as_i64(item.last_seen_ms.get(), "last seen")?,
                     item.notification.as_str(),
+                    item.last_notified_ms
+                        .map(|at| as_i64(at.get(), "last announced"))
+                        .transpose()?,
                     i64::from(item.uncertain),
-                    i64::from(item.attended),
-                    i64::from(item.deferred_at.is_some()),
-                    i64::from(item.last_notified_at.is_some()),
+                    i64::from(item.deferred),
                 ],
             )?;
         }
+        for (actor, revision) in &state.revisions {
+            transaction.execute(
+                "INSERT INTO actors (actor, revision) VALUES (?1, ?2)",
+                params![actor.as_str(), as_i64(*revision, "actor revision")?],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO dropped (id, items) VALUES (0, ?1)",
+            params![as_i64(state.dropped, "dropped count")?],
+        )?;
         for (actor, acks) in &state.item_acks {
             for (key, ack) in acks {
                 transaction.execute(
-                    "INSERT INTO item_acks (actor, key, occurrences, at_ms) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO item_acks (actor, key, occurrences, at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
                     params![
                         actor.as_str(),
                         key.as_str(),
-                        as_i64(ack.occurrences),
-                        as_i64(ack.at_ms.get())
+                        as_i64(ack.occurrences, "acknowledged occurrence")?,
+                        as_i64(ack.at_ms.get(), "acknowledged at")?
                     ],
                 )?;
             }
@@ -379,7 +453,7 @@ impl Store {
                     question_id.to_string(),
                     pending.session_id.to_string(),
                     pending.summary,
-                    as_i64(pending.pending_since_ms.get()),
+                    as_i64(pending.pending_since_ms.get(), "pending since")?,
                     i64::from(pending.reminded)
                 ],
             )?;
@@ -389,8 +463,8 @@ impl Store {
                 "INSERT INTO quiet_hours (id, start_minute, end_minute, zone)
                  VALUES (0, ?1, ?2, ?3)",
                 params![
-                    as_i64(quiet.start_minute.get()),
-                    as_i64(quiet.end_minute.get()),
+                    as_i64(quiet.start_minute.get(), "quiet start")?,
+                    as_i64(quiet.end_minute.get(), "quiet end")?,
                     quiet.zone.as_ref()
                 ],
             )?;
@@ -410,8 +484,8 @@ impl Store {
                     kind,
                     crate::review::subject_session(&subject.subject).to_string(),
                     object,
-                    as_i64(subject.version),
-                    as_i64(subject.at_ms.get())
+                    as_i64(subject.version, "review version")?,
+                    as_i64(subject.at_ms.get(), "review recorded at")?
                 ],
             )?;
         }
@@ -423,8 +497,8 @@ impl Store {
                     params![
                         actor.as_str(),
                         subject,
-                        as_i64(ack.version),
-                        as_i64(ack.at_ms.get())
+                        as_i64(ack.version, "acknowledged version")?,
+                        as_i64(ack.at_ms.get(), "acknowledged at")?
                     ],
                 )?;
             }
@@ -434,24 +508,29 @@ impl Store {
                 "INSERT INTO changes (cursor, kind, session_id, summary, at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    as_i64(change.cursor.get()),
+                    as_i64(change.cursor.get(), "change cursor")?,
                     change.kind.as_str(),
                     change.session_id.to_string(),
                     change.summary,
-                    as_i64(change.at_ms.get())
+                    as_i64(change.at_ms.get(), "change recorded at")?
                 ],
             )?;
         }
         transaction.execute(
             "INSERT INTO change_head (id, next_cursor) VALUES (0, ?1)",
-            params![as_i64(state.next_cursor)],
+            params![as_i64(state.next_cursor, "change head")?],
         )?;
-        for gap in &state.omitted {
+        for (position, omitted) in state.omitted.iter().enumerate() {
             transaction.execute(
-                "INSERT OR REPLACE INTO omitted (from_cursor, to_cursor) VALUES (?1, ?2)",
+                "INSERT OR REPLACE INTO omitted (
+                     at_cursor, source, from_sequence, to_sequence, position
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    as_i64(gap.from_sequence.get()),
-                    as_i64(gap.to_sequence.get())
+                    as_i64(omitted.at_cursor, "omitted position")?,
+                    omitted.gap.source.as_str(),
+                    as_i64(omitted.gap.from_sequence.get(), "omitted start")?,
+                    as_i64(omitted.gap.to_sequence.get(), "omitted end")?,
+                    as_index(position, "omitted order")?
                 ],
             )?;
         }
@@ -460,10 +539,10 @@ impl Store {
                 "INSERT INTO summaries (from_cursor, to_cursor, from_ms, to_ms, model, text)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
-                    as_i64(summary.from_cursor.get()),
-                    as_i64(summary.to_cursor.get()),
-                    as_i64(summary.from_ms.get()),
-                    as_i64(summary.to_ms.get()),
+                    as_i64(summary.from_cursor.get(), "summary start")?,
+                    as_i64(summary.to_cursor.get(), "summary end")?,
+                    as_i64(summary.from_ms.get(), "summary from")?,
+                    as_i64(summary.to_ms.get(), "summary to")?,
                     summary.model,
                     summary.text
                 ],
@@ -472,7 +551,11 @@ impl Store {
         for (actor, visit) in &state.visits {
             transaction.execute(
                 "INSERT INTO visits (actor, cursor, revision) VALUES (?1, ?2, ?3)",
-                params![actor.as_str(), as_i64(visit.cursor), as_i64(visit.revision)],
+                params![
+                    actor.as_str(),
+                    as_i64(visit.cursor, "visit cursor")?,
+                    as_i64(visit.revision, "visit revision")?
+                ],
             )?;
             for (position, view) in visit.views.iter().enumerate() {
                 transaction.execute(
@@ -482,9 +565,9 @@ impl Store {
                     params![
                         actor.as_str(),
                         view.view_id,
-                        as_i64(view.source_offset.get()),
+                        as_i64(view.source_offset.get(), "view offset")?,
                         view.filter,
-                        as_i64(position as u64)
+                        as_index(position, "view order")?
                     ],
                 )?;
             }
@@ -495,56 +578,64 @@ impl Store {
 
     fn load_items(&self) -> Result<Vec<Item>> {
         let mut statement = self.connection.prepare(
-            "SELECT key, rule, session_id, summary, routing, level, steps_taken, occurrences,
-                    first_seen_ms, last_seen_ms, notification, uncertain, attended, deferred,
-                    notified
+            "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
+                    occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
+                    uncertain, deferred
              FROM items ORDER BY first_seen_ms, key",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, String>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, i64>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, i64>(11)?,
-                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<i64>>(12)?,
                 row.get::<_, i64>(13)?,
                 row.get::<_, i64>(14)?,
             ))
         })?;
+        let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
         let mut items = Vec::new();
         for row in rows {
             let row = row?;
-            let session_id = match row.2 {
+            let session_id = match row.3 {
                 Some(text) => Some(SessionId::from_str(&text).map_err(|_| unreadable("session"))?),
                 None => None,
             };
+            let last_notified_ms = row
+                .12
+                .map(|at| as_u64(at, "last announced").map(TimestampMs::new))
+                .transpose()?;
             items.push(Item {
                 key: AttentionKey::new(row.0).map_err(|_| unreadable("item key"))?,
                 rule: AttentionRule::from_wire(&row.1).ok_or_else(|| unreadable("rule"))?,
+                source: AttentionSource::from_wire(&row.2).ok_or_else(|| unreadable("source"))?,
                 session_id,
-                summary: row.3,
-                routing: AttentionRouting::from_wire(&row.4)
+                summary: row.4,
+                routing: AttentionRouting::from_wire(&row.5)
                     .ok_or_else(|| unreadable("routing"))?,
-                level: AttentionLevel::from_wire(&row.5).ok_or_else(|| unreadable("level"))?,
-                steps_taken: usize::try_from(row.6).unwrap_or_default(),
-                occurrences: as_u64(row.7),
-                first_seen_ms: TimestampMs::new(as_u64(row.8)),
-                last_seen_ms: TimestampMs::new(as_u64(row.9)),
-                notification: NotificationState::from_wire(&row.10)
+                level: AttentionLevel::from_wire(&row.6).ok_or_else(|| unreadable("level"))?,
+                steps_taken: usize::try_from(row.7).map_err(|_| unreadable("escalation step"))?,
+                occurrences: as_u64(row.8, "occurrence count")?,
+                first_seen_ms: TimestampMs::new(as_u64(row.9, "first seen")?),
+                last_seen_ms: TimestampMs::new(as_u64(row.10, "last seen")?),
+                notification: NotificationState::from_wire(&row.11)
                     .ok_or_else(|| unreadable("notification"))?,
-                uncertain: row.11 != 0,
-                attended: row.12 != 0,
-                raised_at: 0,
-                last_notified_at: (row.14 != 0).then_some(0),
-                deferred_at: (row.13 != 0).then_some(0),
+                last_notified_ms,
+                uncertain: row.13 != 0,
+                // Both intervals are re-anchored before anything reads them; the values here stand
+                // only until `Attention::open` does that.
+                age: unanchored,
+                since_notified: last_notified_ms.map(|_| unanchored),
+                deferred: row.14 != 0,
             });
         }
         Ok(items)
@@ -570,12 +661,30 @@ impl Store {
             acks.entry(actor).or_default().insert(
                 key,
                 ItemAck {
-                    occurrences: as_u64(occurrences),
-                    at_ms: TimestampMs::new(as_u64(at_ms)),
+                    occurrences: as_u64(occurrences, "acknowledged occurrence")?,
+                    at_ms: TimestampMs::new(as_u64(at_ms, "acknowledged at")?),
                 },
             );
         }
         Ok(acks)
+    }
+
+    fn load_revisions(&self) -> Result<BTreeMap<ActorId, u64>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT actor, revision FROM actors")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut revisions = BTreeMap::new();
+        for row in rows {
+            let (actor, revision) = row?;
+            revisions.insert(
+                ActorId::new(actor).map_err(|_| unreadable("actor"))?,
+                as_u64(revision, "actor revision")?,
+            );
+        }
+        Ok(revisions)
     }
 
     fn load_consumed(&self) -> Result<BTreeMap<AttentionSource, u64>> {
@@ -589,7 +698,7 @@ impl Store {
         for row in rows {
             let (source, sequence) = row?;
             let source = AttentionSource::from_wire(&source).ok_or_else(|| unreadable("source"))?;
-            consumed.insert(source, as_u64(sequence));
+            consumed.insert(source, as_u64(sequence, "consumed cursor")?);
         }
         Ok(consumed)
     }
@@ -610,8 +719,8 @@ impl Store {
             let (source, from, to) = row?;
             gaps.push(AttentionGap {
                 source: AttentionSource::from_wire(&source).ok_or_else(|| unreadable("source"))?,
-                from_sequence: U64::new(as_u64(from)),
-                to_sequence: U64::new(as_u64(to)),
+                from_sequence: U64::new(as_u64(from, "gap start")?),
+                to_sequence: U64::new(as_u64(to, "gap end")?),
             });
         }
         Ok(gaps)
@@ -631,6 +740,7 @@ impl Store {
                 row.get::<_, i64>(4)?,
             ))
         })?;
+        let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
         let mut pending = BTreeMap::new();
         for row in rows {
             let (question_id, session_id, summary, since, reminded) = row?;
@@ -640,8 +750,8 @@ impl Store {
                     session_id: SessionId::from_str(&session_id)
                         .map_err(|_| unreadable("session"))?,
                     summary,
-                    pending_since_ms: TimestampMs::new(as_u64(since)),
-                    pending_since: 0,
+                    pending_since_ms: TimestampMs::new(as_u64(since, "pending since")?),
+                    waited: unanchored,
                     reminded: reminded != 0,
                 },
             );
@@ -658,11 +768,14 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        Ok(row.map(|(start, end, zone)| QuietHours {
-            start_minute: U64::new(as_u64(start)),
-            end_minute: U64::new(as_u64(end)),
-            zone: Nullable(zone),
-        }))
+        row.map(|(start, end, zone)| {
+            Ok(QuietHours {
+                start_minute: U64::new(as_u64(start, "quiet start")?),
+                end_minute: U64::new(as_u64(end, "quiet end")?),
+                zone: Nullable(zone),
+            })
+        })
+        .transpose()
     }
 
     fn load_subjects(&self) -> Result<BTreeMap<String, Subject>> {
@@ -705,8 +818,8 @@ impl Store {
                 key,
                 Subject {
                     subject,
-                    version: as_u64(version),
-                    at_ms: TimestampMs::new(as_u64(at_ms)),
+                    version: as_u64(version, "review version")?,
+                    at_ms: TimestampMs::new(as_u64(at_ms, "review recorded at")?),
                 },
             );
         }
@@ -733,8 +846,8 @@ impl Store {
                 .insert(
                     subject,
                     ReviewAck {
-                        version: as_u64(version),
-                        at_ms: TimestampMs::new(as_u64(at_ms)),
+                        version: as_u64(version, "acknowledged version")?,
+                        at_ms: TimestampMs::new(as_u64(at_ms, "acknowledged at")?),
                     },
                 );
         }
@@ -758,30 +871,41 @@ impl Store {
         for row in rows {
             let (cursor, kind, session, summary, at_ms) = row?;
             changes.push_back(SemanticChange {
-                cursor: U64::new(as_u64(cursor)),
+                cursor: U64::new(as_u64(cursor, "change cursor")?),
                 kind: SemanticChangeKind::from_wire(&kind)
                     .ok_or_else(|| unreadable("change kind"))?,
                 session_id: SessionId::from_str(&session).map_err(|_| unreadable("session"))?,
                 summary,
-                at_ms: TimestampMs::new(as_u64(at_ms)),
+                at_ms: TimestampMs::new(as_u64(at_ms, "change recorded at")?),
             });
         }
         Ok(changes)
     }
 
-    fn load_omitted(&self) -> Result<Vec<AttentionGap>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT from_cursor, to_cursor FROM omitted ORDER BY from_cursor")?;
-        let rows =
-            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    fn load_omitted(&self) -> Result<Vec<Omitted>> {
+        let mut statement = self.connection.prepare(
+            "SELECT at_cursor, source, from_sequence, to_sequence FROM omitted
+             ORDER BY position, at_cursor, from_sequence",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
         let mut omitted = Vec::new();
         for row in rows {
-            let (from, to) = row?;
-            omitted.push(AttentionGap {
-                source: AttentionSource::Semantic,
-                from_sequence: U64::new(as_u64(from)),
-                to_sequence: U64::new(as_u64(to)),
+            let (at_cursor, source, from, to) = row?;
+            omitted.push(Omitted {
+                gap: AttentionGap {
+                    source: AttentionSource::from_wire(&source)
+                        .ok_or_else(|| unreadable("source"))?,
+                    from_sequence: U64::new(as_u64(from, "omitted start")?),
+                    to_sequence: U64::new(as_u64(to, "omitted end")?),
+                },
+                at_cursor: as_u64(at_cursor, "omitted position")?,
             });
         }
         Ok(omitted)
@@ -793,16 +917,28 @@ impl Store {
              FROM summaries ORDER BY from_cursor",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok(ChangeSummary {
-                from_cursor: U64::new(as_u64(row.get::<_, i64>(0)?)),
-                to_cursor: U64::new(as_u64(row.get::<_, i64>(1)?)),
-                from_ms: TimestampMs::new(as_u64(row.get::<_, i64>(2)?)),
-                to_ms: TimestampMs::new(as_u64(row.get::<_, i64>(3)?)),
-                model: row.get::<_, String>(4)?,
-                text: row.get::<_, String>(5)?,
-            })
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
         })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let mut summaries = Vec::new();
+        for row in rows {
+            let (from_cursor, to_cursor, from_ms, to_ms, model, text) = row?;
+            summaries.push(ChangeSummary {
+                from_cursor: U64::new(as_u64(from_cursor, "summary start")?),
+                to_cursor: U64::new(as_u64(to_cursor, "summary end")?),
+                from_ms: TimestampMs::new(as_u64(from_ms, "summary from")?),
+                to_ms: TimestampMs::new(as_u64(to_ms, "summary to")?),
+                model,
+                text,
+            });
+        }
+        Ok(summaries)
     }
 
     fn load_visits(&self) -> Result<BTreeMap<ActorId, Visit>> {
@@ -822,9 +958,9 @@ impl Store {
             visits.insert(
                 ActorId::new(actor).map_err(|_| unreadable("actor"))?,
                 Visit {
-                    cursor: as_u64(cursor),
+                    cursor: as_u64(cursor, "visit cursor")?,
                     views: Vec::new(),
-                    revision: as_u64(revision),
+                    revision: as_u64(revision, "visit revision")?,
                 },
             );
         }
@@ -844,7 +980,7 @@ impl Store {
             let actor = ActorId::new(actor).map_err(|_| unreadable("actor"))?;
             visits.entry(actor).or_default().views.push(LogViewState {
                 view_id,
-                source_offset: U64::new(as_u64(offset)),
+                source_offset: U64::new(as_u64(offset, "view offset")?),
                 filter,
             });
         }

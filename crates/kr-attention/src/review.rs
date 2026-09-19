@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use kr_protocol::attention::{ReviewState, ReviewSubject};
+use kr_protocol::attention::{MAX_RETAINED_REVIEW_SUBJECTS, ReviewState, ReviewSubject};
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
@@ -118,7 +118,36 @@ impl Reviews {
                         at_ms,
                     },
                 );
+                self.enforce_bound();
                 true
+            }
+        }
+    }
+
+    /// Keeps the subject table inside [`MAX_RETAINED_REVIEW_SUBJECTS`].
+    ///
+    /// The oldest version recorded goes first, with the acknowledgements that named it. What is
+    /// let go of is a subject nobody has produced a new version of for longest, and the change
+    /// sets themselves are the project service's to keep, not this table's.
+    fn enforce_bound(&mut self) {
+        while self.subjects.len() > MAX_RETAINED_REVIEW_SUBJECTS {
+            let Some(oldest) = self
+                .subjects
+                .iter()
+                .min_by(|left, right| {
+                    left.1
+                        .at_ms
+                        .get()
+                        .cmp(&right.1.at_ms.get())
+                        .then_with(|| left.0.cmp(right.0))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.subjects.remove(&oldest);
+            for acks in self.acks.values_mut() {
+                acks.remove(&oldest);
             }
         }
     }

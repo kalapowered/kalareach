@@ -13,9 +13,16 @@ kr-protocol.workspace = true
 # The feature store is a small table of its own beside the session journal: per-actor
 # acknowledgement revisions, consumed event cursors and the items rebuilt from them.
 rusqlite = { workspace = true, features = ["bundled"] }
+# An item's key is derived from the subject its condition is about, and a subject is sometimes a
+# command line or an application's own notification text. A digest of the exact bytes keeps the key
+# deterministic across a replay and bounded whatever it covers.
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The rollback test holds a write lock on the store from outside, so the engine's own write is
+# refused for a reason the test controls rather than one the filesystem happens to give it.
+rusqlite = { workspace = true, features = ["bundled"] }
 tempfile.workspace = true
 
 [lints]

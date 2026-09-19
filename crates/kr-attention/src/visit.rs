@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use kr_protocol::attention::{
     AttentionGap, AttentionSource, ChangeSummary, LogViewState, MAX_RETAINED_LOG_VIEWS,
-    MAX_VISIT_CHANGES, RetainedLogView, SemanticChange, SemanticChangeKind,
+    MAX_RETAINED_SUMMARIES, MAX_VISIT_CHANGES, RetainedLogView, SemanticChange, SemanticChangeKind,
 };
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::recovery::HistoryGap;
@@ -31,6 +31,25 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 /// Largest number of semantic changes the host retains for one session.
 pub const MAX_RETAINED_CHANGES: usize = 1_000;
 
+/// Largest number of omitted ranges the host keeps. The oldest is dropped past it.
+pub const MAX_OMITTED_RANGES: usize = 64;
+
+/// One range that is missing from what a visit can be shown, and where it is missing from.
+///
+/// Two different things are missing for two different reasons, and a reader has to be able to tell
+/// them apart. Retention takes a range of this host's own change log, which is a range of local
+/// cursors. An eviction in a retained *source* takes a range of that source's own sequences, and
+/// the engine records it when it notices the jump; it is placed at the local cursor the host had
+/// reached when it noticed, so a visit from before that point is told about it and one from after
+/// is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Omitted {
+    /// The range, in the numbering of whatever it belongs to.
+    pub gap: AttentionGap,
+    /// The local cursor the host had reached when the range went missing.
+    pub at_cursor: u64,
+}
+
 /// One actor's visit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Visit {
@@ -38,7 +57,7 @@ pub struct Visit {
     pub cursor: u64,
     /// The log views it had open.
     pub views: Vec<LogViewState>,
-    /// This actor's acknowledgement revision.
+    /// This actor's acknowledgement revision when the visit was recorded.
     pub revision: u64,
 }
 
@@ -67,7 +86,7 @@ pub struct Visits {
     log: VecDeque<SemanticChange>,
     next_cursor: u64,
     oldest_cursor: u64,
-    omitted: Vec<AttentionGap>,
+    omitted: Vec<Omitted>,
     summaries: Vec<ChangeSummary>,
     visits: BTreeMap<ActorId, Visit>,
 }
@@ -102,10 +121,29 @@ impl Visits {
         &self.summaries
     }
 
-    /// Returns the ranges retention has taken.
+    /// Returns every range that is missing, with where it went missing.
     #[must_use]
-    pub fn omitted(&self) -> &[AttentionGap] {
+    pub fn omitted(&self) -> &[Omitted] {
         &self.omitted
+    }
+
+    /// Records a range a retained source lost, at the position the host had reached.
+    ///
+    /// The engine notices the jump; this is where it becomes visible to somebody reading what
+    /// changed since their last visit. Section 25 requires the omitted range to be shown rather
+    /// than closed over, and a source gap is exactly a range of events nobody can be shown.
+    pub fn note_source_gap(&mut self, gap: AttentionGap) {
+        if self
+            .omitted
+            .iter()
+            .any(|held| held.gap == gap && held.at_cursor == self.next_cursor)
+        {
+            return;
+        }
+        self.push_omitted(Omitted {
+            gap,
+            at_cursor: self.next_cursor,
+        });
     }
 
     /// Returns one actor's visit.
@@ -137,13 +175,13 @@ impl Visits {
             cursor: U64::new(cursor),
             kind,
             session_id,
-            summary,
+            summary: crate::engine::clip_summary(&summary),
             at_ms,
         });
         self.next_cursor = cursor.saturating_add(1);
         while self.log.len() > MAX_RETAINED_CHANGES {
             let evicted = self.log.pop_front().expect("the log is not empty");
-            self.note_omitted(evicted.cursor.get(), evicted.cursor.get().saturating_add(1));
+            self.note_evicted(evicted.cursor.get(), evicted.cursor.get().saturating_add(1));
         }
         self.oldest_cursor = self
             .log
@@ -162,25 +200,32 @@ impl Visits {
         self.summaries.push(summary);
         self.summaries
             .sort_by_key(|summary| summary.from_cursor.get());
+        // A summary is a convenience beside the events, so the oldest goes first once the host
+        // holds more than it is prepared to write down.
+        while self.summaries.len() > MAX_RETAINED_SUMMARIES {
+            self.summaries.remove(0);
+        }
     }
 
     /// Records one actor's visit and the views it had open.
     ///
     /// The cursor never goes backwards: a visit records how far somebody has got, and a client
     /// that reports an older position has not unseen what it saw. Returns the visit as stored.
-    pub fn acknowledge(&mut self, actor: &ActorId, cursor: u64, views: Vec<LogViewState>) -> Visit {
+    pub fn acknowledge(
+        &mut self,
+        actor: &ActorId,
+        cursor: u64,
+        views: Vec<LogViewState>,
+        revision: u64,
+    ) -> Visit {
         let visit = self.visits.entry(actor.clone()).or_default();
         visit.cursor = visit.cursor.max(cursor.min(self.next_cursor));
-        visit.revision = visit.revision.saturating_add(1);
+        visit.revision = revision;
         for view in views {
-            match visit
-                .views
-                .iter_mut()
-                .find(|held| held.view_id == view.view_id)
-            {
-                Some(held) => *held = view,
-                None => visit.views.push(view),
-            }
+            // A view that is updated moves to the newest position. Leaving it where it was would
+            // make the bound below evict the view a client had just used.
+            visit.views.retain(|held| held.view_id != view.view_id);
+            visit.views.push(view);
         }
         // The bound drops the view that was updated longest ago, which is the one a client is
         // least likely to return to. A client with more open views than the bound keeps the ones
@@ -209,7 +254,12 @@ impl Visits {
         let visit = self.visits.get(actor);
         let from = visit.map_or(0, |visit| visit.cursor);
         let limit = usize::try_from(max_changes.clamp(1, MAX_VISIT_CHANGES)).unwrap_or(1);
-        let mut omitted = Vec::new();
+        let mut omitted: Vec<AttentionGap> = self
+            .omitted
+            .iter()
+            .filter(|held| held.at_cursor >= from)
+            .map(|held| held.gap)
+            .collect();
         if from < self.oldest_cursor {
             omitted.push(AttentionGap {
                 source: AttentionSource::Semantic,
@@ -217,6 +267,7 @@ impl Visits {
                 to_sequence: U64::new(self.oldest_cursor),
             });
         }
+        omitted.dedup();
         let start = from.max(self.oldest_cursor);
         let changes: Vec<_> = self
             .log
@@ -251,7 +302,7 @@ impl Visits {
         &mut self,
         log: VecDeque<SemanticChange>,
         next_cursor: u64,
-        omitted: Vec<AttentionGap>,
+        omitted: Vec<Omitted>,
         summaries: Vec<ChangeSummary>,
         visits: BTreeMap<ActorId, Visit>,
     ) {
@@ -265,18 +316,31 @@ impl Visits {
         self.visits = visits;
     }
 
-    fn note_omitted(&mut self, from: u64, to: u64) {
+    /// Records a range of this host's own change log that retention took.
+    fn note_evicted(&mut self, from: u64, to: u64) {
         if let Some(last) = self.omitted.last_mut()
-            && last.to_sequence.get() == from
+            && last.gap.source == AttentionSource::Semantic
+            && last.at_cursor == last.gap.from_sequence.get()
+            && last.gap.to_sequence.get() == from
         {
-            last.to_sequence = U64::new(to);
+            last.gap.to_sequence = U64::new(to);
             return;
         }
-        self.omitted.push(AttentionGap {
-            source: AttentionSource::Semantic,
-            from_sequence: U64::new(from),
-            to_sequence: U64::new(to),
+        self.push_omitted(Omitted {
+            gap: AttentionGap {
+                source: AttentionSource::Semantic,
+                from_sequence: U64::new(from),
+                to_sequence: U64::new(to),
+            },
+            at_cursor: from,
         });
+    }
+
+    fn push_omitted(&mut self, omitted: Omitted) {
+        self.omitted.push(omitted);
+        if self.omitted.len() > MAX_OMITTED_RANGES {
+            self.omitted.remove(0);
+        }
     }
 
     fn retained_views(

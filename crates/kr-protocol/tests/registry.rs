@@ -255,14 +255,20 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // Section 25 gives the review and attention group two operations that section 23's row does
     // not name: a quiet-hours window has to be set before it can defer anything, and the
     // changed-since-last-visit view has to be readable without moving the visit cursor that
-    // defines it. Both carry their own exhaustive entry under the group's own scoped-view right,
-    // and neither can mutate code: section 23's rule for this group is that no review method does,
-    // and the rights below are the whole of what they require.
+    // defines it. Both carry their own exhaustive entry, and neither can mutate code: section 23's
+    // rule for this group is that no review method does, and the rights below are the whole of
+    // what they require. Quiet hours are the one of the two that is not per actor - one window
+    // suppresses the owner's audible delivery - so it asks for host management rather than the
+    // scoped view authority that lets an actor read and acknowledge its own inbox.
     let attention = [
-        ("attention.quiet_hours", EffectClass::Write),
-        ("visit.changed", EffectClass::Read),
+        (
+            "attention.quiet_hours",
+            EffectClass::Write,
+            ActionRight::HostManage,
+        ),
+        ("visit.changed", EffectClass::Read, ActionRight::SessionView),
     ];
-    for (name, effect) in attention {
+    for (name, effect, right) in attention {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
         assert_eq!(entry.effect, effect, "{name} carries its own effect class");
         assert_eq!(
@@ -272,9 +278,35 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
         assert_eq!(
             entry.required_rights,
-            &[RequiredRight::right(ActionRight::SessionView)],
-            "{name} asks for scoped view authority and nothing that mutates code"
+            &[RequiredRight::right(right)],
+            "{name} asks for one right and nothing that mutates code"
         );
+    }
+
+    // No method in the group may reach a right that changes code or Git state. Section 23's rule
+    // for this row is "no code mutation", and this is where that stops being a convention.
+    for entry in REGISTRY
+        .iter()
+        .filter(|entry| entry.group == MethodGroup::ReviewAndAttention)
+    {
+        for right in entry.required_rights {
+            let RequiredAuthority::Right { right } = right.authority else {
+                continue;
+            };
+            assert!(
+                !matches!(
+                    right,
+                    ActionRight::FilesApplyDiff
+                        | ActionRight::ChangesetCreate
+                        | ActionRight::ProjectCreate
+                        | ActionRight::WorkspaceManage
+                        | ActionRight::TerminalInput
+                        | ActionRight::AgentApprovalRespond
+                ),
+                "{} would let a review method mutate code",
+                entry.name
+            );
+        }
     }
 
     assert_eq!(

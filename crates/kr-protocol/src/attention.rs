@@ -56,7 +56,28 @@ pub const IDLE_REMINDER_MS: u64 = 300_000;
 pub const MINUTES_IN_DAY: u64 = 1_440;
 
 /// Largest number of items one attention read returns.
-pub const MAX_ATTENTION_ITEMS: u64 = 500;
+pub const MAX_ATTENTION_ITEMS: u64 = 200;
+
+/// Largest number of items the host keeps in one session's inbox.
+///
+/// The inbox is a working set rather than a record: the receipts, the question ledger and the
+/// retained output are where the history lives. Past this bound the host drops the least urgent
+/// and oldest item and counts it in [`AttentionReadResult::dropped`], because an inbox that grows
+/// without limit is one the host cannot write down or serve.
+pub const MAX_RETAINED_ATTENTION_ITEMS: u64 = 500;
+
+/// Largest summary one item or change carries, in bytes.
+///
+/// A summary is display text taken from a command line or an application's own notification, and
+/// neither is bounded at its source. It is clipped on a character boundary rather than refused:
+/// the item matters more than the whole of its text.
+pub const MAX_ATTENTION_SUMMARY_LEN: usize = 512;
+
+/// Largest number of model summaries the host keeps for one session.
+pub const MAX_RETAINED_SUMMARIES: usize = 32;
+
+/// Largest number of review subjects the host keeps for one session.
+pub const MAX_RETAINED_REVIEW_SUBJECTS: usize = 500;
 
 /// Largest number of semantic changes one changed-since-last-visit read returns.
 pub const MAX_VISIT_CHANGES: u64 = 500;
@@ -296,6 +317,11 @@ pub struct AttentionItem {
     pub key: AttentionKey,
     /// The rule that raised it.
     pub rule: AttentionRule,
+    /// The retained source the condition was observed in.
+    ///
+    /// It is what a gap is weighed against: a range that retention took from this source is a
+    /// range that could have resolved this item, and a range taken from another source is not.
+    pub source: AttentionSource,
     /// What it is asking for now, after any escalation.
     pub level: AttentionLevel,
     /// The session it belongs to, when it belongs to one.
@@ -523,6 +549,10 @@ pub struct AttentionReadParams {
     pub session_id: SessionId,
     /// Whether items this actor has already acknowledged are included.
     pub include_acknowledged: bool,
+    /// The largest page the caller will accept, bounded by [`MAX_ATTENTION_ITEMS`].
+    pub max_items: U64,
+    /// The key to continue after, or null to start at the oldest item.
+    pub after: Nullable<AttentionKey>,
 }
 
 /// The result of `attention.read`.
@@ -531,6 +561,14 @@ pub struct AttentionReadParams {
 pub struct AttentionReadResult {
     /// The items, oldest first.
     pub items: Vec<AttentionItem>,
+    /// Whether more items remain after the last one in this page.
+    pub more: bool,
+    /// How many items the host has dropped to stay inside its own bound.
+    ///
+    /// Nought is the ordinary answer. Anything else says the inbox reached
+    /// [`MAX_RETAINED_ATTENTION_ITEMS`] and the host let go of its least urgent and oldest items,
+    /// which a client shows rather than hides.
+    pub dropped: U64,
     /// The ranges of retained events the host can no longer read.
     pub gaps: Vec<AttentionGap>,
     /// The configured quiet hours, when there are any.

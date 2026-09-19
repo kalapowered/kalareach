@@ -1657,6 +1657,10 @@
           ],
           "description": "The session it belongs to, when it belongs to one."
         },
+        "source": {
+          "$ref": "#/$defs/AttentionSource",
+          "description": "The retained source the condition was observed in.\n\nIt is what a gap is weighed against: a range that retention took from this source is a\nrange that could have resolved this item, and a range taken from another source is not."
+        },
         "summary": {
           "description": "One line naming the subject.",
           "type": "string"
@@ -1673,6 +1677,7 @@
       "required": [
         "key",
         "rule",
+        "source",
         "level",
         "session_id",
         "summary",
@@ -1774,9 +1779,24 @@
       "additionalProperties": false,
       "description": "Parameters of `attention.read`.",
       "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttentionKey"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The key to continue after, or null to start at the oldest item."
+        },
         "include_acknowledged": {
           "description": "Whether items this actor has already acknowledged are included.",
           "type": "boolean"
+        },
+        "max_items": {
+          "$ref": "#/$defs/U64",
+          "description": "The largest page the caller will accept, bounded by [`MAX_ATTENTION_ITEMS`]."
         },
         "session_id": {
           "$ref": "#/$defs/SessionId",
@@ -1785,7 +1805,9 @@
       },
       "required": [
         "session_id",
-        "include_acknowledged"
+        "include_acknowledged",
+        "max_items",
+        "after"
       ],
       "type": "object"
     },
@@ -1793,6 +1815,10 @@
       "additionalProperties": false,
       "description": "The result of `attention.read`.",
       "properties": {
+        "dropped": {
+          "$ref": "#/$defs/U64",
+          "description": "How many items the host has dropped to stay inside its own bound.\n\nNought is the ordinary answer. Anything else says the inbox reached\n[`MAX_RETAINED_ATTENTION_ITEMS`] and the host let go of its least urgent and oldest items,\nwhich a client shows rather than hides."
+        },
         "gaps": {
           "description": "The ranges of retained events the host can no longer read.",
           "items": {
@@ -1806,6 +1832,10 @@
             "$ref": "#/$defs/AttentionItem"
           },
           "type": "array"
+        },
+        "more": {
+          "description": "Whether more items remain after the last one in this page.",
+          "type": "boolean"
         },
         "quiet_hours": {
           "anyOf": [
@@ -1829,6 +1859,8 @@
       },
       "required": [
         "items",
+        "more",
+        "dropped",
         "gaps",
         "quiet_hours",
         "quiet_now",
@@ -16410,6 +16442,11 @@
         {
           "const": "change_set_version",
           "description": "The exact change-set version.",
+          "type": "string"
+        },
+        {
+          "const": "review_subject_version",
+          "description": "The exact version of the subject a review acknowledgement names.\n\nA review binds to a completed turn as well as to a captured change set, and a turn has no\nchange-set version to be bound to. This is the version of whichever subject the\nacknowledgement names, which is what section 14 requires an acknowledgement to carry.",
           "type": "string"
         },
         {

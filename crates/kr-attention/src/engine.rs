@@ -13,32 +13,54 @@
 //! 1. A condition the engine has already consumed changes nothing.
 //! 2. A repeat inside the rule's sixty-second window is counted on the item rather than announced.
 //! 3. An announcement inside quiet hours is deferred and released when they end, never dropped.
-//! 4. An item nobody has attended to climbs its rule's ladder and is announced again at the rule's
-//!    interval.
-//! 5. A condition that ends resolves its item, which leaves the inbox.
+//! 4. An item climbs its rule's ladder while the condition stands, and is announced again at the
+//!    rule's interval. An acknowledgement does not stop it: section 23 makes an acknowledgement
+//!    affect only the actor that made it, and one actor cannot silence the host's own reminder to
+//!    another.
+//! 5. A condition that ends resolves its item, which leaves the inbox and takes any announcement
+//!    still held for it with it.
+//!
+//! # Live and replay
+//!
+//! [`Engine::apply`] is the live path: it decides and announces. [`Engine::replay`] rebuilds the
+//! same state from the retained events without announcing any of it, because an event from an hour
+//! ago is not a notification to send now. A replay leaves every item's announcement undecided, and
+//! the first [`Engine::tick`] after it decides them against the present.
 //!
 //! # What the engine will not do
 //!
 //! It will not treat a gap as an ending. A range of retained events that retention has taken is
-//! recorded as a gap, and every unresolved item the missing range could have resolved is marked
-//! uncertain and left in the inbox. Section 24 is explicit: a history gap is not an inferred
-//! approval or completion, and the only honest answer for a host that cannot tell is to say so.
+//! recorded as a gap, and every unresolved item from that same source is marked uncertain and left
+//! in the inbox. Section 24 is explicit: a history gap is not an inferred approval or completion,
+//! and the only honest answer for a host that cannot tell is to say so.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kr_protocol::attention::{
     AttentionGap, AttentionItem, AttentionKey, AttentionLevel, AttentionRouting, AttentionRule,
-    AttentionSource, IDLE_REMINDER_MS, NotificationState, QuietHours,
+    AttentionSource, IDLE_REMINDER_MS, MAX_ATTENTION_SUMMARY_LEN, MAX_RETAINED_ATTENTION_ITEMS,
+    NotificationState, QuietHours,
 };
 use kr_protocol::ids::{ActorId, QuestionId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
 use crate::event::{EventKind, SourceEvent};
-use crate::rule::{Rule, rule};
-use crate::time::{HostReading, MS_IN_MINUTE};
+use crate::key;
+use crate::rule::rule;
+use crate::time::{Elapsed, HostReading, MS_IN_MINUTE};
 
 /// Largest number of gaps the engine keeps. The oldest is dropped past it.
 pub const MAX_GAPS: usize = 64;
+
+/// Whether a decision is being made now or rebuilt from what was retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The condition is happening now, so a decision is announced.
+    Live,
+    /// The condition is being read back from the retained events. State is rebuilt and nothing is
+    /// announced, because an announcement is about the present.
+    Replay,
+}
 
 /// One item of attention, as the engine holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,9 +69,11 @@ pub struct Item {
     pub key: AttentionKey,
     /// The rule that raised it.
     pub rule: AttentionRule,
+    /// The retained source the condition was observed in.
+    pub source: AttentionSource,
     /// The session it belongs to, when it belongs to one.
     pub session_id: Option<SessionId>,
-    /// One line naming the subject.
+    /// One line naming the subject, clipped to [`MAX_ATTENTION_SUMMARY_LEN`].
     pub summary: String,
     /// Where its notification went.
     pub routing: AttentionRouting,
@@ -65,23 +89,16 @@ pub struct Item {
     pub last_seen_ms: TimestampMs,
     /// What became of the notification.
     pub notification: NotificationState,
+    /// When the last announcement was decided, when there has been one.
+    pub last_notified_ms: Option<TimestampMs>,
     /// Whether a gap in the retained events could have resolved it.
     pub uncertain: bool,
-    /// Whether any actor has acknowledged this occurrence.
-    ///
-    /// The ladder and the repeats stop when somebody has seen the item; each actor's own view of
-    /// it is unchanged, because an acknowledgement is per actor and affects only that actor.
-    pub attended: bool,
-    /// The continuous reading the item was raised at.
-    ///
-    /// The continuous clock is boot-scoped, so a restored item is re-anchored at the reading it
-    /// was restored at. A ladder therefore restarts after a restart rather than being walked to
-    /// the top by a clock that began again at nought.
-    pub raised_at: u64,
-    /// The continuous reading of the last announcement, when there has been one.
-    pub last_notified_at: Option<u64>,
-    /// The continuous reading an announcement was deferred at, when one is being held.
-    pub deferred_at: Option<u64>,
+    /// How long the item has stood.
+    pub age: Elapsed,
+    /// How long since the last announcement, when there has been one.
+    pub since_notified: Option<Elapsed>,
+    /// Whether quiet hours are holding an announcement for it.
+    pub deferred: bool,
 }
 
 impl Item {
@@ -91,6 +108,7 @@ impl Item {
         AttentionItem {
             key: self.key.clone(),
             rule: self.rule,
+            source: self.source,
             level: self.level,
             session_id: Nullable(self.session_id),
             summary: self.summary.clone(),
@@ -164,6 +182,11 @@ pub enum Outcome {
         /// The item.
         key: AttentionKey,
     },
+    /// An item the host let go of to stay inside its own bound.
+    Dropped {
+        /// The item.
+        key: AttentionKey,
+    },
     /// A range of retained events the host can no longer read.
     GapRecorded {
         /// The range.
@@ -182,7 +205,7 @@ pub struct ItemAck {
     pub at_ms: TimestampMs,
 }
 
-/// A question that is waiting for an answer, and when its idle interval started.
+/// A question that is waiting for an answer, and how long it has waited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingInput {
     /// The session it belongs to.
@@ -190,12 +213,9 @@ pub struct PendingInput {
     /// One line naming what is being asked.
     pub summary: String,
     /// What the wall clock read when the request became pending.
-    ///
-    /// This is the durable half. The continuous reading beside it is boot-scoped and means
-    /// nothing after a restart, so the interval is re-anchored from this one.
     pub pending_since_ms: TimestampMs,
-    /// The continuous reading the request became pending at.
-    pub pending_since: u64,
+    /// How long it has been pending.
+    pub waited: Elapsed,
     /// Whether the reminder has already been raised for this request.
     pub reminded: bool,
 }
@@ -209,29 +229,31 @@ pub struct Engine {
     gaps: Vec<AttentionGap>,
     pending_inputs: BTreeMap<QuestionId, PendingInput>,
     quiet: Option<QuietHours>,
+    dropped: u64,
 }
 
-/// Which rules one retained source carries the conditions of.
-///
-/// A gap can only cast doubt on what its own source was carrying. A range of terminal side effects
-/// that retention took says nothing about whether an approval was answered, and marking every item
-/// uncertain over it would make the flag mean nothing.
-const fn rules_of(source: AttentionSource) -> &'static [AttentionRule] {
-    match source {
-        AttentionSource::Receipts => {
-            &[AttentionRule::PendingApproval, AttentionRule::CommandFailed]
-        }
-        AttentionSource::Questions => &[
-            AttentionRule::PendingInput,
-            AttentionRule::InputIdleReminder,
-        ],
-        AttentionSource::HostEvents => &[AttentionRule::ApplicationNotice],
-        AttentionSource::Semantic => &[
-            AttentionRule::ReviewReady,
-            AttentionRule::AdapterFailed,
-            AttentionRule::HostContactLost,
-        ],
+/// Returns `text` clipped to the bound one summary carries, on a character boundary.
+#[must_use]
+pub fn clip_summary(text: &str) -> String {
+    if text.len() <= MAX_ATTENTION_SUMMARY_LEN {
+        return text.to_owned();
     }
+    let mut end = MAX_ATTENTION_SUMMARY_LEN;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Everything one raised condition names.
+struct Raise {
+    id: AttentionRule,
+    subject: String,
+    source: AttentionSource,
+    session_id: Option<SessionId>,
+    summary: String,
+    routing: AttentionRouting,
+    at_ms: TimestampMs,
 }
 
 impl Engine {
@@ -267,7 +289,7 @@ impl Engine {
         reading: HostReading,
     ) -> Vec<Outcome> {
         self.quiet = quiet;
-        self.release_deferred(reading)
+        self.announce_due(reading, &BTreeSet::new())
     }
 
     /// Returns the ranges of retained events the host can no longer read.
@@ -276,15 +298,37 @@ impl Engine {
         &self.gaps
     }
 
+    /// Returns how many items the host has let go of to stay inside its bound.
+    #[must_use]
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
     /// Returns the highest sequence consumed from one source.
     #[must_use]
     pub fn consumed(&self, source: AttentionSource) -> Option<u64> {
         self.consumed.get(&source).copied()
     }
 
-    /// Returns every item, oldest first.
+    /// Records where a source stands without claiming anything about what came before.
+    ///
+    /// A host that starts the engine partway through a session's life calls this rather than
+    /// letting the first event look like a jump. Without it, a first event at sequence nine says
+    /// eight records were evicted, which is a gap the host has no reason to believe in.
+    pub fn start_from(&mut self, source: AttentionSource, sequence: u64) {
+        let consumed = self.consumed.entry(source).or_insert(sequence);
+        *consumed = (*consumed).max(sequence);
+    }
+
+    /// Returns every item, by key.
     pub fn items(&self) -> impl Iterator<Item = &Item> {
         self.items.values()
+    }
+
+    /// Returns one item.
+    #[must_use]
+    pub fn item(&self, key: &AttentionKey) -> Option<&Item> {
+        self.items.get(key)
     }
 
     /// Returns one actor's acknowledgements.
@@ -307,7 +351,7 @@ impl Engine {
         &self.consumed
     }
 
-    /// Returns the questions waiting for an answer, with the reading each started at.
+    /// Returns the questions waiting for an answer.
     #[must_use]
     pub const fn pending_inputs(&self) -> &BTreeMap<QuestionId, PendingInput> {
         &self.pending_inputs
@@ -324,7 +368,12 @@ impl Engine {
                 (include_acknowledged || !acknowledged).then(|| item.to_wire(acknowledged))
             })
             .collect();
-        items.sort_by_key(|item| (item.first_seen_ms.get(), item.key.as_str().to_owned()));
+        items.sort_by(|left, right| {
+            left.first_seen_ms
+                .get()
+                .cmp(&right.first_seen_ms.get())
+                .then_with(|| left.key.as_str().cmp(right.key.as_str()))
+        });
         items
     }
 
@@ -332,6 +381,10 @@ impl Engine {
     ///
     /// Returns the keys that were acknowledged. A key with no item is not acknowledged: there is
     /// nothing to have seen, and recording it would hide the item if the condition recurred.
+    ///
+    /// Nothing about the host's own reminders changes. Section 23 makes an acknowledgement affect
+    /// only the actor that made it, so one device marking an approval seen does not stop the host
+    /// reminding the person about an agent that is still waiting.
     pub fn acknowledge(
         &mut self,
         actor: &ActorId,
@@ -340,14 +393,14 @@ impl Engine {
     ) -> Vec<AttentionKey> {
         let mut acknowledged = Vec::new();
         for key in keys {
-            let Some(item) = self.items.get_mut(key) else {
+            let Some(item) = self.items.get(key) else {
                 continue;
             };
-            item.attended = true;
+            let occurrences = item.occurrences;
             self.acks.entry(actor.clone()).or_default().insert(
                 key.clone(),
                 ItemAck {
-                    occurrences: item.occurrences,
+                    occurrences,
                     at_ms: reading.wall_ms,
                 },
             );
@@ -367,8 +420,8 @@ impl Engine {
 
     /// Records a range of retained events the host can no longer read.
     ///
-    /// Every unresolved item the missing range could have resolved becomes uncertain. It stays in
-    /// the inbox: a gap is never an inferred approval or completion.
+    /// Every unresolved item from the same source becomes uncertain. It stays in the inbox: a gap
+    /// is never an inferred approval or completion.
     pub fn note_gap(&mut self, source: AttentionSource, from: u64, to: u64) -> Vec<Outcome> {
         if to <= from {
             return Vec::new();
@@ -385,9 +438,8 @@ impl Engine {
         if self.gaps.len() > MAX_GAPS {
             self.gaps.remove(0);
         }
-        let doubted: BTreeSet<_> = rules_of(source).iter().copied().collect();
         for item in self.items.values_mut() {
-            if doubted.contains(&item.rule) {
+            if item.source == source {
                 item.uncertain = true;
             }
         }
@@ -398,38 +450,36 @@ impl Engine {
         vec![Outcome::GapRecorded { gap }]
     }
 
-    /// Applies one typed event.
+    /// Applies one typed event, announcing what it decides.
     ///
     /// An event at or below the cursor already consumed from its source changes nothing, which is
     /// what lets the retained events be replayed as often as a host needs to. An event beyond the
     /// next sequence means the records between were evicted, and the range is recorded as a gap
     /// before the event itself is applied.
     pub fn apply(&mut self, event: &SourceEvent, reading: HostReading) -> Vec<Outcome> {
-        let source = event.cursor.source;
-        let sequence = event.cursor.sequence;
-        let mut outcomes = Vec::new();
-        if let Some(consumed) = self.consumed.get(&source).copied() {
-            if sequence <= consumed {
-                return outcomes;
-            }
-            if sequence > consumed + 1 {
-                outcomes.extend(self.note_gap(source, consumed + 1, sequence));
-            }
-        }
-        self.consumed.insert(source, sequence);
-        outcomes.extend(self.decide(event, reading));
-        outcomes
+        self.consume(event, reading, Mode::Live)
+    }
+
+    /// Rebuilds state from one retained event without announcing anything.
+    ///
+    /// This is the reconstruction path. An item's age is taken from the event's own recorded time,
+    /// so an approval that has been outstanding for an hour comes back an hour old, and nothing is
+    /// announced for something that happened before this host was running. The first
+    /// [`Engine::tick`] after a replay decides every announcement against the present.
+    pub fn replay(&mut self, event: &SourceEvent, reading: HostReading) -> Vec<Outcome> {
+        self.consume(event, reading, Mode::Replay)
     }
 
     /// Advances every timer to this reading.
     ///
-    /// Three things happen here and nowhere else: a held announcement is released when quiet hours
-    /// end, an idle reminder is raised when a verified request has waited its interval, and an
-    /// unattended item climbs its ladder or is announced again.
+    /// The order is deliberate. Levels are settled first, then at most one announcement is decided
+    /// per item, so an item that climbed a step and was also due a repeat is announced once, at the
+    /// level it now stands at, rather than twice at two levels.
     pub fn tick(&mut self, reading: HostReading) -> Vec<Outcome> {
-        let mut outcomes = self.release_deferred(reading);
-        outcomes.extend(self.fire_idle_reminders(reading));
-        outcomes.extend(self.escalate(reading));
+        let mut outcomes = self.fire_idle_reminders(reading);
+        let (escalations, climbed) = self.climb(reading);
+        outcomes.extend(escalations);
+        outcomes.extend(self.announce_due(reading, &climbed));
         outcomes
     }
 
@@ -442,96 +492,123 @@ impl Engine {
         let mut consider = |deadline: u64| {
             earliest = Some(earliest.map_or(deadline, |current: u64| current.min(deadline)));
         };
-        if self.items.values().any(|item| item.deferred_at.is_some())
-            && let Some(release) = self.quiet_release(reading)
-        {
-            consider(release);
+        let quiet = self.quiet_now(reading);
+        if self.items.values().any(|item| item.deferred) {
+            // Either the window is still standing, and the release is when it ends, or it is not,
+            // and the release is now.
+            consider(self.quiet_release(reading).unwrap_or(reading.continuous_ms));
         }
         for pending in self.pending_inputs.values() {
             if !pending.reminded {
-                consider(pending.pending_since.saturating_add(IDLE_REMINDER_MS));
+                consider(pending.waited.due_at(IDLE_REMINDER_MS));
             }
         }
         for item in self.items.values() {
-            if item.attended {
-                continue;
-            }
             let policy = rule(item.rule);
             if let Some(next) = policy.next_step_after(item.steps_taken) {
-                consider(item.raised_at.saturating_add(next));
-            } else if let (Some(repeat), Some(last)) = (policy.repeat_ms, item.last_notified_at) {
-                consider(last.saturating_add(repeat));
+                consider(item.age.due_at(next));
+            }
+            // A deferred announcement is waiting on the window rather than on its own interval, so
+            // its repeat is not a deadline of its own until it has been released.
+            if item.deferred && quiet {
+                continue;
+            }
+            if let (Some(repeat), Some(since)) = (policy.repeat_ms, item.since_notified) {
+                consider(since.due_at(repeat));
             }
         }
         earliest
     }
 
-    /// Restores an engine's state, re-anchoring every interval at this reading.
-    pub(crate) fn install(
-        &mut self,
-        items: Vec<Item>,
-        acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
-        consumed: BTreeMap<AttentionSource, u64>,
-        gaps: Vec<AttentionGap>,
-        pending: BTreeMap<QuestionId, PendingInput>,
-        quiet: Option<QuietHours>,
-    ) {
-        self.items = items
+    /// Installs restored state.
+    pub(crate) fn install(&mut self, restored: Restored) {
+        self.items = restored
+            .items
             .into_iter()
             .map(|item| (item.key.clone(), item))
             .collect();
-        self.acks = acks;
-        self.consumed = consumed;
-        self.gaps = gaps;
-        self.pending_inputs = pending;
-        self.quiet = quiet;
+        self.acks = restored.acks;
+        self.consumed = restored.consumed;
+        self.gaps = restored.gaps;
+        self.pending_inputs = restored.pending;
+        self.quiet = restored.quiet;
+        self.dropped = restored.dropped;
     }
 
-    /// Re-anchors every continuous reading at `reading`.
+    /// Re-anchors every interval at `reading`, from the wall-clock moments the store kept.
     ///
-    /// The continuous clock restarts with the machine, so a reading written down in one boot means
-    /// nothing in the next. Anchoring a restored item at the reading it was restored at is the one
-    /// honest choice: the alternative is a ladder climbed to the top by arithmetic on a clock that
-    /// began again at nought.
+    /// The continuous clock restarts with the machine, so the durable half of an interval is the
+    /// moment it started. A host that can prove its wall clock keeps every interval where it was,
+    /// including one that is already overdue. One that cannot starts them again, which is the
+    /// conservative answer rather than arithmetic on a reading nobody can vouch for.
     pub(crate) fn reanchor(&mut self, reading: HostReading) {
         let since = |recorded: TimestampMs| {
             if reading.wall_proven {
-                reading
-                    .continuous_ms
-                    .saturating_sub(reading.wall_ms.get().saturating_sub(recorded.get()))
+                reading.wall_ms.get().saturating_sub(recorded.get())
             } else {
-                reading.continuous_ms
+                0
             }
         };
         for item in self.items.values_mut() {
-            // How long an item has stood is a fact about the world, so a host that can prove its
-            // wall clock keeps the ladder where it was. One that cannot starts the interval again
-            // rather than climbing a ladder by arithmetic on a reading nobody can vouch for.
-            item.raised_at = since(item.first_seen_ms);
-            // The repeat interval starts again either way. A restart is not a reason to announce
-            // everything that was outstanding at once.
-            item.last_notified_at = item.last_notified_at.map(|_| reading.continuous_ms);
-            item.deferred_at = item.deferred_at.map(|_| reading.continuous_ms);
+            item.age = Elapsed::already(since(item.first_seen_ms), reading);
+            item.since_notified = item
+                .last_notified_ms
+                .map(|at| Elapsed::already(since(at), reading));
         }
         for pending in self.pending_inputs.values_mut() {
-            pending.pending_since = since(pending.pending_since_ms);
+            pending.waited = Elapsed::already(since(pending.pending_since_ms), reading);
         }
     }
 
-    fn decide(&mut self, event: &SourceEvent, reading: HostReading) -> Vec<Outcome> {
+    fn consume(&mut self, event: &SourceEvent, reading: HostReading, mode: Mode) -> Vec<Outcome> {
+        let source = event.cursor.source;
+        let sequence = event.cursor.sequence;
+        let mut outcomes = Vec::new();
+        match self.consumed.get(&source).copied() {
+            Some(consumed) => {
+                if sequence <= consumed {
+                    return outcomes;
+                }
+                if sequence > consumed + 1 {
+                    outcomes.extend(self.note_gap(source, consumed + 1, sequence));
+                }
+            }
+            // Nothing consumed from this source yet. Sequences start at one, so an engine whose
+            // first record is a later one has missed the ones before it. A host that knows better
+            // says so with `start_from` rather than leaving the engine to guess.
+            None if sequence > 1 => {
+                outcomes.extend(self.note_gap(source, 1, sequence));
+            }
+            None => {}
+        }
+        self.consumed.insert(source, sequence);
+        outcomes.extend(self.decide(event, reading, mode));
+        outcomes
+    }
+
+    fn decide(&mut self, event: &SourceEvent, reading: HostReading, mode: Mode) -> Vec<Outcome> {
+        let source = event.cursor.source;
         match &event.kind {
+            // A record the host consumed that no rule covers. It moves the cursor and nothing
+            // else, which is what keeps a jump in the sequence meaning an eviction rather than a
+            // record this engine had no rule for.
+            EventKind::Observed => Vec::new(),
             EventKind::ApprovalRequested {
                 request_id,
                 session_id,
                 summary,
             } => self.raise(
-                AttentionRule::PendingApproval,
-                &request_id.to_string(),
-                Some(*session_id),
-                summary.clone(),
-                AttentionRouting::OwnerPolicy,
-                event.at_ms,
+                Raise {
+                    id: AttentionRule::PendingApproval,
+                    subject: request_id.to_string(),
+                    source,
+                    session_id: Some(*session_id),
+                    summary: summary.clone(),
+                    routing: AttentionRouting::OwnerPolicy,
+                    at_ms: event.at_ms,
+                },
                 reading,
+                mode,
             ),
             EventKind::ApprovalResolved { request_id } => {
                 self.resolve(AttentionRule::PendingApproval, &request_id.to_string())
@@ -549,30 +626,29 @@ impl Engine {
                     // not admit is a claim rather than a request.
                     return Vec::new();
                 }
-                // How long it had already waited when the host recorded the event, so a request
-                // that was pending before the engine saw it is not given a fresh five minutes.
-                // The subtraction saturates at this boot's own reading: a machine that was off
-                // for part of the wait did not observe it, and counting time it was not running
-                // for would fire the reminder before anybody could have answered.
-                let waited = event.at_ms.get().saturating_sub(pending_since_ms.get());
+                let waited = Self::waited(*pending_since_ms, event.at_ms, reading);
                 self.pending_inputs.insert(
                     *question_id,
                     PendingInput {
                         session_id: *session_id,
-                        summary: summary.clone(),
+                        summary: clip_summary(summary),
                         pending_since_ms: *pending_since_ms,
-                        pending_since: reading.continuous_ms.saturating_sub(waited),
+                        waited: Elapsed::already(waited, reading),
                         reminded: false,
                     },
                 );
                 self.raise(
-                    AttentionRule::PendingInput,
-                    &question_id.to_string(),
-                    Some(*session_id),
-                    summary.clone(),
-                    AttentionRouting::OwnerPolicy,
-                    event.at_ms,
+                    Raise {
+                        id: AttentionRule::PendingInput,
+                        subject: question_id.to_string(),
+                        source,
+                        session_id: Some(*session_id),
+                        summary: summary.clone(),
+                        routing: AttentionRouting::OwnerPolicy,
+                        at_ms: event.at_ms,
+                    },
                     reading,
+                    mode,
                 )
             }
             EventKind::QuestionResolved { question_id, .. } => {
@@ -593,13 +669,17 @@ impl Engine {
                     return Vec::new();
                 }
                 self.raise(
-                    AttentionRule::CommandFailed,
-                    &format!("{session_id}|{command}"),
-                    Some(*session_id),
-                    format!("{command} exited {exit_code}"),
-                    AttentionRouting::OwnerPolicy,
-                    event.at_ms,
+                    Raise {
+                        id: AttentionRule::CommandFailed,
+                        subject: format!("{session_id}|{command}"),
+                        source,
+                        session_id: Some(*session_id),
+                        summary: format!("{command} exited {exit_code}"),
+                        routing: AttentionRouting::OwnerPolicy,
+                        at_ms: event.at_ms,
+                    },
                     reading,
+                    mode,
                 )
             }
             EventKind::TurnCompleted {
@@ -608,38 +688,54 @@ impl Engine {
                 summary,
                 ..
             } => self.raise(
-                AttentionRule::ReviewReady,
-                &format!("{session_id}|{turn_id}"),
-                Some(*session_id),
-                summary.clone(),
-                AttentionRouting::OwnerPolicy,
-                event.at_ms,
+                Raise {
+                    id: AttentionRule::ReviewReady,
+                    subject: format!("{session_id}|{turn_id}"),
+                    source,
+                    session_id: Some(*session_id),
+                    summary: summary.clone(),
+                    routing: AttentionRouting::OwnerPolicy,
+                    at_ms: event.at_ms,
+                },
                 reading,
+                mode,
             ),
+            // A change set captured outside a turn is review work with no inbox item of its own.
+            // Nothing is waiting on the person for it: it is a version they will find when they
+            // look, and the review state is where that belongs.
+            EventKind::ChangeSetCaptured { .. } => Vec::new(),
             EventKind::AdapterFailed {
                 plugin_id,
                 session_id,
                 detail,
             } => self.raise(
-                AttentionRule::AdapterFailed,
-                &plugin_id.to_string(),
-                *session_id,
-                format!("{plugin_id}: {detail}"),
-                AttentionRouting::OwnerPolicy,
-                event.at_ms,
+                Raise {
+                    id: AttentionRule::AdapterFailed,
+                    subject: plugin_id.to_string(),
+                    source,
+                    session_id: *session_id,
+                    summary: format!("{plugin_id}: {detail}"),
+                    routing: AttentionRouting::OwnerPolicy,
+                    at_ms: event.at_ms,
+                },
                 reading,
+                mode,
             ),
             EventKind::AdapterRecovered { plugin_id } => {
                 self.resolve(AttentionRule::AdapterFailed, &plugin_id.to_string())
             }
             EventKind::HostContactLost { detail } => self.raise(
-                AttentionRule::HostContactLost,
-                "host",
-                None,
-                detail.clone(),
-                AttentionRouting::OwnerPolicy,
-                event.at_ms,
+                Raise {
+                    id: AttentionRule::HostContactLost,
+                    subject: "host".to_owned(),
+                    source,
+                    session_id: None,
+                    summary: detail.clone(),
+                    routing: AttentionRouting::OwnerPolicy,
+                    at_ms: event.at_ms,
+                },
                 reading,
+                mode,
             ),
             EventKind::HostContactRestored => self.resolve(AttentionRule::HostContactLost, "host"),
             EventKind::ApplicationNotice { session_id, notice } => {
@@ -654,62 +750,64 @@ impl Engine {
                     AttentionRouting::OwnerPolicy
                 };
                 self.raise(
-                    AttentionRule::ApplicationNotice,
-                    &format!("{session_id}|{subject}"),
-                    Some(*session_id),
-                    summary,
-                    routing,
-                    event.at_ms,
+                    Raise {
+                        id: AttentionRule::ApplicationNotice,
+                        subject: format!("{session_id}|{subject}"),
+                        source,
+                        session_id: Some(*session_id),
+                        summary,
+                        routing,
+                        at_ms: event.at_ms,
+                    },
                     reading,
+                    mode,
                 )
             }
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one call site per rule, each naming exactly what that rule keys and shows"
-    )]
-    fn raise(
-        &mut self,
-        id: AttentionRule,
-        subject: &str,
-        session_id: Option<SessionId>,
-        summary: String,
-        routing: AttentionRouting,
-        at_ms: TimestampMs,
-        reading: HostReading,
-    ) -> Vec<Outcome> {
-        let Ok(key) = AttentionKey::of(id, subject) else {
-            // A subject this host cannot key on is a subject it cannot de-duplicate or
-            // acknowledge, and an item nobody can acknowledge would sit in the inbox for ever.
-            return Vec::new();
-        };
-        let policy = rule(id);
+    /// Returns how long a request has been pending at this reading.
+    ///
+    /// The proven wall clock is preferred, because the delay between the host recording the event
+    /// and the engine consuming it is part of the wait. Without a proven clock the recorded moment
+    /// is all there is, which understates the wait rather than overstating it.
+    fn waited(since: TimestampMs, at_ms: TimestampMs, reading: HostReading) -> u64 {
+        if reading.wall_proven {
+            reading.wall_ms.get().saturating_sub(since.get())
+        } else {
+            at_ms.get().saturating_sub(since.get())
+        }
+    }
+
+    fn raise(&mut self, raise: Raise, reading: HostReading, mode: Mode) -> Vec<Outcome> {
+        let key = key::attention_key(raise.id, &raise.subject);
+        let policy = rule(raise.id);
+        let summary = clip_summary(&raise.summary);
         let mut outcomes = Vec::new();
         if let Some(item) = self.items.get_mut(&key) {
             item.occurrences = item.occurrences.saturating_add(1);
-            item.last_seen_ms = at_ms;
+            item.last_seen_ms = raise.at_ms;
             item.summary = summary;
-            item.routing = routing;
-            let inside = item.last_notified_at.is_some_and(|last| {
-                reading.continuous_ms.saturating_sub(last) < policy.dedup_window_ms
+            item.routing = raise.routing;
+            item.source = raise.source;
+            let occurrences = item.occurrences;
+            let inside = item
+                .since_notified
+                .is_some_and(|since| since.ms(reading) < policy.dedup_window_ms);
+            outcomes.push(Outcome::Repeated {
+                key: key.clone(),
+                occurrences,
             });
-            if inside {
-                item.notification = NotificationState::Suppressed;
-                outcomes.push(Outcome::Repeated {
-                    key,
-                    occurrences: item.occurrences,
-                });
+            if mode == Mode::Replay {
                 return outcomes;
             }
-            let (level, routing) = (item.level, item.routing);
-            let key_for_notice = key.clone();
-            outcomes.push(Outcome::Repeated {
-                key,
-                occurrences: item.occurrences,
-            });
-            outcomes.extend(self.announce(&key_for_notice, level, routing, reading));
+            if inside {
+                if let Some(item) = self.items.get_mut(&key) {
+                    item.notification = NotificationState::Suppressed;
+                }
+                return outcomes;
+            }
+            outcomes.extend(self.announce(&key, reading, false));
             return outcomes;
         }
         // A fresh item is fresh work. An acknowledgement of an earlier occurrence covered that
@@ -719,66 +817,118 @@ impl Engine {
         }
         let item = Item {
             key: key.clone(),
-            rule: id,
-            session_id,
+            rule: raise.id,
+            source: raise.source,
+            session_id: raise.session_id,
             summary,
-            routing,
+            routing: raise.routing,
             level: policy.initial,
             steps_taken: 0,
             occurrences: 1,
-            first_seen_ms: at_ms,
-            last_seen_ms: at_ms,
+            first_seen_ms: raise.at_ms,
+            last_seen_ms: raise.at_ms,
             notification: NotificationState::Pending,
+            last_notified_ms: None,
             uncertain: false,
-            attended: false,
-            raised_at: reading.continuous_ms,
-            last_notified_at: None,
-            deferred_at: None,
+            age: Elapsed::already(Self::waited(raise.at_ms, raise.at_ms, reading), reading),
+            since_notified: None,
+            deferred: false,
         };
         let level = item.level;
         self.items.insert(key.clone(), item);
         outcomes.push(Outcome::Raised {
             key: key.clone(),
-            rule: id,
+            rule: raise.id,
             level,
         });
-        outcomes.extend(self.announce(&key, level, routing, reading));
+        outcomes.extend(self.enforce_bound(&key));
+        if mode == Mode::Live && self.items.contains_key(&key) {
+            outcomes.extend(self.announce(&key, reading, false));
+        }
+        outcomes
+    }
+
+    /// Keeps the inbox inside [`MAX_RETAINED_ATTENTION_ITEMS`].
+    ///
+    /// The inbox is a working set. The receipts, the question ledger and the retained output are
+    /// where the record lives, so what is let go of here is the least urgent and oldest item, and
+    /// the count of what has gone is reported rather than hidden. `keep` is never the item let go
+    /// of: a host that dropped the item it had just raised would answer an event with nothing.
+    fn enforce_bound(&mut self, keep: &AttentionKey) -> Vec<Outcome> {
+        let bound = usize::try_from(MAX_RETAINED_ATTENTION_ITEMS).unwrap_or(usize::MAX);
+        let mut outcomes = Vec::new();
+        while self.items.len() > bound {
+            let Some(victim) = self
+                .items
+                .values()
+                .filter(|item| &item.key != keep)
+                .min_by(|left, right| {
+                    left.level
+                        .cmp(&right.level)
+                        .then_with(|| left.first_seen_ms.get().cmp(&right.first_seen_ms.get()))
+                        .then_with(|| left.key.as_str().cmp(right.key.as_str()))
+                })
+                .map(|item| item.key.clone())
+            else {
+                break;
+            };
+            self.items.remove(&victim);
+            for acks in self.acks.values_mut() {
+                acks.remove(&victim);
+            }
+            self.dropped = self.dropped.saturating_add(1);
+            outcomes.push(Outcome::Dropped { key: victim });
+        }
         outcomes
     }
 
     fn announce(
         &mut self,
         key: &AttentionKey,
-        level: AttentionLevel,
-        routing: AttentionRouting,
         reading: HostReading,
+        released: bool,
     ) -> Vec<Outcome> {
         let quiet = self.quiet_now(reading);
         let Some(item) = self.items.get_mut(key) else {
             return Vec::new();
         };
+        let (level, routing) = (item.level, item.routing);
+        // The interval starts whether the announcement goes out or is held, so a repeat that falls
+        // inside quiet hours is deferred once rather than re-decided on every tick.
+        item.since_notified = Some(Elapsed::starting(reading));
+        item.last_notified_ms = Some(reading.wall_ms);
         if quiet {
+            item.deferred = true;
             item.notification = NotificationState::Deferred;
-            item.deferred_at = Some(reading.continuous_ms);
             return vec![Outcome::Deferred {
                 key: key.clone(),
                 level,
             }];
         }
+        item.deferred = false;
         item.notification = NotificationState::Delivered;
-        item.last_notified_at = Some(reading.continuous_ms);
-        item.deferred_at = None;
-        vec![Outcome::Notified {
-            key: key.clone(),
-            level,
-            routing,
+        vec![if released {
+            Outcome::Released {
+                key: key.clone(),
+                level,
+                routing,
+            }
+        } else {
+            Outcome::Notified {
+                key: key.clone(),
+                level,
+                routing,
+            }
         }]
     }
 
+    /// Ends one item, taking any announcement still held for it with it.
+    ///
+    /// A held announcement about a condition that has ended is not a notification anybody wants:
+    /// quiet hours defer an announcement about something outstanding, and nothing here is
+    /// outstanding any more.
     fn resolve(&mut self, id: AttentionRule, subject: &str) -> Vec<Outcome> {
-        let Ok(key) = AttentionKey::of(id, subject) else {
-            return Vec::new();
-        };
+        let key = key::attention_key(id, subject);
         if self.items.remove(&key).is_none() {
             return Vec::new();
         }
@@ -788,29 +938,58 @@ impl Engine {
         vec![Outcome::Resolved { key }]
     }
 
-    fn release_deferred(&mut self, reading: HostReading) -> Vec<Outcome> {
-        if self.quiet_now(reading) {
-            return Vec::new();
+    /// Settles every item's level against this reading, without announcing anything.
+    fn climb(&mut self, reading: HostReading) -> (Vec<Outcome>, BTreeSet<AttentionKey>) {
+        let mut outcomes = Vec::new();
+        let mut climbed = BTreeSet::new();
+        for item in self.items.values_mut() {
+            let policy = rule(item.rule);
+            let (level, taken) = policy.level_after(item.age.ms(reading));
+            if taken > item.steps_taken {
+                let from = item.level;
+                item.level = level;
+                item.steps_taken = taken;
+                outcomes.push(Outcome::Escalated {
+                    key: item.key.clone(),
+                    from,
+                    to: level,
+                });
+                climbed.insert(item.key.clone());
+            }
         }
-        let held: Vec<_> = self
+        (outcomes, climbed)
+    }
+
+    /// Makes at most one announcement decision per item.
+    fn announce_due(
+        &mut self,
+        reading: HostReading,
+        climbed: &BTreeSet<AttentionKey>,
+    ) -> Vec<Outcome> {
+        let quiet = self.quiet_now(reading);
+        let due: Vec<_> = self
             .items
             .values()
-            .filter(|item| item.deferred_at.is_some())
-            .map(|item| (item.key.clone(), item.level, item.routing))
-            .collect();
-        held.into_iter()
-            .map(|(key, level, routing)| {
-                if let Some(item) = self.items.get_mut(&key) {
-                    item.notification = NotificationState::Delivered;
-                    item.last_notified_at = Some(reading.continuous_ms);
-                    item.deferred_at = None;
+            .filter_map(|item| {
+                if item.deferred {
+                    // Still held, or released now that the window has ended.
+                    return (!quiet).then(|| (item.key.clone(), true));
                 }
-                Outcome::Released {
-                    key,
-                    level,
-                    routing,
-                }
+                let policy = rule(item.rule);
+                let repeat_due = policy.repeat_ms.is_some_and(|repeat| {
+                    item.since_notified
+                        .is_some_and(|since| since.ms(reading) >= repeat)
+                });
+                // An item that has never been announced is one a replay rebuilt, or one whose
+                // announcement was refused before it could be written down. Either way the
+                // decision has not been made yet, and this is where it is made.
+                let undecided = item.since_notified.is_none();
+                (undecided || climbed.contains(&item.key) || repeat_due)
+                    .then(|| (item.key.clone(), false))
             })
+            .collect();
+        due.into_iter()
+            .flat_map(|(key, released)| self.announce(&key, reading, released))
             .collect()
     }
 
@@ -819,9 +998,7 @@ impl Engine {
             .pending_inputs
             .iter()
             .filter(|(_, pending)| {
-                !pending.reminded
-                    && reading.continuous_ms.saturating_sub(pending.pending_since)
-                        >= IDLE_REMINDER_MS
+                !pending.reminded && pending.waited.ms(reading) >= IDLE_REMINDER_MS
             })
             .map(|(question_id, pending)| {
                 (*question_id, pending.session_id, pending.summary.clone())
@@ -833,50 +1010,18 @@ impl Engine {
                 pending.reminded = true;
             }
             outcomes.extend(self.raise(
-                AttentionRule::InputIdleReminder,
-                &question_id.to_string(),
-                Some(session_id),
-                summary,
-                AttentionRouting::OwnerPolicy,
-                reading.wall_ms,
+                Raise {
+                    id: AttentionRule::InputIdleReminder,
+                    subject: question_id.to_string(),
+                    source: AttentionSource::Questions,
+                    session_id: Some(session_id),
+                    summary,
+                    routing: AttentionRouting::OwnerPolicy,
+                    at_ms: reading.wall_ms,
+                },
                 reading,
+                Mode::Live,
             ));
-        }
-        outcomes
-    }
-
-    fn escalate(&mut self, reading: HostReading) -> Vec<Outcome> {
-        let mut outcomes = Vec::new();
-        let keys: Vec<_> = self.items.keys().cloned().collect();
-        for key in keys {
-            let Some(item) = self.items.get_mut(&key) else {
-                continue;
-            };
-            if item.attended {
-                continue;
-            }
-            let policy: &Rule = rule(item.rule);
-            let elapsed = reading.continuous_ms.saturating_sub(item.raised_at);
-            let (level, taken) = policy.level_after(elapsed);
-            let climbed = taken > item.steps_taken;
-            if climbed {
-                let from = item.level;
-                item.level = level;
-                item.steps_taken = taken;
-                outcomes.push(Outcome::Escalated {
-                    key: key.clone(),
-                    from,
-                    to: level,
-                });
-            }
-            let due = policy.repeat_ms.is_some_and(|repeat| {
-                item.last_notified_at
-                    .is_some_and(|last| reading.continuous_ms.saturating_sub(last) >= repeat)
-            });
-            if climbed || due {
-                let (level, routing) = (item.level, item.routing);
-                outcomes.extend(self.announce(&key, level, routing, reading));
-            }
         }
         outcomes
     }
@@ -897,4 +1042,15 @@ impl Engine {
             .saturating_sub(reading.ms_of_day() % MS_IN_MINUTE);
         Some(reading.continuous_ms.saturating_add(remaining))
     }
+}
+
+/// The engine's half of what the feature store read back.
+pub(crate) struct Restored {
+    pub(crate) items: Vec<Item>,
+    pub(crate) acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
+    pub(crate) consumed: BTreeMap<AttentionSource, u64>,
+    pub(crate) gaps: Vec<AttentionGap>,
+    pub(crate) pending: BTreeMap<QuestionId, PendingInput>,
+    pub(crate) quiet: Option<QuietHours>,
+    pub(crate) dropped: u64,
 }
