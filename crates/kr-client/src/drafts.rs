@@ -1207,8 +1207,9 @@ fn flush_path_names(directory: &Path) -> std::io::Result<()> {
         }
         resolved.push(&name);
 
-        // A failure here is not an absent component: every name on a path that was just opened is
-        // there, so what this can report is the filesystem refusing to say.
+        // A failure here is reported rather than skipped. It can be the filesystem refusing to say,
+        // or a name something removed while this walk was going through it; either way, what the
+        // walk cannot see it cannot make durable, and saying so is the answer.
         if !std::fs::symlink_metadata(&resolved)?
             .file_type()
             .is_symlink()
