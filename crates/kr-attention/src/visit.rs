@@ -21,8 +21,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use kr_protocol::attention::{
-    AttentionGap, AttentionSource, ChangeSummary, LogViewState, MAX_RETAINED_LOG_VIEWS,
-    MAX_RETAINED_SUMMARIES, MAX_VISIT_CHANGES, RetainedLogView, SemanticChange, SemanticChangeKind,
+    AttentionGap, AttentionSource, ChangeSummary, LogViewState, MAX_LOG_VIEW_FILTER_LEN,
+    MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_ACTORS, MAX_RETAINED_LOG_VIEWS, MAX_RETAINED_SUMMARIES,
+    MAX_SUMMARY_MODEL_LEN, MAX_VISIT_CHANGES, RetainedLogView, SemanticChange, SemanticChangeKind,
 };
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::recovery::HistoryGap;
@@ -33,6 +34,18 @@ pub const MAX_RETAINED_CHANGES: usize = 1_000;
 
 /// Largest number of omitted ranges the host keeps. The oldest is dropped past it.
 pub const MAX_OMITTED_RANGES: usize = 64;
+
+/// Returns `text` clipped to `bound` bytes, on a character boundary.
+fn clip(text: &str, bound: usize) -> String {
+    if text.len() <= bound {
+        return text.to_owned();
+    }
+    let mut end = bound;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
 
 /// One range that is missing from what a visit can be shown, and where it is missing from.
 ///
@@ -194,7 +207,9 @@ impl Visits {
     ///
     /// It is held beside the changes, never merged into them. A summary names the interval it was
     /// written from so a reader can see what it did and did not cover.
-    pub fn summarise(&mut self, summary: ChangeSummary) {
+    pub fn summarise(&mut self, mut summary: ChangeSummary) {
+        summary.text = crate::engine::clip_summary(&summary.text);
+        summary.model = clip(&summary.model, MAX_SUMMARY_MODEL_LEN);
         self.summaries
             .retain(|held| held.from_cursor != summary.from_cursor);
         self.summaries.push(summary);
@@ -222,6 +237,15 @@ impl Visits {
         visit.cursor = visit.cursor.max(cursor.min(self.next_cursor));
         visit.revision = revision;
         for view in views {
+            // A view identifier and a filter are the client's own text, and the host writes both
+            // down and gives them back. A filter past its bound is refused where the request is
+            // read; anything that reaches here is clipped so a stored view cannot grow past what
+            // the store and the answer can carry.
+            let view = LogViewState {
+                view_id: clip(&view.view_id, MAX_LOG_VIEW_ID_LEN),
+                filter: clip(&view.filter, MAX_LOG_VIEW_FILTER_LEN),
+                ..view
+            };
             // A view that is updated moves to the newest position. Leaving it where it was would
             // make the bound below evict the view a client had just used.
             visit.views.retain(|held| held.view_id != view.view_id);
@@ -237,7 +261,34 @@ impl Visits {
         if over > 0 {
             visit.views.drain(0..over);
         }
-        visit.clone()
+        let answer = visit.clone();
+        self.enforce_actor_bound(actor);
+        answer
+    }
+
+    /// Keeps the visits inside [`MAX_RETAINED_ACTORS`], never letting go of the one just recorded.
+    ///
+    /// What goes is the actor whose revision is lowest, which is the one that has acknowledged
+    /// least recently. An actor whose visit has gone is an actor with no visit, which is where
+    /// every actor starts.
+    fn enforce_actor_bound(&mut self, keep: &ActorId) {
+        while self.visits.len() > MAX_RETAINED_ACTORS {
+            let Some(oldest) = self
+                .visits
+                .iter()
+                .filter(|(actor, _)| *actor != keep)
+                .min_by(|left, right| {
+                    left.1
+                        .revision
+                        .cmp(&right.1.revision)
+                        .then_with(|| left.0.cmp(right.0))
+                })
+                .map(|(actor, _)| actor.clone())
+            else {
+                break;
+            };
+            self.visits.remove(&oldest);
+        }
     }
 
     /// Answers what changed since one actor's last visit.

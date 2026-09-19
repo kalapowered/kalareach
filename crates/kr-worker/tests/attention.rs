@@ -688,6 +688,195 @@ async fn a_visit_records_a_cursor_and_the_views_it_had_open() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The retained sources the worker reads from
+// ---------------------------------------------------------------------------------------------
+
+fn verified_source(session_member: bool) -> kr_worker::questions::VerifiedSource {
+    kr_worker::questions::VerifiedSource {
+        process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+        executable: Some("/bin/agent".to_owned()),
+        session_member,
+        ancestry: true,
+        launch_channel: true,
+        connection_id: ConnectionId::new(kr_ipc::new_uuid()),
+    }
+}
+
+fn question_params(host: &Host, request: &str) -> kr_protocol::question::QuestionCreateParams {
+    kr_protocol::question::QuestionCreateParams {
+        session_id: host.session_id,
+        request_id: request.to_owned(),
+        agent_name: Nullable::some("an agent".to_owned()),
+        context: "two ways to do it".to_owned(),
+        question: "which branch?".to_owned(),
+        kind: kr_protocol::question::QuestionKind::Confirm,
+        choices: Vec::new(),
+        requested_expiry_ms: Nullable::null(),
+        wait_ms: Nullable::null(),
+    }
+}
+
+#[tokio::test]
+async fn a_question_in_the_ledger_becomes_pending_input_when_the_host_reads_its_sources() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let now = kr_worker::questions::Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    };
+    let (created, _) = host
+        .service
+        .questions()
+        .create(&verified_source(true), &question_params(&host, "r-1"), now)
+        .expect("a verified source creates a question");
+
+    // Nothing has read the sources yet.
+    let before: AttentionReadResult = ok(send_request(
+        &mut client,
+        request(Method::AttentionRead, typed(&read_params(&host))),
+    )
+    .await);
+    assert!(before.items.is_empty());
+
+    host.service.attention_pass();
+    let after: AttentionReadResult = ok(send_request(
+        &mut client,
+        request(Method::AttentionRead, typed(&read_params(&host))),
+    )
+    .await);
+    let item = after
+        .items
+        .iter()
+        .find(|item| item.rule == AttentionRule::PendingInput)
+        .expect("the waiting question is in the inbox");
+    assert!(item.trusted);
+    assert!(
+        item.key
+            .as_str()
+            .contains(&created.question.question_id.to_string()),
+        "and it is keyed on the question it is about"
+    );
+
+    // Answering it takes it out again.
+    host.service
+        .questions()
+        .answer(
+            &ActorId::new("local:501").expect("a principal"),
+            None,
+            &kr_protocol::question::QuestionAnswerParams {
+                session_id: host.session_id,
+                question_id: created.question.question_id,
+                expected_revision: created.question.revision,
+                answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
+            },
+            now,
+        )
+        .expect("a person answers it");
+    host.service.attention_pass();
+    let resolved: AttentionReadResult = ok(send_request(
+        &mut client,
+        request(Method::AttentionRead, typed(&read_params(&host))),
+    )
+    .await);
+    assert!(
+        !resolved
+            .items
+            .iter()
+            .any(|item| item.rule == AttentionRule::PendingInput),
+        "nothing is waiting any more"
+    );
+}
+
+#[tokio::test]
+async fn a_notification_with_no_attachment_to_go_to_becomes_an_untrusted_notice() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    {
+        let mut session = host.service.runtime().session();
+        let journal = session
+            .journal_mut()
+            .expect("the harness journals its session");
+        journal
+            .record_host_event(
+                &kr_term::sideeffect::SideEffect {
+                    kind: kr_term::sideeffect::SideEffectKind::Notification {
+                        title: Some("build".to_owned()),
+                        body: "finished".to_owned(),
+                        id: None,
+                        urgency: kr_term::sideeffect::NotificationUrgency::Normal,
+                        display: kr_term::sideeffect::NotificationDisplay::Always,
+                    },
+                    destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
+                    at: 0,
+                },
+                kr_ipc::now_ms(),
+            )
+            .expect("the journal records it");
+    }
+    host.service.attention_pass();
+    let read: AttentionReadResult = ok(send_request(
+        &mut client,
+        request(Method::AttentionRead, typed(&read_params(&host))),
+    )
+    .await);
+    let item = read
+        .items
+        .iter()
+        .find(|item| item.rule == AttentionRule::ApplicationNotice)
+        .expect("the notice is retained in Attention");
+    assert!(!item.trusted, "any process can print one");
+    assert_eq!(
+        item.routing,
+        kr_protocol::attention::AttentionRouting::OwnerPolicy,
+        "with no lease holder it goes through the owner's notification policy"
+    );
+    assert!(
+        !read
+            .items
+            .iter()
+            .any(|item| item.rule == AttentionRule::PendingApproval),
+        "and it is never an approval"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_this_host_can_decide_rejects_the_action_rather_than_leaving_it_unknown() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let window = window(&client);
+    let refused = mutation(
+        &window,
+        &host,
+        Method::ReviewAcknowledge,
+        typed(&ReviewAcknowledgeParams {
+            session_id: host.session_id,
+            subject: turn_subject(host.session_id),
+            version: U64::new(1),
+        }),
+    );
+    let action_id = refused.action_id;
+    let answer = send_mutation(&mut client, refused).await;
+    let Outcome::Error(error) = answer else {
+        panic!("a subject this session never held cannot be acknowledged");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    let read: kr_protocol::receipt::ActionReadResult = ok(send_request(
+        &mut client,
+        request(
+            Method::ActionRead,
+            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+        ),
+    )
+    .await);
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Rejected,
+        "a refusal this host decided is a rejection, not an outcome nobody can establish"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // The feature store
 // ---------------------------------------------------------------------------------------------
 

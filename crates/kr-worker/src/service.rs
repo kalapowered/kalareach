@@ -395,10 +395,79 @@ impl WorkerService {
                 };
                 state == kr_protocol::session::SessionState::Closed
             };
+            // Outside the barrier: the attention engine reads the retained sources and writes its
+            // own tables, and nothing a mutation does depends on the answer. A failure here is a
+            // failure of maintenance, which is retried on the next tick rather than reported to
+            // somebody who did not ask.
+            self.attention_pass();
             if closed {
                 break;
             }
         }
+    }
+
+    /// Gives the attention engine what the retained sources hold that it has not seen, and
+    /// advances its timers.
+    ///
+    /// The host's own maintenance runs it on every tick. A caller that has just changed one of
+    /// the sources may run it sooner, which is what makes an answered question stop owing a
+    /// reminder promptly rather than a minute later.
+    ///
+    /// Two sources reach it in this build. The question ledger is where a verified pending input
+    /// request lives, and its events carry the moment a request became pending, which is what
+    /// section 25's idle reminder counts from. The journal's host events are the terminal side
+    /// effects that had no attachment to go to, which is what an `OSC 9`, `OSC 99` or `OSC 777`
+    /// notification becomes when nobody holds the input lease.
+    ///
+    /// The other rules of the set - a pending approval, a command's exit status, a completed turn,
+    /// an adapter failure, lost host contact - have no producer in this build, because the upstream
+    /// agent interface, the shell adapter's command blocks and the plugin host are other tasks'.
+    /// Each has its typed event waiting for it.
+    pub fn attention_pass(&self) {
+        let time = Arc::clone(self.runtime.session().time());
+        let mut events = Vec::new();
+        let from = self
+            .attention
+            .consumed(kr_protocol::attention::AttentionSource::Questions)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if let Ok(page) = self.questions.events_since(from, crate::attention::PAGE) {
+            events.extend(
+                page.iter()
+                    .map(|(sequence, event)| crate::attention::question_event(*sequence, event)),
+            );
+        }
+        // Read under the session lock and translated outside it: the engine's own write must not
+        // hold the lock the terminal needs.
+        let from = usize::try_from(
+            self.attention
+                .consumed(kr_protocol::attention::AttentionSource::HostEvents)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        )
+        .unwrap_or(usize::MAX);
+        let (session_id, recorded) = {
+            let session = self.runtime.session();
+            let recorded = session
+                .journal()
+                .and_then(|journal| journal.host_events().ok())
+                .unwrap_or_default();
+            (session.id(), recorded)
+        };
+        events.extend(
+            recorded
+                .iter()
+                .enumerate()
+                .skip(from)
+                .take(crate::attention::PAGE)
+                .map(|(index, event)| {
+                    crate::attention::host_event(index.saturating_add(1) as u64, session_id, event)
+                }),
+        );
+        let _ = self.attention.feed(&events, &time);
+        let _ = self.attention.tick(&time);
     }
 
     /// Looks at the host's clocks, and revalidates what a discontinuity invalidated.
@@ -3021,6 +3090,25 @@ impl WorkerService {
                 // all, and whether it may put its window where the report asks. A semantic
                 // attachment has no viewport to report.
                 session.viewportable(params.attachment_id, params.dimensions, params.position.0)
+            }
+            // Everything about a review or a quiet-hours window this host can decide about. A
+            // subject this session never held, a version nobody produced and a window that is not
+            // minutes of a day are refusals rather than outcomes nobody can establish, so they are
+            // answered here rather than inside the effect.
+            Method::ReviewAcknowledge => {
+                let params: kr_protocol::attention::ReviewAcknowledgeParams =
+                    parse(&mutation.params)?;
+                self.attention.check_review(&params)
+            }
+            Method::AttentionQuietHours => {
+                let params: kr_protocol::attention::AttentionQuietHoursParams =
+                    parse(&mutation.params)?;
+                crate::attention::Attention::check_quiet_hours(&params)
+            }
+            Method::VisitAcknowledge => {
+                let params: kr_protocol::attention::VisitAcknowledgeParams =
+                    parse(&mutation.params)?;
+                crate::attention::Attention::check_visit(&params)
             }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;

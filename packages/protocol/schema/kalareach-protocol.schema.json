@@ -1614,6 +1614,10 @@
           "description": "Whether this actor has acknowledged it.",
           "type": "boolean"
         },
+        "awaiting_delivery": {
+          "description": "Whether a decided announcement is still waiting to be taken by a delivery consumer.\n\nThe host writes a decision down before it hands it over, and keeps it written down until\nsomebody takes it, so a host that decided an announcement and then died re-offers it rather\nthan losing it. What becomes of the announcement afterwards belongs to the delivery\njournal, not to the feature store.",
+          "type": "boolean"
+        },
         "first_seen_ms": {
           "$ref": "#/$defs/TimestampMs",
           "description": "When the condition was first observed."
@@ -1687,6 +1691,7 @@
         "first_seen_ms",
         "last_seen_ms",
         "notification",
+        "awaiting_delivery",
         "acknowledged",
         "uncertain"
       ],

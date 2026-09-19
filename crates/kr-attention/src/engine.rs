@@ -34,12 +34,12 @@
 //! in the inbox. Section 24 is explicit: a history gap is not an inferred approval or completion,
 //! and the only honest answer for a host that cannot tell is to say so.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use kr_protocol::attention::{
     AttentionGap, AttentionItem, AttentionKey, AttentionLevel, AttentionRouting, AttentionRule,
     AttentionSource, IDLE_REMINDER_MS, MAX_ATTENTION_SUMMARY_LEN, MAX_RETAINED_ATTENTION_ITEMS,
-    NotificationState, QuietHours,
+    MAX_RETAINED_PENDING_INPUTS, NotificationState, QuietHours,
 };
 use kr_protocol::ids::{ActorId, QuestionId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
@@ -91,6 +91,19 @@ pub struct Item {
     pub notification: NotificationState,
     /// When the last announcement was decided, when there has been one.
     pub last_notified_ms: Option<TimestampMs>,
+    /// The level the last announcement went out at.
+    ///
+    /// An item that has climbed past it is owed another announcement; one that has not is not.
+    /// Keeping it durable is what stops a restart announcing everything at the level it already
+    /// announced.
+    pub announced_level: Option<AttentionLevel>,
+    /// Whether a decided announcement is still waiting to be taken by a delivery consumer.
+    ///
+    /// The decision is written down before the caller is handed it, and it stays written down
+    /// until somebody takes it. A host that decided an announcement and then died re-offers it at
+    /// its next start rather than losing it, which is the half of the delivery contract the
+    /// feature store can keep on its own.
+    pub pending_handoff: bool,
     /// Whether a gap in the retained events could have resolved it.
     pub uncertain: bool,
     /// How long the item has stood.
@@ -118,6 +131,7 @@ impl Item {
             first_seen_ms: self.first_seen_ms,
             last_seen_ms: self.last_seen_ms,
             notification: self.notification,
+            awaiting_delivery: self.pending_handoff,
             acknowledged,
             uncertain: self.uncertain,
         }
@@ -192,6 +206,23 @@ pub enum Outcome {
         /// The range.
         gap: AttentionGap,
     },
+}
+
+/// One announcement the host decided and has not yet handed to a delivery consumer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Announcement {
+    /// The item.
+    pub key: AttentionKey,
+    /// Its rule.
+    pub rule: AttentionRule,
+    /// What it asks for.
+    pub level: AttentionLevel,
+    /// Where it goes.
+    pub routing: AttentionRouting,
+    /// The session it belongs to, when it belongs to one.
+    pub session_id: Option<SessionId>,
+    /// One line naming the subject.
+    pub summary: String,
 }
 
 /// One actor's acknowledgement of one item.
@@ -289,7 +320,7 @@ impl Engine {
         reading: HostReading,
     ) -> Vec<Outcome> {
         self.quiet = quiet;
-        self.announce_due(reading, &BTreeSet::new())
+        self.announce_due(reading)
     }
 
     /// Returns the ranges of retained events the host can no longer read.
@@ -477,10 +508,42 @@ impl Engine {
     /// level it now stands at, rather than twice at two levels.
     pub fn tick(&mut self, reading: HostReading) -> Vec<Outcome> {
         let mut outcomes = self.fire_idle_reminders(reading);
-        let (escalations, climbed) = self.climb(reading);
-        outcomes.extend(escalations);
-        outcomes.extend(self.announce_due(reading, &climbed));
+        outcomes.extend(self.climb(reading));
+        outcomes.extend(self.announce_due(reading));
         outcomes
+    }
+
+    /// Takes the announcements the host has decided and not yet handed to a delivery consumer.
+    ///
+    /// Each one stays here until it is taken, so a host that decided an announcement and then died
+    /// re-offers it at its next start. What becomes of it afterwards - the attempts, the receipts,
+    /// the destinations - is the delivery journal's, not this store's.
+    pub fn take_announcements(&mut self) -> Vec<Announcement> {
+        let mut taken = Vec::new();
+        for item in self.items.values_mut() {
+            if !item.pending_handoff {
+                continue;
+            }
+            item.pending_handoff = false;
+            taken.push(Announcement {
+                key: item.key.clone(),
+                rule: item.rule,
+                level: item.level,
+                routing: item.routing,
+                session_id: item.session_id,
+                summary: item.summary.clone(),
+            });
+        }
+        taken
+    }
+
+    /// Returns the announcements waiting to be taken, without taking them.
+    #[must_use]
+    pub fn awaiting_delivery(&self) -> usize {
+        self.items
+            .values()
+            .filter(|item| item.pending_handoff)
+            .count()
     }
 
     /// Returns the continuous reading the next timer is due at.
@@ -509,11 +572,23 @@ impl Engine {
                 consider(item.age.due_at(next));
             }
             // A deferred announcement is waiting on the window rather than on its own interval, so
-            // its repeat is not a deadline of its own until it has been released.
+            // nothing about it is a deadline of its own until it has been released.
             if item.deferred && quiet {
                 continue;
             }
-            if let (Some(repeat), Some(since)) = (policy.repeat_ms, item.since_notified) {
+            let Some(since) = item.since_notified else {
+                // Nothing has been decided about it at all: a replay rebuilt it, or the store
+                // refused the write that would have recorded the decision. It is due now.
+                consider(reading.continuous_ms);
+                continue;
+            };
+            if item.announced_level != Some(item.level) {
+                // It has climbed past what was announced, so another announcement is owed. It
+                // waits out the rule's window first, which is what stops an escalation announcing
+                // a second time within a minute of the first.
+                consider(since.due_at(policy.dedup_window_ms));
+            }
+            if let Some(repeat) = policy.repeat_ms {
                 consider(since.due_at(repeat));
             }
         }
@@ -627,6 +702,7 @@ impl Engine {
                     return Vec::new();
                 }
                 let waited = Self::waited(*pending_since_ms, event.at_ms, reading);
+                self.bound_pending_inputs(*question_id);
                 self.pending_inputs.insert(
                     *question_id,
                     PendingInput {
@@ -766,6 +842,32 @@ impl Engine {
         }
     }
 
+    /// Keeps the pending requests inside [`MAX_RETAINED_PENDING_INPUTS`].
+    ///
+    /// The question ledger is where a request lives; this is only what the reminder is measured
+    /// from. What goes is the request that has been pending longest, which is the one whose
+    /// reminder has already been raised if any has.
+    fn bound_pending_inputs(&mut self, keep: QuestionId) {
+        while self.pending_inputs.len() >= MAX_RETAINED_PENDING_INPUTS {
+            let Some(oldest) = self
+                .pending_inputs
+                .iter()
+                .filter(|(question_id, _)| **question_id != keep)
+                .min_by(|left, right| {
+                    left.1
+                        .pending_since_ms
+                        .get()
+                        .cmp(&right.1.pending_since_ms.get())
+                        .then_with(|| left.0.cmp(right.0))
+                })
+                .map(|(question_id, _)| *question_id)
+            else {
+                break;
+            };
+            self.pending_inputs.remove(&oldest);
+        }
+    }
+
     /// Returns how long a request has been pending at this reading.
     ///
     /// The proven wall clock is preferred, because the delay between the host recording the event
@@ -799,6 +901,16 @@ impl Engine {
                 occurrences,
             });
             if mode == Mode::Replay {
+                // A replayed occurrence outside the window is one nobody has decided about. The
+                // replay itself announces nothing, so the item is left undecided and the first
+                // tick after the rebuild decides it; leaving the previous announcement's interval
+                // in place would hide the new occurrence behind an announcement of the old one.
+                if !inside && let Some(item) = self.items.get_mut(&key) {
+                    item.since_notified = None;
+                    item.last_notified_ms = None;
+                    item.announced_level = None;
+                    item.notification = NotificationState::Pending;
+                }
                 return outcomes;
             }
             if inside {
@@ -829,6 +941,8 @@ impl Engine {
             last_seen_ms: raise.at_ms,
             notification: NotificationState::Pending,
             last_notified_ms: None,
+            announced_level: None,
+            pending_handoff: false,
             uncertain: false,
             age: Elapsed::already(Self::waited(raise.at_ms, raise.at_ms, reading), reading),
             since_notified: None,
@@ -841,7 +955,7 @@ impl Engine {
             rule: raise.id,
             level,
         });
-        outcomes.extend(self.enforce_bound(&key));
+        outcomes.extend(self.enforce_bound());
         if mode == Mode::Live && self.items.contains_key(&key) {
             outcomes.extend(self.announce(&key, reading, false));
         }
@@ -852,16 +966,16 @@ impl Engine {
     ///
     /// The inbox is a working set. The receipts, the question ledger and the retained output are
     /// where the record lives, so what is let go of here is the least urgent and oldest item, and
-    /// the count of what has gone is reported rather than hidden. `keep` is never the item let go
-    /// of: a host that dropped the item it had just raised would answer an event with nothing.
-    fn enforce_bound(&mut self, keep: &AttentionKey) -> Vec<Outcome> {
+    /// the count of what has gone is reported rather than hidden. The item that was just raised is
+    /// weighed with the rest: a fresh informational notice does not displace an urgent approval
+    /// merely by being the newest thing to arrive.
+    fn enforce_bound(&mut self) -> Vec<Outcome> {
         let bound = usize::try_from(MAX_RETAINED_ATTENTION_ITEMS).unwrap_or(usize::MAX);
         let mut outcomes = Vec::new();
         while self.items.len() > bound {
             let Some(victim) = self
                 .items
                 .values()
-                .filter(|item| &item.key != keep)
                 .min_by(|left, right| {
                     left.level
                         .cmp(&right.level)
@@ -907,6 +1021,8 @@ impl Engine {
         }
         item.deferred = false;
         item.notification = NotificationState::Delivered;
+        item.announced_level = Some(level);
+        item.pending_handoff = true;
         vec![if released {
             Outcome::Released {
                 key: key.clone(),
@@ -939,9 +1055,8 @@ impl Engine {
     }
 
     /// Settles every item's level against this reading, without announcing anything.
-    fn climb(&mut self, reading: HostReading) -> (Vec<Outcome>, BTreeSet<AttentionKey>) {
+    fn climb(&mut self, reading: HostReading) -> Vec<Outcome> {
         let mut outcomes = Vec::new();
-        let mut climbed = BTreeSet::new();
         for item in self.items.values_mut() {
             let policy = rule(item.rule);
             let (level, taken) = policy.level_after(item.age.ms(reading));
@@ -954,18 +1069,19 @@ impl Engine {
                     from,
                     to: level,
                 });
-                climbed.insert(item.key.clone());
             }
         }
-        (outcomes, climbed)
+        outcomes
     }
 
     /// Makes at most one announcement decision per item.
-    fn announce_due(
-        &mut self,
-        reading: HostReading,
-        climbed: &BTreeSet<AttentionKey>,
-    ) -> Vec<Outcome> {
+    ///
+    /// An announcement is owed when nothing has been decided about the item, when it has climbed
+    /// past the level its last announcement went out at, or when its rule's repeat interval has
+    /// run. Whichever it is, the rule's de-duplication window applies: an escalation a few seconds
+    /// after an announcement waits out the window, and [`Engine::next_deadline`] is where the host
+    /// learns when to come back for it.
+    fn announce_due(&mut self, reading: HostReading) -> Vec<Outcome> {
         let quiet = self.quiet_now(reading);
         let due: Vec<_> = self
             .items
@@ -976,15 +1092,14 @@ impl Engine {
                     return (!quiet).then(|| (item.key.clone(), true));
                 }
                 let policy = rule(item.rule);
-                let repeat_due = policy.repeat_ms.is_some_and(|repeat| {
-                    item.since_notified
-                        .is_some_and(|since| since.ms(reading) >= repeat)
-                });
-                // An item that has never been announced is one a replay rebuilt, or one whose
-                // announcement was refused before it could be written down. Either way the
-                // decision has not been made yet, and this is where it is made.
-                let undecided = item.since_notified.is_none();
-                (undecided || climbed.contains(&item.key) || repeat_due)
+                let Some(since) = item.since_notified else {
+                    return Some((item.key.clone(), false));
+                };
+                let owed = item.announced_level != Some(item.level)
+                    || policy
+                        .repeat_ms
+                        .is_some_and(|repeat| since.ms(reading) >= repeat);
+                (owed && since.ms(reading) >= policy.dedup_window_ms)
                     .then(|| (item.key.clone(), false))
             })
             .collect();

@@ -2873,6 +2873,15 @@ export interface AttentionItem {
    */
   acknowledged: boolean
   /**
+   * Whether a decided announcement is still waiting to be taken by a delivery consumer.
+   *
+   * The host writes a decision down before it hands it over, and keeps it written down until
+   * somebody takes it, so a host that decided an announcement and then died re-offers it rather
+   * than losing it. What becomes of the announcement afterwards belongs to the delivery
+   * journal, not to the feature store.
+   */
+  awaiting_delivery: boolean
+  /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   first_seen_ms: string

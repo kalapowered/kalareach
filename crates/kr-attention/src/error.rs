@@ -19,6 +19,12 @@ pub enum Error {
         /// The version the host holds.
         current: u64,
     },
+    /// A page continues after a key that is no longer in the inbox it was read from.
+    #[error("the inbox no longer holds {key}, so a page cannot continue after it")]
+    UnknownContinuation {
+        /// The key the page named.
+        key: String,
+    },
     /// The feature store could not be read or written.
     #[error("the attention feature store is unavailable ({kind}): {detail}")]
     StoreUnavailable {

@@ -132,6 +132,8 @@ const SCHEMA: &str = "
         last_seen_ms INTEGER NOT NULL,
         notification TEXT NOT NULL,
         last_notified_ms INTEGER,
+        announced_level TEXT,
+        pending_handoff INTEGER NOT NULL,
         uncertain INTEGER NOT NULL,
         deferred INTEGER NOT NULL
     );
@@ -423,8 +425,9 @@ impl Store {
                 "INSERT INTO attention_items (
                      key, rule, source, session_id, summary, routing, level, steps_taken,
                      occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                     uncertain, deferred
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     announced_level, pending_handoff, uncertain, deferred
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                           ?17)",
                 params![
                     item.key.as_str(),
                     item.rule.as_str(),
@@ -441,6 +444,8 @@ impl Store {
                     item.last_notified_ms
                         .map(|at| as_i64(at.get(), "last announced"))
                         .transpose()?,
+                    item.announced_level.map(AttentionLevel::as_str),
+                    i64::from(item.pending_handoff),
                     i64::from(item.uncertain),
                     i64::from(item.deferred),
                 ],
@@ -606,7 +611,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                    uncertain, deferred
+                    announced_level, pending_handoff, uncertain, deferred
              FROM attention_items ORDER BY first_seen_ms, key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -624,8 +629,10 @@ impl Store {
                 row.get::<_, i64>(10)?,
                 row.get::<_, String>(11)?,
                 row.get::<_, Option<i64>>(12)?,
-                row.get::<_, i64>(13)?,
+                row.get::<_, Option<String>>(13)?,
                 row.get::<_, i64>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
             ))
         })?;
         let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
@@ -656,12 +663,19 @@ impl Store {
                 notification: NotificationState::from_wire(&row.11)
                     .ok_or_else(|| unreadable("notification"))?,
                 last_notified_ms,
-                uncertain: row.13 != 0,
+                announced_level: row
+                    .13
+                    .map(|level| {
+                        AttentionLevel::from_wire(&level).ok_or_else(|| unreadable("level"))
+                    })
+                    .transpose()?,
+                pending_handoff: row.14 != 0,
+                uncertain: row.15 != 0,
                 // Both intervals are re-anchored before anything reads them; the values here stand
                 // only until `Attention::open` does that.
                 age: unanchored,
                 since_notified: last_notified_ms.map(|_| unanchored),
-                deferred: row.14 != 0,
+                deferred: row.16 != 0,
             });
         }
         Ok(items)

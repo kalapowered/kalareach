@@ -1216,6 +1216,14 @@ The attention engine runs on the host, from typed events. It holds an inbox, a q
 each actor's acknowledgements and the cursors it has consumed, and it reads no clock of its own:
 every decision that depends on time takes a reading of the host time contract from its caller.
 
+### Where its events come from
+
+The host's own maintenance reads the retained sources on every tick and gives the engine what it
+has not seen, keyed by each source's own cursor. Two sources reach it: the question ledger, whose
+events carry the moment a request became pending, and the journal's host events, which are the
+terminal side effects that had no attachment to go to. A record that no rule covers moves the
+cursor and raises nothing, so a later record is not read as a range retention took.
+
 ### The rule set
 
 Eight rules, each with a stable identifier that outlives any change to the wording it produces.
@@ -1247,7 +1255,9 @@ way.
 
 A quiet-hours window defers an announcement and releases it when the window ends. It never drops
 one, and it never takes an item out of the inbox: an urgent pending approval is in the inbox
-throughout, with its audible delivery held.
+throughout, with its audible delivery held. The one thing that does take a held announcement away
+is the condition it was about ending, which is a cancellation rather than a loss: nothing is
+waiting on the person any more.
 
 The window is minutes of the UTC day, so the host needs no time-zone database to decide whether it
 is inside one. A client converts its own local window before it sets one and may record the zone it
@@ -1272,6 +1282,10 @@ is a version beyond the one it holds.
 
 An acknowledgement affects only the actor that made it. It does not stop the host reminding
 anybody: the ladder and the repeats belong to the condition, and they end when the condition does.
+
+A refusal the host can decide is decided before anything is dispatched. A subject this session
+never held, a version nobody produced, a quiet-hours bound that is not a minute of the day and a
+log view past its own bounds are all rejections, not outcomes nobody can establish.
 
 ### Changed since a visit
 
@@ -1298,6 +1312,10 @@ Every mutating call writes the new state before it publishes the decision. A wri
 leaves the engine where it was, so the same event can be offered again and produces the same
 answer.
 
+A decided announcement stays written down until a delivery consumer takes it, so a host that
+decided one and then died re-offers it at its next start rather than losing it. What becomes of it
+after that - the destinations, the attempts, the receipts - belongs to the delivery journal.
+
 A jump in a source's sequence means the records between were evicted. The engine records the range,
 marks every unresolved item from that same source uncertain, and leaves it in the inbox. A gap is
 never an approval and never a completion: an approval whose answer may have been in the missing
@@ -1311,7 +1329,13 @@ decides what still needs saying.
 
 The inbox is a working set rather than a record: the receipts, the question ledger and the retained
 output are where the history lives. Past five hundred items the host lets go of its least urgent
-and oldest, and the read says how many it has let go of.
+and oldest, weighing the item that has just arrived with the rest, so a fresh informational notice
+does not displace an urgent approval merely by being the newest thing there. The read says how many
+items the host has let go of.
+
+Review subjects are bounded the same way, with one exception: a subject an inbox item still points
+at is never let go of, because an item that says review work is waiting, beside a subject that has
+gone, is a review nobody can complete.
 
 ## Closure
 

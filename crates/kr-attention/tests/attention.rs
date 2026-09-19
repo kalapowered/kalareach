@@ -12,8 +12,8 @@ use kr_attention::{Attention, HostReading};
 use kr_protocol::attention::{
     AttentionItem, AttentionKey, AttentionLevel, AttentionReadParams, AttentionRouting,
     AttentionRule, AttentionSource, IDLE_REMINDER_MS, LogViewState, MAX_ATTENTION_SUMMARY_LEN,
-    MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS, NotificationState, QuietHours,
-    ReviewSubject,
+    MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS, MAX_RETAINED_REVIEW_SUBJECTS,
+    NotificationState, QuietHours, ReviewSubject,
 };
 use kr_protocol::ids::{
     ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
@@ -492,7 +492,9 @@ fn quiet_hours_are_not_enforced_on_a_clock_this_host_cannot_prove() {
         1,
         "an unprovable clock delivers rather than withholds: {outcomes:?}"
     );
-    let read = attention.read(&actor("local:501"), &page(), unproven);
+    let read = attention
+        .read(&actor("local:501"), &page(), unproven)
+        .expect("the page is served");
     assert!(!read.quiet_hours_provable);
     assert!(!read.quiet_now);
     assert!(
@@ -859,7 +861,9 @@ fn the_inbox_stays_inside_its_bound_and_says_how_much_it_let_go_of() {
     }
     let items = whole_inbox(&attention);
     assert_eq!(items.len(), usize::try_from(bound).expect("a small bound"));
-    let read = attention.read(&actor("local:501"), &page(), reading(0));
+    let read = attention
+        .read(&actor("local:501"), &page(), reading(0))
+        .expect("the page is served");
     assert_eq!(read.dropped, U64::new(10), "and it says what it let go of");
     assert!(
         read.more,
@@ -879,25 +883,29 @@ fn a_page_continues_after_the_key_it_was_given() {
             )
             .expect("the store records the decision");
     }
-    let first = attention.read(
-        &actor("local:501"),
-        &AttentionReadParams {
-            max_items: U64::new(2),
-            ..page()
-        },
-        reading(0),
-    );
+    let first = attention
+        .read(
+            &actor("local:501"),
+            &AttentionReadParams {
+                max_items: U64::new(2),
+                ..page()
+            },
+            reading(0),
+        )
+        .expect("the page is served");
     assert_eq!(first.items.len(), 2);
     assert!(first.more);
-    let next = attention.read(
-        &actor("local:501"),
-        &AttentionReadParams {
-            max_items: U64::new(2),
-            after: Nullable::some(first.items[1].key.clone()),
-            ..page()
-        },
-        reading(0),
-    );
+    let next = attention
+        .read(
+            &actor("local:501"),
+            &AttentionReadParams {
+                max_items: U64::new(2),
+                after: Nullable::some(first.items[1].key.clone()),
+                ..page()
+            },
+            reading(0),
+        )
+        .expect("the page is served");
     assert_eq!(next.items.len(), 2);
     assert_ne!(next.items[0].key, first.items[0].key);
     assert_ne!(next.items[0].key, first.items[1].key);
@@ -1712,6 +1720,253 @@ fn a_view_whose_range_retention_took_is_served_from_the_oldest_byte_and_told_abo
     assert_eq!(gap.to_cursor, U64::new(500));
 }
 
+// ----- The delivery handoff -----------------------------------------------------------------
+
+#[test]
+fn a_decided_announcement_waits_to_be_taken_and_survives_a_restart() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&approval(1, 1_000, "req-1"), reading(0))
+            .expect("the store records the decision");
+        assert_eq!(attention.awaiting_delivery(), 1);
+        assert!(whole_inbox(&attention)[0].awaiting_delivery);
+    }
+    // The host died before it sent anything. The decision is still there to be taken.
+    let mut reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
+    assert_eq!(reopened.awaiting_delivery(), 1);
+    let taken = reopened
+        .take_announcements()
+        .expect("the store records that they were taken");
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].rule, AttentionRule::PendingApproval);
+    assert_eq!(reopened.awaiting_delivery(), 0);
+    assert!(!whole_inbox(&reopened)[0].awaiting_delivery);
+}
+
+#[test]
+fn a_release_quiet_hours_let_through_is_an_announcement_waiting_to_be_taken() {
+    let mut attention = engine();
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()), reading(0))
+        .expect("the store records the window");
+    attention
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    assert_eq!(attention.awaiting_delivery(), 0, "nothing has gone out yet");
+    attention
+        .set_quiet_hours(None, reading(1_000))
+        .expect("the store records the window");
+    assert_eq!(
+        attention.awaiting_delivery(),
+        1,
+        "the released announcement is waiting to be taken rather than lost"
+    );
+}
+
+// ----- Deadlines and escalation across calls -------------------------------------------------
+
+#[test]
+fn an_item_nobody_has_decided_about_is_due_now() {
+    let mut attention = engine();
+    let now = reading(3_600_000);
+    attention
+        .rebuild(&[approval(1, 1_000, "req-1")], now)
+        .expect("the store records the rebuild");
+    assert_eq!(
+        attention.engine().next_deadline(now),
+        Some(now.continuous_ms),
+        "a rebuilt item still owes a decision, so the host wakes for it at once"
+    );
+}
+
+#[test]
+fn an_escalation_waits_out_the_de_duplication_window() {
+    let mut attention = engine();
+    attention
+        .apply(&adapter_failed(1, 1_000), reading(0))
+        .expect("the store records the decision");
+    // The same failure again, one second before the ladder is due, which announces it.
+    attention
+        .apply(
+            &adapter_failed(2, ADAPTER_ESCALATION_MS - 1_000),
+            reading(ADAPTER_ESCALATION_MS - 1_000),
+        )
+        .expect("the store records the decision");
+
+    let climbed = attention
+        .tick(reading(ADAPTER_ESCALATION_MS))
+        .expect("the store records the decision");
+    assert!(
+        climbed
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Escalated { .. })),
+        "the level moves at once: {climbed:?}"
+    );
+    assert!(
+        notified(&climbed).is_empty(),
+        "but the announcement waits out the window: {climbed:?}"
+    );
+    let deadline = attention
+        .engine()
+        .next_deadline(reading(ADAPTER_ESCALATION_MS))
+        .expect("the held announcement is a deadline");
+    assert_eq!(deadline, ADAPTER_ESCALATION_MS - 1_000 + 60_000);
+    let due = attention
+        .tick(reading(deadline))
+        .expect("the store records the decision");
+    assert_eq!(notified(&due).len(), 1, "and goes out when it ends");
+}
+
+#[test]
+fn a_replayed_occurrence_outside_the_window_is_decided_after_the_rebuild() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let later = command(2, 120_000, "cargo test", 101);
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&command(1, 1_000, "cargo test", 101), reading(0))
+            .expect("the store records the decision");
+        attention
+            .take_announcements()
+            .expect("the store records that it was taken");
+    }
+    // The host restarts and replays the retained events, which now include a later failure of the
+    // same command. The rule announces once, so nothing but the new occurrence owes a decision.
+    let now = reading(180_000);
+    let mut reopened = Attention::open(&path, now).expect("the feature store reopens");
+    reopened
+        .rebuild(&[command(1, 1_000, "cargo test", 101), later], now)
+        .expect("the store records the rebuild");
+    assert_eq!(
+        reopened.engine().next_deadline(now),
+        Some(now.continuous_ms),
+        "the new occurrence owes a decision"
+    );
+    let decided = reopened.tick(now).expect("the store records the decision");
+    assert_eq!(
+        notified(&decided).len(),
+        1,
+        "and it is announced rather than hidden behind the earlier one: {decided:?}"
+    );
+}
+
+// ----- Bounds -------------------------------------------------------------------------------
+
+#[test]
+fn a_fresh_notice_does_not_displace_an_urgent_approval_merely_by_being_newest() {
+    let mut attention = engine();
+    let bound = MAX_RETAINED_ATTENTION_ITEMS;
+    for index in 0..bound {
+        attention
+            .apply(
+                &approval(index + 1, 1_000 + index, &format!("req-{index}")),
+                reading(index * 61_000),
+            )
+            .expect("the store records the decision");
+    }
+    assert_eq!(
+        whole_inbox(&attention).len(),
+        usize::try_from(bound).expect("a small bound")
+    );
+    let outcomes = attention
+        .apply(
+            &notice(1, 9_000_000, "build finished", false),
+            reading(bound * 61_000),
+        )
+        .expect("the store records the decision");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Dropped { .. })),
+        "something had to go: {outcomes:?}"
+    );
+    assert!(
+        !whole_inbox(&attention)
+            .iter()
+            .any(|item| item.rule == AttentionRule::ApplicationNotice),
+        "and the least urgent thing in the inbox is the notice that had just arrived"
+    );
+}
+
+#[test]
+fn a_review_subject_an_inbox_item_still_points_at_is_never_let_go_of() {
+    let mut attention = engine();
+    // One turn, whose item says it is waiting to be reviewed, and then enough separately captured
+    // change sets to take the subject table past its bound.
+    attention
+        .apply(&turn_completed(1, 1_000, 1), reading(0))
+        .expect("the store records the decision");
+    for index in 0..MAX_RETAINED_REVIEW_SUBJECTS + 10 {
+        let sequence = u64::try_from(index).expect("a small index") + 2;
+        attention
+            .apply(
+                &event(
+                    AttentionSource::Semantic,
+                    sequence,
+                    2_000 + sequence,
+                    EventKind::ChangeSetCaptured {
+                        session_id: session(1),
+                        change_set_id: ChangeSetId::new(Uuid::from_bytes([
+                            u8::try_from(index % 251).expect("a byte"),
+                            u8::try_from(index / 251).expect("a byte"),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            9,
+                        ])),
+                        version: 1,
+                        summary: "captured the workspace".to_owned(),
+                    },
+                ),
+                reading(0),
+            )
+            .expect("the store records the decision");
+    }
+    let state = attention
+        .reviews()
+        .state(&actor("local:501"), &turn_subject())
+        .expect("the turn the inbox still points at is still a subject");
+    assert!(state.outstanding);
+    attention
+        .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
+        .expect("and the review it says is waiting can be completed");
+}
+
+#[test]
+fn a_page_that_continues_after_a_key_the_inbox_no_longer_holds_is_refused() {
+    let mut attention = engine();
+    attention
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    let gone = key(AttentionRule::PendingApproval, "req-gone");
+    let refused = attention.read(
+        &actor("local:501"),
+        &AttentionReadParams {
+            after: Nullable::some(gone),
+            ..page()
+        },
+        reading(0),
+    );
+    assert!(
+        refused.is_err(),
+        "starting again at the beginning would repeat what the client already has"
+    );
+}
+
 // ----- The inbox read ----------------------------------------------------------------------
 
 #[test]
@@ -1726,7 +1981,9 @@ fn the_inbox_read_carries_the_escalation_the_quiet_window_and_the_gaps_together(
     attention
         .apply(&approval(9, 9_000, "req-9"), reading(1_000))
         .expect("the store records the decision");
-    let read = attention.read(&actor("local:501"), &page(), reading(1_000));
+    let read = attention
+        .read(&actor("local:501"), &page(), reading(1_000))
+        .expect("the page is served");
     assert_eq!(read.items.len(), 2);
     assert!(read.quiet_now);
     assert!(read.quiet_hours_provable);

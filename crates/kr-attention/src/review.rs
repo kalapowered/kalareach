@@ -18,7 +18,7 @@
 //! version, the earlier acknowledgement still stands for the version it covered, and the subject
 //! is outstanding again. An acknowledgement is never carried forward onto a version nobody read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kr_protocol::attention::{MAX_RETAINED_REVIEW_SUBJECTS, ReviewState, ReviewSubject};
 use kr_protocol::ids::{ActorId, SessionId};
@@ -118,7 +118,6 @@ impl Reviews {
                         at_ms,
                     },
                 );
-                self.enforce_bound();
                 true
             }
         }
@@ -126,14 +125,20 @@ impl Reviews {
 
     /// Keeps the subject table inside [`MAX_RETAINED_REVIEW_SUBJECTS`].
     ///
-    /// The oldest version recorded goes first, with the acknowledgements that named it. What is
-    /// let go of is a subject nobody has produced a new version of for longest, and the change
-    /// sets themselves are the project service's to keep, not this table's.
-    fn enforce_bound(&mut self) {
+    /// `referenced` names the subjects something else still points at - an inbox item that says a
+    /// turn is waiting to be reviewed, most of all. Those are never let go of: an item that says
+    /// there is review work, beside a subject that has gone, is a review nobody can complete.
+    /// What is let go of is the subject whose version was recorded longest ago, with the
+    /// acknowledgements that named it.
+    ///
+    /// Returns the subjects that were let go of.
+    pub fn enforce_bound(&mut self, referenced: &BTreeSet<String>) -> Vec<String> {
+        let mut released = Vec::new();
         while self.subjects.len() > MAX_RETAINED_REVIEW_SUBJECTS {
             let Some(oldest) = self
                 .subjects
                 .iter()
+                .filter(|(key, _)| !referenced.contains(*key))
                 .min_by(|left, right| {
                     left.1
                         .at_ms
@@ -143,13 +148,18 @@ impl Reviews {
                 })
                 .map(|(key, _)| key.clone())
             else {
+                // Everything left is still referenced. The table goes over its bound rather than
+                // leaving an inbox item pointing at nothing; what bounds it then is the inbox's
+                // own bound, which is enforced where the items are raised.
                 break;
             };
             self.subjects.remove(&oldest);
             for acks in self.acks.values_mut() {
                 acks.remove(&oldest);
             }
+            released.push(oldest);
         }
+        released
     }
 
     /// Records that one actor read one subject at one version.

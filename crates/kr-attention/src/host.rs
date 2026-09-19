@@ -30,7 +30,7 @@
 //! item from that source marked uncertain. Nothing here reads a gap as an approval or a
 //! completion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use kr_protocol::attention::{
@@ -39,10 +39,10 @@ use kr_protocol::attention::{
     MAX_ATTENTION_ITEMS, QuietHours, ReviewAcknowledgeResult, ReviewState, ReviewSubject,
     SemanticChangeKind, VisitAcknowledgeResult, VisitChangedResult,
 };
-use kr_protocol::ids::{ActorId, SessionId};
+use kr_protocol::ids::{ActorId, AgentTurnId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
-use crate::engine::{Engine, Outcome, Restored};
+use crate::engine::{Announcement, Engine, Outcome, Restored};
 use crate::error::Result;
 use crate::event::{EventKind, SourceEvent};
 use crate::key;
@@ -219,24 +219,34 @@ impl Attention {
     }
 
     /// Returns one page of the inbox one actor sees, with the quiet-hours state beside it.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::UnknownContinuation`] when the key a page continues after is no
+    /// longer in this actor's inbox. Starting again at the beginning would repeat items the
+    /// client has already been given, and it could not tell that from a valid continuation.
     pub fn read(
         &self,
         actor: &ActorId,
         params: &AttentionReadParams,
         reading: HostReading,
-    ) -> AttentionReadResult {
+    ) -> Result<AttentionReadResult> {
         let all = self.state.engine.inbox(actor, params.include_acknowledged);
-        let start = params.after.as_ref().map_or(0, |after| {
-            all.iter()
+        let start = match params.after.as_ref() {
+            Some(after) => all
+                .iter()
                 .position(|item| &item.key == after)
-                .map_or(0, |index| index + 1)
-        });
+                .map(|index| index + 1)
+                .ok_or_else(|| crate::Error::UnknownContinuation {
+                    key: after.as_str().to_owned(),
+                })?,
+            None => 0,
+        };
         let limit =
             usize::try_from(params.max_items.get().clamp(1, MAX_ATTENTION_ITEMS)).unwrap_or(1);
         let page: Vec<_> = all.iter().skip(start).take(limit).cloned().collect();
         let more = all.len() > start.saturating_add(page.len());
-        AttentionReadResult {
+        Ok(AttentionReadResult {
             items: page,
             more,
             dropped: U64::new(self.state.engine.dropped()),
@@ -244,7 +254,23 @@ impl Attention {
             quiet_hours: Nullable(self.state.engine.quiet_hours().cloned()),
             quiet_now: self.state.engine.quiet_now(reading),
             quiet_hours_provable: reading.wall_proven,
-        }
+        })
+    }
+
+    /// Takes the announcements the host has decided and not yet handed over.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written. Nothing is
+    /// taken then: an announcement this host could not record as taken is one it offers again.
+    pub fn take_announcements(&mut self) -> Result<Vec<Announcement>> {
+        self.commit(|state| state.engine.take_announcements())
+    }
+
+    /// Returns how many decided announcements are waiting to be taken.
+    #[must_use]
+    pub fn awaiting_delivery(&self) -> usize {
+        self.state.engine.awaiting_delivery()
     }
 
     /// Records one actor's acknowledgement of each item it holds.
@@ -481,7 +507,39 @@ fn consume(
     outcomes.extend(produced);
     if fresh {
         record_semantics(state, event, resolved_session);
+        bound_reviews(state);
     }
+}
+
+/// Keeps the review subjects bounded, without letting go of one an inbox item still points at.
+fn bound_reviews(state: &mut State) {
+    let referenced: BTreeSet<String> = state
+        .engine
+        .items()
+        .filter(|item| item.rule == AttentionRule::ReviewReady)
+        .filter_map(|item| {
+            item.session_id.map(|session_id| {
+                crate::review::subject_key(&ReviewSubject::CompletedTurn {
+                    session_id,
+                    turn_id: turn_of(&item.key),
+                })
+            })
+        })
+        .collect();
+    state.reviews.enforce_bound(&referenced);
+}
+
+/// Returns the turn an `attention.review_ready` key was built from.
+///
+/// The key is `<rule>|<session>|<turn>`, derived rather than allocated, so the turn can be read
+/// back out of it. A key whose subject was derived from a digest reads back as that digest, which
+/// names no subject and therefore protects none; the subject it belonged to is bounded like any
+/// other.
+fn turn_of(key: &AttentionKey) -> AgentTurnId {
+    let turn = key.as_str().rsplit('|').next().unwrap_or_default();
+    AgentTurnId::new(turn).unwrap_or_else(|_| {
+        AgentTurnId::new("unknown").expect("a constant identifier is well formed")
+    })
 }
 
 /// Puts every gap the engine recorded where a visit can see it.

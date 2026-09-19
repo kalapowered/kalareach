@@ -85,6 +85,25 @@ pub const MAX_VISIT_CHANGES: u64 = 500;
 /// Largest number of log views one actor may retain for a session.
 pub const MAX_RETAINED_LOG_VIEWS: u64 = 32;
 
+/// Largest log-view identifier, in bytes.
+pub const MAX_LOG_VIEW_ID_LEN: usize = 128;
+
+/// Largest filter one log view carries, in bytes.
+///
+/// A filter is the client's own form and the host never reads it, but it does write it down and
+/// give it back, so its size is the host's business. A filter past this is refused rather than
+/// clipped: a clipped filter means something else.
+pub const MAX_LOG_VIEW_FILTER_LEN: usize = 4_096;
+
+/// Largest model name one summary names, in bytes.
+pub const MAX_SUMMARY_MODEL_LEN: usize = 128;
+
+/// Largest number of actors one session's feature store keeps.
+pub const MAX_RETAINED_ACTORS: usize = 256;
+
+/// Largest number of pending input requests one session's feature store keeps.
+pub const MAX_RETAINED_PENDING_INPUTS: usize = 500;
+
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*
@@ -344,6 +363,13 @@ pub struct AttentionItem {
     pub last_seen_ms: TimestampMs,
     /// What became of the notification.
     pub notification: NotificationState,
+    /// Whether a decided announcement is still waiting to be taken by a delivery consumer.
+    ///
+    /// The host writes a decision down before it hands it over, and keeps it written down until
+    /// somebody takes it, so a host that decided an announcement and then died re-offers it rather
+    /// than losing it. What becomes of the announcement afterwards belongs to the delivery
+    /// journal, not to the feature store.
+    pub awaiting_delivery: bool,
     /// Whether this actor has acknowledged it.
     pub acknowledged: bool,
     /// Whether a gap in the retained events covers this item's subject.
