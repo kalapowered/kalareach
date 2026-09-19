@@ -3601,7 +3601,19 @@ impl WorkerService {
                     &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok(())
+                // And the refusal this host makes whatever the caller does: the effect the
+                // component prepares does not reach this broker yet, and the broker will not
+                // transmit one nobody validated against the invocation it was prepared under. It
+                // is decided here, before the marker, so it is a rejection rather than an outcome
+                // nobody can establish.
+                Err(crate::broker::BrokerError::UnsupportedCapability {
+                    detail: format!(
+                        "{} is admitted, and the effect its component prepares does not reach \
+                         this broker yet, so nothing is transmitted for it",
+                        params.action
+                    ),
+                }
+                .into())
             }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
@@ -4586,10 +4598,9 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
-                // The admission is taken here, which is what refuses everything this host can
-                // decide. What it cannot yet do is receive the effect the component prepared:
-                // that hand-over runs through the plugin host, and the broker will not transmit
-                // an effect nobody validated against the invocation it was prepared under.
+                // The refusal above is decided before the marker, so nothing reaches this arm.
+                // It stays as the one place that would admit the invocation once the component's
+                // prepared effect reaches this broker.
                 let admitted = self.broker.admit_plugin_action(
                     &Self::broker_caller(caller),
                     binding_id,
@@ -4599,8 +4610,7 @@ impl WorkerService {
                 let _ = admitted;
                 Err(crate::broker::BrokerError::UnsupportedCapability {
                     detail: format!(
-                        "{} was admitted, and the effect its component prepares does not yet \
-                         reach this broker, so nothing is transmitted for it",
+                        "{} has no prepared effect this broker validated",
                         params.action
                     ),
                 }

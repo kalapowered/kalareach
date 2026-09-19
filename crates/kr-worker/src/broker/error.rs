@@ -61,6 +61,9 @@ pub enum BrokerError {
         /// What disagreed.
         detail: String,
     },
+    /// This admission has already carried its one operation to the upstream.
+    #[error("this admission has already been transmitted, and one admission carries one operation")]
+    AlreadyTransmitted,
     /// A draft or request precondition did not hold.
     #[error("{detail}")]
     PreconditionFailed {
@@ -147,7 +150,7 @@ impl BrokerError {
                 ErrorCode::UpstreamUnavailable
             }
             Self::UnknownSubject { .. } | Self::StaleBinding { .. } => ErrorCode::StaleSession,
-            Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
+            Self::AlreadyTransmitted | Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
             Self::LedgerUnavailable { .. } => ErrorCode::StorageUnavailable,
             Self::Launch(refusal) => match refusal {
                 kr_protocol::broker::LaunchRefusal::ForegroundChanged

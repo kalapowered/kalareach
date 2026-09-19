@@ -1146,30 +1146,40 @@ impl Broker {
         // And the draft. An operation that acts on one acts on the invocation's own, and a draft
         // this host cannot resolve is a precondition nobody has established rather than one to
         // assume.
-        if registered.needs_draft {
-            let named =
-                effect
-                    .draft_id
-                    .as_ref()
-                    .ok_or_else(|| BrokerError::PreconditionFailed {
-                        detail: format!(
-                            "{} acts on a draft and this plan named none",
-                            effect.operation
-                        ),
-                    })?;
-            if token.draft_id.as_ref() != Some(named) {
-                return Err(BrokerError::PreconditionFailed {
-                    detail: format!(
-                        "this plan acts on draft {named} and the invocation named another"
-                    ),
-                });
+        // The draft. A plan that names one names the invocation's own, whether the manifest
+        // required a draft or not: a component invited to act on nothing cannot acquire a draft by
+        // putting one in its plan. And a draft this host cannot resolve is a precondition nobody
+        // has established rather than one to assume.
+        if effect.draft_id.as_ref() != token.draft_id.as_ref() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "this plan acts on {} and the invocation named {}",
+                    effect
+                        .draft_id
+                        .as_ref()
+                        .map_or_else(|| "no draft".to_owned(), ToString::to_string),
+                    token
+                        .draft_id
+                        .as_ref()
+                        .map_or_else(|| "none".to_owned(), ToString::to_string)
+                ),
+            });
+        }
+        if let Some(named) = effect.draft_id.as_ref() {
+            if !effect.operation.may_act_on_a_draft() {
+                return Err(BrokerError::invalid(format!(
+                    "{} acts on no draft and this plan named one",
+                    effect.operation
+                )));
             }
             self.resolve_draft(named)?;
-        } else if effect.draft_id.is_present() && !effect.operation.may_act_on_a_draft() {
-            return Err(BrokerError::invalid(format!(
-                "{} acts on no draft and this plan named one",
-                effect.operation
-            )));
+        } else if registered.needs_draft {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{} acts on a draft and this plan named none",
+                    effect.operation
+                ),
+            });
         }
         admitted.mark_effect_validated();
         Ok(())
