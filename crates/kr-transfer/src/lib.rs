@@ -78,6 +78,18 @@ pub mod store;
 )]
 mod windows;
 
+/// Whether an open Apple file carries an access-control list.
+///
+/// The platform's list is reachable only through a descriptor and only through its own interface,
+/// which is why this module is allowed to leave safe Rust and nothing else on this platform is.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "asking a descriptor for its access-control list is a call into the platform's own \
+              interface, which has no safe binding; the call is made here and nowhere else"
+)]
+mod apple;
+
 pub use crate::authority::{
     AuthorisedDirectory, AuthorisedFile, Escape, ObjectIdentity, ObjectPolicy, Privacy,
     RelativeName,

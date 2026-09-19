@@ -568,3 +568,62 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
         "outside"
     );
 }
+
+/// KR-REQ-14.29: a file's own protection is asked of the handle this host holds on it.
+///
+/// Both halves matter. An ordinary file carries its mode bits and nothing else, and a caller that
+/// replaces it takes nothing away. A file somebody gave an access-control list carries protection
+/// no mode says, and a caller that replaces it would.
+#[cfg(unix)]
+#[test]
+fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list() {
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("ordinary.txt").expect("a name");
+    std::fs::write(root.path().join("ordinary.txt"), b"content\n").expect("a file");
+
+    let file = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("it opens");
+    assert!(
+        !file.carries_access_control(),
+        "a file whose protection is its mode bits alone carries no list"
+    );
+    drop(file);
+
+    // The other half needs the platform's own tool. Where it is not installed, this says so rather
+    // than reporting a case it did not run.
+    let listed = root.path().join("listed.txt");
+    std::fs::write(&listed, b"content\n").expect("a second file");
+    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+    let given = if cfg!(target_os = "macos") {
+        std::process::Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(format!("{who} allow read"))
+            .arg(&listed)
+            .status()
+    } else {
+        std::process::Command::new("setfacl")
+            .arg("-m")
+            .arg(format!("u:{who}:r"))
+            .arg(&listed)
+            .status()
+    };
+    match given {
+        Ok(status) if status.success() => {
+            let second = RelativeName::parse("listed.txt").expect("a name");
+            let file = authority
+                .open_read(&second, ObjectPolicy::ReadableFile)
+                .expect("it opens");
+            assert!(
+                file.carries_access_control(),
+                "a file with a list says so through its own handle"
+            );
+        }
+        _ => println!(
+            "not exercised: this platform's access-control tool did not run, so only the \
+             no-list half of this case was checked"
+        ),
+    }
+}

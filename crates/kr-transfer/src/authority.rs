@@ -999,6 +999,53 @@ impl AuthorisedFile {
         self.file
     }
 
+    /// Returns true when this file carries protection beyond its mode bits.
+    ///
+    /// Asked of **this handle**, never of a name: a name asked twice can be two different files,
+    /// and what a caller decides from this is whether replacing the file would take protection
+    /// away from it or give protection to it.
+    ///
+    /// Each platform keeps its list somewhere else and this asks each in its own way. A POSIX list
+    /// includes the mode bits themselves, and the kernel writes its extended attribute only when
+    /// there is something a mode cannot say; an Apple list lives beside the mode bits, reachable
+    /// only through the platform's own interface. A platform this host does not know how to ask
+    /// answers false, which is the answer that leaves a caller carrying the mode bits alone.
+    #[must_use]
+    pub fn carries_access_control(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsFd as _;
+
+            crate::apple::carries_access_control(self.file.as_fd())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd as _;
+
+            match rustix::fs::fgetxattr(
+                self.file.as_fd(),
+                "system.posix_acl_access",
+                &mut [0_u8; 0][..],
+            ) {
+                // There is one, and this asked for its length rather than reading it.
+                Ok(_) | Err(rustix::io::Errno::RANGE) => true,
+                // No such attribute, or a filesystem that keeps none.
+                Err(
+                    rustix::io::Errno::NODATA
+                    | rustix::io::Errno::NOTSUP
+                    | rustix::io::Errno::OPNOTSUPP,
+                ) => false,
+                // A file this host could not ask about is one whose protection it cannot say it
+                // can carry across.
+                Err(_) => true,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
     /// Rereads the object's identity, length and kind through the handle.
     ///
     /// # Errors

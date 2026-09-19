@@ -4011,7 +4011,6 @@ name = "kr-changeset"
 version = "0.1.0"
 dependencies = [
  "cap-std",
- "exacl",
  "kr-cbor",
  "kr-ipc",
  "kr-project",

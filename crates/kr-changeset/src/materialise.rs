@@ -98,11 +98,14 @@ pub fn materialise(
         }
     })?;
     let directory = parent.subdirectory(&name)?;
-    // And empty when it is adopted. Between the create and the open lies one window this platform
-    // gives no way to close: there is no "open the directory I just made". What closes the harm is
-    // this: a directory substituted in that window would have to hold nothing to be adopted, so
+    // And empty when it is adopted. Between the create and the open lies one window no call on
+    // these platforms closes: there is no "open the directory I just made". What closes the harm
+    // is this: a directory substituted in that window would have to hold nothing to be adopted, so
     // everything beneath this name afterwards is this host's own writing and whatever the run it
     // serves puts there, and the release that empties it takes away nothing that was there first.
+    // **That window is an accepted limitation of this service** (D-081): exclusive creation and
+    // this check are what bound it, and closing it would need a create-and-open primitive the
+    // platform does not offer.
     if directory
         .handle()
         .entries()

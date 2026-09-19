@@ -25,16 +25,10 @@ kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Asks an open file whether it carries a POSIX access-control list, and takes an inherited one off
-# a copy this host staged, through the extended attribute the kernel keeps one in. Both questions
-# are asked of a descriptor rather than of a name.
+# Takes an inherited access-control list off a copy this host staged, through the extended
+# attribute the kernel keeps one in and through the copy's own descriptor. Asking whether a file
+# has one at all is the filesystem authority's own question, on every platform.
 rustix = { workspace = true, features = ["fs"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# Reads a file's access-control list. This platform keeps one where nothing may read it through a
-# descriptor, so the read is of a name, bracketed by two readings of the object that name reaches.
-# Used to refuse, never to grant.
-exacl.workspace = true
 
 [features]
 # The seam a test uses to stop an apply exactly where a crash would stop it, so the journal can be

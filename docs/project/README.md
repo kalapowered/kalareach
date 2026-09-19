@@ -657,7 +657,12 @@ different tree.
 ### Materialisations, and what a result may say
 
 A materialisation is an independent copy of one exact version, written out of this host's own
-content-addressed store into a private directory of its own. Neither the repository nor the working
+content-addressed store into a private directory of its own. That directory is **made**, with a
+creation that fails when the name is taken, and adopted only when what it reaches is empty; its
+identity is compared again before a release removes anything. Between the creation and the opening
+lies one window no call on these platforms closes, because there is no "open the directory I just
+made": what bounds it is the emptiness rule, which means a release still takes away nothing that
+was there first. That window is a stated limitation rather than something this host establishes. Neither the repository nor the working
 copy the version came from is touched, so the agent whose tree was captured keeps working.
 
 Recording a result re-reads the materialisation and says what it establishes:
@@ -740,9 +745,9 @@ protection is never lost quietly. That is the answer on macOS, which keeps a lis
 bits, and on Linux, where the question is whether the file carries the extended attribute a list
 lives in: a file whose protection is its mode bits alone carries none. A directory can also put a list on every file made
 inside it, so the copy this host stages is asked as well: on Linux that inherited list is taken off
-it, through the copy's own descriptor, before the mode is set, and on macOS, where a list is
-readable only through a name, a copy that has one ends the operation and the destination is left
-exactly as it was. On a platform whose lists this host does not read, only the mode bits
+it, through the copy's own descriptor, before the mode is set, and elsewhere a copy that has one
+ends the operation and the destination is left exactly as it was. Every question about whether a
+file has a list at all is asked of the handle this host holds on that file, never of its name. On a platform whose lists this host does not read, only the mode bits
 are carried. **Preserving** a destination's own list is not implemented at all: a destination that
 has one is refused. Content is written byte for
 byte, so a line ending is whatever the version holds.
