@@ -10,10 +10,9 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
-use kr_crypto::store::{SecretStore, open_store, open_store_in};
+use kr_crypto::store::StoreSelection;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::paths::HostPaths;
 use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
@@ -47,13 +46,22 @@ struct Arguments {
     secret_store: SecretStoreChoice,
 }
 
-/// The store a daemon was told to keep its device keys in.
+/// The store a daemon was told to keep its device keys in, as the command line spells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum SecretStoreChoice {
     /// The operating system's credential store, with the fallback section 10 allows.
     Platform,
     /// This environment's own `secrets` directory, named deliberately.
     File,
+}
+
+impl From<SecretStoreChoice> for StoreSelection {
+    fn from(choice: SecretStoreChoice) -> Self {
+        match choice {
+            SecretStoreChoice::Platform => Self::Platform,
+            SecretStoreChoice::File => Self::File,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -101,31 +109,28 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // daemons starting at once cannot both decide they are the first.
     let secrets_dir = environment.secrets_dir();
     let marker = environment.state_dir().join("controller-identity");
-    let choice = arguments.secret_store;
-    let open_identity =
-        move || -> kr_controller::Result<(ControllerIdentity, Arc<dyn SecretStore>)> {
-            let store = match choice {
-                SecretStoreChoice::Platform => open_store(CONTROLLER_SECRET_SERVICE, &secrets_dir),
-                SecretStoreChoice::File => open_store_in(&secrets_dir),
-            }
+    let selection = StoreSelection::from(arguments.secret_store);
+    let open_identity = move || -> kr_controller::Result<ControllerIdentity> {
+        let store = selection
+            .open(CONTROLLER_SECRET_SERVICE, &secrets_dir)
             .map_err(|error| kr_controller::ControllerError::NotConfigured(error.to_string()))?;
-            // Named in the daemon's own output, so a run's log says where its keys went rather than
-            // leaving it to be worked out from the command line that started it.
-            println!("kr-controller: keys in {}", store.store.describe());
-            let initialised_before = marker.exists();
-            let identity =
-                ControllerIdentity::open(store.store.as_ref(), environment_id, initialised_before)
-                    .map_err(|error| {
-                        kr_controller::ControllerError::NotConfigured(error.to_string())
-                    })?;
-            if !initialised_before {
-                kr_ipc::paths::write_owner_only_file(
-                    &marker,
-                    format!("{:?}\n", store.kind).as_bytes(),
-                )?;
-            }
-            Ok((identity, Arc::from(store.store)))
-        };
+        // Named in the daemon's own output, so a run's log says where its keys went rather than
+        // leaving it to be worked out from the command line that started it.
+        println!("kr-controller: keys in {}", store.store.describe());
+        let initialised_before = marker.exists();
+        let identity =
+            ControllerIdentity::open(store.store.as_ref(), environment_id, initialised_before)
+                .map_err(|error| {
+                    kr_controller::ControllerError::NotConfigured(error.to_string())
+                })?;
+        if !initialised_before {
+            kr_ipc::paths::write_owner_only_file(
+                &marker,
+                format!("{:?}\n", store.kind).as_bytes(),
+            )?;
+        }
+        Ok(identity)
+    };
 
     let worker_program = arguments.worker.unwrap_or_else(default_worker_program);
     let build_id = BuildId::new(format!("kr-controller/{RELEASE}"))?;
@@ -134,6 +139,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             paths: environment.clone(),
             environment_id,
             identity: Box::new(open_identity),
+            secret_store: selection,
             boot_identity: kr_ipc::identity::boot_identity()?,
             supervisor: kr_controller::supervision::detect(),
             worker_program,

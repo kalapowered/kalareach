@@ -205,8 +205,10 @@ anything is decrypted.
 
 ### Where a test keeps its secrets
 
-`open_store` answers which store belongs to a host, and on macOS, iOS, Android and Windows the
-answer is always the platform's credential store. `open_store_in(directory)` answers a different
+`open_store` answers which store belongs to a host. On macOS, iOS, Android and Windows the only
+answer it can give is the platform's credential store: where there is none it fails, and on iOS and
+Android this `keyring` version reports the platform as unsupported, which is why those keys belong
+to the companion application's platform layer. `open_store_in(directory)` answers a different
 question, "use this directory", and it is the only way to reach `FileStore` where the fallback is
 compiled out. A test, a bench or a demonstration run calls it with a directory of its own, and a
 daemon one of them starts is given `--secret-store file`, which makes the same choice on the
@@ -214,11 +216,16 @@ command line. Items written to a person's credential store outlive the run that 
 nothing collects them, so a run that wrote there would leave its keys behind every time.
 
 The named directory carries the rules the fallback root carries: it is not a link, it is owner-only
-and it gets mode 0700, and every path below it is checked against a link on each read, write and
-deletion. Its parents are the caller's, which is what lets a run keep its secrets under the system
-temporary directory, below `/var` on macOS and `/tmp` on many systems, both of which are links. `open_store_in` records nothing: the
-`.store-kind` marker is `open_store`'s record of a choice made once for a host, and this choice is
-passed in at every start.
+and it gets mode 0700 where the platform has mode bits, and every path below it is checked against
+a link on each read, write and deletion. Its ancestors are checked for nothing and the caller is the
+one vouching for them, which is what lets a run keep its secrets under the system temporary
+directory: on macOS that is below `/var`, a link to `/private/var`, and the strict rule refuses it.
+The name is reduced to its components first, so `store/` and `store/.` cannot slip a link past the
+check on the directory itself. Windows has no mode bits, and a directory opened this way carries the
+access-control list it inherits; that is one of the reasons section 10 offers no fallback there.
+
+`open_store_in` records nothing. The `.store-kind` marker is `open_store`'s record of a choice made
+once for a host, and this choice is passed in at every start.
 
 ### The recorded choice
 

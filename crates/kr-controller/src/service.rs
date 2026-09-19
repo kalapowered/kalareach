@@ -117,13 +117,8 @@ pub struct Controller {
     /// authority it was made under is revoked or the connection ends.
     admitted: Mutex<BTreeMap<ConnectionId, AdmittedConnection>>,
     identity: ControllerIdentity,
-    /// The store this daemon's own keys came out of.
-    ///
-    /// One daemon opens one store, at startup, after the singleton lock is held. Everything else
-    /// that needs a key of this host's — the transport's device keys above all — takes this one
-    /// rather than deciding again, so a daemon cannot end up with its identity in one place and
-    /// its network keys in another.
-    secrets: Arc<dyn kr_crypto::store::SecretStore>,
+    /// Which store this daemon keeps its keys in.
+    secret_store: kr_crypto::store::StoreSelection,
     generation: ControllerGeneration,
     paths: EnvironmentPaths,
     boot_identity: BootIdentity,
@@ -200,7 +195,7 @@ impl Controller {
         let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
         let generation = lock.advance(&mut registry)?;
-        let (identity, secrets) = (setup.identity)()?;
+        let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
@@ -213,7 +208,7 @@ impl Controller {
             pending: Mutex::new(BTreeMap::new()),
             admitted: Mutex::new(BTreeMap::new()),
             identity,
-            secrets,
+            secret_store: setup.secret_store,
             generation,
             paths: setup.paths,
             boot_identity: setup.boot_identity,
@@ -770,10 +765,10 @@ impl Controller {
         &self.paths
     }
 
-    /// Returns the store this daemon's keys live in.
+    /// Returns which store this daemon keeps its keys in.
     #[must_use]
-    pub const fn secrets(&self) -> &Arc<dyn kr_crypto::store::SecretStore> {
-        &self.secrets
+    pub const fn secret_store(&self) -> kr_crypto::store::StoreSelection {
+        self.secret_store
     }
 
     /// Returns the environment's transfer service.
@@ -2636,29 +2631,24 @@ struct AdmittedConnection {
     admitted_revision: kr_protocol::ids::AuthorityRevision,
 }
 
-/// Opens or creates the persistent identity a daemon signs generation tokens with, and hands back
-/// the store it came out of.
-///
-/// It is a closure because it must run **after** the singleton lock is held: creating the
-/// environment's key is a first-start step, and two daemons racing for it would leave one of them
-/// holding a key no live worker recognises.
-///
-/// The store comes back with the identity because choosing one is the caller's decision, made
-/// once: an installed host takes the platform's credential store, and a test, a bench or a
-/// demonstration run names a directory of its own. Everything else this daemon keeps a key in uses
-/// the store it is handed here.
-pub type OpenIdentity = Box<
-    dyn FnOnce() -> Result<(ControllerIdentity, Arc<dyn kr_crypto::store::SecretStore>)> + Send,
->;
-
 /// What a controller needs before it starts.
 pub struct ControllerSetup {
     /// The environment's directories.
     pub paths: EnvironmentPaths,
     /// The environment identity.
     pub environment_id: EnvironmentId,
-    /// Opens the persistent identity this daemon signs generation tokens with.
-    pub identity: OpenIdentity,
+    /// Opens or creates the persistent identity this daemon signs generation tokens with.
+    ///
+    /// It is a closure because it must run **after** the singleton lock is held: creating the
+    /// environment's key is a first-start step, and two daemons racing for it would leave one of
+    /// them holding a key no live worker recognises.
+    pub identity: Box<dyn FnOnce() -> Result<ControllerIdentity> + Send>,
+    /// Which store this daemon keeps its keys in.
+    ///
+    /// The closure above opens it for the identity; this is the same choice, for everything else
+    /// this daemon keeps a key in. The transport's device keys are the one that matters: they are
+    /// opened only when the environment selects a network, which is after startup.
+    pub secret_store: kr_crypto::store::StoreSelection,
     /// The boot this host is running.
     pub boot_identity: BootIdentity,
     /// How workers are started.
@@ -3009,12 +2999,14 @@ mod a_create_that_launches_nothing {
             paths: environment.clone(),
             environment_id,
             identity: Box::new(move || {
-                let store: Arc<dyn kr_crypto::store::SecretStore> = Arc::new(MemoryStore::new());
-                let identity =
-                    kr_ipc::verify::ControllerIdentity::open(store.as_ref(), environment_id, false)
-                        .expect("an identity");
-                Ok((identity, store))
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    &MemoryStore::new(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
             }),
+            secret_store: kr_crypto::store::StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
             supervisor: Box::new(RecordingSupervisor {
                 asked: Arc::clone(&asked),
@@ -3630,12 +3622,14 @@ mod a_close_a_worker_never_answers {
             paths: environment.clone(),
             environment_id,
             identity: Box::new(move || {
-                let store: Arc<dyn kr_crypto::store::SecretStore> = Arc::new(MemoryStore::new());
-                let identity =
-                    kr_ipc::verify::ControllerIdentity::open(store.as_ref(), environment_id, false)
-                        .expect("an identity");
-                Ok((identity, store))
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    &MemoryStore::new(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
             }),
+            secret_store: kr_crypto::store::StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
             supervisor: Box::new(RefusingSupervisor),
             worker_program: temp.root().join("kr-worker"),

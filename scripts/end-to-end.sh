@@ -29,6 +29,7 @@ echo "kalareach end-to-end demonstrations"
 echo "  commit: $(git rev-parse HEAD)"
 echo "  host: $(uname -sr) $(uname -m)"
 echo "  taken at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo "  secret store: a directory inside each suite's own temporary host"
 echo
 # Nothing this script started may outlive it. A worker is deliberately not a child of whatever
 # created it, which is what makes a session survive a control daemon's restart, so a suite that

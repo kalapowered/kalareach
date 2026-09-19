@@ -21,13 +21,12 @@
 //! # Where a test keeps its secrets
 //!
 //! A test, a bench or a demonstration run must never write to the person's own credential store.
-//! Items put there outlive the run that made them, nothing collects them, and on macOS a keychain
-//! that has grown to six figures makes every later write take minutes. So a run that needs a real
-//! store on disk calls [`open_store_in`], which takes the directory to use and is the only way to
-//! reach [`FileStore`] on a platform whose fallback is compiled out; a daemon a test starts is
-//! given `--secret-store file`, which is the same choice made on its command line. [`open_store`]
-//! is the production door and is unchanged: it never returns the directory store where section 10
-//! does not offer it.
+//! An item written there belongs to the account rather than to the run, and outlives it: nothing
+//! collects it afterwards, so every run would leave its keys behind. A run that needs a store on
+//! disk therefore calls [`open_store_in`], which takes the directory to use and is the only way to
+//! reach [`FileStore`] where section 10 offers no fallback; a daemon such a run starts is given
+//! `--secret-store file`, which is the same choice made on its command line. [`open_store`] is the
+//! door a host uses, and it never returns the directory store where section 10 does not offer it.
 //!
 //! # Why every purpose has its own item
 //!
@@ -268,8 +267,7 @@ impl FileStore {
     /// that wants the directory store where section 10 offers no fallback has to say so through
     /// that one named function, and [`FileStore::open`] keeps refusing.
     fn at(directory: impl Into<PathBuf>) -> Result<Self> {
-        let directory = directory.into();
-        prepare_named_directory(&directory)?;
+        let directory = prepare_named_directory(&directory.into())?;
         Ok(Self { directory })
     }
 
@@ -436,30 +434,38 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
     check_owner_only(directory)
 }
 
-/// Creates or validates one owner-only directory whose parents belong to the caller.
+/// Creates or validates one owner-only directory whose ancestors the caller vouches for.
 ///
 /// [`prepare_private_directory`] refuses a directory any ancestor of which is a link, because the
 /// store a host keeps its keys in is reached from that host's own root and nothing on the way may
-/// be repointed. A directory a caller named is reached from wherever the caller put it, and a run
-/// puts its directories under the system temporary directory: on macOS that is below `/var`, which
-/// is a link to `/private/var`, and `/tmp` is a link on the same systems. Refusing those would
-/// refuse every directory a run has.
+/// be repointed. A directory a caller named is reached from wherever the caller put it. The usual
+/// place is the system temporary directory, which on macOS is below `/var`, a link to
+/// `/private/var`; the strict rule refuses that path, and refusing it would refuse the ordinary
+/// case this door exists for.
 ///
-/// So the named directory carries the rules the fallback root carries — it is not itself a link,
-/// it is owner-only, and it gets mode 0700 — and every path below it is checked against a link on
-/// every read, write and deletion exactly as before. Its parents are the caller's to vouch for.
-fn prepare_named_directory(directory: &Path) -> Result<()> {
-    reject_link(directory)?;
+/// So the named directory carries the rules the fallback root carries: it is not itself a link, it
+/// is owner-only, and it gets mode 0700. Every path below it is checked against a link on every
+/// read, write and deletion exactly as before. Its ancestors are checked for nothing, and the
+/// caller is the one saying they can be trusted.
+///
+/// The name is reduced to its components first. `store/` and `store/.` name the same directory as
+/// `store`, but the kernel resolves a trailing separator or `.` through a link before reporting on
+/// it, so the leaf check would pass on a name the strict form rejects. The reduced path is what is
+/// returned, and what the store then uses.
+fn prepare_named_directory(directory: &Path) -> Result<PathBuf> {
+    let directory: PathBuf = directory.components().collect();
+    reject_link(&directory)?;
     if directory.exists() {
-        check_owner_only(directory)?;
+        check_owner_only(&directory)?;
     }
-    std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
+    std::fs::create_dir_all(&directory).map_err(|error| CryptoError::SecretStore {
         message: format!("create {}: {error}", directory.display()),
     })?;
     // Again after the creation: what exists now is what the mode below is set on.
-    reject_link(directory)?;
-    set_mode(directory, 0o700)?;
-    check_owner_only(directory)
+    reject_link(&directory)?;
+    set_mode(&directory, 0o700)?;
+    check_owner_only(&directory)?;
+    Ok(directory)
 }
 
 /// Rejects one path that is a symbolic link.
@@ -526,14 +532,29 @@ pub(crate) fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
         })
 }
 
+/// Creates `path` exclusively, writes `secret` and flushes it to the device.
+///
+/// Windows has no mode bits, so the file carries the access-control list it inherits from the
+/// directory it is created in. That is why section 10 offers no directory fallback there: the
+/// protected store is the Credential Manager, and [`FileStore::open`] keeps refusing. This path is
+/// reached only through [`open_store_in`], where the caller named a directory of its own and the
+/// file is the caller's to protect.
 #[cfg(not(unix))]
-pub(crate) fn write_owner_only(path: &Path, _secret: &[u8]) -> Result<()> {
-    Err(CryptoError::SecretStore {
-        message: format!(
-            "{}: the file fallback store is only available on Unix",
-            path.display()
-        ),
-    })
+pub(crate) fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| CryptoError::SecretStore {
+            message: format!("create {}: {error}", path.display()),
+        })?;
+    file.write_all(secret)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| CryptoError::SecretStore {
+            message: format!("write {}: {error}", path.display()),
+        })
 }
 
 /// Flushes a directory entry to the device.
@@ -611,11 +632,14 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<()> {
     })
 }
 
+/// Windows has no mode bits, so there is nothing to set.
+///
+/// A directory reached through [`open_store_in`] there carries the access-control list it inherits
+/// from the one the caller named it under. Section 10 offers no directory fallback on Windows for
+/// that reason, and [`FileStore::open`] keeps refusing.
 #[cfg(not(unix))]
 pub(crate) fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
-    Err(CryptoError::SecretStore {
-        message: "the file fallback store is only available on Unix".to_owned(),
-    })
+    Ok(())
 }
 
 /// An in-memory store for tests. It never writes to a disk.
@@ -764,6 +788,35 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
     }
 }
 
+/// Which store a host was told to keep its secrets in.
+///
+/// An installed host takes [`Self::Platform`], and nothing has to say so. A test, a bench or a
+/// demonstration run takes [`Self::File`] and has to name it, on a command line or in the setup of
+/// the daemon it starts, every time. The selection is not recorded anywhere: it is the caller's,
+/// made at each start, and [`open_store`]'s own `.store-kind` record continues to answer for the
+/// host rather than for a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreSelection {
+    /// The operating system's credential store, with the fallback section 10 offers where it does.
+    Platform,
+    /// The directory this environment keeps its secrets in, named deliberately.
+    File,
+}
+
+impl StoreSelection {
+    /// Opens the store this selection names, for a host whose secrets directory is `directory`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::SecretStore`] when the selected store cannot be opened.
+    pub fn open(self, service: &str, directory: &Path) -> Result<OpenedStore> {
+        match self {
+            Self::Platform => open_store(service, directory),
+            Self::File => open_store_in(directory),
+        }
+    }
+}
+
 /// Opens the 0700 directory store at `directory`, on any platform, because the caller said so.
 ///
 /// [`open_store`] answers "which store belongs to this host": it offers the directory only where
@@ -773,9 +826,10 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
 /// `--secret-store file` use, so a run writes its device keys into a directory it owns and throws
 /// away rather than into the person's own credential store.
 ///
-/// The directory itself must not be a link, is created with mode 0700 and has to be owner-only,
-/// and every path below it is checked against a link on every use; its parents are the caller's,
-/// which is what lets a run keep its secrets under the system temporary directory.
+/// The directory itself must not be a link, is created with mode 0700 where the platform has mode
+/// bits, has to be owner-only, and every path below it is checked against a link on every use. Its
+/// ancestors are checked for nothing and the caller vouches for them, which is what lets a run keep
+/// its secrets under the system temporary directory.
 ///
 /// It records nothing in the directory. The `.store-kind` marker is [`open_store`]'s record of a
 /// choice it made for a host; this choice is not made once and remembered, it is passed in at
@@ -1263,6 +1317,37 @@ mod tests {
             !base.join(STORE_KIND_MARKER).exists(),
             "naming a directory for one run is not a choice recorded against this host"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A name that reaches the store through a link is refused however it is spelled.
+    ///
+    /// A trailing separator or a `.` component makes the kernel resolve the link before it reports
+    /// on the path, so `link/` and `link/.` name a directory the check on `link` rejects. The name
+    /// is reduced to its components before anything looks at it, which is what makes the three
+    /// spellings one answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_name_is_refused_however_it_is_spelled() {
+        let base = scratch_directory("linked");
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).expect("the directory the link points at");
+        set_mode(&real, 0o700).expect("owner-only");
+        std::os::unix::fs::symlink(&real, &link).expect("a link to it");
+        for name in [
+            link.clone(),
+            link.join(""),
+            link.join("."),
+            PathBuf::from(format!("{}/", link.display())),
+        ] {
+            let refused = open_store_in(&name);
+            assert!(
+                refused.is_err(),
+                "{} named the store through a link and was accepted",
+                name.display()
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

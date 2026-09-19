@@ -18,7 +18,7 @@ use std::time::Duration;
 use kr_controller::registry::{LaunchPhase, Registry};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
-use kr_crypto::store::{SecretStore, open_store_in};
+use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
@@ -77,11 +77,12 @@ async fn host() -> Host {
         environment_id,
         identity: Box::new(move || {
             let store = open_store_in(&secrets).expect("a secret store for the test environment");
-            let secrets: Arc<dyn SecretStore> = Arc::from(store.store);
-            let identity = ControllerIdentity::open(secrets.as_ref(), environment_id, false)
-                .expect("an identity");
-            Ok((identity, secrets))
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
         }),
+        secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
         supervisor: Box::new(SlowSupervisor),
         worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),

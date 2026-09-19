@@ -98,12 +98,14 @@ startup after the singleton lock is held. `kr-controller --secret-store` chooses
 | `platform` (the default) | the operating system's credential store, with the owner-only directory where section 10 offers it | an installed host |
 | `file` | this environment's own `secrets` directory | a test, a bench or a demonstration run |
 
-A run's keys belong to that run. `file` puts them under the temporary state directory the run
-created, where they go when it does, so nothing a test or a measurement does reaches the person's
-own credential store; the harnesses that start a daemon pass it, and the in-process suites call
-`kr_crypto::store::open_store_in` for the same reason. An installed host is never started that way
-and its keys never leave the platform's protection. The daemon names the store it opened in its
-first line of output, so a run's log says where its keys went.
+A run's keys belong to that run. `file` names where they go and nothing else: it creates no
+directory of its own and removes nothing, so a run that wants its keys to disappear gives the
+daemon a state directory it owns and throws away. That is what the harnesses do, and it is why
+nothing a test or a measurement does reaches the person's own credential store; the in-process
+suites call `kr_crypto::store::open_store_in` for the same reason. An installed host is never
+started that way: it takes `platform`, which is `open_store` and the choice that host recorded. The
+daemon names the store it opened in its first line of output, so a run's log says where its keys
+went.
 
 ## Supervision
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
-use kr_crypto::store::{SecretStore, open_store_in};
+use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
@@ -114,11 +114,12 @@ async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) 
             identity: Box::new(move || {
                 let store =
                     open_store_in(&secrets).expect("a secret store for the test environment");
-                let secrets: Arc<dyn SecretStore> = Arc::from(store.store);
-                let identity = ControllerIdentity::open(secrets.as_ref(), environment_id, false)
-                    .expect("an identity");
-                Ok((identity, secrets))
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
             }),
+            secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
             supervisor: Box::new(RefusingSupervisor),
             worker_program: PathBuf::from("/nonexistent/kr-worker"),
@@ -1079,7 +1080,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     drop(control);
     second.stop();
     let _ = held.join();
-    keys_are_this_test_s(&environment, environment_id);
+    keys_are_this_test_s(&environment, environment_id, &log);
 }
 
 /// Waits for the project journal to hold one operation row.
@@ -1135,11 +1136,13 @@ impl Drop for Daemon {
 /// A daemon started with `--secret-store file` writes them into this environment's own `secrets`
 /// directory, which goes when the temporary host does. That is what keeps a test run out of the
 /// person's own credential store, and this is the check that says it happened rather than the flag
-/// on the command line saying it was asked for.
+/// on the command line saying it was asked for. The daemon's own log is checked too, because the
+/// line it prints is what a run's evidence rests on when nobody is reading the directory.
 #[cfg(unix)]
 fn keys_are_this_test_s(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
+    log: &Path,
 ) {
     let scope = environment_id.to_string();
     for purpose in kr_protocol::pairing::KeyPurpose::ALL {
@@ -1155,6 +1158,15 @@ fn keys_are_this_test_s(
             path.display()
         );
     }
+    let said = std::fs::read_to_string(log).unwrap_or_default();
+    let expected = format!(
+        "kr-controller: keys in the 0700 fallback directory at {}",
+        environment.secrets_dir().display()
+    );
+    assert!(
+        said.contains(&expected),
+        "the daemon's log does not say where its keys went; it says: {said}"
+    );
 }
 
 /// Fails the test unless nothing at all is at the path, and says what it found instead.
