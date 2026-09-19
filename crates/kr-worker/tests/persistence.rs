@@ -1294,12 +1294,16 @@ fn a_window_whose_newest_byte_is_not_expired_keeps_the_whole_interval() {
     // this host can say every byte in it had expired. Output written a moment ago is kept even
     // when the interval it belongs to began before the deadline.
     let mut history = kr_worker::history::OutputHistory::in_memory(4096);
+    // The reading is taken *before* the output arrives, so the deadline it produces is at or
+    // before the instant the interval's newest byte was stamped with. Taking it afterwards would
+    // make the test a race: a clock tick between the append and the reading is enough to put the
+    // byte on the wrong side of a one-millisecond window, and a loaded machine ticks.
+    let before_the_output = kr_ipc::now_ms();
     history.append(&[b'x'; 32]);
-    let cutoff_just_past = TimestampMs::new(kr_ipc::now_ms().get() + 1);
     let taken = history.apply_retention(
         OutputRetention::new(std::time::Duration::from_millis(1), 1 << 30, 1 << 30),
         32,
-        cutoff_just_past,
+        before_the_output,
         true,
     );
     assert!(
