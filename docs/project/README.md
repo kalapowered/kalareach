@@ -602,7 +602,10 @@ nothing ever changes what an earlier test or review was about.
 A version is against a **revision**. What the captured tree is compared with is the commit `HEAD`
 names, never the index, so a staged change is an uncommitted change like any other: a staged
 addition is a path the base never held, a staged deletion is a path the base does hold, and
-excluding an uncommitted change falls back to what the commit has rather than to what is staged.
+excluding an uncommitted change falls back to what the commit has rather than to what is staged. A
+path the index lost while the file stayed on disk is not a deletion either: `git rm --cached` leaves
+an untracked file there, and what the working tree holds is what is captured, with the commit's own
+object recorded beside it so a revert still has somewhere to go back to.
 
 ### How consistent the source was, and the mechanism behind each answer
 
@@ -634,9 +637,12 @@ which is a mechanism the workflow service owns rather than this one.
 The grant and the rules decide before anything is opened, in this order, and a path any of them
 removes is never opened at all:
 
-1. A repository's own administrative data. Git reports an untracked nested repository as one
-   directory, and descending into it would reach its configuration, which holds its remotes and can
-   hold a credential, and its object database, which holds every version of every file in it.
+1. A repository's own administrative data, by name and by where this repository actually keeps it.
+   `.git` in any component is refused whatever its case, and so is the directory this repository
+   resolves its own data to, which a `.git` file can point at under any name inside the same tree.
+   Git reports an untracked nested repository as one directory, and descending into it would reach
+   its configuration, which holds its remotes and can hold a credential, and its object database,
+   which holds every version of every file in it.
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field
    turns them off, and the version records that they were applied.
@@ -657,9 +663,11 @@ Recording a result re-reads the materialisation and says what it establishes:
 * it still holds the version — the same paths, the same content, the same modes, and every file
   still the object this host wrote, of the same length, last written at the same instant — and the
   result attests that version;
-* it holds something else — this host records a **derived version** with its own identity, from
-  the one reading it made, and the result attests that and says in as many words that it says
-  nothing about the version that was materialised;
+* it holds something else — the result attests **no version at all**, and this host records a
+  **derived version** with its own identity beside it, which is what the directory held when the
+  result was recorded rather than what the run read. A run that changed a file, tested the change
+  and put the file back leaves a directory that reads as modified and a reading no command ever
+  used, so naming that reading as the tested version would be a claim this host cannot make;
 * it holds something this host cannot represent, cannot read, or would not have captured in the
   first place, or something was written into it after the run the caller reported had ended — the
   result is `indeterminate` and attests nothing at all.
@@ -686,20 +694,28 @@ work is the one a caller gets by asking for it plainly.
 | `shared_existing` | The user's own working tree, written in place. Best-effort conflict detection, not universal no-clobber compare-and-swap |
 
 An apply carries **operations**, not only content: a path the version holds is installed, and a
-path the version's working tree deleted is taken away. A request that names no paths carries every
-one of them, and one that names paths carries exactly those.
+path the version's working tree deleted is taken away. A deletion travels with the object its base
+revision held, so a revert puts the file back rather than refusing for want of anything to restore,
+and a version whose only change is a deletion reads as that change rather than as an empty diff. A
+request that names no paths carries every one of them, and one that names paths carries exactly
+those.
 
 A direct apply to `shared_existing` cannot be chosen until the request carries back the limitations
 this host returns for it, and a preflight is how a caller obtains them: it writes nothing and needs
 no acknowledgement. What a direct apply then does, in order: the preflight, which compares every
 affected path with what the request expects and answers `DRAFT_CONFLICT` with **nothing written
-anywhere** if they differ; an immutable capture of the destination as it stands; the content staged
+anywhere** if they differ; the claim on the action, taken here rather than earlier so that a refused
+preflight leaves nothing durable behind; an immutable capture of the destination as it stands; the content staged
 in a private directory and read back against its digest; `planned` recorded for every operation
 before any of them is attempted; then, per operation, a temporary created exclusively **in the
 destination's own directory** and written with the validated bytes, the destination's permissions
 put on it, the destination rechecked against that same directory handle as the last thing before
-the rename, the rename, and the destination read back and compared with what was meant to land;
-and finally an immutable capture of the destination as it now stands.
+the rename, the rename, and the destination read back twice and compared with what was meant to land: once
+through the directory this host published into, and once by resolving the whole path again from the
+working tree, so a parent somebody moved aside cannot be reported as a success about the path the
+request named. The read-back compares the permissions as well as the content, because the same bytes
+under different protection are not the file this host published. Finally an immutable capture of the
+destination as it now stands.
 
 Nothing is removed to make room. A staging name that is already taken is a path this host reports
 and leaves exactly as it is.
@@ -717,7 +733,7 @@ as expected returns a result with no outcome class at all, because nothing ran.
 
 | Outcome | What it means |
 | --- | --- |
-| `preflight_conflict` | The destination was not what the request expected. Nothing was written, anywhere. This is the class the journal records; the caller receives `DRAFT_CONFLICT` |
+| `preflight_conflict` | The destination was not what the request expected. Nothing was written, anywhere: no apply row, and not even the claim on the action, which is taken only once the preflight has passed. The caller receives `DRAFT_CONFLICT`, and the same action identifier can be used again |
 | `applied` | Every operation landed and this host read each one back |
 | `conflict_after_partial_writes` | Some landed, and then the destination stopped being what the request expected |
 | `interrupted_apply` | This host stopped before finishing. Some operations may have landed and some may not; the rows say which |
@@ -729,7 +745,10 @@ host did not establish what became of it — which is not the same as saying it 
 replacement daemon settles such an apply as `interrupted_apply`, names exactly the paths on each
 side, and **settles the action it was performed under with that answer**, so a caller that repeats
 the action is told what happened rather than applying a second time against a destination the first
-attempt already changed.
+attempt already changed. The action is settled first and the apply afterwards, so a host that stops
+between the two leaves the apply undecided and the next recovery does both again. A recovery also
+looks for the other half of that gap, an apply that says what it came to and an action nobody
+answered, and carries the apply's own outcome to the caller.
 
 Marking a review complete records that somebody acknowledged **that version**. It runs no Git
 invocation, writes to no working tree and removes nothing. `commit`, `push`, `revert`, `reset`,
@@ -740,10 +759,10 @@ invocation, writes to no working tree and removes nothing. `commit`, `push`, `re
 A version is not deleted while anything names it: a materialisation that has not been released, a
 review acknowledgement or any other evidence, a later version derived from it, a recorded result, an
 apply that names it on either side, or a pin the project service holds against the workspace. The
-counting and the removal are one transaction inside the change-set store, and every row that names a
-version is written under a check, in its own transaction, that the version is still there — so a
-holder recorded while a deletion is deciding is either counted or refused, and never left pointing
-at something that is gone. The project service's pin lives in another store and is checked first; a
+counting and the removal are one transaction inside the change-set store, and a materialisation, a
+result, a derived version and an apply are each written under a check, in the same transaction, that
+every version they name is still there — so a holder recorded while a deletion is deciding is either
+counted or refused, and never left pointing at something that is gone. The project service's pin lives in another store and is checked first; a
 pin recorded between that check and the transaction is not covered, and that is written down rather
 than hidden.
 
