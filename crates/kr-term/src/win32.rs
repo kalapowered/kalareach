@@ -13,13 +13,20 @@
 //! for a field that was not sent, and [`encode`] leaves out a trailing run of fields that are
 //! already their defaults.
 //!
-//! **The boundary.** `CSI ?9001h` requests the mode and `CSI ?9001l` disables it. A session can
-//! contain another console - `wsl.exe`, an `ssh` session, a nested ConPTY - and each of those asks
-//! for the mode again on the same stream. [`Nesting`] is what keeps an inner console's disable
-//! from turning the outer one's mode off, which is the behaviour Microsoft's own implementation
-//! has and the behaviour section 8 requires of this boundary. None of these sequences is ever
-//! forwarded to a client: the engine's policy stops them here, and the encoding a client is served
-//! is decided by what this host recorded, not by what a client saw.
+//! **The boundary.** `CSI ?9001h` requests the mode and `CSI ?9001l` disables it. Section 8 gives
+//! this host one obligation about them: *KR terminates each such mode request at the corresponding
+//! boundary*, and never broadcasts it to a remote client. That is what the engine's policy does -
+//! neither sequence is ever forwarded - and what this host then records is the input encoding of
+//! the one backend it owns, from what that backend sent it.
+//!
+//! The other half of the rule is not this host's to implement. A session can contain another
+//! console - `wsl.exe`, an `ssh` session, a nested ConPTY - and each asks for the mode itself.
+//! Keeping an inner console's disable from reaching the outer one is *ConPTY's* behaviour, on the
+//! boundary between those two consoles, and this host is above both of them: what arrives here is
+//! what the console it owns chose to send. So the state is what the owned backend said, and
+//! nothing here infers a nesting depth from a stream that does not carry one. What this host does
+//! owe is that a nested transition cannot leave a **client's** console in the wrong mode after
+//! detach, which is the attach client's saved console modes rather than this state.
 //!
 //! What the record path is **not** is a promise about fidelity. A client that sends no records
 //! sends legacy VT input, which this host accepts without claiming it carries scan codes; and the
@@ -221,57 +228,6 @@ pub fn decode(bytes: &[u8]) -> Result<KeyRecord, RecordError> {
     Ok(record)
 }
 
-/// How many consoles on this stream have asked for the mode, and which one owns it.
-///
-/// A session can hold another console inside it. `wsl.exe`, `ssh` and a nested ConPTY all start
-/// one, each asks for win32 input on the same stream, and each disables it again when it ends. If
-/// every `CSI ?9001l` simply cleared the flag, the first inner console to exit would turn the mode
-/// off underneath the outer one that still wants it, and the backend would go on being told it was
-/// in a mode it is not. Microsoft's ConPTY prevents that for the same reason.
-///
-/// So the requests are counted. The outer console's request is the one that turned the mode on,
-/// and only the disable that matches it turns it off.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Nesting {
-    depth: u16,
-}
-
-impl Nesting {
-    /// Nothing has asked for the mode.
-    pub const NONE: Self = Self { depth: 0 };
-
-    /// Records a request, and returns whether the mode is on afterwards.
-    pub const fn requested(&mut self) -> bool {
-        self.depth = self.depth.saturating_add(1);
-        true
-    }
-
-    /// Records a disable, and returns whether the mode is on afterwards.
-    ///
-    /// An inner console's disable leaves the outer one's request standing.
-    pub const fn disabled(&mut self) -> bool {
-        self.depth = self.depth.saturating_sub(1);
-        self.depth > 0
-    }
-
-    /// Whether the mode is on.
-    #[must_use]
-    pub const fn is_on(&self) -> bool {
-        self.depth > 0
-    }
-
-    /// How many consoles have asked for it and not yet disabled it.
-    #[must_use]
-    pub const fn depth(&self) -> u16 {
-        self.depth
-    }
-
-    /// Forgets every request, which a full or soft reset of the terminal does.
-    pub const fn clear(&mut self) {
-        self.depth = 0;
-    }
-}
-
 /// What a session can honestly say about the input it is carrying.
 ///
 /// Section 8 is explicit that fidelity is reported as it is rather than claimed. A record read
@@ -447,35 +403,6 @@ mod tests {
         );
         // And the state travels whole: 9 is right Alt and left Ctrl together.
         assert_eq!(encode(&alt_graph), b"\x1b[50;3;64;1;9;1_");
-    }
-
-    #[test]
-    fn an_inner_consoles_disable_never_turns_the_outer_ones_mode_off() {
-        let mut nesting = Nesting::NONE;
-        assert!(!nesting.is_on());
-        // The owned ConPTY asks.
-        assert!(nesting.requested());
-        // Something inside it - wsl.exe, ssh, another ConPTY - asks on the same stream.
-        assert!(nesting.requested());
-        assert_eq!(nesting.depth(), 2);
-        // That inner console ends and disables the mode. The outer one still wants it.
-        assert!(nesting.disabled());
-        assert!(nesting.is_on(), "the outer console's mode is still on");
-        // Only the disable matching the outer request turns it off.
-        assert!(!nesting.disabled());
-        assert!(!nesting.is_on());
-        // And a further disable from something that never asked cannot go below nothing.
-        assert!(!nesting.disabled());
-        assert_eq!(nesting.depth(), 0);
-    }
-
-    #[test]
-    fn a_reset_of_the_terminal_forgets_every_request() {
-        let mut nesting = Nesting::NONE;
-        nesting.requested();
-        nesting.requested();
-        nesting.clear();
-        assert!(!nesting.is_on());
     }
 
     #[test]

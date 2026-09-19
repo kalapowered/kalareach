@@ -186,10 +186,11 @@ jobs:
       - name: Compile the workspace and its tests
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # The four crates whose behaviour is platform-specific here: the terminal and its job object,
-      # the local attach client, the terminal engine and the repository boundary. The rest of the
-      # workspace has no Windows-specific behaviour and its tests are the same ones the Linux job
-      # runs; compiling them above is what this job owes them.
+      # The four crates this task qualified on Windows: the terminal and its job object, the local
+      # attach client, the terminal engine and the repository boundary. Other crates have Windows
+      # code of their own - `kr-ipc`'s named pipes and its owner-only check are the clearest - and
+      # their tests are not run here because nothing has qualified them on this platform yet;
+      # compiling them above is what this job owes them until something does.
       #
       # What this runner cannot do is qualify a console interactively. The pseudo-console tests
       # open a console of their own and drive it, which works here; what needs a real machine is

@@ -1108,11 +1108,14 @@ mod tests {
                 assert!(matches!(error, IpcError::Io { .. }));
             }
             Err(refusal) => {
-                // Nothing here is asserted about a link this machine would not make. The refusal
-                // is printed so a run that proved less than the name promises says which it was.
-                eprintln!(
-                    "a symbolic link could not be created on this machine, so the refusal of one \
-                     was not exercised: {refusal}"
+                // Nothing here is asserted about a link this machine would not make, and a runner
+                // hides a printed line unless the test fails. So the refusal is named where a
+                // reader will see it: the test's own name says it did not establish what it is
+                // for, and the reason says why.
+                panic!(
+                    "this machine would not create a symbolic link, so the refusal of one was not \
+                     exercised. On Windows that needs an elevated account or developer mode; see \
+                     docs/host/README.md. The operating system said: {refusal}"
                 );
             }
         }

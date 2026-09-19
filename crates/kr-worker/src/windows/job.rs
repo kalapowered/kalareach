@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
@@ -59,13 +59,6 @@ pub struct SessionJob {
     handle: OwnedHandle,
 }
 
-// SAFETY: a job object handle is the operating system's, and every use here is one call with that
-// handle. Nothing in this process reaches inside it, and the operating system serialises its own
-// access.
-unsafe impl Send for SessionJob {}
-// SAFETY: as above.
-unsafe impl Sync for SessionJob {}
-
 impl SessionJob {
     /// Creates the session's job: unnamed, kill-on-close, breakaway disabled.
     ///
@@ -85,6 +78,19 @@ impl SessionJob {
         let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
         let job = Self { handle };
         job.apply_limits()?;
+        // Read back from the operating system before this job is anybody's boundary. A job whose
+        // limits are not what section 7 requires is a named launch failure here rather than a
+        // session that carries on owning less than it says it does.
+        if !job.kills_on_close()? {
+            return Err(std::io::Error::other(
+                "the session's job object does not end what it holds when it is closed",
+            ));
+        }
+        if job.breakaway_permitted()? {
+            return Err(std::io::Error::other(
+                "the session's job object would let a child break away from it",
+            ));
+        }
         Ok(job)
     }
 
@@ -240,9 +246,19 @@ impl SessionJob {
                 &raw mut written,
             )
         };
-        // A buffer too small is reported as a failure *and* fills in what fitted, so the two
-        // outcomes are told apart by the counts rather than by the return value alone.
+        // A buffer too small is reported as a failure *and* fills in what fitted, so that one
+        // failure is read as "ask again with more room" and every other one is a failure.
         let failure = (read == 0).then(std::io::Error::last_os_error);
+        if let Some(failure) = &failure
+            && !failure
+                .raw_os_error()
+                .and_then(|code| u32::try_from(code).ok())
+                .is_some_and(|code| code == ERROR_MORE_DATA || code == ERROR_INSUFFICIENT_BUFFER)
+        {
+            return Err(std::io::Error::other(format!(
+                "the job would not say which processes it holds: {failure}"
+            )));
+        }
         // SAFETY: the call filled the buffer this thread owns with a structure of this shape, and
         // the read is inside the allocation because the buffer is at least one header long.
         let list = unsafe {
@@ -253,11 +269,6 @@ impl SessionJob {
         if returned > capacity {
             // The operating system reported more than it had room for, which is not an answer.
             return Ok(Query::Truncated { holds });
-        }
-        if let Some(failure) = failure
-            && returned == 0
-        {
-            return Err(failure);
         }
         let mut ids = Vec::with_capacity(returned);
         for index in 0..returned {
@@ -274,8 +285,13 @@ impl SessionJob {
                 ids.push(pid);
             }
         }
-        if holds > returned {
-            return Ok(Query::Truncated { holds });
+        if holds > returned || ids.len() != returned || failure.is_some() {
+            // Either the job holds more than it reported, or the buffer did not carry every entry
+            // the header counted. Both are a partial answer, and a partial answer is never
+            // returned as a whole one.
+            return Ok(Query::Truncated {
+                holds: holds.max(returned),
+            });
         }
         Ok(Query::Complete(ids))
     }
@@ -346,6 +362,9 @@ mod tests {
 
     #[test]
     fn a_session_job_kills_on_close_and_refuses_breakaway() {
+        // What the kernel says the limits are, rather than what was asked for. The behaviour those
+        // limits name is checked by `closing_the_last_handle_ends_what_the_job_holds` in
+        // `crates/kr-worker/tests/windows.rs`, which needs a process to hold.
         let job = SessionJob::create().expect("a job");
         assert!(
             job.kills_on_close().expect("the limits"),

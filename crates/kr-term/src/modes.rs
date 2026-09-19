@@ -91,12 +91,13 @@ pub struct ModeState {
     /// cannot leak into the shell's when it exits. One shared stack would leave the shell speaking
     /// a protocol it never asked for.
     kitty: [KittyState; 2],
-    /// How many consoles on this stream have asked for win32 input and not yet disabled it.
+    /// Whether the backend this session owns asked for win32 input.
     ///
-    /// Counted rather than held as a flag, so that a console inside this session - `wsl.exe`, an
-    /// `ssh` session, a nested ConPTY - cannot turn the owned backend's mode off when it ends.
-    /// [`crate::win32::Nesting`] is where that rule lives.
-    win32_input: crate::win32::Nesting,
+    /// What the owned backend sent, and nothing more. Keeping a console nested inside the session
+    /// from disabling the outer console's mode is that inner boundary's behaviour rather than this
+    /// host's; what this host owes is that neither the request nor the disable is ever forwarded
+    /// to a client, which the engine's policy does.
+    win32_input: bool,
 }
 
 /// One buffer's Kitty keyboard negotiation.
@@ -130,7 +131,7 @@ impl ModeState {
             keypad_application: false,
             modify_other_keys: 0,
             kitty: [KittyState::default(), KittyState::default()],
-            win32_input: crate::win32::Nesting::NONE,
+            win32_input: false,
         }
     }
 
@@ -146,11 +147,7 @@ impl ModeState {
             },
             ModeKind::Dec => {
                 if mode == MODE_WIN32_INPUT {
-                    if enabled {
-                        self.win32_input.requested();
-                    } else {
-                        self.win32_input.disabled();
-                    }
+                    self.win32_input = enabled;
                     return true;
                 }
                 // Modes 47, 1047 and 1049 all name one thing: whether the alternate buffer is
@@ -184,7 +181,7 @@ impl ModeState {
             ModeKind::Ansi => self.ansi.get(&mode).copied().unwrap_or(false),
             ModeKind::Dec => {
                 if mode == MODE_WIN32_INPUT {
-                    return self.win32_input.is_on();
+                    return self.win32_input;
                 }
                 self.dec.get(&mode).copied().unwrap_or(false)
             }
@@ -209,7 +206,7 @@ impl ModeState {
                         return ModeReport::NotRecognised;
                     }
                     MODE_WIN32_INPUT => {
-                        return if self.win32_input.is_on() {
+                        return if self.win32_input {
                             ModeReport::Set
                         } else {
                             ModeReport::Reset
@@ -241,16 +238,6 @@ impl ModeState {
     /// Whether the ConPTY win32 input mode is on for the owned backend.
     #[must_use]
     pub const fn win32_input(&self) -> bool {
-        self.win32_input.is_on()
-    }
-
-    /// How many consoles on this stream have asked for win32 input and not yet disabled it.
-    ///
-    /// One is the owned backend's own request. More than one means a console inside the session
-    /// has asked as well, and the disable that inner console sends when it ends leaves the outer
-    /// backend's mode exactly where it was.
-    #[must_use]
-    pub const fn win32_input_nesting(&self) -> crate::win32::Nesting {
         self.win32_input
     }
 
@@ -260,7 +247,7 @@ impl ModeState {
     /// input does not have: a client without console records sends legacy VT input on either path.
     #[must_use]
     pub const fn backend_input_fidelity(&self) -> crate::win32::Fidelity {
-        if self.win32_input.is_on() {
+        if self.win32_input {
             crate::win32::Fidelity::Records
         } else {
             crate::win32::Fidelity::LegacyVt
@@ -445,7 +432,7 @@ impl ModeState {
         for (mode, value) in &self.dec {
             out.push((ModeKind::Dec, *mode, *value));
         }
-        out.push((ModeKind::Dec, MODE_WIN32_INPUT, self.win32_input.is_on()));
+        out.push((ModeKind::Dec, MODE_WIN32_INPUT, self.win32_input));
         out
     }
 }

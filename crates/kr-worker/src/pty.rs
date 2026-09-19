@@ -186,6 +186,8 @@ impl Pty {
             child,
             identity,
             process_group: foreground_group(self.master.as_ref()),
+            #[cfg(windows)]
+            console_input: std::sync::Arc::clone(&self.console_input),
         })
     }
 
@@ -297,19 +299,20 @@ impl Pty {
     /// Returns [`WorkerError::Pty`] when the console will not take it.
     #[cfg(windows)]
     pub fn interrupt_foreground(&self) -> Result<()> {
-        self.console_input
-            .write(&[0x03])
-            .map_err(|error| WorkerError::pty("interrupt the foreground application", error))
-            .and_then(|written| {
-                if written == 1 {
-                    Ok(())
-                } else {
-                    Err(WorkerError::pty(
-                        "interrupt the foreground application",
-                        "the console took none of the interrupt",
-                    ))
-                }
-            })
+        match self
+            .console_input
+            .write(&[crate::windows::conpty::INTERRUPT_BYTE])
+        {
+            Ok(1) => Ok(()),
+            Ok(_) => Err(WorkerError::pty(
+                "interrupt the foreground application",
+                "the console is full, so it took none of the interrupt",
+            )),
+            Err(error) => Err(WorkerError::pty(
+                "interrupt the foreground application",
+                error,
+            )),
+        }
     }
 
     /// Sends the terminal's interrupt to the group it has in the foreground.
@@ -346,6 +349,13 @@ pub struct RootShell {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     identity: ProcessStartIdentity,
     process_group: Option<i32>,
+    /// The console this shell runs in, which is where a request to stop is delivered.
+    ///
+    /// This platform has no signal that means "please stop". What it has is the console's own
+    /// control byte, which is what the closure sequence's grace period is for: the shell is asked
+    /// through the console, and force is the separate step that follows if it does not go.
+    #[cfg(windows)]
+    console_input: std::sync::Arc<crate::windows::conpty::Input>,
 }
 
 impl std::fmt::Debug for RootShell {
@@ -463,21 +473,49 @@ impl RootShell {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn signal_group(&mut self, signal: Signal) -> Result<()> {
         match signal {
-            // The session's job object carries the group on this platform: closing it, or
-            // terminating it, reaches every descendant. The child killer ends the shell itself,
-            // which is what a caller holding only the shell can do.
+            // Asked, not ended. This platform has no signal that means "please stop", and the
+            // closure sequence allows five seconds for one: turning the request into a forced
+            // termination would spend that allowance before it began and would leave a shell
+            // recorded as having stopped when it was asked. So the request is the console's own
+            // control byte, delivered the same way an interrupt is, and force is the step after.
+            Signal::Terminate | Signal::Interrupt => self.interrupt_through_console(),
+            // Force. The session's job object is what reaches the descendants; this is the shell.
+            Signal::Kill => self
+                .child
+                .kill()
+                .map_err(|error| WorkerError::pty("signal the root shell", error)),
+        }
+    }
+
+    /// Writes the console's control byte into the console this shell runs in.
+    #[cfg(windows)]
+    fn interrupt_through_console(&self) -> Result<()> {
+        match self
+            .console_input
+            .write(&[crate::windows::conpty::INTERRUPT_BYTE])
+        {
+            Ok(1) => Ok(()),
+            Ok(_) => Err(WorkerError::pty(
+                "ask the root shell to stop",
+                "the console took none of the request",
+            )),
+            Err(error) => Err(WorkerError::pty("ask the root shell to stop", error)),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn signal_group(&mut self, signal: Signal) -> Result<()> {
+        match signal {
             Signal::Terminate | Signal::Kill => self
                 .child
                 .kill()
                 .map_err(|error| WorkerError::pty("signal the root shell", error)),
-            // The interrupt is the console's, not the process's, so it is delivered through the
-            // console rather than here. A caller that reaches this has no console to write into.
             Signal::Interrupt => Err(WorkerError::pty(
                 "interrupt the foreground application",
-                "an interrupt is delivered through the console rather than to a process",
+                "this platform names no foreground process group",
             )),
         }
     }

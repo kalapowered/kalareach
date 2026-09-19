@@ -7,7 +7,7 @@
 //! | --- | --- |
 //! | KR-REQ-03.03 | PowerShell 7 is the root shell, inside a pseudo-console this worker owns |
 //! | KR-REQ-07.62 | The per-session job object: kill-on-close, breakaway disabled, joined before execution |
-//! | KR-REQ-07.63 | A process started outside the job is not held by it and survives its closure |
+//! | KR-REQ-07.63 | A process started outside the job is not held by it and survives its closure; the broker that records it as an external resource is not in this build |
 //! | KR-ACC-010 | Resize, draining, the interrupt, the process tree, and PowerShell itself |
 //!
 //! These drive the terminal directly rather than through a session, because what is under test is
@@ -91,6 +91,15 @@ fn drain(pty: &Pty, reader: &mut Box<dyn Read + Send>, patience: Duration) -> St
         }
     }
     String::from_utf8_lossy(&seen).into_owned()
+}
+
+/// Reads the identifier the shell printed as `kr-child=<pid>.`
+fn named_child(seen: &str) -> u32 {
+    seen.split("kr-child=")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|digits| digits.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the shell named the process it started: {seen:?}"))
 }
 
 /// Opens a terminal and starts PowerShell 7 running `command` in it.
@@ -250,12 +259,7 @@ fn the_job_holds_the_shell_and_every_process_it_starts(/* KR-ACC-010, KR-REQ-07.
          Start-Sleep -Seconds 60",
     );
     let seen = read_until(&pty, &mut reader, "kr-child=");
-    let child: u32 = seen
-        .split("kr-child=")
-        .nth(1)
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|digits| digits.trim().parse().ok())
-        .unwrap_or_else(|| panic!("the shell named the process it started: {seen:?}"));
+    let child = named_child(&seen);
 
     let root = u32::try_from(shell.identity().pid.get()).expect("an identifier");
     let job = kr_worker::windows::job::holding(root).expect("the session's job");
@@ -296,11 +300,57 @@ fn the_job_holds_the_shell_and_every_process_it_starts(/* KR-ACC-010, KR-REQ-07.
 }
 
 #[test]
+fn closing_the_last_handle_ends_what_the_job_holds(/* KR-REQ-07.62 */) {
+    // Kill-on-close is the promise that a worker which crashes, is killed, or exits without
+    // closing its session still takes the session's processes with it. Reading the limit back
+    // says it was asked for; this is the behaviour. The console is dropped, which drops the only
+    // handle to the job, and the tree the job held has to go.
+    let (pty, mut reader, shell) = powershell_in_a_console(
+        "$child = Start-Process -PassThru -WindowStyle Hidden -FilePath \
+             $PSHOME/pwsh.exe -ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 300'; \
+         Write-Host -NoNewline \"kr-child=$($child.Id).\"; \
+         Start-Sleep -Seconds 300",
+    );
+    let seen = read_until(&pty, &mut reader, "kr-child=");
+    let child = named_child(&seen);
+    let root = u32::try_from(shell.identity().pid.get()).expect("an identifier");
+    let child_identity =
+        kr_ipc::identity::process_start_identity(child).expect("the operating system describes it");
+
+    // Everything that holds the job: the terminal that created it, the shell's own handles, and
+    // this test's reference for the check above. Nothing keeps a handle back.
+    drop(reader);
+    drop(pty);
+    drop(shell);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if matches!(
+            kr_ipc::identity::process_state(&child_identity),
+            kr_ipc::identity::ProcessState::Ended
+        ) {
+            assert!(
+                kr_worker::windows::job::holding(root).is_none(),
+                "and nothing is left holding the job"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("process {child} is still running after the last handle to its job was closed");
+}
+
+#[test]
 fn a_resource_started_outside_the_job_is_not_held_by_it(/* KR-REQ-07.63 */) {
     // A GUI resource with a lifetime of its own is created through the desktop broker, outside the
     // session's job. This starts one the same way the broker does - as a plain child of this test
-    // process, which is not in the job - and checks the two halves of the promise: the job does
-    // not hold it, and ending the job does not end it.
+    // process, which is not in the job - and checks the two halves of the promise the *job* makes:
+    // it does not hold such a resource, and ending it does not end one.
+    //
+    // What this does not establish is the other half of the row: that the broker records what it
+    // started as an external resource in the closure receipt. Nothing in this build creates a
+    // resource through a broker, so there is nothing to record; the row stays open for the task
+    // that builds one.
     let (_pty, _reader, mut shell) = powershell_in_a_console("Start-Sleep -Seconds 120");
     let root = u32::try_from(shell.identity().pid.get()).expect("an identifier");
     let job = kr_worker::windows::job::holding(root).expect("the session's job");

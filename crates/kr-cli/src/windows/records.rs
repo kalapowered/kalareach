@@ -27,7 +27,8 @@ use std::os::windows::io::AsRawHandle as _;
 
 use kr_term::win32::{Fidelity, KeyRecord, encode_all};
 use windows_sys::Win32::System::Console::{
-    ENABLE_WINDOW_INPUT, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW,
+    ENABLE_MOUSE_INPUT, ENABLE_WINDOW_INPUT, GetNumberOfConsoleInputEvents, INPUT_RECORD,
+    KEY_EVENT, MOUSE_EVENT, ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
 };
 
 use crate::error::{CliError, Result};
@@ -43,6 +44,12 @@ const BATCH: usize = 256;
 pub struct RecordReader {
     handle: std::fs::File,
     fidelity: Fidelity,
+    /// A high surrogate whose low half has not arrived.
+    ///
+    /// One read of the console can end between the two halves of a character outside the basic
+    /// plane, and decoding each read on its own would turn that character into two replacements.
+    /// It is held here until the read that completes it.
+    pending_high_surrogate: Option<u16>,
 }
 
 impl RecordReader {
@@ -61,6 +68,7 @@ impl RecordReader {
             } else {
                 Fidelity::LegacyVt
             },
+            pending_high_surrogate: None,
         }
     }
 
@@ -93,11 +101,10 @@ impl RecordReader {
 
     /// Reads the records the console has, waiting for at least one.
     ///
-    /// Records that are not key events - a window resize, a focus change, a mouse event the
-    /// console reports as a record - are left out of the result, because each of those is its own
-    /// operation in this protocol and none of them belongs in a key encoding. The count of what
-    /// was skipped is returned beside the keys so that a caller can see them happen rather than
-    /// find them missing.
+    /// Records that are not key events - a resize, a mouse event, a focus change - are returned
+    /// beside the keys rather than counted away, because each of those is its own operation in
+    /// this protocol and a caller needs its detail to dispatch it. None of them belongs in a key
+    /// encoding.
     ///
     /// # Errors
     ///
@@ -127,9 +134,34 @@ impl RecordReader {
         let read = usize::try_from(read).unwrap_or(0).min(buffer.len());
         let mut batch = Batch::default();
         for record in &buffer[..read] {
-            if u32::from(record.EventType) != KEY_EVENT {
-                batch.other += 1;
-                continue;
+            match u32::from(record.EventType) {
+                KEY_EVENT => {}
+                MOUSE_EVENT => {
+                    // SAFETY: the console reported this record as a mouse event, which is the
+                    // field of the union that is then live.
+                    let mouse = unsafe { record.Event.MouseEvent };
+                    batch.other.push(ConsoleEvent::Mouse {
+                        column: mouse.dwMousePosition.X,
+                        row: mouse.dwMousePosition.Y,
+                        buttons: mouse.dwButtonState,
+                        control_keys: mouse.dwControlKeyState,
+                        flags: mouse.dwEventFlags,
+                    });
+                    continue;
+                }
+                WINDOW_BUFFER_SIZE_EVENT => {
+                    // SAFETY: as above, for the resize arm of the union.
+                    let size = unsafe { record.Event.WindowBufferSizeEvent };
+                    batch.other.push(ConsoleEvent::Resize {
+                        columns: size.dwSize.X,
+                        rows: size.dwSize.Y,
+                    });
+                    continue;
+                }
+                other => {
+                    batch.other.push(ConsoleEvent::Other { kind: other });
+                    continue;
+                }
             }
             // SAFETY: the console reported this record as a key event, which is the field of the
             // union that is then live.
@@ -156,14 +188,48 @@ impl RecordReader {
     /// # Errors
     ///
     /// Returns an error when the console will not answer.
-    pub fn read_encoded(&mut self) -> Result<Vec<u8>> {
+    pub fn read_encoded(&mut self) -> Result<(Vec<u8>, Vec<ConsoleEvent>)> {
         let batch = self.read()?;
-        Ok(match self.fidelity {
+        let bytes = match self.fidelity {
             Fidelity::Records => encode_all(&batch.keys),
             // A session whose backend never asked for records is sent the text the keys produced
             // and nothing else. No scan code is claimed, because none is sent.
-            Fidelity::LegacyVt => legacy_text(&batch.keys),
-        })
+            Fidelity::LegacyVt => self.legacy_text(&batch.keys),
+        };
+        Ok((bytes, batch.other))
+    }
+
+    /// Turns key records into the text a legacy VT client would have sent.
+    ///
+    /// Key-down events with a character, and nothing else. A key coming up produces nothing,
+    /// because legacy input has no way to say so; a repeat count becomes that many copies, because
+    /// that is what a terminal doing the translation would have sent; and a key with no character
+    /// at all - a dead key, a function key, a modifier on its own - produces nothing here, because
+    /// this is the text path and a special key's sequence is the input encoder's business rather
+    /// than the console's.
+    ///
+    /// A character outside the basic plane is two records and can be split across two reads, so
+    /// the first half is held on this reader until the second arrives.
+    fn legacy_text(&mut self, keys: &[KeyRecord]) -> Vec<u8> {
+        let mut units: Vec<u16> = self.pending_high_surrogate.take().into_iter().collect();
+        for key in keys {
+            if !key.key_down || key.unicode == 0 {
+                continue;
+            }
+            for _ in 0..key.repeat.max(1) {
+                units.push(key.unicode);
+            }
+        }
+        // A high surrogate at the very end is the first half of a character whose second half is
+        // in the next read. Anything else unpaired is a keyboard or an application doing something
+        // odd, and is replaced rather than dropped: a key that did nothing at all is worse.
+        if units
+            .last()
+            .is_some_and(|unit| (0xD800..=0xDBFF).contains(unit))
+        {
+            self.pending_high_surrogate = units.pop();
+        }
+        String::from_utf16_lossy(&units).into_bytes()
     }
 }
 
@@ -172,32 +238,42 @@ impl RecordReader {
 pub struct Batch {
     /// The key records, in the order the console reported them.
     pub keys: Vec<KeyRecord>,
-    /// How many records in the same read were something else: a resize, a focus change, a mouse
-    /// event or a menu event. Each of those is its own operation and none is a key.
-    pub other: usize,
+    /// Everything in the same read that was not a key, in the order it arrived.
+    ///
+    /// Each of these is its own operation in this protocol - a resize claims geometry, a mouse
+    /// event is a mouse event - so each is carried with the detail its dispatch needs rather than
+    /// counted and thrown away.
+    pub other: Vec<ConsoleEvent>,
 }
 
-/// Turns key records into the text a legacy VT client would have sent.
-///
-/// Key-down events with a character, and nothing else. A key coming up produces nothing, because
-/// legacy input has no way to say so; a repeat count becomes that many copies, because that is
-/// what a terminal doing the translation would have sent; and a key with no character - a dead
-/// key, a function key, a modifier on its own - produces nothing here, because this is the text
-/// path and a special key's sequence is the encoder's business rather than the console's.
-fn legacy_text(keys: &[KeyRecord]) -> Vec<u8> {
-    let mut units: Vec<u16> = Vec::new();
-    for key in keys {
-        if !key.key_down || key.unicode == 0 {
-            continue;
-        }
-        for _ in 0..key.repeat.max(1) {
-            units.push(key.unicode);
-        }
-    }
-    // A run of code units, decoded as UTF-16 with anything unpaired replaced rather than dropped.
-    // A lone surrogate is a keyboard or an application doing something odd, and losing it silently
-    // would look to the person like a key that did nothing.
-    String::from_utf16_lossy(&units).into_bytes()
+/// A console record that is not a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleEvent {
+    /// The console's window changed size.
+    Resize {
+        /// The new width, in columns.
+        columns: i16,
+        /// The new height, in rows.
+        rows: i16,
+    },
+    /// A mouse event, with the fields the console reported.
+    Mouse {
+        /// The column the pointer is over.
+        column: i16,
+        /// The row the pointer is over.
+        row: i16,
+        /// Which buttons are down.
+        buttons: u32,
+        /// The control-key state, as [`kr_term::win32::control_keys`] names its bits.
+        control_keys: u32,
+        /// Whether this was a move, a double click, or a wheel.
+        flags: u32,
+    },
+    /// A record this command does not act on: a focus change or a menu event.
+    Other {
+        /// The event type the console reported.
+        kind: u32,
+    },
 }
 
 /// The console input mode a record reader needs.
@@ -218,6 +294,7 @@ pub const fn record_input_mode(saved: u32) -> u32 {
             | ENABLE_PROCESSED_INPUT
             | ENABLE_VIRTUAL_TERMINAL_INPUT))
         | ENABLE_WINDOW_INPUT
+        | ENABLE_MOUSE_INPUT
 }
 
 #[cfg(test)]
@@ -263,29 +340,73 @@ mod tests {
         );
     }
 
+    /// A reader over this process's own console, or none when it has not got one.
+    fn over_the_console(records: bool) -> Option<RecordReader> {
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .ok()
+            .map(|console| RecordReader::over(console, records))
+    }
+
+    /// A reader over a handle that is never read, for the encoding decisions alone.
+    fn encoder() -> RecordReader {
+        RecordReader::over(
+            std::fs::File::options()
+                .read(true)
+                .open("NUL")
+                .expect("the null device"),
+            false,
+        )
+    }
+
     #[test]
     fn legacy_input_carries_the_text_and_nothing_it_cannot_say() {
+        let mut reader = encoder();
         // A repeat becomes that many characters, which is what a translation would have sent.
-        assert_eq!(legacy_text(&[typed(u16::from(b'a'), 3)]), b"aaa");
+        assert_eq!(reader.legacy_text(&[typed(u16::from(b'a'), 3)]), b"aaa");
         // A key coming up says nothing at all in this encoding.
         let released = KeyRecord {
             key_down: false,
             ..typed(u16::from(b'a'), 1)
         };
-        assert!(legacy_text(&[released]).is_empty());
+        assert!(reader.legacy_text(&[released]).is_empty());
         // A dead key, a function key and a modifier on its own carry no character.
         let dead = KeyRecord {
             unicode: 0,
             ..typed(0, 1)
         };
-        assert!(legacy_text(&[dead]).is_empty());
+        assert!(reader.legacy_text(&[dead]).is_empty());
         // And a surrogate pair is put back together rather than sent as two broken halves.
         let high = typed(0xD83D, 1);
         let low = typed(0xDE00, 1);
         assert_eq!(
-            legacy_text(&[high, low]),
+            reader.legacy_text(&[high, low]),
             "\u{1F600}".as_bytes(),
             "the pair names the character it came from"
+        );
+    }
+
+    #[test]
+    fn a_character_split_across_two_reads_is_still_one_character() {
+        // One read of the console can end between the two halves. Decoding each read on its own
+        // would turn the character into two replacements, which is a person's emoji becoming two
+        // question marks.
+        let mut reader = encoder();
+        let high = typed(0xD83D, 1);
+        let low = typed(0xDE00, 1);
+        assert!(
+            reader.legacy_text(&[high]).is_empty(),
+            "the first half waits for the second rather than being sent broken"
+        );
+        assert_eq!(reader.legacy_text(&[low]), "\u{1F600}".as_bytes());
+        // And a half whose other half never comes is replaced rather than lost, once something
+        // else follows it.
+        assert!(reader.legacy_text(&[high]).is_empty());
+        assert_eq!(
+            reader.legacy_text(&[typed(u16::from(b'a'), 1)]),
+            "\u{FFFD}a".as_bytes()
         );
     }
 
@@ -294,17 +415,18 @@ mod tests {
         // The two are separate on purpose: a client reads records either way, because that is the
         // only way to read this console, but what it sends is what the session asked for and the
         // fidelity it reports is that.
-        let console = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open("CONIN$");
-        let Ok(console) = console else {
-            // A test process with no console of its own has nothing to read; the encoding decision
-            // above is what this test is about and it is checked in the two cases below.
+        let Some(reader) = over_the_console(false) else {
+            // A test process with no console of its own cannot open one, and this test is about a
+            // reader over a console.
+            eprintln!("this process has no console, so no reader was opened over one");
             return;
         };
-        let reader = RecordReader::over(console, false);
         assert_eq!(reader.fidelity(), Fidelity::LegacyVt);
         assert!(!reader.fidelity().carries_console_scan_codes());
+        let Some(records) = over_the_console(true) else {
+            return;
+        };
+        assert_eq!(records.fidelity(), Fidelity::Records);
+        assert!(records.fidelity().carries_console_scan_codes());
     }
 }

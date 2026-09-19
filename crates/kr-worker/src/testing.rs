@@ -24,11 +24,37 @@ use crate::pty::ShellCommand;
 /// `TERM` because the engine reads it, an empty `PS1` because a prompt in the output would be
 /// noise in an assertion, and a `PATH` that finds the utilities the scripts use.
 fn environment() -> Vec<(String, String)> {
+    #[cfg_attr(
+        not(windows),
+        expect(unused_mut, reason = "only Windows adds to this list")
+    )]
     let mut environment = vec![
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("PS1".to_owned(), String::new()),
+        ("PATH".to_owned(), search_path()),
     ];
-    environment.push(("PATH".to_owned(), search_path()));
+    // What a program on this platform needs before it can start at all. The environment is
+    // replaced outright rather than inherited, and a Windows process without these does not find
+    // its own system directory, its temporary directory or its user's profile.
+    #[cfg(windows)]
+    for name in [
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "COMSPEC",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            environment.push((name.to_owned(), value));
+        }
+    }
     environment
 }
 

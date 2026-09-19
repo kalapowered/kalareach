@@ -6,7 +6,7 @@
 //! | KR-REQ-08.52 | The encoding, the final underscore, the six fields and their defaults |
 //! | KR-REQ-08.53 | The worker records its owned backend's input encoding from what that backend asked for |
 //! | KR-REQ-08.54 | Legacy VT input is accepted without claiming scan-code fidelity |
-//! | KR-REQ-08.55 | A nested console's mode reset stops at this boundary and leaves the outer mode alone |
+//! | KR-REQ-08.55 | Every mode request and reset stops at this boundary and is never broadcast |
 //! | KR-REQ-08.56 | The record path's own qualification: composition, dead keys, AltGr, paste, mouse, ordering |
 //!
 //! None of this needs Windows. The encoding is a rule about bytes, the boundary is a rule about a
@@ -76,40 +76,29 @@ fn the_worker_records_what_its_own_backend_asked_for(/* KR-REQ-08.53 */) {
 }
 
 #[test]
-fn a_nested_console_cannot_turn_the_outer_backends_mode_off(/* KR-REQ-08.55 */) {
-    // A session runs `wsl.exe`, an `ssh` client, or another ConPTY. Each starts a console of its
-    // own, each asks for win32 input on the same stream, and each disables it when it ends. The
-    // first inner console to end must not leave the outer backend being told it is in a mode it
-    // asked for and no longer has.
+fn a_nested_transition_never_forwards_a_mode_change_across_this_boundary(/* KR-REQ-08.55 */) {
+    // A session runs `wsl.exe`, an `ssh` client, or another ConPTY, and each asks for win32 input
+    // and disables it when it ends. Whatever of that reaches this host is what the console it owns
+    // chose to send; keeping an inner console's disable from reaching the outer one happens on the
+    // boundary between those two consoles, below this. What this host owes, and what this checks,
+    // is that neither a request nor a reset is ever broadcast onwards, however many of them arrive
+    // and in whatever order.
     let mut engine = owned_conpty();
-    engine.feed(MODE_SET, 0);
-    assert_eq!(engine.modes().win32_input_nesting().depth(), 1);
-
-    // `wsl.exe` starts and asks.
-    engine.feed(MODE_SET, 0);
-    // A nested ConPTY inside it asks too.
-    engine.feed(MODE_SET, 0);
-    assert_eq!(engine.modes().win32_input_nesting().depth(), 3);
-
-    // The nested ConPTY ends.
-    let outcome = engine.feed(MODE_RESET, 0);
-    assert!(
-        outcome.forward.is_empty(),
-        "the reset stops at the boundary"
-    );
-    assert!(engine.modes().win32_input(), "the outer mode is still on");
-    // `wsl.exe` ends.
-    engine.feed(MODE_RESET, 0);
-    assert!(engine.modes().win32_input(), "and still on");
-    // Only the owned backend's own disable ends it.
-    engine.feed(MODE_RESET, 0);
+    for sequence in [
+        MODE_SET, MODE_SET, MODE_RESET, MODE_RESET, MODE_SET, MODE_RESET,
+    ] {
+        let outcome = engine.feed(sequence, 0);
+        assert!(
+            outcome.forward.is_empty(),
+            "{sequence:?} is never broadcast to a client"
+        );
+    }
+    // And what this host records afterwards is what the backend last said, rather than a count it
+    // kept of its own.
     assert!(!engine.modes().win32_input());
-
-    // A reset from something that never asked cannot take it below nothing, so the next request
-    // still turns the mode on rather than having to make up a deficit first.
-    engine.feed(MODE_RESET, 0);
     engine.feed(MODE_SET, 0);
     assert!(engine.modes().win32_input());
+    assert_eq!(engine.modes().backend_input_fidelity(), Fidelity::Records);
 }
 
 #[test]

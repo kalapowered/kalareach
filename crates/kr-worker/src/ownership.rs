@@ -107,6 +107,16 @@ pub struct OwnedProcesses {
     boundary: OwnershipBoundary,
     root: ProcessStartIdentity,
     seen: BTreeMap<u64, Recorded>,
+    /// What this host tried to establish about the session's processes and could not.
+    ///
+    /// A boundary that will not say what it holds, and a stop that the operating system refused,
+    /// are both things a closure has to carry into its receipt. Coverage can never be complete
+    /// while one of them stands: "every process this host recorded has ended" says nothing when
+    /// the host could not read what there was to record.
+    ///
+    /// Behind a lock because the stop functions are given a shared reference, which is the shape
+    /// the closure sequence calls them with.
+    unestablished: std::sync::Mutex<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +133,7 @@ impl OwnedProcesses {
             boundary,
             root: root.clone(),
             seen: BTreeMap::new(),
+            unestablished: std::sync::Mutex::new(Vec::new()),
         };
         owned.seen.insert(
             root.pid.get(),
@@ -138,6 +149,29 @@ impl OwnedProcesses {
     #[must_use]
     pub const fn boundary(&self) -> &OwnershipBoundary {
         &self.boundary
+    }
+
+    /// Records something this host could not establish about the session's processes.
+    ///
+    /// Every one of these is carried into the closure receipt and keeps coverage incomplete.
+    pub fn note_unestablished(&self, detail: impl Into<String>) {
+        let detail = detail.into();
+        let mut notes = self
+            .unestablished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !notes.contains(&detail) {
+            notes.push(detail);
+        }
+    }
+
+    /// Returns what this host could not establish, for the closure receipt.
+    #[must_use]
+    pub fn unestablished(&self) -> Vec<String> {
+        self.unestablished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Records every process the boundary currently holds.
@@ -191,24 +225,47 @@ impl OwnedProcesses {
     #[cfg(windows)]
     fn observe_job(&mut self, root: u32) {
         let Some(job) = crate::windows::job::holding(root) else {
+            self.note_unestablished(format!(
+                "the job object holding the session's root shell {root} is no longer this \
+                 worker's to ask, so what it held was not read"
+            ));
             return;
         };
-        let Ok(members) = job.process_ids() else {
-            return;
+        let members = match job.process_ids() {
+            Ok(members) => members,
+            Err(error) => {
+                self.note_unestablished(format!(
+                    "the session's job object would not say which processes it holds: {error}"
+                ));
+                return;
+            }
         };
+        let mut unreadable = 0_usize;
         for pid in members {
             if self.seen.contains_key(&u64::from(pid)) {
                 continue;
             }
-            if let Ok(identity) = kr_ipc::identity::process_start_identity(pid) {
-                self.seen.insert(
-                    u64::from(pid),
-                    Recorded {
-                        identity,
-                        forced: false,
-                    },
-                );
+            match kr_ipc::identity::process_start_identity(pid) {
+                Ok(identity) => {
+                    self.seen.insert(
+                        u64::from(pid),
+                        Recorded {
+                            identity,
+                            forced: false,
+                        },
+                    );
+                }
+                // An identifier the operating system will not describe is not an identity, so it
+                // is not recorded - and not silently forgotten either, because the session owned
+                // whatever it names.
+                Err(_) => unreadable += 1,
             }
+        }
+        if unreadable > 0 {
+            self.note_unestablished(format!(
+                "the session's job object holds {unreadable} process(es) this host could not \
+                 describe, so they are not in the record"
+            ));
         }
     }
 
@@ -281,6 +338,19 @@ impl OwnedProcesses {
     /// Returns what survived the closure, in the form the record carries.
     #[must_use]
     pub fn surviving_resources(&self) -> Vec<SurvivingResource> {
+        let mut resources: Vec<SurvivingResource> = self
+            .unestablished()
+            .into_iter()
+            .map(|detail| SurvivingResource {
+                kind: "unestablished".to_owned(),
+                detail,
+            })
+            .collect();
+        resources.extend(self.processes_that_survived());
+        resources
+    }
+
+    fn processes_that_survived(&self) -> Vec<SurvivingResource> {
         self.seen
             .values()
             .filter_map(|recorded| {
@@ -306,12 +376,17 @@ impl OwnedProcesses {
 
     /// Returns how much of the session's ownership this closure can account for.
     ///
-    /// Complete means two things at once: every process this host recorded has been confirmed
-    /// gone, **and** the boundary it recorded them through could see a descendant that tried to
-    /// leave. A terminal process group cannot, so a host with only that never reports complete.
+    /// Complete means three things at once: every process this host recorded has been confirmed
+    /// gone, the boundary it recorded them through could see a descendant that tried to leave,
+    /// **and** nothing about the session's processes was left unestablished. A terminal process
+    /// group fails the second, and a boundary that would not say what it held fails the third:
+    /// "everything recorded has ended" claims nothing when the recording itself did not happen.
     #[must_use]
     pub fn coverage(&self) -> OwnershipCoverage {
-        if self.boundary.is_complete_boundary() && self.surviving().is_empty() {
+        if self.boundary.is_complete_boundary()
+            && self.surviving().is_empty()
+            && self.unestablished().is_empty()
+        {
             OwnershipCoverage::Complete
         } else {
             OwnershipCoverage::Incomplete
@@ -433,12 +508,21 @@ pub const fn request_stop(_owned: &OwnedProcesses) {}
 #[cfg(not(unix))]
 pub fn force_stop(owned: &OwnedProcesses) {
     #[cfg(windows)]
-    if let OwnershipBoundary::JobObject { root } = *owned.boundary()
-        && let Some(job) = crate::windows::job::holding(root)
-    {
-        // The code a forced process is recorded with. Nothing reads it back; it is there so that
-        // one ended this way is not indistinguishable from one that returned zero.
-        let _ = job.terminate(1);
+    if let OwnershipBoundary::JobObject { root } = *owned.boundary() {
+        match crate::windows::job::holding(root) {
+            // The code a forced process is recorded with. Nothing reads it back; it is there so
+            // that one ended this way is not indistinguishable from one that returned zero.
+            Some(job) => {
+                if let Err(error) = job.terminate(1) {
+                    owned.note_unestablished(format!(
+                        "the session's job object refused to end what it holds: {error}"
+                    ));
+                }
+            }
+            None => owned.note_unestablished(format!(
+                "the job object holding the session's root shell {root} is no longer this                  worker's to end"
+            )),
+        }
     }
     #[cfg(not(windows))]
     let _ = owned;

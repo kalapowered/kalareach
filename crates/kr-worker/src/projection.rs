@@ -216,6 +216,18 @@ impl TerminalEngine {
         let size = grid_size(canonical)?;
         let engine = Engine::new(EngineConfig {
             size,
+            // Which backend owns the terminal decides what the engine does with a request only one
+            // of them can make. Mode 9001 is the whole of it: on a Windows pseudo-console it is a
+            // real request from the backend this worker owns, and the session records what it
+            // asked for; anywhere else it is meaningless and is reported as such.
+            policy: kr_term::policy::Policy {
+                backend: if cfg!(windows) {
+                    kr_term::policy::Backend::ConPty
+                } else {
+                    kr_term::policy::Backend::UnixPty
+                },
+                ..kr_term::policy::Policy::DEFAULT
+            },
             ..EngineConfig::DEFAULT
         })
         .map_err(term_failure)?;

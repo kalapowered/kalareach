@@ -33,7 +33,7 @@ const PIPE_BYTES: u32 = 64 * 1024;
 const READ_BYTES: usize = 64 * 1024;
 
 /// The byte a console turns into an interrupt for the application attached to it.
-const INTERRUPT_BYTE: u8 = 0x03;
+pub const INTERRUPT_BYTE: u8 = 0x03;
 
 /// The pseudo-console, with the two ends of the two pipes this host keeps.
 pub struct Console {
@@ -162,7 +162,10 @@ impl Console {
     /// a stronger one would be claiming something that is not there.
     ///
     /// It is written through the console's input rather than through the session's writer, so it
-    /// is not queued behind input the application has not read.
+    /// is not queued behind input this host has not yet delivered. What it cannot get ahead of is
+    /// what is already in the pipe: the console reads that in order, and an application that has
+    /// stopped reading leaves it there. A console whose pipe is full takes none of it and says so
+    /// rather than pretending the interrupt was delivered.
     ///
     /// # Errors
     ///
@@ -348,8 +351,8 @@ mod handle {
         CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-        WaitForSingleObject,
+        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     /// The attribute that puts a new process inside a pseudo-console.
@@ -804,6 +807,13 @@ mod handle {
         let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         startup.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOEXW>()).unwrap_or(0);
         startup.lpAttributeList = attributes;
+        // The console is how this child reaches its terminal, and its standard handles have to say
+        // nothing at all. Without this flag the operating system hands a child whose parent has
+        // redirected standard handles *those* handles, inheritance or no inheritance, and the
+        // child then writes past the console into whatever the parent's output was: a session
+        // whose application output never arrives, and a test harness log with the shell's output
+        // in it. The three handles stay null, which is what the flag then means.
+        startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
         // SAFETY: as above.
         let mut started: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: every pointer is to a local that outlives the call. The command line is mutable
@@ -825,11 +835,13 @@ mod handle {
                 &raw mut started,
             )
         };
+        // Read before the call below, which has a last error of its own.
+        let failure = (spawned == 0).then(std::io::Error::last_os_error);
         // SAFETY: the list was initialised above, the process no longer needs it, and nothing else
         // holds it.
         unsafe { DeleteProcThreadAttributeList(attributes) };
-        if spawned == 0 {
-            return Err(std::io::Error::last_os_error());
+        if let Some(failure) = failure {
+            return Err(failure);
         }
         // SAFETY: the call reported both handles, and each is this process's own with nothing else
         // holding it. The thread's handle is kept until the process has been resumed.
@@ -841,21 +853,50 @@ mod handle {
         // joined before execution, and a failure here is a failure to start: a process outside the
         // boundary is one this host could never honestly close.
         if let Err(failure) = job.hold(&process) {
-            let _ = end(&process);
+            terminate_unstarted(&process)?;
             return Err(failure);
+        }
+        // And the kernel is asked whether it really holds it, rather than the call being taken at
+        // its word. A shell this host believed was inside the job and was not would make every
+        // ownership claim about the session wrong.
+        match job.holds(&process) {
+            Ok(true) => {}
+            Ok(false) => {
+                terminate_unstarted(&process)?;
+                return Err(std::io::Error::other(
+                    "the session's job object does not hold the shell it was given",
+                ));
+            }
+            Err(failure) => {
+                terminate_unstarted(&process)?;
+                return Err(failure);
+            }
         }
         // SAFETY: the thread is the one the call above created, suspended, and this handle is the
         // only one for it. Resuming it is what starts the process running.
         let resumed = unsafe { ResumeThread(thread.as_raw_handle().cast()) };
         if resumed == u32::MAX {
             let failure = std::io::Error::last_os_error();
-            let _ = end(&process);
+            terminate_unstarted(&process)?;
             return Err(failure);
         }
         drop(thread);
         Ok(Spawned {
             process: Arc::new(process),
             identifier: started.dwProcessId,
+        })
+    }
+
+    /// Ends a process that was created and never resumed, and says so if it cannot be ended.
+    ///
+    /// A suspended process nothing can reach is worse than a launch failure: it holds the console
+    /// and the job open and nothing will ever wait for it. So a refusal here is reported rather
+    /// than swallowed, and it replaces the failure that led to it, because it is the worse one.
+    fn terminate_unstarted(process: &OwnedHandle) -> std::io::Result<()> {
+        end(process).map_err(|failure| {
+            std::io::Error::other(format!(
+                "a shell that was created and never started could not be ended: {failure}"
+            ))
         })
     }
 
