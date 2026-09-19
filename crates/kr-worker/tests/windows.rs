@@ -387,22 +387,3 @@ fn a_resource_started_outside_the_job_is_not_held_by_it(/* KR-REQ-07.63 */) {
     let _ = outside.kill();
     let _ = outside.wait();
 }
-
-#[test]
-fn a_session_without_a_job_selects_a_reduced_profile_rather_than_claiming_one() {
-    // No job was ever recorded for this identifier, which is what a launch that could not create
-    // one looks like from here. The boundary that results is explicitly reduced: it names why, it
-    // tracks only the root, and it can never report complete coverage.
-    let never_started = kr_ipc::identity::ended_process_identity(0xFFFF_FFF0);
-    let boundary = boundary_for(None, &never_started);
-    assert!(
-        matches!(boundary, OwnershipBoundary::ReducedOwnership { .. }),
-        "{boundary:?}"
-    );
-    assert!(!boundary.is_complete_boundary());
-    assert!(
-        boundary.describe().contains("reduced-ownership profile"),
-        "{}",
-        boundary.describe()
-    );
-}

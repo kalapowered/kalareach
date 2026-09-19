@@ -49,19 +49,6 @@ pub enum OwnershipBoundary {
         /// The root shell the job was created for, which is how the job itself is found again.
         root: u32,
     },
-    /// An execution profile explicitly selected without the boundary this platform would give.
-    ///
-    /// Section 7 permits exactly two outcomes when the session's job object cannot hold what it
-    /// should: a named launch failure, or an explicitly selected reduced-ownership profile with
-    /// tracked process-start identities and incomplete cleanup coverage. This is the second. It is
-    /// never reached by falling back quietly: the reason is carried here, it appears in the closure
-    /// receipt, and coverage can never be complete under it.
-    ReducedOwnership {
-        /// Why this session has no job object, in the words the receipt carries.
-        reason: String,
-        /// The root shell's own process, which is all that is tracked without a job.
-        root: u32,
-    },
 }
 
 impl OwnershipBoundary {
@@ -69,7 +56,7 @@ impl OwnershipBoundary {
     #[must_use]
     pub const fn is_complete_boundary(&self) -> bool {
         match self {
-            Self::TerminalGroup { .. } | Self::ReducedOwnership { .. } => false,
+            Self::TerminalGroup { .. } => false,
             Self::ControlGroup { .. } | Self::JobObject { .. } => true,
         }
     }
@@ -94,9 +81,6 @@ impl OwnershipBoundary {
             Self::JobObject { root } => {
                 format!("the job object this worker owns for the root shell {root}")
             }
-            Self::ReducedOwnership { reason, root } => {
-                format!("the root shell {root} alone, under a reduced-ownership profile: {reason}")
-            }
         }
     }
 }
@@ -106,7 +90,12 @@ impl OwnershipBoundary {
 pub struct OwnedProcesses {
     boundary: OwnershipBoundary,
     root: ProcessStartIdentity,
-    seen: BTreeMap<u64, Recorded>,
+    /// Every process this session has been seen to own, by identifier **and** start value.
+    ///
+    /// The identifier alone is not a key: an operating system reuses one, and a descendant that
+    /// took a dead descendant's identifier would be read as the process already recorded and never
+    /// looked at again. The closure would then report as ended the one before it.
+    seen: BTreeMap<(u64, u64), Recorded>,
     /// What this host tried to establish about the session's processes and could not.
     ///
     /// A boundary that will not say what it holds, and a stop that the operating system refused,
@@ -125,6 +114,11 @@ struct Recorded {
     forced: bool,
 }
 
+/// The key one process is recorded under: what the operating system called it, and when it started.
+fn key(identity: &ProcessStartIdentity) -> (u64, u64) {
+    (identity.pid.get(), identity.start_value.get())
+}
+
 impl OwnedProcesses {
     /// Begins tracking the processes of a session whose root shell has just started.
     #[must_use]
@@ -136,7 +130,7 @@ impl OwnedProcesses {
             unestablished: std::sync::Mutex::new(Vec::new()),
         };
         owned.seen.insert(
-            root.pid.get(),
+            key(&root),
             Recorded {
                 identity: root,
                 forced: false,
@@ -163,6 +157,31 @@ impl OwnedProcesses {
         if !notes.contains(&detail) {
             notes.push(detail);
         }
+    }
+
+    /// Returns whether the boundary itself confirms it is holding nothing.
+    ///
+    /// A record that has ended is not the same as a boundary that is empty: a process which
+    /// started after the last look and was ended by the closure is one the record never held. So
+    /// the boundary is asked, and one that will not answer is not one this closure may call
+    /// complete.
+    #[cfg(windows)]
+    fn boundary_is_empty(&self) -> bool {
+        let OwnershipBoundary::JobObject { root } = self.boundary else {
+            return true;
+        };
+        crate::windows::job::holding(root)
+            .and_then(|job| job.process_ids().ok())
+            .is_some_and(|held| held.is_empty())
+    }
+
+    /// Returns whether the boundary itself confirms it is holding nothing.
+    ///
+    /// The boundaries this platform has are read through the processes they hold, which
+    /// [`Self::surviving`] has already asked about.
+    #[cfg(not(windows))]
+    const fn boundary_is_empty(&self) -> bool {
+        true
     }
 
     /// Returns what this host could not establish, for the closure receipt.
@@ -199,19 +218,14 @@ impl OwnedProcesses {
             return;
         };
         for pid in members {
-            if self.seen.contains_key(&u64::from(pid)) {
-                continue;
-            }
             // An identity the kernel will not describe is not recorded. A process identifier on
-            // its own is a hint; the start time is what makes it an identity.
+            // its own is a hint; the start time is what makes it an identity, and what tells a
+            // reused identifier from the process that had it before.
             if let Ok(identity) = kr_ipc::identity::process_start_identity(pid) {
-                self.seen.insert(
-                    u64::from(pid),
-                    Recorded {
-                        identity,
-                        forced: false,
-                    },
-                );
+                self.seen.entry(key(&identity)).or_insert(Recorded {
+                    identity,
+                    forced: false,
+                });
             }
         }
     }
@@ -242,18 +256,14 @@ impl OwnedProcesses {
         };
         let mut unreadable = 0_usize;
         for pid in members {
-            if self.seen.contains_key(&u64::from(pid)) {
-                continue;
-            }
+            // Asked about every time, not only the first: an identifier the record already holds
+            // can belong to a second process by now, and that process is this session's too.
             match kr_ipc::identity::process_start_identity(pid) {
                 Ok(identity) => {
-                    self.seen.insert(
-                        u64::from(pid),
-                        Recorded {
-                            identity,
-                            forced: false,
-                        },
-                    );
+                    self.seen.entry(key(&identity)).or_insert(Recorded {
+                        identity,
+                        forced: false,
+                    });
                 }
                 // An identifier the operating system will not describe is not an identity, so it
                 // is not recorded - and not silently forgotten either, because the session owned
@@ -271,7 +281,8 @@ impl OwnedProcesses {
 
     /// Records that a process was forced to stop rather than asked.
     pub fn note_forced(&mut self, pid: u64) {
-        if let Some(recorded) = self.seen.get_mut(&pid) {
+        // Every process that had that identifier, because a record can hold more than one.
+        for (_, recorded) in self.seen.range_mut((pid, u64::MIN)..=(pid, u64::MAX)) {
             recorded.forced = true;
         }
     }
@@ -292,7 +303,7 @@ impl OwnedProcesses {
                     kr_ipc::identity::ProcessState::Running
                 )
             })
-            .map(|(pid, _)| *pid)
+            .map(|((pid, _), _)| *pid)
             .collect();
         for pid in running {
             self.note_forced(pid);
@@ -386,6 +397,7 @@ impl OwnedProcesses {
         if self.boundary.is_complete_boundary()
             && self.surviving().is_empty()
             && self.unestablished().is_empty()
+            && self.boundary_is_empty()
         {
             OwnershipCoverage::Complete
         } else {
@@ -400,29 +412,23 @@ impl OwnedProcesses {
 ///
 /// Never fails: a host with nothing better falls back to the terminal's process group, which is
 /// weaker but honest about being weaker.
+/// Establishes the strongest ownership boundary this host offers for a session.
+///
+/// There is one on this platform, and a live session has it. The terminal created the session's
+/// job object, read both of its limits back from the operating system, put the shell into it and
+/// asked the kernel to confirm that it holds it - all before the shell ran, and any one of those
+/// failing is a named launch failure rather than a session with less.
+///
+/// Section 7's other permitted outcome, an **explicitly selected** reduced-ownership execution
+/// profile, is not something this build offers: nothing selects one, so nothing returns one, and
+/// no session is quietly given one instead of the boundary it asked for. Where the job later stops
+/// answering, that is recorded as something this host could not establish, which keeps the
+/// closure's coverage incomplete and puts the reason in its receipt.
 #[cfg(windows)]
 #[must_use]
 pub fn boundary_for(_group: Option<i32>, root: &ProcessStartIdentity) -> OwnershipBoundary {
-    // The terminal put the shell into the session's job before it resumed it, so either the job is
-    // there and holding the root, or this session has none and says so. What the boundary claims
-    // is read back from the operating system rather than taken from what was asked for: a job
-    // whose kill-on-close or breakaway limits are not what they must be is not this boundary.
-    let pid = u32::try_from(root.pid.get()).unwrap_or_default();
-    let Some(job) = crate::windows::job::holding(pid) else {
-        return OwnershipBoundary::ReducedOwnership {
-            reason: "this session has no job object, so only its root shell is tracked".to_owned(),
-            root: pid,
-        };
-    };
-    match (job.kills_on_close(), job.breakaway_permitted()) {
-        (Ok(true), Ok(false)) => OwnershipBoundary::JobObject { root: pid },
-        (kills, breakaway) => OwnershipBoundary::ReducedOwnership {
-            reason: format!(
-                "the session's job object does not hold what it must: closing it ends what it \
-                 holds is {kills:?} and a child may break away is {breakaway:?}"
-            ),
-            root: pid,
-        },
+    OwnershipBoundary::JobObject {
+        root: u32::try_from(root.pid.get()).unwrap_or_default(),
     }
 }
 
@@ -599,13 +605,53 @@ mod tests {
             .contains("can leave")
         );
         assert!(OwnershipBoundary::JobObject { root: 7 }.is_complete_boundary());
-        // A reduced-ownership profile is never complete, whatever it managed to confirm, and it
-        // says why in the words the receipt carries.
-        let reduced = OwnershipBoundary::ReducedOwnership {
-            reason: "the vendor sandbox refused to run inside a job".to_owned(),
-            root: 11,
-        };
-        assert!(!reduced.is_complete_boundary());
-        assert!(reduced.describe().contains("vendor sandbox"));
+    }
+
+    #[test]
+    fn a_closure_that_could_not_establish_something_never_reports_complete_coverage() {
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::ControlGroup {
+                path: std::path::PathBuf::from("/sys/fs/cgroup/kr"),
+            },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        // Nothing survives and the boundary is a complete one, and the answer is still incomplete:
+        // what this host could not read is what it could not account for.
+        owned.note_unestablished("the boundary would not say which processes it holds");
+        assert_eq!(owned.coverage(), OwnershipCoverage::Incomplete);
+        assert!(
+            owned
+                .surviving_resources()
+                .iter()
+                .any(|resource| resource.kind == "unestablished"),
+            "and the receipt carries the reason"
+        );
+        // The same note twice is one note: a sweep that ran ten times does not make ten of it.
+        owned.note_unestablished("the boundary would not say which processes it holds");
+        assert_eq!(owned.unestablished().len(), 1);
+    }
+
+    #[test]
+    fn a_reused_identifier_is_a_second_process_rather_than_the_one_already_recorded() {
+        let first = identity(4242);
+        let second = ProcessStartIdentity::new(4242, ProcessStartSource::MacosProcBsdInfo, 2);
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            first,
+        );
+        owned.seen.insert(
+            key(&second),
+            Recorded {
+                identity: second,
+                forced: false,
+            },
+        );
+        assert_eq!(owned.seen.len(), 2, "the record holds both");
+        // And marking that identifier as forced reaches both, because both were that identifier.
+        owned.note_forced(4242);
+        assert!(owned.seen.values().all(|recorded| recorded.forced));
     }
 }

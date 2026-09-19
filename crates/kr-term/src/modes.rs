@@ -423,16 +423,22 @@ impl ModeState {
     }
 
     /// Every tracked mode and its value, for a snapshot.
+    ///
+    /// The backend's own input mode is **not** here. A snapshot is what a client is served and what
+    /// a restoration paints back into a terminal, and mode 9001 is the one mode that must never
+    /// reach either: section 8 terminates it at the boundary that owns it and never broadcasts it
+    /// to a remote client. Carrying it in a snapshot would do exactly that, as a set on a Windows
+    /// session and as a reset on every other one. [`ModeState::win32_input`] is how this host reads
+    /// what its own backend asked for.
     #[must_use]
     pub fn tracked(&self) -> Vec<(ModeKind, u16, bool)> {
-        let mut out = Vec::with_capacity(self.ansi.len() + self.dec.len() + 1);
+        let mut out = Vec::with_capacity(self.ansi.len() + self.dec.len());
         for (mode, value) in &self.ansi {
             out.push((ModeKind::Ansi, *mode, *value));
         }
         for (mode, value) in &self.dec {
             out.push((ModeKind::Dec, *mode, *value));
         }
-        out.push((ModeKind::Dec, MODE_WIN32_INPUT, self.win32_input));
         out
     }
 }

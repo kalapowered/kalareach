@@ -443,32 +443,56 @@ A session never claims to have preserved writes it was never handed.
 
 **The job object.** The worker holds the sole owning handle for one job object per session, with
 kill-on-close, and every process it starts joins that job *before* it runs: the shell is created
-suspended, assigned, and only then resumed. Default breakaway stays disabled, so a child cannot
-leave by asking. A vendor sandbox that creates a job of its own nests inside this one; nesting and
-breakaway are separate questions, and disabling the second says nothing about the first. Where the
-job cannot be created or cannot hold what it must, the session says so: either the launch fails by
-name, or a reduced-ownership profile is selected explicitly, which tracks the root shell's start
-identity alone and can never report complete ownership coverage. A GUI resource that has to outlive
-the session is created through the desktop broker, outside the job, and recorded as an external
-resource; closing a session never ends one.
+suspended, assigned, confirmed to be held, and only then resumed. Both limits are read back from
+the kernel rather than taken from what was asked for. Default breakaway stays disabled, so a child
+cannot leave by asking. A vendor sandbox that creates a job of its own nests inside this one;
+nesting and breakaway are separate questions, and disabling the second says nothing about the
+first. Where the job cannot be created, cannot hold what it must, or does not hold the shell, the
+**launch fails by name**: no session is quietly given a weaker boundary instead. Section 7's other
+permitted outcome, an explicitly selected reduced-ownership execution profile, is not something
+this build offers, because nothing selects one. A GUI resource that has to outlive the session is
+created outside the job and is never ended by closing one.
 
-**The interrupt.** There is no foreground process group here and no signal to send one. The
-interrupt is the byte the console turns into a control event for whatever is attached to it,
-written through the console's own input rather than through the session's, so an application that
-has stopped reading cannot hold it.
+A closure says what it could not establish. A job that stops answering, a process the operating
+system will not describe, and a termination the kernel refused are each carried into the closure
+receipt as a surviving resource, and any one of them keeps the ownership coverage incomplete: a
+record that ended says nothing about a boundary that was never read.
+
+**The interrupt, and asking a shell to stop.** There is no foreground process group here and no
+signal to send one. The interrupt is the byte the console turns into a control event for whatever
+is attached to it, written through the console's own input rather than through the session's, so
+it is not queued behind input this host has not yet delivered. What it cannot get ahead of is what
+is already in the pipe, which the console reads in order; a console with no room takes none of it
+and says so rather than reporting an interrupt that did not happen.
+
+The same byte is how a closure *asks*. The five-second grace period needs a request the shell can
+answer, and this platform has no other; force is the step after it, and it is the job object that
+carries force to the descendants.
 
 **win32 input mode.** A ConPTY asks for console key records with `CSI ?9001h` and disables them
-with `CSI ?9001l`. Those requests stop at this boundary and are never broadcast to a client. The
-worker records what its own backend asked for; a Windows local attach client reads the console with
-`ReadConsoleInputW` and sends typed key records, which the worker encodes as
-`CSI Vk;Sc;Uc;Kd;Cs;Rc_` - a final underscore, not an APC string - carrying the virtual key, the
-scan code the console reported, one UTF-16 code unit, the key-down flag, the control-key state and
-the repeat count. Omitted fields mean `0,0,0,0,0,1`. Nothing decodes a record and encodes it again
-with a scan code this host chose. A client that sends no records sends legacy VT input, which is
-accepted without any claim about scan-code fidelity. A console inside the session - `wsl.exe`, an
-`ssh` client, a nested ConPTY - asks for the mode on the same stream and disables it when it ends;
-the requests are counted, so an inner console's disable leaves the outer backend's mode exactly
-where it was.
+with `CSI ?9001l`. Both stop here: neither is forwarded to a client, and neither appears in a
+snapshot or in a restoration, which are the other two ways bytes reach one. The worker records what
+its own backend asked for.
+
+The encoding is `CSI Vk;Sc;Uc;Kd;Cs;Rc_` - a final underscore, not an APC string - carrying the
+virtual key, the scan code the console reported, one UTF-16 code unit, the key-down flag, the
+control-key state and the repeat count, with all six fields written every time. A reader fills in
+`0,0,0,0,0,1` for any that were omitted. Nothing decodes a record and encodes it again with a scan
+code this host chose. A client that sends no records sends legacy VT input, which is accepted
+without any claim about scan-code fidelity.
+
+What a console inside the session does - `wsl.exe`, an `ssh` client, a nested ConPTY - happens on
+the boundary between that console and the one this worker owns, below this host: what arrives here
+is whatever the owned console chose to send, and what this host records is that. Restoring the
+*client's* console to the modes it had before an attachment is the attach client's own saved mode
+words, and that is what a detach writes back.
+
+**What is not here yet.** The console reader and the encoder exist and are tested, and the worker
+selects the ConPTY backend so that a mode request from its own console is recorded rather than
+ignored. What does not exist is the transport between them: the session protocol carries input as
+bytes, so a local attach client on Windows still sends bytes rather than typed key records, and the
+worker does not yet choose the encoding per client. A session therefore runs on the legacy VT path
+today, and says so rather than claiming the record path it does not yet use.
 
 ### Running the Windows tests
 
@@ -509,8 +533,14 @@ cargo check -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-p
 `cargo test -p kr-worker --test windows` is the platform suite: it opens a pseudo-console, starts
 PowerShell 7 inside it, resizes it and reads the new geometry back from the application, drains
 what the application wrote after it has gone, delivers the interrupt, checks that the job holds the
-shell and the processes it started and that terminating it ends the tree, and checks that a process
-started outside the job survives the session's closure.
+shell and the processes it started and that terminating it ends the tree, checks that closing the
+last handle to the job ends what it holds, and checks that a process started outside the job
+survives the session's closure.
+
+What no automated suite here establishes, and a person at this machine has to: a vendor sandbox
+that creates a job of its own running inside the session's job; a child that asks to break away
+being refused; an IME composing at a real keyboard; and Windows Terminal, WSL interop and a nested
+ConPTY across the release matrix.
 
 The two build commands both need the developer environment for the target loaded first, which
 `vcvarsall.bat x64` or `vcvarsall.bat x64_arm64` does.

@@ -188,9 +188,6 @@ fn contains(boundary: &OwnershipBoundary, pid: u32) -> bool {
         // No job exists on this platform, so nothing is ever held by one.
         #[cfg(not(windows))]
         OwnershipBoundary::JobObject { .. } => false,
-        // A reduced-ownership profile tracks the root shell and nothing else, which is what makes
-        // it reduced. The ancestry walk is what covers the rest.
-        OwnershipBoundary::ReducedOwnership { root, .. } => *root == pid,
     }
 }
 

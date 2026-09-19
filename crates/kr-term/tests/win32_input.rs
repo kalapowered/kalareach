@@ -7,7 +7,7 @@
 //! | KR-REQ-08.53 | The worker records its owned backend's input encoding from what that backend asked for |
 //! | KR-REQ-08.54 | Legacy VT input is accepted without claiming scan-code fidelity |
 //! | KR-REQ-08.55 | Every mode request and reset stops at this boundary and is never broadcast |
-//! | KR-REQ-08.56 | The record path's own qualification: composition, dead keys, AltGr, paste, mouse, ordering |
+//! | KR-REQ-08.56 | The encoding of composition, dead keys, AltGr, paste, mouse and ordering. **Not** the record path's own qualification: nothing here drives a console, an IME or a keyboard, so that stays open for a machine which can |
 //!
 //! None of this needs Windows. The encoding is a rule about bytes, the boundary is a rule about a
 //! stream, and a record is six numbers; writing them out by hand is what lets the same rule be
@@ -17,6 +17,7 @@
 use kr_term::engine::{Engine, EngineConfig};
 use kr_term::modes::ModeKind;
 use kr_term::policy::{Backend, Policy};
+use kr_term::snapshot::Viewport;
 use kr_term::win32::{Fidelity, KeyRecord, MODE_RESET, MODE_SET, control_keys, decode, encode_all};
 
 /// An engine whose backend is the pseudo-console this worker owns.
@@ -84,21 +85,44 @@ fn a_nested_transition_never_forwards_a_mode_change_across_this_boundary(/* KR-R
     // is that neither a request nor a reset is ever broadcast onwards, however many of them arrive
     // and in whatever order.
     let mut engine = owned_conpty();
-    for sequence in [
-        MODE_SET, MODE_SET, MODE_RESET, MODE_RESET, MODE_SET, MODE_RESET,
+    // Each step says what the state has to be immediately afterwards, so a host that had kept a
+    // count of its own would fail on the first reset rather than agreeing at the end.
+    for (sequence, expected) in [
+        (MODE_SET, true),
+        (MODE_SET, true),
+        (MODE_RESET, false),
+        (MODE_RESET, false),
+        (MODE_SET, true),
+        (MODE_RESET, false),
     ] {
         let outcome = engine.feed(sequence, 0);
         assert!(
             outcome.forward.is_empty(),
             "{sequence:?} is never broadcast to a client"
         );
+        assert_eq!(
+            engine.modes().win32_input(),
+            expected,
+            "after {sequence:?} the recorded state is what the backend last said"
+        );
     }
-    // And what this host records afterwards is what the backend last said, rather than a count it
-    // kept of its own.
-    assert!(!engine.modes().win32_input());
     engine.feed(MODE_SET, 0);
-    assert!(engine.modes().win32_input());
     assert_eq!(engine.modes().backend_input_fidelity(), Fidelity::Records);
+
+    // And it reaches no client by any other route either. A snapshot is what an attachment is
+    // served and what a restoration paints back into a terminal, so mode 9001 being in one would
+    // be this host broadcasting it after all.
+    let viewport = Viewport {
+        top_row: 0,
+        rows: 24,
+        left_col: 0,
+        cols: 80,
+    };
+    let (snapshot, _) = engine.snapshot(viewport, 0);
+    assert!(
+        !snapshot.modes.iter().any(|entry| entry.mode == 9001),
+        "the backend's own input mode is not a mode a client is ever told about"
+    );
 }
 
 #[test]
