@@ -1897,6 +1897,18 @@ fn carry_permissions(
     Ok(Some(mode))
 }
 
+/// Does nothing: this platform has no mode bits to carry across.
+#[cfg(not(unix))]
+fn carry_permissions(
+    _destination: &AuthorisedDirectory,
+    _leaf: &RelativeName,
+    _temporary: &RelativeName,
+    _staged: &kr_transfer::AuthorisedFile,
+    _executable: bool,
+) -> Result<Option<u32>> {
+    Ok(Some(0))
+}
+
 /// Returns true when the published file carries the permissions this host set on the copy it
 /// renamed into place.
 ///
