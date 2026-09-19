@@ -776,6 +776,76 @@ fn a_version_that_only_deletes_carries_the_deletion_as_an_operation() {
     );
 }
 
+/// KR-REQ-14.04 and 14.29: a deletion is reverted from what the version itself holds, and a
+/// deletion whose base is not file content is refused rather than written out as a regular file.
+#[test]
+fn a_deletion_is_reverted_from_the_version_s_own_content() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "revert-source");
+    std::fs::remove_file(source.join("src/lib.rs")).expect("the user deletes a tracked file");
+    let source_workspace = fixture.workspace("revert-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "revert-destination");
+    std::fs::remove_file(destination.join("src/lib.rs")).expect("and it is gone there too");
+    let workspace = fixture.workspace("revert-destination");
+    let affected = support::expectations(&destination, &["src/lib.rs"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = ApplyOrder {
+        revert: true,
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &limitations,
+        )
+    };
+    let result = apply::apply(fixture.service(), &order).expect("the revert runs");
+    assert_eq!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+    assert_eq!(
+        support::read_bytes(&destination, "src/lib.rs"),
+        b"pub fn answer() -> u32 { 42 }\n",
+        "the base's own content is back"
+    );
+}
+
+/// KR-REQ-14.29: what the base holds for a deleted path has to be file content.
+#[test]
+fn a_deleted_link_is_never_reverted_as_a_regular_file() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "link-source");
+    std::os::unix::fs::symlink("README.md", source.join("shortcut")).expect("a link");
+    git_raw(&source, ["add", "shortcut"]);
+    git_raw(&source, ["commit", "--quiet", "-m", "a link"]);
+    std::fs::remove_file(source.join("shortcut")).expect("the user deletes it");
+    let source_workspace = fixture.workspace("link-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "link-destination");
+    let workspace = fixture.workspace("link-destination");
+    let affected = support::expectations(&destination, &["shortcut"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = ApplyOrder {
+        revert: true,
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &limitations,
+        )
+    };
+    let result = apply::apply(fixture.service(), &order).expect("the revert runs");
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::UncertainOutcome)),
+        "a revert that could not put back what the base holds is not an applied change"
+    );
+    assert_eq!(result.unresolved_paths, vec!["shortcut".to_owned()]);
+    support::assert_absent(&destination.join("shortcut"));
+}
+
 /// KR-REQ-14.28 and 14.29: an external write between the recheck and the rename is the window this
 /// host states it cannot close. The apply reports what it did, and the version it captured before
 /// it is what a person recovers the overwritten content from.

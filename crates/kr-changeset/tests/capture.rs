@@ -726,6 +726,28 @@ fn a_file_the_index_lost_and_the_working_tree_kept_is_captured() {
         manifest.deletions.is_empty(),
         "nothing was deleted: the file is there"
     );
+
+    // And excluding uncommitted work does not take the path away: the base still holds it, so
+    // what a base-only capture holds for it is the commit's own content.
+    let base_only = fixture.capture(workspace, &InclusionPolicy::base_only());
+    let manifest = fixture
+        .service()
+        .manifest(base_only.change_set_id, base_only.version)
+        .expect("its manifest");
+    assert_eq!(
+        fixture
+            .service()
+            .objects()
+            .get(
+                manifest
+                    .path("src/lib.rs")
+                    .expect("the commit's own content is still held")
+                    .content_digest
+            )
+            .expect("its content"),
+        b"pub fn answer() -> u32 { 42 }\n"
+    );
+    assert!(manifest.deletions.is_empty());
 }
 
 /// KR-REQ-14.32: a commit that lands while a capture is reading makes the capture start again, and

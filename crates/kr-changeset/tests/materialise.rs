@@ -208,6 +208,24 @@ fn a_changed_materialisation_is_recorded_as_a_derived_version() {
         "the attestation refuses the input version by name: {}",
         result.attestation
     );
+    // The reading this result carries is held against deletion for as long as the result is: a
+    // result that points at a version must not outlive it.
+    let held = fixture
+        .service()
+        .holders(tested.change_set_id, tested.version)
+        .expect("what holds it is readable");
+    assert!(
+        held.iter().any(|what| what.detail.contains("result")),
+        "the result holds the version it recorded: {held:?}"
+    );
+    let refusal = fixture
+        .service()
+        .delete_version(tested.change_set_id, tested.version)
+        .expect_err("it is not deleted while the result names it");
+    assert!(
+        refusal.to_string().contains("result"),
+        "the refusal names what holds it: {refusal}"
+    );
 
     // The derived version is a real version: it names its parent and holds what was tested.
     let derived = fixture
