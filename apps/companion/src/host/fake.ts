@@ -15,7 +15,9 @@
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type {
+  CapabilityRecord,
   ClosureRecord,
+  EnvironmentCapabilitiesResult,
   EnvironmentListResult,
   HostInfoResult,
   Receipt,
@@ -42,6 +44,8 @@ import type {
   ProjectedScreen,
   RendezvousOrigin,
   ScannedCode,
+  SettingsPane,
+  SetupIdentity,
   Written
 } from './port'
 
@@ -148,6 +152,20 @@ export interface FakeHostControls {
   readonly uploaded: string[]
   /** The action identifiers this host has issued, in order. */
   readonly actions: string[]
+  /**
+   * Grants one capability's permission, the way a person granting it in System Settings would.
+   *
+   * The record's state changes, its evidence becomes a probe that performed the operation, and the
+   * revision advances, because a record whose evidence changed under the old revision would let a
+   * reader take a superseded answer for a current one.
+   */
+  grantPermission(capability: string): void
+  /** Takes one capability's permission away again. */
+  revokePermission(capability: string): void
+  /** Makes this build's identity an unstable one, or a stable one again. */
+  setIdentityStable(stable: boolean): void
+  /** The settings panes the interface asked the platform to open, in order. */
+  readonly openedPanes: string[]
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -169,6 +187,14 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const nodes: DocumentNode[] = startingConversation()
   const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
+  const openedPanes: string[] = []
+  let capabilityRevision = 4
+  let identityStable = true
+  const granted = new Set<string>([
+    'desktop.application_launch',
+    'desktop.authorised_file_read',
+    'desktop.display_server'
+  ])
 
   const requireConnection = () => {
     if (!connected) {
@@ -187,6 +213,26 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         environment_id: connected ? ENVIRONMENT : null,
         reason: connected ? null : 'this host cannot be contacted right now'
       }),
+
+    environmentCapabilities: (params) => {
+      requireConnection()
+      const asked = (params as { environment_id?: string } | null)?.environment_id
+      if (asked && asked !== ENVIRONMENT) {
+        refuse('NOT_FOUND', 'This host does not own that environment.')
+      }
+      return Promise.resolve(capabilities(granted, capabilityRevision))
+    },
+
+    setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected)),
+
+    openSettingsPane: (pane) => {
+      const found = SETTINGS_PANES.find((each) => each.id === pane)
+      if (!found) {
+        refuse('PERMISSION_DENIED', `${pane} is not a settings pane this application opens.`)
+      }
+      openedPanes.push(pane)
+      return Promise.resolve(found)
+    },
 
     hostInfo: () => {
       requireConnection()
@@ -576,7 +622,19 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     openedLinks,
     importedImages,
     uploaded,
-    actions: issuedActions
+    actions: issuedActions,
+    grantPermission(capability) {
+      granted.add(capability)
+      capabilityRevision += 1
+    },
+    revokePermission(capability) {
+      granted.delete(capability)
+      capabilityRevision += 1
+    },
+    setIdentityStable(stable) {
+      identityStable = stable
+    },
+    openedPanes
   }
 
   return { port, controls }
@@ -1010,5 +1068,194 @@ function projection(): ProjectedScreen {
       '#071217', '#a2352e', '#315e4a', '#7b500d', '#1a57b5', '#6b4d8a', '#2f6f74', '#dcdcda',
       '#585c60', '#faa49c', '#aad2bb', '#e7bf7a', '#8fb8f5', '#c0a6dc', '#8fb4a8', '#ffffff'
     ]
+  }
+}
+
+/* ---- First-start setup --------------------------------------------------------------------- */
+
+/** The settings panes this host says it will open, which is the list the backend holds. */
+const SETTINGS_PANES: readonly SettingsPane[] = [
+  {
+    id: 'accessibility',
+    route: 'System Settings → Privacy & Security → Accessibility',
+    url: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'
+  },
+  {
+    id: 'screen_recording',
+    route: 'System Settings → Privacy & Security → Screen & System Audio Recording',
+    url: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
+  },
+  {
+    id: 'full_disk_access',
+    route: 'System Settings → Privacy & Security → Full Disk Access',
+    url: 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'
+  },
+  {
+    id: 'automation',
+    route: 'System Settings → Privacy & Security → Automation',
+    url: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation'
+  },
+  {
+    id: 'microphone',
+    route: 'System Settings → Privacy & Security → Microphone',
+    url: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
+  },
+  {
+    id: 'remote_management',
+    route: 'System Settings → General → Sharing → Remote Management',
+    url: 'x-apple.systempreferences:com.apple.preferences.sharing?Services_RemoteManagement'
+  }
+]
+
+/** The identity this host reports for the application asking. */
+function setupIdentity(stable: boolean, connected: boolean): SetupIdentity {
+  return {
+    application_id: 'to.kala.companion',
+    application_version: '0.1.0',
+    executable: stable
+      ? '/Applications/KalaReach.app/Contents/MacOS/kalareach-companion'
+      : '/Users/sam/work/kalareach/target/debug/kalareach-companion',
+    bundled: stable,
+    stable,
+    instability: stable
+      ? null
+      : 'This build is running from /Users/sam/work/kalareach/target/debug/kalareach-companion, ' +
+        'which is not an application bundle. A permission the operating system grants is recorded ' +
+        'against a signed application, so a grant given to this build is given to this file and a ' +
+        'rebuild replaces it. Install the application before granting anything.',
+    unverified:
+      'This reads the identity a grant is filed under. It does not read the code signature ' +
+      'itself, and no check here can tell you a permission has been granted: on this platform ' +
+      'the only way to establish that is to perform the operation the permission guards.',
+    helper_build: connected ? 'kr-controller 0.1.0+2fe00021' : null,
+    helper_environment: connected ? ENVIRONMENT : null
+  }
+}
+
+/**
+ * One capability record, in the shape the host publishes it.
+ *
+ * A granted capability is one this host performed the operation for; a capability that is not
+ * granted is one it performed the operation for and was refused. Both are `disclosed_probe`,
+ * because a refusal by the operating system is the operation having been performed and answered.
+ */
+function capabilityRecord(
+  capability: string,
+  grantedNow: boolean,
+  revision: number,
+  detail: { readonly permission: string; readonly binary: string; readonly probed: boolean }
+): CapabilityRecord {
+  return {
+    capability,
+    version: '1',
+    subject: {
+      environment_id: ENVIRONMENT,
+      desktop_session_id: 'macos_security_session:user=sam:uid=501:session=100019:generation=42:boot=abcd',
+      session_id: null,
+      application: null,
+      terminal: null
+    },
+    revision: String(revision),
+    state: detail.probed
+      ? grantedNow
+        ? 'qualified_available'
+        : 'permission_required'
+      : 'not_tested',
+    evidence_source: detail.probed ? 'disclosed_probe' : 'not_probed',
+    identity: {
+      binary: detail.binary,
+      version: '1502942 bytes, digest 8a1f2c3d4e5f6071',
+      package: null,
+      schema: null,
+      profile: 'desktop_bound'
+    },
+    invalidation: ['binary_identity', 'os_permission', 'desktop_generation', 'worker_profile'],
+    disabled_reason: detail.probed
+      ? grantedNow
+        ? 'this context performed the operation and it worked. That is what establishes it, and it ' +
+          'establishes it for this binary and this permission state only'
+        : `this context performed the operation and the operating system refused it. ${detail.permission} ` +
+          'is granted per signed application, and this one does not hold it'
+      : 'this check delivers one keystroke to an application, so it runs only inside a test ' +
+        'context of its own. None was supplied, so it was not run and nothing is established ' +
+        'either way',
+    observed_at_ms: String(FAKE_NOW_MS)
+  }
+}
+
+/** What this host answers `environment.capabilities` with. */
+function capabilities(granted: ReadonlySet<string>, revision: number): EnvironmentCapabilitiesResult {
+  const record = (
+    capability: string,
+    permission: string,
+    binary: string,
+    probed = true
+  ): CapabilityRecord =>
+    capabilityRecord(capability, granted.has(capability), revision, { permission, binary, probed })
+
+  return {
+    environment_id: ENVIRONMENT,
+    default_worker_profile: 'desktop_bound',
+    desktop: {
+      desktop: {
+        desktop_session_id:
+          'macos_security_session:user=sam:uid=501:session=100019:generation=42:boot=abcd',
+        kind: 'macos_security_session',
+        platform_session: '100019',
+        login_generation: '42',
+        generation_source: 'macos_session_creator',
+        os_user: 'sam',
+        uid: '501',
+        boot_identity: { source: 'macos_boot_session_uuid', value: 'q80=' },
+        graphic_access: true,
+        remote: false,
+        availability: 'available',
+        container: 'host',
+        display_server: 'quartz',
+        compositor: 'Aqua',
+        worker_profile: 'desktop_bound'
+      },
+      records: [
+        record('desktop.accessibility', 'Accessibility', '/usr/bin/osascript'),
+        record('desktop.application_launch', 'nothing', '/usr/bin/open'),
+        record('desktop.authorised_file_read', 'Full Disk Access', '/Users/sam/Documents/kalareach-check.txt'),
+        record('desktop.display_server', 'nothing', 'Aqua'),
+        record('desktop.input_injection', 'Accessibility', '/usr/bin/osascript', false),
+        record('desktop.screen_capture', 'Screen & System Audio Recording', '/usr/sbin/screencapture')
+      ]
+    },
+    persistence: [
+      {
+        profile: 'desktop_bound',
+        persistence: 'ends_at_logout',
+        mechanism: 'launchd, a per-user job in the graphical domain',
+        detail:
+          'A desktop-bound session belongs to one graphical login. It survives losing every ' +
+          'attachment and it survives this daemon restarting; it does not survive the login ' +
+          'session ending, and it closes with reason desktop_lost when that happens.'
+      },
+      {
+        profile: 'headless_user',
+        persistence: 'not_established',
+        mechanism: 'launchd, a per-user job in the background domain',
+        detail:
+          "A headless session's job is loaded into this user's background domain, which outlives " +
+          'the graphical login. How long that domain lasts after the last session is the ' +
+          "platform's own behaviour and this host does not read it, so what a logout does to a " +
+          'headless session here is not established.'
+      }
+    ],
+    power: {
+      setting: 'off',
+      active: false,
+      reason: null,
+      mechanism: 'macos_power_assertion',
+      holder: null,
+      power_source: 'mains',
+      withheld_reason: null,
+      pending_requests: '0',
+      sessions_with_work: '0',
+      since_ms: null
+    }
   }
 }

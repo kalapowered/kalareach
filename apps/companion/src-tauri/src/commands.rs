@@ -22,7 +22,7 @@ use tauri::State;
 use crate::error::{CommandError, Result};
 use crate::state::AppState;
 use crate::target::Subject;
-use crate::{export, links, pairing, remote, verify};
+use crate::{export, links, pairing, remote, setup, verify};
 
 /// How long a mutation this application submits may stay acceptable.
 ///
@@ -36,6 +36,13 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // Hosts and environments.
     ("host_info", Some(Method::HostInfo)),
     ("environment_list", Some(Method::EnvironmentList)),
+    // First-start setup.
+    (
+        "environment_capabilities",
+        Some(Method::EnvironmentCapabilities),
+    ),
+    ("setup_identity", None),
+    ("setup_open_settings", None),
     // Sessions.
     ("session_list", Some(Method::SessionList)),
     ("session_read", Some(Method::SessionRead)),
@@ -96,6 +103,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
     tauri::generate_handler![
         host_info,
         environment_list,
+        environment_capabilities,
+        setup_identity,
+        setup_open_settings,
         session_list,
         session_read,
         session_create,
@@ -260,6 +270,18 @@ read_command!(
     /// Lists the host's execution environments.
     environment_list, Method::EnvironmentList, () => kr_protocol::hostinfo::EnvironmentListResult
 );
+read_command!(
+    /// Reads what may actually be done on this environment's desktop.
+    ///
+    /// One document: the desktop, one record per capability with what produced it and what makes
+    /// it stale, what a logout does to each execution profile, and the host's sleep setting. This
+    /// is what first-start setup reads, and it is a read: nothing about asking for it grants
+    /// anything or changes a setting.
+    environment_capabilities, Method::EnvironmentCapabilities,
+    kr_protocol::desktop::EnvironmentCapabilitiesParams
+        => kr_protocol::desktop::EnvironmentCapabilitiesResult
+);
+
 read_command!(
     /// Lists the sessions a row is drawn for.
     session_list, Method::SessionList,
@@ -657,6 +679,57 @@ async fn write_chosen_file(path: std::path::PathBuf, body: &[u8]) -> Result<()> 
 }
 
 /// Whether this application holds a host connection, and why not when it does not.
+/// Reads the identity an operating system would record a permission against.
+///
+/// Setup shows this before it guides anybody through a permission, because a grant belongs to a
+/// signed application: an identity that moves between launches loses every grant it was given, and
+/// finding that out after four settings panes is finding it out too late.
+#[tauri::command]
+pub async fn setup_identity(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<setup::identity::Identity> {
+    let configuration = app.config();
+    let helper = match state.session() {
+        Ok(session) => {
+            let host: kr_protocol::hostinfo::HostInfoResult =
+                session.read(Method::HostInfo, &NoParams {}).await?;
+            Some((host.build_id.to_string(), host.environment_id.to_string()))
+        }
+        // No host is an ordinary state at first start: the identity of this application is still
+        // the thing setup has to show, and it is still readable without one.
+        Err(_) => None,
+    };
+    Ok(setup::identity::read(
+        &configuration.identifier,
+        configuration.version.as_deref().unwrap_or("unknown"),
+        helper,
+    ))
+}
+
+/// Opens one of the platform's settings panes by name.
+///
+/// The page names a pane out of the application's own list. It never names an address, so this is
+/// a route to four privacy panes rather than a command that opens whatever it is handed.
+#[tauri::command]
+pub async fn setup_open_settings(
+    app: tauri::AppHandle,
+    pane: String,
+) -> Result<&'static setup::settings::Pane> {
+    let found = setup::settings::pane(&pane).ok_or_else(|| {
+        CommandError::refused(format!(
+            "{pane} is not a settings pane this application opens"
+        ))
+    })?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_url(found.url, None::<&str>)
+        .map_err(|error| {
+            CommandError::local_failure(format!("the settings pane could not be opened: {error}"))
+        })?;
+    Ok(found)
+}
+
+/// Whether this application holds a host connection, and why not when it does not.
 #[tauri::command]
 pub fn connection_state(state: State<'_, AppState>) -> crate::connection::ConnectionState {
     state.connection_state()
@@ -741,6 +814,10 @@ mod tests {
                 "pairing_scan",
                 "pairing_set_origin",
                 "pairing_verify_owner",
+                // Setup's own two. Neither performs a protocol operation: one reads this
+                // application's identity and one opens a settings pane by name.
+                "setup_identity",
+                "setup_open_settings",
             ])
         );
     }

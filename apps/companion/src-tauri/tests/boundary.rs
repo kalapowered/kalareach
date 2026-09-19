@@ -420,3 +420,61 @@ fn the_mobile_bundle_names_a_platform_floor_and_no_release_identity() {
         );
     }
 }
+
+#[test]
+fn first_start_setup_reaches_three_named_commands_and_no_more() {
+    // Setup reads what may be done on this desktop, reads the identity a grant would be filed
+    // under, and opens a settings pane by name. That is the whole of its surface: there is no
+    // command here that grants a permission, writes a setting or opens an address the page chose.
+    let named: Vec<&str> = NAMED_COMMANDS.iter().map(|(command, _)| *command).collect();
+    let setup: Vec<&&str> = named
+        .iter()
+        .filter(|command| command.starts_with("setup_"))
+        .collect();
+    assert_eq!(
+        setup,
+        vec![&"setup_identity", &"setup_open_settings"],
+        "setup's own commands are exactly these two"
+    );
+    assert!(
+        named.contains(&"environment_capabilities"),
+        "the assistant reads the capability records through a named command"
+    );
+    for (command, method) in NAMED_COMMANDS {
+        if *command == "environment_capabilities" {
+            assert_eq!(
+                *method,
+                Some(kr_protocol::method::Method::EnvironmentCapabilities),
+                "the capabilities command performs one operation and names it"
+            );
+        }
+        if command.starts_with("setup_") {
+            assert_eq!(
+                *method, None,
+                "{command} is this application's own, not a protocol operation"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_settings_pane_is_opened_by_name_and_never_by_an_address_the_page_supplies() {
+    for pane in companion_tauri::setup::settings::PANES {
+        assert!(
+            !pane.id.contains(':') && !pane.id.contains('/'),
+            "{} reads as an address rather than a name",
+            pane.id
+        );
+    }
+    assert!(
+        companion_tauri::setup::settings::pane(
+            "x-apple.systempreferences:com.apple.preference.security"
+        )
+        .is_none(),
+        "an address is not a pane name"
+    );
+    assert!(
+        companion_tauri::setup::settings::pane("https://example.org").is_none(),
+        "the setup route does not open a web address"
+    );
+}

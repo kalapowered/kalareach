@@ -13,6 +13,7 @@
 import type {
   ClosureRecord,
   Dimensions4,
+  EnvironmentCapabilitiesResult,
   EnvironmentListResult,
   HostInfoResult,
   Receipt,
@@ -56,6 +57,46 @@ export interface ConnectionState {
   readonly environment_id: string | null
   /** Why there is no connection, in plain words, when there is none. */
   readonly reason: string | null
+}
+
+/* ---- First-start setup ------------------------------------------------------------------------
+ *
+ * Three additions, and they are all reads. Setup is where a person is guided through permissions
+ * the operating system grants and this application cannot, so nothing here grants, enables or
+ * writes anything: it reads what may be done on this desktop, reads the identity a grant would be
+ * recorded against, and opens a settings pane the person asked for.
+ */
+
+/** The identity an operating system would record a permission against. */
+export interface SetupIdentity {
+  /** The bundle identifier this build declares, which is what a grant is filed under. */
+  readonly application_id: string
+  /** The version this build declares. */
+  readonly application_version: string
+  /** The executable this application is running from. */
+  readonly executable: string | null
+  /** Whether that executable sits inside an application bundle. */
+  readonly bundled: boolean
+  /** Whether the identity is the same on the next launch. */
+  readonly stable: boolean
+  /** Why it is not, when it is not. */
+  readonly instability: string | null
+  /** What this check did not establish, always stated. */
+  readonly unverified: string
+  /** The host build this application is in contact with, where there is one. */
+  readonly helper_build: string | null
+  /** The environment that host owns. */
+  readonly helper_environment: string | null
+}
+
+/** One settings pane this application will open, by name. */
+export interface SettingsPane {
+  /** The name the interface asks for. */
+  readonly id: string
+  /** Where the person is going, in the platform's own words. */
+  readonly route: string
+  /** The address the platform opens that pane with. */
+  readonly url: string
 }
 
 /** The rendezvous origin this device is configured with. */
@@ -198,6 +239,28 @@ export interface HostPort {
 
   hostInfo(): Promise<HostInfoResult>
   environmentList(): Promise<EnvironmentListResult>
+
+  /**
+   * What may actually be done on one environment's desktop.
+   *
+   * One document per environment: the desktop itself, one record per capability with the state,
+   * what produced it, what it was established about and what makes it stale, what a logout does to
+   * each execution profile, and the host's sleep setting. First-start setup is built on this, and
+   * it is a read: asking for it grants nothing and changes nothing.
+   */
+  environmentCapabilities(params: unknown): Promise<EnvironmentCapabilitiesResult>
+
+  /** The identity an operating system would record a permission against. */
+  setupIdentity(): Promise<SetupIdentity>
+
+  /**
+   * Opens one of the platform's settings panes by name.
+   *
+   * The interface names a pane the application already knows. It never names an address, and this
+   * opens a settings pane rather than pressing anything inside it: a grant that needs System
+   * Settings cannot be enabled programmatically and this does not pretend to.
+   */
+  openSettingsPane(pane: string): Promise<SettingsPane>
 
   sessionList(params: unknown): Promise<SessionListResult>
   sessionRead(params: unknown): Promise<SessionReadResult>

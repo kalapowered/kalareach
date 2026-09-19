@@ -27,6 +27,8 @@ import type {
   ScannedCode,
   SessionSubject,
   Settled,
+  SettingsPane,
+  SetupIdentity,
   Written
 } from './port'
 
@@ -83,6 +85,10 @@ export function tauriPort(): HostPort {
 
     hostInfo: () => call('host_info', {}),
     environmentList: () => call('environment_list', {}),
+
+    environmentCapabilities: (params) => read('environment_capabilities', params),
+    setupIdentity: () => call<SetupIdentity>('setup_identity', {}),
+    openSettingsPane: (pane) => call<SettingsPane>('setup_open_settings', { pane }),
 
     sessionList: (params) => read('session_list', params),
     sessionRead: (params) => read('session_read', params),

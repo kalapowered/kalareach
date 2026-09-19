@@ -28,6 +28,7 @@ pub mod export;
 pub mod links;
 pub mod pairing;
 pub mod remote;
+pub mod setup;
 pub mod state;
 pub mod target;
 pub mod transfers;
