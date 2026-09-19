@@ -229,11 +229,9 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     let Some((out, err, directory)) = capture_files() else {
         return Printed::NotRun;
     };
-    let opened = (
-        std::fs::File::create(&out).ok(),
-        std::fs::File::create(&err).ok(),
-    );
-    let (Some(to_out), Some(to_err)) = opened else {
+    // `zip` takes both handles: where one file could not be made, the other is closed before the
+    // directory goes, because a filesystem without POSIX deletion keeps a file something holds.
+    let Some((to_out, to_err)) = new_file(&out).zip(new_file(&err)) else {
         let _ = std::fs::remove_dir_all(&directory);
         return Printed::NotRun;
     };
@@ -274,10 +272,23 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let printed = std::fs::read(&out).unwrap_or_default();
-    let failed = std::fs::read(&err).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&directory);
     let Some(status) = status else {
+        // Nothing is read from a command that did not finish. A descendant it left behind can
+        // still be writing into these files, so what is in them now is half a reading, and half a
+        // reading answers nothing this probe asked.
+        let _ = std::fs::remove_dir_all(&directory);
+        return Printed::NotRun;
+    };
+    let captured = read_capture(&out).zip(read_capture(&err));
+    // The directory goes whether or not it could be read. A descendant that still holds one of
+    // the files keeps it on a filesystem that has no POSIX deletion; that is a file in the
+    // platform's temporary directory, which the platform clears, and not a reading this host owes
+    // anybody.
+    let _ = std::fs::remove_dir_all(&directory);
+    let Some((printed, failed)) = captured else {
+        // A capture this host could not read is not empty output. Empty output is an answer here:
+        // Linux reads it as no graphical session, and Windows as no matching logon. This probe has
+        // no answer, which is what `NotRun` says.
         return Printed::NotRun;
     };
     if status.success() {
@@ -296,8 +307,52 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn capture_files() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
     let directory = std::env::temp_dir().join(format!("kr-desktop-{}", kr_ipc::new_uuid()));
-    std::fs::create_dir(&directory).ok()?;
+    // `create_dir` and not `create_dir_all`: a directory that is already there is one this host
+    // did not make, and on a shared temporary directory that is somebody else's to write in.
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        builder.mode(0o700);
+    }
+    builder.create(&directory).ok()?;
     Some((directory.join("out"), directory.join("err"), directory))
+}
+
+/// Creates one capture file, which must be this reading's own.
+///
+/// `create_new` and not `create`: a file already at that name is one this host did not make, and a
+/// name that resolves through somebody else's symbolic link is somebody else's file to truncate.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn new_file(path: &std::path::Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    options.open(path).ok()
+}
+
+/// The most one capture this host reads from a platform command it ran.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+const CAPTURE_LIMIT: u64 = 1024 * 1024;
+
+/// Reads one capture, up to [`CAPTURE_LIMIT`], or nothing where it could not be read.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn read_capture(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut said = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(CAPTURE_LIMIT)
+        .read_to_end(&mut said)
+        .ok()?;
+    Some(said)
 }
 
 /// How long a platform command is given before the reading is abandoned.

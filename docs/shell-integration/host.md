@@ -236,13 +236,18 @@ and mode, and where each guarded entry goes and whether it is there. It writes n
 | Zsh | `.zshrc` inside the configured `ZDOTDIR` when there is one |
 | Bash | `.bashrc`, plus the first login file this user has when it does not already source `.bashrc` |
 | Fish | a guarded `conf.d` entry; it loads before `config.fish` and its own activation is deferred until after it |
-| PowerShell | the user's own profile, added to rather than replaced |
+| PowerShell | the profile that PowerShell itself names, added to rather than replaced |
 
 The entry is delimited by `# >>> KalaReach shell integration >>>` and `# <<< KalaReach shell
 integration <<<`, and its body is one line that sources the package's own file. Nothing of the
 integration's logic is copied into the user's configuration, so upgrading the package changes what
 runs without rewriting anything they own. Nothing replaces `.bashrc`, points a shell at another
 `ZDOTDIR`, substitutes an `--rcfile` or disables a profile.
+
+PowerShell's profile path differs by edition, by platform and by whether the user's Documents
+directory is redirected, so it is not derived: the shell this host would launch is asked for
+`$PROFILE.CurrentUserCurrentHost`, with a deadline, and a host where no PowerShell answers has no
+profile to add an entry to rather than one this host guessed.
 
 `kr shell install --nsh-bypass` adds the documented session-local bypass for a known auto-wrapper:
 `NSH_NO_WRAP=1`, set only where the worker exported the bridge, which is a KalaReach-created shell.

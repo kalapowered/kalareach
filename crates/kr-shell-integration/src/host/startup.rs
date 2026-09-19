@@ -147,13 +147,13 @@ impl HomeLayout {
         }
     }
 
-    /// Returns the profile PowerShell reads on this platform.
+    /// Returns the profile PowerShell reads on this host.
     ///
-    /// PowerShell keeps its per-user profile where the platform puts a user's documents, and the
-    /// two platforms do not agree: Windows uses `Documents\PowerShell` under the user's profile
-    /// directory, following the `USERPROFILE` and `OneDrive` redirection a modern installation
-    /// does, and everything else uses `.config/powershell` under the home directory. Writing the
-    /// Unix path on Windows would add an entry to a file PowerShell never reads.
+    /// It is asked for rather than worked out. PowerShell keeps its per-user profile in a
+    /// different place on each platform, in a different place for each edition, and on Windows
+    /// under whatever directory the user's documents have been redirected to; a path this host
+    /// derived could be a file PowerShell never reads, and an entry in a file nothing reads is an
+    /// installation that reports success and integrates nothing.
     fn powershell_profile(&self) -> Option<PathBuf> {
         let shell = self.powershell.as_ref()?;
         // The shell's own answer, read from a shell started with no profile of its own so that
@@ -210,13 +210,31 @@ const ASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// and a program that outlasts it is terminated and reaped: a shell that will not start must not
 /// hold `kr shell` open.
 fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
-    let directory = std::env::temp_dir().join(format!("kr-shell-ask-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&directory);
-    let printed = directory.join(format!(
-        "said-{}",
-        std::time::Instant::now().elapsed().as_nanos()
-    ));
-    let to = std::fs::File::create(&printed).ok()?;
+    // A directory of this call's own, created rather than opened and owner-only where the platform
+    // has modes. `/tmp` is shared: a name another account can guess is a name it can pre-create,
+    // and a file opened through it is a file this host writes on somebody else's behalf.
+    let directory = std::env::temp_dir().join(format!("kr-shell-ask-{}", kr_ipc::new_uuid()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        builder.mode(0o700);
+    }
+    builder.create(&directory).ok()?;
+    let said = directory.join("said");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    let Ok(to) = options.open(&said) else {
+        let _ = std::fs::remove_dir_all(&directory);
+        return None;
+    };
     let started = std::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())
@@ -226,7 +244,7 @@ fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
     let mut child = match started {
         Ok(child) => child,
         Err(_) => {
-            let _ = std::fs::remove_file(&printed);
+            let _ = std::fs::remove_dir_all(&directory);
             return None;
         }
     };
@@ -250,9 +268,29 @@ fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let said = std::fs::read_to_string(&printed).ok();
-    let _ = std::fs::remove_file(&printed);
-    status.filter(std::process::ExitStatus::success).and(said)
+    // A program that did not finish answered nothing, so nothing is read: a descendant can still
+    // be writing, and half an answer is worse than none. A successful one is read up to a bound.
+    let answer = status
+        .filter(std::process::ExitStatus::success)
+        .and_then(|_| read_answer(&said));
+    let _ = std::fs::remove_dir_all(&directory);
+    answer
+}
+
+/// The most one answer this host reads from a shell it asked a question of.
+const ANSWER_LIMIT: u64 = 64 * 1024;
+
+/// Reads what a shell answered, up to [`ANSWER_LIMIT`].
+fn read_answer(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut read = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(ANSWER_LIMIT)
+        .read_to_string(&mut read)
+        .ok()?;
+    Some(read)
 }
 
 /// Returns the PowerShell this host would launch, when one is on the path.
@@ -284,35 +322,131 @@ fn powershell_on_path() -> Option<PathBuf> {
 /// What that rules out here: the body of a here-document is text the shell passes on rather than
 /// commands it runs, so `cat <<EOF` … `source ~/.bashrc` … `EOF` is skipped.
 fn runs_bashrc(contents: &str) -> bool {
-    let mut ending: Option<String> = None;
+    let mut pending: Vec<HereDocument> = Vec::new();
+    let mut continued = String::new();
     for line in contents.lines() {
-        if let Some(marker) = ending.as_ref() {
-            if line.trim() == marker {
-                ending = None;
+        // A here-document's body is text the shell passes on rather than commands it runs, and its
+        // end is the delimiter exactly: `<<` matches the line as written, `<<-` after leading tabs
+        // and nothing else.
+        if let Some(open) = pending.first() {
+            let ended = if open.strip_tabs {
+                line.trim_start_matches('\t') == open.marker
+            } else {
+                line == open.marker
+            };
+            if ended {
+                pending.remove(0);
             }
             continue;
         }
-        if let Some(marker) = here_document(line) {
-            ending = Some(marker);
-            // The line that opens one can still be a command that sources it.
+        // A command can run on past the end of a line, and what follows is more of that command
+        // rather than a command of its own.
+        let joined = if continued.is_empty() {
+            line.to_owned()
+        } else {
+            format!("{continued} {}", line.trim_start())
+        };
+        if let Some(rest) = ends_continued(&joined) {
+            continued = rest;
+            continue;
         }
-        if sources_bashrc(line) {
+        continued = String::new();
+        pending = here_documents(&joined);
+        if sources_bashrc(&joined) {
             return true;
         }
     }
     false
 }
 
-/// Returns the word that ends a here-document this line opens, when it opens one.
-fn here_document(line: &str) -> Option<String> {
-    let at = line.find("<<")?;
-    let rest = line[at + 2..].trim_start_matches(['-', '~']).trim_start();
-    let marker: String = rest
-        .chars()
-        .take_while(|character| !character.is_whitespace())
-        .filter(|character| !matches!(character, '"' | '\'' | '\\'))
-        .collect();
-    (!marker.is_empty()).then_some(marker)
+/// One here-document a line opened, and how its end is recognised.
+struct HereDocument {
+    marker: String,
+    /// `<<-` strips leading tabs from the delimiter line, and nothing else does.
+    strip_tabs: bool,
+}
+
+/// Returns the line without its trailing backslash, when a command runs on past it.
+fn ends_continued(line: &str) -> Option<String> {
+    let trailing = line.chars().rev().take_while(|byte| *byte == '\\').count();
+    // An odd number of them is a continuation; an even number is that many escaped backslashes.
+    (trailing % 2 == 1).then(|| line[..line.len() - 1].to_owned())
+}
+
+/// Returns the here-documents one line opens, in the order their bodies follow it.
+fn here_documents(line: &str) -> Vec<HereDocument> {
+    let mut opened = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("<<") {
+        // `<<<` is a here-string: its word is the input, and no body follows.
+        let after = &rest[at + 2..];
+        if let Some(beyond) = after.strip_prefix('<') {
+            rest = beyond;
+            continue;
+        }
+        let strip_tabs = after.starts_with('-');
+        let after = after.strip_prefix('-').unwrap_or(after);
+        let after = after.trim_start();
+        let (marker, taken) = delimiter(after);
+        rest = &after[taken..];
+        if !marker.is_empty() {
+            opened.push(HereDocument { marker, strip_tabs });
+        }
+    }
+    opened
+}
+
+/// Reads one here-document's delimiter, which may be quoted and may hold spaces.
+fn delimiter(text: &str) -> (String, usize) {
+    let mut marker = String::new();
+    let mut taken = 0;
+    let mut quoted = false;
+    let mut quote = '\0';
+    let mut escaped = false;
+    for character in text.chars() {
+        taken += character.len_utf8();
+        if escaped {
+            escaped = false;
+            marker.push(character);
+            continue;
+        }
+        if quoted {
+            if character == quote {
+                quoted = false;
+            } else {
+                marker.push(character);
+            }
+            continue;
+        }
+        match character {
+            // A backslash quotes the character after it: `<<\\EOF` is the delimiter `EOF`.
+            '\\' => escaped = true,
+            '\'' | '"' => {
+                quoted = true;
+                quote = character;
+            }
+            character if character.is_whitespace() => {
+                taken -= character.len_utf8();
+                break;
+            }
+            character => marker.push(character),
+        }
+    }
+    (marker, taken)
+}
+
+/// Returns whether a word assigns a variable in front of a command, such as `LANG=C`.
+fn assigns(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    // `NAME+=value` appends, and is an assignment like any other.
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 /// Returns whether one line of a login file sources `.bashrc`.
@@ -422,10 +556,13 @@ fn sources_bashrc(line: &str) -> bool {
                 word.text.as_str(),
                 "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!"
             );
-        if here && !word.quoted && !introduces {
+        // An assignment in front of a command is that command's environment, not a command of
+        // its own: `LANG=C source ~/.bashrc` runs `source`.
+        let assignment = here && !word.quoted && assigns(&word.text);
+        if here && !word.quoted && !introduces && !assignment {
             verbs.push(index);
         }
-        at_command = introduces;
+        at_command = introduces || assignment;
     }
     verbs.iter().any(|index| {
         let verb = &words[*index];
@@ -973,6 +1110,14 @@ mod tests {
             "echo if source ~/.bashrc\n",
             "\"echo\" source ~/.bashrc\n",
             "cat <<EOF\nsource ~/.bashrc\nEOF\n",
+            // `<<-` strips leading tabs from the delimiter and nothing else, so a line that
+            // begins with a space is body rather than the end of one.
+            ": <<-EOF\n EOF\nsource ~/.bashrc\nEOF\n",
+            "cat <<'END HERE'\nsource ~/.bashrc\nEND HERE\n",
+            // A backslash quotes the delimiter too, so `<<\\EOF` ends at `EOF`.
+            "cat <<\\EOF\nsource ~/.bashrc\nEOF\n",
+            "cat <<ONE <<TWO\nsource ~/.bashrc\nONE\n. ~/.bashrc\nTWO\n",
+            "echo \\\nsource ~/.bashrc\n",
         ] {
             std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
             assert_eq!(
@@ -988,6 +1133,12 @@ mod tests {
             "[ -f ~/.bashrc ] && source \"$HOME/.bashrc\"\n",
             "export PATH=/opt:$PATH; . /home/someone/.bashrc\n",
             "if [ -r ~/.bashrc ]; then . ~/.bashrc; fi\n",
+            // A here-document that ends leaves the commands after it commands again.
+            "cat <<EOF\nnothing\nEOF\n. ~/.bashrc\n",
+            // A here-string opens no body at all.
+            "cat <<<'x'\n. ~/.bashrc\n",
+            // An assignment in front of a command leaves the command where a command stands.
+            "LANG=C source ~/.bashrc\n",
         ] {
             std::fs::write(root.path().join(".bash_profile"), sources).expect("writes");
             assert_eq!(
@@ -1113,7 +1264,24 @@ mod tests {
             .expect("writes a program");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
             .expect("makes it runnable");
-        path
+        // A file this thread has just written is briefly unrunnable: another thread's fork still
+        // holds the descriptor it was written through, and the kernel refuses to run it until that
+        // fork reaches its own program. Run it here until it runs, so the test measures the code
+        // under test rather than that window.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::process::Command::new(&path)
+                .stdout(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => break path,
+                Err(error) => assert!(
+                    std::time::Instant::now() < until,
+                    "the written program never ran: {error}"
+                ),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
