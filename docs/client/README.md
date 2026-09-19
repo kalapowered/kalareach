@@ -5,8 +5,10 @@ is `crates/kr-client`. It is the same library in the command line, the desktop a
 applications and anything else that talks to a host, which is why the decisions below are made once
 here rather than five times in five clients.
 
-It holds no terminal state and no authority. It carries requests to a host and answers back, and it
-knows which of its own actions are unresolved.
+It holds no authority. It carries requests to a host and answers back, and it knows which of its own
+actions are unresolved. What it does hold is its own copy of what the host told it: the screen a
+projected client draws, the cursors a stream has reached, the drafts this device wrote. Everything a
+request means belongs to the host.
 
 ## Two ways in, one contract above them
 
@@ -40,6 +42,11 @@ a bounded attempt count and jittered backoff, and the caller sees the last answe
 attempt. `Session::mutate` never retries: the library cannot know whether the host dispatched a
 mutation, so the decision goes back to the caller with `ClientError::decision`.
 
+The attempt count and the backoff are bounded so that a retry cannot spend a reconnect's budget. A
+restoration is idempotent reads, which is exactly what this library retries, and section 27 gives a
+reconnect two seconds to a usable screen; the most the delays can add to one read is 700
+milliseconds, which `a_retry_cannot_spend_a_reconnects_budget` holds them to.
+
 | Code | Step | What a person is offered |
 | --- | --- | --- |
 | `OUTCOME_UNKNOWN` | Ask the host what became of the action | Check whether it went through |
@@ -67,11 +74,13 @@ and nothing else. They are separate because their lifetimes are: a draft outlive
 client makes, and an association cannot outlive the connection that produced the attachment.
 
 - A draft is one file, written to a temporary name, flushed, and renamed over its own. Every change
-  takes an exclusive lock on the store and every read takes a shared one, so reading a draft,
+  takes an exclusive lock on the store and reading a draft takes a shared one, so reading a draft,
   comparing its revision and replacing it is one step against every other window and every other
-  process. A second editor that lost the comparison is told so and overwrites nothing. The contents
-  are flushed before the rename on every platform; on Unix the directory entry is flushed too, and
-  on Windows this build does not flush one and claims no durability for the rename itself.
+  process. A second editor that lost the comparison is told so and overwrites nothing. Reading the
+  note beside a draft takes the exclusive lock instead, because a note this build cannot read is
+  removed rather than returned. The contents are flushed before the rename on every platform; on
+  Unix the directory entry is flushed too, on creation, replacement and removal, and on Windows this
+  build flushes none and claims no durability for the names themselves.
 - `Associations::connection_lost` clears every association and touches no draft. A `Session` does
   not own the associations and does not clear them: whoever holds both calls it when a connection
   ends, which is the same caller that binds a draft to a new attachment on reconnect.
@@ -86,7 +95,11 @@ client makes, and an association cannot outlive the connection that produced the
 `drafts::DraftSync` is the optional half. It publishes through `services::SyncBackupService` under
 compare and swap on the generation this device last saw, which is kept beside the draft and is *not*
 the draft's own revision: a draft edited three times offline is at revision four and has still only
-been published once. A refused comparison is an answer rather than a failure: what the service holds
+been published once. What goes to the service is the record the store holds, read together with that
+note under one hold of the lock, so a caller cannot publish text this device does not have and
+cannot send an older revision against a generation another publisher has just advanced. A note that
+already names a later generation stands, so an answer that arrives late does not undo what a fetch
+has already learnt. A refused comparison is an answer rather than a failure: what the service holds
 comes down **beside** the local draft under a fresh identity, never over it, and the person chooses.
 Reconnecting never replaces their text.
 

@@ -47,7 +47,18 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// The bound exists because an automatic retry happens inside a call the caller is waiting on. A
 /// library that retried until it succeeded would turn a host that is refusing everything into a
 /// call that never returns, and the caller would have nothing to show for the wait.
+///
+/// It is also what keeps a retry out of a reconnect's budget. Section 27's KR-PERF-006 gives a
+/// reconnect [`RECONNECT_BUDGET`] to reach a usable screen, and a restoration is idempotent reads,
+/// which is exactly what this library retries. The most the delays can add to one of them is the
+/// sum of the ceilings this many retries draw under, and `a_retry_cannot_spend_a_reconnects_budget`
+/// holds that sum well inside it.
 pub const MAX_AUTOMATIC_RETRIES: u32 = 3;
+
+/// What section 27's KR-PERF-006 gives a reconnect to reach a usable screen.
+///
+/// It is not this module's bound to enforce; it is the one the delays here must stay clear of.
+pub const RECONNECT_BUDGET: Duration = Duration::from_secs(2);
 
 /// The longest *one* delay may be before the library hands the decision back instead of waiting.
 ///
@@ -490,8 +501,9 @@ impl Attempts {
 ///
 /// It is not a record of what already happened. The budget is fresh, so a transient failure of an
 /// eligible request reads as [`Recovery::Retry`] here even when the call that produced it had
-/// already spent its attempts and given up. Read the recovery a call returned from the call, and
-/// read this for the step and the action.
+/// already spent its attempts and given up. What a call that retried on its own hands back is its
+/// last failure, not a decision; read this for the step and the action, and treat the delay as the
+/// shortest a fresh attempt would wait rather than as what is left of anything.
 #[must_use]
 pub fn decision(failure: Failure, class: RequestClass) -> Decision {
     Attempts::new().decide(failure, class)
@@ -744,6 +756,39 @@ mod tests {
                 code.as_str()
             );
         }
+    }
+
+    #[test]
+    fn a_retry_cannot_spend_a_reconnects_budget() {
+        // A reconnect restores by reading: subscribe from a cursor, install a snapshot, page
+        // history. Each is an idempotent read this library may send again, so the delays it draws
+        // come out of the two seconds KR-PERF-006 gives the whole reconnect. The most they can be
+        // is the sum of the ceilings, because every draw is under its ceiling.
+        let mut ceiling = RETRY_BACKOFF_MIN;
+        let mut worst = Duration::ZERO;
+        for _ in 0..MAX_AUTOMATIC_RETRIES {
+            worst += ceiling;
+            ceiling = (ceiling * 2).min(RETRY_BACKOFF_MAX);
+        }
+        assert_eq!(worst, Duration::from_millis(700));
+        assert!(
+            worst * 2 <= RECONNECT_BUDGET,
+            "the delays a retry may add, {worst:?}, leave less than half of {RECONNECT_BUDGET:?}"
+        );
+
+        // And what one budget actually draws is inside that, every time.
+        let mut attempts = Attempts::new();
+        let mut spent = Duration::ZERO;
+        while attempts.remaining() > 0 {
+            spent += attempts
+                .decide(
+                    Failure::new(ErrorCode::ResourceUnavailable),
+                    RequestClass::IdempotentRead,
+                )
+                .delay()
+                .expect("a transient failure has a delay");
+        }
+        assert!(spent <= worst, "{spent:?} is more than the ceiling sum");
     }
 
     #[test]

@@ -19,8 +19,8 @@
 //! # One draft, one file, one lock
 //!
 //! A draft is stored as `<draft_id>.draft`, written to a temporary file, flushed, and renamed over
-//! its name. Every change takes an exclusive lock on the store's own `store.lock` file and every
-//! read takes a shared one, so reading a revision, comparing it and replacing it is one step against
+//! its name. Every change takes an exclusive lock on the store's own `store.lock` file and reading a
+//! draft takes a shared one, so reading a revision, comparing it and replacing it is one step against
 //! every other window of the application and against another process. Without that a second editor
 //! could pass the comparison a moment before the first one wrote, and the text it replaced would be
 //! gone with no trace that it had ever been there.
@@ -682,7 +682,11 @@ impl DraftStore {
                 self.check_owner(&draft)?;
             }
             remove_if_present(&self.draft_path(draft_id))?;
-            remove_if_present(&self.checkpoint_path(draft_id))
+            remove_if_present(&self.checkpoint_path(draft_id))?;
+            // A removal is a name leaving a directory, and it is durable on the same terms a name
+            // arriving is.
+            sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+            Ok(())
         })();
         drop(guard);
         outcome
@@ -728,15 +732,29 @@ impl DraftStore {
 
     /// Records where a draft reached on the synchronisation service.
     ///
+    /// A note that already names a later generation stands, and this returns false. Two answers can
+    /// arrive out of order: a publication is accepted, another device writes, a fetch brings that
+    /// down, and only then does the first answer come back naming the generation before it. Writing
+    /// it would throw away what this device had already learnt, and leave a draft looking
+    /// synchronised against an object that has moved on.
+    ///
     /// # Errors
     ///
-    /// Returns [`DraftError::Storage`] when the note cannot be written.
-    pub fn record_checkpoint(&self, draft_id: DraftId, checkpoint: SyncCheckpoint) -> Result<()> {
+    /// Returns [`DraftError::Storage`] when the note cannot be read or written.
+    pub fn record_checkpoint(&self, draft_id: DraftId, checkpoint: SyncCheckpoint) -> Result<bool> {
         let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
         let guard = self.exclusive()?;
-        let written = self.write_bytes(&self.checkpoint_path(draft_id), &bytes);
+        let outcome = (|| {
+            if let Some(held) = self.read_checkpoint(draft_id)?
+                && held.generation.get() > checkpoint.generation.get()
+            {
+                return Ok(false);
+            }
+            self.write_bytes(&self.checkpoint_path(draft_id), &bytes)?;
+            Ok(true)
+        })();
         drop(guard);
-        written
+        outcome
     }
 
     /// Forgets where a draft reached on the synchronisation service.
@@ -1010,6 +1028,7 @@ fn fresh_uuid() -> Result<Uuid> {
 /// not narrow: what protects it there is the access list of the directory the caller chose, so a
 /// caller puts the store under its own per-user application data rather than somewhere shared.
 fn private_directory(directory: &Path) -> std::io::Result<()> {
+    let existed = directory.is_dir();
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -1025,6 +1044,12 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
         if mode & 0o077 != 0 {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         }
+    }
+    // A directory that was just created is a name in its parent, and a name is durable only once
+    // the parent's own entry is flushed. Flushing the store directory afterwards says nothing about
+    // the name it is known by.
+    if !existed && let Some(parent) = directory.parent() {
+        sync_directory(parent)?;
     }
     Ok(())
 }
@@ -1057,10 +1082,9 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Flushes a directory entry, so a name that was replaced survives a crash.
 ///
-/// Unix only. Windows offers no directory handle to flush, so this build does not flush one there
-/// and makes no claim that a replacement it acknowledged survives losing power. What holds on both
-/// is that the new contents are written and flushed before anything renames them into place, so a
-/// reader never sees a file half written.
+/// Unix only. This build flushes no directory on Windows and makes no claim there that a name it
+/// acknowledged survives losing power. What holds on both is that the new contents are written and
+/// flushed before anything renames them into place, so a reader never sees a file half written.
 fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1228,6 +1252,8 @@ impl DraftSync {
             .await
         {
             Ok(accepted) => {
+                // A note that already names a later generation stands; this answer would be the
+                // older one arriving late.
                 store.record_checkpoint(
                     draft_id,
                     SyncCheckpoint {
@@ -1296,6 +1322,7 @@ impl DraftSync {
                 published_revision: Nullable::null(),
             },
         )?;
+
         Ok(Fetched {
             remote,
             generation,
@@ -1882,9 +1909,11 @@ mod tests {
             generation: U64::new(3),
             published_revision: Nullable::some(DraftRevision::new(2)),
         };
-        store
-            .record_checkpoint(draft.draft_id, checkpoint)
-            .expect("a note");
+        assert!(
+            store
+                .record_checkpoint(draft.draft_id, checkpoint)
+                .expect("a note")
+        );
         assert_eq!(
             store.checkpoint(draft.draft_id).expect("a note"),
             Some(checkpoint)
@@ -1915,17 +1944,73 @@ mod tests {
         assert_eq!(store.load(draft.draft_id).expect("the draft").text, "one");
 
         // Forgetting a note a caller no longer trusts is the same thing said deliberately.
-        store
-            .record_checkpoint(
-                draft.draft_id,
-                SyncCheckpoint {
-                    generation: U64::new(9),
-                    published_revision: Nullable::null(),
-                },
-            )
-            .expect("a note");
+        assert!(
+            store
+                .record_checkpoint(
+                    draft.draft_id,
+                    SyncCheckpoint {
+                        generation: U64::new(9),
+                        published_revision: Nullable::null(),
+                    },
+                )
+                .expect("a note")
+        );
         store.forget_checkpoint(draft.draft_id).expect("forgotten");
         assert_eq!(store.checkpoint(draft.draft_id).expect("no note"), None);
+    }
+
+    #[test]
+    fn an_answer_that_arrives_late_does_not_take_the_note_backwards() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let draft = store
+            .create(open_target(), "one".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+
+        // What a fetch writes after another device advanced the object.
+        let current = SyncCheckpoint {
+            generation: U64::new(2),
+            published_revision: Nullable::null(),
+        };
+        assert!(
+            store
+                .record_checkpoint(draft.draft_id, current)
+                .expect("a note")
+        );
+
+        // A publication this device made earlier, answered late, naming the generation before it.
+        // Writing it would throw away what the fetch already learnt.
+        assert!(
+            !store
+                .record_checkpoint(
+                    draft.draft_id,
+                    SyncCheckpoint {
+                        generation: U64::new(1),
+                        published_revision: Nullable::some(draft.revision),
+                    },
+                )
+                .expect("a note"),
+            "an older generation was written over a newer one"
+        );
+        assert_eq!(
+            store.checkpoint(draft.draft_id).expect("a note"),
+            Some(current)
+        );
+
+        // A later generation still lands.
+        let later = SyncCheckpoint {
+            generation: U64::new(3),
+            published_revision: Nullable::some(draft.revision),
+        };
+        assert!(
+            store
+                .record_checkpoint(draft.draft_id, later)
+                .expect("a note")
+        );
+        assert_eq!(
+            store.checkpoint(draft.draft_id).expect("a note"),
+            Some(later)
+        );
     }
 
     #[test]
