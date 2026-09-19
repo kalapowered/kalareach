@@ -253,15 +253,21 @@ profile to add an entry to rather than one this host guessed.
 `NSH_NO_WRAP=1`, set only where the worker exported the bridge, which is a KalaReach-created shell.
 It changes no other setting of that tool and affects no ordinary terminal.
 
+Nothing decides where an entry goes by reading what is inside a startup file, and the one text
+match made on one is the marker, matched as whole lines: a file that prints or talks about the
+marker holds no entry, and removal takes out nothing of the person's own.
+
 Nothing decides where an entry goes by reading what is inside a startup file. A login Bash reads
 exactly one of `.bash_profile`, `.bash_login` and `.profile`, and the entry goes in the first of
 those that exists, or in `.bash_profile` when none does. Whether that file happens to run `.bashrc`
 is not asked: reading a person's shell text without a shell is guesswork, and a guess that goes the
 wrong way leaves a login shell with no integration at all. The two entries share one guard
-instead, `KR_SHELL_ENTRY`, so a shell that reads both of them sources the package once. The guard
-is not exported, so a shell started inside that one loads the integration of its own. The entry in
-`.profile` is written in the language `sh`, `dash` and `ksh` share and does nothing unless
-`BASH_VERSION` says Bash is the shell reading it.
+instead, `KR_SHELL_ENTRY`, so a shell that reads both of them sources the package once. The entry
+takes that variable back out of the environment as it sets it, so a shell started inside that one
+loads the integration of its own and a startup file that turns `allexport` on does not export it.
+The entry in `.profile` is written in the language `sh`, `dash` and `ksh` share, and everything it
+does is inside a test for Bash that is not in its POSIX mode, which is what `/bin/sh` is on the
+platforms where that file is Bash.
 
 Whether the integration actually loaded is established at run time by the handshake, never by
 reading a file back.

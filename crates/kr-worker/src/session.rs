@@ -1550,8 +1550,10 @@ impl Session {
     /// shell was told to run in the background, or one left over from a line that has already
     /// finished, is not, and the attachment this session has a record of is not that caller's.
     ///
-    /// Where the platform does not name a foreground job, nothing is in it, and a detach that
-    /// names no attachment is refused rather than attributed to whoever typed last.
+    /// Where the platform does not name a foreground job, and where the shell is running without
+    /// job control so that every line shares the shell's own group, there is no such job to be in.
+    /// A detach that names no attachment is refused there rather than attributed to whoever typed
+    /// last.
     #[must_use]
     pub fn runs_the_accepted_line(&self, pid: u32) -> bool {
         let Some(group) = self
@@ -1561,6 +1563,21 @@ impl Session {
         else {
             return false;
         };
+        // A shell with job control off puts every child in its own group, so the terminal has the
+        // shell's group in the foreground whatever it is running and the reading says nothing
+        // about which line a caller belongs to. That is a binding this host does not have rather
+        // than one it can assume, and an unknown binding is refused.
+        let shell = self
+            .shell
+            .as_ref()
+            .and_then(RootShell::foreground_group)
+            .and_then(|group| u32::try_from(group).ok());
+        let root = self
+            .root_identity()
+            .and_then(|identity| u32::try_from(identity.pid.get()).ok());
+        if Some(group) == shell || Some(group) == root {
+            return false;
+        }
         kr_ipc::identity::processes_in_group(group).is_ok_and(|members| members.contains(&pid))
     }
 

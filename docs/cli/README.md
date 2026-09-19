@@ -415,7 +415,9 @@ is in the session's own boundary or descends from its root shell, and it is in t
 terminal has in the foreground, which is the job the root shell made for the line it accepted.
 `kr detach <session>` from an ordinary terminal, from a command the shell was told to run in the
 background, or from one left over from a line that has already finished, names the attachment it
-means. Where a platform does not name a foreground job, every `kr detach` names one.
+means. Where a platform does not name a foreground job, and where the shell runs without job control so
+that every line shares its own process group, there is no such job to be in and every `kr detach`
+names its attachment.
 
 Everything else returns `AMBIGUOUS_ATTACHMENT` and names no attachment: a line whose input came
 from more than one attachment or epoch, a line accepted without a valid fence, an origin whose

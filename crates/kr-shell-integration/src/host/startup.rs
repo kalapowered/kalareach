@@ -205,9 +205,9 @@ impl HomeLayout {
     fn bash_login_file(&self) -> PathBuf {
         for name in [".bash_profile", ".bash_login", ".profile"] {
             let path = self.home.join(name);
-            // Its own metadata rather than the target's: a symbolic link to a file that is not
-            // there is still the file Bash finds and refuses to read past.
-            if std::fs::symlink_metadata(&path).is_ok() {
+            // The file's own metadata, followed through a link: a link whose target is gone is
+            // one Bash reads nothing from and goes past, and so does this.
+            if std::fs::metadata(&path).is_ok() {
                 return path;
             }
         }
@@ -350,27 +350,38 @@ pub fn entry(target: &StartupTarget, package_entry: &Path, nsh_bypass: bool) -> 
     );
     match kind {
         ShellKind::Zsh | ShellKind::Bash => {
-            if nsh_bypass {
-                body.push_str(&format!(
-                    "[ -n \"${{KR_SHELL_BRIDGE:-}}\" ] && export {NSH_BYPASS_VARIABLE}=1\n"
-                ));
-            }
             // One shell can read two of these files: a login Bash reads its login file, and that
             // file may run `.bashrc` as well. Both entries test and set the same variable, so the
-            // package is sourced once in that shell. It is not exported, so a shell started inside
-            // this one loads the integration of its own.
+            // package is sourced once in that shell.
             //
-            // `.profile` is read by shells that are not this one, so the entry there says which
-            // shell it is for and is written in the language they all share.
+            // The variable is then taken back out of the environment. A shell started inside this
+            // one has to load the integration of its own, and a person whose startup file turns
+            // `allexport` on would otherwise export every assignment this entry makes, this one
+            // included.
+            let unexport = match kind {
+                ShellKind::Zsh => format!("typeset +x {ENTRY_GUARD_VARIABLE}"),
+                _ => format!("export -n {ENTRY_GUARD_VARIABLE}"),
+            };
+            // `.profile` is read by shells that are not this one, so everything the entry there
+            // does is inside a test for the shell it is for, written in the language they share.
+            // Bash reading that file as `sh` is in its POSIX mode and is not that shell either.
             let guard = if target.shared {
                 format!(
-                    "[ -n \"${{BASH_VERSION:-}}\" ] && [ -z \"${{{ENTRY_GUARD_VARIABLE}:-}}\" ]"
+                    "[ -n \"${{BASH_VERSION:-}}\" ] && case \":${{SHELLOPTS:-}}:\" in \
+                     *:posix:*) false ;; *) true ;; esac && \
+                     [ -z \"${{{ENTRY_GUARD_VARIABLE}:-}}\" ]"
                 )
             } else {
                 format!("[ -z \"${{{ENTRY_GUARD_VARIABLE}:-}}\" ]")
             };
+            let bypass = if nsh_bypass {
+                format!("[ -n \"${{KR_SHELL_BRIDGE:-}}\" ] && export {NSH_BYPASS_VARIABLE}=1; ")
+            } else {
+                String::new()
+            };
             body.push_str(&format!(
-                "if {guard} && [ -r {path} ]; then {ENTRY_GUARD_VARIABLE}=1; . {path}; fi\n"
+                "if {guard} && [ -r {path} ]; then {bypass}{ENTRY_GUARD_VARIABLE}=1; \
+                 {unexport}; . {path}; fi\n"
             ));
         }
         ShellKind::Fish => {
@@ -657,13 +668,22 @@ pub fn installed(path: &Path) -> bool {
 
 /// Splits a file around its KalaReach entry.
 fn strip(contents: &str) -> Option<(String, String)> {
-    let begin = contents.find(MARKER_BEGIN)?;
-    let end = contents[begin..].find(MARKER_END)? + begin;
-    let after = end + MARKER_END.len();
-    let after = contents[after..]
-        .strip_prefix('\n')
-        .map_or(&contents[after..], |rest| rest);
-    Some((contents[..begin].to_owned(), after.to_owned()))
+    // Whole lines, not text that happens to hold the marker. A person's own file can print the
+    // marker, or talk about it, and neither is this host's entry: removing what stands between
+    // two such lines would take their own configuration with it.
+    let line_at = |from: usize, marker: &str| {
+        let mut at = from;
+        for line in contents[from..].split_inclusive('\n') {
+            if line.trim_end_matches(['\r', '\n']) == marker {
+                return Some((at, at + line.len()));
+            }
+            at += line.len();
+        }
+        None
+    };
+    let (begin, _) = line_at(0, MARKER_BEGIN)?;
+    let (_, after) = line_at(begin, MARKER_END)?;
+    Some((contents[..begin].to_owned(), contents[after..].to_owned()))
 }
 
 /// Writes a startup file by replacing it, never by truncating it.
@@ -969,6 +989,56 @@ mod tests {
             );
             let _ = next;
         }
+    }
+
+    /// KR-REQ-07.30: what a person wrote that looks like an entry is not one.
+    #[test]
+    fn text_that_names_the_marker_is_not_an_entry() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(".zshrc");
+        let theirs = format!(
+            "printf '%s\\n' '{MARKER_BEGIN}'\nexport KEEP_ME=1\nprintf '%s\\n' '{MARKER_END}'\n"
+        );
+        std::fs::write(&path, &theirs).expect("writes");
+        assert!(
+            !installed(&path),
+            "a file that prints the marker holds no entry"
+        );
+        assert_eq!(remove(&path).expect("reads"), Change::Absent);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            theirs,
+            "and nothing of theirs was taken out"
+        );
+
+        // An entry beside it is still found, replaced and removed exactly.
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/entry"),
+            false,
+        );
+        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert!(installed(&path));
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
+    }
+
+    /// KR-REQ-07.30: a login file Bash reads nothing from is one it goes past, and so is this.
+    #[cfg(unix)]
+    #[test]
+    fn a_login_file_that_is_a_broken_link_is_not_the_one_bash_reads() {
+        let root = tempfile::tempdir().expect("a directory");
+        let home = layout(root.path());
+        std::os::unix::fs::symlink(root.path().join("gone"), root.path().join(".bash_profile"))
+            .expect("links");
+        std::fs::write(root.path().join(".profile"), "echo hello\n").expect("writes");
+        let targets = home.targets(ShellKind::Bash);
+        assert_eq!(
+            targets[1].path,
+            root.path().join(".profile"),
+            "a link with nothing at the end of it is not a file Bash reads"
+        );
+        assert!(targets[1].shared);
     }
 
     /// KR-REQ-07.16, KR-REQ-07.30: each shell loads the integration once, and a login shell that
