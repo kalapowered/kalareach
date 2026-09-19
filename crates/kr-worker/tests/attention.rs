@@ -364,6 +364,7 @@ async fn the_inbox_the_quiet_window_and_an_acknowledgement_travel_over_the_endpo
     .await;
     let set: kr_protocol::attention::AttentionQuietHoursResult = ok(set);
     assert_eq!(set.quiet_hours, Nullable::some(quiet));
+    assert_eq!(set.quiet_now, set.quiet_hours_provable);
 
     observe(&host, 1, approval("req-1"));
     let raised: AttentionReadResult = ok(send_request(
@@ -376,9 +377,10 @@ async fn the_inbox_the_quiet_window_and_an_acknowledgement_travel_over_the_endpo
     assert_eq!(item.rule, AttentionRule::PendingApproval);
     assert!(item.trusted);
     assert!(!item.acknowledged);
-    assert!(
-        raised.quiet_now,
-        "a whole-day window is a window the host is always inside"
+    assert_eq!(
+        raised.quiet_now, raised.quiet_hours_provable,
+        "a whole-day window covers every hour, and a host that cannot prove its clock is never \
+         inside one"
     );
 
     let acknowledged: AttentionAcknowledgeResult = ok(send_mutation(
