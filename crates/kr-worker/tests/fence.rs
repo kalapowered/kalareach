@@ -1991,7 +1991,21 @@ async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_f
     assert_ne!(later, typist);
     assert_eq!(wired.runtime.session().lease().holder.0, Some(later));
 
-    let detached: kr_protocol::attachment::SessionDetachResult = client
+    // The host's own answer is the attachment the editor accepted the line from, not the lease
+    // holder that took the keys after it.
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .detach_origin()
+            .expect("an origin was recorded"),
+        typist
+    );
+
+    // Section 7 gives that answer inside the originating attachment's context. This client is a
+    // test process rather than a command the session's root shell ran, so it is outside it, and
+    // what it gets back is the instruction to name the attachment it means.
+    let refused = client
         .mutate(
             Method::SessionDetach,
             ActionId::new(kr_ipc::new_uuid()),
@@ -2002,13 +2016,35 @@ async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_f
         )
         .await
         .expect("reaches the worker")
+        .expect_err("a caller outside the session names the attachment it means");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert!(
+        refused.message.contains("--attachment"),
+        "the refusal says what to do instead: {}",
+        refused.message
+    );
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        2,
+        "and nothing was detached"
+    );
+
+    // Naming it is what a window outside the session does, and that still removes exactly it.
+    let detached: kr_protocol::attachment::SessionDetachResult = client
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::attachment::SessionDetachParams {
+                attachment_id: Nullable::some(typist),
+            },
+        )
+        .await
+        .expect("reaches the worker")
         .expect("detaches")
         .to_typed()
         .expect("decodes");
-    assert_eq!(
-        detached.attachment_id, typist,
-        "the host resolves the origin the editor accepted the line from, not the lease holder"
-    );
+    assert_eq!(detached.attachment_id, typist);
     assert!(
         wired
             .runtime
@@ -2031,19 +2067,12 @@ async fn a_detach_that_names_nothing_is_refused_when_the_origin_was_mixed() {
 
     // Before any line has been accepted there is no origin, and one remaining terminal is not
     // proof that it is the one a command would have come from.
-    let refused = client
-        .mutate(
-            Method::SessionDetach,
-            ActionId::new(kr_ipc::new_uuid()),
-            wired.target(),
-            &kr_protocol::attachment::SessionDetachParams {
-                attachment_id: Nullable::null(),
-            },
-        )
-        .await
-        .expect("reaches the worker")
+    let refused = wired
+        .runtime
+        .session()
+        .detach_origin()
         .expect_err("a session that has accepted no line names no originating attachment");
-    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert!(refused.to_string().contains("--attachment"));
 
     let fence = fenced(&mut wired, 1, 1).await;
     wired
@@ -2074,6 +2103,17 @@ async fn a_detach_that_names_nothing_is_refused_when_the_origin_was_mixed() {
     .await
     .expect("the mixed context was recorded");
 
+    let refused = wired
+        .runtime
+        .session()
+        .detach_origin()
+        .expect_err("a mixed context cannot name one attachment");
+    assert!(
+        refused.to_string().contains("more than one attachment"),
+        "the refusal says why: {refused}"
+    );
+
+    // And the method refuses it too, whichever side the caller is on.
     let refused = client
         .mutate(
             Method::SessionDetach,

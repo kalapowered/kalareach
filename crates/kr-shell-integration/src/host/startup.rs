@@ -325,11 +325,13 @@ fn powershell_on_path() -> Option<PathBuf> {
 /// could still hide the call behind, a substitution or an expansion this does not evaluate, reads
 /// as "it does not" and costs one guarded entry.
 ///
-/// The question is whether the file holds such a command, not whether this run of it would reach
-/// one. `[ -f ~/.bashrc ] && . ~/.bashrc` is the ordinary way to write it and is read as a file
-/// that runs `.bashrc`, although the test can fail; a file that names the call inside a function
-/// or a loop reads the same way. The person wrote the call, and the entry this host would add
-/// beside it would run the integration a second time.
+/// A call the shell reaches is a call in this shell: `. ~/.bashrc`, and the same behind a `;`, a
+/// `&&` or a `then`. What a login file writes the call behind is whether `.bashrc` is there,
+/// which an installation has already made true, so that one condition is read through. Any other
+/// condition is one this host cannot answer, and so are a `||`, a loop body that can run no times,
+/// a function body nothing here calls, a pipeline, a background `&` and a subshell: each of them
+/// either may not be reached or reaches a shell this host is not integrating, and each reads as
+/// "it does not".
 fn runs_bashrc(contents: &str) -> bool {
     let mut rest = contents;
     while !rest.is_empty() {
@@ -351,8 +353,27 @@ struct Word {
     text: String,
     /// Whether any of it was quoted, which makes it an argument rather than a verb.
     quoted: bool,
+    /// Whether any of it was taken literally, by single quotes or a backslash.
+    ///
+    /// A path this host reads has to be the path the shell reads. `'$HOME/.bashrc'` names a
+    /// directory called `$HOME`, not the person's home, and nothing here expands anything, so a
+    /// word the shell takes literally is not read as a path at all.
+    literal: bool,
     /// Whether it stands where a command name stands.
     command_position: bool,
+    /// Whether a condition this host does not evaluate stands between the file and this command.
+    ///
+    /// `if` and `&&` both lead to a command that runs only when something else said so. The one
+    /// condition a login file is written with is whether `.bashrc` is there, and after an
+    /// installation it is; any other condition is one this host cannot answer, and a call it
+    /// cannot see made is a call it reads as not made.
+    conditional: bool,
+    /// Whether this host can see the command it belongs to being run by the shell it integrates.
+    ///
+    /// `&&`, `;` and a new line all lead to one. `||` leads to one only when what came before it
+    /// failed, a pipe and a background `&` lead to a shell of their own, and what is inside `( )`,
+    /// `$( )`, backticks or a group is either another shell or not a command at all.
+    plainly_run: bool,
 }
 
 /// One here-document a command opened, and how its body ends.
@@ -375,14 +396,22 @@ struct Command<'a> {
 /// Reads one command from the front of a login file.
 fn read_command(text: &str) -> Command<'_> {
     let characters: Vec<(usize, char)> = text.char_indices().collect();
-    let mut words: Vec<Word> = Vec::new();
+    let mut reading = Reading {
+        words: Vec::new(),
+        word: String::new(),
+        quoted: false,
+        literal: false,
+        started: false,
+    };
     let mut documents = Vec::new();
-    let mut word = String::new();
-    let mut quoted = false;
-    let mut started = false;
     // A command begins at the front and after every separator; everything else is an argument.
     let mut command_position = true;
     let mut next_command_position = true;
+    let mut plainly_run = true;
+    let mut conditional = false;
+    // Where the command being read began, because what follows it can change what this host can
+    // see of it: `. ~/.bashrc &` is read before the `&` that backgrounds it.
+    let mut began = 0usize;
     let mut index = 0;
     while index < characters.len() {
         let character = characters[index].1;
@@ -392,9 +421,10 @@ fn read_command(text: &str) -> Command<'_> {
             '\\' => match characters.get(index + 1) {
                 Some((_, '\n')) => index += 2,
                 Some((_, following)) => {
-                    word.push(*following);
-                    quoted = true;
-                    started = true;
+                    reading.word.push(*following);
+                    reading.quoted = true;
+                    reading.literal = true;
+                    reading.started = true;
                     next_command_position = false;
                     index += 2;
                 }
@@ -402,8 +432,11 @@ fn read_command(text: &str) -> Command<'_> {
             },
             '\'' | '"' => {
                 let quote = character;
-                quoted = true;
-                started = true;
+                // `$'…'` takes backslash escapes, so the apostrophe in `$'it\'s'` does not end it.
+                let escapes = quote == '"' || reading.word.ends_with('$');
+                reading.quoted = true;
+                reading.literal |= quote == '\'';
+                reading.started = true;
                 // A word has begun, so the next one is an argument: `"echo" source ~/.bashrc`
                 // passes `source` to `echo`.
                 next_command_position = false;
@@ -413,25 +446,24 @@ fn read_command(text: &str) -> Command<'_> {
                         index += 1;
                         break;
                     }
-                    // A backslash still quotes inside double quotes, and nothing does inside
-                    // single ones.
-                    if *inside == '\\' && quote == '"' {
+                    if *inside == '\\' && escapes {
                         match characters.get(index + 1) {
                             Some((_, '\n')) => index += 2,
                             Some((_, following)) => {
-                                word.push(*following);
+                                reading.word.push(*following);
+                                reading.literal = true;
                                 index += 2;
                             }
                             None => index += 1,
                         }
                         continue;
                     }
-                    word.push(*inside);
+                    reading.word.push(*inside);
                     index += 1;
                 }
             }
             // A comment begins at a `#` that begins a word and runs to the end of its line.
-            '#' if !started => {
+            '#' if !reading.started => {
                 while matches!(characters.get(index), Some((_, character)) if *character != '\n') {
                     index += 1;
                 }
@@ -440,16 +472,49 @@ fn read_command(text: &str) -> Command<'_> {
                 index += 1;
                 break;
             }
-            // `(` and backticks open a command of their own, and `$(` opens one after the `$`
-            // this does not evaluate.
-            ';' | '&' | '|' | '(' | ')' | '`' => {
-                finish(
-                    &mut words,
-                    &mut word,
-                    &mut quoted,
-                    &mut started,
-                    command_position,
-                );
+            // A subshell, a substitution, arithmetic or array data. Whatever is inside is either
+            // not a command or a command another shell runs, and either way it is not a call this
+            // host can see the shell it integrates make, so all of it is taken as this word's.
+            '(' => {
+                index = skip_nested(&characters, index);
+                reading.started = true;
+                next_command_position = false;
+            }
+            '`' => {
+                index = skip_backticks(&characters, index);
+                reading.started = true;
+                next_command_position = false;
+            }
+            ';' | '&' | '|' => {
+                finish(&mut reading, command_position, plainly_run, conditional);
+                let pair = characters.get(index + 1).map(|(_, character)| *character);
+                // A single `&` backgrounds the command in front of it and a pipe puts it in a
+                // shell of its own, so what this host can see of that command changes here,
+                // after it has been read.
+                let elsewhere = match (character, pair) {
+                    ('&', Some('&')) => false,
+                    ('&' | '|', _) => true,
+                    _ => false,
+                };
+                if elsewhere {
+                    for word in &mut reading.words[began..] {
+                        word.plainly_run = false;
+                    }
+                }
+                // `&&` and `;` lead to a command this shell runs next. `||` leads to one only
+                // when what came before it failed, `|` and `|&` to one in a shell of their own,
+                // `&` to one in the background, and `;;` out of a `case` arm.
+                plainly_run = matches!((character, pair), (';', _) | ('&', Some('&')))
+                    && !matches!((character, pair), (';', Some(';')));
+                // `&&` and `||` both put a condition in front of what comes next.
+                conditional |= matches!((character, pair), ('&' | '|', Some('&' | '|')));
+                if matches!(
+                    (character, pair),
+                    (';', Some(';')) | ('&', Some('&')) | ('|', Some('|' | '&'))
+                ) {
+                    index += 1;
+                }
+                began = reading.words.len();
                 command_position = true;
                 next_command_position = true;
                 index += 1;
@@ -457,13 +522,7 @@ fn read_command(text: &str) -> Command<'_> {
             // A here-document. Its delimiter follows the redirection and its body follows the
             // whole command, so only the delimiter is read here.
             '<' if matches!(characters.get(index + 1), Some((_, '<'))) => {
-                finish(
-                    &mut words,
-                    &mut word,
-                    &mut quoted,
-                    &mut started,
-                    command_position,
-                );
+                finish(&mut reading, command_position, plainly_run, conditional);
                 index += 2;
                 // `<<<` is a here-string: its word is the input, and no body follows.
                 if matches!(characters.get(index), Some((_, '<'))) {
@@ -486,56 +545,109 @@ fn read_command(text: &str) -> Command<'_> {
                 });
             }
             character if character.is_whitespace() => {
-                finish(
-                    &mut words,
-                    &mut word,
-                    &mut quoted,
-                    &mut started,
-                    command_position,
-                );
+                finish(&mut reading, command_position, plainly_run, conditional);
                 command_position = next_command_position;
                 index += 1;
             }
             character => {
-                word.push(character);
-                started = true;
+                reading.word.push(character);
+                reading.started = true;
+                // A word this host reads as opening a condition puts everything after it behind
+                // one, whether or not the shell takes that branch.
+                if command_position
+                    && !reading.quoted
+                    && matches!(reading.word.as_str(), "if" | "elif")
+                {
+                    conditional = true;
+                }
                 next_command_position = false;
                 index += 1;
             }
         }
     }
-    finish(
-        &mut words,
-        &mut word,
-        &mut quoted,
-        &mut started,
-        command_position,
-    );
+    finish(&mut reading, command_position, plainly_run, conditional);
     Command {
-        words,
+        words: reading.words,
         documents,
         rest: characters.get(index).map_or("", |(at, _)| &text[*at..]),
     }
 }
 
+/// Returns where the text a `(` opens ends, counting the ones inside it.
+fn skip_nested(characters: &[(usize, char)], from: usize) -> usize {
+    let mut index = from + 1;
+    let mut depth = 1usize;
+    while let Some((_, character)) = characters.get(index) {
+        match character {
+            '\\' => index += 2,
+            '\'' | '"' => {
+                let quote = *character;
+                index += 1;
+                while let Some((_, inside)) = characters.get(index) {
+                    if *inside == quote {
+                        index += 1;
+                        break;
+                    }
+                    index += if *inside == '\\' && quote == '"' {
+                        2
+                    } else {
+                        1
+                    };
+                }
+            }
+            '(' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' => {
+                depth -= 1;
+                index += 1;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+/// Returns where the text a backtick opens ends.
+fn skip_backticks(characters: &[(usize, char)], from: usize) -> usize {
+    let mut index = from + 1;
+    while let Some((_, character)) = characters.get(index) {
+        match character {
+            '\\' => index += 2,
+            '`' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
 /// Ends the word being read, where one has begun.
-fn finish(
-    words: &mut Vec<Word>,
-    word: &mut String,
-    quoted: &mut bool,
-    started: &mut bool,
-    command_position: bool,
-) {
-    if !*started {
+fn finish(reading: &mut Reading, command_position: bool, plainly_run: bool, conditional: bool) {
+    if !reading.started {
         return;
     }
-    words.push(Word {
-        text: std::mem::take(word),
-        quoted: *quoted,
+    reading.words.push(Word {
+        text: std::mem::take(&mut reading.word),
+        quoted: std::mem::take(&mut reading.quoted),
+        literal: std::mem::take(&mut reading.literal),
+        conditional,
         command_position,
+        plainly_run,
     });
-    *quoted = false;
-    *started = false;
+    reading.started = false;
+}
+
+/// The word being read and the words read so far.
+struct Reading {
+    words: Vec<Word>,
+    word: String,
+    quoted: bool,
+    literal: bool,
+    started: bool,
 }
 
 /// Reads one here-document's delimiter, which may be quoted, may hold spaces and may be empty.
@@ -562,11 +674,29 @@ fn marker_word(characters: &[(usize, char)], from: usize) -> (String, bool, usiz
                 expands = false;
                 index += 1;
                 while let Some((_, inside)) = characters.get(index) {
-                    index += 1;
                     if *inside == quote {
+                        index += 1;
                         break;
                     }
+                    // Inside double quotes a backslash goes before the four characters it can
+                    // quote and stays anywhere else, so `<<"\$EOF"` ends at `$EOF`.
+                    if *inside == '\\' && quote == '"' {
+                        match characters.get(index + 1) {
+                            Some((_, following @ ('$' | '`' | '"' | '\\'))) => {
+                                marker.push(*following);
+                                index += 2;
+                            }
+                            Some((_, following)) => {
+                                marker.push('\\');
+                                marker.push(*following);
+                                index += 2;
+                            }
+                            None => index += 1,
+                        }
+                        continue;
+                    }
                     marker.push(*inside);
+                    index += 1;
                 }
             }
             ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
@@ -655,12 +785,13 @@ fn sources(words: &[Word]) -> bool {
         let here = at_command || word.command_position;
         // A keyword is only a keyword where a command stands and only unquoted: `echo if source
         // ~/.bashrc` passes `if` to `echo`, and `"if"` is the word rather than the keyword.
+        //
+        // These five leave the next word standing where a command stands and lead to one this
+        // shell runs. `while`, `until`, `do` and a group's `{` lead to a body that may run no
+        // times, and a body is not what this reads.
         let introduces = here
             && !word.quoted
-            && matches!(
-                word.text.as_str(),
-                "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!"
-            );
+            && matches!(word.text.as_str(), "if" | "then" | "else" | "elif" | "!");
         // An assignment in front of a command is that command's environment rather than a command
         // of its own: `LANG=C source ~/.bashrc` runs `source`.
         let assignment = here && !word.quoted && assigns(&word.text);
@@ -671,15 +802,33 @@ fn sources(words: &[Word]) -> bool {
     }
     verbs.iter().any(|index| {
         let verb = &words[*index];
-        if verb.text != "source" && verb.text != "." {
+        if !verb.plainly_run || (verb.text != "source" && verb.text != ".") {
+            return false;
+        }
+        // A condition this host does not evaluate stands in front of it only where the condition
+        // is about `.bashrc` itself, which is the one a login file is written with and the one an
+        // installation has already made true.
+        if verb.conditional && !words[..*index].iter().any(names_bashrc) {
             return false;
         }
         words.get(index + 1).is_some_and(|argument| {
-            std::path::Path::new(&argument.text)
-                .file_name()
-                .is_some_and(|name| name == ".bashrc")
+            // The word after it in this same command: `source; /missing/.bashrc` names no file to
+            // `source`, because the `;` ended that command before the path began.
+            !argument.command_position && names_bashrc(argument)
         })
     })
+}
+
+/// Returns whether a word names a path ending in `.bashrc`.
+fn names_bashrc(word: &Word) -> bool {
+    // Quoting that leaves `$HOME` or `~` standing leaves a path that names neither the home
+    // directory nor anything under it, and nothing here expands either one.
+    if word.literal || (word.quoted && word.text.starts_with('~')) {
+        return false;
+    }
+    std::path::Path::new(&word.text)
+        .file_name()
+        .is_some_and(|name| name == ".bashrc")
 }
 
 /// What one guarded entry contains.
@@ -1229,6 +1378,40 @@ mod tests {
         // A backslash before a newline joins the lines with nothing between them, so this
         // names a command called `source~/.bashrc`.
         "source\\\n~/.bashrc\n",
+        // A substitution runs the command inside it in a shell of its own, which leaves the shell
+        // this host integrates with nothing.
+        "OUT=$(source ~/.bashrc)\n",
+        "OUT=`source ~/.bashrc`\n",
+        // Parentheses hold array data as readily as a command.
+        "parts=(source ~/.bashrc)\n",
+        // A substitution that ends leaves the words after it arguments rather than commands.
+        "echo $(printf '') source ~/.bashrc\n",
+        // `$'…'` takes backslash escapes, so the apostrophe in it does not end the quoting.
+        "echo $'it\\'s\nsource ~/.bashrc\n'\n",
+        // A separator ends the command before the path, so `source` is given nothing.
+        "source; /missing/.bashrc\n",
+        // Inside double quotes a backslash goes before the `$` it quotes, so the delimiter is
+        // `$EOF` and the line that reads `\$EOF` is body.
+        ": <<\"\\$EOF\"\n\\$EOF\nsource ~/.bashrc\n$EOF\n",
+        // The inner here-document belongs to the substitution, and the outer body follows the
+        // whole command.
+        ": <<OUT $(cat <<IN\nOUT\nIN\n)\nsource ~/.bashrc\nOUT\n",
+        // Single quotes leave `$HOME` a directory of that name rather than the home.
+        "source '$HOME/.bashrc'\n",
+        // `||` leads to a command only when what came before it failed.
+        "test -f ~/.bashrc || . ~/.bashrc\n",
+        // A loop body can run no times at all, and a function body runs when it is called.
+        "while false; do . ~/.bashrc; done\n",
+        "until true; do . ~/.bashrc; done\n",
+        "f() { . ~/.bashrc; }\n",
+        // A pipe and a background `&` each lead to a shell of their own.
+        "echo x | . ~/.bashrc\n",
+        ". ~/.bashrc &\n",
+        // A condition this host cannot answer is one it does not read a call through.
+        "if false; then . ~/.bashrc; fi\n",
+        "false && . ~/.bashrc\n",
+        // Double quotes leave `~` a directory of that name rather than the home.
+        "source \"~/.bashrc\"\n",
     ];
 
     /// Login files that run `.bashrc`.
@@ -1244,9 +1427,6 @@ mod tests {
         "cat <<<'x'\n. ~/.bashrc\n",
         // An assignment in front of a command leaves the command where a command stands.
         "LANG=C source ~/.bashrc\n",
-        // A substitution runs the command inside it.
-        "OUT=$(source ~/.bashrc)\n",
-        "OUT=`source ~/.bashrc`\n",
     ];
 
     /// KR-REQ-07.30: only a login file that actually runs `.bashrc` counts as one that does.

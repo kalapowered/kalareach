@@ -340,15 +340,37 @@ fn acknowledged(
 /// A terminal that opened outlives this call by design: its window stays until the person closes
 /// it. Something must still collect it when it goes, or the process that presented the session
 /// keeps one dead child per window for as long as it runs.
+///
+/// The launcher is put down where this host can still find it, and one waiter is started for each
+/// one put down. A waiter of its own per launcher, because a window somebody leaves open all day
+/// must not hold back the collection of one they closed a minute ago. A launcher no waiter could
+/// be started for stays on the list and is collected by the next presentation, which is the next
+/// time this host is doing this work anyway.
 #[cfg(not(target_vendor = "apple"))]
-fn reap(mut child: std::process::Child) {
-    // A host that cannot start a thread keeps the child instead: one uncollected launcher is a
-    // better answer than a session that could not be presented.
+fn reap(child: std::process::Child) {
+    {
+        let mut launched = launched();
+        launched.push(child);
+        launched.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+    }
     let _ = std::thread::Builder::new()
         .name("kr-terminal".to_owned())
-        .spawn(move || {
-            let _ = child.wait();
+        .spawn(|| {
+            // Whichever one is there: they are all launchers this host is waiting on, and one
+            // waiter taking another's is the same work.
+            let taken = launched().pop();
+            if let Some(mut child) = taken {
+                let _ = child.wait();
+            }
         });
+}
+
+/// The launchers this host started and holds until they end.
+#[cfg(not(target_vendor = "apple"))]
+fn launched() -> std::sync::MutexGuard<'static, Vec<std::process::Child>> {
+    static LAUNCHED: std::sync::Mutex<Vec<std::process::Child>> = std::sync::Mutex::new(Vec::new());
+
+    LAUNCHED.lock().unwrap_or_else(|held| held.into_inner())
 }
 
 /// Opens the chosen terminal application on a command.

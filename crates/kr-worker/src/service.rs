@@ -3037,11 +3037,25 @@ impl WorkerService {
             // attachment of this session is still refused.
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
-                // A request that names nothing is about the session's own context, so the host
-                // resolves it here, under the same boundary the effect runs on.
+                // A request that names nothing is about the caller's own context, and section 7
+                // gives that answer only inside it. Inside means what it means everywhere else in
+                // this worker: the calling process is in this session's boundary or descends from
+                // its root shell, which the kernel says and the caller does not. A window that is
+                // not in the session names the attachment it means.
                 let attachment_id = match params.attachment_id.0 {
                     Some(named) => named,
-                    None => session.detach_origin()?,
+                    None => {
+                        Self::bind_source_in(session, state).map_err(|_| {
+                            WorkerError::AmbiguousDetach {
+                                detail: "this caller is not running inside the session, so \
+                                         the line it detaches is not one this session \
+                                         accepted from it; name the attachment to detach \
+                                         with --attachment"
+                                    .to_owned(),
+                            }
+                        })?;
+                        session.detach_origin()?
+                    }
                 };
                 if session.attachment_capabilities(attachment_id).is_some() {
                     Ok(())

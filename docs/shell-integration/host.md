@@ -244,6 +244,15 @@ integration's logic is copied into the user's configuration, so upgrading the pa
 runs without rewriting anything they own. Nothing replaces `.bashrc`, points a shell at another
 `ZDOTDIR`, substitutes an `--rcfile` or disables a profile.
 
+Whether a Bash login file already sources `.bashrc` is read from the file as commands rather than
+as text: a here-document's body, a comment, a quoted message and a word inside a substitution are
+not commands. A call this host cannot see the login shell itself make reads as one that is not
+there, and costs one more guarded entry, which is idempotent: that is the direction that leaves a
+login shell integrated either way. `. ~/.bashrc` behind a `;`, a `&&` or a `then` is read as a
+call, and so is the usual `[ -f ~/.bashrc ] && . ~/.bashrc`, because an installation has already
+made that test true. A call behind any other condition, in a loop or function body, in a pipeline,
+in the background or in a subshell is not.
+
 PowerShell's profile path differs by edition, by platform and by whether the user's Documents
 directory is redirected, so it is not derived: the shell this host would launch is asked for
 `$PROFILE.CurrentUserCurrentHost`, with a deadline, and a host where no PowerShell answers has no

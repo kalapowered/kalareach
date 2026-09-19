@@ -409,12 +409,17 @@ editor fence at the moment the line is accepted. That record is what the detach 
 so the terminal that gets removed is the one the person is sitting at, never whichever client
 happens to hold the input lease by the time the command runs.
 
+Run anywhere else it takes an identifier. The session answers a request that names nothing only
+when the calling process is inside it, which the kernel says: the process is in the session's own
+boundary or descends from its root shell. `kr detach <session>` from an ordinary terminal is a
+caller the session has accepted no line from, so it names the attachment it means.
+
 Everything else returns `AMBIGUOUS_ATTACHMENT` and names no attachment: a line whose input came
 from more than one attachment or epoch, a line accepted without a valid fence, an origin whose
 terminal has already left, a session whose root editor has accepted nothing yet, and a
 `native_compat` session, which records no origin at all. Pass `--attachment <id>` to say which one.
 One remaining terminal is not proof that it is the one the command came from, so it is not treated
-as one: outside a session's own context an explicit selector is required.
+as one.
 
 ## `kr question`
 
