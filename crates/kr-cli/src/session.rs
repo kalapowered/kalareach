@@ -862,10 +862,6 @@ async fn drive(
                                 .payload
                                 .to_typed::<kr_protocol::recovery::OutputEvent>()
                         {
-                            // The session's own bytes: this terminal is being handed the live
-                            // stream, so what it shows is the live screen whatever a projection
-                            // last said about it.
-                            showing_history = false;
                             let mut handle = output.as_ref();
                             if handle.write_all(event.bytes.as_slice()).is_err() {
                                 return AttachOutcome::Disconnected;
@@ -1101,6 +1097,13 @@ async fn drive(
                                     >()
                                 {
                                     parked = landed(result.position.0);
+                                    if result.presentation
+                                        == kr_protocol::attachment::TerminalPresentationMode::Direct
+                                    {
+                                        // The session is handing this terminal its own bytes
+                                        // again, which it does only for the live screen.
+                                        showing_history = false;
+                                    }
                                     geometry_epoch = result.geometry.epoch;
                                     owns_geometry =
                                         result.geometry.owner.as_ref() == Some(&attachment_id);
@@ -1169,6 +1172,13 @@ async fn drive(
                                     >()
                                 {
                                     parked = landed(result.position.0);
+                                    if result.presentation
+                                        == kr_protocol::attachment::TerminalPresentationMode::Direct
+                                    {
+                                        // The session is handing this terminal its own bytes
+                                        // again, which it does only for the live screen.
+                                        showing_history = false;
+                                    }
                                 }
                                 // What the person asked for while this was in flight, resolved
                                 // against where the window actually ended up. A refusal leaves the
