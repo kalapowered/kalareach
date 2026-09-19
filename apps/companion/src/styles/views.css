@@ -1,0 +1,853 @@
+/*
+ * The screens.
+ *
+ * Layout only: every colour comes from a token and every duration from the motion tokens. The
+ * conversation and the terminal deliberately have no transitions at all — text that animates as it
+ * streams reads as lag, and a terminal that animates reads as a broken terminal.
+ */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-4);
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+/* ---- Attention ------------------------------------------------------------------------------- */
+
+.attention-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.attention-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 19px 21px 0;
+  font-size: 0.6875rem;
+  flex-wrap: wrap;
+}
+
+.attention-body {
+  padding: 17px 21px 20px;
+}
+
+.attention-body h2 {
+  font-size: 1rem;
+  margin-bottom: 7px;
+}
+
+.attention-body p {
+  font-size: 0.75rem;
+  line-height: 1.65;
+  color: var(--muted);
+}
+
+.card[data-kind='pending_decision'] {
+  border-color: var(--warning-line);
+}
+
+.card[data-kind='failed_action'] {
+  border-color: var(--danger-line);
+}
+
+.command-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  margin-top: 14px;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  overflow-wrap: anywhere;
+}
+
+/* ---- Sessions -------------------------------------------------------------------------------- */
+
+.session-table {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.table-head,
+.session-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(0, 1.2fr) 110px 90px 140px;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 20px;
+}
+
+.table-head {
+  color: var(--faint);
+  background: var(--subtle);
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  border-bottom: 1px solid var(--line);
+}
+
+.session-row {
+  width: 100%;
+  min-height: 80px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  font-size: 0.75rem;
+  text-align: left;
+  color: inherit;
+  transition:
+    background-color var(--state) ease,
+    transform var(--press) var(--ease-out);
+}
+
+.session-row:last-child {
+  border-bottom: 0;
+}
+
+.session-row:active {
+  transform: scale(0.995);
+}
+
+.session-row h3 {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.session-row p {
+  font-size: 0.625rem;
+  color: var(--muted);
+}
+
+.session-number {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  min-width: 1.5rem;
+}
+
+.host-column,
+.agent-column {
+  font-size: 0.6875rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-header {
+  margin-bottom: 20px;
+}
+
+.session-meta {
+  color: var(--muted);
+  font-size: 0.6875rem;
+}
+
+.session-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+.session-tab {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.session-tab[data-active='true'] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.session-tab button {
+  min-height: var(--target);
+  padding: 6px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 0.75rem;
+}
+
+/* ---- Conversation ---------------------------------------------------------------------------- */
+
+.conversation {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.conversation-scroll {
+  padding: 8px 0;
+  max-height: 58vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.history-edge {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 14px;
+}
+
+.message {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 22px;
+}
+
+.message-content {
+  min-width: 0;
+  flex: 1;
+}
+
+.message-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 6px;
+  font-size: 0.75rem;
+}
+
+.message-content p {
+  font-size: 0.8125rem;
+  line-height: 1.75;
+  margin-bottom: 10px;
+}
+
+.message-content p:last-child {
+  margin-bottom: 0;
+}
+
+.message-content ul,
+.message-content ol {
+  padding-left: 18px;
+  font-size: 0.8125rem;
+  line-height: 1.8;
+}
+
+.message-content code {
+  padding: 2px 5px;
+  background: var(--subtle);
+  border-radius: 4px;
+}
+
+.message.unsupported {
+  border-left: 2px solid var(--control-line);
+  background: var(--subtle);
+}
+
+.code-block {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+  overflow-x: auto;
+  margin: 10px 0;
+}
+
+.md-table {
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  margin: 10px 0;
+}
+
+.md-table th,
+.md-table td {
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.md-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.link-refused,
+.html-refused {
+  color: var(--muted);
+}
+
+.md-image-placeholder {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--control-line);
+  border-radius: 6px;
+  font-size: 0.6875rem;
+}
+
+.md-image {
+  max-width: 100%;
+  border-radius: 6px;
+  margin: 10px 0;
+}
+
+.tool-result {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 0.6875rem;
+  margin: 8px 22px;
+}
+
+.diff-summary,
+.control-group,
+.progress-node,
+.terminal-ref {
+  margin: 8px 22px;
+}
+
+.control-group .eyebrow {
+  margin-bottom: 8px;
+}
+
+.pending-actions {
+  list-style: none;
+  padding: 12px 22px 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pending-actions li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ---- The launch surface ---------------------------------------------------------------------- */
+
+.launch-surface {
+  padding: 16px 22px;
+  border-top: 1px solid var(--line);
+  background: var(--raised);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.launch-surface[data-stale='true'] .btn {
+  opacity: 0.6;
+}
+
+/* ---- The composer ---------------------------------------------------------------------------- */
+
+.composer {
+  padding: 16px 18px;
+  border-top: 1px solid var(--line);
+  background: var(--raised);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.composer textarea {
+  display: block;
+  width: 100%;
+  resize: vertical;
+  min-height: 86px;
+  max-height: 280px;
+  border: 0;
+  outline: none;
+  padding: 0 2px 8px;
+  background: transparent;
+  line-height: 1.6;
+  font-size: 0.8125rem;
+  /* Nothing on the typing path animates. */
+  transition: none;
+}
+
+.composer:focus-within {
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+.composer-note {
+  font-size: 0.625rem;
+  color: var(--faint);
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  background: var(--subtle);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 0.6875rem;
+}
+
+.slash-commands {
+  list-style: none;
+  padding: 8px 10px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  font-size: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* ---- The raw terminal ------------------------------------------------------------------------ */
+
+.raw-terminal {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.terminal-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--subtle);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.6875rem;
+  flex-wrap: wrap;
+}
+
+.terminal-surface {
+  min-height: 380px;
+  background: var(--ink);
+  padding: 12px;
+  /* The terminal never animates. A cell that moved would be a cell in the wrong place. */
+  transition: none;
+}
+
+.terminal-footer {
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--raised);
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* ---- Change sets ----------------------------------------------------------------------------- */
+
+.review-layout {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+  margin-bottom: 32px;
+}
+
+.review-layout > * {
+  min-width: 0;
+}
+
+.file-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--target);
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 6px;
+  padding: 9px 10px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.6875rem;
+  transition: background-color var(--state) ease;
+}
+
+.file-button[aria-current='true'] {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.diff-code {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  padding: 10px 0;
+  font: 0.6875rem/1.9 var(--font-mono);
+  tab-size: 2;
+}
+
+.diff-line {
+  display: block;
+  white-space: pre;
+  padding: 0 12px;
+}
+
+.diff-line.add {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+.diff-line.remove {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.consequence-list {
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 0.8125rem;
+  line-height: 1.7;
+}
+
+/* ---- Plugins --------------------------------------------------------------------------------- */
+
+.capability-list {
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.75rem;
+}
+
+/* ---- Pairing --------------------------------------------------------------------------------- */
+
+.pair-code {
+  font: 1.875rem/1.4 var(--font-mono);
+  letter-spacing: 0.18em;
+  text-align: center;
+  padding: 22px;
+  background: var(--subtle);
+  border: 1px dashed var(--control-line);
+  border-radius: 9px;
+  margin: 18px 0;
+  overflow-wrap: anywhere;
+}
+
+/* ---- Settings -------------------------------------------------------------------------------- */
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 175px minmax(0, 1fr);
+  gap: 20px;
+  min-height: 320px;
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: 12px;
+  border-right: 1px solid var(--line);
+}
+
+.settings-nav button {
+  display: flex;
+  align-items: center;
+  min-height: var(--target);
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  padding: 9px 10px;
+  font-size: 0.75rem;
+  text-align: left;
+  transition:
+    background-color var(--state) ease,
+    color var(--state) ease;
+}
+
+.settings-nav button[aria-selected='true'] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.settings-content {
+  min-width: 0;
+}
+
+.settings-content > h2 {
+  margin-bottom: 8px;
+}
+
+.settings-content > p {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 20px;
+}
+
+.settings-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  padding: 17px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-row:last-child {
+  border-bottom: 0;
+}
+
+.settings-row h3 {
+  font-size: 0.75rem;
+  margin: 0 0 4px;
+}
+
+.settings-row p {
+  color: var(--muted);
+  font-size: 0.6875rem;
+  line-height: 1.6;
+}
+
+.theme-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 13px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.theme-option {
+  position: relative;
+  cursor: pointer;
+  display: block;
+  min-width: 0;
+}
+
+.theme-option input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+
+.theme-preview {
+  display: flex;
+  gap: 7px;
+  height: 96px;
+  padding: 12px 10px;
+  border: 1px solid var(--preview-system-control);
+  border-radius: 8px;
+  overflow: hidden;
+  transition: border-color var(--state) ease;
+}
+
+.theme-preview.light {
+  background: var(--preview-light-bg);
+  border-color: var(--preview-light-control);
+}
+
+.theme-preview.dark {
+  background: var(--preview-dark-bg);
+  border-color: var(--preview-dark-control);
+}
+
+.theme-preview.system {
+  background: linear-gradient(112deg, var(--preview-light-bg) 49.7%, var(--preview-dark-bg) 50.3%);
+}
+
+.mini-sidebar {
+  width: 24%;
+  height: 100%;
+  border-radius: 3px;
+}
+
+.mini-sidebar > i {
+  display: block;
+  height: 3px;
+  margin: 8px 4px 0;
+  border-radius: 1px;
+}
+
+.mini-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: 3px;
+}
+
+.mini-content > i {
+  display: block;
+  height: 6px;
+  width: 60%;
+  border-radius: 2px;
+}
+
+.mini-content > b {
+  display: block;
+  flex: 1;
+  border: 1px solid;
+  border-radius: 3px;
+}
+
+.theme-preview.light .mini-sidebar,
+.theme-preview.system .mini-sidebar {
+  background: var(--preview-light-sidebar);
+}
+
+.theme-preview.light .mini-sidebar > i,
+.theme-preview.light .mini-content > i,
+.theme-preview.system .mini-sidebar > i {
+  background: var(--preview-light-accent);
+}
+
+.theme-preview.light .mini-content > b {
+  background: var(--preview-light-surface);
+  border-color: var(--preview-light-control);
+}
+
+.theme-preview.dark .mini-sidebar {
+  background: var(--preview-dark-sidebar);
+}
+
+.theme-preview.dark .mini-sidebar > i,
+.theme-preview.dark .mini-content > i,
+.theme-preview.system .mini-content > i {
+  background: var(--preview-dark-accent);
+}
+
+.theme-preview.dark .mini-content > b,
+.theme-preview.system .mini-content > b {
+  background: var(--preview-dark-surface);
+  border-color: var(--preview-dark-control);
+}
+
+.theme-caption {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 1px;
+  font-size: 0.75rem;
+  min-height: var(--target);
+}
+
+.theme-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--control-line);
+  border-radius: 50%;
+}
+
+.theme-check::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  background: var(--surface);
+  border-radius: 50%;
+  opacity: 0;
+}
+
+.theme-option input:checked ~ .theme-caption .theme-check {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.theme-option input:checked ~ .theme-caption .theme-check::after {
+  opacity: 1;
+}
+
+.theme-option input:checked ~ .theme-preview {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.theme-option input:focus-visible ~ .theme-preview {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+/* ---- Narrow windows -------------------------------------------------------------------------- */
+
+@media (max-width: 1000px) {
+  .review-layout,
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-nav {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 0 0 8px;
+  }
+
+  .table-head,
+  .session-row {
+    grid-template-columns: minmax(0, 1fr) 90px 130px;
+  }
+
+  .host-column,
+  .agent-column,
+  .table-head > span:nth-child(2),
+  .table-head > span:nth-child(3) {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .sidebar {
+    display: none;
+  }
+
+  main {
+    padding: 24px 16px 30px;
+  }
+
+  .topbar {
+    padding: 0 16px;
+  }
+
+  .theme-options {
+    gap: 10px;
+  }
+
+  .theme-preview {
+    height: 72px;
+  }
+}

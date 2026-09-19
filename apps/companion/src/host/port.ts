@@ -11,7 +11,6 @@
  */
 
 import type {
-  AttentionReadResult,
   ClosureRecord,
   Dimensions4,
   EnvironmentListResult,
@@ -22,6 +21,8 @@ import type {
   ShellLaunchResult
 } from '@kalareach/protocol'
 import type { DocumentNode } from '@kalareach/plugin-sdk'
+
+import type { AttentionInbox, LaunchSurface } from '../model/pending'
 
 /** A failure a command answered with. */
 export interface HostError {
@@ -161,6 +162,13 @@ export interface HostPort {
   sessionRead(environmentId: string, params: unknown): Promise<SessionReadResult>
   sessionClose(environmentId: string, params: unknown): Promise<Settled<ClosureRecord>>
 
+  /**
+   * What the launch surface may draw right now.
+   *
+   * The prompt generation in the answer is the one a launch must name. A button drawn at an older
+   * generation is disabled rather than launched against a prompt the person has not seen.
+   */
+  launchSurface(environmentId: string, params: unknown): Promise<LaunchSurface>
   shellLaunch(environmentId: string, params: unknown): Promise<Settled<ShellLaunchResult>>
 
   agentSnapshot(environmentId: string, params: unknown): Promise<{ nodes: DocumentNode[] }>
@@ -179,7 +187,7 @@ export interface HostPort {
   attachmentImage(environmentId: string, params: unknown): Promise<{ bytes: number[]; media_type: string }>
 
   historyPage(environmentId: string, params: unknown): Promise<unknown>
-  attentionRead(environmentId: string, params: unknown): Promise<AttentionReadResult>
+  attentionRead(environmentId: string, params: unknown): Promise<AttentionInbox>
   attentionAcknowledge(environmentId: string, params: unknown): Promise<Settled>
   questionRead(environmentId: string, params: unknown): Promise<unknown>
   questionAnswer(environmentId: string, params: unknown): Promise<Settled>

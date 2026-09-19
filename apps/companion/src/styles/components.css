@@ -727,6 +727,14 @@ textarea::placeholder {
   background: var(--raised);
 }
 
+@media (prefers-reduced-motion: reduce) {
+  /* No travel. The surface arrives and leaves by changing only its opacity. */
+  .sheet,
+  .scrim {
+    transition: opacity 120ms ease;
+  }
+}
+
 @media (prefers-reduced-transparency: reduce) {
   .scrim {
     background: #071217c7;

@@ -7,17 +7,26 @@
     "jsx": "react-jsx",
     "types": ["vite/client"],
     "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
+    // The two flags below are off here for the same reason they are off in `packages/protocol`
+    // and `packages/plugin-sdk`: this project type-checks their sources directly, and one
+    // workspace that disagreed with itself about them would report their code as broken.
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
+    // Unused names are caught by the linter, which runs only over this project's own files. The
+    // compiler sees the neighbouring packages' sources too, and they do not set this.
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    // The package contract's types are generated; the package's entry also carries a validating
+    // loader that resolves differently under a bundler's module resolution than under Node's.
+    // Only the types are used here, so the type import resolves straight to the generated file.
+    "paths": {
+      "@kalareach/plugin-sdk": ["../../packages/plugin-sdk/src/generated/plugin-sdk.ts"]
+    }
   },
   "include": ["src", "test", "e2e"]
 }

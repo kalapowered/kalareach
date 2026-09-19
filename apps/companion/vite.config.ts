@@ -36,12 +36,5 @@ export default defineConfig({
         : { index: resolve(import.meta.dirname, 'index.html') }
     }
   },
-  plugins: [react()],
-  test: {
-    environment: 'jsdom',
-    globals: false,
-    setupFiles: ['./test/setup.ts'],
-    include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
-    restoreMocks: true
-  }
+  plugins: [react()]
 })

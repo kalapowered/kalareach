@@ -9,8 +9,13 @@
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "resolveJsonModule": true,
+    "allowJs": true,
+    "checkJs": false,
+    // The test configuration imports the build configuration by its own filename, which is what
+    // Vite resolves at run time.
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["vite.config.ts", "playwright.config.ts", "scripts"]
+  "include": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts", "scripts/**/*.mjs"]
 }
