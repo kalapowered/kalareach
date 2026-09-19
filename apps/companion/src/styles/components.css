@@ -48,6 +48,17 @@
   object-fit: contain;
 }
 
+/* Two marks are in the document and one is shown, so the mark changes with the mode in the same
+   frame the tokens do. */
+.mark-dark,
+:root[data-theme='dark'] .mark-light {
+  display: none;
+}
+
+:root[data-theme='dark'] .mark-dark {
+  display: block;
+}
+
 .brand-divider {
   height: 24px;
   width: 1px;
