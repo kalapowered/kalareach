@@ -1360,11 +1360,15 @@ right, and the store is where they live.
 
 One session's worker is the one owner of its own attention store, for as long as it is running.
 Every write replaces the whole state and is made from the copy its owner is holding, so two owners
-would each replace the other's work with a picture of the world that predates it. Opening the store
-claims an exclusive lock on a file of its own beside it, before it reads anything, and holds it
-until the store is let go; anything else that opens that file is told it is held rather than handed
-a state it would not be allowed to write back. The lock is on a file of its own, so the receipts
-and the question ledger, which share the store's file, keep writing throughout.
+would each replace the other's work with a picture of the world that predates it. The claim is a
+row inside the store: opening it reads that row and writes its own under the same transaction that
+reads the state, so whatever name reached the database reaches the one claim, and anything else
+that opens it is told who holds it rather than handed a state it would not be allowed to write
+back. Letting the store go releases the claim at once. An owner that ends without letting go - one
+that was killed, or a machine that stopped - leaves the claim behind, and what releases that one is
+its lease: a claim from a boot that has ended is not standing, and one from this boot stands for
+ten minutes unrefreshed, against an owner that refreshes it on every write and a maintenance loop
+that writes at least once a minute.
 
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same

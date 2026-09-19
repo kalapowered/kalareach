@@ -32,10 +32,10 @@ pub enum Error {
         key: String,
     },
     /// Another live owner already holds this feature store.
-    #[error("another owner holds the attention feature store at {path}")]
+    #[error("process {process} holds this attention feature store")]
     StoreHeld {
-        /// The store that is held.
-        path: String,
+        /// The process whose claim stands.
+        process: u32,
     },
     /// The feature store could not be read or written.
     #[error("the attention feature store is unavailable ({kind}): {detail}")]

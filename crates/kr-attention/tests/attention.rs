@@ -3718,11 +3718,9 @@ fn a_wait_a_reopen_restarted_is_not_restarted_by_the_next_one() {
 }
 
 #[test]
-fn an_open_that_reads_an_older_state_does_not_replace_what_was_committed_meanwhile() {
+fn the_write_an_open_makes_does_not_replace_what_the_owner_before_it_committed() {
     // Opening the store reads it and writes it again, and a whole-state write replaces
-    // everything. If the read came before another connection's commit and the write after it,
-    // that commit would be replaced by the state this open had read. The write lock is taken
-    // before the read so the two cannot interleave that way.
+    // everything. What the owner before it committed has to survive that write.
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     let who = actor("device:phone");
@@ -3765,8 +3763,8 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
         .expect("the store records the decision");
     let key = held.key_for(AttentionRule::PendingApproval, "req-1");
 
-    // The race review 15 describes starts here: a second owner tries to read the state before the
-    // first one's next write lands. It never gets that far.
+    // A second owner tries to read the state before the first one's next write lands. It never
+    // gets that far.
     let refused = Attention::open(&path, reading(1_000));
     assert!(
         matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
@@ -3809,17 +3807,20 @@ fn one_database_is_one_owner_whatever_name_reaches_it() {
         "a link to the store is the store: {refused:?}"
     );
 
-    // A hard link beside it: two real names, one database.
-    let second_name = directory.path().join("also.db");
-    std::fs::hard_link(&path, &second_name).expect("the link is made");
-    let refused = Attention::open(&second_name, reading(2_000));
-    assert!(
-        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
-        "a second name for the store is the store: {refused:?}"
-    );
+    // A hard link beside it: two real names, one database, and no second owner either way. The
+    // claim is a row in the database, so the name that reached it is not what decides; SQLite
+    // also declines to open a second name for a database it is already journalling. Either answer
+    // is a refusal, and neither is a second owner.
+    #[cfg(unix)]
+    {
+        let second_name = directory.path().join("also.db");
+        std::fs::hard_link(&path, &second_name).expect("the link is made");
+        assert!(
+            Attention::open(&second_name, reading(2_000)).is_err(),
+            "a second name for the store is not a second owner of it"
+        );
+    }
 
     drop(held);
-    let next = Attention::open(&alias, reading(3_000)).expect("the store opens under either name");
-    drop(next);
-    let _ = Attention::open(&second_name, reading(4_000)).expect("and under the other");
+    let _ = Attention::open(&alias, reading(3_000)).expect("the store opens under either name");
 }

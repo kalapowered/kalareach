@@ -156,8 +156,8 @@ fn translate(error: kr_attention::Error) -> WorkerError {
                 "this session no longer holds {key}, so a page cannot continue after it"
             ),
         },
-        kr_attention::Error::StoreHeld { path } => WorkerError::JournalUnavailable {
-            detail: format!("another owner holds this session's attention store at {path}"),
+        kr_attention::Error::StoreHeld { process } => WorkerError::JournalUnavailable {
+            detail: format!("process {process} holds this session's attention store"),
         },
         kr_attention::Error::TooManyActors { bound } => WorkerError::QuotaExceeded {
             detail: format!(

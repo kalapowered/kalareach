@@ -52,12 +52,15 @@
 //!
 //! Every write here replaces the whole state, and it is made from the copy its owner has been
 //! holding, so two owners of one store would each replace the other's work with a picture of the
-//! world that predates it. There is one owner instead: opening a store claims an exclusive lock on
-//! a file of its own beside it, named after what the operating system says the store *is* rather
-//! than after the name that reached it, holds it until the store is dropped, and refuses a second
-//! opener with [`Error::StoreHeld`] rather than letting it read a state it may not write.
-//! The lock is on a file of its own so the receipt journal and the question ledger, which share
-//! this store's file, keep writing through their own transactions throughout.
+//! world that predates it. There is one owner instead, and the claim is a **row in the store**:
+//! opening it reads that row and writes its own under the same transaction that reads the state,
+//! so every name for one database reaches one claim because there is nothing to key on but the
+//! database. A claim from a boot that has ended, or one this boot has not refreshed within
+//! [`OWNER_LEASE_MS`], is taken; anything else is a live owner and the second opener is told so
+//! with [`Error::StoreHeld`]. Nothing here takes a second handle on the file: on the Unix family,
+//! closing any descriptor for a file drops every lock the process holds on it, so a handle opened
+//! beside SQLite's own would release the locks the receipt journal and the question ledger are
+//! holding on the same file.
 //!
 //! # What a stored value may not do
 //!
@@ -92,7 +95,7 @@ use crate::visit::{Omitted, Visit};
 /// by - so a row written under a different derivation would be read under a name that does not
 /// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
 /// each of its intervals is measured from, and a row that predates those columns carries none.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -112,6 +115,8 @@ pub struct StoredState {
     pub gaps: Vec<AttentionGap>,
     /// How many items the host has let go of to stay inside its bound.
     pub dropped: u64,
+    /// Who holds this store, when anybody does.
+    pub owner: Option<Owner>,
     /// The secret this store derives its item keys under.
     ///
     /// It is generated once, when a store first has state to write, and read back with the rest.
@@ -146,148 +151,110 @@ pub struct StoredState {
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
-    /// What says this process is the one owner of this store, for as long as it is held.
+}
+
+/// What one process must say to own a store, and how long that claim stands unrefreshed.
+///
+/// The claim is a row in the store itself, so every name for one database reaches one claim by
+/// construction: there is nothing to key on but the database. It carries the process that made it,
+/// the boot that process is running in, and the continuous reading it was last refreshed at, which
+/// is the only clock an interval may be measured on.
+///
+/// A claim from another boot is stale by definition: that boot has ended and so has its process. A
+/// claim from this boot that has not been refreshed within the lease is stale too, because an
+/// owner that is running refreshes it on every write, and the host's own maintenance writes at
+/// least once a minute. Anything else is a live owner, and a second opener is told so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner {
+    /// What tells this claim apart from every other, including another in the same process.
     ///
-    /// `None` for a store that lives only in memory, because nothing else can reach one.
-    _ownership: Option<Ownership>,
+    /// A process identifier cannot do it: two owners inside one process share one, and a process
+    /// that died and whose number was given to another is not the owner that number names. This is
+    /// random, and one value holds one of them for its life.
+    pub claim: u64,
+    /// The process that holds the store, for a person reading the refusal.
+    pub process: u32,
+    /// The boot that process is running in.
+    pub boot: BootMark,
+    /// The continuous reading the claim was last refreshed at, within that boot.
+    pub refreshed_ms: u64,
 }
 
-/// The claim one process makes on one feature store.
+/// How long a claim stands without being refreshed before another opener may take it.
 ///
-/// A whole-state write replaces everything, and it is made from the copy its owner has been
-/// holding, so two owners of one store would each replace the other's work with a picture of the
-/// world that predates it. There is one owner instead. The claim is an exclusive lock on a file of
-/// its own beside the store and named after what the operating system says the store *is* - its
-/// device and its number there - so every name for one database claims one lock. It is held from
-/// before the state is read until this value is dropped, and released by the operating system if
-/// the process ends without dropping it. It is a file of its
-/// own so that the receipt journal and the question ledger, which share the store's file, keep
-/// writing through their own transactions throughout.
-#[derive(Debug)]
-struct Ownership {
-    _claim: Connection,
+/// Ten minutes against a maintenance loop that writes every minute: long enough that an owner
+/// which is merely busy is never taken from, short enough that a process killed without unwinding
+/// does not hold a session's store until the machine restarts.
+pub const OWNER_LEASE_MS: u64 = 10 * 60_000;
+
+impl Owner {
+    /// Returns this process's claim at this reading.
+    #[must_use]
+    pub fn here(claim: u64, reading: HostReading) -> Self {
+        Self {
+            claim,
+            process: std::process::id(),
+            boot: reading.boot,
+            refreshed_ms: reading.continuous_ms,
+        }
+    }
+
+    /// Returns a claim no other owner holds.
+    ///
+    /// Sixty-three bits of it, because the store writes an integer it can read back exactly and a
+    /// row it could not is refused rather than stored. Sixty-three bits is not a number two owners
+    /// draw the same of.
+    #[must_use]
+    pub fn fresh_claim() -> u64 {
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        let drawn = u64::from_be_bytes(bytes[..8].try_into().expect("eight of sixteen bytes"));
+        drawn >> 1
+    }
+
+    /// Whether this claim still stands against `reading`, for an owner other than `claim`.
+    ///
+    /// A claim from a boot that has ended is not standing: that boot's processes are gone. One
+    /// from this boot stands until its lease runs out, which an owner that is running refreshes on
+    /// every write. **What this cannot ask** is whether a process on this boot is still alive, so
+    /// an owner that was killed without unwinding holds its store until the lease does run out.
+    #[must_use]
+    pub fn stands_against(&self, claim: u64, reading: HostReading) -> bool {
+        self.claim != claim
+            && self.boot == reading.boot
+            && reading.continuous_ms.saturating_sub(self.refreshed_ms) < OWNER_LEASE_MS
+    }
 }
 
-/// How long a second owner waits for the first to let go before it is told the store is held.
+/// How a store is opened: a file, never a URI.
 ///
-/// Short, because it is not a queue: the answer to a store somebody else owns is to say so.
-pub const OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// What the file a store's ownership is claimed on is called, before the store's own identity.
-pub const OWNERSHIP_PREFIX: &str = "attention-owner-";
-
-/// How a store and its ownership are opened: a file, never a URI.
-///
-/// SQLite reads a name beginning `file:` as a URI by default, and a URI carries a query after the
-/// path it names. A suffix appended to one of those changes the query rather than the file, so two
-/// names that look different would open one database - and an ownership claim meant for a file
-/// beside the store would land on the store's own file, where it would hold the lock the receipts
-/// and the question ledger need. A name here is a path.
+/// SQLite reads a name beginning `file:` as a URI, and `:memory:` as a database of its own, so the
+/// path is resolved before it is handed over and the flags leave URI interpretation out. Neither
+/// is what names the owner - the row in the database is - but a string that opened a different
+/// file would make a second database rather than a second owner of one.
 const FILE_ONLY: rusqlite::OpenFlags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
     .union(rusqlite::OpenFlags::SQLITE_OPEN_CREATE)
     .union(rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX);
 
-impl Ownership {
-    /// Claims the one ownership of the store at `path`, or says who has it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::StoreHeld`] when another live owner holds it, and
-    /// [`Error::StoreUnavailable`] when the claim itself cannot be made.
-    fn claim(path: &Path) -> Result<Self> {
-        let claim = Connection::open_with_flags(Self::identity(path)?, FILE_ONLY)?;
-        claim.busy_timeout(OWNERSHIP_TIMEOUT)?;
-        // The transaction is never committed. It holds the file's write lock until this
-        // connection closes, which is this value's drop or this process ending.
-        match claim.execute_batch("BEGIN EXCLUSIVE") {
-            Ok(()) => Ok(Self { _claim: claim }),
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if matches!(
-                    error.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                ) =>
-            {
-                Err(Error::StoreHeld {
-                    path: path.display().to_string(),
-                })
-            }
-            Err(error) => Err(error.into()),
-        }
+/// Returns a path SQLite can be given, resolved and absolute, for a file that may not exist yet.
+fn resolve(path: &Path) -> Result<std::path::PathBuf> {
+    let unavailable = |error: &dyn core::fmt::Display| Error::StoreUnavailable {
+        kind: StoreFault::Other,
+        detail: format!("{} cannot be resolved: {error}", path.display()),
+    };
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Ok(resolved);
     }
-
-    /// Returns the one name this store is claimed under, whatever name reached it.
-    ///
-    /// Ownership is of a database, not of a spelling. A symbolic link gives one database two
-    /// paths and a hard link gives it two real names, and two owners claiming two names would each
-    /// hold a lock the other never asks for, which is no ownership at all. So the claim is named
-    /// after what the operating system says the file *is* - the device it sits on and its number
-    /// there, read from an open handle rather than from the path - and it is placed beside the
-    /// file the path resolves to.
-    ///
-    /// **What this does not reach:** a second hard link to the store in another directory. Both
-    /// names are real and each resolves to its own directory, so the claim beside one is not the
-    /// claim beside the other. On a platform where this build cannot ask what a file is, a hard
-    /// link beside it is not reached either. Nothing this host does creates one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::StoreUnavailable`] when the file cannot be opened, when what it is cannot
-    /// be read, or when the path cannot be resolved.
-    fn identity(path: &Path) -> Result<std::path::PathBuf> {
-        let unavailable = |what: &str, error: &dyn core::fmt::Display| Error::StoreUnavailable {
-            kind: StoreFault::Other,
-            detail: format!("{} {what}: {error}", path.display()),
-        };
-        // Opened, and created when it is not there yet, so the identity comes from a handle to the
-        // file rather than from the name that reached it.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| unavailable("cannot be opened", &error))?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| unavailable("cannot be read", &error))?;
-        let resolved = std::fs::canonicalize(path)
-            .map_err(|error| unavailable("cannot be resolved", &error))?;
-        let directory = resolved.parent().unwrap_or_else(|| Path::new("."));
-        Ok(directory.join(format!(
-            "{OWNERSHIP_PREFIX}{}",
-            Self::file_mark(&metadata, &resolved)
-        )))
-    }
-
-    /// Returns what the operating system says this file is, as a name a claim can carry.
-    ///
-    /// The device it sits on and its number there, which every name for one database shares: a
-    /// symbolic link and a hard link both answer with the one the file actually is.
-    #[cfg(unix)]
-    fn file_mark(metadata: &std::fs::Metadata, _resolved: &Path) -> String {
-        use std::os::unix::fs::MetadataExt;
-
-        format!("{:x}-{:x}", metadata.dev(), metadata.ino())
-    }
-
-    /// The same, where this build cannot ask what a file is without leaving the standard library.
-    ///
-    /// The resolved path is what is left. It follows a symbolic link, so two paths for one file
-    /// still claim one lock; two *hard* links do not, because each is a real name of its own.
-    /// Nothing this host does creates a second hard link to a session's own store.
-    #[cfg(not(unix))]
-    fn file_mark(_metadata: &std::fs::Metadata, resolved: &Path) -> String {
-        use sha2::{Digest, Sha256};
-
-        let digest = Sha256::digest(resolved.as_os_str().as_encoded_bytes());
-        let mut mark = String::with_capacity(32);
-        for byte in digest.iter().take(16) {
-            use core::fmt::Write;
-
-            write!(mark, "{byte:02x}").expect("writing to a string cannot fail");
-        }
-        mark
-    }
+    let name = path.file_name().ok_or_else(|| Error::StoreUnavailable {
+        kind: StoreFault::Other,
+        detail: format!("{} names no feature store", path.display()),
+    })?;
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok(std::fs::canonicalize(directory)
+        .map_err(|error| unavailable(&error))?
+        .join(name))
 }
 
 const SCHEMA: &str = "
@@ -334,6 +301,13 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS attention_dropped (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         items INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS attention_owner (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        claim INTEGER NOT NULL,
+        process INTEGER NOT NULL,
+        boot TEXT NOT NULL,
+        refreshed_ms INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS attention_key_secret (
         id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -431,6 +405,7 @@ const TABLES: &[&str] = &[
     "attention_actors",
     "attention_dropped",
     "attention_announcements",
+    "attention_owner",
     "attention_key_secret",
     "attention_item_acks",
     "attention_pending_inputs",
@@ -492,16 +467,15 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be
-    /// created, and [`Error::StoreUnreadable`] when the file records a schema this build does not
-    /// know.
+    /// Returns [`Error::StoreHeld`] when another live owner already holds this store,
+    /// [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be created,
+    /// and [`Error::StoreUnreadable`] when the file records a schema this build does not know.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        // Claimed before the file is opened, let alone read: an owner that read first and claimed
-        // afterwards would already be holding a copy of the world it might not be allowed to write.
-        let ownership = Ownership::claim(path)?;
-        let connection = Connection::open_with_flags(path, FILE_ONLY)?;
-        Self::prepare(connection, Some(ownership))
+        // The resolved path, never the name that reached here: SQLite reads a name beginning
+        // `file:` as a URI and `:memory:` as a database of its own, and neither is the file this
+        // store is meant to be. Who owns the store is a row inside it, not anything about a name.
+        let connection = Connection::open_with_flags(resolve(path.as_ref())?, FILE_ONLY)?;
+        Self::prepare(connection)
     }
 
     /// Opens the store inside the worker's private journal, or in memory when there is none.
@@ -511,9 +485,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be
-    /// created, and [`Error::StoreUnreadable`] when the file records a schema this build does not
-    /// know.
+    /// Returns [`Error::StoreHeld`] when another live owner already holds this store,
+    /// [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be created,
+    /// and [`Error::StoreUnreadable`] when the file records a schema this build does not know.
     pub fn beside(path: Option<&Path>) -> Result<Self> {
         match path {
             Some(path) => Self::open(path),
@@ -528,10 +502,10 @@ impl Store {
     /// Returns [`Error::StoreUnavailable`] when the schema cannot be created.
     pub fn in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory()?;
-        Self::prepare(connection, None)
+        Self::prepare(connection)
     }
 
-    fn prepare(connection: Connection, ownership: Option<Ownership>) -> Result<Self> {
+    fn prepare(connection: Connection) -> Result<Self> {
         // The store shares its file with the receipt journal and the question ledger, so a write
         // can find another of them holding it. The wait is bounded: past it the caller is told the
         // store is unavailable rather than left blocked.
@@ -562,10 +536,7 @@ impl Store {
             }
         }
         connection.execute_batch(SCHEMA)?;
-        Ok(Self {
-            connection,
-            _ownership: ownership,
-        })
+        Ok(Self { connection })
     }
 
     /// Reads the whole stored state back.
@@ -621,6 +592,22 @@ impl Store {
             None if Self::is_empty(connection)? => crate::key::KeySecret::fresh(),
             None => return Err(unreadable("key secret")),
         };
+        let owner: Option<(i64, i64, String, i64)> = connection
+            .query_row(
+                "SELECT claim, process, boot, refreshed_ms FROM attention_owner WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let owner = match owner {
+            Some((claim, process, boot, refreshed)) => Some(Owner {
+                claim: as_u64(claim, "owner claim")?,
+                process: u32::try_from(process).map_err(|_| unreadable("owner process"))?,
+                boot: BootMark::from_hex(&boot).ok_or_else(|| unreadable("owner boot"))?,
+                refreshed_ms: as_u64(refreshed, "owner lease")?,
+            }),
+            None => None,
+        };
         let announcement: Option<i64> = connection
             .query_row(
                 "SELECT next FROM attention_announcements WHERE id = 0",
@@ -639,6 +626,7 @@ impl Store {
                 None => 0,
             },
             keys,
+            owner,
             next_announcement: match announcement {
                 Some(value) => as_u64(value, "announcement counter")?,
                 None => 0,
@@ -794,6 +782,18 @@ impl Store {
             "INSERT INTO attention_dropped (id, items) VALUES (0, ?1)",
             params![as_i64(state.dropped, "dropped count")?],
         )?;
+        if let Some(owner) = state.owner {
+            transaction.execute(
+                "INSERT INTO attention_owner (id, claim, process, boot, refreshed_ms)
+                 VALUES (0, ?1, ?2, ?3, ?4)",
+                params![
+                    as_i64(owner.claim, "owner claim")?,
+                    i64::from(owner.process),
+                    owner.boot.to_hex(),
+                    as_i64(owner.refreshed_ms, "owner lease")?
+                ],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO attention_key_secret (id, secret) VALUES (0, ?1)",
             params![state.keys.as_bytes().as_slice()],

@@ -46,7 +46,7 @@ use crate::engine::{Announcement, Content, Engine, Outcome, Restored};
 use crate::error::Result;
 use crate::event::{EventKind, SourceEvent};
 use crate::review::Reviews;
-use crate::store::{Store, StoredState};
+use crate::store::{Owner, Store, StoredState};
 use crate::time::HostReading;
 use crate::visit::{Changed, Visit, Visits};
 
@@ -64,6 +64,19 @@ struct State {
 pub struct Attention {
     state: State,
     store: Store,
+    /// This process's claim on the store, refreshed by every write it makes.
+    ///
+    /// Every write replaces the whole state and is made from the copy this value holds, so two
+    /// owners would each replace the other's work with a picture of the world that predates it.
+    /// The claim is a row in the store, taken as it is opened, and a second opener that finds a
+    /// live one is told so rather than handed a state it may not write back.
+    owner: Owner,
+    /// The last reading this value was given, which is what refreshes the claim.
+    ///
+    /// A call that carries no reading of its own refreshes the claim at the last one there was,
+    /// which is never later than now: a claim that looks older than it is may be taken by somebody
+    /// else, and one that looked newer would keep a store nobody owns.
+    latest: HostReading,
 }
 
 impl Attention {
@@ -71,9 +84,10 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the store cannot be opened, read or written
-    /// back, and [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read.
-    /// Opening writes, because what it read back may have had to be re-anchored.
+    /// Returns [`crate::Error::StoreHeld`] when another live owner already holds the store,
+    /// [`crate::Error::StoreUnavailable`] when it cannot be opened, read or written back, and
+    /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read. Opening
+    /// writes, because what it read back may have had to be re-anchored.
     pub fn open(path: impl AsRef<Path>, reading: HostReading) -> Result<Self> {
         Self::from_store(Store::open(path)?, reading)
     }
@@ -82,9 +96,10 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the store cannot be opened, read or written
-    /// back, and [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read.
-    /// Opening writes, because what it read back may have had to be re-anchored.
+    /// Returns [`crate::Error::StoreHeld`] when another live owner already holds the store,
+    /// [`crate::Error::StoreUnavailable`] when it cannot be opened, read or written back, and
+    /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read. Opening
+    /// writes, because what it read back may have had to be re-anchored.
     pub fn beside(path: Option<&Path>, reading: HostReading) -> Result<Self> {
         Self::from_store(Store::beside(path)?, reading)
     }
@@ -107,12 +122,29 @@ impl Attention {
         // write lock is taken before the read. A whole-state write replaces everything, so another
         // connection that committed between the two would have its work replaced by the older
         // state this one had read.
+        let claim = Owner::fresh_claim();
+        let owner = Owner::here(claim, reading);
         let state = store.recover(|stored| {
+            // The claim is read and written under the transaction that reads the state, so no
+            // opener can come between the two. A claim from a boot that has ended, or one this
+            // boot has not refreshed within its lease, is taken; a live one is told about.
+            if let Some(held) = stored.owner
+                && held.stands_against(claim, reading)
+            {
+                return Err(crate::Error::StoreHeld {
+                    process: held.process,
+                });
+            }
             let state = Self::restore(stored, reading);
-            let written = snapshot(&state);
+            let written = snapshot(&state, Some(owner));
             Ok((written, state))
         })?;
-        Ok(Self { state, store })
+        Ok(Self {
+            state,
+            store,
+            owner,
+            latest: reading,
+        })
     }
 
     /// Builds the state one stored snapshot and one reading describe.
@@ -180,11 +212,24 @@ impl Attention {
     /// event would have changed is kept, and nothing is announced: a decision this host could not
     /// record is one it would make again at its next start.
     pub fn apply(&mut self, event: &SourceEvent, reading: HostReading) -> Result<Vec<Outcome>> {
+        self.latest = reading;
+
         self.commit(|state| {
             let mut outcomes = Vec::new();
             consume(state, event, reading, false, &mut outcomes);
             outcomes
         })
+    }
+
+    /// Lets the store go, so the next owner does not wait out a lease nobody is holding.
+    ///
+    /// An owner that ends without this - killed, or its process gone - leaves its claim behind,
+    /// and the lease is what releases that one. This is the ordinary way, and it is immediate.
+    fn release(&mut self) {
+        // Best effort: a store that cannot be written now is one whose claim the lease releases
+        // instead, and there is nobody left to tell.
+        let released = snapshot(&self.state, None);
+        let _ = self.store.save(&released);
     }
 
     /// Returns the key one rule and one subject land on in this session's store.
@@ -216,6 +261,8 @@ impl Attention {
     ///
     /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
     pub fn tick(&mut self, reading: HostReading) -> Result<Vec<Outcome>> {
+        self.latest = reading;
+
         self.commit(|state| {
             let outcomes = state.engine.tick(reading);
             carry_gaps(state, &outcomes);
@@ -357,6 +404,7 @@ impl Attention {
         keys: &[AttentionKey],
         reading: HostReading,
     ) -> Result<AttentionAcknowledgeResult> {
+        self.latest = reading;
         self.try_commit(|state| {
             admit(state, actor)?;
             let acknowledged = state.engine.acknowledge(actor, keys, reading);
@@ -403,6 +451,7 @@ impl Attention {
         version: u64,
         reading: HostReading,
     ) -> Result<ReviewAcknowledgeResult> {
+        self.latest = reading;
         self.try_commit(|state| {
             admit(state, actor)?;
             let review = state
@@ -537,6 +586,7 @@ impl Attention {
         events: &[SourceEvent],
         reading: HostReading,
     ) -> Result<Vec<Outcome>> {
+        self.latest = reading;
         self.commit(|state| {
             let mut outcomes = Vec::new();
             for event in events {
@@ -561,7 +611,10 @@ impl Attention {
     fn try_commit<T>(&mut self, change: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut candidate = self.state.clone();
         let answer = change(&mut candidate)?;
-        self.store.save(&snapshot(&candidate))?;
+        // Every write refreshes the claim, which is what tells a later opener this owner is still
+        // here.
+        self.owner = Owner::here(self.owner.claim, self.latest);
+        self.store.save(&snapshot(&candidate, Some(self.owner)))?;
         self.state = candidate;
         Ok(answer)
     }
@@ -766,8 +819,14 @@ fn record_semantics(state: &mut State, event: &SourceEvent) {
     }
 }
 
+impl Drop for Attention {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Returns everything the feature store writes down.
-fn snapshot(state: &State) -> StoredState {
+fn snapshot(state: &State, owner: Option<Owner>) -> StoredState {
     StoredState {
         items: state.engine.items().cloned().collect(),
         item_acks: state.engine.all_acknowledgements().clone(),
@@ -775,6 +834,7 @@ fn snapshot(state: &State) -> StoredState {
         consumed: state.engine.all_consumed().clone(),
         gaps: state.engine.gaps().to_vec(),
         dropped: state.engine.dropped(),
+        owner,
         next_announcement: state.engine.next_announcement(),
         keys: state.engine.key_secret(),
         pending_inputs: state.engine.pending_inputs().clone(),
