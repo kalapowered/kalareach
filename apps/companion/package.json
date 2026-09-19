@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
     "test:mobile": "vitest run test/mobile",
+    "test:setup": "vitest run test/setup-states.test.ts test/setup-assistant.test.tsx",
     "e2e": "node scripts/e2e.mjs",
     "tauri": "tauri",
     "android": "node scripts/android.mjs"

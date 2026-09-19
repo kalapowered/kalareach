@@ -15,6 +15,7 @@ import { Hosts, Sessions } from './views/Sessions'
 import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
+import { Setup } from './setup/Setup'
 import { failureMessage } from './host/port'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
@@ -110,6 +111,16 @@ export function App(): ReactNode {
           >
             Add a device
           </button>
+          <button
+            type="button"
+            className="nav-item"
+            aria-current={place.view === 'setup' ? 'page' : undefined}
+            onClick={() => {
+              go({ view: 'setup' })
+            }}
+          >
+            Set up this Mac
+          </button>
         </div>
       </aside>
 
@@ -130,6 +141,7 @@ export function App(): ReactNode {
           {place.view === 'changesets' ? <ChangeSets /> : null}
           {place.view === 'plugins' ? <Plugins /> : null}
           {place.view === 'pairing' ? <Pairing /> : null}
+          {place.view === 'setup' ? <Setup /> : null}
           {place.view === 'session' ? (
             <Session sessionId={place.sessionId} pane={place.pane} />
           ) : null}

@@ -28,6 +28,7 @@ export type Place =
   | { readonly view: 'changesets' }
   | { readonly view: 'plugins' }
   | { readonly view: 'pairing' }
+  | { readonly view: 'setup' }
   | { readonly view: 'session'; readonly sessionId: string; readonly pane: 'semantic' | 'terminal' }
 
 

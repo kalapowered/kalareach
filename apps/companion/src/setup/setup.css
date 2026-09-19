@@ -1,0 +1,285 @@
+/*
+ * The setup assistant's own layout.
+ *
+ * Every colour, space and duration here is a Newsprint token. There is no second visual system in
+ * this file: the cards, badges, buttons and banners are the ones the rest of the application uses,
+ * and what is added is the arrangement a single path through five steps needs.
+ *
+ * Motion. Everything here is between 120 and 200 ms and moves opacity, colour or one grid row,
+ * and everything a person can change twice quickly is a transition rather than a keyframe, so it
+ * retargets from what is on screen instead of restarting. The one keyframe is the step panel's
+ * arrival, which plays once on a surface that has just been mounted and has nothing to interrupt.
+ * A keyboard-driven change is instant and reduced motion removes the travel, both through the
+ * shared rules in base.css.
+ */
+
+.setup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-5);
+  max-width: 46rem;
+  margin: 0 auto;
+  padding-bottom: var(--gap-6);
+}
+
+/* ---- The rail --------------------------------------------------------------------------------- */
+
+.setup-rail {
+  display: flex;
+  gap: var(--gap-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-x: auto;
+  /* The rail scrolls on a narrow window rather than wrapping into a second row that reads as a
+     second path. */
+  scrollbar-width: none;
+}
+
+.setup-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.setup-rail > li {
+  flex: 1 1 0;
+  min-width: 8.5rem;
+}
+
+.setup-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
+  width: 100%;
+  min-height: var(--target);
+  padding: var(--gap-2) var(--gap-3);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-top: 2px solid var(--line);
+  border-radius: 0;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+  transition:
+    color var(--state) var(--ease-out),
+    border-color var(--state) var(--ease-out);
+}
+
+.setup-step:hover {
+  color: var(--text);
+}
+
+.setup-step[data-state='passed'] {
+  border-top-color: var(--success-line);
+  color: var(--text);
+}
+
+.setup-step[data-state='current'] {
+  border-top-color: var(--accent);
+  color: var(--text);
+}
+
+.setup-step-mark {
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
+.setup-step[data-state='current'] .setup-step-mark {
+  color: var(--accent);
+}
+
+.setup-step-title {
+  font-weight: 600;
+  /* Tighter than body text, because a short label at this size reads too loose at 0. */
+  letter-spacing: -0.01em;
+}
+
+.setup-step-note {
+  font-size: 0.8125rem;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- The panel -------------------------------------------------------------------------------- */
+
+.setup-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-4);
+  animation: setup-step-in var(--surface-in) var(--ease-out);
+}
+
+@keyframes setup-step-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 6px, 0);
+  }
+}
+
+.setup-group {
+  margin: var(--gap-4) 0 0;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+
+.setup-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  position: sticky;
+  bottom: 0;
+  padding: var(--gap-3) 0;
+  background: linear-gradient(to top, var(--bg) 60%, transparent);
+}
+
+/* ---- Inside a card ---------------------------------------------------------------------------- */
+
+.setup-caveat {
+  margin: 0;
+  padding: var(--gap-2) var(--gap-3);
+  border-left: 2px solid var(--warning-line);
+  background: var(--warning-soft);
+  color: var(--warning);
+  border-radius: 0 6px 6px 0;
+}
+
+.setup-governs,
+.setup-choices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.setup-governs > li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  padding: var(--gap-2) 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.setup-governs > li:last-child {
+  border-bottom: 0;
+}
+
+.setup-choices > li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
+  padding: var(--gap-2) 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.setup-choices > li:last-child {
+  border-bottom: 0;
+}
+
+.setup-persistence {
+  margin: 0;
+  color: var(--muted);
+}
+
+.setup-route {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  flex-wrap: wrap;
+}
+
+.setup-disclose {
+  align-self: flex-start;
+  min-height: var(--target);
+  /* A text control still has to be as easy to hit as a button, in both directions. */
+  padding: var(--gap-1) 0;
+}
+
+/*
+ * The evidence a record carries.
+ *
+ * It opens with a row transition rather than a height in pixels, so the panel is exactly as tall
+ * as what is in it and nothing has to be measured. The opacity follows a little behind the row, so
+ * the text arrives after there is room for it rather than through the edge of the card.
+ */
+.setup-evidence {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows var(--state) var(--ease-out),
+    opacity var(--press) var(--ease-out);
+}
+
+.setup-evidence > div {
+  overflow: hidden;
+}
+
+.setup-evidence[data-open='true'] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows var(--state) var(--ease-out),
+    opacity var(--state) var(--ease-out) 40ms;
+}
+
+.setup-effects {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-4);
+  margin: 0 0 var(--gap-4);
+  padding: 0;
+  list-style: none;
+}
+
+.setup-effects > li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
+  padding-bottom: var(--gap-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.setup-effects > li:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.setup-effects p {
+  margin: 0;
+}
+
+/* ---- Narrow windows --------------------------------------------------------------------------- */
+
+@media (max-width: 40rem) {
+  .setup-route {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .setup-governs > li {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--gap-1);
+  }
+}
+
+/* ---- Reduced motion --------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  /*
+   * The row transition is travel, so it goes and the panel is its full size at once; the text
+   * still fades in, which is what says the answer arrived rather than having always been there.
+   * The step panel's own arrival is an animation, and the application's shared rule removes every
+   * one of those under reduced motion, which is the answer this product already gives.
+   */
+  .setup-evidence,
+  .setup-evidence[data-open='true'] {
+    transition: opacity var(--state) var(--ease-out);
+  }
+}
