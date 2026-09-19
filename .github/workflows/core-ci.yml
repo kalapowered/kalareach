@@ -154,12 +154,14 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
 
-      # What the two shells need to configure and build from their own release tarballs. Upstream
-      # is fetched by the build script, never vendored.
+      # What the shells need to configure and build from their own release tarballs. Upstream is
+      # fetched by the build script, never vendored. The fish package is a Rust shell built through
+      # CMake, and its own build turns the message catalogues with gettext.
       - name: Install the shells' build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes libncurses-dev
+          sudo apt-get install --no-install-recommends --yes libncurses-dev cmake gettext
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -175,7 +177,7 @@ jobs:
       # pinned release with no fuzz at all, so a patch that has drifted from the release it names
       # fails here rather than being reconciled by hand.
       - name: Patches apply cleanly to the pinned releases
-        run: bash scripts/build-shells.sh --zsh --bash --check-patches
+        run: bash scripts/build-shells.sh --all --check-patches
 
       # Fetches the pinned tarballs by digest, applies the patch sets, builds both packages and
       # runs each shell's own test suite. The identity written beside each binary is what the
@@ -183,13 +185,29 @@ jobs:
       - name: Build the packages
         run: bash scripts/build-shells.sh --zsh --bash --require-upstream-tests
 
+      # fish's own suite drives a terminal through Python and takes longer than this job has to
+      # give it; the manifest still names it, so a person rebuilding the package runs it. What this
+      # job proves about fish is that the patches apply, the shell builds, and the package answers
+      # the contract in the step below.
+      - name: Build the fish package
+        run: bash scripts/build-shells.sh --fish --no-upstream-tests
+
+      # This package builds no shell: it is qualified against the editor the runner already has,
+      # and the module records what it found where the tests look for it.
+      - name: Qualify the PSReadLine package
+        run: |
+          pwsh -NoProfile -Command '
+            Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
+            Publish-KalaReachQualification | Format-List'
+
       # The identity is a digest of the inputs, so the same inputs land in the same place and a
       # second run has nothing to do.
       - name: A second build reports nothing changed
         run: |
-          bash scripts/build-shells.sh --zsh --bash | tee /tmp/kr-shell-rebuild.log
+          bash scripts/build-shells.sh --all | tee /tmp/kr-shell-rebuild.log
           grep -q 'zsh .* is current, nothing changed' /tmp/kr-shell-rebuild.log
           grep -q 'bash .* is current, nothing changed' /tmp/kr-shell-rebuild.log
+          grep -q 'fish .* is current, nothing changed' /tmp/kr-shell-rebuild.log
 
       # Everything a person needs to rebuild the same package from the same upstream release: the
       # patch set, the sources the patches bring with them, the startup entry, the manifest that
@@ -202,7 +220,7 @@ jobs:
           cp scripts/build-shells.sh /tmp/kr-shell-packages/scripts/
           cp docs/shell-integration/packages.md /tmp/kr-shell-packages/docs/shell-integration/
           cp LICENSE /tmp/kr-shell-packages/
-          for shell in zsh bash; do
+          for shell in zsh bash fish; do
             mkdir -p "/tmp/kr-shell-packages/shells/$shell"
             cp -r "shells/$shell/patches" "shells/$shell/src" "shells/$shell/startup" \
                   "/tmp/kr-shell-packages/shells/$shell/"
@@ -212,6 +230,15 @@ jobs:
             cp "${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells/$shell/$identity/kr-shell-identity.json" \
                "/tmp/kr-shell-packages/shells/$shell/"
           done
+          # The package that patches nothing publishes its module and what it qualified against.
+          mkdir -p /tmp/kr-shell-packages/shells/psreadline
+          cp -r shells/psreadline/module shells/psreadline/startup \
+                /tmp/kr-shell-packages/shells/psreadline/
+          cp shells/psreadline/manifest.json shells/psreadline/LICENSE \
+             /tmp/kr-shell-packages/shells/psreadline/
+          identity="$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells/powershell/current")"
+          cp "${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells/powershell/$identity/kr-shell-identity.json" \
+             /tmp/kr-shell-packages/shells/psreadline/
 
       - name: Publish the patch sets and identity records
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -225,7 +252,9 @@ jobs:
       - name: Drive the built packages through the contract
         env:
           KR_REQUIRE_SHELL_PACKAGES: "1"
-        run: cargo test --locked -p kr-shell-integration --test zsh --test bash -- --test-threads=1
+        run: |
+          cargo test --locked -p kr-shell-integration \
+            --test zsh --test bash --test fish --test pwsh -- --test-threads=1
 
   typescript:
     name: typescript
