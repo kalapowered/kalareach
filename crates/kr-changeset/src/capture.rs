@@ -1177,10 +1177,15 @@ fn nested_repositories(
         // A repository can keep its per-worktree data in one place and its configuration, its
         // references and its objects in another, and say so in a file called `commondir`. This
         // host does not chase that second place either.
-        if let Ok(common) = RelativeName::parse(&format!("{data}/commondir"))
-            && tree.probe(&common).is_ok()
-        {
+        let Ok(common) = RelativeName::parse(&format!("{data}/commondir")) else {
             return Err(unplaceable(directory));
+        };
+        match tree.probe(&common) {
+            // Nothing of the sort: this repository's data is all in one place.
+            Err(kr_transfer::Escape::NotFound { .. }) => {}
+            // One that is there, or one this host could not ask about. Either way there may be a
+            // second place, and this host does not chase it.
+            _ => return Err(unplaceable(directory)),
         }
         found.insert(directory.to_owned());
     }
@@ -1226,24 +1231,47 @@ fn submodule_data(
         here
     };
     parts.extend(components(std::path::Path::new(target)));
-    let resolved = lexical_parts(parts);
-    let mut wanted = inside.clone();
-    wanted.extend(components(std::path::Path::new(administrative)));
-    if resolved.len() <= wanted.len() || resolved[..wanted.len()] != wanted[..] {
-        return None;
+    // Walked, not reduced. Cancelling `a/..` on paper erases whatever `a` was, and if `a` was a
+    // link the name that comes out of the arithmetic is not the place the target reaches. So each
+    // component is taken in turn and the prefix it makes is asked about before the next one: a
+    // link anywhere along the way, or anything that is not a directory, ends it.
+    let mut walked: Vec<String> = Vec::new();
+    for part in parts {
+        let part = part.to_str()?;
+        match part {
+            "." => continue,
+            "/" => walked.clear(),
+            ".." => {
+                walked.pop()?;
+                continue;
+            }
+            _ => walked.push(part.to_owned()),
+        }
+        if walked.len() <= inside.len() {
+            // Still above this working tree, where the authority cannot ask anything. Those
+            // components are the tree's own path and this host put them there itself.
+            continue;
+        }
+        let so_far: Vec<String> = walked[inside.len()..].to_vec();
+        let name = RelativeName::parse(&so_far.join("/")).ok()?;
+        match tree.probe(&name) {
+            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
+            _ => return None,
+        }
     }
-    // Spelled inside, and then walked to. A component of that spelling could be a link, and then
-    // the data would be somewhere else entirely while the name looked right.
-    let relative: Vec<String> = resolved[inside.len()..]
+    let mut wanted: Vec<String> = inside
         .iter()
         .map(|part| part.to_string_lossy().into_owned())
         .collect();
-    let candidate = relative.join("/");
-    let walked = RelativeName::parse(&candidate).ok()?;
-    match tree.probe(&walked) {
-        Ok(kr_transfer::authority::ObjectKind::Directory) => Some(candidate),
-        _ => None,
+    wanted.extend(
+        components(std::path::Path::new(administrative))
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned()),
+    );
+    if walked.len() <= wanted.len() || walked[..wanted.len()] != wanted[..] {
+        return None;
     }
+    Some(walked[inside.len()..].join("/"))
 }
 
 /// Reduces one path to its components without touching the filesystem.

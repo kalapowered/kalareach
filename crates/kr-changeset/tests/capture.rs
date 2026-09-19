@@ -1018,7 +1018,7 @@ fn a_nested_repository_that_keeps_its_data_elsewhere_refuses_the_capture() {
 /// objects somewhere other than its per-worktree data.
 #[test]
 fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
-    for shape in ["link", "commondir"] {
+    for shape in ["link", "commondir", "jump", "unreadable"] {
         let fixture = Fixture::create();
         let path = ordinary_repository(fixture.work(), &format!("{shape}-tree"));
         let nested = path.join("vendor/inner");
@@ -1040,19 +1040,49 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
         std::fs::rename(nested.join(".git"), path.join("vendor/repo-data"))
             .expect("the data moves");
         std::fs::create_dir_all(path.join(".git/modules")).expect("the modules directory");
-        if shape == "link" {
-            std::os::unix::fs::symlink("../../vendor/repo-data", path.join(".git/modules/inner"))
+        let mut spelling = "../../.git/modules/inner".to_owned();
+        match shape {
+            "link" => {
+                std::os::unix::fs::symlink(
+                    "../../vendor/repo-data",
+                    path.join(".git/modules/inner"),
+                )
                 .expect("a link to it");
-        } else {
-            std::fs::create_dir_all(path.join(".git/modules/inner")).expect("a real directory");
-            std::fs::write(
-                path.join(".git/modules/inner/commondir"),
-                b"../../../vendor/repo-data\n",
-            )
-            .expect("and it names its common directory");
+            }
+            "commondir" => {
+                std::fs::create_dir_all(path.join(".git/modules/inner")).expect("a real directory");
+                std::fs::write(
+                    path.join(".git/modules/inner/commondir"),
+                    b"../../../vendor/repo-data\n",
+                )
+                .expect("and it names its common directory");
+            }
+            // A link, then a `..` that cancels it on paper. Reducing the spelling before looking
+            // would erase the link and check a directory the target never reaches.
+            "jump" => {
+                std::fs::create_dir_all(path.join("vendor/hop")).expect("somewhere to point");
+                std::os::unix::fs::symlink("../../vendor/hop", path.join(".git/modules/jump"))
+                    .expect("a link on the way");
+                std::fs::create_dir_all(path.join(".git/modules/inner"))
+                    .expect("the name the arithmetic would reach");
+                spelling = "../../.git/modules/jump/../inner".to_owned();
+            }
+            // A directory this host cannot look inside, so it cannot say whether it names a
+            // common directory somewhere else.
+            _ => {
+                std::fs::create_dir_all(path.join(".git/modules/inner")).expect("a real directory");
+                std::fs::set_permissions(
+                    path.join(".git/modules/inner"),
+                    std::os::unix::fs::PermissionsExt::from_mode(0o000),
+                )
+                .expect("and nothing may look inside it");
+            }
         }
-        std::fs::write(nested.join(".git"), b"gitdir: ../../.git/modules/inner\n")
-            .expect("the submodule's own file");
+        std::fs::write(
+            nested.join(".git"),
+            format!("gitdir: {spelling}\n").as_bytes(),
+        )
+        .expect("the submodule's own file");
 
         let workspace = fixture.workspace(&format!("{shape}-tree"));
         let failure = fixture
@@ -1064,6 +1094,7 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
                 None,
             )
             .expect_err("a spelling this host cannot walk to is not captured around");
+        // Nothing of that repository's data is anywhere, because no version was made at all.
         assert!(
             failure
                 .to_string()

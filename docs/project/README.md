@@ -650,9 +650,15 @@ removes is never opened at all:
    follow, can name a linked worktree whose configuration lives somewhere else again, and can name
    something that is not there while the base commit still holds what used to be under it. Rather
    than guess at any of those, **this host refuses to capture the tree at all** and says so. The
-   one exception is the ordinary submodule: a target that spells its way into this repository's own
-   administrative directory is already refused by the first rule, so the capture runs and the
-   submodule's tree is named as an exclusion.
+   one exception is the ordinary submodule, and spelling alone does not earn it. The target is
+   walked **component by component** through the working tree's own handle, which follows nothing:
+   each step has to be a real directory, so a link anywhere along the way ends it, and a `..` is
+   taken after that step rather than cancelled on paper, because cancelling it would erase whatever
+   the step reached. Where it ends has to be inside this repository's own administrative directory,
+   and has to name no common directory somewhere else. Then the data is already refused by the
+   first rule, the capture runs, and the submodule's tree is named as an exclusion. A repository
+   whose own `.git` is outside its working tree has no such directory to be inside, so a tree it
+   holds with submodules is one this host refuses as well.
 
    What this covers is what a capture reads: a repository in a directory no path of the capture
    goes near is one the capture does not reach either.
