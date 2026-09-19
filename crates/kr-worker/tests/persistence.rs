@@ -1390,13 +1390,24 @@ fn a_purge_reaches_the_files_a_lost_spool_left_on_the_disk() {
         left.is_empty(),
         "a lost spool's segments are gone after the purge: {left:?}"
     );
-    // The boundary stays, because it is where this session's output got to rather than content,
-    // and a reader that lost it would be told the session started at nought.
-    let page = history.page(0, 1024).expect("a page");
-    assert!(
-        page.gap.is_present(),
-        "the range that went still reads as a gap after the purge"
+    // The boundary stays on the disk, because it is where this session's output got to rather
+    // than content. A reader that comes to the directory afterwards - the archive does exactly
+    // this - is told the range that went rather than that the session started at nought, and only
+    // the file can tell it that: the history that did the purge still has the cursor in memory.
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("the archive reads what is left");
+    assert_eq!(
+        reopened.oldest_retained_cursor(),
+        history.next_cursor(),
+        "the boundary the purge wrote is where the output got to"
     );
+    assert!(reopened.next_cursor() > 0, "and it is not nought");
+    let page = reopened.page(0, 1024).expect("a page");
+    let gap = page
+        .gap
+        .as_ref()
+        .expect("the range that went reads as a gap");
+    assert_eq!(gap.to_cursor.get(), history.next_cursor());
     std::fs::remove_dir_all(&directory).ok();
 }
 
