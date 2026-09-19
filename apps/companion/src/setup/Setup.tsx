@@ -106,6 +106,19 @@ const STEPS = [
   { id: 'ready', title: 'Ready', question: 'What did this cost you?' }
 ] as const
 
+/**
+ * One line of the host's own words, as a sentence.
+ *
+ * A reason arrives as a clause, because it is written to be read after "because". Put in front of
+ * another sentence it needs a capital and a stop, or the two run together.
+ */
+function sentence(said: string): string {
+  const trimmed = said.trim()
+  if (trimmed.length === 0) return trimmed
+  const capitalised = trimmed[0]?.toUpperCase() + trimmed.slice(1)
+  return /[.!?]$/.test(capitalised) ? capitalised : `${capitalised}.`
+}
+
 /** One reading of the machine, before any of it is put on the screen. */
 interface Reading {
   readonly identity: SetupIdentity
@@ -260,7 +273,7 @@ export function Setup(): ReactNode {
         <Banner
           tone="warning"
           title="No host is answering on this machine"
-          detail={`${failure} The steps below still say what this Mac will be asked for.`}
+          detail={`${sentence(failure)} The steps below still say what this Mac will be asked for.`}
         />
       ) : null}
 

@@ -343,3 +343,24 @@ describe('what setup costs a person', () => {
     })
   })
 })
+
+describe('when there is no host on this machine', () => {
+  it('still says what this Mac will be asked for, in whole sentences', async () => {
+    const host = fakeHost()
+    host.controls.setConnected(false)
+    const { port } = watched(host.port)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'setup' }}>
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('setup-identity')
+    await goTo('permissions')
+    const banner = await screen.findByText('No host is answering on this machine')
+    const said = banner.parentElement?.textContent ?? ''
+    expect(said).toMatch(/This host cannot be contacted right now\. The steps below/)
+    // The categories are still guided, because they are facts about this Mac rather than about
+    // a host that happens to be running.
+    expect(screen.getByTestId('setup-permission-accessibility')).toBeInTheDocument()
+  })
+})
