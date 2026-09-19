@@ -31,8 +31,8 @@ use kr_protocol::receipt::ReceiptState;
 use kr_protocol::scalars::{Digest256, DurationMs, Nullable, TimestampMs, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_worker::broker::{
-    BrokerError, BrokerTransport, Credential, ManagedProcess, TransportHandle, UpstreamDispatch,
-    UpstreamOutcome, UpstreamRequest, subject,
+    BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
+    UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
 };
 use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
@@ -76,15 +76,15 @@ impl UpstreamDispatch for SlowUpstream {
         Ok(())
     }
 
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         std::thread::sleep(self.holds);
         self.carried
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(UpstreamOutcome {
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
             upstream_request_id: None,
             turn_id: request.turn_id.clone(),
             provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-        })
+        })))
     }
 }
 
@@ -424,14 +424,14 @@ impl UpstreamDispatch for JournalHoldingUpstream {
         Ok(())
     }
 
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         self.carried
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(UpstreamOutcome {
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
             upstream_request_id: None,
             turn_id: request.turn_id.clone(),
             provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-        })
+        })))
     }
 }
 
@@ -491,14 +491,14 @@ impl UpstreamDispatch for CountingUpstream {
         Ok(())
     }
 
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         self.carried
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(UpstreamOutcome {
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
             upstream_request_id: None,
             turn_id: request.turn_id.clone(),
             provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-        })
+        })))
     }
 }
 

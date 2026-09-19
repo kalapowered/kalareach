@@ -149,6 +149,63 @@ pub struct UpstreamOutcome {
     pub provenance: ActionProvenance,
 }
 
+/// One prepared operation a transport has taken and has not finished with.
+///
+/// Handing bytes to a queue, writing them to a socket and the upstream acting on them are three
+/// different facts, and a transport that answered the first as though it were the third would let
+/// a receipt say `applied` for an operation that never left this host. So a transport answers with
+/// this, and what comes back from it is what the upstream actually did.
+pub struct PendingTransmission(Flight);
+
+enum Flight {
+    /// The transport has already done everything it is going to do.
+    Settled(Result<UpstreamOutcome>),
+    /// The transport will say later.
+    Carried(std::pin::Pin<Box<dyn core::future::Future<Output = Result<UpstreamOutcome>> + Send>>),
+}
+
+impl core::fmt::Debug for PendingTransmission {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.0 {
+            Flight::Settled(outcome) => formatter
+                .debug_tuple("PendingTransmission::Settled")
+                .field(outcome)
+                .finish(),
+            Flight::Carried(_) => formatter.write_str("PendingTransmission::Carried"),
+        }
+    }
+}
+
+impl PendingTransmission {
+    /// A transport that has already finished with this operation.
+    #[must_use]
+    pub const fn settled(outcome: Result<UpstreamOutcome>) -> Self {
+        Self(Flight::Settled(outcome))
+    }
+
+    /// A transport that will say what the upstream did once it knows.
+    #[must_use]
+    pub fn carried(
+        work: impl core::future::Future<Output = Result<UpstreamOutcome>> + Send + 'static,
+    ) -> Self {
+        Self(Flight::Carried(Box::pin(work)))
+    }
+
+    /// Waits for the transport to say what the upstream did.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport could not establish. `UPSTREAM_UNAVAILABLE` covers a frame
+    /// that did not go, one that went in part and one the upstream never answered; section 11
+    /// forbids opening a second backend or replaying an unknown request instead.
+    pub async fn outcome(self) -> Result<UpstreamOutcome> {
+        match self.0 {
+            Flight::Settled(outcome) => outcome,
+            Flight::Carried(work) => work.await,
+        }
+    }
+}
+
 /// What carries a prepared operation to one upstream.
 ///
 /// The broker decides whether an operation may happen. This is what makes it happen, and it is a
@@ -171,14 +228,17 @@ pub trait UpstreamDispatch: Send + Sync + core::fmt::Debug {
     /// name no method for, or name one this build does not support.
     fn admit(&self, request: &UpstreamRequest) -> Result<()>;
 
-    /// Submits one prepared operation and returns what the upstream answered.
+    /// Hands one prepared operation to the transport.
+    ///
+    /// What comes back is the transmission, not its outcome: the operation has been taken, and
+    /// [`PendingTransmission::outcome`] is what says whether it reached the upstream and what the
+    /// upstream did with it.
     ///
     /// # Errors
     ///
-    /// Returns whatever the transport could not do. `UPSTREAM_UNAVAILABLE` is the answer when the
-    /// framing connection cannot safely continue; section 11 forbids opening a second backend or
-    /// replaying an unknown request instead.
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome>;
+    /// Returns whatever refuses the operation before anything is queued for it, which is the only
+    /// point at which a transport can still refuse one outright.
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission>;
 }
 
 /// Which component is answerable for one mutation reaching its upstream.
@@ -442,6 +502,126 @@ impl MutationAdmission {
     }
 }
 
+/// One admitted answer whose bytes are on their way to the upstream.
+///
+/// The marker is already committed, so the resource says an answer may have gone. What it becomes
+/// is what the transmission says, and this object is the only thing that may say it: it holds the
+/// claim the execution permit carried, and the claim is what settlement authority is.
+///
+/// Dropping one without waiting leaves the resource **uncertain**. That is not a defensive
+/// default: an answer whose fate nobody waited for is an answer whose fate nobody can establish,
+/// and section 11 never lets such a resource be answered a second time.
+#[derive(Debug)]
+pub struct AnswerInFlight<'a> {
+    broker: &'a Broker,
+    claim: Option<Claim>,
+    pending: Option<PendingTransmission>,
+    binding_revision: AgentBindingRevision,
+    upstream_request_id: kr_protocol::ids::UpstreamRequestId,
+    resource_id: kr_protocol::ids::PendingResourceId,
+    admitted_at: TimestampMs,
+}
+
+impl AnswerInFlight<'_> {
+    /// Returns the resource this answer resolves.
+    #[must_use]
+    pub const fn resource_id(&self) -> kr_protocol::ids::PendingResourceId {
+        self.resource_id
+    }
+
+    /// Waits for the transport, then settles the resource with what it says.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport could not establish, after leaving the resource uncertain.
+    pub async fn settled(mut self, now: TimestampMs) -> Result<AgentApprovalRespondResult> {
+        let (Some(claim), Some(pending)) = (self.claim.take(), self.pending.take()) else {
+            return Err(BrokerError::AlreadyTransmitted);
+        };
+        let outcome = match pending.outcome().await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = self.broker.uncertain(&claim, now);
+                return Err(error);
+            }
+        };
+        let resolved = self.broker.resolve(&claim, now)?;
+        Ok(AgentApprovalRespondResult {
+            mutation: AgentMutationResult {
+                binding_revision: self.binding_revision,
+                provenance: outcome.provenance,
+                upstream_request_id: Nullable::some(self.upstream_request_id.clone()),
+                turn_id: Nullable::from(outcome.turn_id),
+            },
+            resource_id: self.resource_id,
+            state: resolved.state,
+        })
+    }
+}
+
+impl Drop for AnswerInFlight<'_> {
+    fn drop(&mut self) {
+        let Some(claim) = self.claim.take() else {
+            return;
+        };
+        let _ = self.broker.uncertain(&claim, self.admitted_at);
+    }
+}
+
+/// One admitted mutation whose bytes are on their way to the upstream.
+#[derive(Debug)]
+pub struct MutationInFlight {
+    pending: PendingTransmission,
+    binding_revision: AgentBindingRevision,
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
+}
+
+impl MutationInFlight {
+    /// Waits for the upstream to say what it did with the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport could not establish.
+    pub async fn settled(self) -> Result<AgentMutationResult> {
+        let outcome = self.pending.outcome().await?;
+        Ok(AgentMutationResult {
+            binding_revision: self.binding_revision,
+            provenance: outcome.provenance,
+            upstream_request_id: Nullable::from(outcome.upstream_request_id),
+            turn_id: Nullable::from(outcome.turn_id.or(self.turn_id)),
+        })
+    }
+}
+
+/// One admitted plugin action whose bytes are on their way to the upstream.
+#[derive(Debug)]
+pub struct ActionInFlight {
+    pending: PendingTransmission,
+    binding_revision: AgentBindingRevision,
+    action: ActionName,
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
+}
+
+impl ActionInFlight {
+    /// Waits for the upstream to say what it did with the invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport could not establish.
+    pub async fn settled(self) -> Result<PluginActionInvokeResult> {
+        let outcome = self.pending.outcome().await?;
+        Ok(PluginActionInvokeResult {
+            mutation: AgentMutationResult {
+                binding_revision: self.binding_revision,
+                provenance: outcome.provenance,
+                upstream_request_id: Nullable::from(outcome.upstream_request_id),
+                turn_id: Nullable::from(outcome.turn_id.or(self.turn_id)),
+            },
+            action: self.action,
+        })
+    }
+}
+
 /// One action a package registered, and everything the broker checks before it runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredAction {
@@ -668,7 +848,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns whatever [`Broker::admit_prompt`] and the transport refuse.
-    pub fn agent_prompt(
+    pub async fn agent_prompt(
         &self,
         caller: &Caller,
         params: &AgentPromptParams,
@@ -676,7 +856,7 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<AgentMutationResult> {
         let admitted = self.admit_prompt(caller, params, queued, now)?;
-        self.dispatch_mutation(&admitted, now)
+        self.dispatch_mutation(&admitted, now)?.settled().await
     }
 
     /// Applies `agent.turn.steer`.
@@ -684,14 +864,14 @@ impl Broker {
     /// # Errors
     ///
     /// Returns whatever [`Broker::admit_steer`] and the transport refuse.
-    pub fn agent_steer(
+    pub async fn agent_steer(
         &self,
         caller: &Caller,
         params: &AgentSteerParams,
         now: TimestampMs,
     ) -> Result<AgentMutationResult> {
         let admitted = self.admit_steer(caller, params, now)?;
-        self.dispatch_mutation(&admitted, now)
+        self.dispatch_mutation(&admitted, now)?.settled().await
     }
 
     /// Applies `agent.turn.cancel`.
@@ -699,14 +879,14 @@ impl Broker {
     /// # Errors
     ///
     /// Returns whatever [`Broker::admit_cancel`] and the transport refuse.
-    pub fn agent_cancel(
+    pub async fn agent_cancel(
         &self,
         caller: &Caller,
         params: &AgentCancelParams,
         now: TimestampMs,
     ) -> Result<AgentMutationResult> {
         let admitted = self.admit_cancel(caller, params, now)?;
-        self.dispatch_mutation(&admitted, now)
+        self.dispatch_mutation(&admitted, now)?.settled().await
     }
 
     /// Admits `agent.approval.respond`: the mutation, the resource, the claim and the resource's
@@ -831,18 +1011,23 @@ impl Broker {
     /// # Errors
     ///
     /// Returns whatever [`Broker::admit_approval`] and the transport refuse.
-    pub fn agent_approval_respond(
+    pub async fn agent_approval_respond(
         &self,
         caller: &Caller,
         params: &AgentApprovalRespondParams,
         now: TimestampMs,
     ) -> Result<(AgentApprovalRespondResult, MutationAdmission)> {
         let admitted = self.admit_approval(caller, params, now)?;
-        let result = self.record_approval(&admitted, now)?;
+        let result = self.record_approval(&admitted, now)?.settled(now).await?;
         Ok((result, admitted))
     }
 
-    /// Carries an admitted approval to its upstream and records the outcome.
+    /// Hands an admitted approval to its upstream, and returns the answer in flight.
+    ///
+    /// The marker is committed and the bytes are queued here. What settles the resource is
+    /// [`AnswerInFlight::settled`], because the resource's state is what the transmission says it
+    /// is and that is not known yet: the permit's holder is the only caller that may settle, and
+    /// this is the object it holds.
     ///
     /// # Errors
     ///
@@ -852,7 +1037,7 @@ impl Broker {
         &self,
         admitted: &MutationAdmission,
         now: TimestampMs,
-    ) -> Result<AgentApprovalRespondResult> {
+    ) -> Result<AnswerInFlight<'_>> {
         // The kind is checked before the permit is taken, so an admission handed to the wrong
         // entry point comes back unspent rather than being destroyed by the mistake.
         if admitted.resource_id().is_none() {
@@ -878,23 +1063,21 @@ impl Broker {
             let _ = self.release_claim(&claim, now);
             return Err(error);
         }
-        let outcome = match permit.dispatch.submit(&permit.request) {
-            Ok(outcome) => outcome,
+        let pending = match permit.dispatch.submit(&permit.request) {
+            Ok(pending) => pending,
             Err(error) => {
                 let _ = self.uncertain(&claim, now);
                 return Err(error);
             }
         };
-        let resolved = self.resolve(&claim, now)?;
-        Ok(AgentApprovalRespondResult {
-            mutation: AgentMutationResult {
-                binding_revision: admitted.binding_revision(),
-                provenance: outcome.provenance,
-                upstream_request_id: Nullable::some(dispatch.upstream_request_id.clone()),
-                turn_id: Nullable::from(outcome.turn_id),
-            },
+        Ok(AnswerInFlight {
+            broker: self,
+            claim: Some(claim),
+            pending: Some(pending),
+            binding_revision: admitted.binding_revision(),
+            upstream_request_id: dispatch.upstream_request_id.clone(),
             resource_id: dispatch.resource.resource_id,
-            state: resolved.state,
+            admitted_at: admitted.admitted_at(),
         })
     }
 
@@ -988,7 +1171,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns whatever [`Broker::admit_plugin_action`] and the transport refuse.
-    pub fn plugin_action_invoke(
+    pub async fn plugin_action_invoke(
         &self,
         caller: &Caller,
         binding_id: BrokerBindingId,
@@ -998,7 +1181,7 @@ impl Broker {
     ) -> Result<PluginActionInvokeResult> {
         let admitted = self.admit_plugin_action(caller, binding_id, params, now)?;
         self.validate_effect(&admitted, effect)?;
-        self.record_plugin_action(&admitted, now)
+        self.record_plugin_action(&admitted, now)?.settled().await
     }
 
     /// Carries an admitted plugin action to its upstream and records the outcome.
@@ -1010,7 +1193,7 @@ impl Broker {
         &self,
         admitted: &MutationAdmission,
         now: TimestampMs,
-    ) -> Result<PluginActionInvokeResult> {
+    ) -> Result<ActionInFlight> {
         let _ = now;
         // The kind is checked before the permit is taken. An approval handed to this entry point
         // comes back unspent, with its claim, rather than being consumed by the mistake.
@@ -1026,15 +1209,13 @@ impl Broker {
             .token
             .clone()
             .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
-        let outcome = permit.dispatch.submit(&permit.request)?;
-        Ok(PluginActionInvokeResult {
-            mutation: AgentMutationResult {
-                binding_revision: token.binding_revision,
-                provenance: outcome.provenance,
-                upstream_request_id: Nullable::from(outcome.upstream_request_id),
-                turn_id: Nullable::from(outcome.turn_id),
-            },
+        let turn_id = permit.request.turn_id.clone();
+        let pending = permit.dispatch.submit(&permit.request)?;
+        Ok(ActionInFlight {
+            pending,
+            binding_revision: token.binding_revision,
             action: token.action,
+            turn_id,
         })
     }
 
@@ -1464,7 +1645,7 @@ impl Broker {
         &self,
         admitted: &MutationAdmission,
         now: TimestampMs,
-    ) -> Result<AgentMutationResult> {
+    ) -> Result<MutationInFlight> {
         let _ = now;
         // An answer settles its resource, and this route does not settle anything. Refusing it
         // before the permit is taken leaves the approval's own admission intact.
@@ -1476,12 +1657,11 @@ impl Broker {
         }
         let permit = admitted.take()?;
         let turn_id = permit.request.turn_id.clone();
-        let outcome = permit.dispatch.submit(&permit.request)?;
-        Ok(AgentMutationResult {
+        let pending = permit.dispatch.submit(&permit.request)?;
+        Ok(MutationInFlight {
+            pending,
             binding_revision: admitted.binding_revision(),
-            provenance: outcome.provenance,
-            upstream_request_id: Nullable::from(outcome.upstream_request_id),
-            turn_id: Nullable::from(outcome.turn_id.or(turn_id)),
+            turn_id,
         })
     }
 

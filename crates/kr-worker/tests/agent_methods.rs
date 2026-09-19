@@ -29,8 +29,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, GrantLowerBound, ManagedProcess,
-    RegisteredAction, TransportHandle, UpstreamBody, UpstreamDispatch, UpstreamOutcome,
-    UpstreamRequest, command, subject,
+    PendingTransmission, RegisteredAction, TransportHandle, UpstreamBody, UpstreamDispatch,
+    UpstreamOutcome, UpstreamRequest, command, subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -207,7 +207,7 @@ impl UpstreamDispatch for RecordingUpstream {
         Ok(())
     }
 
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         self.submitted
             .lock()
             .expect("the record is not poisoned")
@@ -217,11 +217,11 @@ impl UpstreamDispatch for RecordingUpstream {
                 detail: "the framing connection ended".to_owned(),
             });
         }
-        Ok(UpstreamOutcome {
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
             upstream_request_id: Some(UpstreamRequestId::new("upstream-1").expect("valid")),
             turn_id: request.turn_id.clone(),
             provenance: ActionProvenance::UpstreamTypedRpc,
-        })
+        })))
     }
 }
 
@@ -274,7 +274,7 @@ impl UpstreamDispatch for RefusingUpstream {
     fn submit(
         &self,
         _request: &kr_worker::broker::UpstreamRequest,
-    ) -> Result<kr_worker::broker::UpstreamOutcome, BrokerError> {
+    ) -> Result<kr_worker::broker::PendingTransmission, BrokerError> {
         panic!("a transport that admits nothing is never asked to carry anything")
     }
 }
@@ -454,8 +454,8 @@ fn kr_req_23_39_an_agent_read_names_the_instance_carries_its_evidence_and_report
 
 /// KR-REQ-23.40 and KR-REQ-12.06: the five agent mutations carry the rights the method registry
 /// names for them, and every one of them refuses a revision that is not the one in force.
-#[test]
-fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_binding() {
+#[tokio::test]
+async fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_binding() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
@@ -511,6 +511,7 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
     };
     let applied = broker
         .agent_prompt(&caller(), &prompt, false, TimestampMs::new(20))
+        .await
         .expect("the prompt applies");
     assert_eq!(applied.binding_revision, AgentBindingRevision::new(1));
     assert_eq!(applied.provenance, ActionProvenance::UpstreamTypedRpc);
@@ -521,6 +522,7 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
     );
     broker
         .agent_prompt(&caller(), &prompt, true, TimestampMs::new(21))
+        .await
         .expect("and so does a queued one");
     broker
         .agent_steer(
@@ -532,6 +534,7 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
             },
             TimestampMs::new(22),
         )
+        .await
         .expect("the steer applies to the turn that is running");
     broker
         .agent_cancel(
@@ -542,6 +545,7 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
             },
             TimestampMs::new(23),
         )
+        .await
         .expect("the cancellation applies");
 
     // Each of those reached the upstream, with the operation it was for.
@@ -567,6 +571,7 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
     assert!(
         unreachable
             .agent_prompt(&caller(), &prompt, false, TimestampMs::new(20))
+            .await
             .is_err(),
         "a prompt with no transport is refused, not applied"
     );
@@ -582,6 +587,7 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
                 },
                 TimestampMs::new(23),
             )
+            .await
             .is_err()
     );
 
@@ -591,6 +597,7 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
         .expect("the selected thread changed");
     let stale = broker
         .agent_prompt(&caller(), &prompt, false, TimestampMs::new(20))
+        .await
         .expect_err("a prompt prepared against the old conversation is stale");
     assert_eq!(stale.code(), ErrorCode::StaleSession);
 
@@ -607,14 +614,15 @@ fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_bi
                 false,
                 TimestampMs::new(24),
             )
+            .await
             .is_err()
     );
 }
 
 /// KR-REQ-23.40: `agent.approval.respond` answers the exact pending resource, with a decision the
 /// request actually offered, once.
-#[test]
-fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered() {
+#[tokio::test]
+async fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let body = r#"{"id":11,"method":"session/request_permission"}"#;
@@ -637,15 +645,17 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
         )
         .expect("interpreted");
 
-    let invented = broker.agent_approval_respond(
-        &caller(),
-        &AgentApprovalRespondParams {
-            target: target(1),
-            resource_id: resource.resource_id,
-            option_id: "allow_always".to_owned(),
-        },
-        TimestampMs::new(4),
-    );
+    let invented = broker
+        .agent_approval_respond(
+            &caller(),
+            &AgentApprovalRespondParams {
+                target: target(1),
+                resource_id: resource.resource_id,
+                option_id: "allow_always".to_owned(),
+            },
+            TimestampMs::new(4),
+        )
+        .await;
     assert!(
         invented.is_err(),
         "a decision the request never offered is not an answer this host encodes"
@@ -661,6 +671,7 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
             },
             TimestampMs::new(5),
         )
+        .await
         .expect("the answer is applied");
     assert_eq!(answered.state, PendingState::Resolved);
     assert_eq!(answered.resource_id, resource.resource_id);
@@ -686,6 +697,7 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
                 },
                 TimestampMs::new(6),
             )
+            .await
             .is_err()
     );
 }
@@ -773,8 +785,8 @@ fn kr_req_23_40_an_approval_that_cannot_be_answered_is_refused_at_admission() {
 /// KR-REQ-23.30 and KR-REQ-12.08: `plugin.action.invoke` validates the registered action, the
 /// grant, the effect class and the preconditions, and an action's capability is separate from the
 /// observation beside it.
-#[test]
-fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditions() {
+#[tokio::test]
+async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditions() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
@@ -824,40 +836,45 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
         }
     };
     let invoke = |action: &str, draft: Nullable<kr_protocol::ids::DraftId>| {
-        broker.plugin_action_invoke(
-            &caller(),
-            binding(),
-            &PluginActionInvokeParams {
-                target: target(1),
-                plugin_id: PluginId::new("kalareach.codex").expect("valid"),
-                action: ActionName::new(action).expect("valid"),
-                draft_id: draft,
-                parameters: Bytes::from(b"{}".to_vec()),
-            },
-            &prepared(action, draft),
-            TimestampMs::new(4),
-        )
+        let params = PluginActionInvokeParams {
+            target: target(1),
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            action: ActionName::new(action).expect("valid"),
+            draft_id: draft,
+            parameters: Bytes::from(b"{}".to_vec()),
+        };
+        let effect = prepared(action, draft);
+        let broker = &broker;
+        async move {
+            broker
+                .plugin_action_invoke(&caller(), binding(), &params, &effect, TimestampMs::new(4))
+                .await
+        }
     };
 
-    let applied = invoke("prompt.submit", Nullable::null()).expect("a registered action runs");
+    let applied = invoke("prompt.submit", Nullable::null())
+        .await
+        .expect("a registered action runs");
     assert_eq!(applied.action.as_str(), "prompt.submit");
 
     // An action the package never registered.
-    assert!(invoke("prompt.inject", Nullable::null()).is_err());
+    assert!(invoke("prompt.inject", Nullable::null()).await.is_err());
 
     // An action declared as a read, arriving on the write path.
-    assert!(invoke("conversation.read", Nullable::null()).is_err());
+    assert!(invoke("conversation.read", Nullable::null()).await.is_err());
 
     // An action that acts on a draft, with no draft named.
     let missing_draft = invoke("draft.attach", Nullable::null())
+        .await
         .expect_err("a precondition the action declares is checked");
     assert_eq!(missing_draft.code(), ErrorCode::DraftConflict);
 
     // Naming one is not enough either: a draft this host cannot resolve is a precondition nobody
     // has established, and the action waits for it rather than being sent hopefully.
     let draft = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
-    let unresolvable =
-        invoke("draft.attach", Nullable::some(draft)).expect_err("nothing here resolves a draft");
+    let unresolvable = invoke("draft.attach", Nullable::some(draft))
+        .await
+        .expect_err("nothing here resolves a draft");
     assert_eq!(unresolvable.code(), ErrorCode::DraftConflict);
     broker.bind_drafts(std::sync::Arc::new(KnownDrafts {
         known: [draft].into_iter().collect(),
@@ -867,10 +884,12 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
             "draft.attach",
             Nullable::some(kr_protocol::ids::DraftId::new(Uuid::from_bytes([5; 16]))),
         )
+        .await
         .is_err(),
         "and a draft the store does not hold is refused"
     );
     invoke("draft.attach", Nullable::some(draft))
+        .await
         .expect("and it runs once the draft is one this host can resolve");
     // And what goes to the upstream names the revision the draft stood at when it was admitted,
     // not only the identifier: the identifier alone would denote whatever the draft holds by the
@@ -892,6 +911,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
         .withdraw_grant(binding(), BrokerGrant::UpstreamAction)
         .expect("the grant is withdrawn");
     let refusal = invoke("prompt.submit", Nullable::null())
+        .await
         .expect_err("an action needs the grant it declares");
     assert!(matches!(refusal, BrokerError::Grant(_)));
     // And the same refusal is reachable before anything is marked, so it is a rejection rather
@@ -959,6 +979,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                 },
                 TimestampMs::new(6),
             )
+            .await
             .is_err()
     );
     broker
@@ -1387,8 +1408,8 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
 /// The two calls here are sequential, which is the shape a losing concurrent caller ends up in:
 /// the permit is taken atomically, so whichever caller loses the race arrives at exactly this
 /// state.
-#[test]
-fn kr_req_11_27_a_later_caller_on_one_admission_transmits_nothing_and_settles_nothing() {
+#[tokio::test]
+async fn kr_req_11_27_a_later_caller_on_one_admission_transmits_nothing_and_settles_nothing() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let opaque = broker
@@ -1423,6 +1444,9 @@ fn kr_req_11_27_a_later_caller_on_one_admission_transmits_nothing_and_settles_no
         .expect("the answer is admitted");
     let answered = broker
         .record_approval(&admitted, TimestampMs::new(5))
+        .expect("the winner holds the permit")
+        .settled(TimestampMs::new(5))
+        .await
         .expect("the winner transmits");
     assert_eq!(answered.state, PendingState::Resolved);
     assert_eq!(upstream.submitted().len(), 1);
@@ -1596,8 +1620,8 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
 
 /// KR-REQ-11.33 and KR-REQ-12.13: an answer goes out on the connection whose resource it
 /// resolves, and one instance's two connections never answer each other's.
-#[test]
-fn kr_req_12_13_each_connection_answers_its_own_resource() {
+#[tokio::test]
+async fn kr_req_12_13_each_connection_answers_its_own_resource() {
     let first = std::sync::Arc::new(RecordingUpstream::default());
     let second = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&first));
@@ -1631,27 +1655,28 @@ fn kr_req_12_13_each_connection_answers_its_own_resource() {
                 TimestampMs::new(at + 1),
             )
             .expect("interpreted");
-        broker
-            .agent_approval_respond(
-                &caller(),
-                &AgentApprovalRespondParams {
-                    target: target(1),
-                    resource_id: resource.resource_id,
-                    option_id: "allow".to_owned(),
-                },
-                TimestampMs::new(at + 2),
-            )
-            .expect("the answer is applied")
+        let params = AgentApprovalRespondParams {
+            target: target(1),
+            resource_id: resource.resource_id,
+            option_id: "allow".to_owned(),
+        };
+        let broker = &broker;
+        async move {
+            broker
+                .agent_approval_respond(&caller(), &params, TimestampMs::new(at + 2))
+                .await
+                .expect("the answer is applied")
+        }
     };
 
-    answer(GatewayConnectionId::new(1), "11", 2);
+    answer(GatewayConnectionId::new(1), "11", 2).await;
     assert_eq!(first.submitted().len(), 1);
     assert!(
         second.submitted().is_empty(),
         "the other connection was not written to"
     );
 
-    answer(other, "12", 10);
+    answer(other, "12", 10).await;
     assert_eq!(second.submitted().len(), 1, "its own connection carries it");
     assert_eq!(first.submitted().len(), 1, "and the first is untouched");
 }
@@ -1728,8 +1753,8 @@ fn kr_req_11_33_a_resolved_resource_leaves_the_rich_answer_nothing_to_admit() {
 
 /// KR-REQ-11.27 and KR-REQ-24.24: an admission that is abandoned before its bytes leaves the
 /// resource answerable, because the reservation and the dispatch marker are two moments.
-#[test]
-fn kr_req_11_27_an_abandoned_answer_leaves_the_resource_answerable() {
+#[tokio::test]
+async fn kr_req_11_27_an_abandoned_answer_leaves_the_resource_answerable() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let opaque = broker
@@ -1777,6 +1802,7 @@ fn kr_req_11_27_an_abandoned_answer_leaves_the_resource_answerable() {
     // Which the next answer proves: it admits, transmits and settles.
     let answered = broker
         .agent_approval_respond(&caller(), &params, TimestampMs::new(5))
+        .await
         .expect("the next answer is applied")
         .0;
     assert_eq!(answered.state, PendingState::Resolved);
@@ -1860,8 +1886,8 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
 
 /// KR-REQ-12.06 and KR-REQ-11.27: a transport that cannot carry an answer refuses it at
 /// admission, gives the resource back, and lets the next answer through.
-#[test]
-fn kr_req_12_06_a_transport_that_cannot_carry_an_answer_gives_the_resource_back() {
+#[tokio::test]
+async fn kr_req_12_06_a_transport_that_cannot_carry_an_answer_gives_the_resource_back() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let opaque = broker
@@ -1913,6 +1939,7 @@ fn kr_req_12_06_a_transport_that_cannot_carry_an_answer_gives_the_resource_back(
     );
     let answered = broker
         .agent_approval_respond(&caller(), &params, TimestampMs::new(5))
+        .await
         .expect("the next answer is applied")
         .0;
     assert_eq!(answered.state, PendingState::Resolved);
@@ -2066,7 +2093,7 @@ impl UpstreamDispatch for GatedUpstream {
         Ok(())
     }
 
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         self.inside.send(()).expect("the test is watching");
         self.go
             .lock()
@@ -2077,11 +2104,11 @@ impl UpstreamDispatch for GatedUpstream {
             .lock()
             .expect("the record is not poisoned")
             .push(request.clone());
-        Ok(UpstreamOutcome {
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
             upstream_request_id: Some(UpstreamRequestId::new("upstream-1").expect("valid")),
             turn_id: request.turn_id.clone(),
             provenance: ActionProvenance::UpstreamTypedRpc,
-        })
+        })))
     }
 }
 
@@ -2092,8 +2119,8 @@ impl UpstreamDispatch for GatedUpstream {
 /// loser runs the whole of `record_approval` in that window. It transmits nothing, and it leaves
 /// the resource exactly as the winner left it rather than recording the winner's answer as
 /// uncertain.
-#[test]
-fn kr_req_11_27_a_second_caller_inside_the_first_ones_transmission_settles_nothing() {
+#[tokio::test]
+async fn kr_req_11_27_a_second_caller_inside_the_first_ones_transmission_settles_nothing() {
     let (entered, inside) = std::sync::mpsc::sync_channel(1);
     let (release, go) = std::sync::mpsc::sync_channel(1);
     let upstream = std::sync::Arc::new(GatedUpstream {
@@ -2148,7 +2175,12 @@ fn kr_req_11_27_a_second_caller_inside_the_first_ones_transmission_settles_nothi
         "and it left the resource as the winner had it, rather than making it uncertain"
     );
     assert_eq!(
-        winner.expect("the winner's answer is applied").state,
+        winner
+            .expect("the winner held the permit")
+            .settled(TimestampMs::new(5))
+            .await
+            .expect("the winner's answer is applied")
+            .state,
         PendingState::Resolved
     );
     assert_eq!(
@@ -2287,30 +2319,37 @@ fn kr_req_11_28_arguments_that_name_a_member_twice_are_refused_before_the_marker
 /// The rich answer and the person's own answer in the terminal are started at the same moment.
 /// Whichever takes the resource's one transmission admission is the one that writes; the other
 /// writes nothing, and the resource carries one resolution either way.
-#[test]
-fn kr_req_11_27_the_native_and_rich_answers_race_and_one_of_them_writes() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_27_the_native_and_rich_answers_race_and_one_of_them_writes() {
     for attempt in 0..16u64 {
         let upstream = std::sync::Arc::new(RecordingUpstream::default());
-        let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+        let broker = std::sync::Arc::new(agent_broker_with(std::sync::Arc::clone(&upstream)));
         let resource = offered(&broker, "11", 2);
-        let carried = std::sync::Mutex::new(Vec::new());
-        let start = std::sync::Barrier::new(2);
+        let carried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
 
-        let (rich, native) = std::thread::scope(|scope| {
-            let one = scope.spawn(|| {
-                start.wait();
-                broker.agent_approval_respond(
-                    &caller(),
-                    &AgentApprovalRespondParams {
-                        target: target(1),
-                        resource_id: resource.resource_id,
-                        option_id: "allow".to_owned(),
-                    },
-                    TimestampMs::new(4),
-                )
-            });
-            let two = scope.spawn(|| {
-                start.wait();
+        let one = {
+            let broker = std::sync::Arc::clone(&broker);
+            let start = std::sync::Arc::clone(&start);
+            let params = AgentApprovalRespondParams {
+                target: target(1),
+                resource_id: resource.resource_id,
+                option_id: "allow".to_owned(),
+            };
+            tokio::spawn(async move {
+                start.wait().await;
+                broker
+                    .agent_approval_respond(&caller(), &params, TimestampMs::new(4))
+                    .await
+                    .map(|(result, _)| result)
+            })
+        };
+        let two = {
+            let broker = std::sync::Arc::clone(&broker);
+            let start = std::sync::Arc::clone(&start);
+            let carried = std::sync::Arc::clone(&carried);
+            tokio::spawn(async move {
+                start.wait().await;
                 broker.native_answer_through(
                     GatewayConnectionId::new(1),
                     br#"{"id":11,"result":{"outcome":"allow"}}"#,
@@ -2323,12 +2362,12 @@ fn kr_req_11_27_the_native_and_rich_answers_race_and_one_of_them_writes() {
                         Ok(())
                     },
                 )
-            });
-            (
-                one.join().expect("the thread finished"),
-                two.join().expect("the thread finished"),
-            )
-        });
+            })
+        };
+        let (rich, native) = (
+            one.await.expect("the task finished"),
+            two.await.expect("the task finished"),
+        );
 
         let native_frames = carried.lock().expect("the record is not poisoned").len();
         let rich_frames = upstream.submitted().len();

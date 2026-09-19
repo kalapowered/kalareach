@@ -25,7 +25,9 @@
 //! | [`error`] | The broker's refusals, each mapped to a stable protocol code |
 //! | [`gateway`] | The core-declarative forwarding path, the closed rich table and reverse calls |
 //! | [`ledger`] | The durable records, in the worker's own journal file |
-//! | [`link`] | The worker-owned transport that reads, forwards, answers and executes |
+//! | [`attach`] | Endpoint acceptance, launch authentication and the connection it becomes |
+//! | [`duplex`] | One supervised owner per live connection: both directions, both queues |
+//! | [`framing`] | How one connector's frames are wrapped and taken apart again |
 //! | [`methods`] | The agent-state reads, the five agent mutations and the plugin action call |
 //! | [`listener`] | The private local endpoint, bridge registration and the pinned binary |
 //! | [`process`] | Launched processes, their credentials and their immutable source frames |
@@ -42,12 +44,14 @@
 //! reconnects.
 
 pub mod arbitration;
+pub mod attach;
 pub mod capability;
+pub mod duplex;
 pub mod endpoint;
 pub mod error;
+pub mod framing;
 pub mod gateway;
 pub mod ledger;
-pub mod link;
 pub mod listener;
 pub mod methods;
 pub mod process;
@@ -78,24 +82,30 @@ use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 pub use crate::broker::arbitration::{
     Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
+pub use crate::broker::attach::{Attached, NativeGateway, NativeLaunch, hello_frame};
 pub use crate::broker::capability::{CapabilityOwner, Probe};
+pub use crate::broker::duplex::{
+    Carried, Closure, Delivery, Dispatch, Duplex, Observations, Observatory, Queued,
+    ResourceTransition, Sink, UpstreamReply,
+};
 pub use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 pub use crate::broker::error::{BrokerError, Result};
+pub use crate::broker::framing::Framing;
 pub use crate::broker::gateway::{
     Connection, ConnectionOrigin, Forwarded, Gateway, PreparedResponse, ReverseRequest,
     RichInvocation,
 };
 pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
-pub use crate::broker::link::{Carried, Framing, Link, LinkDispatch, Writer, writers};
 pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
 pub use crate::broker::methods::{
-    Caller, MutationAdmission, RegisteredAction, Responsible, UpstreamBody, UpstreamDispatch,
+    ActionInFlight, AnswerInFlight, Caller, MutationAdmission, MutationInFlight,
+    PendingTransmission, RegisteredAction, Responsible, UpstreamBody, UpstreamDispatch,
     UpstreamOutcome, UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
-    BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
+    BackendStop, BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
 };
 pub use crate::broker::profiles::{ForegroundMark, LaunchIntent, ProfileStore, new_profile_id};
 pub use crate::broker::semantic::{GrantLowerBound, HistoryFilter, Replay, SemanticLog};
@@ -2127,6 +2137,24 @@ impl Broker {
     #[must_use]
     pub fn connection(&self, connection: GatewayConnectionId) -> Option<Connection> {
         self.state().gateway.connection(connection).cloned()
+    }
+
+    /// Reads which request one response frame correlates to, and checks it is a response.
+    ///
+    /// Nothing is recorded and nothing is resolved. A transport asks this so it can tell a reply
+    /// to one of its own requests from the upstream's answer to a request of the upstream's,
+    /// which are two different frames that can carry the same raw identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the frame is a request, is not a readable
+    /// response, or carries no correlation identifier.
+    pub fn correlate_response(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+    ) -> Result<DownstreamRequestId> {
+        self.state().gateway.correlate_response(connection, frame)
     }
 
     /// Records the upstream answering or withdrawing a request of its own.

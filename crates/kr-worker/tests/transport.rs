@@ -22,8 +22,8 @@ use kr_protocol::ids::{
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
-    BoundEndpoint, Broker, BrokerTransport, Credential, Framing, Link, ManagedProcess,
-    TransportHandle,
+    BoundEndpoint, Broker, BrokerTransport, Carried, Credential, Duplex, Framing, ManagedProcess,
+    Observatory, TransportHandle,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -129,6 +129,13 @@ fn table() -> DeclarativeTable {
                 reverse: Nullable::some(ReverseOperation::FilesystemRead),
             },
             DeclarativeEntry {
+                method: method("fs/write_text_file"),
+                class: NativeMethodClass::Mutation,
+                expects_response: true,
+                approval_option_field: Nullable::null(),
+                reverse: Nullable::some(ReverseOperation::FilesystemWrite),
+            },
+            DeclarativeEntry {
                 method: method("session/request_permission"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
@@ -136,6 +143,13 @@ fn table() -> DeclarativeTable {
                 // so rather than the core assuming a member name.
                 approval_option_field: Nullable::some("behavior".to_owned()),
                 reverse: Nullable::null(),
+            },
+            DeclarativeEntry {
+                method: method("terminal/create"),
+                class: NativeMethodClass::Mutation,
+                expects_response: true,
+                approval_option_field: Nullable::null(),
+                reverse: Nullable::some(ReverseOperation::Terminal),
             },
         ],
     };
@@ -290,36 +304,102 @@ fn broker_with_rich(rich: RichMethodTable) -> Arc<Broker> {
     Arc::new(broker)
 }
 
-/// Builds a link over two real socket pairs and returns the ends a test drives.
-async fn link_over_sockets(
+/// Builds one connection's owner over two real socket pairs and returns the ends a test drives.
+async fn duplex_over_sockets(
     broker: &Arc<Broker>,
 ) -> (
-    Arc<Link>,
+    Arc<Duplex>,
     tokio::net::UnixStream,
     tokio::net::UnixStream,
     tokio::task::JoinHandle<()>,
 ) {
+    let served = duplex_watched(broker).await;
+    (served.owner, served.upstream, served.client, served.drained)
+}
+
+/// One connection's owner and every end of it a test may drive.
+struct Served {
+    owner: Arc<Duplex>,
+    /// The upstream's own end of the connection.
+    upstream: tokio::net::UnixStream,
+    /// The native client's own end.
+    client: tokio::net::UnixStream,
+    /// What the owner reads the upstream through, for a test that drives the read loop.
+    upstream_reads: tokio::io::ReadHalf<tokio::net::UnixStream>,
+    /// The owner's write task.
+    drained: tokio::task::JoinHandle<()>,
+    /// The subscription an authorised observer of the instance reads.
+    #[allow(dead_code)]
+    observations: kr_worker::broker::Observations,
+}
+
+/// The same, with every end of the connection and the observer subscription.
+async fn duplex_watched(broker: &Arc<Broker>) -> Served {
     let (upstream_here, upstream_there) =
         tokio::net::UnixStream::pair().expect("a socket pair is made");
     let (client_here, client_there) =
         tokio::net::UnixStream::pair().expect("a socket pair is made");
     let framing = Framing::new(NativeFraming::JsonLines);
-    let (to_upstream, to_client, drain) = kr_worker::broker::writers(
-        framing,
-        tokio::io::split(upstream_here).1,
-        tokio::io::split(client_here).1,
-    );
-    let drained = tokio::spawn(drain);
-    let link = Arc::new(Link::new(
+    let observatory = Observatory::new();
+    let observations = observatory.subscribe(GatewayConnectionId::new(1));
+    let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
+    let (owner, writes) = Duplex::new(
         Arc::clone(broker),
         GatewayConnectionId::new(1),
         framing,
-        to_upstream,
-        to_client,
+        upstream_writes,
+        tokio::io::split(client_here).1,
+        observatory,
         EnvironmentId::new(Uuid::from_bytes([4; 16])),
         "agent-user",
-    ));
-    (link, upstream_there, client_there, drained)
+    );
+    let drained = tokio::spawn(writes);
+    Served {
+        owner,
+        upstream: upstream_there,
+        client: client_there,
+        upstream_reads,
+        drained,
+        observations,
+    }
+}
+
+/// Answers every request this host sends on `upstream`, so an operation reaches its acknowledgement.
+///
+/// The transport records a mutation as applied only when the upstream has answered it, so a test
+/// that sends one needs something on the other end that does. This is that, and it records what
+/// it was sent.
+fn acknowledge(
+    upstream: tokio::net::UnixStream,
+    frames: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (reading, mut writing) = tokio::io::split(upstream);
+        let mut reader = tokio::io::BufReader::new(reading);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let identifier = frame["id"].clone();
+            frames
+                .lock()
+                .expect("the record is not poisoned")
+                .push(frame);
+            let reply = serde_json::json!({ "id": identifier, "result": {} });
+            if writing
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
 }
 
 async fn next_line(stream: &mut tokio::io::BufReader<tokio::net::UnixStream>) -> String {
@@ -339,17 +419,18 @@ async fn next_line(stream: &mut tokio::io::BufReader<tokio::net::UnixStream>) ->
 #[tokio::test]
 async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer_back() {
     let broker = broker();
-    let (link, upstream, client, drained) = link_over_sockets(&broker).await;
+    let (owner, upstream, client, drained) = duplex_over_sockets(&broker).await;
     let mut client_reader = tokio::io::BufReader::new(client);
     let mut upstream_reader = tokio::io::BufReader::new(upstream);
 
     // The upstream asks for a permission. The broker records it before it is forwarded, and the
     // client end reads the frame off its own socket.
     let request = br#"{"id":11,"method":"session/request_permission","params":{}}"#;
-    let carried = link
+    let carried = owner
         .from_upstream(request, TimestampMs::new(2))
+        .await
         .expect("the request is carried");
-    let kr_worker::broker::Carried::UpstreamRequest {
+    let Carried::UpstreamRequest {
         method,
         resource_id,
     } = carried
@@ -376,7 +457,7 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
             TimestampMs::new(3),
         )
         .expect("the interpretation is accepted");
-    let dispatch = link.dispatch().expect("the link carries operations");
+    let dispatch = owner.dispatch().expect("the link carries operations");
     broker.bind_connection_dispatch(GatewayConnectionId::new(1), dispatch);
     let answered = broker
         .agent_approval_respond(
@@ -391,6 +472,7 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
             },
             TimestampMs::new(4),
         )
+        .await
         .expect("the answer is admitted and carried")
         .0;
     assert_eq!(answered.state, PendingState::Resolved);
@@ -410,7 +492,7 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
         answer["result"].get("option_id").is_none(),
         "and in no member the core invented"
     );
-    drop(link);
+    drop(owner);
     drop(client_reader);
     drop(upstream_reader);
     drained.abort();
@@ -421,24 +503,27 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
 #[tokio::test]
 async fn kr_req_11_27_a_clients_own_answer_travels_the_transport_and_a_second_one_does_not() {
     let broker = broker();
-    let (link, upstream, client, drained) = link_over_sockets(&broker).await;
+    let (owner, upstream, client, drained) = duplex_over_sockets(&broker).await;
     let mut client_reader = tokio::io::BufReader::new(client);
     let mut upstream_reader = tokio::io::BufReader::new(upstream);
 
-    link.from_upstream(
-        br#"{"id":12,"method":"session/request_permission","params":{}}"#,
-        TimestampMs::new(2),
-    )
-    .expect("the request is carried");
+    owner
+        .from_upstream(
+            br#"{"id":12,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
     let _ = next_line(&mut client_reader).await;
 
     // The person answers in the terminal. The answer takes the resource's one admission and is
     // then forwarded, in that order.
     let answer = br#"{"id":12,"result":{"outcome":"allow"}}"#;
-    let carried = link
+    let carried = owner
         .from_client(answer, TimestampMs::new(3))
+        .await
         .expect("the client's own answer is admitted and forwarded");
-    let kr_worker::broker::Carried::ClientAnswer { resource_id } = carried else {
+    let Carried::ClientAnswer { resource_id, .. } = carried else {
         panic!("an answer is what this was");
     };
     let forwarded = next_line(&mut upstream_reader).await;
@@ -450,7 +535,10 @@ async fn kr_req_11_27_a_clients_own_answer_travels_the_transport_and_a_second_on
 
     // A second answer to the same request is refused, and nothing more reaches the upstream.
     assert!(
-        link.from_client(answer, TimestampMs::new(4)).is_err(),
+        owner
+            .from_client(answer, TimestampMs::new(4))
+            .await
+            .is_err(),
         "one resource takes one answer"
     );
     assert!(
@@ -463,48 +551,77 @@ async fn kr_req_11_27_a_clients_own_answer_travels_the_transport_and_a_second_on
         "the refusal happened before any bytes went"
     );
 
-    drop(link);
+    drop(owner);
     drop(client_reader);
     drop(upstream_reader);
     drained.abort();
 }
 
-/// KR-REQ-12.16: a reverse request runs in the agent's own host environment and is answered on the
-/// connection it arrived on.
+/// KR-REQ-12.16 and KR-REQ-11.23: a reverse request is answered on the connection it arrived on,
+/// and nothing of it touches the filesystem outside the host resources this session granted.
+///
+/// Section 12 executes these "in the selected host environment with scoped broker resources", and
+/// a path in a request is not a scoped resource. Until one is resolved through the file authority
+/// under an exclusive execution admission, the request is refused with a qualified reason, and the
+/// refusal happens before anything could read or write.
 #[tokio::test]
-async fn kr_req_12_16_a_reverse_request_is_performed_and_answered_on_the_same_connection() {
+async fn kr_req_12_16_a_reverse_request_is_refused_before_any_effect_and_answered_in_place() {
     let broker = broker();
-    let (link, upstream, _client, drained) = link_over_sockets(&broker).await;
+    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
     let mut upstream_reader = tokio::io::BufReader::new(upstream);
 
     let directory = private_directory();
-    let path = directory.join("note.txt");
-    std::fs::write(&path, "what the agent asked for").expect("the file is written");
-    let request = format!(
-        r#"{{"id":13,"method":"fs/read_text_file","params":{{"path":{}}}}}"#,
-        serde_json::to_string(&path.to_string_lossy()).expect("encodable")
-    );
-    let carried = link
-        .from_upstream(request.as_bytes(), TimestampMs::new(2))
-        .expect("the reverse request is carried");
-    assert_eq!(
-        carried,
-        kr_worker::broker::Carried::Reverse {
-            operation: ReverseOperation::FilesystemRead,
-            performed: true,
-        }
-    );
-    let answer = next_line(&mut upstream_reader).await;
-    let answer: serde_json::Value = serde_json::from_str(answer.trim()).expect("readable");
-    assert_eq!(answer["id"], serde_json::json!(13));
-    assert_eq!(
-        answer["result"]["content"],
-        serde_json::json!("what the agent asked for")
+    let read_from = directory.join("note.txt");
+    let write_to = directory.join("written.txt");
+    std::fs::write(&read_from, "what the agent asked for").expect("the file is written");
+    for (id, method, params) in [
+        (
+            13,
+            "fs/read_text_file",
+            serde_json::json!({ "path": read_from.to_string_lossy() }),
+        ),
+        (
+            14,
+            "fs/write_text_file",
+            serde_json::json!({ "path": write_to.to_string_lossy(), "content": "anything" }),
+        ),
+        (15, "terminal/create", serde_json::json!({})),
+    ] {
+        let request =
+            serde_json::json!({ "id": id, "method": method, "params": params }).to_string();
+        let carried = owner
+            .from_upstream(request.as_bytes(), TimestampMs::new(2))
+            .await
+            .expect("the reverse request is carried");
+        let Carried::Reverse { performed, .. } = carried else {
+            panic!("a reverse request is what this was");
+        };
+        assert!(!performed, "{method} performs nothing without a grant");
+        let answer = next_line(&mut upstream_reader).await;
+        let answer: serde_json::Value = serde_json::from_str(answer.trim()).expect("readable");
+        assert_eq!(
+            answer["id"],
+            serde_json::json!(id),
+            "the answer goes back on the identifier it came in with"
+        );
+        assert!(
+            answer["result"].is_null(),
+            "{method} produced no result to report"
+        );
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("granted none")),
+            "{method} says why rather than failing silently: {}",
+            answer["error"]
+        );
+    }
+    assert!(
+        !write_to.exists(),
+        "a write with no granted resource wrote nothing"
     );
 
-    // Terminal input is not something a reverse request gets: this session's input path holds the
-    // lease and records what it wrote.
-    drop(link);
+    drop(owner);
     drop(upstream_reader);
     drained.abort();
     let _ = std::fs::remove_dir_all(&directory);
@@ -561,14 +678,14 @@ async fn kr_req_12_14_the_transport_runs_over_an_endpoint_this_host_bound() {
 #[tokio::test]
 async fn kr_req_11_32_the_read_loop_carries_what_arrives_on_the_socket() {
     let broker = broker();
-    let (link, _upstream, client, drained) = link_over_sockets(&broker).await;
+    let (owner, _upstream, client, drained) = duplex_over_sockets(&broker).await;
     let mut client_reader = tokio::io::BufReader::new(client);
 
     let (serving_end, mut writing_end) =
         tokio::net::UnixStream::pair().expect("a socket pair is made");
     let reading = {
-        let link = Arc::clone(&link);
-        tokio::spawn(async move { link.serve(serving_end, true).await })
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move { owner.serve(serving_end, true).await })
     };
 
     // The frame arrives in two writes, which is what a socket does. The loop waits for the whole
@@ -607,10 +724,18 @@ async fn kr_req_11_32_the_read_loop_carries_what_arrives_on_the_socket() {
 #[tokio::test]
 async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_its_turn() {
     let broker = broker();
-    let (link, upstream, _client, drained) = link_over_sockets(&broker).await;
-    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let served = duplex_watched(&broker).await;
+    let (owner, drained) = (Arc::clone(&served.owner), served.drained);
+    // The upstream answers every request this host sends it, because a mutation is applied when
+    // the upstream has acted on it and not when its bytes left this host.
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let answering = acknowledge(served.upstream, Arc::clone(&sent));
+    let reading = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move { owner.serve(served.upstream_reads, true).await })
+    };
     broker
-        .bind_dispatch(instance(), link.dispatch().expect("it carries operations"))
+        .bind_dispatch(instance(), owner.dispatch().expect("it carries operations"))
         .expect("the transport is bound");
     let turn = kr_protocol::ids::AgentTurnId::new("turn-7").expect("valid");
     broker
@@ -632,9 +757,11 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
     // method, with its own parameters, and never as whichever the table happened to list first.
     broker
         .agent_prompt(&caller, &prompt("hello"), false, TimestampMs::new(2))
+        .await
         .expect("the prompt is applied");
     broker
         .agent_prompt(&caller, &prompt("and then this"), true, TimestampMs::new(3))
+        .await
         .expect("the queued prompt is applied");
     broker
         .agent_steer(
@@ -646,6 +773,7 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
             },
             TimestampMs::new(4),
         )
+        .await
         .expect("the steer is applied");
     broker
         .agent_cancel(
@@ -656,9 +784,10 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
             },
             TimestampMs::new(5),
         )
+        .await
         .expect("the cancellation is applied");
 
-    for (method_name, parameters) in [
+    for (index, (method_name, parameters)) in [
         (
             "session/prompt",
             serde_json::json!({ "draft_id": null, "text": "hello" }),
@@ -672,9 +801,14 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
             serde_json::json!({ "text": "try the other file", "turn_id": "turn-7" }),
         ),
         ("session/cancel", serde_json::json!({ "turn_id": "turn-7" })),
-    ] {
-        let frame = next_line(&mut upstream_reader).await;
-        let frame: serde_json::Value = serde_json::from_str(frame.trim()).expect("readable");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sent = sent.lock().expect("the record is not poisoned");
+        let frame = sent
+            .get(index)
+            .expect("each operation reached the upstream");
         assert_eq!(
             frame["method"],
             serde_json::json!(method_name),
@@ -683,6 +817,11 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
         assert_eq!(
             frame["params"], parameters,
             "{method_name} carries exactly what it asks for"
+        );
+        assert!(
+            frame["id"].as_str().is_some_and(|id| id.starts_with("kr-")),
+            "and under an identifier this host minted rather than one an upstream could mint: {}",
+            frame["id"]
         );
     }
 
@@ -713,10 +852,10 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
     .expect("the native connection is authenticated");
     record_capabilities(&bare);
     let bare = Arc::new(bare);
-    let (narrow_link, _upstream, _client, other_drain) = link_over_sockets(&bare).await;
+    let (narrow_owner, _upstream, _client, other_drain) = duplex_over_sockets(&bare).await;
     bare.bind_dispatch(
         instance(),
-        narrow_link.dispatch().expect("it carries operations"),
+        narrow_owner.dispatch().expect("it carries operations"),
     )
     .expect("the transport is bound");
     bare.set_turn(instance(), Some(turn.clone()))
@@ -756,8 +895,9 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
         );
     }
 
-    drop(link);
-    drop(upstream_reader);
+    drop(owner);
+    answering.abort();
+    reading.abort();
     drained.abort();
     other_drain.abort();
 }
@@ -777,17 +917,18 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
         .entries
         .retain(|entry| entry.operation.as_ref() != Some(&RichOperation::ApprovalRespond));
     let broker = broker_with_rich(narrowed);
-    let (link, upstream, client, drained) = link_over_sockets(&broker).await;
+    let (owner, upstream, client, drained) = duplex_over_sockets(&broker).await;
     let mut client_reader = tokio::io::BufReader::new(client);
     let mut upstream_reader = tokio::io::BufReader::new(upstream);
 
-    let carried = link
+    let carried = owner
         .from_upstream(
             br#"{"id":11,"method":"session/request_permission","params":{}}"#,
             TimestampMs::new(2),
         )
+        .await
         .expect("the request is carried");
-    let kr_worker::broker::Carried::UpstreamRequest { resource_id, .. } = carried else {
+    let Carried::UpstreamRequest { resource_id, .. } = carried else {
         panic!("a request is what this was");
     };
     let resource_id = resource_id.expect("it expects a response");
@@ -801,7 +942,7 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
             TimestampMs::new(3),
         )
         .expect("the interpretation is accepted");
-    let dispatch = link.dispatch().expect("the link carries operations");
+    let dispatch = owner.dispatch().expect("the link carries operations");
     broker.bind_connection_dispatch(GatewayConnectionId::new(1), dispatch);
 
     let answered = broker
@@ -817,6 +958,7 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
             },
             TimestampMs::new(4),
         )
+        .await
         .expect("a table with no answer method still answers its own requests")
         .0;
     assert_eq!(answered.state, PendingState::Resolved);
@@ -839,7 +981,7 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
         kr_protocol::error::ErrorCode::UnsupportedCapability
     );
 
-    drop(link);
+    drop(owner);
     drop(client_reader);
     drop(upstream_reader);
     drained.abort();

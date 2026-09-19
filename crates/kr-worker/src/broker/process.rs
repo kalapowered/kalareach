@@ -558,3 +558,101 @@ mod tests {
         }
     }
 }
+
+/// How long a dedicated backend is given to stop before it is forced.
+///
+/// Section 7 makes the native TUI's intentional exit stop its dedicated backend "through the
+/// normal grace period", and section 7's close sequence is where that period is defined.
+pub const BACKEND_GRACE: std::time::Duration = crate::session::GRACE_PERIOD;
+
+/// How often a stopping backend is looked at again.
+const BACKEND_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What stopping one dedicated backend did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendStop {
+    /// True when this host asked the process to stop.
+    ///
+    /// False means the identity named no running process: either it had already ended, or the
+    /// identifier belongs to something else now, and section 7 stops what this host started rather
+    /// than whatever holds that identifier.
+    pub asked: bool,
+    /// True when the grace period ended with the process still running, so it was forced.
+    pub forced: bool,
+    /// True when the process this host started is no longer running.
+    pub ended: bool,
+}
+
+/// Stops one dedicated backend through the normal grace period.
+///
+/// The identity is checked before anything is signalled and again before anything is forced,
+/// because a bare process identifier can be reused and signalling a stranger is worse than leaving
+/// a backend running.
+pub async fn stop_backend(
+    process: &ProcessStartIdentity,
+    grace: std::time::Duration,
+) -> BackendStop {
+    if !running(process) {
+        return BackendStop {
+            asked: false,
+            forced: false,
+            ended: true,
+        };
+    }
+    signal(process, false);
+    let deadline = tokio::time::Instant::now() + grace;
+    while tokio::time::Instant::now() < deadline {
+        if !running(process) {
+            return BackendStop {
+                asked: true,
+                forced: false,
+                ended: true,
+            };
+        }
+        tokio::time::sleep(BACKEND_POLL).await;
+    }
+    if !running(process) {
+        return BackendStop {
+            asked: true,
+            forced: false,
+            ended: true,
+        };
+    }
+    signal(process, true);
+    BackendStop {
+        asked: true,
+        forced: true,
+        ended: !running(process),
+    }
+}
+
+/// Returns true when the process this host recorded is the one running under that identifier.
+fn running(process: &ProcessStartIdentity) -> bool {
+    matches!(
+        kr_ipc::identity::process_state(process),
+        kr_ipc::identity::ProcessState::Running
+    )
+}
+
+#[cfg(unix)]
+fn signal(process: &ProcessStartIdentity, force: bool) {
+    let signal = if force {
+        rustix::process::Signal::KILL
+    } else {
+        rustix::process::Signal::TERM
+    };
+    let Ok(pid) = i32::try_from(process.pid.get()) else {
+        return;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return;
+    };
+    let _ = rustix::process::kill_process(pid, signal);
+}
+
+#[cfg(not(unix))]
+fn signal(_process: &ProcessStartIdentity, _force: bool) {
+    // The job object this worker owns ends its processes when it is closed. Nothing here signals
+    // one at a time, and section 12 keeps the Windows managed gateway unsupported until its own
+    // protected exchange exists.
+}

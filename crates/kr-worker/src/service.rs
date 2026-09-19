@@ -805,6 +805,26 @@ impl WorkerService {
                     .await
                 });
             }
+            // An admitted operation the upstream has not answered is answered on its own task for
+            // the same reason: the transport work is the upstream's, and this loop owes the same
+            // client its input, its interrupt and its keepalive while that work is happening.
+            if let Some(pending) = state.pending_upstream.take() {
+                let service = Arc::clone(&self);
+                let sender = Arc::clone(&writer);
+                let answering_writable = writable.clone();
+                let answering_withdrawn = Arc::clone(&withdrawn);
+                tokio::spawn(async move {
+                    let answer = service.finish_upstream(pending).await;
+                    write_frame(
+                        &answering_writable,
+                        &sender,
+                        &answer,
+                        &answering_withdrawn,
+                        true,
+                    )
+                    .await
+                });
+            }
             if let Some(reply) = reply {
                 // A close that was admitted happens, whether or not its acceptance can be written.
                 // What the two bounds here separate is the write and the delivery: the write gets
@@ -1198,13 +1218,15 @@ impl WorkerService {
                         false,
                     )
                     .await;
-                // A launch the reader is deciding has no answer yet, and this request is written
-                // when it has one.
-                state.pending_launch.is_none().then_some(reply)
+                // A launch the reader is deciding and an operation the upstream has not answered
+                // both have no answer yet, and this request is written when one of them does.
+                (state.pending_launch.is_none() && state.pending_upstream.is_none())
+                    .then_some(reply)
             }
             ControlFrame::Forwarded(forwarded) => {
                 let reply = self.forwarded(state, &forwarded).await;
-                state.pending_launch.is_none().then_some(reply)
+                (state.pending_launch.is_none() && state.pending_upstream.is_none())
+                    .then_some(reply)
             }
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
             _ => Some(failure(
@@ -2207,47 +2229,26 @@ impl WorkerService {
                 // to a task of its own and writes nothing for this request until the reader speaks.
                 return ControlFrame::Event(ControlEvent::Keepalive);
             }
-            // The admission is committed and the boundary is over. The transport work happens
-            // here, bounded: an upstream that has not answered by the deadline leaves an outcome
-            // nobody can establish, which section 9 records as unknown rather than as a refusal.
+            // The admission is committed and the boundary is over. The transport work is the
+            // upstream's, and waiting for it on this task would stop the connection reading
+            // anything else: the same client's next keystroke, its interrupt, its detach and its
+            // keepalive all travel on this socket. So the wait, the receipt and the response leave
+            // the read loop, exactly as a launch's do.
             Ok(Answered::Upstream {
                 handoff,
                 action_id,
                 actor_id,
             }) => {
-                let carried = tokio::time::timeout(
-                    UPSTREAM_SUBMIT_DEADLINE,
-                    tokio::task::spawn_blocking(move || handoff.carry()),
-                )
-                .await;
-                let outcome = match carried {
-                    Ok(Ok(outcome)) => outcome,
-                    Ok(Err(error)) => Err(WorkerError::Broker(
-                        crate::broker::BrokerError::UpstreamUnavailable {
-                            detail: format!("the transport could not be run: {error}"),
-                        },
-                    )),
-                    Err(_) => Err(WorkerError::Broker(
-                        crate::broker::BrokerError::UpstreamUnavailable {
-                            detail: format!(
-                                "the upstream did not answer within {} seconds, so whether the \
-                                 operation reached it cannot be established",
-                                UPSTREAM_SUBMIT_DEADLINE.as_secs()
-                            ),
-                        },
-                    )),
-                };
-                // Past the admission there is no rejection. Whether the operation reached the
-                // upstream cannot be established from here, and section 9 records that as
-                // unknown rather than as a refusal the caller would read as "nothing happened".
-                self.settle_unknown(&actor_id, action_id, outcome.as_ref());
-                return match outcome {
-                    Ok(value) => ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
-                    Err(error) => failure(mutation.request_id, &error.to_protocol_error()),
-                };
+                state.pending_upstream = Some(PendingUpstream {
+                    request_id: mutation.request_id,
+                    action_id,
+                    actor_id,
+                    handoff,
+                });
+                // Nothing is written now. The connection's loop finds the pending operation, hands
+                // it to a task of its own and writes nothing for this request until the transport
+                // has said what the upstream did.
+                return ControlFrame::Event(ControlEvent::Keepalive);
             }
             other => other,
         };
@@ -2309,12 +2310,42 @@ impl WorkerService {
         respond(pending.request_id, outcome)
     }
 
+    /// Waits for one admitted operation's upstream, records its receipt and answers the caller.
+    ///
+    /// It runs on its own task. The dispatch marker was committed before this was handed over, so
+    /// a crash in between leaves the receipt `unknown`, which is exactly what an operation that
+    /// may have reached the upstream is. The bound is this worker's own: an upstream that has not
+    /// answered by then leaves an outcome nobody can establish, which section 9 records as unknown
+    /// rather than as a refusal the caller would read as "nothing happened".
+    async fn finish_upstream(&self, pending: PendingUpstream) -> ControlFrame {
+        let carried = tokio::time::timeout(UPSTREAM_SUBMIT_DEADLINE, pending.handoff.carry()).await;
+        let outcome = carried.unwrap_or_else(|_| {
+            Err(WorkerError::Broker(
+                crate::broker::BrokerError::UpstreamUnavailable {
+                    detail: format!(
+                        "the upstream did not answer within {} seconds, so whether the operation \
+                         reached it cannot be established",
+                        UPSTREAM_SUBMIT_DEADLINE.as_secs()
+                    ),
+                },
+            ))
+        });
+        self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
+        match outcome {
+            Ok(value) => ControlFrame::Response(Response {
+                request_id: pending.request_id,
+                outcome: Outcome::Ok(value),
+            }),
+            Err(error) => failure(pending.request_id, &error.to_protocol_error()),
+        }
+    }
+
     /// Records the outcome of an admitted operation that was transmitted outside the boundary.
     ///
     /// The admission is committed before the bytes go, so a failure after it is an outcome nobody
     /// can establish rather than a refusal: the frame may have reached the upstream and the answer
     /// may have been lost. Section 9 records exactly that.
-    fn settle_unknown(
+    fn settle_upstream(
         &self,
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
@@ -2326,6 +2357,9 @@ impl WorkerService {
             return;
         };
         let settled = match outcome {
+            // The upstream answered and this is what it said. Nothing earlier than its own
+            // acknowledgement reaches here: a queue that took the bytes and a socket that wrote
+            // them are two facts about this host, and neither of them is the upstream acting.
             Ok(value) => {
                 let bytes = kr_cbor::encode(value.as_value());
                 journal.settle(
@@ -2337,10 +2371,21 @@ impl WorkerService {
                     now,
                 )
             }
+            // An upstream that answered and refused has *proved* the refusal, and section 9 keeps
+            // that apart from an outcome nobody can establish. Everything else past the admission
+            // is unknown: a frame that went in part, a reply that never came, a connection that
+            // ended. The caller reads the two differently, so they are recorded differently.
             Err(error) => journal.settle(
                 actor_id.clone(),
                 action_id,
-                kr_protocol::receipt::ReceiptState::Unknown,
+                if matches!(
+                    error,
+                    WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused { .. })
+                ) {
+                    kr_protocol::receipt::ReceiptState::Refused
+                } else {
+                    kr_protocol::receipt::ReceiptState::Unknown
+                },
                 None,
                 Some(error.to_protocol_error()),
                 now,
@@ -4981,6 +5026,12 @@ pub struct ConnectionState {
     /// The connection's own loop takes it and hands it to a task of its own, so the read loop goes
     /// on serving this client while its launch is with the reader.
     pub pending_launch: Option<PendingLaunch>,
+    /// An admitted upstream operation whose transport work has not happened yet.
+    ///
+    /// The connection's own loop takes it and hands it to a task of its own. Section 12 has this
+    /// socket carry the same client's next keystroke, its interrupt, its detach and its keepalive,
+    /// and none of those waits behind an upstream that is slow to answer.
+    pub pending_upstream: Option<PendingUpstream>,
     /// A close whose acceptance was written and whose delivery a proxy has not yet confirmed.
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
@@ -5033,6 +5084,7 @@ impl ConnectionState {
             input_sequence: 0,
             close_gate: None,
             pending_launch: None,
+            pending_upstream: None,
             pending_delivery: None,
             pending_challenge: None,
             restoration: None,
@@ -5413,6 +5465,22 @@ pub struct PendingLaunch {
     receiver: tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer>,
 }
 
+/// One admitted operation the upstream has not answered yet.
+///
+/// Everything the answer needs, carried off the connection's read loop so the wait holds nothing
+/// up.
+#[derive(Debug)]
+pub struct PendingUpstream {
+    /// The request the answer belongs to.
+    request_id: RequestId,
+    /// The action its receipt belongs to.
+    action_id: kr_protocol::ids::ActionId,
+    /// The principal that asked.
+    actor_id: ActorId,
+    /// The admitted operation and what recording it means.
+    handoff: Box<UpstreamHandoff>,
+}
+
 /// How long an admitted operation has to reach its upstream.
 ///
 /// Section 11 makes a framing connection that cannot safely continue `UPSTREAM_UNAVAILABLE` rather
@@ -5446,21 +5514,23 @@ impl UpstreamHandoff {
         self.broker.abandon(&self.admitted);
     }
 
-    /// Carries the admitted operation to its upstream and encodes what it answered.
+    /// Carries the admitted operation to its upstream and encodes what the upstream did.
     ///
     /// Nothing of this worker's is held while this runs. The admission already carries everything
     /// the broker checked and the transport it checked against, so the transmission needs no lock
-    /// of its own.
-    fn carry(self) -> Result<ParamsValue> {
+    /// of its own. What is awaited is the transport's own account of the operation: the bytes
+    /// reaching the socket, and then, for a request, the upstream's own answer. A receipt says
+    /// `applied` for this and for nothing earlier.
+    async fn carry(self) -> Result<ParamsValue> {
         let now = kr_ipc::now_ms();
         match self.kind {
             UpstreamKind::Mutation => {
-                let result = self.broker.dispatch_mutation(&self.admitted, now)?;
-                encode(&result)
+                let flight = self.broker.dispatch_mutation(&self.admitted, now)?;
+                encode(&flight.settled().await?)
             }
             UpstreamKind::Approval => {
-                let result = self.broker.record_approval(&self.admitted, now)?;
-                encode(&result)
+                let flight = self.broker.record_approval(&self.admitted, now)?;
+                encode(&flight.settled(now).await?)
             }
         }
     }

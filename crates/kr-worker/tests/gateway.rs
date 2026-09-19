@@ -26,8 +26,8 @@ use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::Durability;
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, ConnectionOrigin, Credential, ManagedProcess,
-    MutationAdmission, ReconcileScope, TransportHandle, UpstreamBody, UpstreamDispatch,
-    UpstreamOutcome, UpstreamRequest, subject,
+    MutationAdmission, PendingTransmission, ReconcileScope, TransportHandle, UpstreamBody,
+    UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -208,7 +208,7 @@ impl UpstreamDispatch for RecordingUpstream {
         Ok(())
     }
 
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         self.submitted
             .lock()
             .expect("the record is not poisoned")
@@ -220,11 +220,11 @@ impl UpstreamDispatch for RecordingUpstream {
             } => upstream_request_id.clone(),
             _ => UpstreamRequestId::new("upstream-1").expect("valid"),
         };
-        Ok(UpstreamOutcome {
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
             upstream_request_id: Some(upstream_request_id),
             turn_id: request.turn_id.clone(),
             provenance: ActionProvenance::UpstreamTypedRpc,
-        })
+        })))
     }
 }
 
@@ -245,7 +245,7 @@ impl UpstreamDispatch for StoppingUpstream {
         Ok(())
     }
 
-    fn submit(&self, _request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         panic!("{STOPPED}")
     }
 }
@@ -296,8 +296,17 @@ fn answer_and_stop(
         GatewayConnectionId::new(1),
         std::sync::Arc::new(StoppingUpstream),
     );
+    // The host stops inside `submit`, which the admission reaches before anything is awaited,
+    // so the stop is caught here rather than in a future nobody polls.
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = answer(broker, resource_id, "allow", now);
+        let admitted = broker
+            .admit_approval(
+                &caller("device-1"),
+                &respond(resource_id, "allow"),
+                TimestampMs::new(now),
+            )
+            .expect("the answer is admitted");
+        let _ = broker.record_approval(&admitted, TimestampMs::new(now));
     }));
     let payload = stopped.expect_err("the host stopped where the transport stops it");
     assert_eq!(
@@ -311,7 +320,7 @@ fn answer_and_stop(
 }
 
 /// Answers one approval the way the method does: admit, mark, transmit, settle.
-fn answer(
+async fn answer(
     broker: &Broker,
     resource_id: PendingResourceId,
     option_id: &str,
@@ -323,6 +332,7 @@ fn answer(
             &respond(resource_id, option_id),
             TimestampMs::new(now),
         )
+        .await
         .map(|(result, _)| result)
 }
 
@@ -587,8 +597,8 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
 
 /// KR-REQ-11.33: the encode, recheck, claim and dispatch transaction, and a native answer that
 /// arrives during encoding wins.
-#[test]
-fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_told_so() {
+#[tokio::test]
+async fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_told_so() {
     let broker = gateway(None);
     let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
 
@@ -606,6 +616,7 @@ fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_t
 
     // The rich answer now reaches the recheck, and there is nothing to admit.
     let refusal = answer(&broker, resource.resource_id, "allow", 6)
+        .await
         .expect_err("the native answer already resolved it");
     assert_eq!(refusal.code(), ErrorCode::QuestionResolved);
     assert_eq!(
@@ -620,7 +631,9 @@ fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_t
     // The ordinary order, and the whole of it is one admission: it reserves the resource, marks
     // it, transmits it and settles it, and nothing outside it can do any of those.
     let second = approval(&broker, "2", 7).expect("another interpretation");
-    let applied = answer(&broker, second.resource_id, "allow", 8).expect("the upstream took it");
+    let applied = answer(&broker, second.resource_id, "allow", 8)
+        .await
+        .expect("the upstream took it");
     assert_eq!(
         applied.mutation.provenance,
         ActionProvenance::UpstreamTypedRpc
@@ -995,11 +1008,13 @@ fn kr_req_12_16_a_reverse_request_names_the_agents_own_environment_and_user() {
 }
 
 /// KR-REQ-12.09: an action records how it actually reached the upstream.
-#[test]
-fn kr_req_12_09_an_admitted_answer_records_the_provenance_it_reached_the_upstream_by() {
+#[tokio::test]
+async fn kr_req_12_09_an_admitted_answer_records_the_provenance_it_reached_the_upstream_by() {
     let broker = gateway(None);
     let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
-    let applied = answer(&broker, resource.resource_id, "allow", 4).expect("the answer is applied");
+    let applied = answer(&broker, resource.resource_id, "allow", 4)
+        .await
+        .expect("the answer is applied");
     assert_eq!(
         applied.mutation.provenance,
         ActionProvenance::UpstreamTypedRpc,
@@ -1015,8 +1030,8 @@ fn kr_req_12_09_an_admitted_answer_records_the_provenance_it_reached_the_upstrea
 
 /// KR-REQ-11.35 and KR-REQ-11.36: `native_only_volatile` fences rich work, keeps native
 /// arbitration, exposes the gap, relabels nothing, and answers `UPSTREAM_UNAVAILABLE`.
-#[test]
-fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the_gap() {
+#[tokio::test]
+async fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the_gap() {
     let broker = gateway(None);
     let claimed = approval(&broker, "1", 2).expect("an interpretation before the fault");
     let untouched = approval(&broker, "4", 2).expect("another one before the fault");
@@ -1069,8 +1084,9 @@ fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the
         )
         .expect_err("a rich mutation is fenced");
     assert_eq!(rich_refusal.code(), ErrorCode::UpstreamUnavailable);
-    let answer_refusal =
-        answer(&broker, untouched.resource_id, "allow", 9).expect_err("a rich approval is fenced");
+    let answer_refusal = answer(&broker, untouched.resource_id, "allow", 9)
+        .await
+        .expect_err("a rich approval is fenced");
     assert_eq!(answer_refusal.code(), ErrorCode::UpstreamUnavailable);
 
     // The gap is exposed while it is open, and it counts what passed through it.
@@ -1103,8 +1119,8 @@ fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the
 
 /// KR-REQ-11.37: after storage recovers the gap is committed and pending identifiers are
 /// reconciled with the same upstream before rich work comes back.
-#[test]
-fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns() {
+#[tokio::test]
+async fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns() {
     let path = journal_path();
     let (surviving, answered) = {
         let (broker, upstream) = gateway_recording(Some(&path));
@@ -1134,7 +1150,9 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
             "committing the gap is not the same as reconciling the upstream"
         );
         assert!(
-            answer(&broker, surviving.resource_id, "allow", 10).is_err(),
+            answer(&broker, surviving.resource_id, "allow", 10)
+                .await
+                .is_err(),
             "rich work does not come back before the pending identifiers are reconciled"
         );
 
@@ -1203,8 +1221,8 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
 /// A crash between committing the gap and reconciling the upstream must not leave a resource this
 /// host may already have answered claimable again, and a restarted worker must not put a new
 /// connection's identifiers in an old connection's namespace.
-#[test]
-fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_wrote() {
+#[tokio::test]
+async fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_wrote() {
     let path = journal_path();
     let resource_id = {
         let broker = gateway(Some(&path));
@@ -1227,7 +1245,7 @@ fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_wrote()
         "a recovery this host did not finish is one it comes back in the middle of"
     );
     assert!(
-        answer(&restarted, resource_id, "allow", 10).is_err(),
+        answer(&restarted, resource_id, "allow", 10).await.is_err(),
         "nothing is answerable until an upstream has been reconciled"
     );
     assert!(
@@ -1238,8 +1256,8 @@ fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_wrote()
 }
 
 /// Rich work comes back when every upstream that owed a reconciliation has given one.
-#[test]
-fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
+#[tokio::test]
+async fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
     let broker = gateway(None);
     broker
         .register_instance(
@@ -1299,7 +1317,11 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
         "one upstream says nothing about another's pending identifiers"
     );
     assert_eq!(broker.mode(), GatewayMode::Recovering);
-    assert!(answer(&broker, first.resource_id, "allow", 7).is_err());
+    assert!(
+        answer(&broker, first.resource_id, "allow", 7)
+            .await
+            .is_err()
+    );
 
     let (_, finished) = broker
         .reconcile_recovered(
@@ -1318,7 +1340,9 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
     assert!(finished.is_some(), "and that was the last one that owed");
     assert_eq!(broker.mode(), GatewayMode::Normal);
     assert!(broker.pending(second.resource_id).is_some());
-    answer(&broker, first.resource_id, "allow", 9).expect("rich work is back");
+    answer(&broker, first.resource_id, "allow", 9)
+        .await
+        .expect("rich work is back");
 }
 
 /// KR-REQ-12.10: the worker's own agent, terminal and gateway request state survives a restart of
@@ -1388,8 +1412,8 @@ fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal
 /// Recording competing answers afterwards is not the contract. Section 11 gives every pending
 /// resource one resolution, and a resolution is bytes reaching the upstream, so what has to be
 /// impossible is the second transmission.
-#[test]
-fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_takes_it() {
+#[tokio::test]
+async fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_takes_it() {
     let (broker, upstream) = gateway_recording(None);
 
     // The rich writer takes the admission first. The native answer that follows is refused, and
@@ -1452,6 +1476,7 @@ fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_take
         .expect("the native client's answer is admitted");
     assert_eq!(native.resource_id, second.resource_id);
     let taken = answer(&broker, second.resource_id, "allow", 7)
+        .await
         .expect_err("the native writer holds the admission");
     assert_eq!(taken.code(), ErrorCode::QuestionResolved);
     broker
@@ -1488,8 +1513,8 @@ fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_take
 /// acknowledgement in flight from the one that failed must not finish it. And an upstream whose
 /// first request arrives while the recovery is running has not said what it holds, so rich work
 /// does not come back over it.
-#[test]
-fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_it_owes() {
+#[tokio::test]
+async fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_it_owes() {
     let directory = std::env::temp_dir().join(format!("kr-recovery-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&directory).expect("the directory is created");
     let journal = directory.join("worker.db");
@@ -1529,7 +1554,9 @@ fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_i
         .expect_err("a reconciliation from the recovery that failed finishes nothing");
     assert_eq!(stale.code(), ErrorCode::InvalidArgument);
     assert!(
-        answer(&broker, first.resource_id, "allow", 8).is_err(),
+        answer(&broker, first.resource_id, "allow", 8)
+            .await
+            .is_err(),
         "rich work has not come back"
     );
 
@@ -1728,8 +1755,8 @@ fn kr_req_11_26_a_restoration_checks_every_resource_the_connection_retained() {
 /// The decision goes in the member the connector's own table names. A table that names none
 /// describes no way to answer its requests, and saying so at admission is what keeps the refusal
 /// in front of the claim and the marker rather than behind them.
-#[test]
-fn kr_req_11_33_a_table_that_names_no_answer_member_refuses_before_anything_is_marked() {
+#[tokio::test]
+async fn kr_req_11_33_a_table_that_names_no_answer_member_refuses_before_anything_is_marked() {
     // An installation whose table says nothing about where a decision goes.
     let mut silent = table();
     for entry in &mut silent.entries {
@@ -1740,6 +1767,7 @@ fn kr_req_11_33_a_table_that_names_no_answer_member_refuses_before_anything_is_m
     let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
 
     let refusal = answer(&broker, resource.resource_id, "allow", 4)
+        .await
         .expect_err("this table describes no way to answer its own requests");
     assert_eq!(refusal.code(), ErrorCode::UnsupportedCapability);
     assert!(
@@ -1761,8 +1789,8 @@ fn kr_req_11_33_a_table_that_names_no_answer_member_refuses_before_anything_is_m
 /// The two halves of reconciliation are the difference the marker makes. A resource this host had
 /// reserved but not marked is answerable again once the upstream says it still holds the request;
 /// one it had marked is uncertain for ever.
-#[test]
-fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_under() {
+#[tokio::test]
+async fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_under() {
     let (broker, upstream) = gateway_recording(None);
     let reserved = approval(&broker, "1", 2).expect("the interpretation is accepted");
     let admitted =
@@ -1805,7 +1833,9 @@ fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_under() {
             .record_approval(&admitted, TimestampMs::new(7))
             .is_err()
     );
-    let applied = answer(&broker, reserved.resource_id, "allow", 8).expect("it is answerable");
+    let applied = answer(&broker, reserved.resource_id, "allow", 8)
+        .await
+        .expect("it is answerable");
     assert_eq!(applied.state, PendingState::Resolved);
     assert_eq!(upstream.submitted().len(), 1, "one answer went in the end");
 }

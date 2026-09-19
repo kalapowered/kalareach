@@ -43,6 +43,16 @@ pub enum BrokerError {
         /// What went wrong, and what a person can do about it.
         detail: String,
     },
+    /// The operation reached the upstream and the upstream refused it.
+    ///
+    /// This is not uncertainty: the upstream answered, so what happened is established. Section 9
+    /// keeps the two apart because a caller reads them differently — a refusal is a thing that did
+    /// not happen, and an unknown outcome is a thing that may have.
+    #[error("{detail}")]
+    UpstreamRefused {
+        /// What the upstream said.
+        detail: String,
+    },
     /// A rich operation arrived while the journal was faulted.
     #[error("{detail}")]
     RichWorkFenced {
@@ -149,6 +159,9 @@ impl BrokerError {
             Self::UpstreamUnavailable { .. } | Self::RichWorkFenced { .. } => {
                 ErrorCode::UpstreamUnavailable
             }
+            // The upstream answered and said no. It is the upstream's own argument failure, not
+            // this host's, and never an unavailable connection: the connection carried it.
+            Self::UpstreamRefused { .. } => ErrorCode::InvalidArgument,
             Self::UnknownSubject { .. } | Self::StaleBinding { .. } => ErrorCode::StaleSession,
             Self::AlreadyTransmitted | Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
             Self::LedgerUnavailable { .. } => ErrorCode::StorageUnavailable,

@@ -29,8 +29,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, InstanceEnding,
-    Invocation, ManagedProcess, MutationAdmission, Probe, ReconcileScope, TransportHandle,
-    UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
+    Invocation, ManagedProcess, MutationAdmission, PendingTransmission, Probe, ReconcileScope,
+    TransportHandle, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -284,7 +284,7 @@ impl UpstreamDispatch for RecordingUpstream {
         Ok(())
     }
 
-    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         self.submitted
             .lock()
             .expect("the record is not poisoned")
@@ -296,11 +296,11 @@ impl UpstreamDispatch for RecordingUpstream {
             } => upstream_request_id.clone(),
             _ => UpstreamRequestId::new("upstream-1").expect("valid"),
         };
-        Ok(UpstreamOutcome {
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
             upstream_request_id: Some(upstream_request_id),
             turn_id: request.turn_id.clone(),
             provenance: ActionProvenance::UpstreamTypedRpc,
-        })
+        })))
     }
 }
 
@@ -320,7 +320,7 @@ impl UpstreamDispatch for StoppingUpstream {
         Ok(())
     }
 
-    fn submit(&self, _request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+    fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
         panic!("{STOPPED}")
     }
 }
@@ -379,7 +379,7 @@ fn reserve(
 }
 
 /// Answers one approval the way the method does: admit, mark, transmit, settle.
-fn answer(
+async fn answer(
     broker: &Broker,
     resource_id: PendingResourceId,
     option_id: &str,
@@ -391,6 +391,7 @@ fn answer(
             &respond(resource_id, option_id),
             TimestampMs::new(now),
         )
+        .await
         .map(|(result, _)| result)
 }
 
@@ -479,8 +480,8 @@ fn offer(
 
 /// KR-REQ-11.22: the broker owns the processes it launched, their credentials, their source
 /// frames and the arbitration over what those frames imply.
-#[test]
-fn kr_req_11_22_the_broker_owns_the_process_identity_the_source_and_the_arbitration() {
+#[tokio::test]
+async fn kr_req_11_22_the_broker_owns_the_process_identity_the_source_and_the_arbitration() {
     let broker = broker_with(
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
@@ -511,7 +512,9 @@ fn kr_req_11_22_the_broker_owns_the_process_identity_the_source_and_the_arbitrat
     assert_eq!(opaque.kind, PendingKind::ReverseRpc);
     assert!(!opaque.interpretation_verified);
     assert!(
-        answer(&broker, opaque.resource_id, "allow", 4).is_err(),
+        answer(&broker, opaque.resource_id, "allow", 4)
+            .await
+            .is_err(),
         "a pending opaque request is not an actionable approval"
     );
 
@@ -843,8 +846,8 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
 
 /// KR-REQ-11.27: one resolution per pending resource, and a reconnect reconciles an answer that
 /// went without reissuing it.
-#[test]
-fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_uncertain() {
+#[tokio::test]
+async fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_uncertain() {
     let (broker, upstream) = broker_recording(
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
@@ -909,7 +912,9 @@ fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_uncerta
         PendingState::Uncertain
     );
     assert!(
-        answer(&broker, resource.resource_id, "allow", 9).is_err(),
+        answer(&broker, resource.resource_id, "allow", 9)
+            .await
+            .is_err(),
         "a reconnect never reissues an uncertain response"
     );
     // And the admission that was in force before the reconnect settles nothing either: its
@@ -1536,8 +1541,8 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
 ///
 /// This is the durability half of `native_only_volatile`. The fence itself, the native
 /// arbitration that continues through it and `UPSTREAM_UNAVAILABLE` are the gateway's.
-#[test]
-fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes() {
+#[tokio::test]
+async fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes() {
     let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&directory).expect("the directory is created");
     let path = directory.join("session.sqlite");
@@ -1605,7 +1610,9 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
         // Rich work does not come back yet: the pending identifiers have to be reconciled with
         // the same upstream first.
         assert!(
-            answer(&broker, surviving.resource_id, "allow", 10).is_err(),
+            answer(&broker, surviving.resource_id, "allow", 10)
+                .await
+                .is_err(),
             "committing the gap is not the same as reconciling the upstream"
         );
         broker
@@ -1622,7 +1629,9 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
 
         // Normal operation again: an admitted answer goes and is written down, although the
         // resource's own history says it lived through a gap.
-        answer(&broker, surviving.resource_id, "allow", 12).expect("the upstream took it");
+        answer(&broker, surviving.resource_id, "allow", 12)
+            .await
+            .expect("the upstream took it");
 
         (surviving.resource_id, withdrawn.resource_id)
     };
