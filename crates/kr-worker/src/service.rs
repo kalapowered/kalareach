@@ -2148,6 +2148,45 @@ impl WorkerService {
                 // to a task of its own and writes nothing for this request until the reader speaks.
                 return ControlFrame::Event(ControlEvent::Keepalive);
             }
+            // The admission is committed and the boundary is over. The transport work happens
+            // here, bounded: an upstream that has not answered by the deadline leaves an outcome
+            // nobody can establish, which section 9 records as unknown rather than as a refusal.
+            Ok(Answered::Upstream {
+                handoff,
+                action_id,
+                actor_id,
+            }) => {
+                let carried = tokio::time::timeout(
+                    UPSTREAM_SUBMIT_DEADLINE,
+                    tokio::task::spawn_blocking(move || handoff.carry()),
+                )
+                .await;
+                let outcome = match carried {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(error)) => Err(WorkerError::Broker(
+                        crate::broker::BrokerError::UpstreamUnavailable {
+                            detail: format!("the transport could not be run: {error}"),
+                        },
+                    )),
+                    Err(_) => Err(WorkerError::Broker(
+                        crate::broker::BrokerError::UpstreamUnavailable {
+                            detail: format!(
+                                "the upstream did not answer within {} seconds, so whether the \
+                                 operation reached it cannot be established",
+                                UPSTREAM_SUBMIT_DEADLINE.as_secs()
+                            ),
+                        },
+                    )),
+                };
+                self.settle(&actor_id, action_id, outcome.as_ref());
+                return match outcome {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(mutation.request_id, &error.to_protocol_error()),
+                };
+            }
             other => other,
         };
         match answered {
@@ -2166,8 +2205,8 @@ impl WorkerService {
                     ControlFrame::Response(response)
                 }
             }
-            // A launch that has already been awaited above cannot appear here.
-            Ok(Answered::Launch { .. }) => failure(
+            // An upstream operation and a launch are both answered above.
+            Ok(Answered::Upstream { .. } | Answered::Launch { .. }) => failure(
                 mutation.request_id,
                 &ProtocolError::new(
                     ErrorCode::ResourceUnavailable,
@@ -2604,8 +2643,14 @@ impl WorkerService {
 
         let outcome = self.apply(&mut session, state, mutation, method, caller);
         // A launch that reached the reader has no outcome yet, so none is recorded: it is settled
-        // when the reader answers, outside this boundary.
-        let pending = matches!(outcome, Ok((_, AfterEffect::Launch { .. })));
+        // when the reader answers, outside this boundary. An admitted upstream operation is the
+        // same shape for the same reason: its effect is the admission, and its outcome is what the
+        // upstream says once this boundary has ended and the transport work has happened.
+        let pending = matches!(
+            outcome,
+            Ok((_, AfterEffect::Launch { .. } | AfterEffect::Upstream(_)))
+        );
+        let settling = actor_id.clone();
         let now = kr_ipc::now_ms();
         match (&outcome, session.journal_mut()) {
             _ if pending => {}
@@ -2692,6 +2737,16 @@ impl WorkerService {
                 return Ok(Answered::Launch {
                     transaction,
                     receiver,
+                });
+            }
+            // The session mutex and the dispatch barrier are both released by now, which is the
+            // point: terminal ingestion needs the first and every other mutation needs the second,
+            // and neither waits for an upstream.
+            AfterEffect::Upstream(handoff) => {
+                return Ok(Answered::Upstream {
+                    handoff,
+                    action_id: mutation.action_id,
+                    actor_id: settling,
                 });
             }
         }
@@ -4410,46 +4465,75 @@ impl WorkerService {
                     .acknowledge_visit(&caller.actor_id, &params)?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
-            // The five agent mutations and the plugin action call. Each is applied by the broker,
-            // which is where the binding revision, the capability evidence, the grant and the
-            // arbitration live; what happens here is the parse and the hand-over.
+            // The five agent mutations and the plugin action call. The broker admits each one
+            // under its own lock, and the admission is what leaves this boundary: the transport
+            // work happens after the session mutex is released, because terminal ingestion needs
+            // that mutex and an upstream that is slow to answer must not stop a person typing.
             Method::AgentPromptSubmit | Method::AgentPromptQueue => {
                 let params: kr_protocol::agent::AgentPromptParams = parse(params)?;
                 let queued = method == Method::AgentPromptQueue;
-                let result = self.broker.agent_prompt(
+                let admitted = self.broker.admit_prompt(
                     &Self::broker_caller(caller),
                     &params,
                     queued,
                     kr_ipc::now_ms(),
                 )?;
-                Ok((encode(&result)?, AfterEffect::None))
+                Ok((
+                    ParamsValue::empty(),
+                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
+                        broker: Arc::clone(&self.broker),
+                        admitted,
+                        kind: UpstreamKind::Mutation,
+                    })),
+                ))
             }
             Method::AgentTurnSteer => {
                 let params: kr_protocol::agent::AgentSteerParams = parse(params)?;
-                let result = self.broker.agent_steer(
+                let admitted = self.broker.admit_steer(
                     &Self::broker_caller(caller),
                     &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok((encode(&result)?, AfterEffect::None))
+                Ok((
+                    ParamsValue::empty(),
+                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
+                        broker: Arc::clone(&self.broker),
+                        admitted,
+                        kind: UpstreamKind::Mutation,
+                    })),
+                ))
             }
             Method::AgentTurnCancel => {
                 let params: kr_protocol::agent::AgentCancelParams = parse(params)?;
-                let result = self.broker.agent_cancel(
+                let admitted = self.broker.admit_cancel(
                     &Self::broker_caller(caller),
                     &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok((encode(&result)?, AfterEffect::None))
+                Ok((
+                    ParamsValue::empty(),
+                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
+                        broker: Arc::clone(&self.broker),
+                        admitted,
+                        kind: UpstreamKind::Mutation,
+                    })),
+                ))
             }
             Method::AgentApprovalRespond => {
                 let params: kr_protocol::agent::AgentApprovalRespondParams = parse(params)?;
-                let (result, _) = self.broker.agent_approval_respond(
+                let admitted = self.broker.admit_approval(
                     &Self::broker_caller(caller),
                     &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok((encode(&result)?, AfterEffect::None))
+                Ok((
+                    ParamsValue::empty(),
+                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
+                        broker: Arc::clone(&self.broker),
+                        admitted,
+                        kind: UpstreamKind::Approval,
+                    })),
+                ))
             }
             Method::PluginActionInvoke => {
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(params)?;
@@ -4457,13 +4541,20 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
-                let result = self.broker.plugin_action_invoke(
+                let admitted = self.broker.admit_plugin_action(
                     &Self::broker_caller(caller),
                     binding_id,
                     &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok((encode(&result)?, AfterEffect::None))
+                Ok((
+                    ParamsValue::empty(),
+                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
+                        broker: Arc::clone(&self.broker),
+                        admitted,
+                        kind: UpstreamKind::PluginAction,
+                    })),
+                ))
             }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
@@ -4507,6 +4598,19 @@ enum Answered {
     Performed(ParamsValue),
     /// The journal already held this action's result.
     Retained(ParamsValue),
+    /// An admitted upstream operation whose transport work has not happened yet.
+    ///
+    /// The admission is committed and the boundary is over. What is left is bytes reaching the
+    /// upstream and the outcome being recorded, and neither of those holds anything this worker
+    /// needs for something else.
+    Upstream {
+        /// The admitted operation and what recording it means.
+        handoff: Box<UpstreamHandoff>,
+        /// The action the outcome is recorded against.
+        action_id: kr_protocol::ids::ActionId,
+        /// The principal whose action it is.
+        actor_id: ActorId,
+    },
     /// A launch the reader is deciding.
     ///
     /// Every method but this one is finished when the boundary ends. A launch's effect is the
@@ -5233,11 +5337,69 @@ pub struct PendingLaunch {
     receiver: tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer>,
 }
 
+/// How long an admitted operation has to reach its upstream.
+///
+/// Section 11 makes a framing connection that cannot safely continue `UPSTREAM_UNAVAILABLE` rather
+/// than a wait without an end. This is what turns "cannot continue" into a fact rather than a
+/// hope: an upstream that has not answered by now leaves the outcome unknown, which is what it is.
+pub const UPSTREAM_SUBMIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Which of the broker's three recordings one admitted operation ends in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamKind {
+    /// A prompt, a steer or a cancellation.
+    Mutation,
+    /// An approval answer, which also resolves its pending resource.
+    Approval,
+    /// A plugin action, which also spends its token.
+    PluginAction,
+}
+
+/// One admitted operation, waiting for the session boundary to end before it is transmitted.
+#[derive(Debug)]
+pub struct UpstreamHandoff {
+    broker: Arc<crate::broker::Broker>,
+    admitted: crate::broker::MutationAdmission,
+    kind: UpstreamKind,
+}
+
+impl UpstreamHandoff {
+    /// Carries the admitted operation to its upstream and encodes what it answered.
+    ///
+    /// Nothing of this worker's is held while this runs. The admission already carries everything
+    /// the broker checked and the transport it checked against, so the transmission needs no lock
+    /// of its own.
+    fn carry(self) -> Result<ParamsValue> {
+        let now = kr_ipc::now_ms();
+        match self.kind {
+            UpstreamKind::Mutation => {
+                let result = self.broker.dispatch_mutation(&self.admitted, now)?;
+                encode(&result)
+            }
+            UpstreamKind::Approval => {
+                let result = self.broker.record_approval(&self.admitted, now)?;
+                encode(&result)
+            }
+            UpstreamKind::PluginAction => {
+                let result = self.broker.record_plugin_action(&self.admitted, now)?;
+                encode(&result)
+            }
+        }
+    }
+}
+
 /// What a mutation left for the caller to do once the session boundary is over.
 #[derive(Debug)]
 pub enum AfterEffect {
     /// Nothing.
     None,
+    /// An admitted operation whose transport work happens outside the session boundary.
+    ///
+    /// Section 12 has terminal ingestion take the session mutex too, so an upstream that is slow
+    /// to answer would stop a person typing if the transmission happened inside it. The admission
+    /// is committed first, the mutex is released, the transport work happens, and the outcome is
+    /// recorded afterwards.
+    Upstream(Box<UpstreamHandoff>),
     /// A termination sequence to start once the acceptance has reached the requester.
     Close(crate::runtime::CloseGate),
     /// A launch the reader is deciding, whose answer the caller is owed.
