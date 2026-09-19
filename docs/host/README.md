@@ -1242,13 +1242,18 @@ beside live authority.
 **Transfer of control is not a delegation.** The transferring device does not keep what it hands
 over: the recipient receives an active grant over the session named in the plan, and the
 transferring device's grant is revoked with its descendants, both in one commit. It changes who
-holds authority, so it takes the owner's confirmation every time, verified and consumed against a
-digest that covers the whole plan. It hands over no more than the transferring grant carries, and
-it advances the revision and fences like any other revocation.
+holds authority, so it takes the owner's confirmation every time. The challenge is verified and
+consumed where the transfer happens, against an expectation this host builds from what it knows —
+its own identity, the recipient's keys from its device record, the rights the plan hands over and a
+digest covering the whole plan — so a challenge that supplied its own answers to those does not
+authorise anything. The evidence carries the challenge's deadline and is refused after it. The
+transfer hands over no more than the transferring grant carries, and it advances the revision and
+fences like any other revocation.
 
-**Nothing is lent through an intermediary.** What an actor may do through a plugin action, an
-attachment action or a workflow is the *intersection* of what the actor holds and what the
-intermediary declares. An intermediary bounds a call; it never funds one.
+**Nothing is lent through an intermediary.** The rule for a plugin action, an attachment action or a
+workflow is the *intersection* of what the actor holds and what the intermediary declares: an
+intermediary bounds a call and never funds one. The host states that rule in one place so every
+execution path decides it the same way.
 
 **Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
 delegates from — naming one is not holding one — and that grant has to carry `session.share`.

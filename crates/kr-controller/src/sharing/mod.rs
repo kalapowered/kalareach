@@ -41,7 +41,7 @@ use crate::grants::{GrantDirectory, GrantRecord, GrantRevocation};
 
 pub use invitation::InvitationRecord;
 pub use roles::{Intermediary, effective_rights};
-pub use transfer::{ConfirmedTransfer, ControlTransfer, TransferPlan};
+pub use transfer::{ConfirmedTransfer, ControlTransfer, TransferHost, TransferPlan};
 
 /// What the issuer supplies when it shares a session.
 #[derive(Clone, Debug)]
@@ -451,7 +451,7 @@ impl SharingService {
         authority_revision: AuthorityRevision,
         now_ms: u64,
     ) -> Result<ControlTransfer> {
-        confirmation.covers(plan)?;
+        confirmation.covers(plan, now_ms)?;
         // Built from the source rather than from the caller, so a transfer cannot widen the
         // environment or the history the source reached. The source is read again inside the
         // transaction; this copy is only to build the record, and the transaction's own check is
@@ -481,7 +481,10 @@ impl SharingService {
         };
         let replacement = GrantRecord {
             grant: issued.clone(),
-            session_id: source.session_id,
+            // The session the plan names, so a listing that filters by session finds it. Copying a
+            // broad source's `None` would leave the replacement out of the very list its recipient
+            // would look in.
+            session_id: Some(plan.session_id),
             issued_at_ms: now_ms,
             // Active on issue. The confirmation is the ceremony; there is nothing left to redeem.
             activated_at_ms: Some(now_ms),

@@ -19,8 +19,8 @@ use std::time::Duration;
 use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::sharing::{
-    ConfirmedTransfer, Intermediary, ShareRequest, SharingService, TransferPlan, effective_rights,
-    requires_owner_confirmation, roles, transfer,
+    ConfirmedTransfer, Intermediary, ShareRequest, SharingService, TransferHost, TransferPlan,
+    effective_rights, requires_owner_confirmation, roles, transfer,
 };
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
@@ -125,21 +125,38 @@ impl kr_pairing::platform::PairingClock for Clock {
 /// The challenge is issued for this exact plan's digest, the owner's key signs it, and
 /// `ConfirmedTransfer::verify` is the thing that accepts it: the test never constructs the
 /// evidence, because nothing outside this crate can.
+fn recipient_keys() -> kr_protocol::pairing::DevicePublicKeys {
+    kr_protocol::pairing::DevicePublicKeys {
+        authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([11; 32]),
+        stored_envelope: kr_protocol::scalars::StoredEnvelopeKey::from_bytes([12; 32]),
+        notification_preview: kr_protocol::scalars::NotificationPreviewKey::from_bytes([13; 32]),
+        transport: kr_protocol::scalars::EndpointKey::from_bytes([14; 32]),
+    }
+}
+
+fn transfer_host(keys: &kr_protocol::pairing::DevicePublicKeys) -> TransferHost<'_> {
+    TransferHost {
+        device_id: device_id(0xf0),
+        endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([3; 32]),
+        recipient_keys: keys,
+    }
+}
+
 fn confirm_transfer(
     plan: &TransferPlan,
     owner_key: &kr_crypto::keys::AuthorisationKeyPair,
 ) -> ConfirmedTransfer {
     let clock = Clock;
-    let host_device_id = device_id(0xf0);
-    let host_endpoint_id = kr_protocol::scalars::EndpointKey::from_bytes([3; 32]);
+    let keys = recipient_keys();
+    let host = transfer_host(&keys);
     let request = kr_pairing::confirm::request_confirmation(
         &clock,
         TransferPlan::sensitive_action(),
         plan.action_digest().expect("a digest"),
-        None,
+        Some(keys),
         plan.actions.iter().copied().collect(),
-        host_device_id,
-        host_endpoint_id,
+        host.device_id,
+        host.endpoint_id,
     )
     .expect("a challenge");
     let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
@@ -152,15 +169,99 @@ fn confirm_transfer(
     .expect("a proof");
     ConfirmedTransfer::verify(
         plan,
+        &host,
         &mut ledger,
         &clock,
         &request,
         &proof,
         owner_key.public(),
         kr_pairing::confirm::HostEnrolment::Enrolled,
-        None,
     )
     .expect("the owner confirmed this transfer")
+}
+
+/// A challenge answered for another host does not confirm a transfer on this one.
+#[test]
+fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
+    let clock = Clock;
+    let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
+    let keys = recipient_keys();
+    let plan = TransferPlan {
+        session_id: session_id(0xa0),
+        from_device_id: device_id(0xf1),
+        to_device_id: device_id(0xf2),
+        revoking_grant_id: grant_id(1),
+        issuing_grant_id: grant_id(9),
+        actions: [ActionRight::SessionView, ActionRight::SessionShare]
+            .into_iter()
+            .collect(),
+    };
+    // The challenge names another host entirely.
+    let request = kr_pairing::confirm::request_confirmation(
+        &clock,
+        TransferPlan::sensitive_action(),
+        plan.action_digest().expect("a digest"),
+        Some(keys),
+        plan.actions.iter().copied().collect(),
+        device_id(0xee),
+        kr_protocol::scalars::EndpointKey::from_bytes([9; 32]),
+    )
+    .expect("a challenge");
+    let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
+    ledger.issue(&request, &clock);
+    let proof = kr_pairing::confirm::sign_confirmation(
+        &owner_key,
+        &request,
+        kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
+    )
+    .expect("a proof");
+    let host = transfer_host(&keys);
+    ConfirmedTransfer::verify(
+        &plan,
+        &host,
+        &mut ledger,
+        &clock,
+        &request,
+        &proof,
+        owner_key.public(),
+        kr_pairing::confirm::HostEnrolment::Enrolled,
+    )
+    .expect_err("this host builds the expectation, so another host's challenge does not answer it");
+
+    // And a challenge that names different destination keys does not answer it either.
+    let elsewhere = kr_protocol::pairing::DevicePublicKeys {
+        authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([99; 32]),
+        ..recipient_keys()
+    };
+    let request = kr_pairing::confirm::request_confirmation(
+        &clock,
+        TransferPlan::sensitive_action(),
+        plan.action_digest().expect("a digest"),
+        Some(elsewhere),
+        plan.actions.iter().copied().collect(),
+        host.device_id,
+        host.endpoint_id,
+    )
+    .expect("a challenge");
+    let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
+    ledger.issue(&request, &clock);
+    let proof = kr_pairing::confirm::sign_confirmation(
+        &owner_key,
+        &request,
+        kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
+    )
+    .expect("a proof");
+    ConfirmedTransfer::verify(
+        &plan,
+        &host,
+        &mut ledger,
+        &clock,
+        &request,
+        &proof,
+        owner_key.public(),
+        kr_pairing::confirm::HostEnrolment::Enrolled,
+    )
+    .expect_err("the owner was shown a different device than the one this transfer hands over to");
 }
 
 /// A grant as it stands once its invitation has been redeemed.

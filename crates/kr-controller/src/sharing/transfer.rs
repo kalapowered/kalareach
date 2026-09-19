@@ -30,6 +30,21 @@ use kr_protocol::sharing::SessionRole;
 use crate::error::{ControllerError, Result};
 use crate::grants::GrantRevocation;
 
+/// What this host knows about itself and the device a transfer hands control to.
+///
+/// The confirmation's expectation is built from **this**, not from the challenge. A challenge that
+/// supplied its own host identity and its own destination keys would be proving that somebody
+/// issued a challenge, not that this host's owner approved this transfer to this device.
+#[derive(Clone, Copy, Debug)]
+pub struct TransferHost<'a> {
+    /// This host's device identity.
+    pub device_id: DeviceId,
+    /// This host's iroh endpoint identity.
+    pub endpoint_id: kr_protocol::scalars::EndpointKey,
+    /// The public keys of the device the plan hands control to, from this host's device record.
+    pub recipient_keys: &'a kr_protocol::pairing::DevicePublicKeys,
+}
+
 /// What a transfer will do, written down before any of it happens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferPlan {
@@ -89,6 +104,8 @@ impl TransferPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfirmedTransfer {
     action_digest: Digest256,
+    /// The challenge's own deadline, carried so a use of this evidence after it is refused.
+    expires_at_ms: u64,
 }
 
 impl ConfirmedTransfer {
@@ -112,21 +129,23 @@ impl ConfirmedTransfer {
     )]
     pub fn verify(
         plan: &TransferPlan,
+        host: &TransferHost<'_>,
         ledger: &mut kr_pairing::confirm::ConfirmationLedger,
         clock: &dyn kr_pairing::platform::PairingClock,
         request: &kr_protocol::pairing::OwnerConfirmationRequest,
         proof: &kr_protocol::pairing::OwnerConfirmationProof,
         signer: &kr_protocol::scalars::AuthorisationKey,
         enrolment: kr_pairing::confirm::HostEnrolment,
-        destination_keys: Option<&kr_protocol::pairing::DevicePublicKeys>,
     ) -> Result<Self> {
         let action_digest = plan.action_digest()?;
+        // The host and the destination come from what this host knows, not from the challenge. A
+        // challenge that named its own host would be proving only that somebody issued it.
         let expectation = kr_pairing::confirm::ConfirmationExpectation {
             action: TransferPlan::sensitive_action(),
             action_digest,
-            host_device_id: request.host_device_id,
-            host_endpoint_id: request.host_endpoint_id,
-            destination_keys,
+            host_device_id: host.device_id,
+            host_endpoint_id: host.endpoint_id,
+            destination_keys: Some(host.recipient_keys),
             destination_rights: &plan.actions,
         };
         kr_pairing::confirm::accept_confirmation(
@@ -141,7 +160,10 @@ impl ConfirmedTransfer {
         .map_err(|error| ControllerError::PermissionDenied {
             detail: format!("the owner's confirmation does not authorise this transfer: {error}"),
         })?;
-        Ok(Self { action_digest })
+        Ok(Self {
+            action_digest,
+            expires_at_ms: request.expires_at_ms.get(),
+        })
     }
 
     /// The digest this confirmation is about.
@@ -150,18 +172,25 @@ impl ConfirmedTransfer {
         self.action_digest
     }
 
-    /// Checks that this confirmation is about this plan.
+    /// Checks that this confirmation is about this plan, and is still inside its own deadline.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::PermissionDenied`] when it is about something else.
-    pub fn covers(&self, plan: &TransferPlan) -> Result<()> {
-        if plan.action_digest()? == self.action_digest {
-            return Ok(());
+    /// Returns [`ControllerError::PermissionDenied`] when it is about something else, or when the
+    /// challenge's short expiry has passed: a confirmation is for a decision the owner is making
+    /// now, and one carried past its deadline is not that.
+    pub fn covers(&self, plan: &TransferPlan, now_ms: u64) -> Result<()> {
+        if plan.action_digest()? != self.action_digest {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the owner's confirmation is for a different transfer".to_owned(),
+            });
         }
-        Err(ControllerError::PermissionDenied {
-            detail: "the owner's confirmation is for a different transfer".to_owned(),
-        })
+        if now_ms >= self.expires_at_ms {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the owner's confirmation for this transfer has expired".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 

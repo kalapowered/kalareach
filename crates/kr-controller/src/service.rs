@@ -1228,12 +1228,13 @@ impl Controller {
         // intent is written **before** the record changes, because a debt recorded after a
         // withdrawal that then failed to record would be a withdrawal nothing fences.
         let intent = kr_protocol::ids::GrantId::new(device_id.get());
-        self.sharing.grants().owe_fence([intent], now_ms)?;
-        if !self.devices.revoke(device_id, TimestampMs::new(now_ms))? {
-            // The record was already revoked, so this call withdrew nothing and the intent was
-            // for work that turned out to be done. Clearing it is safe because the record it was
-            // about is settled; leaving it would fence the host for every repeat.
-            self.sharing.grants().fence_completed(&[intent])?;
+        let mine = self.sharing.grants().owe_fence([intent], now_ms)?;
+        if !self.devices.revoke(device_id, TimestampMs::new(now_ms))? && !mine.is_empty() {
+            // The record was already revoked, so this call withdrew nothing, and the intent this
+            // call wrote was for work that turned out to be done. Only what *this* call wrote is
+            // cleared: an intent that was already there belongs to an attempt that has not been
+            // fenced, and erasing it would leave that withdrawal unfenced for ever.
+            self.sharing.grants().fence_completed(&mine)?;
         }
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
@@ -1355,16 +1356,20 @@ impl Controller {
     /// revive a grant this host has already refused.
     fn settled_now_ms(&self) -> u64 {
         let now_ms = kr_ipc::now_ms().get();
-        self.update_policy(|policy| {
-            policy.observe_utc(now_ms);
-            policy.settled_now(now_ms)
-        })
-        .unwrap_or_else(|_| {
-            // The floor could not be written down. The reading this host has already decided from
-            // is still the one to use: failing to persist it is a reason to keep the stricter
-            // answer, not to fall back to a clock that may have gone backwards.
-            self.policy().settled_now(now_ms)
-        })
+        // The floor is raised in memory first and kept whether or not the write succeeds. It only
+        // ever moves forward, so publishing it before it is persisted can make this host stricter
+        // and never laxer, and dropping it after a failed write would let the next reading be an
+        // earlier one.
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        policy.observe_utc(now_ms);
+        let settled = policy.settled_now(now_ms);
+        let snapshot = policy.snapshot();
+        drop(policy);
+        let _ = self.sharing.grants().store_policy(&snapshot);
+        settled
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.
@@ -2914,10 +2919,13 @@ impl Controller {
         let params: kr_protocol::sharing::DeviceListParams = parse(params)?;
         let records = self.devices.devices()?;
         let status = self.authority_feed().status();
-        // The revision in force is the registry's, which the policy carries. The feed's own
-        // accepted revision is what it has seen, and reporting that as current would show a number
-        // older than the one this host is deciding against.
-        let authority_revision = self.policy().authority_revision();
+        // The revision in force is the registry's. The feed's accepted revision is what it has
+        // seen and the policy's is what it was last told, and either can be behind the allocator
+        // after a revocation this daemon took by another path.
+        let authority_revision = {
+            let registry = self.registry.lock().await;
+            registry.authority_revision()?
+        };
         let mut devices = Vec::new();
         for record in records {
             if record.revoked_at_ms.is_some() && !params.include_revoked {

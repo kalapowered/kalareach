@@ -209,6 +209,7 @@ impl GrantDirectory {
                      action_id      BLOB NOT NULL,
                      payload_digest BLOB NOT NULL,
                      claimed_at_ms  INTEGER NOT NULL,
+                     leased_at_ms   INTEGER NOT NULL,
                      result         BLOB,
                      recorded_at_ms INTEGER,
                      PRIMARY KEY (actor_id, action_id)
@@ -658,7 +659,13 @@ impl GrantDirectory {
                 )
                 .map_err(ControllerError::registry)?;
             if activated == 0 || consumed == 0 {
-                return Ok(Err(refusal("this invitation has already been redeemed")));
+                // One of the two changed and the other did not, which is a state neither of them
+                // should be able to reach. An outer error rolls the whole thing back rather than
+                // committing half of a redemption.
+                return Err(ControllerError::InvalidArgument(
+                    "this invitation and the grant it carries disagree about their state"
+                        .to_owned(),
+                ));
             }
             Ok(Ok(record.grant))
         })?
@@ -759,14 +766,19 @@ impl GrantDirectory {
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be written.
-    pub fn owe_fence(&self, keys: impl IntoIterator<Item = GrantId>, now_ms: u64) -> Result<()> {
+    pub fn owe_fence(
+        &self,
+        keys: impl IntoIterator<Item = GrantId>,
+        now_ms: u64,
+    ) -> Result<Vec<GrantId>> {
         let keys: Vec<GrantId> = keys.into_iter().collect();
         if keys.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.in_transaction(|connection| {
+            let mut written = Vec::new();
             for key in keys {
-                connection
+                let rows = connection
                     .execute(
                         "INSERT OR IGNORE INTO fence_debt (grant_id, recorded_at_ms)
                          VALUES (?1, ?2)",
@@ -776,8 +788,14 @@ impl GrantDirectory {
                         ],
                     )
                     .map_err(ControllerError::registry)?;
+                if rows > 0 {
+                    written.push(key);
+                }
             }
-            Ok(())
+            // What *this* call wrote. A caller that finds its work already done clears only its
+            // own intent: debt that was already there belongs to an attempt that has not been
+            // fenced, and erasing it would leave that withdrawal unfenced for ever.
+            Ok(written)
         })
     }
 
@@ -894,16 +912,17 @@ impl GrantDirectory {
         now_ms: u64,
     ) -> Result<ActionClaim> {
         self.in_transaction(|connection| {
-            let held: Option<(Vec<u8>, i64, Option<Vec<u8>>)> = connection
+            let held: Option<HeldClaim> = connection
                 .query_row(
-                    "SELECT payload_digest, claimed_at_ms, result FROM authority_receipts
+                    "SELECT payload_digest, claimed_at_ms, leased_at_ms, result
+                       FROM authority_receipts
                       WHERE actor_id = ?1 AND action_id = ?2",
                     params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(ControllerError::registry)?;
-            if let Some((digest, claimed_at_ms, result)) = held {
+            if let Some((digest, claimed_at_ms, leased_at_ms, result)) = held {
                 if digest.as_slice() != payload_digest.as_bytes() {
                     return Err(ControllerError::IdConflict {
                         token: action_id.to_string(),
@@ -917,14 +936,18 @@ impl GrantDirectory {
                 // that belonged to an attempt that crashed or was cut off, and this caller takes
                 // it over rather than finding the identifier wedged.
                 let claimed = u64::try_from(claimed_at_ms).unwrap_or_default();
+                let leased = u64::try_from(leased_at_ms).unwrap_or_default();
                 let stale =
-                    now_ms >= claimed.saturating_add(kr_protocol::limits::MAX_MUTATION_TTL.get());
+                    now_ms >= leased.saturating_add(kr_protocol::limits::MAX_MUTATION_TTL.get());
                 if !stale {
                     return Ok(ActionClaim::InFlight);
                 }
+                // The lease is renewed; the moment the *proposal* was made is not. A takeover that
+                // moved it would make each retry ask for a grant with a later deadline than the
+                // one before it, which is the opposite of what a retry is for.
                 connection
                     .execute(
-                        "UPDATE authority_receipts SET claimed_at_ms = ?3
+                        "UPDATE authority_receipts SET leased_at_ms = ?3
                           WHERE actor_id = ?1 AND action_id = ?2 AND result IS NULL",
                         params![
                             actor_id.as_str(),
@@ -940,9 +963,9 @@ impl GrantDirectory {
             connection
                 .execute(
                     "INSERT INTO authority_receipts
-                         (actor_id, action_id, payload_digest, claimed_at_ms, result,
-                          recorded_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                         (actor_id, action_id, payload_digest, claimed_at_ms, leased_at_ms,
+                          result, recorded_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL)",
                     params![
                         actor_id.as_str(),
                         action_id.get().as_bytes().as_slice(),
@@ -1169,6 +1192,10 @@ fn settle_invitation(
         .map(|_| ())
         .map_err(ControllerError::registry)
 }
+
+/// One claim row, as the store reads it back: the digest, when the proposal was made, when the
+/// lease was last renewed, and the result once there is one.
+type HeldClaim = (Vec<u8>, i64, i64, Option<Vec<u8>>);
 
 /// A refusal a transaction returns as a value, so its own writes still commit.
 fn refusal(detail: &str) -> ControllerError {
