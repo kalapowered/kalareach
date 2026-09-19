@@ -313,7 +313,7 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		"TEMP_AA18E364-5857-48D6-99AB-9216162E3DBD" /* x86_64 */ = {
+		"TEMP_F7C92612-CACB-450F-92DE-B20CBD5ECEBF" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);

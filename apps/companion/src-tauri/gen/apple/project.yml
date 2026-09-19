@@ -133,6 +133,10 @@ targets:
         # build resolves. Swift does not expand build variables inside a string literal, so the
         # one place the expanded value exists is the description the build writes.
         KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion.shared
+        # The group nothing outside this application may reach, where the device authorisation key
+        # goes. Named for the same reason as the shared one: Swift does not expand a build variable
+        # inside a string literal, so the expanded value has to be written by the build.
+        KRPrivateKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion
         UIBackgroundModes:
           - remote-notification
     # Remote notifications, and the two keychain groups this application writes to. The shared

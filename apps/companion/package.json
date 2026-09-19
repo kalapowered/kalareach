@@ -15,7 +15,8 @@
     "test": "vitest run",
     "test:mobile": "vitest run test/mobile",
     "e2e": "node scripts/e2e.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "android": "node scripts/android.mjs"
   },
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",
