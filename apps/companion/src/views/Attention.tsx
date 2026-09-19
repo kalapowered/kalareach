@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
-import { ENVIRONMENT_ID, useApp } from '../app/state'
+import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
 import type { AttentionEntry, AttentionInbox, AttentionKind } from '../model/pending'
 
@@ -59,7 +59,7 @@ export function Attention(): ReactNode {
 
   const load = useCallback(() => {
     port
-      .attentionRead(ENVIRONMENT_ID, {})
+      .attentionRead({})
       .then((result) => {
         setInbox(result)
         setReadAtMs(Date.now())
@@ -74,10 +74,12 @@ export function Attention(): ReactNode {
 
   const decide = (entry: AttentionEntry, decision: 'allow' | 'deny') => {
     port
-      .approvalRespond(ENVIRONMENT_ID, {
-        approval_request_id: entry.approval_request_id,
-        decision
-      })
+      .approvalRespond(
+        { approval_request_id: entry.approval_request_id, decision },
+        entry.session_id && entry.session_epoch
+          ? { sessionId: entry.session_id, sessionEpoch: entry.session_epoch }
+          : {}
+      )
       .then((settled) => {
         // The completion feedback waits for the receipt: the host said what happened, not the
         // network.

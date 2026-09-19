@@ -32,9 +32,9 @@ pub struct Origin {
 /// fragment, credentials or another scheme all make the string something other than an origin.
 pub fn parse_origin(value: &str) -> Result<Origin> {
     let trimmed = value.trim_end_matches('/');
-    let rest = trimmed.strip_prefix("https://").ok_or_else(|| {
-        CommandError::invalid("a rendezvous origin is an https origin")
-    })?;
+    let rest = trimmed
+        .strip_prefix("https://")
+        .ok_or_else(|| CommandError::invalid("a rendezvous origin is an https origin"))?;
     if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
         return Err(CommandError::invalid(
             "a rendezvous origin carries a host and an optional port, and nothing else",
@@ -50,7 +50,9 @@ pub fn parse_origin(value: &str) -> Result<Origin> {
     // A host is compared case-insensitively, so the canonical form is the lowercase one.
     let host = host.to_ascii_lowercase();
     if host.is_empty() {
-        return Err(CommandError::invalid("a rendezvous origin must name a host"));
+        return Err(CommandError::invalid(
+            "a rendezvous origin must name a host",
+        ));
     }
     let origin = format!("https://{}", rest.to_ascii_lowercase());
     Ok(Origin {
@@ -125,9 +127,11 @@ pub fn scan(payload: &str, configured: &Origin) -> Result<Scanned> {
             let origin = parse_origin(raw.rendezvous_origin.as_deref().ok_or_else(|| {
                 CommandError::invalid("a code QR names the rendezvous origin it belongs to")
             })?)?;
-            let code = normalise_code(raw.code.as_deref().ok_or_else(|| {
-                CommandError::invalid("a code QR carries a code")
-            })?)?;
+            let code = normalise_code(
+                raw.code
+                    .as_deref()
+                    .ok_or_else(|| CommandError::invalid("a code QR carries a code"))?,
+            )?;
             Ok(Scanned::Code {
                 needs_origin_confirmation: origin.origin != configured.origin,
                 origin,
@@ -141,9 +145,9 @@ pub fn scan(payload: &str, configured: &Origin) -> Result<Scanned> {
             endpoint_id: raw.endpoint_id.ok_or_else(|| {
                 CommandError::invalid("a direct QR carries the host endpoint it pins")
             })?,
-            expires_at_ms: raw.expires_at_ms.ok_or_else(|| {
-                CommandError::invalid("a direct QR carries its expiry")
-            })?,
+            expires_at_ms: raw
+                .expires_at_ms
+                .ok_or_else(|| CommandError::invalid("a direct QR carries its expiry"))?,
         }),
         _ => Err(CommandError::invalid(
             "a QR without a supported pairing mode is not an invitation",
@@ -244,7 +248,10 @@ mod tests {
             panic!("that payload is a code QR");
         };
         assert!(!needs_origin_confirmation);
-        assert_eq!(code, "KALA4821xy", "separators are removed and case is kept");
+        assert_eq!(
+            code, "KALA4821xy",
+            "separators are removed and case is kept"
+        );
     }
 
     #[test]
@@ -257,7 +264,8 @@ mod tests {
     #[test]
     fn a_qr_without_a_supported_mode_is_refused() {
         let payload = r#"{"version":1,"mode":"guess","code":"KALA4821xy"}"#;
-        let error = scan(payload, &default_origin()).expect_err("an untyped QR is not an invitation");
+        let error =
+            scan(payload, &default_origin()).expect_err("an untyped QR is not an invitation");
         assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
     }
 

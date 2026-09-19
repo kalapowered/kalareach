@@ -54,9 +54,9 @@ pub fn approve(url: &str) -> Result<Approved> {
         ));
     }
 
-    let (scheme, rest) = trimmed.split_once(':').ok_or_else(|| {
-        CommandError::invalid("a link without a scheme is not opened")
-    })?;
+    let (scheme, rest) = trimmed
+        .split_once(':')
+        .ok_or_else(|| CommandError::invalid("a link without a scheme is not opened"))?;
     let scheme = scheme.to_ascii_lowercase();
     if !scheme
         .chars()
@@ -92,25 +92,24 @@ const MAX_URL_LEN: usize = 2048;
 /// A URL with credentials in its authority is refused outright: the part a person reads is not the
 /// part the browser connects to, which is the whole of that trick.
 fn https_host(rest: &str) -> Result<String> {
-    let authority = rest.strip_prefix("//").ok_or_else(|| {
-        CommandError::invalid("an https link must name a host")
-    })?;
-    let authority = authority
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let authority = rest
+        .strip_prefix("//")
+        .ok_or_else(|| CommandError::invalid("an https link must name a host"))?;
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.contains('@') {
         return Err(CommandError::refused(
             "a link that carries credentials in front of its host is not opened",
         ));
     }
-    let host = authority.rsplit_once(':').map_or(authority, |(host, port)| {
-        if port.chars().all(|character| character.is_ascii_digit()) {
-            host
-        } else {
-            authority
-        }
-    });
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, port)| {
+            if port.chars().all(|character| character.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        });
     if host.is_empty() {
         return Err(CommandError::invalid("an https link must name a host"));
     }

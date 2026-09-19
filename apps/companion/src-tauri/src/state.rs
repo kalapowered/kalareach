@@ -1,21 +1,27 @@
 //! What the backend holds between commands.
 //!
-//! One host link, one rendezvous origin and one draft store. Nothing here is reachable from the
-//! WebView except through the commands, and the commands never hand out a handle: a command
-//! returns protocol values, never a capability the page could keep.
+//! One connection, one rendezvous origin, one draft store, and one record of where the last export
+//! was allowed to be written. Nothing here is reachable from the WebView except through the
+//! commands, and a command returns protocol values rather than handles: there is nothing the page
+//! can keep and use later.
 
 use std::sync::{Arc, Mutex, RwLock};
 
+use kr_client::Session;
+use kr_protocol::ids::EnvironmentId;
+
+use crate::connection::{Connection, ConnectionState};
 use crate::error::{CommandError, Result};
-use crate::link::{HostLink, Unconnected};
 use crate::pairing::{self, Origin};
 
 /// The backend's long-lived state.
 #[derive(Debug)]
 pub struct AppState {
-    link: RwLock<Arc<dyn HostLink>>,
+    connection: RwLock<Option<Connection>>,
+    reason: RwLock<Option<String>>,
     origin: Mutex<Origin>,
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
+    export_destinations: Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -28,24 +34,89 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            link: RwLock::new(Arc::new(Unconnected)),
+            connection: RwLock::new(None),
+            reason: RwLock::new(Some(
+                "this application has not reached a host yet".to_owned(),
+            )),
             origin: Mutex::new(
                 pairing::parse_origin(pairing::DEFAULT_RENDEZVOUS_ORIGIN)
                     .expect("the shipped rendezvous origin parses"),
             ),
             drafts: Mutex::new(None),
+            export_destinations: Mutex::new(Vec::new()),
         }
     }
 
-    /// Replaces the host link.
-    pub fn connect(&self, link: Arc<dyn HostLink>) {
-        *self.link.write().expect("the link lock is not poisoned") = link;
+    /// Records a live connection.
+    pub fn connected(&self, connection: Connection) {
+        *self.reason.write().expect("the state lock is not poisoned") = None;
+        *self
+            .connection
+            .write()
+            .expect("the state lock is not poisoned") = Some(connection);
     }
 
-    /// The current host link.
+    /// Records that there is no connection, and why.
+    pub fn disconnected(&self, reason: impl Into<String>) {
+        *self
+            .connection
+            .write()
+            .expect("the state lock is not poisoned") = None;
+        *self.reason.write().expect("the state lock is not poisoned") = Some(reason.into());
+    }
+
+    /// The session every command goes through.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HOST_NOT_CONFIGURED` when there is no connection, which is the same answer the
+    /// interface gets for a host that went away.
+    pub fn session(&self) -> Result<Arc<Session>> {
+        self.connection
+            .read()
+            .expect("the state lock is not poisoned")
+            .as_ref()
+            .map(Connection::session)
+            .ok_or_else(CommandError::not_connected)
+    }
+
+    /// The environment the connection belongs to, as the host stamped it on the handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HOST_NOT_CONFIGURED` when there is no connection.
+    pub fn environment_id(&self) -> Result<EnvironmentId> {
+        self.connection
+            .read()
+            .expect("the state lock is not poisoned")
+            .as_ref()
+            .map(Connection::environment_id)
+            .ok_or_else(CommandError::not_connected)
+    }
+
+    /// What the interface is told about the connection.
     #[must_use]
-    pub fn link(&self) -> Arc<dyn HostLink> {
-        Arc::clone(&self.link.read().expect("the link lock is not poisoned"))
+    pub fn connection_state(&self) -> ConnectionState {
+        let held = self
+            .connection
+            .read()
+            .expect("the state lock is not poisoned");
+        match held.as_ref() {
+            Some(connection) => ConnectionState {
+                connected: true,
+                environment_id: Some(connection.environment_id().to_string()),
+                reason: None,
+            },
+            None => ConnectionState {
+                connected: false,
+                environment_id: None,
+                reason: self
+                    .reason
+                    .read()
+                    .expect("the state lock is not poisoned")
+                    .clone(),
+            },
+        }
     }
 
     /// The rendezvous origin this device is configured with.
@@ -66,6 +137,43 @@ impl AppState {
         let parsed = pairing::parse_origin(value)?;
         *self.origin.lock().expect("the origin lock is not poisoned") = parsed.clone();
         Ok(parsed)
+    }
+
+    /// Remembers that the person chose this destination in a save dialog.
+    ///
+    /// An export writes only where a dialog put it. The WebView never names a path: it asks for a
+    /// destination, the platform's own dialog answers, and the answer is kept here until the one
+    /// write that uses it. Without this the export commands would be a general file write with a
+    /// path the page chose.
+    pub fn allow_export_to(&self, path: std::path::PathBuf) {
+        let mut allowed = self
+            .export_destinations
+            .lock()
+            .expect("the export lock is not poisoned");
+        // A handful at most: a person can have several dialogs open, and an abandoned one should
+        // not keep its destination writable for the life of the application.
+        if allowed.len() >= MAX_PENDING_EXPORTS {
+            allowed.remove(0);
+        }
+        allowed.push(path);
+    }
+
+    /// Takes back a destination the person chose, once, for one write.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` for any path that is not one a save dialog returned.
+    pub fn take_export_destination(&self, path: &std::path::Path) -> Result<std::path::PathBuf> {
+        let mut allowed = self
+            .export_destinations
+            .lock()
+            .expect("the export lock is not poisoned");
+        match allowed.iter().position(|each| each == path) {
+            Some(index) => Ok(allowed.remove(index)),
+            None => Err(CommandError::refused(
+                "an export is written only to a destination the save dialog returned",
+            )),
+        }
     }
 
     /// Opens, or reuses, this device's draft store.
@@ -93,6 +201,9 @@ impl AppState {
     }
 }
 
+/// How many save destinations may be waiting for their write at once.
+const MAX_PENDING_EXPORTS: usize = 8;
+
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -104,9 +215,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_new_application_is_unconnected_and_carries_the_shipped_origin() {
+    fn a_new_application_is_unconnected_and_says_why() {
         let state = AppState::new();
-        assert!(!state.link().connected());
+        let connection = state.connection_state();
+        assert!(!connection.connected);
+        assert!(connection.reason.is_some());
+        assert!(state.session().is_err());
         assert!(state.origin().is_default);
     }
 
@@ -125,5 +239,48 @@ mod tests {
         let state = AppState::new();
         assert!(state.set_origin("http://pair.example.org").is_err());
         assert!(state.origin().is_default);
+    }
+
+    #[test]
+    fn an_export_destination_the_dialog_never_returned_is_refused() {
+        let state = AppState::new();
+        let error = state
+            .take_export_destination(std::path::Path::new("/etc/passwd"))
+            .expect_err("that path came from the page");
+        assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn a_chosen_destination_is_usable_once_and_not_twice() {
+        let state = AppState::new();
+        let chosen = std::path::PathBuf::from("/tmp/session.json");
+        state.allow_export_to(chosen.clone());
+        assert!(state.take_export_destination(&chosen).is_ok());
+        assert!(
+            state.take_export_destination(&chosen).is_err(),
+            "one dialog is one write"
+        );
+    }
+
+    #[test]
+    fn abandoned_destinations_do_not_accumulate_without_bound() {
+        let state = AppState::new();
+        for index in 0..MAX_PENDING_EXPORTS + 4 {
+            state.allow_export_to(std::path::PathBuf::from(format!("/tmp/export-{index}")));
+        }
+        assert!(
+            state
+                .take_export_destination(std::path::Path::new("/tmp/export-0"))
+                .is_err(),
+            "the oldest abandoned destination is forgotten"
+        );
+        assert!(
+            state
+                .take_export_destination(std::path::Path::new(&format!(
+                    "/tmp/export-{}",
+                    MAX_PENDING_EXPORTS + 3
+                )))
+                .is_ok()
+        );
     }
 }

@@ -100,6 +100,21 @@ function receipt(actionId: string, state: Receipt['state'], method: string): Rec
 }
 
 let actionCounter = 0
+/**
+ * One settled answer whose receipt and identity agree.
+ *
+ * Every mutation answers with the action it is about, because that identity is what the interface
+ * matches a later receipt against.
+ */
+function settledAs(method: string, state: Receipt['state']): {
+  receipt: Receipt
+  value: null
+  action_id: string
+} {
+  const actionId = nextActionId()
+  return { receipt: receipt(actionId, state, method), value: null, action_id: actionId }
+}
+
 function nextActionId(): string {
   actionCounter += 1
   return `00000000-0000-4000-8000-${String(actionCounter).padStart(12, '0')}`
@@ -109,8 +124,8 @@ function nextActionId(): string {
 export interface FakeHostControls {
   /** Pushes one event to every subscriber. */
   emit(event: HostEvent): void
-  /** Appends one node to the conversation and tells the interface about it. */
-  appendNode(node: DocumentNode): void
+  /** Appends one node to a session's conversation and tells the interface about it. */
+  appendNode(node: DocumentNode, sessionId?: string): void
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
   /** Marks the host as unreachable, or reachable again. */
@@ -155,7 +170,12 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   }
 
   const port: HostPort = {
-    connectionState: () => Promise.resolve(connected),
+    connectionState: () =>
+      Promise.resolve({
+        connected,
+        environment_id: connected ? ENVIRONMENT : null,
+        reason: connected ? null : 'this host cannot be contacted right now'
+      }),
 
     hostInfo: () => {
       requireConnection()
@@ -165,27 +185,19 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       requireConnection()
       return Promise.resolve(environments())
     },
-    environmentCapabilities: () => {
-      requireConnection()
-      return Promise.resolve({
-        environment_id: ENVIRONMENT,
-        desktop_ready: true,
-        desktop_reason: null
-      })
-    },
-
+    
     sessionList: () => {
       requireConnection()
       return Promise.resolve(sessions())
     },
-    sessionRead: (_environmentId, params) => {
+    sessionRead: (params) => {
       requireConnection()
       const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
       const found = sessions().sessions.find((session) => session.session_id === sessionId)
       if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
       return Promise.resolve({ endpoint: null, session: found } as unknown as SessionReadResult)
     },
-    sessionClose: (_environmentId, params) => {
+    sessionClose: (params) => {
       requireConnection()
       const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
       const closure: ClosureRecord = {
@@ -201,6 +213,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
       return Promise.resolve({
         receipt: receipt(nextActionId(), 'applied', 'session.close'),
+        action_id: null,
         value: closure
       })
     },
@@ -209,7 +222,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       requireConnection()
       return Promise.resolve(fakeLaunchSurface(true, String(promptGeneration)))
     },
-    shellLaunch: (_environmentId, params) => {
+    shellLaunch: (params) => {
       requireConnection()
       const asked = params as { expected_prompt_generation?: string; expected_buffer_revision?: string }
       if (asked.expected_prompt_generation !== String(promptGeneration)) {
@@ -223,6 +236,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       }
       return Promise.resolve({
         receipt: receipt(nextActionId(), 'applied', 'shell.launch'),
+        action_id: null,
         value: result
       })
     },
@@ -239,7 +253,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           { name: '/review', summary: 'Review the current change set' }
         ]
       }),
-    composerSubmit: (_environmentId, params) => {
+    composerSubmit: (params) => {
       requireConnection()
       const text = (params as { text?: string }).text ?? ''
       const actionId = nextActionId()
@@ -249,34 +263,30 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         body: { kind: 'message', author: 'you', text }
       }
       nodes.push(node)
-      emit({ stream_id: 'semantic', sequence: String(nodes.length), body: { kind: 'node', node } })
+      emit({
+        stream_id: `semantic:${SESSION_MAIN}`,
+        sequence: String(nodes.length),
+        body: { kind: 'node', node }
+      })
       return Promise.resolve({
         receipt: receipt(actionId, 'applied', 'agent.prompt.submit'),
-        value: null
+        value: null,
+        action_id: actionId
       })
     },
     composerQueue: () => {
       requireConnection()
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'accepted', 'agent.prompt.queue'),
-        value: null
-      })
+      return Promise.resolve(settledAs('agent.prompt.queue', 'accepted'))
     },
     composerSteer: () => {
       requireConnection()
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'agent.turn.steer'),
-        value: null
-      })
+      return Promise.resolve(settledAs('agent.turn.steer', 'applied'))
     },
     composerInterrupt: () => {
       requireConnection()
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'agent.turn.cancel'),
-        value: null
-      })
+      return Promise.resolve(settledAs('agent.turn.cancel', 'applied'))
     },
-    approvalRespond: (_environmentId, params) => {
+    approvalRespond: (params) => {
       requireConnection()
       const decision = (params as { decision?: string }).decision ?? 'deny'
       const actionId = nextActionId()
@@ -287,23 +297,25 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
       return Promise.resolve({
         receipt: receipt(actionId, 'applied', 'agent.approval.respond'),
-        value: { decision }
+        value: { decision },
+        action_id: actionId
       })
     },
-    pluginActionInvoke: (_environmentId, params) => {
+    pluginActionInvoke: (params) => {
       requireConnection()
       const actionId = (params as { action_id?: string }).action_id ?? 'unknown'
       return Promise.resolve({
         receipt: receipt(nextActionId(), 'applied', 'plugin.action.invoke'),
+        action_id: null,
         value: { invoked: actionId }
       })
     },
 
     draftCreate: () =>
-      Promise.resolve({ receipt: receipt(nextActionId(), 'applied', 'draft.create'), value: null }),
+      Promise.resolve(settledAs('draft.create', 'applied')),
     draftUpdate: () =>
-      Promise.resolve({ receipt: receipt(nextActionId(), 'applied', 'draft.update'), value: null }),
-    draftAddAttachment: (_environmentId, params) => {
+      Promise.resolve(settledAs('draft.update', 'applied')),
+    draftAddAttachment: (params) => {
       requireConnection()
       const method = (params as { insertion_method?: string }).insertion_method
       if (method === 'verified_composer_insertion') {
@@ -311,10 +323,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         // draft is retained, and the person is offered the terminal workflow instead.
         refuse('DRAFT_CONFLICT', 'The agent composer is not at an empty, qualified boundary.')
       }
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'agent.draft.add_attachment'),
-        value: null
-      })
+      return Promise.resolve(settledAs('agent.draft.add_attachment', 'applied'))
     },
     attachmentImage: () =>
       Promise.resolve({
@@ -337,13 +346,10 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       requireConnection()
       return Promise.resolve(attention(acknowledged))
     },
-    attentionAcknowledge: (_environmentId, params) => {
+    attentionAcknowledge: (params) => {
       const id = (params as { attention_id?: string }).attention_id
       if (id) acknowledged.add(id)
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'attention.acknowledge'),
-        value: null
-      })
+      return Promise.resolve(settledAs('attention.acknowledge', 'applied'))
     },
     questionRead: () =>
       Promise.resolve({
@@ -357,12 +363,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         ]
       }),
     questionAnswer: () =>
-      Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'question.answer'),
-        value: null
-      }),
+      Promise.resolve(settledAs('question.answer', 'applied')),
     grantList: () => Promise.resolve(grants() as unknown),
-    grantCreate: (_environmentId, params) => {
+    grantCreate: (params) => {
       const asked = params as { role?: string; rights?: string[] }
       const wantsAnswering = asked.rights?.includes('question.respond') ?? false
       const isReadOnlyRole = asked.role === 'viewer' || asked.role === 'reviewer'
@@ -373,10 +376,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           'A viewer or reviewer receives question.respond only through the explained invitation option.'
         )
       }
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'grant.create'),
-        value: null
-      })
+      return Promise.resolve(settledAs('grant.create', 'applied'))
     },
 
     pluginList: () => Promise.resolve(packages() as unknown),
@@ -385,7 +385,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     changesetRead: () => Promise.resolve(changesets() as unknown),
 
     storageStatus: () => Promise.resolve(retained(deletedArtefacts) as unknown),
-    storageObjectDelete: (_environmentId, params) => {
+    storageObjectDelete: (params) => {
       const id = (params as { object_id?: string }).object_id
       const artefact = retained(new Set()).artefacts.find((each) => each.object_id === id)
       if (artefact?.held_by_other_party) {
@@ -395,25 +395,19 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         )
       }
       if (id) deletedArtefacts.add(id)
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'storage.object.delete'),
-        value: null
-      })
+      return Promise.resolve(settledAs('storage.object.delete', 'applied'))
     },
 
     terminalProjection: () => {
       requireConnection()
       return Promise.resolve(projection())
     },
-    terminalInput: (_environmentId, params) => {
+    terminalInput: (params) => {
       requireConnection()
       return Promise.resolve({ accepted: true, sequence: '1', echo: params })
     },
     attachmentViewport: () =>
-      Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'attachment.viewport'),
-        value: null
-      }),
+      Promise.resolve(settledAs('attachment.viewport', 'applied')),
 
     pairingOrigin: () => Promise.resolve(rendezvous),
     pairingSetOrigin: (origin) => {
@@ -525,7 +519,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     emit,
     appendNode(node) {
       nodes.push(node)
-      emit({ stream_id: 'semantic', sequence: String(nodes.length), body: { kind: 'node', node } })
+      emit({
+        stream_id: `semantic:${SESSION_MAIN}`,
+        sequence: String(nodes.length),
+        body: { kind: 'node', node }
+      })
     },
     changePromptGeneration() {
       promptGeneration += 1
@@ -719,6 +717,7 @@ function attention(acknowledged: ReadonlySet<string>): AttentionInbox {
       host_label: 'studio',
       environment_id: ENVIRONMENT,
       session_id: SESSION_MAIN,
+      session_epoch: '1',
       session_display_number: '1',
       application: 'Codex',
       raised_at_ms: FAKE_NOW_MS - 90_000,
@@ -733,6 +732,7 @@ function attention(acknowledged: ReadonlySet<string>): AttentionInbox {
       host_label: 'studio',
       environment_id: ENVIRONMENT,
       session_id: SESSION_BUILD,
+      session_epoch: '1',
       session_display_number: '2',
       application: 'Claude Code',
       raised_at_ms: FAKE_NOW_MS - 300_000,
@@ -746,6 +746,7 @@ function attention(acknowledged: ReadonlySet<string>): AttentionInbox {
       host_label: 'studio',
       environment_id: ENVIRONMENT,
       session_id: SESSION_MAIN,
+      session_epoch: '1',
       session_display_number: '1',
       application: 'Codex',
       raised_at_ms: FAKE_NOW_MS - 600_000
@@ -758,6 +759,7 @@ function attention(acknowledged: ReadonlySet<string>): AttentionInbox {
       host_label: 'laptop',
       environment_id: '3f1a2c40-11aa-4b2c-9d3e-000000000002',
       session_id: null,
+      session_epoch: null,
       session_display_number: null,
       application: null,
       raised_at_ms: FAKE_NOW_MS - 1_800_000,

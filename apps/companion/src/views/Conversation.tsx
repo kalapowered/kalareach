@@ -5,6 +5,10 @@
  * rendered set is bounded, and a node kind this client does not draw renders an unsupported block
  * that can invoke nothing.
  *
+ * Nothing in this component owns the session's state. The draft, the document, the window and the
+ * pending actions live in the application's per-session store, so switching to the terminal and
+ * back keeps them, and one session's state can never appear under another's name.
+ *
  * Streamed output does not animate. Text that fades in each time a token arrives reads as lag, and
  * this is the surface a person watches most.
  */
@@ -13,18 +17,23 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
-import { Badge, Button, Card, CommitButton, IconButton } from '../components/ui'
-import { ENVIRONMENT_ID, useApp } from '../app/state'
-import { failureCode, failureMessage, type DroppedFile } from '../host/port'
+import { Badge, Banner, Button, Card, CommitButton, IconButton } from '../components/ui'
+import { useApp, useSession } from '../app/state'
+import {
+  failureCode,
+  failureMessage,
+  type DroppedFile,
+  type SessionSubject
+} from '../host/port'
 import { renderMarkdown } from '../markdown/render'
 import {
   applyNodes,
-  emptyConversation,
   nodesAbove,
   prependHistory,
   setFollowing,
+  setWindowStart,
   visibleNodes,
-  type ConversationState
+  WINDOW_SIZE
 } from '../model/conversation'
 import {
   emptyControlState,
@@ -39,22 +48,23 @@ import {
   edit,
   notSubmittableBecause,
   readInsertionRefusal,
-  startDraft,
   submittable,
   type Draft
 } from '../model/drafts'
 import { FrameBatcher } from '../model/frame'
+import { eventIsFor } from '../model/sessions'
 import {
+  describeState,
   failed,
   queued,
   reconnectBanner,
   sent,
-  settled,
-  describeState,
-  type Submission
+  settled
 } from '../model/receipts'
 import type { LaunchSurface } from '../model/pending'
-import { Banner } from '../components/ui'
+
+/** The composer's own actions, which the specification names. */
+type ComposerAction = 'submit' | 'queue' | 'steer' | 'interrupt'
 
 /**
  * One field of a node body, as text.
@@ -68,30 +78,23 @@ function text(value: unknown): string {
   return ''
 }
 
-/** The composer's own actions, which the specification names. */
-type ComposerAction = 'submit' | 'queue' | 'steer' | 'interrupt'
-
 /** The semantic view of one session. */
 export function Conversation({
   sessionId,
+  subject,
   connected,
   launch,
   onLaunched
 }: {
   readonly sessionId: string
+  readonly subject: SessionSubject
   readonly connected: boolean
   readonly launch: LaunchSurface | null
   readonly onLaunched: () => void
 }): ReactNode {
   const { port, say } = useApp()
-  const [state, setState] = useState<ConversationState>(emptyConversation)
-  const [submissions, setSubmissions] = useState<readonly Submission[]>([])
-  const [draft, setDraft] = useState<Draft>(() =>
-    startDraft(`d-${sessionId}`, { sessionId, applicationInstanceId: null, agentBindingRevision: null }, Date.now())
-  )
-  const [images, setImages] = useState<ReadonlyMap<string, string>>(new Map())
+  const { state, update } = useSession(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
-  const [frames, setFrames] = useState(0)
   const scroller = useRef<HTMLDivElement | null>(null)
 
   // One batch per animation frame. Forty events in one tick are one render, and the composer keeps
@@ -99,120 +102,139 @@ export function Conversation({
   const batcher = useMemo(
     () =>
       new FrameBatcher<DocumentNode>((batch) => {
-        setState((current) => applyNodes(current, batch))
-        setFrames((count) => count + 1)
+        update((current) => ({
+          ...current,
+          conversation: applyNodes(current.conversation, batch)
+        }))
       }),
-    []
+    [update]
   )
 
   useEffect(() => {
     let cancelled = false
     port
-      .agentSnapshot(ENVIRONMENT_ID, { session_id: sessionId })
+      .agentSnapshot({ session_id: sessionId })
       .then((snapshot) => {
-        if (!cancelled) setState((current) => applyNodes(current, snapshot.nodes))
+        if (cancelled) return
+        update((current) => ({
+          ...current,
+          conversation: applyNodes(current.conversation, snapshot.nodes),
+          loaded: true
+        }))
       })
       .catch(() => {
-        // A snapshot that cannot be read leaves the view empty and the banner says why.
+        // A snapshot that cannot be read leaves the view as it was, and the banner says why.
       })
     return () => {
       cancelled = true
       batcher.discard()
     }
-  }, [port, sessionId, batcher])
+  }, [port, sessionId, batcher, update])
 
   useEffect(() => {
     const stop = port.subscribe((event) => {
       const body = event.body as { kind?: string; node?: DocumentNode; receipt?: unknown }
-      if (body.kind === 'node' && body.node) batcher.push(body.node)
+      // An event belongs to the stream it names. A view showing one session ignores another's
+      // rather than folding it into what the person is looking at.
+      if (body.kind === 'node' && body.node && eventIsFor(event.stream_id, sessionId)) {
+        batcher.push(body.node)
+      }
       if (body.kind === 'receipt' && body.receipt) {
         const receipt = body.receipt as { action_id: string }
-        setSubmissions((current) =>
-          current.map((submission) =>
+        update((current) => ({
+          ...current,
+          submissions: current.submissions.map((submission) =>
             submission.actionId === receipt.action_id
               ? settled(submission, body.receipt as Parameters<typeof settled>[1])
               : submission
           )
-        )
+        }))
       }
     })
     return stop
-  }, [port, batcher])
-
-  // Losing contact removes the association, not the draft. That is a fact about the connection, so
-  // it is derived here rather than written into the stored draft: the text, the revision and the
-  // attachments are untouched, and a rebind is still the explicit act it has to be.
-  const presented = useMemo(
-    () => (connected ? draft : connectionLost(draft)),
-    [connected, draft]
-  )
+  }, [port, batcher, sessionId, update])
 
   const controlState: ControlState = useMemo(() => {
-    const present = new Set(state.nodes.map((node) => node.id))
+    const present = new Set(state.conversation.nodes.map((node) => node.id))
     return { ...emptyControlState(), presentNodes: present }
-  }, [state.nodes])
+  }, [state.conversation.nodes])
 
   const send = useCallback(
     (action: ComposerAction) => {
-      const label = draft.text.trim() || action
+      const typed = state.draft.text
+      const label = typed.trim() || action
       const local = queued(`s-${Date.now()}-${Math.random()}`, label, Date.now())
-      setSubmissions((current) => [...current, local])
-      // Local feedback first: the composer clears and the entry appears as queued. The completion
+      const clears = action === 'submit' || action === 'queue'
+
+      // Local feedback first: the entry appears as queued and the composer clears. The completion
       // feedback below waits for the receipt.
-      if (action === 'submit' || action === 'queue') {
-        setDraft((current) => edit(current, '', Date.now()))
-      }
-      const params = { session_id: sessionId, text: draft.text }
+      update((current) => ({
+        ...current,
+        submissions: [...current.submissions, local],
+        draft: clears ? edit(current.draft, '', Date.now()) : current.draft
+      }))
+
+      const params = { session_id: sessionId, text: typed }
       const call =
         action === 'submit'
-          ? port.composerSubmit(ENVIRONMENT_ID, params)
+          ? port.composerSubmit(params, subject)
           : action === 'queue'
-            ? port.composerQueue(ENVIRONMENT_ID, params)
+            ? port.composerQueue(params, subject)
             : action === 'steer'
-              ? port.composerSteer(ENVIRONMENT_ID, params)
-              : port.composerInterrupt(ENVIRONMENT_ID, { session_id: sessionId })
+              ? port.composerSteer(params, subject)
+              : port.composerInterrupt({ session_id: sessionId }, subject)
 
       call
         .then((result) => {
-          setSubmissions((current) =>
-            current.map((submission) => {
+          update((current) => ({
+            ...current,
+            submissions: current.submissions.map((submission) => {
               if (submission.localId !== local.localId) return submission
-              const withAction = result.receipt
-                ? sent(submission, result.receipt.action_id)
+              const identified = result.action_id
+                ? sent(submission, result.action_id)
                 : submission
-              return result.receipt ? settled(withAction, result.receipt) : withAction
+              return result.receipt ? settled(identified, result.receipt) : identified
             })
-          )
+          }))
         })
         .catch((error: unknown) => {
-          setSubmissions((current) =>
-            current.map((submission) =>
+          const code = failureCode(error) ?? 'UNKNOWN'
+          update((current) => ({
+            ...current,
+            submissions: current.submissions.map((submission) =>
               submission.localId === local.localId
-                ? failed(submission, {
-                    code: failureCode(error) ?? 'UNKNOWN',
-                    message: failureMessage(error)
-                  })
+                ? failed(submission, { code, message: failureMessage(error) })
                 : submission
-            )
-          )
+            ),
+            // A refused submission gives the text back. Losing what someone wrote because the host
+            // said no is the one outcome a composer must never have.
+            draft:
+              clears && current.draft.text.length === 0
+                ? edit(current.draft, typed, Date.now())
+                : current.draft
+          }))
           say(failureMessage(error), 'danger')
         })
     },
-    [draft.text, port, sessionId, say]
+    [port, sessionId, subject, state.draft.text, update, say]
   )
 
   const attach = useCallback(
     (files: readonly DroppedFile[]) => {
       for (const file of files) {
         port
-          .draftAddAttachment(ENVIRONMENT_ID, {
-            session_id: sessionId,
-            draft_id: draft.draftId,
-            original_file_name: file.name,
-            insertion_method: 'typed_submission'
-          })
-          .then(() => {
-            say(`${file.name} attached.`)
+          .draftAddAttachment(
+            {
+              draft_id: state.draft.draftId,
+              original_file_name: file.name,
+              insertion_method: 'typed_submission'
+            },
+            subject
+          )
+          .then((result) => {
+            // Only an applied receipt says the attachment reached the draft.
+            if (result.receipt?.state === 'applied') say(`${file.name} attached.`)
+            else say(`${file.name} sent. Waiting for the host to confirm.`)
           })
           .catch((error: unknown) => {
             const refusal = readInsertionRefusal(failureCode(error) ?? 'UNKNOWN')
@@ -220,16 +242,22 @@ export function Conversation({
           })
       }
     },
-    [draft.draftId, port, sessionId, say]
+    [port, state.draft.draftId, subject, say]
   )
 
   useEffect(() => port.onFilesDropped(attach), [port, attach])
 
-  const banner = reconnectBanner(connected, submissions)
-  // The window's identity changes only when the document does, so a keystroke in the composer
-  // cannot make the memoised document below re-render.
-  const rendered = useMemo(() => visibleNodes(state), [state])
-  const hidden = nodesAbove(state)
+  // Losing contact removes the association, not the draft. That is a fact about the connection, so
+  // it is derived here rather than written into the stored draft: the text, the revision and the
+  // attachments are untouched, and a rebind is still the explicit act it has to be.
+  const presented = useMemo(
+    () => (connected ? state.draft : connectionLost(state.draft)),
+    [connected, state.draft]
+  )
+
+  const banner = reconnectBanner(connected, state.submissions)
+  const rendered = useMemo(() => visibleNodes(state.conversation), [state.conversation])
+  const hidden = nodesAbove(state.conversation)
 
   const openLink = useCallback(
     (url: string) => {
@@ -251,52 +279,96 @@ export function Conversation({
         .importRemoteImage(url)
         .then((imported) => {
           const blob = new Blob([new Uint8Array(imported.bytes)], { type: imported.media_type })
-          setImages((current) => new Map(current).set(url, URL.createObjectURL(blob)))
+          const held = URL.createObjectURL(blob)
+          update((current) => ({
+            ...current,
+            images: new Map(current.images).set(url, held)
+          }))
         })
         .catch((error: unknown) => {
           say(failureMessage(error), 'danger')
         })
     },
-    [port, say]
+    [port, update, say]
   )
 
   const invoke = useCallback(
     (control: Control) => {
       port
-        .pluginActionInvoke(ENVIRONMENT_ID, {
-          session_id: sessionId,
-          action_id: control.action_id,
-          control_revision: control.revision
-        })
-        .then(() => {
-          say(`${control.label} done.`)
+        .pluginActionInvoke(
+          { action_id: control.action_id, control_revision: control.revision },
+          subject
+        )
+        .then((result) => {
+          say(
+            result.receipt?.state === 'applied'
+              ? `${control.label} done.`
+              : `${control.label} sent. Waiting for the host to confirm.`
+          )
         })
         .catch((error: unknown) => {
           say(failureMessage(error), 'danger')
         })
     },
-    [port, sessionId, say]
+    [port, subject, say]
   )
 
-  const loadOlder = () => {
+  /**
+   * Loads the page of history above what is held, and keeps the reader where they are.
+   *
+   * The window moves by exactly the number of nodes that were added, so the node the person was
+   * looking at stays in the same place.
+   */
+  const loadOlder = useCallback(() => {
     port
-      .historyPage(ENVIRONMENT_ID, { session_id: sessionId })
-      .then(() => {
-        // The anchor is kept by the model: the window start moves by exactly what was prepended.
-        setState((current) => prependHistory(current, []))
+      .historyPage({ session_id: sessionId })
+      .then((page) => {
+        const older = readHistoryNodes(page)
+        if (older.length === 0) {
+          say('There is no more history on this host.')
+          return
+        }
+        update((current) => ({
+          ...current,
+          conversation: prependHistory(current.conversation, older)
+        }))
       })
-      .catch(() => {
-        say('Older history could not be read.', 'danger')
+      .catch((error: unknown) => {
+        say(failureMessage(error), 'danger')
       })
-  }
+  }, [port, sessionId, update, say])
+
+  /**
+   * Moves the window and decides whether the view is still following.
+   *
+   * Following is what the scroll position says, not a setting: a person who has scrolled up is
+   * reading, and new output must not pull them away from it.
+   */
+  const onScroll = useCallback(() => {
+    const element = scroller.current
+    if (!element) return
+    const atEnd = element.scrollHeight - element.scrollTop - element.clientHeight < 32
+    const total = state.conversation.nodes.length
+    const fraction =
+      element.scrollHeight <= element.clientHeight
+        ? 0
+        : element.scrollTop / (element.scrollHeight - element.clientHeight)
+    const start = Math.round(fraction * Math.max(0, total - WINDOW_SIZE))
+    update((current) => ({
+      ...current,
+      conversation: atEnd
+        ? setFollowing(current.conversation, true)
+        : setWindowStart(current.conversation, start)
+    }))
+  }, [state.conversation.nodes.length, update])
 
   return (
-    <div className="conversation" data-testid="conversation" data-frames={frames}>
+    <div className="conversation" data-testid="conversation">
       {banner ? <Banner tone={banner.tone} title={banner.title} detail={banner.detail} /> : null}
 
-      {submissions.length > 0 ? (
+      {state.submissions.length > 0 ? (
         <ul className="pending-actions" data-testid="pending-actions">
-          {submissions.map((submission) => (
+          {state.submissions.map((submission) => (
             <li key={submission.localId} data-state={submission.state}>
               <Badge
                 tone={
@@ -317,27 +389,37 @@ export function Conversation({
         </ul>
       ) : null}
 
-      <div className="conversation-scroll" ref={scroller} data-testid="conversation-scroll">
+      <div
+        className="conversation-scroll"
+        ref={scroller}
+        onScroll={onScroll}
+        data-testid="conversation-scroll"
+        data-following={state.conversation.following ? 'true' : 'false'}
+      >
         {hidden > 0 ? (
           <div className="history-edge">
-            <Button onClick={loadOlder}>Load {hidden} earlier</Button>
+            <Button data-testid="load-older" onClick={loadOlder}>
+              Load earlier output
+            </Button>
           </div>
         ) : null}
 
         <Document
           nodes={rendered}
           controlState={controlState}
-          images={images}
+          images={state.images}
           onOpenLink={openLink}
           onImportImage={importImage}
           onInvoke={invoke}
         />
       </div>
 
-      {launch && launch.prompt_is_empty ? (
+      {launch?.prompt_is_empty ? (
         <LaunchSurfaceView
           surface={launch}
+          subject={subject}
           sessionId={sessionId}
+          connected={connected}
           onLaunched={onLaunched}
         />
       ) : null}
@@ -346,15 +428,31 @@ export function Conversation({
         draft={presented}
         connected={connected}
         insertion={insertion}
-        onChange={(text) => {
-          setDraft((current) => edit(current, text, Date.now()))
+        onChange={(next) => {
+          update((current) => ({ ...current, draft: edit(current.draft, next, Date.now()) }))
         }}
         onAction={send}
-        onFollowChange={(following) => {
-          setState((current) => setFollowing(current, following))
-        }}
       />
     </div>
+  )
+}
+
+/**
+ * The nodes in one page of retained history.
+ *
+ * A host that answered with something this client cannot read contributes nothing rather than
+ * contributing a guess.
+ */
+function readHistoryNodes(page: unknown): readonly DocumentNode[] {
+  if (typeof page !== 'object' || page === null) return []
+  const nodes = (page as { nodes?: unknown }).nodes
+  if (!Array.isArray(nodes)) return []
+  return nodes.filter(
+    (node): node is DocumentNode =>
+      typeof node === 'object' &&
+      node !== null &&
+      typeof (node as DocumentNode).id === 'string' &&
+      typeof (node as DocumentNode).revision === 'string'
   )
 }
 
@@ -594,16 +692,23 @@ function ControlButton({
  */
 function LaunchSurfaceView({
   surface,
+  subject,
   sessionId,
+  connected,
   onLaunched
 }: {
   readonly surface: LaunchSurface
+  readonly subject: SessionSubject
   readonly sessionId: string
+  readonly connected: boolean
   readonly onLaunched: () => void
 }): ReactNode {
   const { port, say } = useApp()
-  const [drawnAt] = useState(surface.prompt_generation)
-  const stale = drawnAt !== surface.prompt_generation
+  // The generation these buttons were drawn at. A host that moved the prompt on makes them stale,
+  // and reading the surface again is what makes them usable: a person looks at the prompt, and the
+  // refreshed proof is what re-enables the buttons.
+  const [drawnAt, setDrawnAt] = useState(surface.prompt_generation)
+  const stale = drawnAt !== surface.prompt_generation || !connected
 
   return (
     <section className="launch-surface" data-testid="launch-surface" data-stale={stale}>
@@ -625,14 +730,21 @@ function LaunchSurfaceView({
               }
               onCommit={() => {
                 port
-                  .shellLaunch(ENVIRONMENT_ID, {
-                    session_id: sessionId,
-                    command: { arguments: [...profile.arguments] },
-                    expected_prompt_generation: surface.prompt_generation,
-                    expected_buffer_revision: surface.buffer_revision
-                  })
-                  .then(() => {
-                    say(`${profile.label} started.`)
+                  .shellLaunch(
+                    {
+                      session_id: sessionId,
+                      command: { arguments: [...profile.arguments] },
+                      expected_prompt_generation: surface.prompt_generation,
+                      expected_buffer_revision: surface.buffer_revision
+                    },
+                    subject
+                  )
+                  .then((result) => {
+                    say(
+                      result.receipt?.state === 'applied'
+                        ? `${profile.label} started.`
+                        : `${profile.label} requested. Waiting for the host to confirm.`
+                    )
                     onLaunched()
                   })
                   .catch((error: unknown) => {
@@ -649,7 +761,19 @@ function LaunchSurfaceView({
       </div>
       {stale ? (
         <p className="small warning-text" data-testid="launch-stale">
-          The prompt changed since these were drawn. Nothing will be typed into it.
+          {connected
+            ? 'The prompt changed since these were drawn. Nothing will be typed into it.'
+            : 'Not in contact with this host, so nothing can be started on it.'}
+          {connected ? (
+            <Button
+              data-testid="launch-refresh"
+              onClick={() => {
+                setDrawnAt(surface.prompt_generation)
+              }}
+            >
+              I have looked at the prompt
+            </Button>
+          ) : null}
         </p>
       ) : (
         <p className="small faint">
@@ -666,15 +790,13 @@ function Composer({
   connected,
   insertion,
   onChange,
-  onAction,
-  onFollowChange
+  onAction
 }: {
   readonly draft: Draft
   readonly connected: boolean
   readonly insertion: string | null
   readonly onChange: (text: string) => void
   readonly onAction: (action: ComposerAction) => void
-  readonly onFollowChange: (following: boolean) => void
 }): ReactNode {
   const [showCommands, setShowCommands] = useState(false)
   const reason = notSubmittableBecause(draft)
@@ -709,9 +831,6 @@ function Composer({
           value={draft.text}
           data-testid="composer-input"
           placeholder="Ask for something, or press / for a command"
-          onFocus={() => {
-            onFollowChange(true)
-          }}
           onChange={(event) => {
             onChange(event.target.value)
             setShowCommands(event.target.value.startsWith('/'))

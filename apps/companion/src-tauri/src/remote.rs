@@ -191,7 +191,10 @@ mod tests {
         assert_eq!(imported.media_type, "image/png");
         let calls = fetcher.calls.lock().expect("the recorder is not poisoned");
         assert_eq!(calls.len(), 1, "an import fetches once");
-        assert_eq!(calls[0].1, MAX_IMPORT_BYTES, "the limit is declared up front");
+        assert_eq!(
+            calls[0].1, MAX_IMPORT_BYTES,
+            "the limit is declared up front"
+        );
     }
 
     #[test]

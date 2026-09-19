@@ -86,9 +86,16 @@ export function IconButton({
  *
  * Approving a command is the one place in this product where a mistaken press has a consequence
  * the person cannot take back, so this is not an ordinary button. It highlights on pointer-down,
- * which is the feedback; it commits on pointer-up while the pointer is still inside it, which is
- * the decision. Dragging off it cancels. From the keyboard it commits on key-up, for the same
- * reason: a held key must not repeat a decision.
+ * which is the feedback; it commits on pointer-up while the same pointer is still inside it, which
+ * is the decision. Dragging off it cancels, and so does losing focus or losing the pointer.
+ *
+ * Only the primary button arms it: a right-click is a request for a menu, not a decision. From the
+ * keyboard it commits on the key-up of a key it saw go down, so a held key repeats nothing and a
+ * key-up that arrives from somewhere else decides nothing.
+ *
+ * A `click` that arrives without any of that is an activation from assistive technology, which
+ * synthesises no pointer or key events. That is a deliberate action by a person, so it commits,
+ * once, and the pointer path suppresses its own click so nothing commits twice.
  */
 export function CommitButton({
   onCommit,
@@ -102,12 +109,25 @@ export function CommitButton({
   readonly children: ReactNode
 }): ReactNode {
   const [pressed, setPressed] = useState(false)
-  const armed = useRef(false)
+  const pointer = useRef<number | null>(null)
+  const key = useRef<string | null>(null)
+  const committedHere = useRef(false)
 
   const cancel = useCallback(() => {
-    armed.current = false
+    pointer.current = null
+    key.current = null
     setPressed(false)
   }, [])
+
+  const inside = (event: { clientX: number; clientY: number }, element: HTMLElement) => {
+    const box = element.getBoundingClientRect()
+    return (
+      event.clientX >= box.left &&
+      event.clientX <= box.right &&
+      event.clientY >= box.top &&
+      event.clientY <= box.bottom
+    )
+  }
 
   return (
     <button
@@ -116,48 +136,54 @@ export function CommitButton({
       data-pressed={pressed ? 'true' : undefined}
       disabled={disabled}
       onPointerDown={(event) => {
-        if (disabled) return
+        // The primary button only. `button` is 0 for the primary one on every pointer type.
+        if (disabled || event.button !== 0 || pointer.current !== null) return
         event.currentTarget.setPointerCapture(event.pointerId)
-        armed.current = true
+        pointer.current = event.pointerId
         setPressed(true)
       }}
       onPointerMove={(event) => {
-        if (!armed.current) return
-        const box = event.currentTarget.getBoundingClientRect()
-        const inside =
-          event.clientX >= box.left &&
-          event.clientX <= box.right &&
-          event.clientY >= box.top &&
-          event.clientY <= box.bottom
-        setPressed(inside)
+        if (pointer.current !== event.pointerId) return
+        setPressed(inside(event, event.currentTarget))
       }}
       onPointerUp={(event) => {
-        if (!armed.current) return
-        const box = event.currentTarget.getBoundingClientRect()
-        const inside =
-          event.clientX >= box.left &&
-          event.clientX <= box.right &&
-          event.clientY >= box.top &&
-          event.clientY <= box.bottom
+        if (pointer.current !== event.pointerId) return
+        const within = inside(event, event.currentTarget)
         cancel()
-        if (inside && !disabled) onCommit()
+        if (within && !disabled) {
+          committedHere.current = true
+          onCommit()
+        }
       }}
       onPointerCancel={cancel}
-      onPointerLeave={() => {
-        setPressed(false)
-      }}
+      onLostPointerCapture={cancel}
+      onBlur={cancel}
       onKeyDown={(event) => {
+        if (disabled) return
         if (event.key === ' ' || event.key === 'Enter') {
           event.preventDefault()
-          if (!event.repeat) setPressed(true)
+          if (event.repeat) return
+          key.current = event.key
+          setPressed(true)
         }
       }}
       onKeyUp={(event) => {
-        if (event.key === ' ' || event.key === 'Enter') {
-          event.preventDefault()
-          setPressed(false)
-          if (!disabled) onCommit()
+        if (event.key !== ' ' && event.key !== 'Enter') return
+        event.preventDefault()
+        const armed = key.current === event.key
+        cancel()
+        if (armed && !disabled) {
+          committedHere.current = true
+          onCommit()
         }
+      }}
+      onClick={() => {
+        // The pointer and keyboard paths have already decided by the time their click arrives.
+        if (committedHere.current) {
+          committedHere.current = false
+          return
+        }
+        if (!disabled) onCommit()
       }}
       {...rest}
     >

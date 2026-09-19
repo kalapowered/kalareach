@@ -75,9 +75,11 @@ fn platform_verify(reason: &str) -> Result<Presence> {
     }
 
     let (sender, receiver) = std::sync::mpsc::channel();
-    let handler = block2::RcBlock::new(move |success: objc2::runtime::Bool, _error: *mut objc2_foundation::NSError| {
-        let _ = sender.send(success.as_bool());
-    });
+    let handler = block2::RcBlock::new(
+        move |success: objc2::runtime::Bool, _error: *mut objc2_foundation::NSError| {
+            let _ = sender.send(success.as_bool());
+        },
+    );
     unsafe {
         context.evaluatePolicy_localizedReason_reply(policy, &localised, &handler);
     }
@@ -133,8 +135,11 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_platform_without_a_ceremony_says_so_rather_than_claiming_presence() {
-        let error = verify_owner_presence("Confirm this new device")
-            .expect_err("no ceremony, no claim");
-        assert_eq!(error.code, kr_protocol::error::ErrorCode::ResourceUnavailable);
+        let error =
+            verify_owner_presence("Confirm this new device").expect_err("no ceremony, no claim");
+        assert_eq!(
+            error.code,
+            kr_protocol::error::ErrorCode::ResourceUnavailable
+        );
     }
 }

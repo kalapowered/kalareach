@@ -11,7 +11,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card } from '../components/ui'
-import { ENVIRONMENT_ID, useApp } from '../app/state'
+import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
 
 type Session = SessionListResult['sessions'][number]
@@ -54,7 +54,7 @@ export function Sessions(): ReactNode {
 
   const load = useCallback(() => {
     port
-      .sessionList(ENVIRONMENT_ID, {})
+      .sessionList({})
       .then((result) => {
         setList(result)
         setFailure(null)
@@ -166,7 +166,7 @@ export function Hosts(): ReactNode {
   const [failure, setFailure] = useState<string | null>(null)
 
   const load = useCallback(() => {
-    Promise.all([port.hostInfo(ENVIRONMENT_ID), port.environmentList(ENVIRONMENT_ID)])
+    Promise.all([port.hostInfo(), port.environmentList()])
       .then(([hostInfo, list]) => {
         setInfo(hostInfo)
         setEnvironments(list)

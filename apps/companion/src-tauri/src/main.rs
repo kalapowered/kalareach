@@ -6,7 +6,10 @@
 // The window owns the user interface; nothing here writes to a console. On Windows a console
 // subsystem binary opens one behind the window, so the release build declares the windows
 // subsystem instead.
-#![cfg_attr(not(debug_assertions), cfg_attr(windows, windows_subsystem = "windows"))]
+#![cfg_attr(
+    not(debug_assertions),
+    cfg_attr(windows, windows_subsystem = "windows")
+)]
 
 fn main() {
     companion_tauri::run();

@@ -28,6 +28,8 @@ export interface AttentionEntry {
   readonly host_label: string
   readonly environment_id: string
   readonly session_id: string | null
+  /** The session's epoch, which every mutation about that session must name. */
+  readonly session_epoch: string | null
   readonly session_display_number: string | null
   readonly application: string | null
   readonly raised_at_ms: number

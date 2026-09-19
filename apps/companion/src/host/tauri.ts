@@ -4,16 +4,19 @@
  * Every method here is one `invoke` of one named command. Nothing builds a command name from a
  * value, so the set of commands this file can reach is the set written in it, and the set the
  * backend registers is the set it will answer.
+ *
+ * Some of the operations the interface knows how to display have no command yet, because their
+ * parameters and results are not part of the published contract on this build. Those refuse here,
+ * with the protocol's own word for it, rather than sending a request whose shape nobody agrees on.
  */
 
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { save } from '@tauri-apps/plugin-dialog'
 
-import type { LaunchSurface } from '../model/pending'
 import type {
   ApprovedLink,
+  ConnectionState,
   DroppedFile,
   HostEvent,
   HostPort,
@@ -22,86 +25,105 @@ import type {
   ProjectedScreen,
   RendezvousOrigin,
   ScannedCode,
+  SessionSubject,
   Settled,
   Written
 } from './port'
 
-/** The event the backend publishes host events on. */
+/** The event the backend publishes each host notification on. */
 export const HOST_EVENT = 'kr://event'
+
+/** The event the backend publishes a change of connection state on. */
+export const CONNECTION_EVENT = 'kr://connection'
+
+/**
+ * The refusal for an operation this build has no agreed shape for.
+ *
+ * `UNSUPPORTED_SCHEMA` is the protocol's own word for two builds that do not share a contract, and
+ * that is exactly the situation: the interface can draw the screen, and this build cannot state
+ * the request. Refusing here keeps a half-formed request off the wire.
+ */
+class NoAgreedShape extends Error {
+  readonly code = 'UNSUPPORTED_SCHEMA'
+  readonly user_action = 'update'
+
+  constructor(operation: string) {
+    super(`this host and this application do not share a contract for ${operation}`)
+    this.name = 'NoAgreedShape'
+  }
+}
+
+function noAgreedShape(operation: string): Promise<never> {
+  return Promise.reject(new NoAgreedShape(operation))
+}
+
+/** What the backend publishes for one host event. */
+interface PublishedEvent {
+  readonly stream_id: string
+  readonly sequence: string
+  readonly event_type: string
+  readonly payload: unknown
+}
 
 /** Builds the desktop port. */
 export function tauriPort(): HostPort {
   const call = <T,>(command: string, args: Record<string, unknown>): Promise<T> =>
     invoke<T>(command, args)
 
-  const protocol = <T,>(command: string, environmentId: string, params: unknown): Promise<T> =>
-    call<T>(command, { environmentId, params })
+  const read = <T,>(command: string, params: unknown): Promise<T> => call<T>(command, { params })
+
+  const mutate = <T,>(command: string, params: unknown, subject: SessionSubject): Promise<T> =>
+    call<T>(command, { params, subject })
 
   return {
-    connectionState: () => call<boolean>('connection_state', {}),
+    connectionState: () => call<ConnectionState>('connection_state', {}),
 
-    hostInfo: (environmentId) => protocol('host_info', environmentId, {}),
-    environmentList: (environmentId) => protocol('environment_list', environmentId, {}),
-    environmentCapabilities: (environmentId, params) =>
-      protocol('environment_capabilities', environmentId, params),
+    hostInfo: () => call('host_info', {}),
+    environmentList: () => call('environment_list', {}),
 
-    sessionList: (environmentId, params) => protocol('session_list', environmentId, params),
-    sessionRead: (environmentId, params) => protocol('session_read', environmentId, params),
-    sessionClose: (environmentId, params) => protocol('session_close', environmentId, params),
+    sessionList: (params) => read('session_list', params),
+    sessionRead: (params) => read('session_read', params),
+    sessionClose: (params, subject) => mutate('session_close', params, subject),
 
-    // The environment reports which of the six profiles it actually has, and the session reports
-    // the prompt generation a launch must name. Both come from the host; nothing here guesses at
-    // an executable.
-    launchSurface: (environmentId, params) =>
-      protocol<LaunchSurface>('environment_capabilities', environmentId, params),
-    shellLaunch: (environmentId, params) => protocol('shell_launch', environmentId, params),
+    launchSurface: () => noAgreedShape('the launch surface'),
+    shellLaunch: (params, subject) => mutate('shell_launch', params, subject),
 
-    agentSnapshot: (environmentId, params) => protocol('agent_snapshot', environmentId, params),
-    agentCommands: (environmentId, params) => protocol('agent_commands', environmentId, params),
-    composerSubmit: (environmentId, params) =>
-      protocol<Settled>('composer_submit', environmentId, params),
-    composerQueue: (environmentId, params) =>
-      protocol<Settled>('composer_queue', environmentId, params),
-    composerSteer: (environmentId, params) =>
-      protocol<Settled>('composer_steer', environmentId, params),
-    composerInterrupt: (environmentId, params) =>
-      protocol<Settled>('composer_interrupt', environmentId, params),
-    approvalRespond: (environmentId, params) =>
-      protocol<Settled>('approval_respond', environmentId, params),
-    pluginActionInvoke: (environmentId, params) =>
-      protocol<Settled>('plugin_action_invoke', environmentId, params),
+    agentSnapshot: () => noAgreedShape("an agent's semantic snapshot"),
+    agentCommands: () => noAgreedShape("an agent's commands"),
+    composerSubmit: () => noAgreedShape('submitting a prompt'),
+    composerQueue: () => noAgreedShape('queueing a prompt'),
+    composerSteer: () => noAgreedShape('steering a turn'),
+    composerInterrupt: () => noAgreedShape('interrupting a turn'),
+    approvalRespond: () => noAgreedShape('answering an approval'),
+    pluginActionInvoke: () => noAgreedShape("invoking a package's action"),
 
-    draftCreate: (environmentId, params) => protocol<Settled>('draft_create', environmentId, params),
-    draftUpdate: (environmentId, params) => protocol<Settled>('draft_update', environmentId, params),
-    draftAddAttachment: (environmentId, params) =>
-      protocol<Settled>('draft_add_attachment', environmentId, params),
-    attachmentImage: (environmentId, params) =>
-      protocol<{ bytes: number[]; media_type: string }>('attachment_image', environmentId, params),
+    draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
+    draftUpdate: (params, subject) => mutate<Settled>('draft_update', params, subject),
+    draftAddAttachment: (params, subject) =>
+      mutate<Settled>('draft_add_attachment', params, subject),
+    attachmentImage: (params) =>
+      mutate<{ bytes: number[]; media_type: string }>('attachment_image', params, {}),
 
-    historyPage: (environmentId, params) => protocol('history_page', environmentId, params),
-    attentionRead: (environmentId, params) => protocol('attention_read', environmentId, params),
-    attentionAcknowledge: (environmentId, params) =>
-      protocol<Settled>('attention_acknowledge', environmentId, params),
-    questionRead: (environmentId, params) => protocol('question_read', environmentId, params),
-    questionAnswer: (environmentId, params) =>
-      protocol<Settled>('question_answer', environmentId, params),
-    grantList: (environmentId, params) => protocol('grant_list', environmentId, params),
-    grantCreate: (environmentId, params) => protocol<Settled>('grant_create', environmentId, params),
+    historyPage: (params) => read('history_page', params),
+    attentionRead: () => noAgreedShape('the attention inbox'),
+    attentionAcknowledge: () => noAgreedShape('acknowledging an attention entry'),
+    questionRead: (params) => read('question_read', params),
+    questionAnswer: (params, subject) => mutate<Settled>('question_answer', params, subject),
+    grantList: () => noAgreedShape('the grants a session has issued'),
+    grantCreate: () => noAgreedShape('issuing a grant'),
 
-    pluginList: (environmentId, params) => protocol('plugin_list', environmentId, params),
-    catalogueList: (environmentId, params) => protocol('catalogue_list', environmentId, params),
+    pluginList: () => noAgreedShape('the installed packages'),
+    catalogueList: () => noAgreedShape('the package catalogue'),
 
-    changesetRead: (environmentId, params) => protocol('changeset_read', environmentId, params),
+    changesetRead: () => noAgreedShape('a change set'),
 
-    storageStatus: (environmentId, params) => protocol('storage_status', environmentId, params),
-    storageObjectDelete: (environmentId, params) =>
-      protocol<Settled>('storage_object_delete', environmentId, params),
+    storageStatus: () => noAgreedShape('what this host retains'),
+    storageObjectDelete: () => noAgreedShape('deleting a retained artefact'),
 
-    terminalProjection: (environmentId, params) =>
-      protocol<ProjectedScreen>('events_snapshot', environmentId, params),
-    terminalInput: (environmentId, params) => protocol('input_write', environmentId, params),
-    attachmentViewport: (environmentId, params) =>
-      protocol<Settled>('attachment_viewport', environmentId, params),
+    terminalProjection: (params) => read<ProjectedScreen>('events_snapshot', params),
+    terminalInput: (params) => read('input_write', params),
+    attachmentViewport: (params, subject) =>
+      mutate<Settled>('attachment_viewport', params, subject),
 
     pairingOrigin: () => call<RendezvousOrigin>('pairing_origin', {}),
     pairingSetOrigin: (origin) => call<RendezvousOrigin>('pairing_set_origin', { origin }),
@@ -129,20 +151,38 @@ export function tauriPort(): HostPort {
         omissions: request.omissions
       }),
 
-    chooseExportPath: (suggestedName) => save({ defaultPath: suggestedName }),
+    // The platform's own dialog answers, and the backend remembers its answer for exactly one
+    // write. The page never names a path of its own.
+    chooseExportPath: (suggestedName) =>
+      call<string | null>('choose_export_destination', { suggestedName }),
 
     subscribe(listener: (event: HostEvent) => void) {
-      let stop: (() => void) | null = null
+      const stops: (() => void)[] = []
       let cancelled = false
-      void listen<HostEvent>(HOST_EVENT, (event) => {
-        listener(event.payload)
-      }).then((unlisten) => {
+      const keep = (unlisten: () => void) => {
         if (cancelled) unlisten()
-        else stop = unlisten
-      })
+        else stops.push(unlisten)
+      }
+
+      void listen<PublishedEvent>(HOST_EVENT, (event) => {
+        listener({
+          stream_id: event.payload.stream_id,
+          sequence: event.payload.sequence,
+          body: { kind: event.payload.event_type, payload: event.payload.payload }
+        })
+      }).then(keep)
+
+      void listen<ConnectionState>(CONNECTION_EVENT, (event) => {
+        listener({
+          stream_id: '',
+          sequence: '',
+          body: { kind: 'connection', connected: event.payload.connected }
+        })
+      }).then(keep)
+
       return () => {
         cancelled = true
-        stop?.()
+        for (const stop of stops) stop()
       }
     },
 

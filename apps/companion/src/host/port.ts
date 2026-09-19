@@ -34,6 +34,30 @@ export interface HostError {
   readonly user_action: string
 }
 
+/**
+ * What a mutation is about.
+ *
+ * Section 23 makes every mutation state its exact subject. The interface supplies it because the
+ * interface is what read it: it saw the session in a list the host sent, with the epoch beside the
+ * identifier. The environment is not the page's to choose and comes from the connection itself.
+ */
+export interface SessionSubject {
+  readonly sessionId?: string
+  readonly sessionEpoch?: string
+  readonly applicationInstanceId?: string
+  readonly agentBindingRevision?: string
+}
+
+/** What the backend says about the host connection. */
+export interface ConnectionState {
+  /** True while a session is live. */
+  readonly connected: boolean
+  /** The environment the connection belongs to, when there is one. */
+  readonly environment_id: string | null
+  /** Why there is no connection, in plain words, when there is none. */
+  readonly reason: string | null
+}
+
 /** The rendezvous origin this device is configured with. */
 export interface RendezvousOrigin {
   readonly origin: string
@@ -121,6 +145,13 @@ export interface RecordedFrame {
 export interface Settled<T = unknown> {
   readonly receipt: Receipt | null
   readonly value: T | null
+  /**
+   * The action's durable identity.
+   *
+   * It exists from the moment the request is submitted, before any receipt, so a submission whose
+   * outcome is unknown is still one the interface can ask about rather than resubmit.
+   */
+  readonly action_id: string | null
 }
 
 /** One event the host pushed. */
@@ -151,16 +182,15 @@ export interface DroppedFile {
  * here takes a method name: a screen cannot reach an operation this list does not carry.
  */
 export interface HostPort {
-  /** Whether a host connection is live. */
-  connectionState(): Promise<boolean>
+  /** Whether a host connection is live, and why not when it is not. */
+  connectionState(): Promise<ConnectionState>
 
-  hostInfo(environmentId: string): Promise<HostInfoResult>
-  environmentList(environmentId: string): Promise<EnvironmentListResult>
-  environmentCapabilities(environmentId: string, params: unknown): Promise<unknown>
+  hostInfo(): Promise<HostInfoResult>
+  environmentList(): Promise<EnvironmentListResult>
 
-  sessionList(environmentId: string, params: unknown): Promise<SessionListResult>
-  sessionRead(environmentId: string, params: unknown): Promise<SessionReadResult>
-  sessionClose(environmentId: string, params: unknown): Promise<Settled<ClosureRecord>>
+  sessionList(params: unknown): Promise<SessionListResult>
+  sessionRead(params: unknown): Promise<SessionReadResult>
+  sessionClose(params: unknown, subject: SessionSubject): Promise<Settled<ClosureRecord>>
 
   /**
    * What the launch surface may draw right now.
@@ -168,43 +198,43 @@ export interface HostPort {
    * The prompt generation in the answer is the one a launch must name. A button drawn at an older
    * generation is disabled rather than launched against a prompt the person has not seen.
    */
-  launchSurface(environmentId: string, params: unknown): Promise<LaunchSurface>
-  shellLaunch(environmentId: string, params: unknown): Promise<Settled<ShellLaunchResult>>
+  launchSurface(params: unknown): Promise<LaunchSurface>
+  shellLaunch(params: unknown, subject: SessionSubject): Promise<Settled<ShellLaunchResult>>
 
-  agentSnapshot(environmentId: string, params: unknown): Promise<{ nodes: DocumentNode[] }>
-  agentCommands(environmentId: string, params: unknown): Promise<unknown>
-  composerSubmit(environmentId: string, params: unknown): Promise<Settled>
-  composerQueue(environmentId: string, params: unknown): Promise<Settled>
-  composerSteer(environmentId: string, params: unknown): Promise<Settled>
-  composerInterrupt(environmentId: string, params: unknown): Promise<Settled>
-  approvalRespond(environmentId: string, params: unknown): Promise<Settled>
-  pluginActionInvoke(environmentId: string, params: unknown): Promise<Settled>
+  agentSnapshot(params: unknown): Promise<{ nodes: DocumentNode[] }>
+  agentCommands(params: unknown): Promise<unknown>
+  composerSubmit(params: unknown, subject: SessionSubject): Promise<Settled>
+  composerQueue(params: unknown, subject: SessionSubject): Promise<Settled>
+  composerSteer(params: unknown, subject: SessionSubject): Promise<Settled>
+  composerInterrupt(params: unknown, subject: SessionSubject): Promise<Settled>
+  approvalRespond(params: unknown, subject: SessionSubject): Promise<Settled>
+  pluginActionInvoke(params: unknown, subject: SessionSubject): Promise<Settled>
 
-  draftCreate(environmentId: string, params: unknown): Promise<Settled>
-  draftUpdate(environmentId: string, params: unknown): Promise<Settled>
-  draftAddAttachment(environmentId: string, params: unknown): Promise<Settled>
+  draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
+  draftUpdate(params: unknown, subject: SessionSubject): Promise<Settled>
+  draftAddAttachment(params: unknown, subject: SessionSubject): Promise<Settled>
   /** Reads the bytes behind one validated attachment handle. */
-  attachmentImage(environmentId: string, params: unknown): Promise<{ bytes: number[]; media_type: string }>
+  attachmentImage(params: unknown): Promise<{ bytes: number[]; media_type: string }>
 
-  historyPage(environmentId: string, params: unknown): Promise<unknown>
-  attentionRead(environmentId: string, params: unknown): Promise<AttentionInbox>
-  attentionAcknowledge(environmentId: string, params: unknown): Promise<Settled>
-  questionRead(environmentId: string, params: unknown): Promise<unknown>
-  questionAnswer(environmentId: string, params: unknown): Promise<Settled>
-  grantList(environmentId: string, params: unknown): Promise<unknown>
-  grantCreate(environmentId: string, params: unknown): Promise<Settled>
+  historyPage(params: unknown): Promise<unknown>
+  attentionRead(params: unknown): Promise<AttentionInbox>
+  attentionAcknowledge(params: unknown, subject: SessionSubject): Promise<Settled>
+  questionRead(params: unknown): Promise<unknown>
+  questionAnswer(params: unknown, subject: SessionSubject): Promise<Settled>
+  grantList(params: unknown): Promise<unknown>
+  grantCreate(params: unknown, subject: SessionSubject): Promise<Settled>
 
-  pluginList(environmentId: string, params: unknown): Promise<unknown>
-  catalogueList(environmentId: string, params: unknown): Promise<unknown>
+  pluginList(params: unknown): Promise<unknown>
+  catalogueList(params: unknown): Promise<unknown>
 
-  changesetRead(environmentId: string, params: unknown): Promise<unknown>
+  changesetRead(params: unknown): Promise<unknown>
 
-  storageStatus(environmentId: string, params: unknown): Promise<unknown>
-  storageObjectDelete(environmentId: string, params: unknown): Promise<Settled>
+  storageStatus(params: unknown): Promise<unknown>
+  storageObjectDelete(params: unknown, subject: SessionSubject): Promise<Settled>
 
-  terminalProjection(environmentId: string, params: unknown): Promise<ProjectedScreen>
-  terminalInput(environmentId: string, params: unknown): Promise<unknown>
-  attachmentViewport(environmentId: string, params: unknown): Promise<Settled>
+  terminalProjection(params: unknown): Promise<ProjectedScreen>
+  terminalInput(params: unknown): Promise<unknown>
+  attachmentViewport(params: unknown, subject: SessionSubject): Promise<Settled>
 
   pairingOrigin(): Promise<RendezvousOrigin>
   pairingSetOrigin(origin: string): Promise<RendezvousOrigin>

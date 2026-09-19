@@ -12,11 +12,13 @@ import {
   useContext,
   useMemo,
   useState,
+  useSyncExternalStore,
   type ReactNode
 } from 'react'
 
 import type { HostPort } from '../host/port'
 import type { ToastMessage } from '../components/ui'
+import { SessionStates, type SessionState } from '../model/sessions'
 
 /** The screens the navigation model has. */
 export type Place =
@@ -28,11 +30,11 @@ export type Place =
   | { readonly view: 'pairing' }
   | { readonly view: 'session'; readonly sessionId: string; readonly pane: 'semantic' | 'terminal' }
 
-/** The environment the desktop application is looking at. */
-export const ENVIRONMENT_ID = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 
 interface AppValue {
   readonly port: HostPort
+  /** What every session's views share, kept apart from every other session's. */
+  readonly sessions: SessionStates
   readonly place: Place
   readonly go: (place: Place) => void
   readonly toast: ToastMessage | null
@@ -59,6 +61,9 @@ export function AppProvider({
   const [place, setPlace] = useState<Place>(initialPlace)
   const [toast, setToast] = useState<ToastMessage | null>(null)
   const [tabs, setTabs] = useState<readonly string[]>([])
+  // One store per window, created once. A store built during render would be a different store on
+  // every render, and every session's state would go with the old one.
+  const [sessions] = useState(() => new SessionStates())
 
   const say = useCallback((text: string, tone: 'success' | 'danger' = 'success') => {
     setToast({ id: Date.now() + Math.random(), text, tone })
@@ -68,9 +73,13 @@ export function AppProvider({
     setTabs((current) => (current.includes(sessionId) ? current : [...current, sessionId]))
   }, [])
 
-  const closeTab = useCallback((sessionId: string) => {
-    setTabs((current) => current.filter((each) => each !== sessionId))
-  }, [])
+  const closeTab = useCallback(
+    (sessionId: string) => {
+      setTabs((current) => current.filter((each) => each !== sessionId))
+      sessions.forget(sessionId)
+    },
+    [sessions]
+  )
 
   const go = useCallback(
     (next: Place) => {
@@ -83,6 +92,7 @@ export function AppProvider({
   const value = useMemo<AppValue>(
     () => ({
       port,
+      sessions,
       place,
       go,
       toast,
@@ -94,7 +104,7 @@ export function AppProvider({
       openTab,
       closeTab
     }),
-    [port, place, go, toast, say, tabs, openTab, closeTab]
+    [port, sessions, place, go, toast, say, tabs, openTab, closeTab]
   )
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
@@ -105,4 +115,28 @@ export function useApp(): AppValue {
   const value = useContext(AppContext)
   if (!value) throw new Error('This component must be rendered inside the application.')
   return value
+}
+
+/**
+ * Reads and writes one session's state.
+ *
+ * The update function is bound to this session, so a view cannot write another session's state
+ * even by mistake.
+ */
+export function useSession(sessionId: string): {
+  readonly state: SessionState
+  readonly update: (change: (current: SessionState) => SessionState) => void
+} {
+  const { sessions } = useApp()
+  const state = useSyncExternalStore(
+    useCallback((listener) => sessions.subscribe(listener), [sessions]),
+    () => sessions.get(sessionId)
+  )
+  const update = useCallback(
+    (change: (current: SessionState) => SessionState) => {
+      sessions.update(sessionId, change)
+    },
+    [sessions, sessionId]
+  )
+  return { state, update }
 }

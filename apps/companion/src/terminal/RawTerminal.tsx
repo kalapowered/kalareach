@@ -17,8 +17,8 @@ import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 
 import { Badge, Button, Segmented } from '../components/ui'
-import { ENVIRONMENT_ID, useApp } from '../app/state'
-import { failureMessage, type ProjectedScreen } from '../host/port'
+import { useApp } from '../app/state'
+import { failureMessage, type ProjectedScreen, type SessionSubject } from '../host/port'
 import { drawRow, measuredReproducible } from './clusters'
 import {
   describeProvenance,
@@ -35,10 +35,12 @@ const BASE_FONT_SIZE = 12
 /** The raw view of one session. */
 export function RawTerminal({
   sessionId,
+  subject,
   attachmentId,
   onReleaseGeometry
 }: {
   readonly sessionId: string
+  readonly subject: SessionSubject
   readonly attachmentId: string
   readonly onReleaseGeometry: () => void
 }): ReactNode {
@@ -74,7 +76,7 @@ export function RawTerminal({
 
   const load = useCallback(() => {
     port
-      .terminalProjection(ENVIRONMENT_ID, { session_id: sessionId })
+      .terminalProjection({ session_id: sessionId })
       .then((projection) => {
         setScreen(projection)
         setFailure(null)
@@ -172,7 +174,7 @@ export function RawTerminal({
             // the program as the wheel event it is.
             setWheelToApplication((count) => count + 1)
             void port
-              .terminalInput(ENVIRONMENT_ID, {
+              .terminalInput({
                 session_id: sessionId,
                 wheel: { lines: outcome.lines }
               })
@@ -187,11 +189,14 @@ export function RawTerminal({
             return
           }
           void port
-            .attachmentViewport(ENVIRONMENT_ID, {
-              attachment_id: attachmentId,
-              session_id: sessionId,
-              viewport: { rows_above: outcome.rows, columns: outcome.columns }
-            })
+            .attachmentViewport(
+              {
+                attachment_id: attachmentId,
+                session_id: sessionId,
+                viewport: { rows_above: outcome.rows, columns: outcome.columns }
+              },
+              subject
+            )
             .then(load)
             .catch(() => {
               // Nothing to say: the projection stays where it was.

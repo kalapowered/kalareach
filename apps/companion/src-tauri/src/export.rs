@@ -118,11 +118,31 @@ pub struct Asciicast {
 /// writes the system clipboard; OSC 7 and OSC 9;9 report a working directory a shell may then
 /// change to; DCS and APC carry payloads a terminal or a multiplexer executes.
 const SIDE_EFFECT_INTRODUCERS: &[(&str, &str, &str)] = &[
-    ("clipboard_write", "\u{1b}]52;", "a clipboard write recorded from the session"),
-    ("working_directory_report", "\u{1b}]7;", "a working-directory report"),
-    ("working_directory_report", "\u{1b}]9;9;", "a working-directory report"),
-    ("device_control_string", "\u{1b}P", "a device-control string"),
-    ("application_program_command", "\u{1b}_", "an application-program command"),
+    (
+        "clipboard_write",
+        "\u{1b}]52;",
+        "a clipboard write recorded from the session",
+    ),
+    (
+        "working_directory_report",
+        "\u{1b}]7;",
+        "a working-directory report",
+    ),
+    (
+        "working_directory_report",
+        "\u{1b}]9;9;",
+        "a working-directory report",
+    ),
+    (
+        "device_control_string",
+        "\u{1b}P",
+        "a device-control string",
+    ),
+    (
+        "application_program_command",
+        "\u{1b}_",
+        "an application-program command",
+    ),
 ];
 
 /// Builds an asciicast recording, dropping every sequence whose replay would act on the reader's
@@ -327,7 +347,10 @@ mod tests {
             !cast.body.contains("]52;"),
             "a clipboard write never reaches the recording"
         );
-        assert!(cast.body.contains("beforeafter"), "the text around it is kept");
+        assert!(
+            cast.body.contains("beforeafter"),
+            "the text around it is kept"
+        );
         let omission = cast
             .omissions
             .iter()
@@ -350,7 +373,10 @@ mod tests {
         )
         .expect("a valid recording");
         let body = cast.body.lines().nth(1).expect("a frame");
-        assert!(body.contains("ab"), "the payload and its terminator both go");
+        assert!(
+            body.contains("ab"),
+            "the payload and its terminator both go"
+        );
         assert!(!body.contains("544e"));
     }
 
@@ -367,7 +393,10 @@ mod tests {
             Vec::new(),
         )
         .expect("a valid recording");
-        assert!(cast.body.contains("[31m"), "rendering data is safe and is kept");
+        assert!(
+            cast.body.contains("[31m"),
+            "rendering data is safe and is kept"
+        );
         assert!(cast.body.contains("[2J"));
         assert!(cast.omissions.is_empty());
     }

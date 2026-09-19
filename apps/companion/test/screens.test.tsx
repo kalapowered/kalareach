@@ -438,3 +438,102 @@ describe('a control that commits on a completed action', () => {
     expect(commit).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('one session at a time', () => {
+  const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
+
+  it('keeps the draft when the view changes to the terminal and back', async () => {
+    const { port } = fakeHost()
+    const { rerender } = render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await userEvent.type(await screen.findByTestId('composer-input'), 'half a thought')
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.queryByTestId('composer-input')).toBeNull()
+    })
+    await userEvent.click(screen.getByRole('tab', { name: 'Conversation' }))
+
+    expect(await screen.findByTestId('composer-input')).toHaveValue('half a thought')
+    rerender(<div />)
+  })
+
+  it('does not show one session’s draft under another’s name', async () => {
+    const { port } = fakeHost()
+    render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await userEvent.type(await screen.findByTestId('composer-input'), 'for the first session')
+
+    // The same window, a different session: the tab strip is how a person moves between them.
+    await userEvent.click(screen.getByRole('button', { name: 'Sessions' }))
+    await userEvent.click(await screen.findByTestId('session-row-2'))
+
+    expect(await screen.findByTestId('composer-input')).toHaveValue('')
+  })
+
+  it('ignores an event that belongs to another session', async () => {
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('conversation')
+
+    controls.appendNode(
+      {
+        id: 'n-elsewhere',
+        revision: '1',
+        body: { kind: 'message', author: 'agent', text: 'this belongs to the build session' }
+      } as never,
+      SESSION_BUILD
+    )
+
+    await waitFor(() => {
+      expect(screen.queryByText('this belongs to the build session')).toBeNull()
+    })
+  })
+
+  it('gives the text back when the host refuses a submission', async () => {
+    const { port } = fakeHost()
+    const refusing = {
+      ...port,
+      composerSubmit: () =>
+        Promise.reject({
+          code: 'UPSTREAM_UNAVAILABLE',
+          message: 'the agent is not reachable',
+          user_action: 'wait'
+        })
+    }
+    render(
+      <AppProvider
+        port={refusing}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    const input = await screen.findByTestId('composer-input')
+    await userEvent.type(input, 'do the thing')
+    await userEvent.click(screen.getByTestId('composer-send'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-input')).toHaveValue('do the thing')
+    })
+  })
+})

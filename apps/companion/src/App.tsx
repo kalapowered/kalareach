@@ -30,7 +30,9 @@ export function App(): ReactNode {
   const [connected, setConnected] = useState(true)
 
   useEffect(() => {
-    void port.connectionState().then(setConnected)
+    void port.connectionState().then((state) => {
+      setConnected(state.connected)
+    })
     return port.subscribe((event) => {
       const body = event.body as { kind?: string; connected?: boolean }
       if (body.kind === 'connection' && typeof body.connected === 'boolean') {

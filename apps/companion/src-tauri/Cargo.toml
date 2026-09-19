@@ -24,6 +24,8 @@ tauri-build = { workspace = true, features = [] }
 kr-cbor.workspace = true
 # The shared native client: sessions, cursors, projection, drafts, controls and the upload path.
 kr-client.workspace = true
+# Where the host on this machine keeps its runtime directory and its controller endpoint.
+kr-ipc.workspace = true
 kr-protocol.workspace = true
 kr-term.workspace = true
 serde.workspace = true

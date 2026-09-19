@@ -12,8 +12,8 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import type { SessionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
-import { ENVIRONMENT_ID, useApp } from '../app/state'
-import { failureMessage } from '../host/port'
+import { useApp } from '../app/state'
+import { failureMessage, type SessionSubject } from '../host/port'
 import type { LaunchSurface } from '../model/pending'
 import { Conversation } from './Conversation'
 import { RawTerminal } from '../terminal/RawTerminal'
@@ -36,7 +36,7 @@ export function Session({
 
   const load = useCallback(() => {
     port
-      .sessionRead(ENVIRONMENT_ID, { session_id: sessionId })
+      .sessionRead({ session_id: sessionId })
       .then((result) => {
         setSession(result)
         setConnected(true)
@@ -45,7 +45,7 @@ export function Session({
         setConnected(false)
       })
     port
-      .launchSurface(ENVIRONMENT_ID, { session_id: sessionId })
+      .launchSurface({ session_id: sessionId })
       .then(setSurface)
       .catch(() => {
         // Without a verified empty prompt there is no launch surface, which is the right answer
@@ -75,6 +75,12 @@ export function Session({
 
   const summary = session?.session
   const state = summary ? describeApplicationState(summary) : null
+  // What every mutation about this session names. The epoch comes from the host's own record of
+  // the session, beside its identifier, so an action can never be aimed at a session that has been
+  // replaced since the person looked at it.
+  const subject: SessionSubject = summary
+    ? { sessionId: summary.session_id, sessionEpoch: summary.session_epoch }
+    : {}
 
   return (
     <>
@@ -160,6 +166,7 @@ export function Session({
       {pane === 'semantic' ? (
         <Conversation
           sessionId={sessionId}
+          subject={subject}
           connected={connected}
           launch={surface}
           onLaunched={load}
@@ -167,6 +174,7 @@ export function Session({
       ) : (
         <RawTerminal
           sessionId={sessionId}
+          subject={subject}
           attachmentId={`att-${sessionId}`}
           onReleaseGeometry={() => {
             go({ view: 'session', sessionId, pane: 'semantic' })
@@ -177,6 +185,7 @@ export function Session({
       <SessionSettings
         open={settingsOpen}
         sessionId={sessionId}
+        subject={subject}
         onClose={() => {
           setSettingsOpen(false)
         }}
@@ -190,7 +199,7 @@ export function Session({
         }}
         onConfirm={() => {
           port
-            .sessionClose(ENVIRONMENT_ID, { session_id: sessionId })
+            .sessionClose({ session_id: sessionId }, subject)
             .then((result) => {
               setClosing(false)
               say(
@@ -275,10 +284,12 @@ function CloseConsequence({
 function SessionSettings({
   open,
   sessionId,
+  subject,
   onClose
 }: {
   readonly open: boolean
   readonly sessionId: string
+  readonly subject: SessionSubject
   readonly onClose: () => void
 }): ReactNode {
   const { port, say } = useApp()
@@ -368,12 +379,17 @@ function SessionSettings({
                 data-testid="invite-viewer"
                 onClick={() => {
                   port
-                    .grantCreate(ENVIRONMENT_ID, {
-                      session_id: sessionId,
-                      role: 'viewer',
-                      rights: explained ? ['session.view', 'question.respond'] : ['session.view'],
-                      answering_explained: explained
-                    })
+                    .grantCreate(
+                      {
+                        session_id: sessionId,
+                        role: 'viewer',
+                        rights: explained
+                          ? ['session.view', 'question.respond']
+                          : ['session.view'],
+                        answering_explained: explained
+                      },
+                      subject
+                    )
                     .then(() => {
                       say('Invitation issued.')
                     })
@@ -402,7 +418,7 @@ function ExportPanel({ sessionId }: { readonly sessionId: string }): ReactNode {
     void port.chooseExportPath(`session-${sessionId}.json`).then((path) => {
       if (!path) return
       port
-        .agentSnapshot(ENVIRONMENT_ID, { session_id: sessionId })
+        .agentSnapshot({ session_id: sessionId })
         .then((snapshot) =>
           port.exportSemanticJson({
             path,

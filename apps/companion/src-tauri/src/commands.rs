@@ -1,116 +1,92 @@
 //! Every command the WebView may call, and nothing else.
 //!
-//! Each command names one [`Method`] in its own body. The page supplies parameters; it never
-//! supplies a method, a path or a command line. An operation with no command here cannot be
-//! reached from the page at all, which is what section 13 means by exposing only the shared
-//! client's named commands.
+//! Each command names one [`Method`] in its own body, and parses the page's parameters into that
+//! method's own Rust type before anything is sent. The page supplies values; it never supplies a
+//! method, a path or a command line, and a value it supplies that is not the shape the method
+//! takes is refused here rather than on the wire.
 //!
-//! [`NAMED_COMMANDS`] is that surface as data. The crate's tests hold it against the handler list
-//! and against the Tauri capability file, so a command added in one place and not the others fails
-//! the build rather than widening the boundary quietly.
+//! That parse is not a formality. The protocol's canonical encoding is KR-CBOR-1, where an
+//! identifier is a byte string and a counter is an unsigned integer, while the same values in the
+//! page's JSON are text. Passing the page's JSON straight through would put text on the wire where
+//! the host expects bytes. Going through the typed struct is what makes the two agree.
+//!
+//! [`NAMED_COMMANDS`] is the surface as data, and the crate's tests hold it against the handler
+//! list, so a command added in one place and not the other fails the build rather than widening
+//! the boundary quietly.
 
 use kr_protocol::method::Method;
+use serde::Serialize;
 use serde_json::Value;
 use tauri::State;
 
 use crate::error::{CommandError, Result};
 use crate::state::AppState;
+use crate::target::Subject;
 use crate::{export, links, pairing, remote, verify};
 
-/// One command, and the protocol method it names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Named {
-    /// The name the WebView invokes.
-    pub command: &'static str,
-    /// The protocol method it performs, where it performs one.
-    pub method: Option<Method>,
-}
+/// How long a mutation this application submits may stay acceptable.
+///
+/// Long enough that a person who presses a button and watches the receipt settle sees the outcome,
+/// short enough that an application closed mid-action does not leave one acceptable for an hour.
+pub const MUTATION_TTL: kr_protocol::scalars::DurationMs =
+    kr_protocol::scalars::DurationMs::new(60_000);
 
-/// The complete command surface.
-pub const NAMED_COMMANDS: &[Named] = &[
+/// The complete command surface, as a table of names and the methods they perform.
+pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
+    /// The complete command surface.
     // Hosts and environments.
-    Named { command: "host_info", method: Some(Method::HostInfo) },
-    Named { command: "environment_list", method: Some(Method::EnvironmentList) },
-    Named { command: "environment_capabilities", method: Some(Method::EnvironmentCapabilities) },
+    ("host_info", Some(Method::HostInfo)),
+    ("environment_list", Some(Method::EnvironmentList)),
     // Sessions.
-    Named { command: "session_list", method: Some(Method::SessionList) },
-    Named { command: "session_read", method: Some(Method::SessionRead) },
-    Named { command: "session_create", method: Some(Method::SessionCreate) },
-    Named { command: "session_close", method: Some(Method::SessionClose) },
-    Named { command: "session_rename", method: Some(Method::SessionRename) },
+    ("session_list", Some(Method::SessionList)),
+    ("session_read", Some(Method::SessionRead)),
+    ("session_create", Some(Method::SessionCreate)),
+    ("session_close", Some(Method::SessionClose)),
     // Attachments and the terminal view.
-    Named { command: "session_attach", method: Some(Method::SessionAttach) },
-    Named { command: "session_detach", method: Some(Method::SessionDetach) },
-    Named { command: "attachment_configure", method: Some(Method::AttachmentConfigure) },
-    Named { command: "attachment_viewport", method: Some(Method::AttachmentViewport) },
-    Named { command: "terminal_resize", method: Some(Method::TerminalResize) },
-    Named { command: "terminal_palette_set", method: Some(Method::TerminalPaletteSet) },
+    ("session_attach", Some(Method::SessionAttach)),
+    ("session_detach", Some(Method::SessionDetach)),
+    ("attachment_configure", Some(Method::AttachmentConfigure)),
+    ("attachment_viewport", Some(Method::AttachmentViewport)),
+    ("terminal_resize", Some(Method::TerminalResize)),
     // Input.
-    Named { command: "input_acquire", method: Some(Method::InputAcquire) },
-    Named { command: "input_release", method: Some(Method::InputRelease) },
-    Named { command: "input_interrupt", method: Some(Method::InputInterrupt) },
-    Named { command: "input_write", method: Some(Method::InputWrite) },
+    ("input_acquire", Some(Method::InputAcquire)),
+    ("input_release", Some(Method::InputRelease)),
+    ("input_interrupt", Some(Method::InputInterrupt)),
+    ("input_write", Some(Method::InputWrite)),
     // The launch surface.
-    Named { command: "shell_launch", method: Some(Method::ShellLaunch) },
-    // The semantic interface.
-    Named { command: "agent_capabilities", method: Some(Method::AgentCapabilities) },
-    Named { command: "agent_snapshot", method: Some(Method::AgentSnapshot) },
-    Named { command: "agent_commands", method: Some(Method::AgentCommands) },
-    Named { command: "composer_submit", method: Some(Method::AgentPromptSubmit) },
-    Named { command: "composer_queue", method: Some(Method::AgentPromptQueue) },
-    Named { command: "composer_steer", method: Some(Method::AgentTurnSteer) },
-    Named { command: "composer_interrupt", method: Some(Method::AgentTurnCancel) },
-    Named { command: "approval_respond", method: Some(Method::AgentApprovalRespond) },
-    Named { command: "plugin_action_invoke", method: Some(Method::PluginActionInvoke) },
+    ("shell_launch", Some(Method::ShellLaunch)),
     // Drafts and attachments.
-    Named { command: "draft_create", method: Some(Method::DraftCreate) },
-    Named { command: "draft_update", method: Some(Method::DraftUpdate) },
-    Named { command: "draft_add_attachment", method: Some(Method::AgentDraftAddAttachment) },
-    Named { command: "attachment_image", method: Some(Method::DownloadBegin) },
-    Named { command: "attachment_image_chunk", method: Some(Method::DownloadChunk) },
+    ("draft_create", Some(Method::DraftCreate)),
+    ("draft_update", Some(Method::DraftUpdate)),
+    (
+        "draft_add_attachment",
+        Some(Method::AgentDraftAddAttachment),
+    ),
+    ("attachment_upload_status", Some(Method::UploadStatus)),
+    ("attachment_image", Some(Method::DownloadBegin)),
+    ("attachment_image_chunk", Some(Method::DownloadChunk)),
     // Events and history.
-    Named { command: "events_subscribe", method: Some(Method::EventsSubscribe) },
-    Named { command: "events_snapshot", method: Some(Method::EventsSnapshot) },
-    Named { command: "history_page", method: Some(Method::HistoryPage) },
-    Named { command: "action_read", method: Some(Method::ActionRead) },
-    Named { command: "action_cancel", method: Some(Method::ActionCancel) },
-    // Attention and review.
-    Named { command: "attention_read", method: Some(Method::AttentionRead) },
-    Named { command: "attention_acknowledge", method: Some(Method::AttentionAcknowledge) },
-    Named { command: "review_read", method: Some(Method::ReviewRead) },
-    Named { command: "review_acknowledge", method: Some(Method::ReviewAcknowledge) },
-    // Questions, sharing and the explained invitation.
-    Named { command: "question_read", method: Some(Method::QuestionRead) },
-    Named { command: "question_answer", method: Some(Method::QuestionAnswer) },
-    Named { command: "grant_list", method: Some(Method::GrantList) },
-    Named { command: "grant_create", method: Some(Method::GrantCreate) },
-    Named { command: "grant_revoke", method: Some(Method::GrantRevoke) },
-    // Plugins: Installed, Catalogue and Repositories.
-    Named { command: "plugin_list", method: Some(Method::PluginList) },
-    Named { command: "plugin_capabilities", method: Some(Method::PluginCapabilities) },
-    Named { command: "catalogue_list", method: Some(Method::CatalogueList) },
-    Named { command: "catalogue_sync", method: Some(Method::CatalogueSync) },
-    // Change sets and diffs.
-    Named { command: "changeset_read", method: Some(Method::ChangesetRead) },
-    Named { command: "diff_read", method: Some(Method::DiffRead) },
-    // Privacy and retained artefacts.
-    Named { command: "storage_status", method: Some(Method::StorageStatus) },
-    Named { command: "storage_object_delete", method: Some(Method::StorageObjectDelete) },
+    ("events_subscribe", Some(Method::EventsSubscribe)),
+    ("events_snapshot", Some(Method::EventsSnapshot)),
+    ("history_page", Some(Method::HistoryPage)),
+    ("action_read", Some(Method::ActionRead)),
+    ("action_cancel", Some(Method::ActionCancel)),
+    // Questions.
+    ("question_read", Some(Method::QuestionRead)),
+    ("question_answer", Some(Method::QuestionAnswer)),
     // Pairing.
-    Named { command: "pairing_origin", method: None },
-    Named { command: "pairing_set_origin", method: None },
-    Named { command: "pairing_scan", method: None },
-    Named { command: "pairing_verify_owner", method: None },
-    Named { command: "pair_invite", method: Some(Method::PairInvite) },
-    Named { command: "pair_confirm", method: Some(Method::PairConfirm) },
-    Named { command: "pair_cancel", method: Some(Method::PairCancel) },
-    Named { command: "pair_status", method: Some(Method::PairStatus) },
+    ("pairing_origin", None),
+    ("pairing_set_origin", None),
+    ("pairing_scan", None),
+    ("pairing_verify_owner", None),
+    ("pair_status", Some(Method::PairStatus)),
     // The application's own boundary.
-    Named { command: "open_external", method: None },
-    Named { command: "import_remote_image", method: None },
-    Named { command: "export_semantic_json", method: None },
-    Named { command: "export_asciicast", method: None },
-    Named { command: "connection_state", method: None },
+    ("open_external", None),
+    ("import_remote_image", None),
+    ("choose_export_destination", None),
+    ("export_semantic_json", None),
+    ("export_asciicast", None),
+    ("connection_state", None),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -121,35 +97,24 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
     tauri::generate_handler![
         host_info,
         environment_list,
-        environment_capabilities,
         session_list,
         session_read,
         session_create,
         session_close,
-        session_rename,
         session_attach,
         session_detach,
         attachment_configure,
         attachment_viewport,
         terminal_resize,
-        terminal_palette_set,
         input_acquire,
         input_release,
         input_interrupt,
         input_write,
         shell_launch,
-        agent_capabilities,
-        agent_snapshot,
-        agent_commands,
-        composer_submit,
-        composer_queue,
-        composer_steer,
-        composer_interrupt,
-        approval_respond,
-        plugin_action_invoke,
         draft_create,
         draft_update,
         draft_add_attachment,
+        attachment_upload_status,
         attachment_image,
         attachment_image_chunk,
         events_subscribe,
@@ -157,304 +122,282 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         history_page,
         action_read,
         action_cancel,
-        attention_read,
-        attention_acknowledge,
-        review_read,
-        review_acknowledge,
         question_read,
         question_answer,
-        grant_list,
-        grant_create,
-        grant_revoke,
-        plugin_list,
-        plugin_capabilities,
-        catalogue_list,
-        catalogue_sync,
-        changeset_read,
-        diff_read,
-        storage_status,
-        storage_object_delete,
         pairing_origin,
         pairing_set_origin,
         pairing_scan,
         pairing_verify_owner,
-        pair_invite,
-        pair_confirm,
-        pair_cancel,
         pair_status,
         open_external,
         import_remote_image,
+        choose_export_destination,
         export_semantic_json,
         export_asciicast,
         connection_state,
     ]
 }
 
-/// Performs one method through the current host link.
-async fn perform(
-    state: &AppState,
-    method: Method,
-    environment_id: &str,
-    params: Value,
-) -> Result<Value> {
-    let target = crate::link::environment_target(environment_id)?;
-    state.link().call(method, target, params).await
+/// A method that takes no parameters.
+///
+/// Serialised as the empty map the protocol's request shape expects, rather than as a null.
+#[derive(Debug, Serialize)]
+struct NoParams {}
+
+/// The subject preconditions this application states.
+///
+/// None, deliberately. Every precondition this client relies on is one the method carries itself:
+/// the prompt generation and buffer revision on a launch, the revision on a draft update, the
+/// declared size and digest on an upload. A second copy in a separate map would be a second place
+/// for them to disagree.
+#[derive(Debug, Serialize)]
+struct NoPreconditions {}
+
+/// Parses the page's parameters into the method's own type.
+fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T> {
+    serde_json::from_value(params).map_err(|error| {
+        CommandError::invalid(format!(
+            "those are not this operation's parameters: {error}"
+        ))
+    })
 }
 
-/// Declares one command that performs one method and nothing else.
-macro_rules! protocol_command {
-    ($(#[$meta:meta])* $name:ident, $method:expr) => {
+/// Turns a method's result back into what the page reads.
+fn encode<T: Serialize>(value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| {
+        CommandError::local_failure(format!("the result could not be read: {error}"))
+    })
+}
+
+/// What a mutation answered with: the receipt, and the method's own result when there was one.
+///
+/// Section 9 makes the receipt the outcome, so it travels beside the value rather than being
+/// replaced by it. An interface that shows "applied" shows it because a receipt said so.
+#[derive(Debug, Serialize)]
+pub struct Settled {
+    /// The receipt, when the host answered with one.
+    pub receipt: Option<kr_protocol::receipt::Receipt>,
+    /// The method's own result, when the host answered with one.
+    pub value: Option<Value>,
+    /// The action identifier, which exists from the moment the request is submitted.
+    pub action_id: Option<String>,
+}
+
+fn settled(answer: &kr_client::Settled) -> Result<Settled> {
+    Ok(match answer {
+        kr_client::Settled::Receipt(receipt) => Settled {
+            action_id: Some(receipt.action_id.to_string()),
+            receipt: Some((**receipt).clone()),
+            value: None,
+        },
+        kr_client::Settled::Result(value) => Settled {
+            receipt: None,
+            value: Some(encode(value)?),
+            action_id: None,
+        },
+    })
+}
+
+/// Declares a command that performs one read and nothing else.
+macro_rules! read_command {
+    ($(#[$meta:meta])* $name:ident, $method:expr, () => $result:ty) => {
         $(#[$meta])*
         #[tauri::command]
-        pub async fn $name(
-            state: State<'_, AppState>,
-            environment_id: String,
-            params: Value,
-        ) -> Result<Value> {
-            perform(&state, $method, &environment_id, params).await
+        pub async fn $name(state: State<'_, AppState>) -> Result<Value> {
+            let session = state.session()?;
+            let answer: $result = session.read($method, &NoParams {}).await?;
+            encode(&answer)
+        }
+    };
+    ($(#[$meta:meta])* $name:ident, $method:expr, $params:ty => $result:ty) => {
+        $(#[$meta])*
+        #[tauri::command]
+        pub async fn $name(state: State<'_, AppState>, params: Value) -> Result<Value> {
+            let typed: $params = decode(params)?;
+            let session = state.session()?;
+            let answer: $result = session.read($method, &typed).await?;
+            encode(&answer)
         }
     };
 }
 
-protocol_command!(
+/// Declares a command that performs one mutation and nothing else.
+macro_rules! mutate_command {
+    ($(#[$meta:meta])* $name:ident, $method:expr, $params:ty) => {
+        $(#[$meta])*
+        #[tauri::command]
+        pub async fn $name(
+            state: State<'_, AppState>,
+            subject: Subject,
+            params: Value,
+        ) -> Result<Settled> {
+            let typed: $params = decode(params)?;
+            let target = subject.target(state.environment_id()?)?;
+            let session = state.session()?;
+            let answer = session
+                .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
+                .await;
+            match answer {
+                Ok(value) => settled(&value),
+                // A submission whose outcome the host never confirmed still has an identity, and
+                // the interface needs it: that is the action it asks about rather than resubmits.
+                Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
+                    receipt: None,
+                    value: None,
+                    action_id: Some(action_id.to_string()),
+                }),
+                Err(error) => Err(CommandError::from(error)),
+            }
+        }
+    };
+}
+
+read_command!(
     /// Reads what the host is.
-    host_info, Method::HostInfo
+    host_info, Method::HostInfo, () => kr_protocol::hostinfo::HostInfoResult
 );
-protocol_command!(
+read_command!(
     /// Lists the host's execution environments.
-    environment_list, Method::EnvironmentList
+    environment_list, Method::EnvironmentList, () => kr_protocol::hostinfo::EnvironmentListResult
 );
-protocol_command!(
-    /// Reads one environment's capabilities, including desktop readiness.
-    environment_capabilities, Method::EnvironmentCapabilities
-);
-protocol_command!(
+read_command!(
     /// Lists the sessions a row is drawn for.
-    session_list, Method::SessionList
+    session_list, Method::SessionList,
+    kr_protocol::session::SessionListParams => kr_protocol::session::SessionListResult
 );
-protocol_command!(
+read_command!(
     /// Reads one session.
-    session_read, Method::SessionRead
+    session_read, Method::SessionRead,
+    kr_protocol::session::SessionReadParams => kr_protocol::session::SessionReadResult
 );
-protocol_command!(
+read_command!(
+    /// Reads the agent's questions.
+    question_read, Method::QuestionRead,
+    kr_protocol::question::QuestionReadParams => kr_protocol::question::QuestionReadResult
+);
+read_command!(
+    /// Reads what became of one action.
+    action_read, Method::ActionRead,
+    kr_protocol::receipt::ActionReadParams => kr_protocol::receipt::ActionReadResult
+);
+read_command!(
+    /// Subscribes to a stream from the cursor this client holds.
+    events_subscribe, Method::EventsSubscribe,
+    kr_protocol::recovery::EventsSubscribeParams => kr_protocol::recovery::EventsSubscribeResult
+);
+read_command!(
+    /// Takes a session's snapshot at the cursor the subscription began from.
+    events_snapshot, Method::EventsSnapshot,
+    kr_protocol::recovery::EventsSnapshotParams => kr_protocol::recovery::EventsSnapshotResult
+);
+read_command!(
+    /// Reads one page of retained history above the live screen.
+    history_page, Method::HistoryPage,
+    kr_protocol::recovery::HistoryPageParams => kr_protocol::recovery::HistoryPageResult
+);
+read_command!(
+    /// Reads a pairing attempt's state.
+    pair_status, Method::PairStatus,
+    kr_protocol::preauth::PairStatusParams => kr_protocol::preauth::PairStatusResult
+);
+read_command!(
+    /// Reads how much of an upload the host already holds.
+    attachment_upload_status, Method::UploadStatus,
+    kr_protocol::transfer::UploadStatusParams => kr_protocol::transfer::UploadStatusResult
+);
+
+mutate_command!(
     /// Creates a session.
-    session_create, Method::SessionCreate
+    session_create, Method::SessionCreate, kr_protocol::session::SessionCreateParams
 );
-protocol_command!(
+mutate_command!(
     /// Closes a session, after the interface has shown what closing does.
-    session_close, Method::SessionClose
+    session_close, Method::SessionClose, kr_protocol::session::SessionCloseParams
 );
-protocol_command!(
-    /// Renames a session.
-    session_rename, Method::SessionRename
-);
-protocol_command!(
+mutate_command!(
     /// Attaches a view to a session.
-    session_attach, Method::SessionAttach
+    session_attach, Method::SessionAttach, kr_protocol::attachment::SessionAttachParams
 );
-protocol_command!(
+mutate_command!(
     /// Detaches a view.
-    session_detach, Method::SessionDetach
+    session_detach, Method::SessionDetach, kr_protocol::attachment::SessionDetachParams
 );
-protocol_command!(
+mutate_command!(
     /// Configures what an attachment observes.
-    attachment_configure, Method::AttachmentConfigure
+    attachment_configure, Method::AttachmentConfigure,
+    kr_protocol::attachment::AttachmentConfigureParams
 );
-protocol_command!(
+mutate_command!(
     /// Reports this view's viewport position and dimensions.
-    attachment_viewport, Method::AttachmentViewport
+    attachment_viewport, Method::AttachmentViewport,
+    kr_protocol::attachment::AttachmentViewportParams
 );
-protocol_command!(
+mutate_command!(
     /// Asks for a terminal size.
-    terminal_resize, Method::TerminalResize
+    terminal_resize, Method::TerminalResize, kr_protocol::attachment::TerminalResizeParams
 );
-protocol_command!(
-    /// Sets the palette a session was created with.
-    terminal_palette_set, Method::TerminalPaletteSet
-);
-protocol_command!(
+mutate_command!(
     /// Takes the input lease.
-    input_acquire, Method::InputAcquire
+    input_acquire, Method::InputAcquire, kr_protocol::input::InputAcquireParams
 );
-protocol_command!(
+mutate_command!(
     /// Releases the input lease.
-    input_release, Method::InputRelease
+    input_release, Method::InputRelease, kr_protocol::input::InputReleaseParams
 );
-protocol_command!(
+mutate_command!(
     /// Interrupts the foreground application.
-    input_interrupt, Method::InputInterrupt
+    input_interrupt, Method::InputInterrupt, kr_protocol::input::InputInterruptParams
 );
-protocol_command!(
-    /// Writes one ordered batch of raw terminal input.
-    input_write, Method::InputWrite
-);
-protocol_command!(
+mutate_command!(
     /// Launches an installed profile or a named command at a verified empty prompt.
-    shell_launch, Method::ShellLaunch
+    shell_launch, Method::ShellLaunch, kr_protocol::root::ShellLaunchParams
 );
-protocol_command!(
-    /// Reads what the bound agent supports.
-    agent_capabilities, Method::AgentCapabilities
-);
-protocol_command!(
-    /// Reads the agent's current semantic snapshot.
-    agent_snapshot, Method::AgentSnapshot
-);
-protocol_command!(
-    /// Reads the agent's slash commands.
-    agent_commands, Method::AgentCommands
-);
-protocol_command!(
-    /// Submits the draft as a prompt.
-    composer_submit, Method::AgentPromptSubmit
-);
-protocol_command!(
-    /// Queues a prompt behind the current turn.
-    composer_queue, Method::AgentPromptQueue
-);
-protocol_command!(
-    /// Steers the running turn.
-    composer_steer, Method::AgentTurnSteer
-);
-protocol_command!(
-    /// Cancels the running turn.
-    composer_interrupt, Method::AgentTurnCancel
-);
-protocol_command!(
-    /// Answers an approval request.
-    approval_respond, Method::AgentApprovalRespond
-);
-protocol_command!(
-    /// Invokes one declarative control's registered action.
-    plugin_action_invoke, Method::PluginActionInvoke
-);
-protocol_command!(
+mutate_command!(
     /// Creates a draft on the host.
-    draft_create, Method::DraftCreate
+    draft_create, Method::DraftCreate, kr_protocol::transfer::DraftCreateParams
 );
-protocol_command!(
+mutate_command!(
     /// Updates a draft on the host.
-    draft_update, Method::DraftUpdate
+    draft_update, Method::DraftUpdate, kr_protocol::transfer::DraftUpdateParams
 );
-protocol_command!(
+mutate_command!(
     /// Adds a completed attachment handle to a draft.
-    draft_add_attachment, Method::AgentDraftAddAttachment
+    draft_add_attachment, Method::AgentDraftAddAttachment,
+    kr_protocol::transfer::AgentDraftAddAttachmentParams
 );
-protocol_command!(
+mutate_command!(
     /// Begins reading an image through its validated attachment handle.
     ///
-    /// This is the only way an image reaches the page. A renderer that followed a URL out of agent
-    /// text would be fetching whatever that text named; a handle names bytes the host verified.
-    attachment_image, Method::DownloadBegin
+    /// This is the only way an image from a session reaches the page. A renderer that followed a
+    /// URL out of agent text would be fetching whatever that text named; a handle names bytes the
+    /// host verified.
+    attachment_image, Method::DownloadBegin, kr_protocol::transfer::DownloadBeginParams
 );
-protocol_command!(
+mutate_command!(
     /// Reads one chunk of an image the handle named.
-    attachment_image_chunk, Method::DownloadChunk
+    attachment_image_chunk, Method::DownloadChunk, kr_protocol::transfer::DownloadChunkParams
 );
-protocol_command!(
-    /// Subscribes to a stream from the cursor this client holds.
-    events_subscribe, Method::EventsSubscribe
-);
-protocol_command!(
-    /// Takes a session's snapshot at the cursor the subscription began from.
-    events_snapshot, Method::EventsSnapshot
-);
-protocol_command!(
-    /// Reads one page of retained history above the live screen.
-    history_page, Method::HistoryPage
-);
-protocol_command!(
-    /// Reads what became of one action.
-    action_read, Method::ActionRead
-);
-protocol_command!(
-    /// Cancels a pending action.
-    action_cancel, Method::ActionCancel
-);
-protocol_command!(
-    /// Reads the attention inbox.
-    attention_read, Method::AttentionRead
-);
-protocol_command!(
-    /// Acknowledges one attention entry.
-    attention_acknowledge, Method::AttentionAcknowledge
-);
-protocol_command!(
-    /// Reads completed work awaiting review.
-    review_read, Method::ReviewRead
-);
-protocol_command!(
-    /// Marks reviewed work as seen.
-    review_acknowledge, Method::ReviewAcknowledge
-);
-protocol_command!(
-    /// Reads a pending question.
-    question_read, Method::QuestionRead
-);
-protocol_command!(
+mutate_command!(
     /// Answers a question.
-    question_answer, Method::QuestionAnswer
+    question_answer, Method::QuestionAnswer, kr_protocol::question::QuestionAnswerParams
 );
-protocol_command!(
-    /// Lists the grants a session has issued.
-    grant_list, Method::GrantList
+mutate_command!(
+    /// Cancels a pending action.
+    action_cancel, Method::ActionCancel, kr_protocol::receipt::ActionCancelParams
 );
-protocol_command!(
-    /// Issues a grant, including the explained answering option a viewer or reviewer needs.
-    grant_create, Method::GrantCreate
-);
-protocol_command!(
-    /// Revokes a grant.
-    grant_revoke, Method::GrantRevoke
-);
-protocol_command!(
-    /// Lists installed packages.
-    plugin_list, Method::PluginList
-);
-protocol_command!(
-    /// Reads one package's capability evidence.
-    plugin_capabilities, Method::PluginCapabilities
-);
-protocol_command!(
-    /// Lists enrolled repositories and their catalogue state.
-    catalogue_list, Method::CatalogueList
-);
-protocol_command!(
-    /// Synchronises one repository's signed catalogue metadata.
-    catalogue_sync, Method::CatalogueSync
-);
-protocol_command!(
-    /// Reads one immutable change set.
-    changeset_read, Method::ChangesetRead
-);
-protocol_command!(
-    /// Reads a diff.
-    diff_read, Method::DiffRead
-);
-protocol_command!(
-    /// Reads what this host retains, including artefacts a privacy generation left behind.
-    storage_status, Method::StorageStatus
-);
-protocol_command!(
-    /// Deletes one retained artefact, as a separately authorised action.
-    storage_object_delete, Method::StorageObjectDelete
-);
-protocol_command!(
-    /// Issues a pairing invitation.
-    pair_invite, Method::PairInvite
-);
-protocol_command!(
-    /// Confirms a candidate the owner approved.
-    pair_confirm, Method::PairConfirm
-);
-protocol_command!(
-    /// Cancels an invitation.
-    pair_cancel, Method::PairCancel
-);
-protocol_command!(
-    /// Reads a pairing attempt's state.
-    pair_status, Method::PairStatus
-);
+
+/// Writes one ordered batch of raw terminal input.
+///
+/// Raw input is the one write that is not a mutation: section 9 makes it an ordered stream keyed
+/// by connection, lease epoch and sequence, with no action identifier and no receipt. It has its
+/// own command for that reason.
+#[tauri::command]
+pub async fn input_write(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: kr_protocol::input::InputWriteParams = decode(params)?;
+    let session = state.session()?;
+    let answer = session.write_input(&typed).await?;
+    encode(&answer)
+}
 
 /// The rendezvous origin this device is configured with.
 ///
@@ -481,9 +424,16 @@ pub fn pairing_scan(state: State<'_, AppState>, payload: String) -> Result<pairi
 }
 
 /// Runs the platform's user-verification ceremony on this device.
+///
+/// The ceremony is the platform's own window and a person may take a while over it, so it runs on
+/// a blocking worker rather than holding a command thread.
 #[tauri::command]
-pub fn pairing_verify_owner(reason: String) -> Result<verify::Presence> {
-    verify::verify_owner_presence(&reason)
+pub async fn pairing_verify_owner(reason: String) -> Result<verify::Presence> {
+    tauri::async_runtime::spawn_blocking(move || verify::verify_owner_presence(&reason))
+        .await
+        .map_err(|error| {
+            CommandError::local_failure(format!("the ceremony did not finish: {error}"))
+        })?
 }
 
 /// Opens an external link, after checking its scheme.
@@ -499,7 +449,7 @@ pub async fn open_external(app: tauri::AppHandle, url: String) -> Result<links::
 }
 
 /// What the WebView receives for an explicitly imported image.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ImportedImage {
     /// The URL that was fetched.
     pub url: String,
@@ -515,12 +465,14 @@ pub struct ImportedImage {
 /// action; this runs when the action does.
 #[tauri::command]
 pub async fn import_remote_image(url: String) -> Result<ImportedImage> {
-    let fetcher = remote::HttpsFetcher::new();
-    let imported = tokio::task::spawn_blocking(move || remote::import(&url, &fetcher))
-        .await
-        .map_err(|error| {
-            CommandError::local_failure(format!("the import task did not finish: {error}"))
-        })??;
+    let imported = tauri::async_runtime::spawn_blocking(move || {
+        let fetcher = remote::HttpsFetcher::new();
+        remote::import(&url, &fetcher)
+    })
+    .await
+    .map_err(|error| {
+        CommandError::local_failure(format!("the import did not finish: {error}"))
+    })??;
     Ok(ImportedImage {
         url: imported.url,
         media_type: imported.media_type,
@@ -528,8 +480,56 @@ pub async fn import_remote_image(url: String) -> Result<ImportedImage> {
     })
 }
 
+/// Asks the person where an export should go.
+///
+/// The platform's own dialog answers, and the answer is remembered for exactly one write. The page
+/// never names a path: it passes back what this returned, and a path this did not return is
+/// refused.
+#[tauri::command]
+pub async fn choose_export_destination(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    suggested_name: String,
+) -> Result<Option<String>> {
+    use tauri_plugin_dialog::DialogExt as _;
+
+    let name = safe_file_name(&suggested_name)?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&name)
+        .save_file(move |path| {
+            let _ = sender.send(path);
+        });
+    let chosen = receiver
+        .await
+        .map_err(|_| CommandError::local_failure("the save dialog did not answer"))?;
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|error| {
+        CommandError::invalid(format!("that destination is not a path: {error}"))
+    })?;
+    let shown = path.to_string_lossy().into_owned();
+    state.allow_export_to(path);
+    Ok(Some(shown))
+}
+
+/// A suggested filename, with everything that is not part of a filename removed.
+fn safe_file_name(suggested: &str) -> Result<String> {
+    let name: String = suggested
+        .chars()
+        .filter(|character| !character.is_control() && !matches!(character, '/' | '\\' | ':'))
+        .collect();
+    let name = name.trim_matches(['.', ' ']).to_owned();
+    if name.is_empty() || name.len() > 200 {
+        return Err(CommandError::invalid("that is not a filename"));
+    }
+    Ok(name)
+}
+
 /// What an export wrote.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Written {
     /// The destination the person chose.
     pub path: String,
@@ -539,9 +539,10 @@ pub struct Written {
     pub omissions: Vec<export::Omission>,
 }
 
-/// Writes a session's semantic archive to a file the person chose.
+/// Writes a session's semantic archive to the file the person chose.
 #[tauri::command]
 pub async fn export_semantic_json(
+    state: State<'_, AppState>,
     path: String,
     session_id: String,
     exported_at_ms: u64,
@@ -549,17 +550,13 @@ pub async fn export_semantic_json(
     nodes: Vec<export::ArchivedNode>,
     omissions: Vec<export::Omission>,
 ) -> Result<Written> {
-    let archive = export::semantic_archive(
-        &session_id,
-        exported_at_ms,
-        dimensions,
-        nodes,
-        omissions.clone(),
-    )?;
+    let destination = state.take_export_destination(std::path::Path::new(&path))?;
+    let archive =
+        export::semantic_archive(&session_id, exported_at_ms, dimensions, nodes, omissions)?;
     let body = serde_json::to_vec_pretty(&archive).map_err(|error| {
         CommandError::local_failure(format!("the archive could not be written: {error}"))
     })?;
-    write_chosen_file(&path, &body).await?;
+    write_chosen_file(destination, &body).await?;
     Ok(Written {
         path,
         byte_len: body.len() as u64,
@@ -567,9 +564,10 @@ pub async fn export_semantic_json(
     })
 }
 
-/// Writes a session's terminal recording to a file the person chose.
+/// Writes a session's terminal recording to the file the person chose.
 #[tauri::command]
 pub async fn export_asciicast(
+    state: State<'_, AppState>,
     path: String,
     title: String,
     started_at_unix_seconds: u64,
@@ -577,6 +575,7 @@ pub async fn export_asciicast(
     frames: Vec<RecordedFrame>,
     omissions: Vec<export::Omission>,
 ) -> Result<Written> {
+    let destination = state.take_export_destination(std::path::Path::new(&path))?;
     let frames: Vec<export::Frame> = frames
         .into_iter()
         .map(|frame| export::Frame {
@@ -591,7 +590,7 @@ pub async fn export_asciicast(
         &frames,
         omissions,
     )?;
-    write_chosen_file(&path, cast.body.as_bytes()).await?;
+    write_chosen_file(destination, cast.body.as_bytes()).await?;
     Ok(Written {
         path,
         byte_len: cast.body.len() as u64,
@@ -601,6 +600,7 @@ pub async fn export_asciicast(
 
 /// One recorded slice of terminal output, as the page hands it over.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordedFrame {
     /// Milliseconds since the recording began.
     pub at_ms: u64,
@@ -608,32 +608,23 @@ pub struct RecordedFrame {
     pub text: String,
 }
 
-/// Writes one file at a destination the platform's save dialog returned.
-///
-/// The page never names a path of its own: the dialog plugin returns the destination and the page
-/// passes it straight back, so this writes where the person pointed and nowhere else.
-async fn write_chosen_file(path: &str, body: &[u8]) -> Result<()> {
-    let path = std::path::PathBuf::from(path);
-    if !path.is_absolute() {
-        return Err(CommandError::invalid(
-            "an export is written to the destination the save dialog returned",
-        ));
-    }
+/// Writes one file at the destination the platform's save dialog returned.
+async fn write_chosen_file(path: std::path::PathBuf, body: &[u8]) -> Result<()> {
     let body = body.to_vec();
-    tokio::task::spawn_blocking(move || std::fs::write(&path, &body))
+    tauri::async_runtime::spawn_blocking(move || std::fs::write(&path, &body))
         .await
         .map_err(|error| {
-            CommandError::local_failure(format!("the export task did not finish: {error}"))
+            CommandError::local_failure(format!("the export did not finish: {error}"))
         })?
         .map_err(|error| {
             CommandError::local_failure(format!("the export could not be written: {error}"))
         })
 }
 
-/// Whether this application currently holds a host connection.
+/// Whether this application holds a host connection, and why not when it does not.
 #[tauri::command]
-pub fn connection_state(state: State<'_, AppState>) -> bool {
-    state.link().connected()
+pub fn connection_state(state: State<'_, AppState>) -> crate::connection::ConnectionState {
+    state.connection_state()
 }
 
 #[cfg(test)]
@@ -644,12 +635,8 @@ mod tests {
     #[test]
     fn every_named_command_is_unique() {
         let mut seen = BTreeSet::new();
-        for named in NAMED_COMMANDS {
-            assert!(
-                seen.insert(named.command),
-                "{} is registered twice",
-                named.command
-            );
+        for (command, _) in NAMED_COMMANDS {
+            assert!(seen.insert(command), "{command} is registered twice");
         }
     }
 
@@ -659,10 +646,11 @@ mod tests {
         // commands name. This is the sentence the boundary rests on, written as a test.
         let reachable: BTreeSet<&str> = NAMED_COMMANDS
             .iter()
-            .filter_map(|named| named.method.map(Method::as_str))
+            .filter_map(|(_, method)| method.map(Method::as_str))
             .collect();
         for forbidden in [
             "session.describe",
+            "session.rename",
             "project.clone",
             "workflow.run",
             "voice.start",
@@ -671,7 +659,13 @@ mod tests {
             "plugin.grant",
             "owner.confirmation.complete",
             "storage.upload.create",
+            "storage.object.delete",
             "authority.sync",
+            "grant.create",
+            "pair.invite",
+            "pair.confirm",
+            "terminal.geometry.transfer",
+            "root.editor.enter",
         ] {
             assert!(
                 !reachable.contains(forbidden),
@@ -682,12 +676,11 @@ mod tests {
 
     #[test]
     fn no_command_names_a_method_the_registry_does_not_hold() {
-        for named in NAMED_COMMANDS {
-            if let Some(method) = named.method {
+        for (command, method) in NAMED_COMMANDS {
+            if let Some(method) = method {
                 assert!(
-                    Method::ALL.contains(&method),
-                    "{} names a method outside the registry",
-                    named.command
+                    Method::ALL.contains(method),
+                    "{command} names a method outside the registry"
                 );
             }
         }
@@ -697,12 +690,13 @@ mod tests {
     fn the_commands_that_perform_no_method_are_the_applications_own() {
         let local: BTreeSet<&str> = NAMED_COMMANDS
             .iter()
-            .filter(|named| named.method.is_none())
-            .map(|named| named.command)
+            .filter(|(_, method)| method.is_none())
+            .map(|(command, _)| *command)
             .collect();
         assert_eq!(
             local,
             BTreeSet::from([
+                "choose_export_destination",
                 "connection_state",
                 "export_asciicast",
                 "export_semantic_json",
@@ -713,6 +707,42 @@ mod tests {
                 "pairing_set_origin",
                 "pairing_verify_owner",
             ])
+        );
+    }
+
+    #[test]
+    fn a_suggested_filename_cannot_carry_a_path() {
+        assert_eq!(
+            safe_file_name("../../etc/passwd").expect("a filename"),
+            "etcpasswd",
+            "a suggestion is a name, and separators and leading dots are not part of one"
+        );
+        assert_eq!(
+            safe_file_name("session-1.json").expect("a filename"),
+            "session-1.json"
+        );
+        assert!(safe_file_name("").is_err());
+        assert!(safe_file_name("...").is_err());
+        assert!(safe_file_name(&"a".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
+        let refusal: Result<kr_protocol::session::SessionReadParams> =
+            decode(serde_json::json!({ "session_id": "the one I was looking at" }));
+        let error = refusal.expect_err("that is not a session identifier");
+        assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn a_parameter_map_with_an_unknown_field_is_refused() {
+        let refusal: Result<kr_protocol::session::SessionReadParams> = decode(serde_json::json!({
+            "session_id": "44444444-4444-4444-8444-444444444444",
+            "and_also": "run this"
+        }));
+        assert!(
+            refusal.is_err(),
+            "a closed schema refuses what it does not name"
         );
     }
 }

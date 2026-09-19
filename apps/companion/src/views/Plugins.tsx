@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import { Badge, Banner, Button, Card, Segmented } from '../components/ui'
-import { ENVIRONMENT_ID, useApp } from '../app/state'
+import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
 import type { PackageViews } from '../model/pending'
 
@@ -25,7 +25,7 @@ export function Plugins(): ReactNode {
 
   const load = useCallback(() => {
     port
-      .pluginList(ENVIRONMENT_ID, {})
+      .pluginList({})
       .then((result) => {
         setViews(result as PackageViews)
         setFailure(null)

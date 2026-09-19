@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
-import { ENVIRONMENT_ID, useApp } from '../app/state'
+import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
 import type { ChangeSets as ChangeSetList, RetainedArtefacts } from '../model/pending'
 
@@ -22,7 +22,7 @@ export function ChangeSets(): ReactNode {
   const [selected, setSelected] = useState<string | null>(null)
 
   const load = useCallback(() => {
-    Promise.all([port.changesetRead(ENVIRONMENT_ID, {}), port.storageStatus(ENVIRONMENT_ID, {})])
+    Promise.all([port.changesetRead({}), port.storageStatus({})])
       .then(([changes, storage]) => {
         setSets(changes as ChangeSetList)
         setRetained(storage as RetainedArtefacts)
@@ -163,7 +163,7 @@ export function ChangeSets(): ReactNode {
                     data-testid={`delete-${artefact.object_id}`}
                     onCommit={() => {
                       port
-                        .storageObjectDelete(ENVIRONMENT_ID, { object_id: artefact.object_id })
+                        .storageObjectDelete({ object_id: artefact.object_id }, {})
                         .then(() => {
                           say('Deleted. This removes the record, not the physical bytes.')
                           load()

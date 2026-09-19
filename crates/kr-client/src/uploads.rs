@@ -23,14 +23,13 @@
 //!   └── status ┴── a lost reply resumes from the bitmap ────┘
 //! ```
 
-
 use kr_protocol::ids::{DeviceId, EnvironmentId, SessionId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
 use kr_protocol::transfer::{
     AttachmentHandle, ChunkBitmap, ChunkDescriptor, ChunkLayout, UploadBeginParams,
-    UploadBeginResult, UploadChunkParams, UploadChunkResult, UploadFinishParams, UploadFinishResult,
-    UploadStatusResult,
+    UploadBeginResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
+    UploadFinishResult, UploadStatusResult,
 };
 
 use crate::error::{ClientError, Result};
@@ -85,9 +84,13 @@ impl Content for Held {
 
     fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let start = usize::try_from(offset).map_err(|_| out_of_range())?;
-        let end = start.checked_add(usize::try_from(len).map_err(|_| out_of_range())?)
+        let end = start
+            .checked_add(usize::try_from(len).map_err(|_| out_of_range())?)
             .ok_or_else(out_of_range)?;
-        self.bytes.get(start..end).map(<[u8]>::to_vec).ok_or_else(out_of_range)
+        self.bytes
+            .get(start..end)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(out_of_range)
     }
 }
 
@@ -212,7 +215,11 @@ impl Upload {
     pub fn progress(&self) -> f64 {
         let total = self.layout.chunk_count.get();
         if total == 0 {
-            return if self.phase == Phase::Reserving { 0.0 } else { 1.0 };
+            return if self.phase == Phase::Reserving {
+                0.0
+            } else {
+                1.0
+            };
         }
         self.acknowledged_chunks() as f64 / total as f64
     }
@@ -226,8 +233,14 @@ impl Upload {
         match self.phase {
             Phase::Reserving => Ok(Step::Begin(Box::new(UploadBeginParams {
                 environment_id: self.subject.environment_id,
-                session_id: self.subject.session_id.map_or(Nullable::null(), Nullable::some),
-                device_id: self.subject.device_id.map_or(Nullable::null(), Nullable::some),
+                session_id: self
+                    .subject
+                    .session_id
+                    .map_or(Nullable::null(), Nullable::some),
+                device_id: self
+                    .subject
+                    .device_id
+                    .map_or(Nullable::null(), Nullable::some),
                 declared_byte_len: U64::new(self.content.byte_len()),
                 declared_digest: self.content.digest(),
                 declared_media_type: self.subject.declared_media_type.clone(),
@@ -246,7 +259,9 @@ impl Upload {
                         "the upload is sending chunks with none missing",
                     ))
                 })?;
-                Ok(Step::Chunk(Box::new(self.chunk_params(transfer_id, index)?)))
+                Ok(Step::Chunk(Box::new(
+                    self.chunk_params(transfer_id, index)?,
+                )))
             }
             Phase::Publishing => {
                 let transfer_id = self.transfer_id.clone().ok_or_else(|| {
@@ -420,7 +435,9 @@ mod tests {
 
     fn transfer_id() -> kr_protocol::ids::TransferId {
         kr_protocol::ids::TransferId::new(
-            "11111111-1111-4111-8111-111111111111".parse().expect("a uuid"),
+            "11111111-1111-4111-8111-111111111111"
+                .parse()
+                .expect("a uuid"),
         )
     }
 
@@ -569,7 +586,9 @@ mod tests {
         upload.accept(answer).expect("the reservation folds in");
 
         let other = kr_protocol::ids::TransferId::new(
-            "22222222-2222-4222-8222-222222222222".parse().expect("a uuid"),
+            "22222222-2222-4222-8222-222222222222"
+                .parse()
+                .expect("a uuid"),
         );
         let refusal = upload.accept(Answer::Chunked(Box::new(UploadChunkResult {
             transfer_id: other,
@@ -578,7 +597,10 @@ mod tests {
             received_chunks: empty.encode(),
             received_byte_len: U64::new(0),
         })));
-        assert!(refusal.is_err(), "another transfer's answer is not this upload's");
+        assert!(
+            refusal.is_err(),
+            "another transfer's answer is not this upload's"
+        );
     }
 
     #[test]
