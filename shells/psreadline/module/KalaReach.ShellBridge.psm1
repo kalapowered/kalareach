@@ -97,6 +97,15 @@ function Test-KrQualifiedEditor {
             Detail = "PSReadLine $version is outside $($script:QualifiedFrom) to $($script:QualifiedBefore)"
         }
     }
+    if (-not (Test-KrQueueReadable)) {
+        # A fence rests on the reader's own queue, and a build that does not keep one where this
+        # package was qualified to find it cannot prove one.
+        return @{
+            Ok     = $false
+            Reason = 'psreadline_queue_unreadable'
+            Detail = "PSReadLine $version keeps no reader queue this package can read"
+        }
+    }
     @{ Ok = $true; Reason = ''; Detail = '' }
 }
 
@@ -165,6 +174,7 @@ function Initialize-KalaReachBridge {
     }
     $script:Kr.Registered = $true
     $script:Kr.Managed = $true
+    Write-KrTrace 'registered'
 
     # The secret leaves the exported environment and stays in this module's own memory, where a
     # child process and a user's profile cannot reach it. The integration keeps it because a reader
@@ -189,6 +199,9 @@ function Start-KrSignal {
     if ($null -ne $script:Hooks.Timer) { return }
     $timer = [System.Timers.Timer]::new()
     $timer.Interval = $script:SignalIntervalMs
+    # The signal keeps coming on its own. The work behind it is a poll of a socket and nothing
+    # else: no command of this module's runs on the reader's thread, so a signal the reader takes
+    # a moment to reach is answered rather than piling up behind one that never arrives.
     $timer.AutoReset = $true
     # The signal: the host delivers this event on the reader's own thread, inside its read loop,
     # which is where the mailbox can be answered with the editor's real state.
@@ -223,7 +236,9 @@ function Enable-KalaReachHooks {
     $script:Hooks.Activated = $true
 
     $installed = Install-KrObservedHandlers
+    Write-KrTrace ("wrapped " + (@($installed) -join ' '))
     $gesture = Install-KrGestureHandler
+    Write-KrTrace ("gesture chord=$($script:Hooks.GestureChord) ok=$($gesture.Ok) $($gesture.Reason) $($gesture.Detail)")
     Send-KrHooksActivated ([uint64]($script:State.PromptGeneration + 1))
 
     if (-not $gesture.Ok) {
@@ -248,7 +263,9 @@ function Install-KrObservedHandlers {
                 Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock $block `
                     -BriefDescription $name -Description "KalaReach: $name"
                 $wrapped.Add("$chord=$name")
-            } catch { }
+            } catch {
+                Write-KrTrace "wrap failed $chord $name : $($_.Exception.Message)"
+            }
         }
     }
     $wrapped
@@ -333,6 +350,7 @@ function Invoke-KalaReachReadLine {
     [CmdletBinding()]
     param()
 
+    Write-KrTrace 'readline wrapper entered'
     if (-not $script:Hooks.Activated) {
         # The profile has run by the time the host asks for a line, and the reader has not started.
         Enable-KalaReachHooks
@@ -345,7 +363,14 @@ function Invoke-KalaReachReadLine {
     $script:State.CancelRequested = $false
     $script:State.IdleReported = $false
     $script:State.InvokingKeys = [byte[]]::new(0)
+    $script:State.EntryReported = $false
+    $script:State.ReaderThreadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+    $script:State.BufferSeen = ''
+    $script:State.BufferRevision++
+    # Read here, where the runspace is this function's own, and used by the reader's own thread.
+    $script:State.EditMode = try { "$((Get-PSReadLineOption).EditMode)" } catch { 'Emacs' }
     Send-KrEditorEnter
+    $script:State.EntryReported = $true
 
     $accepted = $false
     try {
@@ -354,6 +379,7 @@ function Invoke-KalaReachReadLine {
         $line
     } finally {
         $script:State.InsideReader--
+        $script:State.EntryReported = $false
         if ($script:Kr.Registered) {
             if ($accepted) {
                 # The accepted line is reported from inside the fence, before the leave that
@@ -376,13 +402,26 @@ function Invoke-KalaReachService {
     [CmdletBinding()]
     param()
 
-    if (-not $script:Kr.Registered) { return }
-    if ($script:State.InsideReader -le 0) { return }
-    if (-not $script:State.IdleReported) {
-        $script:State.IdleReported = $true
-        Send-KrReaderIdle
+    # The reader's own thread and no other. The host decides where it delivers this signal, and
+    # the editor's state belongs to the thread that is reading: touching it from anywhere else
+    # would be reaching into a reader that is running.
+    if ([System.Threading.Thread]::CurrentThread.ManagedThreadId -ne $script:State.ReaderThreadId) {
+        return
     }
-    Invoke-KrService
+    try {
+        if (-not $script:Kr.Registered) { return }
+        if ($script:State.InsideReader -le 0 -or -not $script:State.EntryReported) { return }
+        if (-not $script:State.IdleReported) {
+            # The reader has nothing left to read, which is one of the three points a worker
+            # retries a withheld fence at.
+            $script:State.IdleReported = $true
+            Send-KrReaderIdle
+        }
+        Invoke-KrService
+    } catch {
+        # The reader is never left without its signal because one answer went wrong.
+        Write-KrTrace "service failed: $($_.Exception.GetType().FullName): $($_.Exception.Message)"
+    }
 }
 
 function Invoke-KalaReachPending {
@@ -395,12 +434,21 @@ function Invoke-KalaReachPending {
 
     $script:Pending[$Pending]++
     $script:State.IdleReported = $false
+    # The sequence that invoked this operation is what the reader is in the middle of, and it is
+    # the person's own: anything the worker asks for waits behind it.
+    $previousKeys = $script:State.InvokingKeys
+    if ($null -ne $Key -and $Key.KeyChar -ne [char]0) {
+        $script:State.InvokingKeys = [byte[]]@([byte]([int]$Key.KeyChar -band 0xFF))
+    } else {
+        $script:State.InvokingKeys = [byte[]]@([byte]0x1b)
+    }
     try {
         $type = [Microsoft.PowerShell.PSConsoleReadLine]
         $method = $type.GetMethod($Function, [type[]]@([System.Nullable[System.ConsoleKeyInfo]], [object]))
         if ($null -ne $method) { $method.Invoke($null, @($Key, $Argument)) | Out-Null }
     } finally {
         $script:Pending[$Pending]--
+        $script:State.InvokingKeys = $previousKeys
         $script:State.CancelRequested = $false
         $script:State.IdleReported = $false
     }
@@ -476,6 +524,19 @@ function Get-KrCacheRoot {
 function Get-KrFileDigest {
     param([string]$Path)
     (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# What the recorded executable needs in its environment to start at all.
+function Get-KrLaunchEnvironment {
+    $environment = [ordered]@{}
+    foreach ($name in @('DOTNET_ROOT', "DOTNET_ROOT_$($env:PROCESSOR_ARCHITECTURE)", 'DOTNET_ROOT_ARM64', 'DOTNET_ROOT_X64')) {
+        if ([string]::IsNullOrEmpty($name)) { continue }
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrEmpty($value) -and -not $environment.Contains($name)) {
+            $environment[$name] = $value
+        }
+    }
+    $environment
 }
 
 function Publish-KalaReachQualification {
@@ -581,6 +642,11 @@ function Publish-KalaReachQualification {
             psreadline_before = $script:QualifiedBefore.ToString()
             psreadline_found  = "$psrl"
         }
+        # The host's own image needs its runtime's location, which the launcher that started this
+        # one passed in. A worker that starts the recorded executable directly needs the same.
+        launch        = [ordered]@{
+            environment = Get-KrLaunchEnvironment
+        }
     }
     $record | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $destination 'kr-shell-identity.json')
     Set-Content -Path (Join-Path (Join-Path $Prefix $manifest.shell) 'current') -Value $identity
@@ -625,4 +691,5 @@ Export-ModuleMember -Function @(
 )
 
 # The bridge loads with the module: the marked profile block imports it before the first prompt.
+Write-KrTrace 'module loaded'
 Initialize-KalaReachBridge

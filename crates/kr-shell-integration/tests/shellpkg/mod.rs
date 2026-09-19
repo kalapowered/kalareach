@@ -57,6 +57,8 @@ pub struct Package {
     pub identity: String,
     pub executable: PathBuf,
     pub startup_entry: PathBuf,
+    /// Where a package that loads modules by name keeps them.
+    pub module_directory: PathBuf,
     pub record: serde_json::Value,
 }
 
@@ -84,10 +86,18 @@ impl Package {
         let name = kind.as_str();
         let root = cache_root().join(name);
         let pointer = root.join("current");
+        let how = match kind {
+            // This package builds no shell: it is qualified against the editor the person already
+            // has, and the module publishes what it found.
+            ShellKind::PowerShell => {
+                "import shells/psreadline/module and run Publish-KalaReachQualification".to_owned()
+            }
+            other => format!("run scripts/build-shells.sh --{}", other.as_str()),
+        };
         let identity = std::fs::read_to_string(&pointer)
             .map_err(|error| {
                 format!(
-                    "{} is not built here ({}: {error}); run scripts/build-shells.sh --{name}",
+                    "{} is not built here ({}: {error}); {how}",
                     name,
                     pointer.display()
                 )
@@ -109,18 +119,19 @@ impl Package {
         if !executable.exists() {
             return Err(format!("{} is not installed", executable.display()));
         }
+        let module_directory = directory.join("modules");
         let startup_entry = directory.join("startup").join(match kind {
             ShellKind::Zsh => "kr-zshrc.zsh",
             ShellKind::Bash => "kr-bashrc.bash",
-            ShellKind::Fish | ShellKind::PowerShell => {
-                return Err(format!("{name} is not one of this task's packages"));
-            }
+            ShellKind::Fish => "kr-fish.fish",
+            ShellKind::PowerShell => "kr-profile.ps1",
         });
         Ok(Self {
             kind,
             identity,
             executable,
             startup_entry,
+            module_directory,
             record,
         })
     }
@@ -161,11 +172,15 @@ impl Package {
     }
 }
 
-/// What the shell's startup file holds: the user's own configuration and the marked block.
-fn startup_file(package: &Package, prompt: &str) -> String {
-    let entry = std::fs::read_to_string(&package.startup_entry)
-        .unwrap_or_else(|error| panic!("{}: {error}", package.startup_entry.display()));
-    let user = match package.kind {
+/// The marked block the package publishes, exactly as it publishes it.
+fn startup_entry(package: &Package) -> String {
+    std::fs::read_to_string(&package.startup_entry)
+        .unwrap_or_else(|error| panic!("{}: {error}", package.startup_entry.display()))
+}
+
+/// The person's own configuration, which the integration never replaces.
+fn user_configuration(kind: ShellKind, prompt: &str) -> String {
+    match kind {
         ShellKind::Zsh => format!(
             "# the person's own configuration, which the integration never replaces\n\
              PROMPT='{prompt}'\n\
@@ -174,14 +189,60 @@ fn startup_file(package: &Package, prompt: &str) -> String {
              HISTFILE=\n\
              typeset -g KR_TEST_USER_CONFIGURATION=1\n\n"
         ),
-        _ => format!(
+        ShellKind::Bash => format!(
             "# the person's own configuration, which the integration never replaces\n\
              PS1='{prompt}'\n\
              HISTFILE=\n\
              KR_TEST_USER_CONFIGURATION=1\n\n"
         ),
-    };
-    format!("{user}{entry}")
+        ShellKind::Fish => format!(
+            "# the person's own configuration, which the integration never replaces\n\
+             function fish_prompt; printf '%s' '{prompt}'; end\n\
+             set -g fish_greeting\n\
+             set -g KR_TEST_USER_CONFIGURATION 1\n\n"
+        ),
+        ShellKind::PowerShell => format!(
+            "# the person's own configuration, which the integration never replaces\n\
+             function global:prompt {{ '{prompt}' }}\n\
+             $global:KR_TEST_USER_CONFIGURATION = 1\n\
+             Set-PSReadLineOption -HistorySaveStyle SaveNothing\n\
+             Set-PSReadLineOption -PredictionSource None\n\n"
+        ),
+    }
+}
+
+/// Writes the person's configuration and the package's own marked entry where the shell reads
+/// them, in the layout the package's manifest names.
+fn install_startup(package: &Package, home: &Path, prompt: &str) {
+    let user = user_configuration(package.kind, prompt);
+    let entry = startup_entry(package);
+    match package.kind {
+        ShellKind::Zsh => {
+            std::fs::write(home.join(".zshrc"), format!("{user}{entry}")).expect("the startup file");
+        }
+        ShellKind::Bash => {
+            std::fs::write(home.join(".bashrc"), format!("{user}{entry}"))
+                .expect("the startup file");
+        }
+        ShellKind::Fish => {
+            // Files under conf.d run before the person's own config.fish, which is why the entry
+            // waits for the first prompt before it activates anything.
+            let config = home.join(".config").join("fish");
+            std::fs::create_dir_all(config.join("conf.d")).expect("a configuration directory");
+            std::fs::write(config.join("config.fish"), user).expect("the startup file");
+            std::fs::write(config.join("conf.d").join("kr-kalareach.fish"), entry)
+                .expect("the startup entry");
+        }
+        ShellKind::PowerShell => {
+            let config = home.join(".config").join("powershell");
+            std::fs::create_dir_all(&config).expect("a configuration directory");
+            std::fs::write(
+                config.join("Microsoft.PowerShell_profile.ps1"),
+                format!("{user}{entry}"),
+            )
+            .expect("the startup file");
+        }
+    }
 }
 
 /// One live session: the worker's endpoint, the shell under a pseudo-terminal, and the frames
@@ -201,7 +262,7 @@ pub struct Session {
     next_request: u64,
     output: Arc<Mutex<Vec<u8>>>,
     stopped: Arc<AtomicBool>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
     _directory: tempfile::TempDir,
@@ -245,16 +306,7 @@ impl Session {
             .map(|i| (i as u8).wrapping_mul(7))
             .collect();
 
-        match package.kind {
-            ShellKind::Zsh => {
-                std::fs::write(home.join(".zshrc"), startup_file(package, &prompt))
-                    .expect("the startup file");
-            }
-            _ => {
-                std::fs::write(home.join(".bashrc"), startup_file(package, &prompt))
-                    .expect("the startup file");
-            }
-        }
+        install_startup(package, &home, &prompt);
 
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -266,10 +318,38 @@ impl Session {
             .expect("a pseudo-terminal");
 
         let mut command = CommandBuilder::new(package.executable.to_string_lossy().into_owned());
-        command.arg("-i");
+        match package.kind {
+            ShellKind::PowerShell => {
+                // The host reads its profile and drops into its own read loop; nothing else about
+                // the launch is this package's.
+                command.arg("-NoLogo");
+                // The qualified editor and this module are selected before the profile runs, which
+                // is what the marked block then imports by name.
+                let mut module_path = package.module_directory.to_string_lossy().into_owned();
+                if let Some(existing) = std::env::var_os("PSModulePath") {
+                    module_path.push(':');
+                    module_path.push_str(&existing.to_string_lossy());
+                }
+                command.env("PSModulePath", module_path);
+                // The host's own image needs its runtime's location, which the qualification
+                // recorded from the launcher that started the host it qualified.
+                if let Some(environment) = package.record["launch"]["environment"].as_object() {
+                    for (name, value) in environment {
+                        if let Some(value) = value.as_str() {
+                            command.env(name, value);
+                        }
+                    }
+                }
+            }
+            _ => {
+                command.arg("-i");
+            }
+        }
         command.cwd(&home);
         command.env("HOME", &home);
         command.env("ZDOTDIR", &home);
+        command.env("XDG_CONFIG_HOME", home.join(".config"));
+        command.env("XDG_DATA_HOME", home.join(".local").join("share"));
         command.env("TERM", "xterm-256color");
         command.env("LANG", "C");
         command.env("KR_SESSION", session_id.to_string());
@@ -278,6 +358,10 @@ impl Session {
             "KR_SHELL_BRIDGE_SECRET",
             kr_protocol::scalars::to_base64url(&secret),
         );
+        // A run that asked a package for diagnostics passes that through to the shell it starts.
+        if let Some(trace) = std::env::var_os("KR_SHELL_BRIDGE_TRACE") {
+            command.env("KR_SHELL_BRIDGE_TRACE", trace);
+        }
 
         let child = pty
             .slave
@@ -290,19 +374,26 @@ impl Session {
         let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
         let collected = Arc::clone(&output);
         let finished = Arc::clone(&stopped);
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pty.master.take_writer().expect("a terminal writer")));
+        let answering = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             while !finished.load(Ordering::Relaxed) {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(taken) => collected
-                        .lock()
-                        .expect("the output lock")
-                        .extend_from_slice(&buffer[..taken]),
+                    Ok(taken) => {
+                        // A terminal that never answers a query is a terminal the editor waits
+                        // for, so this one answers the three an editor asks at every prompt.
+                        answer_terminal_queries(&buffer[..taken], &answering);
+                        collected
+                            .lock()
+                            .expect("the output lock")
+                            .extend_from_slice(&buffer[..taken]);
+                    }
                 }
             }
         });
-        let writer = pty.master.take_writer().expect("a terminal writer");
 
         let stream = accept_within(&listener, REPLY)
             .expect("the shell connects to the endpoint it was given");
@@ -588,8 +679,25 @@ impl Session {
     pub fn ask(&mut self, request: WorkerRequest) -> RequestId {
         let id = RequestId::new(self.next_request);
         self.next_request += 1;
+        self.nudge();
         self.write_frame(&BridgeFrame::Request { id, request });
+        self.nudge();
         id
+    }
+
+    /// Gives a reader that reaches its own queue only when it steps one step to take.
+    ///
+    /// The key is one the editor has nothing bound to, so the step is the whole of its effect: the
+    /// buffer, the revisions and the queues are where they were. A person at the keyboard gives
+    /// the reader the same step by typing at all.
+    pub fn nudge(&mut self) {
+        if !dialect(self.package_kind).answers_at_the_next_step {
+            return;
+        }
+        self.type_bytes(&[0x1c]);
+        // The step is over before anything is asked of the reader: a key it has not taken yet is
+        // input of the person's, and the contract puts that ahead of anything the worker asks for.
+        std::thread::sleep(Duration::from_millis(60));
     }
 
     /// Waits for the reader's answer to one request.
@@ -632,10 +740,9 @@ impl Session {
 
     /// Types bytes into the terminal, as a person at the keyboard would.
     pub fn type_bytes(&mut self, bytes: &[u8]) {
-        self.writer
-            .write_all(bytes)
-            .expect("the terminal accepts input");
-        self.writer.flush().expect("the terminal flushes");
+        let mut writer = self.writer.lock().expect("the terminal writer");
+        writer.write_all(bytes).expect("the terminal accepts input");
+        writer.flush().expect("the terminal flushes");
     }
 
     /// Types a line and its return.
@@ -717,6 +824,36 @@ fn name_of(event: &BridgeEvent) -> &'static str {
         BridgeEvent::HooksActivated(_) => "hooks_activated",
         BridgeEvent::IntegrationLost(_) => "integration_lost",
     }
+}
+
+/// Answers the queries a terminal is expected to answer while an editor draws a prompt.
+///
+/// An editor that asks where the cursor is and waits for the reply cannot start its read loop
+/// until something answers, so this terminal answers rather than leaving it waiting.
+fn answer_terminal_queries(bytes: &[u8], writer: &Arc<Mutex<Box<dyn Write + Send>>>) {
+    let mut reply: Vec<u8> = Vec::new();
+    if find(bytes, b"\x1b[6n") {
+        reply.extend_from_slice(b"\x1b[1;1R");
+    }
+    if find(bytes, b"\x1b[c") || find(bytes, b"\x1b[0c") {
+        reply.extend_from_slice(b"\x1b[?6c");
+    }
+    if find(bytes, b"\x1b]11;?") {
+        reply.extend_from_slice(b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+    }
+    if reply.is_empty() {
+        return;
+    }
+    if let Ok(mut writer) = writer.lock() {
+        let _ = writer.write_all(&reply);
+        let _ = writer.flush();
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn accept_within(listener: &UnixListener, within: Duration) -> Option<UnixStream> {
@@ -893,5 +1030,7 @@ pub fn outside_workspace(path: &Path) -> bool {
 }
 
 mod cases;
+mod dialect;
 
 pub use cases::*;
+pub use dialect::*;

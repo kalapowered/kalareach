@@ -24,13 +24,6 @@ use kr_shell_integration::contract::requests::{
 
 use super::*;
 
-const CTRL_D: &[u8] = &[0x04];
-const CTRL_U: &[u8] = &[0x15];
-const CTRL_G: &[u8] = &[0x07];
-const CTRL_V: &[u8] = &[0x16];
-const CTRL_R: &[u8] = &[0x12];
-const ESCAPE: &[u8] = &[0x1b];
-
 impl Session {
     /// Waits for the hooks the guarded startup entry activates and the first primary reader.
     ///
@@ -153,10 +146,26 @@ pub fn the_handshake_declares_the_packaged_reader(kind: ShellKind) {
         package.patch_names(),
         "every published patch is named in the handshake"
     );
-    assert!(
-        !hello.shell.patches.is_empty(),
-        "a managed package declares the reader patches behind it"
-    );
+    if package.record["build"]["upstream"]["sha256"]
+        .as_str()
+        .is_some_and(|digest| !digest.is_empty())
+    {
+        assert!(
+            !hello.shell.patches.is_empty(),
+            "a package built from a patched release declares the patches behind it"
+        );
+    } else {
+        // A package that builds no shell patches nothing, so what it declares instead is the
+        // module tree it binds into, with the ABI each module was built against.
+        assert!(
+            hello.shell.patches.is_empty(),
+            "a package that patches no source declared a patch"
+        );
+        assert!(
+            !hello.shell.modules.is_empty(),
+            "a qualified module package declares the module tree it binds into"
+        );
+    }
     for module in &hello.shell.modules {
         assert_eq!(
             module.editor_abi, hello.shell.editor_abi,
@@ -202,17 +211,16 @@ pub fn the_handshake_declares_the_packaged_reader(kind: ShellKind) {
 
     // The bootstrap values have left the exported environment, so nothing a child starts inherits
     // them and the user's own startup file never saw the secret.
+    let speech = dialect(kind);
     assert!(
-        session.run(
-            "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
-            "kr-endpoint=[unset] kr-secret=[unset]"
-        ),
+        session.run(speech.bootstrap_probe, speech.bootstrap_gone),
         "the bootstrap values are still exported:\n{}",
         session.terminal_output()
     );
     assert!(
-        session.run("echo kr-config=$KR_TEST_USER_CONFIGURATION", "kr-config=1"),
-        "the person's own startup configuration did not survive"
+        session.run(speech.user_configuration_probe, "kr-config=1"),
+        "the person's own startup configuration did not survive:\n{}",
+        session.terminal_output()
     );
 }
 
@@ -227,10 +235,7 @@ pub fn a_child_shell_has_nothing_to_activate_from(kind: ShellKind) {
 
     // The same packaged shell, started as a child of the managed root: it inherits neither value,
     // so it attempts no handshake at all and the endpoint sees nothing.
-    let command = format!(
-        "{} -c 'echo kr-child=[${{KR_SHELL_BRIDGE:-unset}}]'",
-        package.executable.display()
-    );
+    let command = child_probe(kind, &package.executable);
     assert!(
         session.run(&command, "kr-child=[unset]"),
         "a child inherited the endpoint:\n{}",
@@ -319,17 +324,19 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
     );
 
     // A continuation line is its own reader context, and it is not the root editor's prompt.
-    session.type_line("echo 'kr-continuation");
-    let (_, event) = session.expect_event("a continuation reader", |event| {
-        matches!(
-            event,
-            BridgeEvent::EditorEnter(params)
-                if params.reader_context == kr_protocol::root::ReaderContext::Continuation
-        )
-    });
-    let _ = as_enter(&event);
-    session.type_line("' >/dev/null; echo kr-continuation-ok");
-    assert!(session.wait_for_output("kr-continuation-ok", REPLY));
+    if let Some((open, close)) = dialect(kind).continuation {
+        session.type_line(open);
+        let (_, event) = session.expect_event("a continuation reader", |event| {
+            matches!(
+                event,
+                BridgeEvent::EditorEnter(params)
+                    if params.reader_context == kr_protocol::root::ReaderContext::Continuation
+            )
+        });
+        let _ = as_enter(&event);
+        session.type_line(close);
+        assert!(session.wait_for_output("kr-continuation-ok", REPLY));
+    }
 }
 
 /// KR-REQ-07.71, KR-REQ-07.72, and `enter-fence-acknowledge-detach`.
@@ -488,13 +495,16 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         return;
     };
     let named = excluded_states();
+    let speech = dialect(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
     // Outside the detach condition the key is the editor's own, and at an empty prompt the
-    // editor's own answer is to end the shell. The person's ignoreeof setting is what makes that
-    // answer observable without ending this session, and it is left exactly as they set it.
-    session.type_line(ignore_eof_command(kind));
+    // editor's own answer can be to end the shell. Where the shell has a setting of its own for
+    // that, the person's setting is what makes the answer observable without ending this session,
+    // and it is left exactly as they set it; where it has none, the buffer is not empty, so the
+    // editor's own answer is to delete a character.
+    session.type_line(speech.ignore_eof_on.unwrap_or("echo kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
     let (_, _fence) = session.fenced_prompt(5);
 
@@ -502,117 +512,44 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     // contract's answer is native, so the reader keeps the key: no detach, no consume, and the
     // shell carries on.
     let mut driven: Vec<DetachExclusion> = Vec::new();
-    let mut drive =
-        |session: &mut Session, exclusion: DetachExclusion, setup: &[&[u8]], teardown: &[&[u8]]| {
-            for bytes in setup {
-                session.type_bytes(bytes);
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            session.type_bytes(CTRL_D);
+    for drive in exclusion_drives(kind) {
+        if let Some((command, marker)) = drive.prepare {
+            session.type_line(command);
             assert!(
-                !session.saw_event(Duration::from_millis(500), |event| matches!(
-                    event,
-                    BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-                )),
-                "{} did not exclude the gesture",
-                exclusion.as_str()
+                session.wait_for_output(marker, REPLY),
+                "{} could not be prepared:\n{}",
+                drive.exclusion.as_str(),
+                session.terminal_output()
             );
-            for bytes in teardown {
-                session.type_bytes(bytes);
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            session.clear_line();
-            assert!(session.alive(), "{} ended the shell", exclusion.as_str());
-            driven.push(exclusion);
-        };
+            std::thread::sleep(Duration::from_millis(200));
+            session.forget_events();
+        }
+        for bytes in drive.setup {
+            session.type_bytes(bytes);
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        session.type_bytes(CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(500), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "{} did not exclude the gesture:\n{}",
+            drive.exclusion.as_str(),
+            session.terminal_output()
+        );
+        for bytes in drive.teardown {
+            session.type_bytes(bytes);
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        session.clear_line();
+        assert!(session.alive(), "{} ended the shell", drive.exclusion.as_str());
+        driven.push(drive.exclusion);
+    }
 
-    drive(&mut session, DetachExclusion::BufferNotEmpty, &[b"kr"], &[]);
-    drive(
-        &mut session,
-        DetachExclusion::QuotedInsertion,
-        &[CTRL_V],
-        &[],
-    );
-    drive(
-        &mut session,
-        DetachExclusion::MultikeySequence,
-        &[ESCAPE],
-        &[],
-    );
-    drive(
-        &mut session,
-        DetachExclusion::NumericArgument,
-        &[ESCAPE, b"2"],
-        &[],
-    );
-    drive(&mut session, DetachExclusion::Search, &[CTRL_R], &[CTRL_G]);
-    drive(
-        &mut session,
-        DetachExclusion::Paste,
-        &[b"\x1b[200~"],
-        &[b"\x1b[201~"],
-    );
-
-    // A vi motion waits for its target, and the gesture belongs to that wait. It needs the vi
-    // keymap, which is the person's own setting, so it is put back afterwards.
-    session.clear_line();
-    let vi_mode = match kind {
-        ShellKind::Zsh => "bindkey -v; echo kr-vi-on",
-        _ => "set -o vi; echo kr-vi-on",
-    };
-    session.type_line(vi_mode);
-    assert!(session.wait_for_output("kr-vi-on", REPLY));
-    std::thread::sleep(Duration::from_millis(300));
-    session.forget_events();
-    session.type_bytes(ESCAPE);
-    std::thread::sleep(Duration::from_millis(120));
-    session.type_bytes(b"d");
-    std::thread::sleep(Duration::from_millis(120));
-    session.type_bytes(CTRL_D);
-    assert!(
-        !session.saw_event(Duration::from_millis(600), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "a gesture a vi motion was waiting for was treated as a detach"
-    );
-    assert!(session.alive(), "a vi motion's gesture ended the shell");
-    driven.push(DetachExclusion::ViMotion);
-    session.type_bytes(&[0x03]);
-    std::thread::sleep(Duration::from_millis(150));
-    let emacs_mode = match kind {
-        ShellKind::Zsh => "bindkey -e; echo kr-vi-off",
-        _ => "set -o emacs; echo kr-vi-off",
-    };
-    session.type_line(emacs_mode);
-    assert!(session.wait_for_output("kr-vi-off", REPLY));
-
-    // A macro the reader is replaying is the reader's own input, not a gesture a person made, and
-    // a binding that feeds the gesture itself proves the source is what excludes it.
-    session.clear_line();
-    let bind_macro = match kind {
-        ShellKind::Zsh => "bindkey -s '^T' $'\\x04'; echo kr-macro-bound",
-        _ => "bind '\"\\C-t\": \"\\C-d\"' ; echo kr-macro-bound",
-    };
-    session.type_line(bind_macro);
-    assert!(session.wait_for_output("kr-macro-bound", REPLY));
-    std::thread::sleep(Duration::from_millis(300));
-    session.forget_events();
-    session.type_bytes(&[0x14]);
-    assert!(
-        !session.saw_event(Duration::from_millis(600), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "a gesture a macro produced was treated as one a person made"
-    );
-    assert!(session.alive(), "macro input ended the shell");
-    driven.push(DetachExclusion::MacroInput);
-    session.clear_line();
-
-    // The `read` builtin reading through the editor is not the root editor's prompt.
-    if matches!(kind, ShellKind::Bash) {
-        session.type_line("read -e -t 5 kr_read_var");
+    // The reader the shell's own `read` starts is not the root editor's prompt.
+    if let Some(command) = read_builtin_command(kind) {
+        session.type_line(command);
         std::thread::sleep(Duration::from_millis(500));
         session.forget_events();
         session.type_bytes(CTRL_D);
@@ -632,61 +569,120 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         assert!(session.wait_for_output("kr-read-done", REPLY));
     }
 
+    // A vi motion waits for its target, and the gesture belongs to that wait. It needs the vi
+    // keymap, which is the person's own setting, so it is put back afterwards.
+    if let Some((vi_mode, emacs_mode)) = vi_keymap_commands(kind) {
+        session.clear_line();
+        session.type_line(vi_mode);
+        assert!(session.wait_for_output("kr-vi-on", REPLY));
+        std::thread::sleep(Duration::from_millis(300));
+        session.forget_events();
+        session.type_bytes(ESCAPE);
+        std::thread::sleep(Duration::from_millis(120));
+        session.type_bytes(b"d");
+        std::thread::sleep(Duration::from_millis(120));
+        session.type_bytes(CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "a gesture a vi motion was waiting for was treated as a detach"
+        );
+        assert!(session.alive(), "a vi motion's gesture ended the shell");
+        driven.push(DetachExclusion::ViMotion);
+        session.type_bytes(CTRL_C);
+        std::thread::sleep(Duration::from_millis(150));
+        session.type_line(emacs_mode);
+        assert!(session.wait_for_output("kr-vi-off", REPLY));
+    }
+
+    // A macro the reader is replaying is the reader's own input, not a gesture a person made, and
+    // a binding that feeds the gesture itself proves the source is what excludes it.
+    if let Some(bind_macro) = macro_binding(kind) {
+        session.clear_line();
+        session.type_line(bind_macro);
+        assert!(session.wait_for_output("kr-macro-bound", REPLY));
+        std::thread::sleep(Duration::from_millis(300));
+        session.forget_events();
+        session.type_bytes(CTRL_T);
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "a gesture a macro produced was treated as one a person made"
+        );
+        assert!(session.alive(), "macro input ended the shell");
+        driven.push(DetachExclusion::MacroInput);
+        session.clear_line();
+    }
+
     // A continuation line is a different reader, so the gesture is the editor's there too.
-    session.clear_line();
-    session.type_line("echo 'kr-exclusion");
-    session.expect_event("a continuation reader", |event| {
-        matches!(
-            event,
-            BridgeEvent::EditorEnter(params)
-                if params.reader_context == kr_protocol::root::ReaderContext::Continuation
-        )
-    });
-    session.type_bytes(CTRL_D);
-    assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "a continuation line did not exclude the gesture"
-    );
-    driven.push(DetachExclusion::ContinuationInput);
-    session.type_line("' >/dev/null; echo kr-exclusions-ok");
-    assert!(session.wait_for_output("kr-exclusions-ok", REPLY));
+    if let Some((open, close)) = speech.continuation {
+        session.clear_line();
+        session.type_line(open);
+        session.expect_event("a continuation reader", |event| {
+            matches!(
+                event,
+                BridgeEvent::EditorEnter(params)
+                    if params.reader_context == kr_protocol::root::ReaderContext::Continuation
+            )
+        });
+        session.type_bytes(CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(500), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "a continuation line did not exclude the gesture"
+        );
+        driven.push(DetachExclusion::ContinuationInput);
+        session.type_line(close);
+        assert!(session.wait_for_output("kr-exclusions-ok", REPLY));
+    }
 
     for exclusion in &named {
         assert!(
-            driven.contains(exclusion) || not_constructible_here(kind, *exclusion),
+            driven.contains(exclusion) || not_constructible_here(kind, *exclusion).is_some(),
             "{} is in the corpus and neither driven nor accounted for",
             exclusion.as_str()
         );
     }
     assert!(
-        driven.len() >= 9,
-        "only {} exclusions were driven; this test has stopped proving anything",
-        driven.len()
+        driven.len() >= speech.driven_exclusions,
+        "only {} of {}'s exclusions were driven; this test has stopped proving anything",
+        driven.len(),
+        kind.as_str()
     );
 }
 
-/// Turns on the person's own ignoreeof setting, which the integration never touches.
-fn ignore_eof_command(kind: ShellKind) -> &'static str {
+/// The shell's own `read`, reading a line through the editor.
+fn read_builtin_command(kind: ShellKind) -> Option<&'static str> {
     match kind {
-        ShellKind::Zsh => "setopt ignoreeof; echo kr-ready",
-        _ => "set -o ignoreeof; echo kr-ready",
+        ShellKind::Bash => Some("read -e -t 5 kr_read_var"),
+        ShellKind::Fish => Some("read -l kr_read_var"),
+        _ => None,
     }
 }
 
-/// The exclusions that need a state this harness cannot put a real reader into.
-fn not_constructible_here(kind: ShellKind, exclusion: DetachExclusion) -> bool {
-    match exclusion {
-        // Not a state of a managed root editor at all, but the requirement that the contract
-        // applies to this reader: a reader that fails it is some other program.
-        DetachExclusion::NotManagedRootEditor => true,
-        // Zsh's `vared` is its reader through the editor, and it ends on the gesture rather than
-        // surviving it, so driving it here would end the session it is being observed in. Bash's
-        // `read -e` is driven above.
-        DetachExclusion::ReadBuiltin => matches!(kind, ShellKind::Zsh),
-        _ => false,
+/// Switching the editor to vi bindings and back, where a motion waits for its target there.
+fn vi_keymap_commands(kind: ShellKind) -> Option<(&'static str, &'static str)> {
+    match kind {
+        ShellKind::Zsh => Some(("bindkey -v; echo kr-vi-on", "bindkey -e; echo kr-vi-off")),
+        ShellKind::Bash => Some(("set -o vi; echo kr-vi-on", "set -o emacs; echo kr-vi-off")),
+        // This editor resolves a vi operator as a key sequence rather than as a wait for a motion,
+        // so the state a jump waits in is what the drives above put it into.
+        _ => None,
+    }
+}
+
+/// A binding that feeds the gesture back as the reader's own input.
+fn macro_binding(kind: ShellKind) -> Option<&'static str> {
+    match kind {
+        ShellKind::Zsh => Some("bindkey -s '^T' $'\\x04'; echo kr-macro-bound"),
+        ShellKind::Bash => Some("bind '\"\\C-t\": \"\\C-d\"' ; echo kr-macro-bound"),
+        _ => None,
     }
 }
 
@@ -717,6 +713,13 @@ fn excluded_states() -> Vec<DetachExclusion> {
 
 /// KR-REQ-07.73's package half, and `veof-change`, `veof-disabled`.
 pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
+    let speech = dialect(kind);
+    let (Some(change), Some(disable)) = (speech.veof_change, speech.veof_disable) else {
+        // This editor's gesture is a chord the worker configures rather than the line discipline's
+        // own character, which `psreadline-chord-gesture` is the scenario for.
+        println!("skipped: {} follows a configured chord", kind.as_str());
+        return;
+    };
     let Some(package) = Package::found(kind) else {
         return;
     };
@@ -724,14 +727,17 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     session.first_prompt();
     session.forget_events();
     // A character that is not the gesture is the editor's own, and at an empty prompt the editor's
-    // own answer is to end the shell. The person's ignoreeof setting makes that answer observable
-    // without ending this session.
-    session.type_line(ignore_eof_command(kind));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    // own answer can be to end the shell. The person's ignoreeof setting makes that answer
+    // observable without ending this session; an editor with no such setting keeps something in
+    // the buffer instead.
+    if let Some(command) = speech.ignore_eof_on {
+        session.type_line(command);
+        assert!(session.wait_for_output("kr-ready", REPLY));
+    }
 
     // A VEOF reassignment is a user change to the gesture, and it takes effect at a prompt rather
     // than in the middle of a read.
-    session.type_line("stty eof ^G; echo kr-veof-set");
+    session.type_line(change);
     assert!(session.wait_for_output("kr-veof-set", REPLY));
     let (_, changed) = session.expect_event("gesture_changed", |event| {
         matches!(event, BridgeEvent::GestureChanged(_))
@@ -747,6 +753,11 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     );
 
     let (_, fence) = session.fenced_prompt(6);
+    if speech.ignore_eof_on.is_none() {
+        // Nothing of the editor's own ends a shell whose buffer is not empty.
+        session.type_bytes(b"kr");
+        std::thread::sleep(Duration::from_millis(80));
+    }
     session.type_bytes(CTRL_D);
     assert!(
         !session.saw_event(Duration::from_millis(500), |event| matches!(
@@ -768,7 +779,7 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
 
     // A terminal with no end-of-file character has no gesture, so no character is one.
     session.clear_line();
-    session.type_line("stty eof undef; echo kr-veof-undef");
+    session.type_line(disable);
     assert!(session.wait_for_output("kr-veof-undef", REPLY));
     let (_, disabled) = session.expect_event("a disabled gesture", |event| {
         matches!(
@@ -809,11 +820,17 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     // would break into two, and a word that is a command substitution, which an unquoted install
     // would run. `printf` prints each argument followed by a bar, so the exact vector that ran is
     // visible in the output.
+    let substitution = match kind {
+        // Each shell's own way of writing a command substitution, so an unquoted install would run
+        // something rather than print it.
+        ShellKind::Fish => "(echo substituted)".to_owned(),
+        _ => "$(echo substituted)".to_owned(),
+    };
     let command = LaunchCommand::Arguments(vec![
         "printf".to_owned(),
         "%s|".to_owned(),
         "kr launch ok".to_owned(),
-        "$(echo substituted)".to_owned(),
+        substitution,
     ]);
     let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
         session_id: session.session_id,
@@ -851,6 +868,11 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     );
     assert_eq!(accepted.prompt_generation, enter.prompt_generation);
 
+    // This editor completes an acceptance at its own next step, so the session gives it one. The
+    // acceptance is already in the editor's own queue, which is drained before anything the
+    // terminal has, so it is the installed line that runs.
+    session.nudge();
+
     // The accepted line is reported from the reader, inside the fence, before the leave.
     let (_, recorded) = session.expect_event("command_accepted", |event| {
         matches!(event, BridgeEvent::CommandAccepted(_))
@@ -875,7 +897,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     assert_eq!(left.reason, EditorLeaveReason::CommandAccepted);
 
     assert!(
-        session.wait_for_output("kr launch ok|$(echo substituted)|", REPLY),
+        session.wait_for_output(dialect(kind).launch_expectation, REPLY),
         "the arguments that ran are not the arguments the caller named:\n{}",
         session.terminal_output()
     );
@@ -891,11 +913,17 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
     let Some(package) = Package::found(kind) else {
         return;
     };
+    let wait = pending_wait(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    // Whatever the wait below needs runs before the reader the launches are checked against.
+    let ready = wait
+        .as_ref()
+        .and_then(|wait| wait.prepare)
+        .unwrap_or(("echo kr-ready", "kr-ready"));
+    session.type_line(ready.0);
+    assert!(session.wait_for_output(ready.1, REPLY));
 
     let (enter, fence) = session.fenced_prompt(9);
     let base = LaunchMailboxRequest {
@@ -977,37 +1005,56 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
     );
     session.clear_line();
 
-    // Something the person had half-typed is theirs too: the reader is waiting for the rest of an
-    // escape sequence, so the launch waits behind it.
-    session.type_bytes(ESCAPE);
-    std::thread::sleep(Duration::from_millis(150));
-    refuse(
-        &mut session,
-        base.clone(),
-        LaunchRejectionReason::QueuedPriorInput,
-    );
-    let cancel = session.ask(WorkerRequest::Cancel(CancelKeyWait {
-        session_id: session.session_id,
-        sequence: U64::new(2),
-        epoch: epoch(4),
-        prompt_generation: enter.prompt_generation,
-        reader_revision: enter.reader_revision,
-    }));
-    let _ = session.answer(cancel);
+    // Something the person had half-typed is theirs too: the reader is waiting for another key,
+    // so the launch waits behind it.
+    if let Some(wait) = wait {
+        session.type_bytes(wait.enter);
+        std::thread::sleep(Duration::from_millis(150));
+        refuse(
+            &mut session,
+            base.clone(),
+            LaunchRejectionReason::QueuedPriorInput,
+        );
+        let cancel = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+            session_id: session.session_id,
+            sequence: U64::new(2),
+            epoch: epoch(4),
+            prompt_generation: enter.prompt_generation,
+            reader_revision: enter.reader_revision,
+        }));
+        let _ = session.answer(cancel);
+    }
 
     // Every reason the corpus names is driven above, or is one the worker decides rather than the
     // reader, or needs a reader this session cannot reach.
     for reason in launch_rejection_reasons() {
         assert!(
-            driven_here(reason) || worker_side(reason),
+            driven_here(kind, reason) || worker_side(reason),
             "{} is in the corpus and neither driven nor accounted for",
             reason.as_str()
         );
     }
 }
 
+/// Whether the reader raised the flag this wait is supposed to raise.
+fn pending_flag_is_set(
+    pending: &kr_protocol::root::PendingReaderInput,
+    flag: PendingFlag,
+) -> bool {
+    match flag {
+        PendingFlag::MultikeySequence => pending.multikey_sequence,
+        PendingFlag::ViMotion => pending.vi_motion,
+        PendingFlag::QuotedInsertion => pending.quoted_insertion,
+    }
+}
+
 /// The reasons the cases above put a real reader into.
-fn driven_here(reason: LaunchRejectionReason) -> bool {
+fn driven_here(kind: ShellKind, reason: LaunchRejectionReason) -> bool {
+    if reason == LaunchRejectionReason::QueuedPriorInput {
+        // Input of the person's waiting ahead of a launch is a state this session can only reach
+        // through a reader that waits for another key, which not every editor has.
+        return pending_wait(kind).is_some();
+    }
     matches!(
         reason,
         LaunchRejectionReason::FenceInvalid
@@ -1016,7 +1063,6 @@ fn driven_here(reason: LaunchRejectionReason) -> bool {
             | LaunchRejectionReason::CwdRevisionMismatch
             | LaunchRejectionReason::BufferRevisionMismatch
             | LaunchRejectionReason::BufferNotEmpty
-            | LaunchRejectionReason::QueuedPriorInput
     )
 }
 
@@ -1259,29 +1305,44 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     let Some(package) = Package::found(kind) else {
         return;
     };
+    let Some(wait) = pending_wait(kind) else {
+        println!("skipped: {} has no key wait a takeover can end", kind.as_str());
+        return;
+    };
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    // Whatever the wait needs runs before the reader it is measured against starts.
+    let ready = wait.prepare.unwrap_or(("echo kr-ready", "kr-ready"));
+    session.type_line(ready.0);
+    assert!(session.wait_for_output(ready.1, REPLY));
     let enter = session.next_prompt();
 
-    // The reader is left waiting for the rest of an escape sequence, with text already typed.
+    // The reader is left waiting for another key, with text already typed.
     session.type_bytes(b"echo kr-");
     std::thread::sleep(Duration::from_millis(120));
-    session.type_bytes(ESCAPE);
-    std::thread::sleep(Duration::from_millis(120));
+    session.type_bytes(wait.enter);
+    std::thread::sleep(Duration::from_millis(150));
 
-    // A reader in that state says so: the partial-key queue still holds input, and the fence the
+    // A reader in that state says so: a queue of its own still holds input, and the fence the
     // worker asked for is one it will withhold until that queue drains.
     let waiting = session.fence_exchange(&enter, fence_id(14));
     assert!(
-        !waiting.queues.partial_key_drained,
-        "a reader waiting for the rest of a sequence reported its partial-key queue clear"
+        !waiting.queues.partial_key_drained || !waiting.snapshot.is_drained(),
+        "a reader waiting for another key reported every queue clear: {:?} {:?}",
+        waiting.queues,
+        waiting.snapshot
     );
+    if wait.partial_key_queue {
+        assert!(
+            !waiting.queues.partial_key_drained,
+            "a reader waiting for the rest of a sequence reported its partial-key queue clear"
+        );
+    }
     assert!(
-        waiting.editor.pending.multikey_sequence,
-        "a reader waiting for the rest of a sequence reported nothing pending"
+        pending_flag_is_set(&waiting.editor.pending, wait.flag),
+        "a reader waiting for another key reported nothing pending: {:?}",
+        waiting.editor.pending
     );
     assert!(
         !waiting.editor.buffer_empty,
@@ -1336,24 +1397,31 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     );
 
     // A quoted insertion waits for its character in the same way, and ends the same way.
-    session.type_bytes(CTRL_V);
-    std::thread::sleep(Duration::from_millis(150));
-    let quoted = session.ask(WorkerRequest::Cancel(CancelKeyWait {
-        session_id: session.session_id,
-        sequence: U64::new(2),
-        epoch: epoch(4),
-        prompt_generation: enter.prompt_generation,
-        reader_revision: enter.reader_revision,
-    }));
-    let BridgeAnswer::Cancel(report) = session.answer(quoted) else {
-        panic!("the reader answered a cancellation with something else")
-    };
-    assert!(report.buffer_preserved);
-    assert!(
-        report.cancelled.quoted_insertion,
-        "the cancellation did not name the quoted insertion it ended: {:?}",
-        report.cancelled
-    );
+    if let Some(quoted_insertion) = quoted_wait(kind) {
+        if let Some((command, marker)) = quoted_insertion.prepare {
+            session.type_line(command);
+            assert!(session.wait_for_output(marker, REPLY));
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        session.type_bytes(quoted_insertion.enter);
+        std::thread::sleep(Duration::from_millis(150));
+        let quoted = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+            session_id: session.session_id,
+            sequence: U64::new(2),
+            epoch: epoch(4),
+            prompt_generation: enter.prompt_generation,
+            reader_revision: enter.reader_revision,
+        }));
+        let BridgeAnswer::Cancel(report) = session.answer(quoted) else {
+            panic!("the reader answered a cancellation with something else")
+        };
+        assert!(report.buffer_preserved);
+        assert!(
+            report.cancelled.quoted_insertion,
+            "the cancellation did not name the quoted insertion it ended: {:?}",
+            report.cancelled
+        );
+    }
 
     // A cancellation for a reader the worker is not looking at ends nothing.
     let stale = session.ask(WorkerRequest::Cancel(CancelKeyWait {
@@ -1386,16 +1454,22 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
     let Some(package) = Package::found(kind) else {
         return;
     };
+    let wait = pending_wait(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    // Whatever the wait needs runs before the reader it is measured against starts.
+    let ready = wait
+        .as_ref()
+        .and_then(|wait| wait.prepare)
+        .unwrap_or(("echo kr-ready", "kr-ready"));
+    session.type_line(ready.0);
+    assert!(session.wait_for_output(ready.1, REPLY));
     let enter = session.next_prompt();
 
     // The reader is waiting for a key with nothing in progress, so there is nothing of the old
     // lease's for this cancellation to end and nothing for it to throw away.
-    session.type_bytes(b"echo kr-$((6*7))");
+    session.type_bytes(dialect(kind).arithmetic.0.as_bytes());
     std::thread::sleep(Duration::from_millis(120));
     session.forget_events();
     let idle = session.ask(WorkerRequest::Cancel(CancelKeyWait {
@@ -1431,12 +1505,19 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
     // The person then starts a sequence of their own, and the mailbox is read while it is
     // part-read. The cancellation before it is over, so the sequence is still the reader's to
     // finish rather than something that cancellation takes away.
-    session.type_bytes(ESCAPE);
-    std::thread::sleep(Duration::from_millis(120));
+    let Some(wait) = wait else {
+        // Nothing of this package's runs on this reader's thread while the editor is inside one of
+        // its own nested reads, so there is no part-read sequence to leave alone.
+        println!("skipped: {} has no key wait to leave alone", kind.as_str());
+        return;
+    };
+    session.type_bytes(wait.enter);
+    std::thread::sleep(Duration::from_millis(150));
     for fence in [fence_id(20), fence_id(21)] {
         let held = session.fence_exchange(&enter, fence);
         assert!(
-            held.editor.pending.multikey_sequence && !held.queues.partial_key_drained,
+            pending_flag_is_set(&held.editor.pending, wait.flag)
+                && (!held.queues.partial_key_drained || !held.snapshot.is_drained()),
             "the reader lost the sequence the person had started: {:?} {:?}",
             held.editor.pending,
             held.queues
@@ -1461,9 +1542,9 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
     );
     // The rest of the line is typed and the whole command runs: the shell's own answer, which is
     // in none of the keystrokes, is what proves it ran rather than an echo of the typing.
-    session.type_line("-ok");
+    session.type_line(dialect(kind).arithmetic.1);
     assert!(
-        session.wait_for_output("kr-42-ok", REPLY),
+        session.wait_for_output(dialect(kind).arithmetic.2, REPLY),
         "the edit buffer did not survive the cancellations:\n{}",
         session.terminal_output()
     );
@@ -1471,6 +1552,10 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
 
 /// KR-REQ-07.72: the person's own IGNORE_EOF setting is left as they set it.
 pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
+    if dialect(kind).ignore_eof_on.is_none() {
+        println!("skipped: {} has no end-of-file setting of its own", kind.as_str());
+        return;
+    }
     let Some(package) = Package::found(kind) else {
         return;
     };
@@ -1479,10 +1564,14 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
             "setopt ignoreeof; echo kr-ignoreeof-set",
             "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
         ),
-        _ => (
+        ShellKind::Bash => (
             "set -o ignoreeof; echo kr-ignoreeof-set",
             "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
         ),
+        _ => {
+            println!("skipped: {} has no end-of-file setting of its own", kind.as_str());
+            return;
+        }
     };
     let mut session = Session::start(&package);
     session.first_prompt();
@@ -1532,10 +1621,33 @@ pub fn the_package_declares_the_baseline_the_specification_names(kind: ShellKind
             (major, minor) >= (5, 9),
             "the managed Zsh baseline is 5.9 and this package is {version}"
         ),
-        _ => assert!(
+        ShellKind::Bash => assert!(
             (major, minor) >= (5, 2),
             "the managed Bash baseline is 5.2 and this package is {version}"
         ),
+        ShellKind::Fish => assert!(
+            major >= 4,
+            "the managed fish baseline is 4.x and this package is {version}"
+        ),
+        ShellKind::PowerShell => {
+            assert!(
+                (major, minor) >= (7, 4),
+                "the PowerShell baseline is 7.4 and this package is {version}"
+            );
+            let qualified = &record["qualified"];
+            assert_eq!(
+                qualified["psreadline_from"], "2.3.4",
+                "the package names the PSReadLine range it was qualified against"
+            );
+            let found = qualified["psreadline_found"]
+                .as_str()
+                .expect("the record names the PSReadLine it found");
+            let (psrl_major, psrl_minor) = version_pair(found);
+            assert!(
+                (psrl_major, psrl_minor) >= (2, 3),
+                "a qualified PSReadLine is 2.3.4 or later and this one is {found}"
+            );
+        }
     }
 
     let abi = &record["abi"];
@@ -1587,25 +1699,28 @@ fn record_evidence(kind: ShellKind, package: &Package) {
 /// This replays the committed scenarios against the contract, which is the worker's side; the
 /// cases above are what drives the package. Both read the same files, which is the point.
 pub fn every_scenario_naming_this_shell_holds(kind: ShellKind) {
-    let scenarios = scenarios_for(kind);
+    let named = scenarios_for(kind);
+    // Every scenario but the ones that name another editor's own gesture.
+    let expected = scenarios().len() - 2;
     assert!(
-        scenarios.len() >= 39,
-        "only {} scenarios name {}",
-        scenarios.len(),
+        named.len() >= expected,
+        "only {} of {} scenarios name {}",
+        named.len(),
+        expected,
         kind.as_str()
     );
     let mut failures = Vec::new();
-    for scenario in &scenarios {
+    for scenario in &named {
         failures.extend(contract_failures(scenario));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The shell-independent half of the bridge is the same source in both packages.
+/// The shell-independent half of the bridge is the same source in every package that compiles it.
 ///
-/// The two packages are self-contained because each patch set is published against its own
-/// upstream project under that project's licence. That is a decision, not a licence for the two
-/// copies to drift, so it is checked here.
+/// Each package is self-contained because each patch set is published against its own upstream
+/// project under that project's licence. That is a decision, not a licence for the copies to
+/// drift, so it is checked here.
 pub fn the_bridge_core_is_identical_in_both_packages() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -1621,13 +1736,15 @@ pub fn the_bridge_core_is_identical_in_both_packages() {
     ] {
         let zsh = std::fs::read_to_string(root.join("zsh/src").join(name))
             .unwrap_or_else(|error| panic!("shells/zsh/src/{name}: {error}"));
-        let bash = std::fs::read_to_string(root.join("bash/src").join(name))
-            .unwrap_or_else(|error| panic!("shells/bash/src/{name}: {error}"));
-        assert_eq!(
-            strip_licence_note(&zsh),
-            strip_licence_note(&bash),
-            "shells/zsh/src/{name} and shells/bash/src/{name} have drifted apart"
-        );
+        for other in ["bash", "fish"] {
+            let theirs = std::fs::read_to_string(root.join(other).join("src").join(name))
+                .unwrap_or_else(|error| panic!("shells/{other}/src/{name}: {error}"));
+            assert_eq!(
+                strip_licence_note(&zsh),
+                strip_licence_note(&theirs),
+                "shells/zsh/src/{name} and shells/{other}/src/{name} have drifted apart"
+            );
+        }
     }
 }
 

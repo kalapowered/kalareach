@@ -65,6 +65,23 @@ $script:State = @{
     AcceptRequested  = $false
     CancelRequested  = $false
     IdleReported     = $false
+    EntryReported    = $false
+    EditMode         = 'Emacs'
+    ReaderThreadId   = 0
+}
+
+# A line of diagnostics, when the session asked for them.
+#
+# The integration says what it did and why when something asks it to, and says nothing at all
+# otherwise: a managed root shell writes no file of its own unless the person turned this on.
+function Write-KrTrace {
+    param([string]$Line)
+    if ([string]::IsNullOrEmpty($env:KR_SHELL_BRIDGE_TRACE)) { return }
+    try {
+        [System.IO.File]::AppendAllText(
+            $env:KR_SHELL_BRIDGE_TRACE,
+            ("{0} {1}`n" -f [DateTimeOffset]::Now.ToString('o'), $Line))
+    } catch { }
 }
 
 function Get-KrNowMs {
@@ -180,6 +197,7 @@ function Send-KrBytes {
 function Send-KrFrame {
     param($Value)
     $body = ConvertTo-KrCbor $Value
+    Write-KrTrace ("frame " + [Convert]::ToBase64String($body))
     if ($body.Length -gt $script:KR_MAX_FRAME) { return $false }
     $framed = [byte[]]::new($body.Length + 4)
     $framed[0] = [byte](($body.Length -shr 24) -band 0xFF)
@@ -204,6 +222,7 @@ function Receive-KrAvailable {
             if (-not $socket.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)) { break }
             $count = $socket.Receive($buffer, 0, $buffer.Length, 'None')
             if ($count -eq 0) { Disconnect-KrEndpoint; return $false }
+            Write-KrTrace "received $count bytes"
             for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
         } catch [System.Net.Sockets.SocketException] {
             if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::WouldBlock) { break }
@@ -273,6 +292,7 @@ function New-KrGesture {
 function Send-KrEvent {
     param([string]$Name, [hashtable]$Payload)
     if (-not $script:Kr.Registered) { return }
+    Write-KrTrace "event $Name"
     $script:Kr.EventCounter++
     Send-KrFrame @{
         event = @{
@@ -336,7 +356,7 @@ function Read-KrAccept {
     $script:Kr.GestureDisabled = $false
     $script:Kr.GestureByte = [uint64]4
     $script:Kr.GestureChord = $null
-    if ($Accepted.ContainsKey('gesture')) {
+    if ($Accepted.PSBase.ContainsKey('gesture')) {
         $variant = Get-KrVariant $Accepted['gesture']
         if ($null -ne $variant) {
             switch ($variant.Name) {
@@ -346,7 +366,7 @@ function Read-KrAccept {
             }
         }
     }
-    if ($Accepted.ContainsKey('hint') -and $Accepted['hint'] -is [string]) {
+    if ($Accepted.PSBase.ContainsKey('hint') -and $Accepted['hint'] -is [string]) {
         $script:Kr.Hint = $Accepted['hint']
     }
 }
@@ -356,12 +376,20 @@ function Wait-KrHandshake {
     while ($true) {
         $frame = Read-KrFrame
         if ($null -ne $frame) {
-            $value = try { ConvertFrom-KrCbor $frame } catch { $null }
+            Write-KrTrace "handshake frame of $($frame.Length) bytes"
+            $value = try { ConvertFrom-KrCbor $frame } catch { Write-KrTrace "decode failed: $_"; $null }
             $outcome = if ($null -eq $value) { $null } else { Get-KrVariant $value }
-            if ($null -eq $outcome -or $outcome.Name -ne 'handshake') { return $false }
+            if ($null -eq $outcome -or $outcome.Name -ne 'handshake') {
+                Write-KrTrace "not a handshake: $($outcome.Name)"
+                return $false
+            }
             $verdict = Get-KrVariant $outcome.Payload
-            if ($null -eq $verdict -or $verdict.Name -ne 'accepted') { return $false }
+            if ($null -eq $verdict -or $verdict.Name -ne 'accepted') {
+                Write-KrTrace "refused: $($verdict.Name)"
+                return $false
+            }
             Read-KrAccept $verdict.Payload
+            Write-KrTrace 'accepted'
             return $true
         }
         if ($null -eq $script:Kr.Socket) { return $false }
@@ -458,9 +486,13 @@ function Send-KrCommandAccepted {
     $origin = if ($fenced) {
         @{ fenced = @{ input_epoch = $script:Kr.FenceEpoch; attachment_id = $script:Kr.FenceAttachment } }
     } else { 'unverifiable' }
+    # Assigned rather than written inline: a subexpression takes a byte string apart into its own
+    # numbers, and the fence this names would go out as a list of them.
+    $fenceId = $null
+    if ($fenced) { $fenceId = $script:Kr.FenceId }
     Send-KrEvent 'command_accepted' @{
         origin            = $origin
-        fence_id          = $(if ($fenced) { $script:Kr.FenceId } else { $null })
+        fence_id          = $fenceId
         session_id        = $script:Kr.Session
         prompt_generation = $reader.prompt_generation
     }
@@ -503,7 +535,7 @@ function Test-KrDetachEligible {
     if ($Reader.reader_context -ne 'primary') { return $false }
     if ($Source -eq 'macro' -or $Source -eq 'pushed_back' -or $Source -eq 'paste') { return $false }
     if (-not $Reader.buffer_empty) { return $false }
-    foreach ($flag in $Reader.pending.Values) { if ($flag) { return $false } }
+    foreach ($flag in $Reader.pending.PSBase.Values) { if ($flag) { return $false } }
     $true
 }
 
@@ -622,7 +654,10 @@ function Get-KrLaunchText {
         if ($argument -isnot [string]) { return $null }
         $parts += Get-KrQuotedArgument $argument
     }
-    $parts -join ' '
+    if ($parts.Count -eq 0) { return '' }
+    # The call operator, because the first argument is quoted like the rest: a quoted word at the
+    # start of a line is a string of this shell's rather than the name of what to run.
+    '& ' + ($parts -join ' ')
 }
 
 # `decide_launch`, on the reader's own thread, in the order the reasons matter.
@@ -630,8 +665,9 @@ function Invoke-KrAnswerLaunch {
     param([uint64]$Id, [hashtable]$Request, [bool]$Revoked)
     $transaction = [byte[]]$Request['transaction']
     $fenceId = [byte[]]$Request['fence_id']
-    if ($null -eq $transaction -or $transaction.Length -ne 16) { return }
-    if ($null -eq $fenceId -or $fenceId.Length -ne 16) { return }
+    Write-KrTrace "launch request t=$($transaction.Length) f=$($fenceId.Length) revoked=$Revoked"
+    if ($null -eq $transaction -or $transaction.Length -ne 16) { Write-KrTrace 'launch: no transaction'; return }
+    if ($null -eq $fenceId -or $fenceId.Length -ne 16) { Write-KrTrace 'launch: no fence'; return }
     $expectedPrompt = [uint64]$Request['expected_prompt_generation']
     $expectedBuffer = [uint64]$Request['expected_buffer_revision']
     $expectedCwd = [uint64]$Request['expected_cwd_revision']
@@ -725,6 +761,8 @@ function Invoke-KrAnswerCancel {
         $reader = Get-KrReaderState $script:State
     }
 
+    $reportedReader = if ($readerRevision -ne 0) { $readerRevision } else { $reader.reader_revision }
+    $reportedPrompt = if ($prompt -ne 0) { $prompt } else { $reader.prompt_generation }
     Send-KrFrame @{
         answer = @{
             id     = $Id
@@ -740,9 +778,9 @@ function Invoke-KrAnswerCancel {
                         multikey_sequence = $ended.multikey_sequence
                     }
                     discarded_bytes   = $ended.discarded_bytes
-                    reader_revision   = $(if ($readerRevision -ne 0) { $readerRevision } else { $reader.reader_revision })
+                    reader_revision   = $reportedReader
                     buffer_preserved  = $ended.buffer_preserved
-                    prompt_generation = $(if ($prompt -ne 0) { $prompt } else { $reader.prompt_generation })
+                    prompt_generation = $reportedPrompt
                 }
             }
         }
@@ -852,6 +890,7 @@ function Invoke-KrFrame {
             $id = [uint64]$variant.Payload['id']
             $request = Get-KrVariant $variant.Payload['request']
             if ($null -eq $request) { return }
+            Write-KrTrace "request $($request.Name) id=$id"
             switch ($request.Name) {
                 'fence' { Invoke-KrAnswerFence $id $request.Payload }
                 'launch' {
@@ -889,6 +928,7 @@ function Invoke-KrService {
         while ($true) {
             $body = Read-KrFrame
             if ($null -eq $body -or -not $script:Kr.Registered) { break }
+            Write-KrTrace "handling a frame of $($body.Length) bytes"
             $script:Kr.FrameAtMs = Get-KrNowMs
             Invoke-KrFrame $body
             if ($script:State.CancelRequested) { break }

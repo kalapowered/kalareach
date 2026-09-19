@@ -10,7 +10,8 @@
 Set-StrictMode -Version 3.0
 
 function New-KrCborWriter {
-    [System.Collections.Generic.List[byte]]::new(256)
+    # The comma keeps the list whole: a collection returned bare comes back as its own elements.
+    , [System.Collections.Generic.List[byte]]::new(256)
 }
 
 function Write-KrCborHead {
@@ -18,12 +19,14 @@ function Write-KrCborHead {
     $tag = [byte]($Major -shl 5)
     if ($Value -lt 24) {
         $Writer.Add([byte]($tag -bor [byte]$Value))
-    } elseif ($Value -le 0xFF) {
+    } elseif ($Value -le 255) {
         $Writer.Add([byte]($tag -bor 24)); $Writer.Add([byte]$Value)
-    } elseif ($Value -le 0xFFFF) {
+    } elseif ($Value -le 65535) {
         $Writer.Add([byte]($tag -bor 25))
         $Writer.Add([byte](($Value -shr 8) -band 0xFF)); $Writer.Add([byte]($Value -band 0xFF))
-    } elseif ($Value -le 0xFFFFFFFF) {
+        # Written out rather than in hexadecimal: this shell reads 0xFFFFFFFF as a signed value,
+        # and everything above it would then take the widest form rather than the shortest.
+    } elseif ($Value -le 4294967295) {
         $Writer.Add([byte]($tag -bor 26))
         for ($shift = 24; $shift -ge 0; $shift -= 8) {
             $Writer.Add([byte](($Value -shr $shift) -band 0xFF))
@@ -55,10 +58,12 @@ function Write-KrCborValue {
         return
     }
     if ($Value -is [hashtable]) {
-        # Canonical order: the shorter key first, then bytewise.
-        $keys = @($Value.Keys) | Sort-Object -Property @{ Expression = { $_.Length } }, @{ Expression = { $_ } }
-        Write-KrCborHead $Writer 5 ([uint64]$keys.Count)
-        foreach ($key in $keys) {
+        # Canonical order: the shorter key first, then bytewise. The map is reached through its
+        # own base object, because a key named after one of its properties would otherwise answer
+        # in the property's place.
+        $entries = @($Value.PSBase.Keys | Sort-Object -Property @{ Expression = { "$_".Length } }, @{ Expression = { "$_" } })
+        Write-KrCborHead $Writer 5 ([uint64]$entries.Length)
+        foreach ($key in $entries) {
             Write-KrCborValue $Writer ([string]$key)
             Write-KrCborValue $Writer $Value[$key]
         }
@@ -124,11 +129,13 @@ function Read-KrCborValue {
     switch ($major) {
         0 { $At.Value = $i; return $value }
         2 {
+            # A name of its own: this shell's variables do not tell case apart, so anything called
+            # `$bytes` here would be the frame itself.
             $length = [int]$value
-            $bytes = [byte[]]::new($length)
-            if ($length -gt 0) { [Array]::Copy($Bytes, $i, $bytes, 0, $length) }
+            $chunk = [byte[]]::new($length)
+            if ($length -gt 0) { [Array]::Copy($Bytes, $i, $chunk, 0, $length) }
             $At.Value = $i + $length
-            return , $bytes
+            return , $chunk
         }
         3 {
             $length = [int]$value
@@ -186,8 +193,8 @@ function ConvertFrom-KrCbor {
 function Get-KrVariant {
     param($Value)
     if ($Value -is [string]) { return @{ Name = $Value; Payload = $null } }
-    if ($Value -is [hashtable] -and $Value.Count -eq 1) {
-        $name = @($Value.Keys)[0]
+    if ($Value -is [hashtable] -and $Value.PSBase.Count -eq 1) {
+        $name = @($Value.PSBase.Keys)[0]
         return @{ Name = [string]$name; Payload = $Value[$name] }
     }
     $null

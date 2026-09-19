@@ -22,9 +22,9 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_ulong};
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::RawFd;
 
-use super::reader::{Reader, ReaderData};
+use super::reader::{Reader, ReaderData, kr_terminal_eof};
 use crate::env::{EnvMode, EnvSetMode, EnvStack, Environment as _};
 use crate::input::{
     CharEvent, DEFAULT_BIND_MODE, InputEventQueuer as _, KeyNameStyle, ReadlineCmd, bindings,
@@ -185,6 +185,8 @@ struct BridgeState {
 
     /// A takeover's cancellation: requested inside the wait, settled at the next boundary.
     cancel_requested: bool,
+    /// The old lease's undelivered input, dropped once the reader is out of what it was inside.
+    cancel_drain: bool,
     /// The text a launch installed, so a revocation takes exactly that back out.
     installed: Option<WString>,
     /// Set by the core when it accepts a line; acted on once the core's call has returned.
@@ -217,6 +219,7 @@ static STATE: BridgeStateCell = BridgeStateCell(UnsafeCell::new(BridgeState {
     source_pushed_back: false,
     idle_reported: false,
     cancel_requested: false,
+    cancel_drain: false,
     installed: None,
     accept_requested: false,
     gesture_key: None,
@@ -552,22 +555,13 @@ pub unsafe extern "C" fn kr_shell_print_hint(line: *const c_char) {
 }
 
 /// The terminal's `VEOF`, or -1 when the terminal has no end-of-file character.
+///
+/// The reader holds the terminal in the shell's own modes while it reads, and those keep their own
+/// control characters, so the character the person configured is the one the shell hands to the
+/// programs it runs. A disabled `VEOF` leaves the terminal with no gesture, so no character is one.
 #[unsafe(no_mangle)]
 pub extern "C" fn kr_shell_veof() -> c_int {
-    let fd = parked_data().map_or(libc::STDIN_FILENO, |data| data.kr_input_fd());
-    if fd < 0 {
-        return -1;
-    }
-    // Safety: the reader owns this descriptor for as long as it is reading from it.
-    let Ok(modes) = nix::sys::termios::tcgetattr(unsafe { BorrowedFd::borrow_raw(fd) }) else {
-        return -1;
-    };
-    let veof = modes.control_chars[libc::VEOF];
-    if veof == libc::_POSIX_VDISABLE {
-        // A disabled `VEOF` leaves the terminal with no gesture, so no character is one.
-        return -1;
-    }
-    c_int::from(veof)
+    kr_terminal_eof()
 }
 
 /// Removes one variable from the shell's own exported environment.
@@ -672,6 +666,7 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
         state.source_pushed_back = false;
         state.idle_reported = false;
         state.cancel_requested = false;
+        state.cancel_drain = false;
         state.installed = None;
         state.accept_requested = false;
         state.inside_reader = true;
@@ -702,6 +697,7 @@ pub fn editor_leave(reader: &mut Reader<'_>, reason: c_int) {
         state.installed = None;
         state.accept_requested = false;
         state.cancel_requested = false;
+        state.cancel_drain = false;
     }
     with_reader(reader, || {
         // Safety: the reader is parked for the whole of these calls.
@@ -747,6 +743,9 @@ fn settle(reader: &mut Reader<'_>) -> bool {
         // back the part-read sequence, handle this first and try the sequence again. The edit
         // buffer is not touched by any of it.
         reader.push_front(CharEvent::from_check_exit());
+        // The part-read sequence comes back to the queue behind that event, and it is the old
+        // lease's undelivered input, so it goes at the boundary this pass ends at.
+        state().cancel_drain = true;
         state().idle_reported = false;
         with_reader(reader, || {
             // Safety: the reader is parked for the whole of the call.
@@ -776,6 +775,11 @@ pub fn boundary(reader: &mut Reader<'_>) {
 /// This is one of the three points a worker retries a withheld fence at.
 pub fn before_wait(reader: &mut Reader<'_>) {
     if !registered() {
+        return;
+    }
+    if reader.kr_querying() || terminal_typeahead(reader.kr_input_fd()) > 0 {
+        // A reader with bytes still waiting on its terminal has something left to read, whether
+        // that is the person's typing or the answer to a question it asked the terminal itself.
         return;
     }
     {
@@ -818,7 +822,14 @@ pub fn pass_end(reader: &mut Reader<'_>) {
     if !registered() {
         return;
     }
-    state().idle_reported = false;
+    if std::mem::take(&mut state().cancel_drain) {
+        // The reader is out of whatever the cancellation ended, so the old lease's undelivered
+        // input goes here rather than reaching the person's next prompt. The edit buffer, which
+        // is not input, stays exactly as it was.
+        reader.input_data.queue.retain(|event| !event.is_char());
+        state().peeked_keys = 0;
+        state().idle_reported = false;
+    }
     let _ = service(reader);
 }
 

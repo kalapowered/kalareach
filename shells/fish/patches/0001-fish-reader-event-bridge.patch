@@ -223,7 +223,7 @@
  use libc::{
      _POSIX_VDISABLE, SIGINT, STDIN_FILENO, STDOUT_FILENO, VMIN, VQUIT, VSUSP, VTIME, c_char,
  };
-@@ -795,6 +796,59 @@
+@@ -795,6 +796,82 @@
      }
  }
  
@@ -268,6 +268,14 @@
 +        self.update_buff_pos(EditableLineTag::Commandline, None);
 +    }
 +
++    /// True while the reader is waiting for a terminal query's own answer.
++    ///
++    /// A reader that has asked the terminal something and is waiting for the reply is not idle,
++    /// and the bytes still unread are the terminal's answer rather than anybody's typing.
++    pub(super) fn kr_querying(&self) -> bool {
++        self.input_data.blocking_query.is_some()
++    }
++
 +    /// Prints one line above the prompt and draws the prompt again below it.
 +    pub(super) fn kr_print_above_prompt(&mut self, line: &wstr) {
 +        let mut text = WString::from_str("\r\n");
@@ -280,10 +288,25 @@
 +    }
 +}
 +
++/// The terminal's own end-of-file character, or -1 when it has none.
++///
++/// The reader runs with the shell's own terminal modes, which keep their own control characters,
++/// so the character the person configured is read from the modes the shell hands to the programs
++/// it runs. Those are refreshed from the terminal after every command, which is where a `stty`
++/// of the person's own lands.
++pub(super) fn kr_terminal_eof() -> i32 {
++    let modes = TTY_MODES_FOR_EXTERNAL_CMDS.lock().unwrap();
++    let eof = modes.control_chars[libc::VEOF];
++    if eof == _POSIX_VDISABLE {
++        return -1;
++    }
++    i32::from(eof)
++}
++
  /// Read commands from \c fd until encountering EOF.
  /// The fd is not closed.
  pub fn reader_read(parser: &mut Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
-@@ -2606,6 +2660,10 @@
+@@ -2606,6 +2683,10 @@
          }
          self.exec_prompt(true, false);
  
@@ -294,7 +317,7 @@
          // Start out as initially dirty.
          self.force_exec_prompt_and_repaint = true;
  
-@@ -2622,6 +2680,9 @@
+@@ -2622,6 +2703,9 @@
              if self.handle_char_event(None).is_break() || self.rls().finished {
                  break;
              }
@@ -304,7 +327,7 @@
          }
  
          // Disable tty protocols now that we're going to execute a command.
-@@ -2678,6 +2739,17 @@
+@@ -2678,6 +2762,17 @@
              }
              Outputter::stdoutput().borrow_mut().reset_text_face();
          }
@@ -322,7 +345,7 @@
          let result = self
              .rls()
              .finished
-@@ -3393,6 +3465,11 @@
+@@ -3393,6 +3488,11 @@
                      self.exit_loop_requested = true;
                      check_exit_loop_maybe_warning(Some(self));
                  }

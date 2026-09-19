@@ -43,13 +43,18 @@ function Get-KrBufferCursor {
     $cursor
 }
 
+# The keymap the editor is in.
+#
+# Read from the editor's own statics, and from the edit mode the reader recorded at its boundary:
+# asking the editor for its options runs a command, and the reader's own thread is inside the read
+# loop when this is asked, where a command of ours would wait for the runspace holding it.
 function Get-KrKeymap {
+    param([string]$EditMode)
     try {
         if ($script:Rl::InViCommandMode()) { return 'vi_command' }
         if ($script:Rl::InViInsertMode()) { return 'vi_insert' }
     } catch { }
-    $mode = try { (Get-PSReadLineOption).EditMode } catch { $null }
-    switch ("$mode") {
+    switch ($EditMode) {
         'Vi' { 'vi_insert' }
         'Emacs' { 'emacs' }
         'Windows' { 'emacs' }
@@ -57,22 +62,79 @@ function Get-KrKeymap {
     }
 }
 
-# How many bytes the terminal is still holding for this reader.
+$script:QueuedKeysField = $null
+$script:SingletonField = $null
+
+# How many keys the reader has taken and not yet acted on.
 #
-# The host reads keys rather than bytes, so this is the console's own answer to whether anything is
-# waiting: what matters to a fence is whether the queue is clear, and a lower bound of one says so
-# exactly when it is not.
-function Get-KrTypeahead {
+# The editor reads keys on a thread of its own and holds them in its own queue, and it publishes no
+# count of them. The queue itself is what a fence rests on, so it is read directly, under the
+# version range this package was qualified against; asking the console whether a key is available
+# instead would take the lock the editor's own read is holding, and the reader would wait for
+# itself.
+function Get-KrQueuedKeys {
     try {
-        if ([Console]::KeyAvailable) { return [uint64]1 }
+        if ($null -eq $script:SingletonField) {
+            $script:SingletonField = $script:Rl.GetField('_singleton', 'NonPublic,Static')
+            $script:QueuedKeysField = $script:Rl.GetField('_queuedKeys', 'NonPublic,Instance')
+        }
+        if ($null -eq $script:SingletonField -or $null -eq $script:QueuedKeysField) { return [uint64]0 }
+        $singleton = $script:SingletonField.GetValue($null)
+        if ($null -eq $singleton) { return [uint64]0 }
+        $queue = $script:QueuedKeysField.GetValue($singleton)
+        if ($null -eq $queue) { return [uint64]0 }
+        return [uint64]$queue.Count
+    } catch {
+        return [uint64]0
+    }
+}
+
+$script:SearchCountField = $null
+$script:StatusPromptField = $null
+
+# The modes the editor enters rather than the operations it runs.
+#
+# A history search and a numeric argument are states of the editor between keys, not nested reads,
+# so there is no handler of this package's to be inside while one is running. The editor keeps them
+# where this package was qualified to find them.
+function Get-KrEditorModes {
+    $modes = @{ search = $false; numeric_argument = $false }
+    try {
+        if ($null -eq $script:SearchCountField) {
+            $script:SearchCountField = $script:Rl.GetField('_searchHistoryCommandCount', 'NonPublic,Instance')
+            $script:StatusPromptField = $script:Rl.GetField('_statusLinePrompt', 'NonPublic,Instance')
+        }
+        $singleton = $script:SingletonField.GetValue($null)
+        if ($null -eq $singleton) { return $modes }
+        if ($null -ne $script:SearchCountField) {
+            $modes.search = ([int]$script:SearchCountField.GetValue($singleton)) -gt 0
+        }
+        if ($null -ne $script:StatusPromptField) {
+            $prompt = "$($script:StatusPromptField.GetValue($singleton))"
+            if ($prompt -like '*i-search*') { $modes.search = $true }
+            if ($prompt -like 'digit-argument*') { $modes.numeric_argument = $true }
+        }
     } catch { }
-    [uint64]0
+    $modes
+}
+
+# Whether the editor's own key queue can be read at all, which is what a fence rests on here.
+function Test-KrQueueReadable {
+    try {
+        $singleton = $script:Rl.GetField('_singleton', 'NonPublic,Static')
+        $queued = $script:Rl.GetField('_queuedKeys', 'NonPublic,Instance')
+        return ($null -ne $singleton -and $null -ne $queued)
+    } catch {
+        return $false
+    }
 }
 
 # One revision per observed change, counted where it is read.
 function Update-KrRevisions {
     param([hashtable]$State)
-    $text = Get-KrBufferText
+    # Before the reader has started, the editor still holds the line that has just been accepted,
+    # and the buffer this reader is about to have is empty.
+    $text = if ($State.EntryReported) { Get-KrBufferText } else { '' }
     if ($text -ne $State.BufferSeen) {
         $State.BufferSeen = $text
         $State.BufferRevision++
@@ -90,30 +152,33 @@ function Get-KrReaderState {
 
     Update-KrRevisions $State
     $text = $State.BufferSeen
-    $typeahead = Get-KrTypeahead
+    $queued = Get-KrQueuedKeys
+    $typeahead = $queued
     if ($State.KeySelected) { $typeahead++ }
+    $modes = Get-KrEditorModes
 
     @{
         prompt_generation = [uint64]$State.PromptGeneration
         reader_revision   = [uint64]$State.ReaderRevision
-        reader_context    = $(if ($State.InsideReader -gt 0) { 'primary' } else { 'primary' })
+        # The only other reader this host starts does not read through this editor at all.
+        reader_context    = 'primary'
         buffer_revision   = [uint64]$State.BufferRevision
         buffer_empty      = [bool]($text.Length -eq 0)
-        keymap            = Get-KrKeymap
+        keymap            = Get-KrKeymap $State.EditMode
         pending           = @{
             quoted_insertion  = [bool]($script:Pending.quoted_insertion -gt 0)
             macro_input       = [bool]($script:Pending.macro_input -gt 0)
-            search            = [bool]($script:Pending.search -gt 0)
-            numeric_argument  = [bool]($script:Pending.numeric_argument -gt 0)
+            search            = [bool](($script:Pending.search -gt 0) -or $modes.search)
+            numeric_argument  = [bool](($script:Pending.numeric_argument -gt 0) -or $modes.numeric_argument)
             multikey_sequence = [bool]($script:Pending.multikey_sequence -gt 0)
             vi_motion         = [bool]($script:Pending.vi_motion -gt 0)
             paste             = [bool]($script:Pending.paste -gt 0)
         }
         keys              = [byte[]]$State.InvokingKeys
-        queued_keys       = [uint64]0
+        queued_keys       = [uint64]$queued
         pending_bytes     = [uint64]$typeahead
         tty_typeahead_drained = [bool]($typeahead -eq 0)
-        macro_input_drained   = [bool]($script:Pending.macro_input -eq 0)
+        macro_input_drained   = [bool]($queued -eq 0 -and $script:Pending.macro_input -eq 0)
         partial_key_drained   = [bool]($script:Pending.multikey_sequence -eq 0)
         cwd_revision      = [uint64]$State.CwdRevision
     }
@@ -155,11 +220,39 @@ function Invoke-KrRemoveInstalled {
     $true
 }
 
+$script:KeyFromConsoleKey = $null
+
 # Accepts the installed line through the editor's own acceptance.
+#
+# The acceptance is submitted twice over, because this editor completes it at its own next step
+# rather than where it is asked: the editor's own accept is called, and its own return key goes
+# into its own key queue, which is drained before anything the terminal has. The module claims no
+# asynchronous editing method the editor does not have, so a line installed while the reader is
+# waiting for a key is accepted when the reader next steps.
 function Invoke-KrAcceptLine {
     param([hashtable]$State)
     $State.Installed = ''
-    try { $script:Rl::AcceptLine() } catch { return $false }
+    try {
+        if ($null -eq $script:KeyFromConsoleKey) {
+            $keyInfo = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo')
+            if ($null -ne $keyInfo) {
+                $script:KeyFromConsoleKey = $keyInfo.GetMethod(
+                    'From', 'Public,NonPublic,Static', $null, [type[]]@([System.ConsoleKey]), $null)
+            }
+        }
+        if ($null -ne $script:KeyFromConsoleKey) {
+            $singleton = $script:SingletonField.GetValue($null)
+            $queue = $script:QueuedKeysField.GetValue($singleton)
+            $queue.Enqueue($script:KeyFromConsoleKey.Invoke($null, @([System.ConsoleKey]::Enter)))
+        }
+    } catch {
+        Write-KrTrace "queueing the acceptance failed: $($_.Exception.Message)"
+    }
+    try { $script:Rl::AcceptLine() } catch {
+        Write-KrTrace "accept failed: $($_.Exception.Message)"
+        return $false
+    }
+    Write-KrTrace 'accepted the installed line'
     $true
 }
 
@@ -185,7 +278,7 @@ function Invoke-KrCancelKeyWait {
         # The wrappers watch this: the one that is running comes out at its next key, leaving the
         # buffer as it found it.
         $State.CancelRequested = $true
-        $ended.discarded_bytes = [uint64](Get-KrTypeahead)
+        $ended.discarded_bytes = Get-KrQueuedKeys
     }
     $ended
 }
