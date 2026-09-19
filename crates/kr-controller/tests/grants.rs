@@ -1765,6 +1765,64 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
     assert_eq!(restored.accepted_floor(), result.authority_revision);
 }
 
+/// An authority change carrying an admission that no longer stands withdraws nothing.
+#[tokio::test]
+async fn a_revocation_whose_admission_no_longer_stands_withdraws_nothing() {
+    let (_temp, controller) = daemon().await;
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()))
+        .expect("written");
+
+    // An admission from a connection this daemon holds no registration for. Whatever the clock
+    // says, it stands for nothing, and the withdrawal it was carrying does not happen.
+    let lapsed = kr_controller::authority::AdmittedMutation {
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([1; 16])),
+        admitted_revision: controller.policy().authority_revision(),
+        deadline: None,
+    };
+    let refused = tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(held.grant_id, Some(&lapsed)),
+    )
+    .await
+    .expect("completes")
+    .expect_err("an admission that no longer stands withdraws nothing");
+    assert!(
+        refused.to_string().contains("registration")
+            || refused.to_string().contains("registered")
+            || refused.to_string().contains("withdrawn"),
+        "unexpected refusal: {refused}"
+    );
+    let stored = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(stored.revoked_at_ms.is_none(), "the grant still stands");
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+            .is_empty(),
+        "and nothing is owed a fence"
+    );
+
+    // The same revocation, carrying nothing, is the local owner's own and goes through.
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(held.grant_id, None),
+    )
+    .await
+    .expect("completes")
+    .expect("succeeds");
+}
+
 /// Revoking the same grant twice withdraws nothing the second time, and fences nothing.
 #[tokio::test]
 async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {

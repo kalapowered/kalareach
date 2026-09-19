@@ -1256,13 +1256,17 @@ impl Controller {
     /// re-admitted at all.
     ///
     /// `carried` is as [`Self::revoke_grant`]: the admission of the mutation this is performing.
-    /// This withdrawal is three writes rather than one, in three stores, and each of them waits
-    /// for a lock of its own, so the admission is checked again before each.
+    /// This withdrawal is more than one write and they are not in one store, so the admission is
+    /// checked while it can still decide: before the grants are read, inside the transaction that
+    /// withdraws them, and again before the device record when that transaction withdrew nothing
+    /// and the record is therefore the whole withdrawal. Once something is withdrawn, the rest
+    /// follows whatever the clock has done since, because a half-finished revocation is worse than
+    /// a late one.
     ///
     /// # Errors
     ///
     /// Returns an error when the grant store, the device record or the registry cannot be written,
-    /// or when the admission has lapsed by the time one of the writes would happen.
+    /// or when the admission has lapsed before anything was withdrawn.
     pub async fn revoke_device_authority(
         &self,
         device_id: kr_protocol::ids::DeviceId,
@@ -1297,20 +1301,29 @@ impl Controller {
             // could delete the row another caller was relying on. Reading the record first is what
             // keeps a repeat from fencing the host again, and two callers racing the first
             // revocation both fence, which is the harmless direction.
+            if revocation.revoked.is_empty() {
+                // Nothing is withdrawn yet, so the admission still decides whether this happens at
+                // all, and it is checked once more: the transaction above waited for the grant
+                // store's lock, and a device that holds its grant in its pairing record has no
+                // grant row there, which makes the device record below its whole withdrawal.
+                //
+                // Where the transaction *did* withdraw something, the opposite is true. That is
+                // committed, and a deadline that passes afterwards is no reason to stop half way:
+                // grants withdrawn and a device record still live is the dangerous state, and a
+                // revocation takes authority away rather than granting any, so finishing it is
+                // always the safe direction. Nothing below returns early for a lapsed admission,
+                // which is what keeps a committed withdrawal fenced.
+                self.still_admitted(registry.as_deref(), carried)?;
+            }
             if self
                 .devices
                 .record_for_device(device_id)?
                 .is_some_and(|record| record.revoked_at_ms.is_none())
             {
-                // Checked again: the grant transaction and this read each waited for a lock of
-                // their own. For a device that holds its grant in its pairing record there is no
-                // grant row at all, so what follows is its whole withdrawal.
-                self.still_admitted(registry.as_deref(), carried)?;
                 self.sharing
                     .grants()
                     .owe_fence([kr_protocol::ids::GrantId::new(device_id.get())], now_ms)?;
             }
-            self.still_admitted(registry.as_deref(), carried)?;
             self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
             revocation
         };

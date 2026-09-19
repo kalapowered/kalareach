@@ -453,13 +453,23 @@ impl GrantDirectory {
             // thing between this call and the first withdrawal rather than the first of several
             // reads. Revoking a grant changes no parent link, so a subtree read now is the same
             // subtree the writes act on.
+            //
+            // A grant reached from two of this device's roots is kept once, under the first root
+            // that reaches it, which is the root its record would have named anyway: the write
+            // below takes each row only while it is still live, so a second root never revoked it
+            // twice. Keeping every copy would hold a whole chain of grants once per grant.
+            let mut claimed: BTreeSet<GrantId> = BTreeSet::new();
             let mut subtrees = Vec::new();
             for record in held {
                 if record.revoked_at_ms.is_some() {
                     continue;
                 }
                 let grant_id = record.grant.grant_id;
-                subtrees.push((grant_id, Self::subtree_to_revoke(connection, grant_id)?));
+                let subtree: Vec<GrantRecord> = Self::subtree_to_revoke(connection, grant_id)?
+                    .into_iter()
+                    .filter(|record| claimed.insert(record.grant.grant_id))
+                    .collect();
+                subtrees.push((grant_id, subtree));
             }
             still_admitted()?;
             for (grant_id, subtree) in &subtrees {

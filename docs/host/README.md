@@ -489,12 +489,17 @@ the durable write rather than before it, so a create that queued past its deadli
 reservation instead of starting a shell. `session.close` checks it once it holds the worker's
 client, which is where the waiting happens.
 
-The authority changes follow the same rule inside the grant store. `grant.create` checks it again
-inside the transaction that writes the grant and its invitation, after the parent is resolved.
-`grant.revoke` checks it once the subtree it is about to withdraw has been read, which walks every
-grant this host holds. `device.revoke` is three writes in three stores, each waiting for a lock of
-its own, so it checks before the grants, before the fence it owes and before the device's own
-record is marked.
+The authority changes take the two locks the other way round, because the admission is a question
+about the registry: they hold the registry guard and take the grant store's lock inside it, and
+nothing takes those two in the other order. The check itself is the same, and it happens inside the
+grant store's transaction. `grant.create` checks once the parent is resolved and before the grant
+and its invitation are written. `grant.revoke` checks once the subtree it is about to withdraw has
+been read, which walks every grant this host holds. `device.revoke` withdraws the grants in that
+transaction and then marks the device's own record, which is a separate store: it checks again
+before that record only when the transaction withdrew nothing, because then the record is the whole
+withdrawal. Once something is withdrawn, the rest of a revocation follows whatever the clock has
+done since. A revocation takes authority away rather than granting any, and grants withdrawn beside
+a device record still live is the state worth avoiding.
 
 An admission can carry **no deadline at all**, and that is not the same as one whose deadline has
 passed. A retry of an action this host may already hold has no freshness: section 9 keeps a receipt
