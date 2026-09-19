@@ -489,6 +489,13 @@ the durable write rather than before it, so a create that queued past its deadli
 reservation instead of starting a shell. `session.close` checks it once it holds the worker's
 client, which is where the waiting happens.
 
+The authority changes follow the same rule inside the grant store. `grant.create` checks it again
+inside the transaction that writes the grant and its invitation, after the parent is resolved.
+`grant.revoke` checks it once the subtree it is about to withdraw has been read, which walks every
+grant this host holds. `device.revoke` is three writes in three stores, each waiting for a lock of
+its own, so it checks before the grants, before the fence it owes and before the device's own
+record is marked.
+
 An admission can carry **no deadline at all**, and that is not the same as one whose deadline has
 passed. A retry of an action this host may already hold has no freshness: section 9 keeps a receipt
 readable after the window that admitted it is gone, so the daemon forwards such a mutation with a

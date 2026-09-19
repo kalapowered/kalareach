@@ -174,6 +174,20 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
         );
     }
 
+    // The check runs after the read, not before it: a revocation that names a grant this host does
+    // not hold is refused by the read, and the check is never reached. Reading a subtree walks
+    // every grant the host holds, so a check that ran before it would be a check with a read still
+    // to come.
+    let missing = directory.revoke(grant_id(9), 4_150, || {
+        panic!("the check runs once the rows to withdraw have been read");
+    });
+    assert!(
+        missing
+            .expect_err("no such grant")
+            .to_string()
+            .contains("no such grant")
+    );
+
     // And with an admission that still stands, the same call withdraws.
     directory
         .revoke(held.grant_id, 4_200, || Ok(()))

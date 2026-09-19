@@ -1209,9 +1209,10 @@ impl Controller {
     /// retry that changed nothing.
     ///
     /// `carried` is the admission of the mutation this revocation is performing, when it is
-    /// performing one. It is checked again inside the transaction that withdraws the rows, because
-    /// an admission has a deadline and the wait for the store's lock can outlast it. The local
-    /// owner's own revocation carries none.
+    /// performing one. It is checked again inside the transaction that withdraws the rows, once
+    /// the rows have been read and immediately before the first of them changes: an admission has
+    /// a deadline, and the wait for the store's lock and the read that follows it can each outlast
+    /// one. The local owner's own revocation carries none.
     ///
     /// # Errors
     ///
@@ -1254,60 +1255,65 @@ impl Controller {
     /// revision now in force, and the revoked device's record is already marked so it cannot be
     /// re-admitted at all.
     ///
-    /// `carried` is as [`Self::revoke_grant`]: the admission of the mutation this is performing,
-    /// checked again where the grants are withdrawn.
+    /// `carried` is as [`Self::revoke_grant`]: the admission of the mutation this is performing.
+    /// This withdrawal is three writes rather than one, in three stores, and each of them waits
+    /// for a lock of its own, so the admission is checked again before each.
     ///
     /// # Errors
     ///
     /// Returns an error when the grant store, the device record or the registry cannot be written,
-    /// or when the admission has lapsed by the time the grants would be withdrawn.
+    /// or when the admission has lapsed by the time one of the writes would happen.
     pub async fn revoke_device_authority(
         &self,
         device_id: kr_protocol::ids::DeviceId,
         carried: Option<&crate::authority::AdmittedMutation>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
-        // Held across all three writes below and dropped before the fence, which takes it again.
-        let registry = match carried {
-            Some(carried) => {
-                let registry = self.registry.lock().await;
-                self.check_admission(&registry, carried)?;
-                Some(registry)
+        // Every write this makes happens while the registry guard is held, and the guard goes
+        // before the fence, which takes it again. The block is what drops it: nothing this holds
+        // may be alive across the await below.
+        let revocation = {
+            let registry = match carried {
+                Some(carried) => {
+                    let registry = self.registry.lock().await;
+                    self.check_admission(&registry, carried)?;
+                    Some(registry)
+                }
+                None => None,
+            };
+            let revocation = self.sharing.grants().revoke_device(device_id, now_ms, || {
+                self.still_admitted(registry.as_deref(), carried)
+            })?;
+            // The device record is marked revoked before the revision advances, so nothing can be
+            // authorised against it in between. The directory is a view on this daemon's own
+            // registry database, which is the file the network half keeps its device records in.
+            // A device can hold its grant in the pairing record and have no row in the grant
+            // store, so its own withdrawal owes a fence in its own right, keyed by the device's
+            // identity. The intent is written **before** the record changes, because a debt
+            // recorded after a withdrawal that then failed to record would be a withdrawal nothing
+            // fences.
+            // The intent is written only when there is a withdrawal to fence, and once written it
+            // is never taken back: a caller that decided its own work was done and deleted the row
+            // could delete the row another caller was relying on. Reading the record first is what
+            // keeps a repeat from fencing the host again, and two callers racing the first
+            // revocation both fence, which is the harmless direction.
+            if self
+                .devices
+                .record_for_device(device_id)?
+                .is_some_and(|record| record.revoked_at_ms.is_none())
+            {
+                // Checked again: the grant transaction and this read each waited for a lock of
+                // their own. For a device that holds its grant in its pairing record there is no
+                // grant row at all, so what follows is its whole withdrawal.
+                self.still_admitted(registry.as_deref(), carried)?;
+                self.sharing
+                    .grants()
+                    .owe_fence([kr_protocol::ids::GrantId::new(device_id.get())], now_ms)?;
             }
-            None => None,
+            self.still_admitted(registry.as_deref(), carried)?;
+            self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
+            revocation
         };
-        let revocation = self.sharing.grants().revoke_device(device_id, now_ms, || {
-            match (registry.as_deref(), carried) {
-                (Some(registry), Some(carried)) => self.check_admission(registry, carried),
-                _ => Ok(()),
-            }
-        })?;
-        // The device record is marked revoked before the revision advances, so nothing can be
-        // authorised against it in between. The directory is a view on this daemon's own registry
-        // database, which is the file the network half keeps its device records in.
-        // A device can hold its grant in the pairing record and have no row here, so the device
-        // record changing is a withdrawal in its own right. Reading only the grant rows would let
-        // exactly that device keep a live connection.
-        // A device can hold its grant in the pairing record and have no row in the grant store, so
-        // its own withdrawal owes a fence in its own right, keyed by the device's identity. The
-        // intent is written **before** the record changes, because a debt recorded after a
-        // withdrawal that then failed to record would be a withdrawal nothing fences.
-        // The intent is written only when there is a withdrawal to fence, and once written it is
-        // never taken back: a caller that decided its own work was done and deleted the row could
-        // delete the row another caller was relying on. Reading the record first is what keeps a
-        // repeat from fencing the host again, and two callers racing the first revocation both
-        // fence, which is the harmless direction.
-        if self
-            .devices
-            .record_for_device(device_id)?
-            .is_some_and(|record| record.revoked_at_ms.is_none())
-        {
-            self.sharing
-                .grants()
-                .owe_fence([kr_protocol::ids::GrantId::new(device_id.get())], now_ms)?;
-        }
-        self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
-        drop(registry);
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
     }
@@ -1594,6 +1600,23 @@ impl Controller {
                     }
                 }
             })
+    }
+
+    /// The admission check a mutation's own effect repeats, when it is carrying an admission.
+    ///
+    /// A withdrawal is several writes in several stores, and each waits for a lock of its own. The
+    /// check is cheap and the guard is already held, so it is repeated before each write rather
+    /// than made once and trusted afterwards. `None` on either side is the local owner's own path,
+    /// which carries no mutation window.
+    fn still_admitted(
+        &self,
+        registry: Option<&Registry>,
+        carried: Option<&crate::authority::AdmittedMutation>,
+    ) -> Result<()> {
+        match (registry, carried) {
+            (Some(registry), Some(carried)) => self.check_admission(registry, carried),
+            _ => Ok(()),
+        }
     }
 
     /// Returns the table of admitted connections.

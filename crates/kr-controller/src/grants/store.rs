@@ -392,9 +392,10 @@ impl GrantDirectory {
     /// that was already revoked on its own is left as it was, for the same reason.
     ///
     /// `still_admitted` is run inside the transaction, once this call holds the store's lock and
-    /// before anything is written. A request is admitted with a deadline, and the wait for that
-    /// lock can outlast it, so a check made before the wait says only what was true before the
-    /// wait. A caller with nothing to re-check passes `|| Ok(())`.
+    /// once it has read what it is about to withdraw, immediately before the first write. A
+    /// request is admitted with a deadline, and the wait for that lock and the read that follows
+    /// it can both outlast it, so a check made before either says only what was true before them.
+    /// A caller with nothing to re-check passes `|| Ok(())`.
     ///
     /// # Errors
     ///
@@ -410,8 +411,11 @@ impl GrantDirectory {
         // and the update would otherwise escape the cascade entirely, and a crash part way through
         // the loop would leave a subtree half revoked.
         self.in_transaction(|connection| {
+            // Read first, check second, write third. Reading a subtree walks every grant this host
+            // holds, so a check made before it is a check with a read still to come.
+            let subtree = Self::subtree_to_revoke(connection, grant_id)?;
             still_admitted()?;
-            Self::revoke_within(connection, grant_id, now_ms)
+            Self::revoke_subtree(connection, grant_id, &subtree, now_ms)
         })
     }
 
@@ -420,8 +424,8 @@ impl GrantDirectory {
     /// One transaction for the whole set, for the same reason one revocation is: a grant issued to
     /// that device between two of these would survive its own device's revocation.
     ///
-    /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, after the device's
-    /// grants are read and before the first of them is withdrawn.
+    /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, after every subtree
+    /// this would withdraw has been read and before the first of them is withdrawn.
     ///
     /// # Errors
     ///
@@ -434,7 +438,6 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         self.in_transaction(|connection| {
             let held = read_for_device(connection, device_id)?;
-            still_admitted()?;
             let mut merged = GrantRevocation {
                 grant_id: held.first().map_or_else(
                     || GrantId::new(kr_protocol::scalars::Uuid::NIL),
@@ -446,11 +449,21 @@ impl GrantDirectory {
                 covers_every_session: false,
             };
             merged.devices.insert(device_id);
+            // Every subtree is read before any of them is written, so the check below is the last
+            // thing between this call and the first withdrawal rather than the first of several
+            // reads. Revoking a grant changes no parent link, so a subtree read now is the same
+            // subtree the writes act on.
+            let mut subtrees = Vec::new();
             for record in held {
                 if record.revoked_at_ms.is_some() {
                     continue;
                 }
-                let one = Self::revoke_within(connection, record.grant.grant_id, now_ms)?;
+                let grant_id = record.grant.grant_id;
+                subtrees.push((grant_id, Self::subtree_to_revoke(connection, grant_id)?));
+            }
+            still_admitted()?;
+            for (grant_id, subtree) in &subtrees {
+                let one = Self::revoke_subtree(connection, *grant_id, subtree, now_ms)?;
                 merged.revoked.extend(one.revoked);
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
@@ -471,18 +484,37 @@ impl GrantDirectory {
         grant_id: GrantId,
         now_ms: u64,
     ) -> Result<GrantRevocation> {
+        let subtree = Self::subtree_to_revoke(connection, grant_id)?;
+        Self::revoke_subtree(connection, grant_id, &subtree, now_ms)
+    }
+
+    /// The grants one revocation would withdraw: the named one and everything below it.
+    ///
+    /// Separate from the writing half so a caller can do its reading first and check, immediately
+    /// before the first write, whatever it has to be sure of at that moment.
+    fn subtree_to_revoke(connection: &Connection, grant_id: GrantId) -> Result<Vec<GrantRecord>> {
         let subtree = subtree_within(connection, grant_id)?;
         if subtree.is_empty() {
             return Err(ControllerError::InvalidArgument(
                 "this host holds no such grant".to_owned(),
             ));
         }
+        Ok(subtree)
+    }
+
+    /// Withdraws a subtree [`Self::subtree_to_revoke`] read, inside the caller's transaction.
+    fn revoke_subtree(
+        connection: &Connection,
+        grant_id: GrantId,
+        subtree: &[GrantRecord],
+        now_ms: u64,
+    ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
         let mut devices = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
         let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
-        for record in &subtree {
+        for record in subtree {
             let is_the_named_one = record.grant.grant_id == grant_id;
             let changed = connection
                 .execute(

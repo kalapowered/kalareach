@@ -241,10 +241,33 @@ fn a_grant_that_loses_its_admission_at_the_store_writes_neither_grant_nor_invita
 /// A confirmation that runs out while the store is waited for transfers nothing.
 #[test]
 fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
+    /// The clock the ceremony runs on: fixed, so the deadline this test is about is exact.
+    #[derive(Debug)]
+    struct Ceremony;
+
+    const CEREMONY_MONOTONIC_MS: u64 = 5_000;
+    const CEREMONY_WALL_MS: u64 = 1_000;
+    const CEREMONY_BOOT: [u8; 32] = [7; 32];
+
+    impl kr_pairing::platform::PairingClock for Ceremony {
+        fn monotonic_ms(&self) -> u64 {
+            CEREMONY_MONOTONIC_MS
+        }
+
+        fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
+            kr_pairing::platform::BootIdentity(CEREMONY_BOOT)
+        }
+
+        fn wall_clock_ms(&self) -> u64 {
+            CEREMONY_WALL_MS
+        }
+    }
+
     /// A clock that runs past the confirmation's deadline after its first reading.
     ///
     /// The transfer reads it once before it goes to the store and once inside the transaction,
-    /// which is exactly the interval a wait for the store's lock occupies.
+    /// which is exactly the interval a wait for the store's lock occupies. Same boot as the
+    /// ceremony, so what refuses the second reading is the deadline rather than the boot.
     #[derive(Debug, Default)]
     struct Slipping {
         readings: std::sync::atomic::AtomicU64,
@@ -255,20 +278,20 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
             let reading = self
                 .readings
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let now = <Clock as kr_pairing::platform::PairingClock>::monotonic_ms(&Clock);
             if reading == 0 {
-                now
+                CEREMONY_MONOTONIC_MS
             } else {
-                now.saturating_add(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS + 1)
+                CEREMONY_MONOTONIC_MS
+                    .saturating_add(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS + 1)
             }
         }
 
         fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
-            <Clock as kr_pairing::platform::PairingClock>::boot_identity(&Clock)
+            kr_pairing::platform::BootIdentity(CEREMONY_BOOT)
         }
 
         fn wall_clock_ms(&self) -> u64 {
-            <Clock as kr_pairing::platform::PairingClock>::wall_clock_ms(&Clock)
+            CEREMONY_WALL_MS
         }
     }
 
@@ -288,14 +311,48 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
         issuing_grant_id: grant_id(9),
         actions: transfer::transferable_actions(&owner.grant),
     };
+    // The ceremony runs on the fixed clock, so the deadline the evidence carries is
+    // `CEREMONY_MONOTONIC_MS + CONFIRMATION_LIFETIME_MS` and nothing about this test depends on
+    // how long the machine takes to reach the next line.
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
-    let confirmed = confirm_transfer(&plan, &owner_key);
+    let keys = recipient_keys();
+    let host = transfer_host(&keys);
+    let request = kr_pairing::confirm::request_confirmation(
+        &Ceremony,
+        TransferPlan::sensitive_action(),
+        plan.action_digest().expect("a digest"),
+        Some(keys),
+        plan.actions.iter().copied().collect(),
+        host.device_id,
+        host.endpoint_id,
+    )
+    .expect("a challenge");
+    let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
+    ledger.issue(&request, &Ceremony);
+    let proof = kr_pairing::confirm::sign_confirmation(
+        &owner_key,
+        &request,
+        kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
+    )
+    .expect("a proof");
+    let confirmed = ConfirmedTransfer::verify(
+        &plan,
+        &host,
+        &mut ledger,
+        &Ceremony,
+        &request,
+        &proof,
+        owner_key.public(),
+        kr_pairing::confirm::HostEnrolment::Enrolled,
+    )
+    .expect("the owner confirmed this transfer");
 
+    let clock = Slipping::default();
     let refused = service
         .transfer_control(
             &plan,
             &confirmed,
-            &Slipping::default(),
+            &clock,
             AuthorityRevision::new(1),
             NOW + 2,
         )
@@ -320,6 +377,11 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
     assert!(
         source.revoked_at_ms.is_none() && source.is_active(),
         "and the transferring device kept the control it was handing over"
+    );
+    assert_eq!(
+        clock.readings.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the confirmation was checked twice: once before the store, once where it writes"
     );
 }
 
