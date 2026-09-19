@@ -470,6 +470,12 @@ impl GrantDirectory {
             if let Some(session_id) = record.session_id {
                 sessions.insert(session_id);
             }
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO fence_debt (grant_id, recorded_at_ms) VALUES (?1, ?2)",
+                    params![record.grant.grant_id.get().as_bytes().as_slice(), moment],
+                )
+                .map_err(ControllerError::registry)?;
             revoked.push(record.grant.grant_id);
         }
         Ok(GrantRevocation {
@@ -594,48 +600,42 @@ impl GrantDirectory {
         device_id: DeviceId,
         now_ms: u64,
     ) -> Result<Grant> {
+        // The refusal travels out of the transaction as a *value*, so the transaction commits and
+        // the refusal is raised afterwards. An error would roll the transaction back, and one of
+        // the things it writes is that the invitation expired: rolling that back would let a
+        // later call with an earlier clock reading redeem an invitation this host has already
+        // refused as expired.
         self.in_transaction(|connection| {
             let Some(invitation) = read_invitation_within(connection, invitation_id)? else {
-                return Err(ControllerError::InvalidArgument(
+                return Ok(Err(ControllerError::InvalidArgument(
                     "this host holds no such invitation".to_owned(),
-                ));
+                )));
             };
             if invitation.recipient_device_id != device_id {
-                return Err(ControllerError::PermissionDenied {
-                    detail: "that invitation was issued to another device".to_owned(),
-                });
+                return Ok(Err(refusal("that invitation was issued to another device")));
             }
             match invitation.state_at(now_ms) {
                 InvitationState::Open => {}
                 InvitationState::Redeemed => {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "this invitation has already been redeemed".to_owned(),
-                    });
+                    return Ok(Err(refusal("this invitation has already been redeemed")));
                 }
                 InvitationState::Cancelled => {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "this invitation was withdrawn".to_owned(),
-                    });
+                    return Ok(Err(refusal("this invitation was withdrawn")));
                 }
                 InvitationState::Expired => {
                     settle_invitation(connection, invitation_id, InvitationState::Expired)?;
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "this invitation has expired".to_owned(),
-                    });
+                    return Ok(Err(refusal("this invitation has expired")));
                 }
             }
             let record = read_one(connection, invitation.grant_id)?.ok_or_else(|| {
                 ControllerError::InvalidArgument("this host holds no such grant".to_owned())
             })?;
             if record.revoked_at_ms.is_some() {
-                return Err(ControllerError::PermissionDenied {
-                    detail: "that invitation's grant has been revoked".to_owned(),
-                });
+                return Ok(Err(refusal("that invitation's grant has been revoked")));
             }
             if !record.grant.expiry.is_valid_at(now_ms) {
-                return Err(ControllerError::PermissionDenied {
-                    detail: "that invitation has expired".to_owned(),
-                });
+                settle_invitation(connection, invitation_id, InvitationState::Expired)?;
+                return Ok(Err(refusal("that invitation has expired")));
             }
             let activated = connection
                 .execute(
@@ -658,12 +658,10 @@ impl GrantDirectory {
                 )
                 .map_err(ControllerError::registry)?;
             if activated == 0 || consumed == 0 {
-                return Err(ControllerError::PermissionDenied {
-                    detail: "this invitation has already been redeemed".to_owned(),
-                });
+                return Ok(Err(refusal("this invitation has already been redeemed")));
             }
-            Ok(record.grant)
-        })
+            Ok(Ok(record.grant))
+        })?
     }
 
     /// Withdraws an invitation and the proposal it carries, in one transaction.
@@ -783,31 +781,94 @@ impl GrantDirectory {
         })
     }
 
-    /// Returns true when a revocation is still owed a fence.
+    /// Returns the revocations still owed a fence.
+    ///
+    /// The caller takes this list, fences, and hands the same list back to
+    /// [`Self::fence_completed`]. Reading and clearing the whole table instead would let one fence
+    /// retire debt a revocation recorded while that fence was waiting on a worker.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read.
-    pub fn fence_owed(&self) -> Result<bool> {
-        let owed: i64 = self.with(|connection| {
-            connection.query_row("SELECT COUNT(*) FROM fence_debt", [], |row| row.get(0))
+    pub fn fence_owed(&self) -> Result<Vec<GrantId>> {
+        let rows: Vec<Option<Vec<u8>>> = self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT grant_id FROM fence_debt ORDER BY grant_id")?;
+            let rows = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<Option<Vec<u8>>>>>()?;
+            Ok(rows)
         })?;
-        Ok(owed > 0)
+        Ok(rows
+            .into_iter()
+            .filter_map(|bytes| bytes.as_deref().and_then(uuid_of).map(GrantId::new))
+            .collect())
     }
 
-    /// Clears the fence debt, because a fence has completed.
+    /// Clears exactly the debt a completed fence covered.
     ///
-    /// Called only after the revision advanced and the connections were fenced. Clearing it any
-    /// earlier would be recording completion of work that had not happened.
+    /// Called only after the revision advanced and the connections were fenced, and only for the
+    /// rows that fence was started for. Clearing the table would retire a revocation that arrived
+    /// while this fence was waiting, and that one has had no fence of its own.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be written.
-    pub fn fence_completed(&self) -> Result<()> {
-        self.with(|connection| connection.execute("DELETE FROM fence_debt", []).map(|_| ()))
+    pub fn fence_completed(&self, covered: &[GrantId]) -> Result<()> {
+        if covered.is_empty() {
+            return Ok(());
+        }
+        self.in_transaction(|connection| {
+            for key in covered {
+                connection
+                    .execute(
+                        "DELETE FROM fence_debt WHERE grant_id = ?1",
+                        params![key.get().as_bytes().as_slice()],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
+            Ok(())
+        })
     }
 
     // --- Retained results -------------------------------------------------------------------
+
+    /// Returns the result this host already recorded for one actor's action, if it has one.
+    ///
+    /// A read, with no claim. It answers a retry from what happened rather than performing
+    /// anything, which is what lets a retry whose freshness window has gone still be told its
+    /// outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::IdConflict`] when the identifier was reused with a different
+    /// payload, and a storage error when the row cannot be read.
+    pub fn answered_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+        payload_digest: &Digest256,
+    ) -> Result<Option<Vec<u8>>> {
+        let held: Option<(Vec<u8>, Option<Vec<u8>>)> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT payload_digest, result FROM authority_receipts
+                      WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+        })?;
+        let Some((digest, result)) = held else {
+            return Ok(None);
+        };
+        if digest.as_slice() != payload_digest.as_bytes() {
+            return Err(ControllerError::IdConflict {
+                token: action_id.to_string(),
+            });
+        }
+        Ok(result)
+    }
 
     /// Claims one actor's action before its effect, or reports what already happened under it.
     ///
@@ -848,10 +909,32 @@ impl GrantDirectory {
                         token: action_id.to_string(),
                     });
                 }
-                let _ = claimed_at_ms;
-                return Ok(match result {
-                    Some(result) => ActionClaim::Answered { result },
-                    None => ActionClaim::InFlight,
+                if let Some(result) = result {
+                    return Ok(ActionClaim::Answered { result });
+                }
+                // A claim with no result is somebody inside the effect. It is not a claim for
+                // ever: a mutation cannot outlive its own maximum lifetime, so a claim older than
+                // that belonged to an attempt that crashed or was cut off, and this caller takes
+                // it over rather than finding the identifier wedged.
+                let claimed = u64::try_from(claimed_at_ms).unwrap_or_default();
+                let stale =
+                    now_ms >= claimed.saturating_add(kr_protocol::limits::MAX_MUTATION_TTL.get());
+                if !stale {
+                    return Ok(ActionClaim::InFlight);
+                }
+                connection
+                    .execute(
+                        "UPDATE authority_receipts SET claimed_at_ms = ?3
+                          WHERE actor_id = ?1 AND action_id = ?2 AND result IS NULL",
+                        params![
+                            actor_id.as_str(),
+                            action_id.get().as_bytes().as_slice(),
+                            i64::try_from(now_ms).unwrap_or(i64::MAX),
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                return Ok(ActionClaim::Claimed {
+                    claimed_at_ms: claimed,
                 });
             }
             connection
@@ -1085,6 +1168,13 @@ fn settle_invitation(
         )
         .map(|_| ())
         .map_err(ControllerError::registry)
+}
+
+/// A refusal a transaction returns as a value, so its own writes still commit.
+fn refusal(detail: &str) -> ControllerError {
+    ControllerError::PermissionDenied {
+        detail: detail.to_owned(),
+    }
 }
 
 fn read_invitation(row: &rusqlite::Row<'_>) -> Result<InvitationRecord> {

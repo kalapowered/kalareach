@@ -444,10 +444,14 @@ impl Controller {
             None => crate::grants::HostPolicy::personal(authority_revision),
         };
         sharing.grants().store_policy(&policy.snapshot())?;
-        let feed = match sharing.grants().stored_feed()? {
+        let mut feed = match sharing.grants().stored_feed()? {
             Some(stored) => crate::grants::AuthorityFeed::restore(&stored),
             None => crate::grants::AuthorityFeed::new(host_device_id, authority_revision),
         };
+        // The registry is the allocator. A feed restored below it would number its next entry with
+        // a revision the registry has already used, and would report an old number as the one in
+        // force.
+        feed.note_revision(authority_revision);
         sharing.grants().store_feed(&feed.snapshot())?;
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
@@ -1186,12 +1190,10 @@ impl Controller {
         grant_id: kr_protocol::ids::GrantId,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
+        // The revocation writes its own fence debt inside the same transaction that revokes the
+        // rows, so a failure afterwards leaves a record a retry can see. Nothing newly revoked is
+        // not the same as nothing owed.
         let revocation = self.sharing.revoke(grant_id, now_ms)?;
-        // The debt is written before the fence is attempted, so a failure between the two leaves a
-        // record that a retry can see. Nothing newly revoked is not the same as nothing owed.
-        self.sharing
-            .grants()
-            .owe_fence(revocation.revoked.iter().copied(), now_ms)?;
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
     }
@@ -1221,15 +1223,18 @@ impl Controller {
         // A device can hold its grant in the pairing record and have no row here, so the device
         // record changing is a withdrawal in its own right. Reading only the grant rows would let
         // exactly that device keep a live connection.
-        let withdrawn = self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
         // A device can hold its grant in the pairing record and have no row in the grant store, so
-        // its own withdrawal is a debt in its own right, keyed by the device's identity. Recording
-        // it before the fence is attempted is what lets a retry finish the work after a failure.
-        let mut owed: Vec<kr_protocol::ids::GrantId> = revocation.revoked.to_vec();
-        if withdrawn {
-            owed.push(kr_protocol::ids::GrantId::new(device_id.get()));
+        // its own withdrawal owes a fence in its own right, keyed by the device's identity. The
+        // intent is written **before** the record changes, because a debt recorded after a
+        // withdrawal that then failed to record would be a withdrawal nothing fences.
+        let intent = kr_protocol::ids::GrantId::new(device_id.get());
+        self.sharing.grants().owe_fence([intent], now_ms)?;
+        if !self.devices.revoke(device_id, TimestampMs::new(now_ms))? {
+            // The record was already revoked, so this call withdrew nothing and the intent was
+            // for work that turned out to be done. Clearing it is safe because the record it was
+            // about is settled; leaving it would fence the host for every repeat.
+            self.sharing.grants().fence_completed(&[intent])?;
         }
-        self.sharing.grants().owe_fence(owed, now_ms)?;
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
     }
@@ -1257,9 +1262,6 @@ impl Controller {
         let transfer = self
             .sharing
             .transfer_control(plan, confirmation, revision, now_ms)?;
-        self.sharing
-            .grants()
-            .owe_fence(transfer.revoked.revoked.iter().copied(), now_ms)?;
         let completed = self
             .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), now_ms)
             .await?;
@@ -1280,7 +1282,11 @@ impl Controller {
         now_ms: u64,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let _ = now_ms;
-        if !self.sharing.grants().fence_owed()? {
+        // Captured before the fence starts. A revocation that arrives while this fence is waiting
+        // on a worker records its own debt, and clearing the whole table afterwards would retire
+        // that one without ever fencing it.
+        let covered = self.sharing.grants().fence_owed()?;
+        if covered.is_empty() {
             // The work was already done and fenced. The answer is the revision in force and the
             // barrier as it stands, with nothing newly withdrawn.
             let authority_revision = self.policy().authority_revision();
@@ -1304,7 +1310,7 @@ impl Controller {
         }
         // Last, because it is the record that this revocation's fence finished. Writing it before
         // the fence would let a failure in between look like completed work.
-        self.sharing.grants().fence_completed()?;
+        self.sharing.grants().fence_completed(&covered)?;
         Ok(kr_protocol::sharing::RevocationResult {
             authority_revision: barrier.authority_revision,
             revoked_grants,
@@ -1328,12 +1334,17 @@ impl Controller {
         // The lock is held across the write. Releasing it first would let two accepted changes
         // reach the store out of order and leave the older one on disk, which is the restriction
         // silently coming back after the next restart.
-        let mut policy = self
+        let mut held = self
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let value = change(&mut policy);
-        self.sharing.grants().store_policy(&policy.snapshot())?;
+        // The change is made to a copy and published only once it is written down. Mutating the
+        // live policy first would let a relaxation that failed to persist take effect anyway, and
+        // an error the caller sees would be an error about something that happened.
+        let mut candidate = held.clone();
+        let value = change(&mut candidate);
+        self.sharing.grants().store_policy(&candidate.snapshot())?;
+        *held = candidate;
         Ok(value)
     }
 
@@ -1389,6 +1400,16 @@ impl Controller {
             return self
                 .retained_installation(actor_id, mutation, connection_id)
                 .await;
+        }
+        // An authority change this host already performed is answered from its record, here,
+        // before freshness is asked for. Section 9 keeps a receipt readable after the window that
+        // admitted it has expired, and a retry of a revocation that cannot reach its result would
+        // otherwise be told its window is gone rather than what happened.
+        if matches!(
+            method,
+            Method::GrantCreate | Method::GrantRevoke | Method::DeviceRevoke
+        ) {
+            return self.retained_authority_change(actor_id, mutation);
         }
 
         if method != Method::SessionCreate {
@@ -2790,6 +2811,34 @@ impl Controller {
         respond(mutation.request_id, outcome)
     }
 
+    /// Answers an authority change this host has already performed, before freshness is asked for.
+    ///
+    /// Only a completed record answers here. A claim with no result is somebody inside the effect,
+    /// and this path says nothing about it: the claim is taken where the effect happens, under the
+    /// admission this mutation carries.
+    fn retained_authority_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Option<ControlFrame> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        match self
+            .sharing
+            .grants()
+            .answered_action(actor_id, mutation.action_id, &digest)
+        {
+            Ok(Some(result)) => {
+                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT).ok()?;
+                Some(ControlFrame::Response(Response {
+                    request_id: mutation.request_id,
+                    outcome: Outcome::Ok(ParamsValue::new(value)),
+                }))
+            }
+            Ok(None) => None,
+            Err(error) => Some(respond(mutation.request_id, Err(error))),
+        }
+    }
+
     /// What a claim on one authority change found.
     ///
     /// Either this caller now holds the claim, with the moment it was made, or the change already
@@ -2809,10 +2858,12 @@ impl Controller {
         )? {
             crate::grants::ActionClaim::Claimed { claimed_at_ms } => Ok(Ok(claimed_at_ms)),
             // Somebody else is inside this action. Performing it again would advance the revision
-            // twice for one withdrawal; the caller retries and is answered from the record once
-            // the first attempt has finished.
-            crate::grants::ActionClaim::InFlight => Err(ControllerError::IdConflict {
-                token: mutation.action_id.to_string(),
+            // twice for one withdrawal, and this is not a conflict: the payload is the same one,
+            // so the answer is transient and the caller retries for it. An attempt that crashed
+            // releases its claim once the mutation's own maximum lifetime has passed.
+            crate::grants::ActionClaim::InFlight => Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "another attempt under this action identifier has not finished".to_owned(),
             }),
             crate::grants::ActionClaim::Answered { result } => {
                 let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
@@ -2847,7 +2898,7 @@ impl Controller {
             self.host_device_id(),
             params.session_id.as_ref().copied(),
             params.include_resolved,
-            kr_ipc::now_ms().get(),
+            self.settled_now_ms(),
         )?;
         encode(&result)
     }
@@ -2863,6 +2914,10 @@ impl Controller {
         let params: kr_protocol::sharing::DeviceListParams = parse(params)?;
         let records = self.devices.devices()?;
         let status = self.authority_feed().status();
+        // The revision in force is the registry's, which the policy carries. The feed's own
+        // accepted revision is what it has seen, and reporting that as current would show a number
+        // older than the one this host is deciding against.
+        let authority_revision = self.policy().authority_revision();
         let mut devices = Vec::new();
         for record in records {
             if record.revoked_at_ms.is_some() && !params.include_revoked {
@@ -2882,7 +2937,7 @@ impl Controller {
         devices.sort_by_key(|device| device.device_id);
         encode(&kr_protocol::sharing::DeviceListResult {
             devices,
-            authority_revision: status.accepted_revision,
+            authority_revision,
             feed_synchronised_at_ms: status.last_synchronised_at_ms,
             feed_stale: status.stale,
         })

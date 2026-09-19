@@ -81,23 +81,73 @@ impl TransferPlan {
 
 /// Evidence that an owner confirmed one exact transfer.
 ///
-/// Constructed only by the code that verified and consumed the confirmation ceremony, which is why
-/// it carries the digest rather than a flag: a Boolean is something any caller can write, and a
-/// confirmation is not. [`Self::covers`] is the check that this evidence is about *this* plan.
+/// The only way to construct one is [`Self::verify`], which runs the ceremony's own acceptance:
+/// the challenge has to describe this plan's digest, this host, these rights and this destination,
+/// the proof has to answer it, and the challenge is consumed. A Boolean is something any caller can
+/// write; this is not. [`Self::covers`] then checks that the evidence is about *this* plan, which
+/// is what stops a confirmation for one transfer being carried to another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfirmedTransfer {
     action_digest: Digest256,
 }
 
 impl ConfirmedTransfer {
-    /// Records that an owner's confirmation for this digest was verified and consumed.
+    /// Verifies and consumes the owner's confirmation for this exact transfer.
     ///
-    /// The caller is the one that ran `kr_pairing::confirm::accept_confirmation` against the
-    /// host's own signer and ledger. Nothing here re-verifies it; what this type does is carry
-    /// *which* action was confirmed to the place that performs it.
+    /// This is the only way to get one. The expectation is built from the plan rather than from
+    /// the caller, so a confirmation answered for another action, another host, another
+    /// destination or another set of rights does not produce one, and the ceremony's challenge is
+    /// consumed here rather than left outstanding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] when the proof does not answer this
+    /// transfer's challenge.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a confirmation's acceptance is the plan, the ledger, the clock, the challenge, \
+                  the proof, the signer, this host's enrolment and the destination it names; each \
+                  one is part of what the owner confirmed, and grouping them into a struct would \
+                  hide which of them a caller left out"
+    )]
+    pub fn verify(
+        plan: &TransferPlan,
+        ledger: &mut kr_pairing::confirm::ConfirmationLedger,
+        clock: &dyn kr_pairing::platform::PairingClock,
+        request: &kr_protocol::pairing::OwnerConfirmationRequest,
+        proof: &kr_protocol::pairing::OwnerConfirmationProof,
+        signer: &kr_protocol::scalars::AuthorisationKey,
+        enrolment: kr_pairing::confirm::HostEnrolment,
+        destination_keys: Option<&kr_protocol::pairing::DevicePublicKeys>,
+    ) -> Result<Self> {
+        let action_digest = plan.action_digest()?;
+        let expectation = kr_pairing::confirm::ConfirmationExpectation {
+            action: TransferPlan::sensitive_action(),
+            action_digest,
+            host_device_id: request.host_device_id,
+            host_endpoint_id: request.host_endpoint_id,
+            destination_keys,
+            destination_rights: &plan.actions,
+        };
+        kr_pairing::confirm::accept_confirmation(
+            ledger,
+            clock,
+            request,
+            proof,
+            signer,
+            enrolment,
+            &expectation,
+        )
+        .map_err(|error| ControllerError::PermissionDenied {
+            detail: format!("the owner's confirmation does not authorise this transfer: {error}"),
+        })?;
+        Ok(Self { action_digest })
+    }
+
+    /// The digest this confirmation is about.
     #[must_use]
-    pub const fn accepted(action_digest: Digest256) -> Self {
-        Self { action_digest }
+    pub const fn action_digest(&self) -> Digest256 {
+        self.action_digest
     }
 
     /// Checks that this confirmation is about this plan.

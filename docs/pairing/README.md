@@ -331,4 +331,5 @@ invitation is not a persistent enlargement however wide it is.
 Transfer of control is separate, because it changes who holds authority rather than adding to what
 somebody has. The digest an owner confirms for a transfer covers the whole plan: the session, both
 devices, both grants and every action handed over. A confirmation obtained for one transfer
-therefore authorises no other.
+therefore authorises no other, and the ceremony's challenge is verified and consumed where the
+transfer happens rather than beside it.

@@ -1220,11 +1220,11 @@ carries the notice explaining that an answer, including free text, is input the 
 under its own permissions.
 
 **An issuer is shown what it is sharing.** The preview is computed by the same code that writes the
-grant. An invitation that names a question, an approval or the live screen is refused unless the
-current text of that thing arrives with it and matches what the selection names, and the request is
-refused when the notices the issuer states it accepted are not the ones the grant carries. A shared
-live screen can hold text printed long before the invitation, so the preview shows the text. A new
-recipient receives no historical attachment keys.
+grant, and an invitation that names a question, an approval or the live screen is refused unless
+text for that thing arrives with it and the two name the same things. The request is refused when
+the notices the issuer states it accepted are not the ones the grant carries. A shared live screen
+can hold text printed long before the invitation, so the preview carries the text rather than a
+description of it. A new recipient receives no historical attachment keys.
 
 **Invitations are single use and they expire.** The default is `session.view` for one hour, from the
 moment the invitation is issued: the recipient sees the selected live screen and what happens next,
@@ -1240,14 +1240,15 @@ an invitation withdraws the proposal with it, so cancelling is a complete answer
 beside live authority.
 
 **Transfer of control is not a delegation.** The transferring device does not keep what it hands
-over: the recipient receives an active grant over the session and the transferring device's grant is
-revoked, with its descendants. It changes who holds authority, so it needs the owner's confirmation
-every time, and it can hand over no more than the transferring grant carries.
+over: the recipient receives an active grant over the session named in the plan, and the
+transferring device's grant is revoked with its descendants, both in one commit. It changes who
+holds authority, so it takes the owner's confirmation every time, verified and consumed against a
+digest that covers the whole plan. It hands over no more than the transferring grant carries, and
+it advances the revision and fences like any other revocation.
 
 **Nothing is lent through an intermediary.** What an actor may do through a plugin action, an
 attachment action or a workflow is the *intersection* of what the actor holds and what the
-intermediary declares, which is `sharing::roles::effective_rights`. An intermediary bounds a call;
-it never funds one.
+intermediary declares. An intermediary bounds a call; it never funds one.
 
 **Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
 delegates from — naming one is not holding one — and that grant has to carry `session.share`.
@@ -1304,10 +1305,11 @@ reported stale rather than current.
 
 `grants::policy` holds what is true of this host rather than of one grant.
 
-* **Organisation leases.** A signed membership lease lasts at most 15 minutes, is held per member
-  account, and is checked against the clock when a grant that requires membership is decided, never
-  against whether a socket is open: an expired membership blocks organisation-mediated reads and
-  mutations while the transport stays connected, and one member's lease never answers for another.
+* **Organisation leases.** A signed membership lease lasts at most 15 minutes and is held per
+  member account. When a grant that requires membership is decided, the lease is checked against
+  the clock rather than against whether a socket is open, so an expired membership blocks
+  organisation-mediated reads and mutations while the transport stays connected, and one member's
+  lease never answers for another.
   A lease longer than 15 minutes, signed under an unpinned key revision, or wider than its role's
   ceiling is not stored at all. Personal local owner access continues through an organisation
   outage unless the host is exclusively organisation-managed.

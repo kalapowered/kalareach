@@ -148,8 +148,15 @@ impl SharingService {
     pub fn preview(&self, request: &ShareRequest) -> Result<InvitationPreview> {
         // Nothing enters a grant's scope that the issuer was not shown. Section 25 requires the
         // preview to show what is being shared, so a selection naming a question, an approval or
-        // the live screen has to arrive with the current text of that thing beside it: a host that
-        // accepted a bare identifier would be sharing something nobody previewed.
+        // the live screen has to arrive with text beside it, naming the same things in both
+        // directions: a host that accepted a bare identifier would be sharing something nobody
+        // previewed.
+        //
+        // What this checks is agreement, not currency. Whether the text is what that question says
+        // right now, and whether the question is still open, is the caller's to establish from the
+        // session that owns it; this service does not hold questions and cannot ask. A caller that
+        // supplies stale text produces an invitation whose preview is stale, and the requirement
+        // that it not do so is stated here rather than enforced here.
         for question_id in &request.selection.named_questions {
             if !request
                 .named_questions
@@ -461,7 +468,12 @@ impl SharingService {
             recipient_device_id: plan.to_device_id,
             authority_revision,
             environment_selector: source.grant.environment_selector.clone(),
-            session_selector: source.grant.session_selector.clone(),
+            // The plan names one session, so the replacement covers one session. Copying a source
+            // selector that said `Any` would hand over every session in the environment under a
+            // plan that named one, and the owner confirmed the plan.
+            session_selector: kr_protocol::grant::SessionSelector::These {
+                session_ids: [plan.session_id].into_iter().collect(),
+            },
             actions: plan.actions.clone(),
             history: source.grant.history.clone(),
             expiry: source.grant.expiry,

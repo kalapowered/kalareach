@@ -113,6 +113,105 @@ fn proposal(grant: Grant) -> GrantRecord {
     }
 }
 
+/// A fence a revocation owes survives the failure of the half that would have cleared it.
+#[test]
+fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    directory.issue(&record(held.clone())).expect("written");
+
+    assert!(
+        directory.fence_owed().expect("readable").is_empty(),
+        "nothing is owed before anything is revoked"
+    );
+    directory.revoke(held.grant_id, 4_000).expect("revoked");
+    let owed = directory.fence_owed().expect("readable");
+    assert_eq!(
+        owed,
+        vec![held.grant_id],
+        "the debt is written in the same transaction as the revocation"
+    );
+
+    // A second revocation arrives while the first fence is still waiting. Clearing what the first
+    // fence covered must not retire the second one's debt.
+    let second = grant(2, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    directory.issue(&record(second.clone())).expect("written");
+    directory.revoke(second.grant_id, 4_100).expect("revoked");
+    directory
+        .fence_completed(&owed)
+        .expect("the first fence finished");
+    assert_eq!(
+        directory.fence_owed().expect("readable"),
+        vec![second.grant_id],
+        "a revocation that arrived during a fence still owes one of its own"
+    );
+
+    directory
+        .fence_completed(&[second.grant_id])
+        .expect("the second fence finished");
+    assert!(directory.fence_owed().expect("readable").is_empty());
+}
+
+/// A claim excludes a second attempt, and a crashed attempt does not wedge the identifier.
+#[test]
+fn a_claim_excludes_a_second_attempt_and_a_crashed_one_releases_it() {
+    use kr_controller::grants::ActionClaim;
+    use kr_protocol::ids::ActionId;
+
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let actor = kr_protocol::ids::ActorId::new("device:phone").expect("a principal");
+    let action = ActionId::new(Uuid::from_bytes([5; 16]));
+    let digest = kr_protocol::scalars::Digest256::from_bytes([7; 32]);
+
+    assert_eq!(
+        directory
+            .claim_action(&actor, action, &digest, 1_000)
+            .expect("claimed"),
+        ActionClaim::Claimed {
+            claimed_at_ms: 1_000
+        }
+    );
+    assert_eq!(
+        directory
+            .claim_action(&actor, action, &digest, 1_001)
+            .expect("read"),
+        ActionClaim::InFlight,
+        "a second attempt under one action identifier does not reach the effect"
+    );
+
+    // A different payload under the same identifier is a conflict, not a second attempt.
+    let other = kr_protocol::scalars::Digest256::from_bytes([8; 32]);
+    directory
+        .claim_action(&actor, action, &other, 1_002)
+        .expect_err("a reused identifier with a different payload");
+
+    // The first attempt crashed. Once a mutation could no longer be alive, the claim is takeable.
+    let past = 1_000 + kr_protocol::limits::MAX_MUTATION_TTL.get();
+    assert_eq!(
+        directory
+            .claim_action(&actor, action, &digest, past)
+            .expect("reclaimed"),
+        ActionClaim::Claimed {
+            claimed_at_ms: 1_000
+        },
+        "the retry rebuilds its proposal from the moment the first claim was made"
+    );
+
+    // And once it has a result, that is the answer, and it is never replaced.
+    directory
+        .retain_result(&actor, action, b"first", past + 1)
+        .expect("recorded");
+    directory
+        .retain_result(&actor, action, b"second", past + 2)
+        .expect("a completed receipt is not replaced");
+    assert_eq!(
+        directory
+            .answered_action(&actor, action, &digest)
+            .expect("readable"),
+        Some(b"first".to_vec())
+    );
+}
+
 /// A grant that was written and never redeemed authorises nothing.
 #[test]
 fn a_grant_whose_invitation_was_never_redeemed_decides_nothing() {
