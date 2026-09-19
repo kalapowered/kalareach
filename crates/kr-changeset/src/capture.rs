@@ -63,7 +63,7 @@ use kr_protocol::project::{
     ChangeKind, ContentClass, InclusionChoice, InclusionClass, InclusionPolicy,
 };
 use kr_protocol::scalars::{Digest256, Nullable, U64};
-use kr_transfer::{ObjectPolicy, RelativeName};
+use kr_transfer::{AuthorisedDirectory, ObjectPolicy, RelativeName};
 
 use crate::error::{ChangeSetError, Result};
 use crate::grant::{self, GrantDecision};
@@ -235,7 +235,7 @@ pub fn capture(
             request.grant,
             administrative.as_deref(),
         )?;
-        let nested = nested_repositories(repository, &reading, administrative.as_deref())?;
+        let nested = nested_repositories(repository, &reading)?;
         let request = Scope {
             request,
             administrative_prefix: administrative.as_deref(),
@@ -261,7 +261,7 @@ pub fn capture(
         // Where every repository nested in this tree keeps its own data, worked out from the
         // directories this reading names. It has to be done before anything is planned, because a
         // path under one of them is never content whatever else decides about it.
-        let nested = nested_repositories(repository, &before, request.administrative_prefix)?;
+        let nested = nested_repositories(repository, &before)?;
         let request = Scope {
             nested: &nested,
             ..request
@@ -1114,26 +1114,25 @@ fn store_base_content(
 
 /// Returns every repository nested in this tree, as paths relative to it.
 ///
-/// A nested repository is found by its `.git`, which this walk meets as a directory beside its
-/// tree or as a **file** naming the directory its data is really in. The tree is answered here and
-/// refused by the plan; nothing under it is ever content of this capture.
+/// **Identity decides, never spelling.** A directory this capture names is another repository's
+/// business when the object it is, not the name it has, is one this host found behind a nested
+/// `.git`. A nested repository is found by its `.git`: a directory beside its tree, or a file
+/// naming where its data really is. That name is resolved by **descending from this working tree's
+/// own handle, one component at a time**, refusing a link and refusing anything that leaves the
+/// tree, and what is kept is the identity of the directory the descent reached. Every directory
+/// the capture names is then compared with those identities, so no spelling of any of them,
+/// through a link, through `..`, relative or absolute, reaches one under another name.
 ///
-/// A `.git` **file** refuses the whole capture instead, unless it names a place inside **this**
-/// repository's own administrative directory, which is what an ordinary submodule is and which
-/// this capture already refuses by another rule. Where it points is a question with no
-/// answer this host can rely on: the name may be spelled any way Git accepts, may reach through a
-/// link this host will not follow, may name a linked worktree whose configuration and objects are
-/// somewhere else again, and may not be there at all while the base commit still holds what used
-/// to be under it. Each of those is a way another repository's configuration, which holds its
-/// remotes and can hold a credential, would end up in a version. So a working tree with a nested
-/// repository of that shape is one this host does not capture, and says so.
+/// A target this host cannot resolve that way refuses the whole capture. A target that is not
+/// there excludes nothing, because there is nothing of it to capture. A repository that also keeps
+/// its configuration, references and objects somewhere else says so in a `commondir`, and that
+/// place is resolved and compared the same way.
 ///
 /// What a reading does not name, this does not find: a repository in a directory no path of this
 /// capture goes near is one the capture never reaches either.
 fn nested_repositories(
     repository: &OpenedRepository,
     reading: &Reading,
-    administrative: Option<&str>,
 ) -> Result<BTreeSet<String>> {
     let mut directories: BTreeSet<&str> = BTreeSet::new();
     let paths = reading
@@ -1145,9 +1144,6 @@ fn nested_repositories(
         .chain(reading.status.iter().map(|entry| entry.path.as_str()));
     for path in paths {
         let path = path.trim_end_matches('/');
-        // The path itself as well as every directory above it. A submodule the index records is
-        // one entry with no descendants, and a whole directory the status reported is one entry
-        // too; both are directories this capture names and both can hold a repository's own data.
         directories.insert(path);
         let mut at = path;
         while let Some((parent, _)) = at.rsplit_once('/') {
@@ -1158,12 +1154,8 @@ fn nested_repositories(
         }
     }
     let tree = repository.work_tree();
-    let mut found = BTreeSet::new();
     let mut budget = MAX_WALK_ENTRIES;
-    for directory in directories {
-        if directory.is_empty() {
-            continue;
-        }
+    let mut charge = |directory: &str| -> Result<()> {
         budget = budget
             .checked_sub(1)
             .ok_or_else(|| ChangeSetError::QuotaExceeded {
@@ -1173,188 +1165,196 @@ fn nested_repositories(
                 )
                 .into(),
             })?;
-        // Is it a directory at all? A path a reading names is usually a file, which has nothing
-        // inside it to be a repository. One this host cannot ask about is a different matter: it
-        // cannot then say whether a repository is in there.
-        let Ok(here) = RelativeName::parse(directory) else {
+        let _ = directory;
+        Ok(())
+    };
+
+    // What each directory this capture names **is**, so the second pass can compare objects rather
+    // than names, and so a repository found behind one spelling is refused under every other.
+    let mut opened: Vec<(&str, AuthorisedDirectory)> = Vec::new();
+    for directory in directories {
+        if directory.is_empty() {
             continue;
-        };
-        match tree.probe(&here) {
-            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
-            Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => continue,
-            Err(_) => return Err(unplaceable(directory)),
         }
-        let Ok(name) =
-            RelativeName::parse(&format!("{directory}/{}", grant::ADMINISTRATIVE_DIRECTORY))
-        else {
-            continue;
-        };
-        let held = match tree.probe(&name) {
-            Ok(held) => held,
-            // Nothing of the sort in it, which is what an ordinary directory answers.
-            Err(kr_transfer::Escape::NotFound { .. }) => continue,
-            // A directory this host could not look into. It cannot say whether a repository is in
-            // there, and a capture that might hold one's configuration is not one it takes.
-            Err(_) => return Err(unplaceable(directory)),
-        };
-        // Where that repository's data is, as a name this host walked to rather than one it read.
-        let data = if held == kr_transfer::authority::ObjectKind::Directory {
-            name.as_str().to_owned()
-        } else {
-            let Some(inside) = submodule_data(tree, &name, directory, administrative) else {
-                return Err(unplaceable(directory));
-            };
-            inside
-        };
-        // A repository can keep its per-worktree data in one place and its configuration, its
-        // references and its objects in another, and say so in a file called `commondir`. This
-        // host does not chase that second place either.
-        let Ok(common) = RelativeName::parse(&format!("{data}/commondir")) else {
+        charge(directory)?;
+        let Ok(name) = RelativeName::parse(directory) else {
+            // A name this host cannot carry beneath the handle is a directory it cannot ask
+            // about, and it will not say a tree is free of another repository it could not look
+            // for.
             return Err(unplaceable(directory));
         };
-        match tree.probe(&common) {
-            // Nothing of the sort: this repository's data is all in one place.
-            Err(kr_transfer::Escape::NotFound { .. }) => {}
-            // One that is there, or one this host could not ask about. Either way there may be a
-            // second place, and this host does not chase it.
-            _ => return Err(unplaceable(directory)),
+        match tree.subdirectory(&name) {
+            Ok(held) => opened.push((directory, held)),
+            // Not a directory, or not there, or a link, which this host neither follows nor
+            // looks inside: none of them has anything in it to be a repository.
+            Err(
+                kr_transfer::Escape::NotFound { .. }
+                | kr_transfer::Escape::WrongKind { .. }
+                | kr_transfer::Escape::Link { .. }
+                | kr_transfer::Escape::Unopenable { .. },
+            ) => {}
+            Err(_) => return Err(unplaceable(directory)),
         }
-        found.insert(directory.to_owned());
+    }
+
+    // What each nested repository **is**: its own tree, the directory its data is in, and the
+    // directory it keeps its common data in when it keeps one.
+    let mut refused: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for (directory, held) in &opened {
+        let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
+        let kind = match held.probe(&administrative) {
+            Ok(kind) => kind,
+            // No `.git` in it: an ordinary directory of this repository's own content.
+            Err(kr_transfer::Escape::NotFound { .. }) => continue,
+            Err(_) => return Err(unplaceable(directory)),
+        };
+        refused.insert(identity_of(held));
+        let data = match kind {
+            // Its data is beside its tree, which is the ordinary nested repository.
+            kr_transfer::authority::ObjectKind::Directory => held
+                .subdirectory(&administrative)
+                .map_err(|_| unplaceable(directory))?,
+            // Its data is wherever its own file says, resolved by descending rather than by
+            // reading the name as arithmetic.
+            _ => match resolve_target(tree, held, directory, &administrative)? {
+                Some(data) => data,
+                // Nothing is there, so there is nothing of it to capture either.
+                None => continue,
+            },
+        };
+        refused.insert(identity_of(&data));
+        let common = RelativeName::parse("commondir")?;
+        match data.probe(&common) {
+            // It keeps everything in one place.
+            Err(kr_transfer::Escape::NotFound { .. }) => {}
+            Ok(_) => {
+                if let Some(elsewhere) = resolve_target(tree, &data, directory, &common)? {
+                    refused.insert(identity_of(&elsewhere));
+                }
+            }
+            Err(_) => return Err(unplaceable(directory)),
+        }
+    }
+
+    // And now by identity: every directory this capture names that **is** one of those objects,
+    // whatever it is called here.
+    let mut found = BTreeSet::new();
+    for (directory, held) in &opened {
+        if refused.contains(&identity_of(held)) {
+            found.insert((*directory).to_owned());
+        }
     }
     Ok(found)
 }
 
-/// Returns where a nested repository keeps its data when that is **inside this repository's own
-/// administrative directory**, and nothing when it is anywhere else.
+/// Returns the object one open directory is.
+fn identity_of(directory: &AuthorisedDirectory) -> (u64, u64) {
+    let identity = directory.identity();
+    (identity.device, identity.file_id)
+}
+
+/// Resolves what one `gitdir:` or `commondir` file names, by descending to it.
 ///
-/// Inside it is what an ordinary submodule is: its tree is in this working tree and its data is
-/// under this repository's own `.git`, which is already the first thing a capture refuses. Two
-/// things have to hold, and spelling is only the first. The target is joined to the directory its
-/// file is in and reduced once, and it has to spell its way into this repository's own data. Then
-/// that name is **walked through the working tree's own handle**, which follows nothing, and has
-/// to reach a real directory: a link at the end of the spelling, or on the way to it, or a name
-/// with nothing at it, is a place this host has not established and does not accept.
-fn submodule_data(
-    tree: &kr_transfer::AuthorisedDirectory,
-    name: &RelativeName,
+/// Nothing here is arithmetic on a path. The descent starts at this working tree's own handle,
+/// walks the directory the file is in, and then takes the file's own components one at a time:
+/// `.` is nothing, `..` steps back to the directory the descent actually came from, and every
+/// other component is **asked about first** and has to be a directory. A link anywhere along the
+/// way ends it, because a `..` after a link means something this descent cannot reproduce; so does
+/// a target that steps above the working tree, and so does an absolute one, which names a place
+/// outside what this handle can reach. Each of those refuses the whole capture.
+fn resolve_target(
+    tree: &AuthorisedDirectory,
+    holder: &AuthorisedDirectory,
     directory: &str,
-    administrative: Option<&str>,
-) -> Option<String> {
+    file: &RelativeName,
+) -> Result<Option<AuthorisedDirectory>> {
     use std::io::Read as _;
 
-    let administrative = administrative?;
-    let mut file = tree.open_read(name, ObjectPolicy::ReadableFile).ok()?;
-    if file.byte_len() > MAX_GIT_FILE_BYTES {
-        return None;
+    let mut open = holder
+        .open_read(file, ObjectPolicy::ReadableFile)
+        .map_err(|_| unplaceable(directory))?;
+    if open.byte_len() > MAX_GIT_FILE_BYTES {
+        return Err(unplaceable(directory));
     }
     let mut text = String::new();
-    file.handle_mut()
+    open.handle_mut()
         .take(MAX_GIT_FILE_BYTES)
         .read_to_string(&mut text)
-        .ok()?;
-    let target = text.trim().strip_prefix("gitdir:").map(str::trim)?;
-    let root = tree.display_path();
-    let inside = lexical(std::path::Path::new(root));
-    let mut parts = if std::path::Path::new(target).is_absolute() {
-        Vec::new()
-    } else {
-        let mut here = inside.clone();
-        here.extend(components(std::path::Path::new(directory)));
-        here
-    };
-    parts.extend(components(std::path::Path::new(target)));
-    // Walked, not reduced. Cancelling `a/..` on paper erases whatever `a` was, and if `a` was a
-    // link the name that comes out of the arithmetic is not the place the target reaches. So each
-    // component is taken in turn and the prefix it makes is asked about before the next one: a
-    // link anywhere along the way, or anything that is not a directory, ends it.
-    let mut walked: Vec<String> = Vec::new();
-    for part in parts {
-        let part = part.to_str()?;
-        match part {
-            "." => continue,
-            "/" => walked.clear(),
+        .map_err(|_| unplaceable(directory))?;
+    let text = text.trim();
+    let target = text.strip_prefix("gitdir:").map_or(text, str::trim);
+    if target.is_empty() || std::path::Path::new(target).is_absolute() {
+        return Err(unplaceable(directory));
+    }
+    // The directory the file is in, reached from the tree's own handle. Its components came from
+    // this capture's own readings rather than from the file.
+    let mut stack: Vec<AuthorisedDirectory> = vec![clone_of(tree)?];
+    for component in directory.split('/') {
+        let step = RelativeName::parse(component)?;
+        let here = stack.last().ok_or_else(|| unplaceable(directory))?;
+        let next = here
+            .subdirectory(&step)
+            .map_err(|_| unplaceable(directory))?;
+        stack.push(next);
+    }
+    for component in target.split('/') {
+        match component {
+            "" | "." => continue,
             ".." => {
-                walked.pop()?;
-                continue;
+                stack.pop();
+                if stack.is_empty() {
+                    // Above the working tree, where this handle reaches nothing.
+                    return Err(unplaceable(directory));
+                }
             }
-            _ => walked.push(part.to_owned()),
-        }
-        if walked.len() <= inside.len() {
-            // Still above this working tree, where the authority cannot ask anything. Those
-            // components are the tree's own path and this host put them there itself.
-            continue;
-        }
-        let so_far: Vec<String> = walked[inside.len()..].to_vec();
-        let name = RelativeName::parse(&so_far.join("/")).ok()?;
-        match tree.probe(&name) {
-            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
-            _ => return None,
-        }
-    }
-    let mut wanted: Vec<String> = inside
-        .iter()
-        .map(|part| part.to_string_lossy().into_owned())
-        .collect();
-    wanted.extend(
-        components(std::path::Path::new(administrative))
-            .iter()
-            .map(|part| part.to_string_lossy().into_owned()),
-    );
-    if walked.len() <= wanted.len() || walked[..wanted.len()] != wanted[..] {
-        return None;
-    }
-    Some(walked[inside.len()..].join("/"))
-}
-
-/// Reduces one path to its components without touching the filesystem.
-fn lexical(path: &std::path::Path) -> Vec<std::ffi::OsString> {
-    lexical_parts(components(path))
-}
-
-/// Returns one path's components, with `.`, `..` and a root kept as they are.
-fn components(path: &std::path::Path) -> Vec<std::ffi::OsString> {
-    path.components()
-        .map(|part| match part {
-            std::path::Component::Normal(part) => part.to_owned(),
-            std::path::Component::CurDir => std::ffi::OsString::from("."),
-            std::path::Component::ParentDir => std::ffi::OsString::from(".."),
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                std::ffi::OsString::from("/")
+            _ => {
+                let step = RelativeName::parse(component)?;
+                let here = stack.last().ok_or_else(|| unplaceable(directory))?;
+                match here.probe(&step) {
+                    // A directory, asked about before it is entered.
+                    Ok(kr_transfer::authority::ObjectKind::Directory) => {}
+                    // Nothing there: nothing of it to capture.
+                    Err(kr_transfer::Escape::NotFound { .. }) => return Ok(None),
+                    // A link, or something this host could not ask about.
+                    _ => return Err(unplaceable(directory)),
+                }
+                let next = here
+                    .subdirectory(&step)
+                    .map_err(|_| unplaceable(directory))?;
+                stack.push(next);
             }
-        })
-        .collect()
-}
-
-/// Cancels `.` and `..` in a component list, and starts it again at a root.
-fn lexical_parts(parts: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    let mut out: Vec<std::ffi::OsString> = Vec::new();
-    for part in parts {
-        if part == "." {
-        } else if part == ".." {
-            out.pop();
-        } else if part == "/" {
-            out.clear();
-        } else {
-            out.push(part);
         }
     }
-    out
+    stack.pop().map(Some).ok_or_else(|| unplaceable(directory))
 }
 
-/// The most a `.git` file is read for the one line it holds.
-const MAX_GIT_FILE_BYTES: u64 = 4096;
+/// Returns a second authority over the same open directory.
+fn clone_of(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
+    let handle = directory
+        .handle()
+        .try_clone()
+        .map_err(ChangeSetError::storage)?;
+    Ok(AuthorisedDirectory::from_handle(
+        directory.environment_id(),
+        handle,
+        directory.display_path().to_path_buf(),
+    )?)
+}
 
-/// The refusal for a nested repository that keeps its own data somewhere else.
+/// The refusal for a nested repository whose own data this host could not place.
 fn unplaceable(directory: &str) -> ChangeSetError {
     ChangeSetError::Unsupported {
         detail: format!(
-            "a repository nested at {} keeps its own data somewhere other than beside its tree, \
-             and this host cannot establish where, so it did not read the tree at all",
+            "a repository nested at {} keeps its own data somewhere this host could not reach by \
+             descending to it, so it did not read the tree at all",
             kr_project::git::redact(directory)
         )
         .into(),
     }
 }
+
+/// The most a `.git` or `commondir` file is read for the one line it holds.
+const MAX_GIT_FILE_BYTES: u64 = 4096;
 
 /// Returns true when one path is this repository's own administrative data.
 ///

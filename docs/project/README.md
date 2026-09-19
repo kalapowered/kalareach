@@ -639,26 +639,22 @@ removes is never opened at all:
 
 1. A repository's own administrative data, and any other repository's whole tree. `.git` in any
    component is refused whatever its case, and so is the directory **this** repository resolves its
-   own data to. Every path the capture's own readings name, and every directory above it, is then
-   asked whether it holds a `.git`: one that does is another repository, whose tree this host does
-   not read inside at all. What is inside would otherwise be that repository's configuration, which
-   holds its remotes and can hold a credential, and its object database, which holds every version
-   of every file in it.
+   own data to.
 
-   A nested repository whose `.git` is a **file** names the directory its data is really in, and
-   that name can be spelled any way Git accepts, can reach through a link this host will not
-   follow, can name a linked worktree whose configuration lives somewhere else again, and can name
-   something that is not there while the base commit still holds what used to be under it. Rather
-   than guess at any of those, **this host refuses to capture the tree at all** and says so. The
-   one exception is the ordinary submodule, and spelling alone does not earn it. The target is
-   walked **component by component** through the working tree's own handle, which follows nothing:
-   each step has to be a real directory, so a link anywhere along the way ends it, and a `..` is
-   taken after that step rather than cancelled on paper, because cancelling it would erase whatever
-   the step reached. Where it ends has to be inside this repository's own administrative directory,
-   and has to name no common directory somewhere else. Then the data is already refused by the
-   first rule, the capture runs, and the submodule's tree is named as an exclusion. A repository
-   whose own `.git` is outside its working tree has no such directory to be inside, so a tree it
-   holds with submodules is one this host refuses as well.
+   For a repository nested in the tree, **what a directory is decides, never what it is called.**
+   Every path the capture's own readings name, and every directory above it, is opened through the
+   working tree's own handle and asked whether it holds a `.git`. One that does is another
+   repository: its tree is that object, and where it keeps its data is found by **descending to it
+   one component at a time** from the same handle, refusing a link, refusing a step above the tree
+   and refusing an absolute name. The identity of the directory the descent reached is what is
+   kept, along with the identity of the common directory it names when it names one. Every
+   directory the capture opens is then compared with those objects, so no spelling of any of them,
+   through a link, through `..`, relative or absolute, reaches one under another name.
+
+   A place this host cannot descend to refuses the whole capture rather than being guessed at. A
+   place that is not there excludes nothing, because there is nothing of it to capture. What is
+   inside would otherwise be that repository's configuration, which holds its remotes and can hold
+   a credential, and its object database, which holds every version of every file in it.
 
    What this covers is what a capture reads: a repository in a directory no path of the capture
    goes near is one the capture does not reach either.

@@ -936,18 +936,17 @@ fn a_nested_repository_s_own_data_is_never_captured() {
     );
 }
 
-/// KR-REQ-14.33: a nested repository that keeps its data elsewhere refuses the whole capture.
+/// KR-REQ-14.33 and D-087: what a nested repository's data **is** decides, not what it is called.
 ///
-/// A `.git` **file** names the directory a repository's data is really in, and the name can be
-/// spelled any way Git accepts, can reach through a link, can name a linked worktree whose
-/// configuration is somewhere else again, and can name something that is not there while the base
-/// commit still holds what used to be under it. Each is a way another repository's configuration
-/// would reach a version, so a tree with a nested repository of that shape is one this host does
-/// not capture.
+/// A `.git` file names where a repository keeps its data, and the name can be spelled any way Git
+/// accepts. This host descends to it through the working tree's own handle and keeps the identity
+/// of the directory it reached; every directory the capture names is then compared with that
+/// object. So a spelling nobody wrote a rule for is still excluded, and one that reaches through a
+/// link, which this descent will not follow, refuses the whole capture.
 #[test]
-fn a_nested_repository_that_keeps_its_data_elsewhere_refuses_the_capture() {
+fn a_nested_repository_s_data_is_excluded_by_what_it_is_not_by_its_spelling() {
     let fixture = Fixture::create();
-    let path = ordinary_repository(fixture.work(), "elsewhere-tree");
+    let path = ordinary_repository(fixture.work(), "spelling-tree");
     let nested = path.join("vendor/inner");
     std::fs::create_dir_all(&nested).expect("a directory");
     git_raw(&nested, ["init", "--initial-branch=main"]);
@@ -963,51 +962,67 @@ fn a_nested_repository_that_keeps_its_data_elsewhere_refuses_the_capture() {
     write(&nested, "inner.txt", "inner content\n");
     std::fs::rename(nested.join(".git"), path.join("vendor/repo-data"))
         .expect("the data moves beside the nested tree");
-    std::os::unix::fs::symlink("repo-data", path.join("vendor/git-alias")).expect("a link to it");
-    let workspace = fixture.workspace("elsewhere-tree");
+    let workspace = fixture.workspace("spelling-tree");
     let policy = include_everything();
     let grant = kr_protocol::changeset::FileGrant::default();
 
-    // Every spelling, the place beside the tree, the place reached through a link, and a place
-    // that is not there at all.
-    for target in [
-        "repo-data",
-        "./repo-data",
-        "../repo-data",
-        "../git-alias",
-        "../not-there",
-    ] {
+    // Three spellings of the one place, the third of which goes down and back up again. None of
+    // them is a rule anybody wrote: the identity the descent reaches is what decides.
+    std::fs::create_dir_all(path.join("vendor/round")).expect("somewhere to go through");
+    for target in ["../repo-data", ".././repo-data", "../round/../repo-data"] {
         std::fs::write(
             nested.join(".git"),
             format!("gitdir: {target}\n").as_bytes(),
         )
         .expect("and points at it");
-        let failure = fixture
+        let record = fixture
             .capture_with(workspace, &policy, &grant, None, None)
-            .expect_err("a tree holding a repository of that shape is not captured");
+            .expect("the capture runs");
+        let manifest = fixture
+            .service()
+            .manifest(record.change_set_id, record.version)
+            .expect("its manifest");
         assert!(
-            failure
-                .to_string()
-                .contains("somewhere other than beside its tree"),
-            "the refusal says why under {target}: {failure}"
+            manifest
+                .paths
+                .iter()
+                .all(|entry| !entry.path.starts_with("vendor/repo-data/")),
+            "under {target}, that repository's own data is not in the version: {:?}",
+            manifest
+                .paths
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            record
+                .exclusions
+                .iter()
+                .any(|entry| entry.path.starts_with("vendor/repo-data")),
+            "and it is named under {target}: {:?}",
+            record.exclusions
         );
     }
 
-    // And with its data back beside its own tree, the capture runs and the tree is excluded.
-    std::fs::remove_file(nested.join(".git")).expect("the file goes");
-    std::fs::rename(path.join("vendor/repo-data"), nested.join(".git"))
-        .expect("the data goes back where it started");
-    let record = fixture
+    // A spelling that reaches through a link is one this descent will not follow, so the whole
+    // capture is refused rather than taken with a guess in it.
+    std::os::unix::fs::symlink("repo-data", path.join("vendor/git-alias")).expect("a link to it");
+    std::fs::write(nested.join(".git"), b"gitdir: ../git-alias\n").expect("through the link");
+    let failure = fixture
         .capture_with(workspace, &policy, &grant, None, None)
-        .expect("an ordinary nested repository is captured around");
+        .expect_err("a place this host cannot descend to is not captured around");
     assert!(
-        record
-            .exclusions
-            .iter()
-            .any(|entry| entry.path == "vendor/inner"),
-        "the nested tree is named: {:?}",
-        record.exclusions
+        failure
+            .to_string()
+            .contains("could not reach by descending to it"),
+        "the refusal says why: {failure}"
     );
+
+    // A spelling that names nothing excludes nothing, because there is nothing of it to capture.
+    std::fs::write(nested.join(".git"), b"gitdir: ../not-there\n").expect("nowhere");
+    fixture
+        .capture_with(workspace, &policy, &grant, None, None)
+        .expect("a target that is not there is not a reason to refuse");
 }
 
 /// KR-REQ-14.33: a submodule whose data is not really under this repository refuses the capture.
@@ -1098,7 +1113,7 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
         assert!(
             failure
                 .to_string()
-                .contains("somewhere other than beside its tree"),
+                .contains("could not reach by descending to it"),
             "the refusal says why for {shape}: {failure}"
         );
     }
