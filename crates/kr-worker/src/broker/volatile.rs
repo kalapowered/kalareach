@@ -154,6 +154,22 @@ impl VolatileState {
         }
     }
 
+    /// Refuses an acknowledgement that belongs to another recovery than the one running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] naming both generations.
+    pub fn check_generation(&self, generation: RecoveryGeneration) -> Result<()> {
+        if generation == self.generation {
+            Ok(())
+        } else {
+            Err(BrokerError::invalid(format!(
+                "this reconciliation belongs to {generation} and {} is running",
+                self.generation
+            )))
+        }
+    }
+
     /// Records that one upstream has been reconciled, and returns what is still owed.
     ///
     /// # Errors
@@ -166,12 +182,7 @@ impl VolatileState {
         application_instance_id: kr_protocol::ids::ApplicationInstanceId,
         connection: kr_protocol::ids::GatewayConnectionId,
     ) -> Result<usize> {
-        if generation != self.generation {
-            return Err(BrokerError::invalid(format!(
-                "this reconciliation belongs to {generation} and {} is running",
-                self.generation
-            )));
-        }
+        self.check_generation(generation)?;
         self.owed.remove(&(application_instance_id, connection));
         Ok(self.owed.len())
     }

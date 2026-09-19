@@ -735,6 +735,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                     effect: EffectClass::Write,
                     capability: Some(capability("agent.prompt")),
                     needs_draft: false,
+                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
                 },
                 RegisteredAction {
                     name: ActionName::new("draft.attach").expect("valid"),
@@ -742,6 +743,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                     effect: EffectClass::Write,
                     capability: Some(capability("agent.prompt")),
                     needs_draft: true,
+                    operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
                 },
                 RegisteredAction {
                     name: ActionName::new("conversation.read").expect("valid"),
@@ -749,11 +751,26 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                     effect: EffectClass::Read,
                     capability: None,
                     needs_draft: false,
+                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
                 },
             ],
         )
         .expect("the actions are registered");
 
+    // The effect a component would return for one action, as the broker receives it.
+    let prepared = |action: &str, draft: Nullable<kr_protocol::ids::DraftId>| {
+        kr_protocol::broker::PreparedEffect {
+            action: ActionName::new(action).expect("valid"),
+            class: EffectClass::Write,
+            operation: if action == "draft.attach" {
+                kr_protocol::broker::PreparedOperation::UpstreamAttachment
+            } else {
+                kr_protocol::broker::PreparedOperation::UpstreamSubmit
+            },
+            draft_id: draft,
+            argument_hash: Digest256::from_bytes([8; 32]),
+        }
+    };
     let invoke = |action: &str, draft: Nullable<kr_protocol::ids::DraftId>| {
         broker.plugin_action_invoke(
             &caller(),
@@ -765,6 +782,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                 draft_id: draft,
                 parameters: Bytes::from(b"{}".to_vec()),
             },
+            &prepared(action, draft),
             TimestampMs::new(4),
         )
     };
@@ -845,6 +863,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
             }],
         )
         .expect("the actions are registered");
@@ -864,6 +883,13 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                     action: ActionName::new("prompt.submit").expect("valid"),
                     draft_id: Nullable::null(),
                     parameters: Bytes::from(b"{}".to_vec()),
+                },
+                &kr_protocol::broker::PreparedEffect {
+                    action: ActionName::new("prompt.submit").expect("valid"),
+                    class: EffectClass::Write,
+                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                    draft_id: Nullable::null(),
+                    argument_hash: Digest256::from_bytes([8; 32]),
                 },
                 TimestampMs::new(6),
             )
@@ -1098,6 +1124,7 @@ fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_on
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
             }],
         )
         .expect("the actions are registered");
@@ -1170,10 +1197,11 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
                 effect: EffectClass::Write,
                 capability: None,
                 needs_draft: true,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
             }],
         )
         .expect("the actions are registered");
-    let admitted = broker
+    let mut admitted = broker
         .admit_plugin_action(
             &caller(),
             binding(),
@@ -1187,6 +1215,10 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
             TimestampMs::new(2),
         )
         .expect("the invocation is admitted");
+    assert!(
+        !admitted.effect_validated(),
+        "nothing is validated until a plan arrives"
+    );
 
     let plan = |action: &str,
                 class: EffectClass,
@@ -1204,7 +1236,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
 
     broker
         .validate_effect(
-            &admitted,
+            &mut admitted,
             &plan(
                 "draft.attach",
                 EffectClass::Write,
@@ -1218,7 +1250,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert!(matches!(
         broker
             .validate_effect(
-                &admitted,
+                &mut admitted,
                 &plan(
                     "prompt.submit",
                     EffectClass::Write,
@@ -1234,7 +1266,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert!(
         broker
             .validate_effect(
-                &admitted,
+                &mut admitted,
                 &plan(
                     "draft.attach",
                     EffectClass::Read,
@@ -1250,7 +1282,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert_eq!(
         broker
             .validate_effect(
-                &admitted,
+                &mut admitted,
                 &plan(
                     "draft.attach",
                     EffectClass::Write,
@@ -1270,7 +1302,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     assert!(matches!(
         broker
             .validate_effect(
-                &admitted,
+                &mut admitted,
                 &plan(
                     "draft.attach",
                     EffectClass::Write,

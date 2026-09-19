@@ -653,18 +653,29 @@ impl PreparedOperation {
         }
     }
 
-    /// Returns the grant this operation needs.
+    /// Returns the grant this operation needs, where one of the broker's three covers it.
     ///
-    /// Every one of them acts on the bound execution, so every one of them needs the upstream
-    /// action grant. Observation permits reading and nothing here.
+    /// Terminal text is deliberately absent. Section 11 keeps method classification, input leases,
+    /// file grants and native approval rights distinct, and writing into the terminal is the input
+    /// lease's, not the upstream-action grant's. An effect plan that asks for it is asking for
+    /// something no plugin grant carries.
     #[must_use]
-    pub const fn grant(self) -> BrokerGrant {
-        BrokerGrant::UpstreamAction
+    pub const fn grant(self) -> Option<BrokerGrant> {
+        match self {
+            Self::UpstreamSubmit | Self::UpstreamCancel | Self::UpstreamAttachment => {
+                Some(BrokerGrant::UpstreamAction)
+            }
+            Self::TerminalText => None,
+        }
     }
 
-    /// Returns true when this operation acts on the invocation's draft.
+    /// Returns true when this operation can act on a draft at all.
+    ///
+    /// Whether a given action *must* is the manifest's own declaration, because a prompt can
+    /// carry its text inline as well as live in a draft. This is the weaker fact: an operation
+    /// that cannot touch a draft is one no plan may name a draft for.
     #[must_use]
-    pub const fn acts_on_a_draft(self) -> bool {
+    pub const fn may_act_on_a_draft(self) -> bool {
         matches!(self, Self::UpstreamSubmit | Self::UpstreamAttachment)
     }
 

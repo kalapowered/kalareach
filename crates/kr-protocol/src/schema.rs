@@ -44,7 +44,7 @@ use crate::attention::{
 use crate::authority::MethodEntry;
 use crate::broker::{
     ActionToken, ActionTokenClaim, CapabilityMap, DecoderLedgerEntry, DecodingTrust,
-    InstanceCapabilityRecord, LaunchProfile,
+    InstanceCapabilityRecord, LaunchProfile, PreparedEffect,
 };
 use crate::changeset::{
     CaptureCount, ChangeSetVersionRecord, ChangeSetVersionSummary, ChangesetCaptureParams,
@@ -364,6 +364,7 @@ pub fn protocol_schema() -> Value {
         "pair_status_params" => PairStatusParams,
         "pair_status_result" => PairStatusResult,
         "pending_resource" => PendingResource,
+        "prepared_effect" => PreparedEffect,
         "plugin_action_invoke_params" => PluginActionInvokeParams,
         "plugin_action_invoke_result" => PluginActionInvokeResult,
         "projection_delta" => ProjectionDelta,

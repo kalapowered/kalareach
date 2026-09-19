@@ -1625,6 +1625,7 @@ export interface KalaReachProtocol {
   plugin_action_invoke_params?: PluginActionInvokeParams
   plugin_action_invoke_result?: PluginActionInvokeResult
   policy_authority?: PolicyAuthority
+  prepared_effect?: PreparedEffect
   preview_entry?: PreviewEntry
   project_adopt_params?: ProjectAdoptParams
   project_adopt_result?: ProjectAdoptResult
@@ -12280,6 +12281,35 @@ export interface PolicyAuthorityHeadPayload {
    * The organisation this statement belongs to.
    */
   organisation_id: string
+}
+/**
+ * The effect one component prepared, as the broker receives it.
+ *
+ * Proposing is not doing. Section 11: "Its effect plan can use only resources and operations
+ * permitted by that invocation." What arrives here is a proposal, and the broker compares it with
+ * the token it was prepared under before anything is dispatched.
+ */
+export interface PreparedEffect {
+  /**
+   * The action the component says it prepared.
+   */
+  action: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  argument_hash: string
+  /**
+   * The effect class it says the operation has.
+   */
+  class: 'read' | 'write'
+  /**
+   * The draft it acts on, where it acts on one.
+   */
+  draft_id: DraftId | null
+  /**
+   * What it asks the host to perform.
+   */
+  operation: 'upstream_submit' | 'upstream_cancel' | 'upstream_attachment' | 'terminal_text'
 }
 /**
  * Parameters of `project.adopt`.

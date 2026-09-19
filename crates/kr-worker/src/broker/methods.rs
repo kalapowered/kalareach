@@ -214,6 +214,10 @@ pub struct MutationAdmission {
     provenance: ActionProvenance,
     approval: Option<(Claim, DispatchAdmission)>,
     token: Option<ActionToken>,
+    /// True once the effect this admission carries has been validated against its invocation.
+    effect_validated: bool,
+    /// Spent when the operation is transmitted, so one admission carries one transmission.
+    spent: std::sync::atomic::AtomicBool,
 }
 
 impl MutationAdmission {
@@ -233,6 +237,8 @@ impl MutationAdmission {
             provenance: ActionProvenance::UpstreamTypedRpc,
             approval: None,
             token: None,
+            effect_validated: false,
+            spent: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -325,7 +331,32 @@ impl MutationAdmission {
     ///
     /// Returns whatever the transport refuses.
     pub fn submit(&self) -> Result<UpstreamOutcome> {
+        // One admission, one transmission. A caller that submitted and then submitted again would
+        // send one operation twice, and the second send would discover the resolved state only
+        // after its bytes had gone.
+        if self.spent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(BrokerError::invalid(
+                "this admission has already been transmitted, and one admission carries one \
+                 operation",
+            ));
+        }
         self.dispatch.submit(&self.request)
+    }
+
+    /// Returns true when the effect this admission carries has been validated.
+    #[must_use]
+    pub const fn effect_validated(&self) -> bool {
+        self.effect_validated
+    }
+
+    /// Returns true when this invocation is one a component prepares an effect for.
+    #[must_use]
+    pub const fn prepares_an_effect(&self) -> bool {
+        self.token.is_some()
+    }
+
+    pub(crate) const fn mark_effect_validated(&mut self) {
+        self.effect_validated = true;
     }
 }
 
@@ -346,6 +377,11 @@ pub struct RegisteredAction {
     pub capability: Option<CapabilityId>,
     /// True when the action acts on a draft, so a draft must be named.
     pub needs_draft: bool,
+    /// The operation the manifest declares this action performs.
+    ///
+    /// An effect plan is compared with it, so a component cannot prepare one operation under an
+    /// action declared for another.
+    pub operation: kr_protocol::broker::PreparedOperation,
 }
 
 /// What a caller presents for an agent mutation.
@@ -786,9 +822,11 @@ impl Broker {
         caller: &Caller,
         binding_id: BrokerBindingId,
         params: &PluginActionInvokeParams,
+        effect: &kr_protocol::broker::PreparedEffect,
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
-        let admitted = self.admit_plugin_action(caller, binding_id, params, now)?;
+        let mut admitted = self.admit_plugin_action(caller, binding_id, params, now)?;
+        self.validate_effect(&mut admitted, effect)?;
         self.record_plugin_action(&admitted, now)
     }
 
@@ -803,6 +841,16 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
         let _ = now;
+        // An invocation that prepared an effect transmits the effect this broker validated, and
+        // nothing else. An admission whose component returned a plan that was never checked is
+        // one this host will not spend.
+        if admitted.prepares_an_effect() && !admitted.effect_validated() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: "this invocation's prepared effect has not been validated against the \
+                         invocation it was prepared under"
+                    .to_owned(),
+            });
+        }
         let token = admitted
             .token()
             .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?
@@ -1043,7 +1091,7 @@ impl Broker {
     /// invocation named or is one this host cannot resolve.
     pub fn validate_effect(
         &self,
-        admitted: &MutationAdmission,
+        admitted: &mut MutationAdmission,
         effect: &kr_protocol::broker::PreparedEffect,
     ) -> Result<()> {
         let token = admitted
@@ -1054,9 +1102,6 @@ impl Broker {
                 kr_protocol::broker::TokenError::Mismatch { field: "action" },
             ));
         }
-        // The operation's own grant, checked against the binding as it stands rather than against
-        // the grant the token was issued under: a grant withdrawn while the component was working
-        // is not a grant.
         let binding_id = match admitted.responsible() {
             Responsible::Binding(binding_id) => binding_id,
             Responsible::Transport => {
@@ -1066,8 +1111,30 @@ impl Broker {
                 ));
             }
         };
+        // The operation the manifest declared. A plan that asks for something else is asking
+        // under an invocation that was admitted for something else.
+        let registered = self
+            .registered_action(binding_id, &token.action)?
+            .ok_or_else(|| {
+                BrokerError::unknown(format!("{} is no longer a registered action", token.action))
+            })?;
+        if registered.operation != effect.operation {
+            return Err(BrokerError::invalid(format!(
+                "{} is declared as {} and this plan prepares {}",
+                token.action, registered.operation, effect.operation
+            )));
+        }
+        // The operation's own grant, checked against the binding as it stands rather than against
+        // the grant the token was issued under: a grant withdrawn while the component was working
+        // is not a grant. An operation no plugin grant covers is refused outright.
+        let needed = effect.operation.grant().ok_or_else(|| {
+            BrokerError::denied(format!(
+                "{} is not something a component grant carries, so no effect plan may ask for it",
+                effect.operation
+            ))
+        })?;
         let grants = self.grants(binding_id)?;
-        grants.require(effect.operation.grant())?;
+        grants.require(needed)?;
         // A read cannot arrive on the write path, and an operation that changes the upstream is
         // not a read whatever the plan calls it.
         if effect.class != EffectClass::Write || !effect.operation.writes() {
@@ -1079,7 +1146,7 @@ impl Broker {
         // And the draft. An operation that acts on one acts on the invocation's own, and a draft
         // this host cannot resolve is a precondition nobody has established rather than one to
         // assume.
-        if effect.operation.acts_on_a_draft() {
+        if registered.needs_draft {
             let named =
                 effect
                     .draft_id
@@ -1098,12 +1165,13 @@ impl Broker {
                 });
             }
             self.resolve_draft(named)?;
-        } else if effect.draft_id.is_present() {
+        } else if effect.draft_id.is_present() && !effect.operation.may_act_on_a_draft() {
             return Err(BrokerError::invalid(format!(
                 "{} acts on no draft and this plan named one",
                 effect.operation
             )));
         }
+        admitted.mark_effect_validated();
         Ok(())
     }
 

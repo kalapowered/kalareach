@@ -208,7 +208,7 @@ impl Writer {
 pub struct LinkDispatch {
     connection: GatewayConnectionId,
     upstream: Writer,
-    next: std::sync::atomic::AtomicU64,
+    next: Arc<std::sync::atomic::AtomicU64>,
     rich: kr_protocol::gateway::RichMethodTable,
     params_field: String,
     request_id_field: String,
@@ -307,6 +307,14 @@ impl UpstreamDispatch for LinkDispatch {
         // An approval's answer was prepared by the core at admission, from this connection's own
         // table. Writing anything else here would send bytes nobody admitted.
         if let UpstreamBody::Approval { response, .. } = &request.body {
+            // The prepared answer names the connection it was admitted on. Writing it anywhere
+            // else would answer one upstream's resource on another's stream.
+            if response.request.connection != self.connection {
+                return Err(BrokerError::denied(format!(
+                    "this answer was admitted on {} and this transport speaks for {}",
+                    response.request.connection, self.connection
+                )));
+            }
             self.upstream.send(&response.frame)?;
             return Ok(UpstreamOutcome {
                 upstream_request_id: Some(response.upstream_request_id.clone()),
@@ -370,6 +378,10 @@ pub enum Carried {
 pub struct Link {
     broker: Arc<Broker>,
     connection: GatewayConnectionId,
+    /// The identifiers this connection has issued, owned by the connection rather than by each
+    /// dispatch. Two dispatches of one connection that both started at one would put two requests
+    /// under one identifier, and an answer to either would resolve the other.
+    next: Arc<std::sync::atomic::AtomicU64>,
     framing: Framing,
     upstream: Writer,
     client: Writer,
@@ -390,7 +402,7 @@ impl Link {
         Ok(Arc::new(LinkDispatch {
             connection: self.connection,
             upstream: self.upstream.clone(),
-            next: std::sync::atomic::AtomicU64::new(0),
+            next: Arc::clone(&self.next),
             rich: connection.rich.clone(),
             params_field: connection.table.params_field.clone(),
             request_id_field: connection.table.request_id_field.clone(),
@@ -452,15 +464,10 @@ impl Link {
             .native_answer_through(self.connection, frame, now, |bytes| {
                 self.upstream.send(bytes)
             })?;
-        // Every attached observer is told, because a person watching from a second device is
-        // watching the same resource.
-        for observer in self.broker.observers(resolved.application_instance_id) {
-            if observer != self.connection {
-                let _ = self.client.send(frame);
-                let _ = observer;
-                break;
-            }
-        }
+        // Delivering the resolution to the other attached observers is not this link's: an
+        // observer reads it over its own subscription, which is where the authority check and the
+        // bounded queue live. What this link owes them is that the resource is resolved before
+        // anything else can answer it, which the admission above is.
         Ok(Carried::ClientAnswer {
             resource_id: resolved.resource_id,
         })
@@ -617,6 +624,7 @@ impl Link {
         Self {
             broker,
             connection,
+            next: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             framing,
             upstream,
             client,

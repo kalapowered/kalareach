@@ -1795,6 +1795,10 @@ impl Broker {
                 state.volatile.mode()
             )));
         }
+        // The generation is checked before anything is written. An acknowledgement prepared under
+        // a recovery that failed carries a list about a moment that has passed, and applying it
+        // first would cancel resources that are current before the refusal was reported.
+        state.volatile.check_generation(generation)?;
         let reconciliation = state.reconcile_in(scope, still_open, now)?;
         // This upstream is reconciled. Rich work comes back when every one that owed a
         // reconciliation has given it, and not before.
@@ -1995,9 +1999,24 @@ impl Broker {
             .arbitration
             .iter()
             .find(|pending| pending.resource.request.connection == connection);
+        let instance_generation = state
+            .instances
+            .get(&application_instance_id)
+            .map(|instance| instance.source_generation);
         match retained {
             Some(pending)
-                if pending.resource.application_instance_id == application_instance_id => {}
+                if pending.resource.application_instance_id == application_instance_id
+                    && Some(pending.resource.source_generation) == instance_generation => {}
+            Some(pending)
+                if pending.resource.application_instance_id == application_instance_id =>
+            {
+                return Err(BrokerError::denied(format!(
+                    "{connection} holds resources from generation {} and this instance is at \
+                     another, so restoring it would expose an old execution's resources to a new \
+                     one",
+                    pending.resource.source_generation
+                )));
+            }
             Some(pending) => {
                 return Err(BrokerError::denied(format!(
                     "{connection} holds resources of {} and this restoration names {application_instance_id}",

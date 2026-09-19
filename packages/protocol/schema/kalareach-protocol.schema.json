@@ -16862,6 +16862,72 @@
       },
       "type": "object"
     },
+    "PreparedEffect": {
+      "additionalProperties": false,
+      "description": "The effect one component prepared, as the broker receives it.\n\nProposing is not doing. Section 11: \"Its effect plan can use only resources and operations\npermitted by that invocation.\" What arrives here is a proposal, and the broker compares it with\nthe token it was prepared under before anything is dispatched.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The action the component says it prepared."
+        },
+        "argument_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The hash of the arguments it filled in."
+        },
+        "class": {
+          "$ref": "#/$defs/EffectClass",
+          "description": "The effect class it says the operation has."
+        },
+        "draft_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DraftId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The draft it acts on, where it acts on one."
+        },
+        "operation": {
+          "$ref": "#/$defs/PreparedOperation",
+          "description": "What it asks the host to perform."
+        }
+      },
+      "required": [
+        "action",
+        "class",
+        "operation",
+        "draft_id",
+        "argument_hash"
+      ],
+      "type": "object"
+    },
+    "PreparedOperation": {
+      "description": "What one operation a prepared effect asks for.\n\nThe vocabulary is the component interface's, narrowed to what the broker has to decide about:\nwhich grant the operation needs, whether it acts on a draft, and whether the action's declared\neffect class agrees with it. The arguments themselves are the connector's.",
+      "oneOf": [
+        {
+          "const": "upstream_submit",
+          "description": "Submit or queue a prompt against the bound execution.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_cancel",
+          "description": "Cancel the running turn.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_attachment",
+          "description": "Contribute a completed attachment to the upstream draft.",
+          "type": "string"
+        },
+        {
+          "const": "terminal_text",
+          "description": "Write text into the terminal.",
+          "type": "string"
+        }
+      ]
+    },
     "Presentation": {
       "description": "How a new session is presented locally.\n\nThe three are mutually exclusive. `attach` is the default when standard input and output are\nterminals; otherwise the caller states one.",
       "oneOf": [
@@ -28818,6 +28884,9 @@
     },
     "policy_authority": {
       "$ref": "#/$defs/PolicyAuthority"
+    },
+    "prepared_effect": {
+      "$ref": "#/$defs/PreparedEffect"
     },
     "preview_entry": {
       "$ref": "#/$defs/PreviewEntry"

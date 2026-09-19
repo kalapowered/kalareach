@@ -2178,7 +2178,10 @@ impl WorkerService {
                         },
                     )),
                 };
-                self.settle(&actor_id, action_id, outcome.as_ref());
+                // Past the admission there is no rejection. Whether the operation reached the
+                // upstream cannot be established from here, and section 9 records that as
+                // unknown rather than as a refusal the caller would read as "nothing happened".
+                self.settle_unknown(&actor_id, action_id, outcome.as_ref());
                 return match outcome {
                     Ok(value) => ControlFrame::Response(Response {
                         request_id: mutation.request_id,
@@ -2245,6 +2248,48 @@ impl WorkerService {
         };
         self.settle(&pending.actor_id, pending.action_id, outcome.as_ref());
         respond(pending.request_id, outcome)
+    }
+
+    /// Records the outcome of an admitted operation that was transmitted outside the boundary.
+    ///
+    /// The admission is committed before the bytes go, so a failure after it is an outcome nobody
+    /// can establish rather than a refusal: the frame may have reached the upstream and the answer
+    /// may have been lost. Section 9 records exactly that.
+    fn settle_unknown(
+        &self,
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        outcome: std::result::Result<&ParamsValue, &WorkerError>,
+    ) {
+        let now = kr_ipc::now_ms();
+        let mut session = self.runtime.session();
+        let Some(journal) = session.journal_mut() else {
+            return;
+        };
+        let settled = match outcome {
+            Ok(value) => {
+                let bytes = kr_cbor::encode(value.as_value());
+                journal.settle(
+                    actor_id.clone(),
+                    action_id,
+                    kr_protocol::receipt::ReceiptState::Applied,
+                    Some(&bytes),
+                    None,
+                    now,
+                )
+            }
+            Err(error) => journal.settle(
+                actor_id.clone(),
+                action_id,
+                kr_protocol::receipt::ReceiptState::Unknown,
+                None,
+                Some(error.to_protocol_error()),
+                now,
+            ),
+        };
+        if let Err(failure) = settled {
+            session.note_journal_failure(&failure);
+        }
     }
 
     /// Records the outcome of a mutation that was settled outside the session boundary.
@@ -4541,20 +4586,25 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
+                // The admission is taken here, which is what refuses everything this host can
+                // decide. What it cannot yet do is receive the effect the component prepared:
+                // that hand-over runs through the plugin host, and the broker will not transmit
+                // an effect nobody validated against the invocation it was prepared under.
                 let admitted = self.broker.admit_plugin_action(
                     &Self::broker_caller(caller),
                     binding_id,
                     &params,
                     kr_ipc::now_ms(),
                 )?;
-                Ok((
-                    ParamsValue::empty(),
-                    AfterEffect::Upstream(Box::new(UpstreamHandoff {
-                        broker: Arc::clone(&self.broker),
-                        admitted,
-                        kind: UpstreamKind::PluginAction,
-                    })),
-                ))
+                let _ = admitted;
+                Err(crate::broker::BrokerError::UnsupportedCapability {
+                    detail: format!(
+                        "{} was admitted, and the effect its component prepares does not yet \
+                         reach this broker, so nothing is transmitted for it",
+                        params.action
+                    ),
+                }
+                .into())
             }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
@@ -5351,8 +5401,6 @@ enum UpstreamKind {
     Mutation,
     /// An approval answer, which also resolves its pending resource.
     Approval,
-    /// A plugin action, which also spends its token.
-    PluginAction,
 }
 
 /// One admitted operation, waiting for the session boundary to end before it is transmitted.
@@ -5378,10 +5426,6 @@ impl UpstreamHandoff {
             }
             UpstreamKind::Approval => {
                 let result = self.broker.record_approval(&self.admitted, now)?;
-                encode(&result)
-            }
-            UpstreamKind::PluginAction => {
-                let result = self.broker.record_plugin_action(&self.admitted, now)?;
                 encode(&result)
             }
         }

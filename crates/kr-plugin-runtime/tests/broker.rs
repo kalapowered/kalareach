@@ -72,6 +72,7 @@ fn token() -> ActionToken {
         binding_revision: AgentBindingRevision::new(4),
         action: ActionName::new("prompt.submit").expect("valid"),
         parameter_hash: Digest256::from_bytes([1; 32]),
+        draft_id: Nullable::null(),
         issued_at: TimestampMs::new(1),
     }
 }
