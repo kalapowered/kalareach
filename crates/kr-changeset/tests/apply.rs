@@ -454,6 +454,7 @@ fn a_crash_after_one_file_never_yields_an_atomic_success_receipt() {
     fixture.service().inject(Some(Fault {
         after_paths: 1,
         act: None,
+        before_rename: None,
         stop: true,
         detail: "the daemon stopped after one path".to_owned(),
     }));
@@ -543,6 +544,7 @@ fn an_external_write_between_the_recheck_and_the_rename_is_a_conflict_after_part
             std::fs::write(racing.join("src/lib.rs"), b"somebody else wrote this\n")
                 .expect("the other writer writes");
         })),
+        before_rename: None,
         stop: false,
         detail: String::new(),
     }));
@@ -645,6 +647,11 @@ fn a_revert_restores_the_base_and_removes_nothing_of_the_user_s() {
         )
     };
     let result = apply::apply(fixture.service(), &order).expect("the revert runs");
+    assert_ne!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "an operation this host refused keeps the apply from being an applied change"
+    );
     assert_eq!(
         support::read_bytes(&path, "README.md"),
         b"a repository\n",
@@ -689,4 +696,266 @@ fn an_apply_that_names_no_expectation_for_a_path_it_would_write_is_refused() {
         "the refusal says why: {failure}"
     );
     let _ = Path::new(&path);
+}
+
+/// KR-REQ-14.25 and 14.29: a version whose working tree deleted a path carries that deletion as an
+/// operation, and an apply that performs it says so rather than reporting that it applied nothing.
+#[test]
+fn a_version_that_only_deletes_carries_the_deletion_as_an_operation() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "deleting-source");
+    std::fs::remove_file(source.join("src/lib.rs")).expect("the user deletes a tracked file");
+    let source_workspace = fixture.workspace("deleting-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+    assert!(
+        record.changes.is_empty(),
+        "this version holds no changed content at all"
+    );
+
+    let destination = ordinary_repository(fixture.work(), "deleting-destination");
+    let workspace = fixture.workspace("deleting-destination");
+    let affected = support::expectations(&destination, &["src/lib.rs"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let result = apply::apply(fixture.service(), &order).expect("the apply runs");
+    assert_eq!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+    assert_eq!(result.changed_paths, vec!["src/lib.rs".to_owned()]);
+    support::assert_absent(&destination.join("src/lib.rs"));
+    // And a path the version does not carry at all is still refused by name.
+    let order = ApplyOrder {
+        paths: &["README.md".to_owned()],
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &limitations,
+        )
+    };
+    let failure = apply::apply(fixture.service(), &order).expect_err("it is refused");
+    assert!(
+        failure.to_string().contains("no change and no deletion"),
+        "the refusal says why: {failure}"
+    );
+}
+
+/// KR-REQ-14.28 and 14.29: an external write between the recheck and the rename is the window this
+/// host states it cannot close. The apply reports what it did, and the version it captured before
+/// it is what a person recovers the overwritten content from.
+#[test]
+fn a_write_in_the_window_this_host_cannot_close_is_recoverable_from_the_before_version() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "window-source");
+    write(&source, "README.md", "the change this apply carries\n");
+    let source_workspace = fixture.workspace("window-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "window-destination");
+    let workspace = fixture.workspace("window-destination");
+    let affected = support::expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    // Somebody writes the destination **after** this host's last look at it and before the rename.
+    let racing = destination.clone();
+    fixture.service().inject(Some(Fault {
+        after_paths: usize::MAX,
+        act: None,
+        before_rename: Some(std::sync::Arc::new(move |path: &str| {
+            if path == "README.md" {
+                std::fs::write(racing.join("README.md"), b"somebody else wrote this\n")
+                    .expect("the other writer writes");
+            }
+        })),
+        stop: false,
+        detail: String::new(),
+    }));
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let result = apply::apply(fixture.service(), &order).expect("the apply runs");
+    // The rename landed. This is the stated limitation, not a defect: a recheck is not a lock.
+    assert_eq!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"the change this apply carries\n"
+    );
+    // What the other writer wrote is gone from the tree, and what was there *before the apply* is
+    // recoverable, which is what this host does promise.
+    let Nullable(Some(before)) = result.recovery.before_version else {
+        panic!("an apply records what the destination held");
+    };
+    let manifest = fixture
+        .service()
+        .manifest(before.change_set_id, before.version)
+        .expect("its manifest");
+    assert_eq!(
+        fixture
+            .service()
+            .objects()
+            .get(
+                manifest
+                    .path("README.md")
+                    .expect("it is there")
+                    .content_digest
+            )
+            .expect("its content"),
+        b"a repository\n"
+    );
+    assert!(
+        result
+            .limitations
+            .iter()
+            .any(|line| line.contains("does not claim to have captured every intermediate")),
+        "and the answer says what it does not claim: {:?}",
+        result.limitations
+    );
+}
+
+/// KR-REQ-14.29: a rename that installed something other than the validated content is caught
+/// rather than recorded as a success.
+#[test]
+fn a_destination_that_does_not_hold_what_was_installed_is_never_recorded_as_written() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "swapped-source");
+    write(&source, "README.md", "the validated content\n");
+    let source_workspace = fixture.workspace("swapped-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "swapped-destination");
+    let workspace = fixture.workspace("swapped-destination");
+    let affected = support::expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    // Somebody replaces the staged copy this host is about to rename into place.
+    let racing = destination.clone();
+    fixture.service().inject(Some(Fault {
+        after_paths: usize::MAX,
+        act: None,
+        before_rename: Some(std::sync::Arc::new(move |path: &str| {
+            if path == "README.md" {
+                let temporary = format!(
+                    ".kr-apply-{}",
+                    kr_changeset::objects::hex_of(kr_changeset::objects::digest_of(
+                        path.as_bytes()
+                    ))
+                );
+                std::fs::write(racing.join(temporary), b"something else entirely\n")
+                    .expect("the other writer replaces the staged copy");
+            }
+        })),
+        stop: false,
+        detail: String::new(),
+    }));
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let result = apply::apply(fixture.service(), &order).expect("the apply reports what happened");
+    assert_ne!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+    assert!(result.changed_paths.is_empty());
+    assert_eq!(result.unresolved_paths, vec!["README.md".to_owned()]);
+    let row = result
+        .progress
+        .iter()
+        .find(|row| row.path == "README.md")
+        .expect("the path is named");
+    assert_eq!(row.state, PathProgressState::Unresolved);
+    assert!(
+        row.detail
+            .contains("other than the content this host installed"),
+        "the row says what happened: {}",
+        row.detail
+    );
+}
+
+/// KR-REQ-14.26 and 14.28: this host removes nothing to make room for its own staging, and a name
+/// it cannot use is a path it leaves exactly as it is.
+#[test]
+fn an_occupied_staging_name_is_left_alone_and_the_path_is_reported() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "occupied-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("occupied-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "occupied-destination");
+    // Somebody's own file is at the name this host would stage through.
+    let temporary = format!(
+        ".kr-apply-{}",
+        kr_changeset::objects::hex_of(kr_changeset::objects::digest_of(b"README.md"))
+    );
+    std::fs::write(destination.join(&temporary), b"somebody else's file\n").expect("their file");
+    let workspace = fixture.workspace("occupied-destination");
+    let affected = support::expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let result = apply::apply(fixture.service(), &order).expect("the apply reports what happened");
+    assert_ne!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+    assert_eq!(result.unresolved_paths, vec!["README.md".to_owned()]);
+    assert_eq!(
+        support::read_bytes(&destination, &temporary),
+        b"somebody else's file\n",
+        "nothing of theirs was removed"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"a repository\n",
+        "and the destination is as it was"
+    );
+}
+
+/// KR-REQ-14.28: a preflight returns the limitations without needing them back, which is how a
+/// caller learns what it has to acknowledge.
+#[test]
+fn a_preflight_returns_the_limitations_a_direct_apply_then_requires() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "shown");
+    write(&path, "README.md", "a change\n");
+    let workspace = fixture.workspace("shown");
+    let record = fixture.capture(workspace, &include_everything());
+    let affected = support::expectations(&path, &["README.md"]);
+    let order = ApplyOrder {
+        preflight_only: true,
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &[],
+        )
+    };
+    let shown =
+        apply::apply(fixture.service(), &order).expect("a preflight needs no acknowledgement");
+    assert_eq!(shown.outcome, Nullable(None));
+    assert_eq!(
+        shown.limitations,
+        apply::limitations(DestinationClass::SharedExisting)
+    );
+    // And what it returned is exactly what the apply then accepts.
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &shown.limitations,
+    );
+    let applied = apply::apply(fixture.service(), &order).expect("the apply runs");
+    assert_eq!(applied.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
 }

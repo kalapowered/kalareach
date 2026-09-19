@@ -3450,10 +3450,25 @@ impl Controller {
                     error.to_string(),
                 );
             }
-            return self
+            let answered = self
                 .changesets
                 .write_frame(actor_id, mutation, method)
                 .await;
+            // The effect and its reply are separated by everything a blocking task waits for, and
+            // a revocation can land in that interval. What this host must not do is **disclose**
+            // an answer under authority that has since been withdrawn, so the check is made again
+            // here, where the reply is about to go out. What it does not undo is the effect: the
+            // admission the service's own transaction would have to carry is the host action
+            // contract's, which T-020 owns, and this service has the same gap the project and
+            // transfer services have.
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
+            return answered;
         }
         // The admission the mutation carries into its transaction: the deadline this daemon
         // accepted, the authority revision it was admitted under, and the connection it arrived

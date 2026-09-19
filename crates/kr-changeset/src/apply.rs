@@ -46,9 +46,10 @@ use std::io::Write as _;
 use kr_project::{OpenedRepository, RestrictedProfile};
 use kr_protocol::changeset::{
     AffectedVersion, ApplyOutcomeClass, CapturePolicy, CapturedPath, ChangeSetVersionRecord,
-    ContentOrigin, DestinationClass, DiffApplyResult, DiffEntry, DiffReadResult, ExpectedReference,
-    FileGrant, MAX_CHANGESET_ENTRIES, PathClass, PathConflict, PathProgress, PathProgressState,
-    Provenance, RecoveryObjects, ReferenceOutcome, SourceConsistency, VersionRef,
+    ContentOrigin, DestinationClass, DiffApplyResult, DiffEntry, DiffReadResult, ExclusionReason,
+    ExpectedReference, FileGrant, MAX_CHANGESET_ENTRIES, PathClass, PathConflict, PathProgress,
+    PathProgressState, Provenance, RecoveryObjects, ReferenceOutcome, SourceConsistency,
+    VersionRef,
 };
 use kr_protocol::ids::{ActionId, WorkspaceId};
 use kr_protocol::project::{ChangeKind, ContentClass, InclusionChoice, InclusionPolicy};
@@ -92,6 +93,10 @@ pub struct ApplyOrder<'a> {
     pub provenance: Provenance,
 }
 
+/// What a test runs immediately before one path's rename, named by that path.
+#[cfg(feature = "fault-injection")]
+pub type BeforeRename = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// What a test does to an apply that is already running.
 ///
 /// Two things a real apply meets and a test cannot otherwise reach: a daemon that dies part way
@@ -106,6 +111,9 @@ pub struct Fault {
     pub act: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Stop the apply there **without settling it**, exactly as a daemon that died would.
     pub stop: bool,
+    /// Run this immediately before one path's rename, which is the one window this host states it
+    /// cannot close.
+    pub before_rename: Option<BeforeRename>,
     /// What the failure says when it stops.
     pub detail: String,
 }
@@ -117,6 +125,7 @@ impl std::fmt::Debug for Fault {
             .debug_struct("Fault")
             .field("after_paths", &self.after_paths)
             .field("acts", &self.act.is_some())
+            .field("acts_before_rename", &self.before_rename.is_some())
             .field("stop", &self.stop)
             .finish()
     }
@@ -198,7 +207,8 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
         ));
     };
     let index = read_index(profile, &repository)?;
-    let differences = read_differences(profile, &repository, &head_revision)?;
+    let differences = read_differences(profile, &repository, &head_revision, false)?;
+    let staged = read_differences(profile, &repository, &head_revision, true)?;
     let status = read_status(profile, &repository, &FileGrant::default())?;
     let mut tracked = Vec::new();
     let mut untracked = Vec::new();
@@ -222,14 +232,22 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
             byte_len: Nullable(byte_len),
             // The content revision of the base side: the object the **commit** holds, which is
             // what the diff reports, rather than whatever the index happens to hold.
+            // The content revision of the base side is the object the **commit** holds. A path
+            // the working-tree diff names carries it; a path only the index changed carries it in
+            // the index-against-commit diff; and a path neither names is one where the index and
+            // the working tree both match the commit, so the index's object is the commit's.
             base_object_id: Nullable(
                 differences
                     .get(&entry.path)
+                    .or_else(|| staged.get(&entry.path))
                     .and_then(|difference| difference.base_object_id.clone())
                     .or_else(|| {
                         index
                             .get(&entry.path)
-                            .filter(|_| !differences.contains_key(&entry.path))
+                            .filter(|_| {
+                                !differences.contains_key(&entry.path)
+                                    && !staged.contains_key(&entry.path)
+                            })
                             .map(|held| held.object_id.clone())
                     }),
             ),
@@ -367,7 +385,10 @@ pub fn apply(service: &ChangeSetService, order: &ApplyOrder<'_>) -> Result<DiffA
     let manifest = service.manifest(order.version.change_set_id, order.version.version)?;
     let carried = carried_paths(&manifest, order)?;
     let limitations = limitations(order.destination);
-    if order.destination == DestinationClass::SharedExisting {
+    // A preflight is a read: it writes nothing anywhere, and it is how a caller **obtains** the
+    // limitations it then has to pass back. Requiring them before it would mean a caller could
+    // not learn them through this interface at all.
+    if order.destination == DestinationClass::SharedExisting && !order.preflight_only {
         for limitation in &limitations {
             if !order
                 .acknowledged_limitations
@@ -376,9 +397,11 @@ pub fn apply(service: &ChangeSetService, order: &ApplyOrder<'_>) -> Result<DiffA
             {
                 return Err(ChangeSetError::InvalidArgument(
                     format!(
-                        "a direct apply to a shared working tree is chosen only after this \
-                         limitation has been shown, and this request does not carry it back: \
-                         {limitation}"
+                        "a direct apply to a shared working tree is chosen only after every one \
+                         of these limitations has been shown, and this request carries none of \
+                         them or not all of them. They are, in full: {}. The one it is missing \
+                         is: {limitation}",
+                        limitations.join("; ")
                     )
                     .into(),
                 ));
@@ -394,21 +417,58 @@ pub fn apply(service: &ChangeSetService, order: &ApplyOrder<'_>) -> Result<DiffA
     }
 }
 
-/// Returns exactly the paths this apply carries.
-fn carried_paths(manifest: &Manifest, order: &ApplyOrder<'_>) -> Result<Vec<CapturedPath>> {
-    let changes: Vec<CapturedPath> = manifest.changes().into_iter().cloned().collect();
+/// One operation the request asked for: a path, and what the version holds for it.
+#[derive(Clone, Debug)]
+pub struct Requested {
+    /// The path, relative to the repository's top level.
+    pub path: String,
+    /// What the captured tree holds there, or nothing when the version does not hold the path.
+    ///
+    /// Nothing is not "no operation": a version whose working tree deleted a path holds nothing
+    /// for it, and applying that version means taking the path away. A request that asks for such
+    /// a path gets a deletion, and one that asks for all of them gets every deletion the version
+    /// carries.
+    pub holds: Option<CapturedPath>,
+}
+
+/// Returns exactly the operations this apply carries.
+///
+/// A version's **changes** are the paths whose content differs from the base, and its
+/// **deletions** are the paths the working tree took away. Both are operations: leaving the second
+/// out would let an apply of a version that only deletes report that it applied everything while
+/// changing nothing.
+fn carried_paths(manifest: &Manifest, order: &ApplyOrder<'_>) -> Result<Vec<Requested>> {
+    let mut every: Vec<Requested> = manifest
+        .changes()
+        .into_iter()
+        .map(|entry| Requested {
+            path: entry.path.clone(),
+            holds: Some(entry.clone()),
+        })
+        .collect();
+    every.extend(
+        manifest
+            .exclusions
+            .iter()
+            .filter(|exclusion| exclusion.reason == ExclusionReason::Deleted)
+            .map(|exclusion| Requested {
+                path: exclusion.path.clone(),
+                holds: None,
+            }),
+    );
+    every.sort_by(|a, b| a.path.cmp(&b.path));
     if order.paths.is_empty() {
-        return Ok(changes);
+        return Ok(every);
     }
     let mut chosen = Vec::new();
     for path in order.paths {
-        let found = changes
+        let found = every
             .iter()
-            .find(|entry| entry.path == *path)
+            .find(|requested| requested.path == *path)
             .ok_or_else(|| {
                 ChangeSetError::InvalidArgument(
                     format!(
-                        "this version holds no change for {}",
+                        "this version holds no change and no deletion for {}",
                         kr_project::git::redact(path)
                     )
                     .into(),
@@ -469,11 +529,11 @@ fn conflicts(
             continue;
         };
         let worktree_differs = entry.expected_worktree_digest.0 != here.worktree_digest;
-        let index_differs = entry
-            .expected_index_object_id
-            .0
-            .as_ref()
-            .is_some_and(|expected| here.index_object_id.as_ref() != Some(expected));
+        // An absent expectation is an expectation that the index does not hold the path, not a
+        // wildcard, and a caller that does not mean to check the index says so rather than
+        // leaving a field out.
+        let index_differs =
+            entry.check_index && entry.expected_index_object_id.0 != here.index_object_id;
         if worktree_differs || index_differs {
             found.push(PathConflict {
                 path: entry.path.clone(),
@@ -497,7 +557,7 @@ fn conflicts(
 fn preflight(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
-    carried: &[CapturedPath],
+    carried: &[Requested],
 ) -> Result<(
     OpenedRepository,
     BTreeMap<String, IndexEntry>,
@@ -539,7 +599,7 @@ fn proposal(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
     manifest: &Manifest,
-    carried: &[CapturedPath],
+    carried: &[Requested],
     limitations: &[String],
 ) -> Result<DiffApplyResult> {
     let (repository, _index, found) = preflight(service, order, carried)?;
@@ -551,14 +611,8 @@ fn proposal(
     }
     let before = capture_destination(service, order, None, "before")?;
     let mut proposed = service.manifest(before.change_set_id, before.version)?;
-    overlay(
-        &mut proposed,
-        carried,
-        order.revert,
-        service,
-        &repository,
-        manifest,
-    )?;
+    let _ = manifest;
+    overlay(&mut proposed, carried, order, service, &repository)?;
     proposed.canonicalise();
     let provenance = Provenance {
         derived_from: Nullable(Some(order.version)),
@@ -740,7 +794,7 @@ fn direct(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
     manifest: &Manifest,
-    carried: &[CapturedPath],
+    carried: &[Requested],
     limitations: &[String],
 ) -> Result<DiffApplyResult> {
     let (repository, _index, found) = preflight(service, order, carried)?;
@@ -750,27 +804,17 @@ fn direct(
     if order.preflight_only {
         return Ok(clean_preflight(order, limitations));
     }
-    // What goes into the destination, decided before anything is written: a revert puts the base's
-    // own content back, an apply puts the version's content in.
-    let mut content: Vec<(String, Vec<u8>, bool)> = Vec::new();
-    let mut unresolved = Vec::new();
-    for entry in carried {
-        if order.revert {
-            let Nullable(Some(object_id)) = &entry.base_object_id else {
-                // The base never held this path, so putting it back would mean removing the file.
-                // This host does not remove a user's file to revert a change: the path is reported
-                // and left exactly as it is.
-                unresolved.push(entry.path.clone());
-                continue;
-            };
-            let bytes = read_object(service.project().profile(), &repository, object_id)?;
-            content.push((entry.path.clone(), bytes, entry.executable));
-        } else {
-            let bytes = service.objects().get(entry.content_digest)?;
-            content.push((entry.path.clone(), bytes, entry.executable));
-        }
-    }
     let _ = manifest;
+    // What each requested operation puts in the destination, decided before anything is written: a
+    // revert puts the base's own content back, an apply puts the version's content in, and a path
+    // the version does not hold is taken away.
+    let mut operations: Vec<(String, Operation)> = Vec::new();
+    for requested in carried {
+        operations.push((
+            requested.path.clone(),
+            operation_for(service, &repository, order, requested)?,
+        ));
+    }
     let before = capture_destination(service, order, None, "before")?;
     let now = kr_ipc::now_ms();
     let staged_name = format!("apply-{}", order.action_id);
@@ -790,123 +834,51 @@ fn direct(
         decided_at_ms: None,
     })?;
     // Staged and validated: every byte is written into a private directory of this host's own and
-    // read back against its digest, so nothing half-written can reach the destination.
-    let staging = stage(service, &staged_name, &content)?;
+    // read back against its digest, so a recoverable copy of what this apply meant to install
+    // exists before the destination is touched.
+    stage(service, &staged_name, &operations)?;
     // Every path this apply plans is recorded **before any of them is attempted**, so a daemon
-    // that dies half way through leaves a row for each one. A row that still says `planned` means
-    // this host did not establish what became of that path, which is not the same as saying it
-    // did not write it; a run that stops on its own settles the ones it never reached as skipped,
-    // which is the stronger statement it can make.
-    for (path, _, _) in &content {
+    // that dies half way through leaves a row for each. A row that still says `planned` means this
+    // host did not establish what became of that path, which is not the same as saying it did not
+    // write it; a run that stops on its own settles the ones it never reached as skipped.
+    for (path, _) in &operations {
         service.locked()?.plan_path(order.action_id, path)?;
     }
-    let mut progress: Vec<PathProgress> = Vec::new();
-    let mut changed = Vec::new();
-    let mut stopped: Option<(ApplyOutcomeClass, String)> = None;
-    for (index, (path, bytes, executable)) in content.iter().enumerate() {
-        let expected = order
-            .affected
-            .iter()
-            .find(|affected| affected.path == *path);
-        // The recheck, as late as the platform permits: immediately before the rename, and on the
-        // object the handle names rather than on a path resolved earlier.
-        let before_digest = match read_working_tree(&repository, path)? {
-            WorkingRead::Content { bytes, .. } => Some(digest_of(&bytes)),
-            WorkingRead::Gone => None,
-            WorkingRead::Unsupported(detail) | WorkingRead::Unreadable(detail) => {
-                let row = ProgressRow {
-                    path: path.clone(),
-                    state: PathProgressState::Unresolved,
-                    before_digest: None,
-                    after_digest: None,
-                    detail,
-                };
-                service.locked()?.settle_path(order.action_id, &row)?;
-                progress.push(wire_progress(&row));
-                stopped = Some((
-                    ApplyOutcomeClass::UncertainOutcome,
-                    "this host could not read what one destination path holds".to_owned(),
-                ));
-                break;
+    // Once installation can begin, every exit goes through the outcome: a failure after a write
+    // that returned early would leave a caller with an ordinary error and no record of what had
+    // already landed.
+    let (mut progress, changed, mut stopped) =
+        match run_operations(service, &repository, order, &operations) {
+            Ok(run) => {
+                if let Some(detail) = run.abandoned {
+                    // Nothing settles the apply: what this host did not decide, it records no
+                    // decision for. A replacement service reads the open row and its progress.
+                    return Err(ChangeSetError::OutcomeUnknown {
+                        detail: detail.into(),
+                    });
+                }
+                (run.progress, run.changed, run.stopped)
             }
+            Err(error) => (
+                service
+                    .locked()?
+                    .progress(order.action_id)?
+                    .iter()
+                    .map(wire_progress)
+                    .collect::<Vec<PathProgress>>(),
+                Vec::new(),
+                Some((
+                    ApplyOutcomeClass::UncertainOutcome,
+                    format!(
+                        "this apply stopped for a reason that is not the destination's: {error}. \
+                         What is known about each path is what its own row says"
+                    ),
+                )),
+            ),
         };
-        if let Some(expected) = expected
-            && expected.expected_worktree_digest.0 != before_digest
-        {
-            let row = ProgressRow {
-                path: path.clone(),
-                state: PathProgressState::Conflicted,
-                before_digest,
-                after_digest: before_digest,
-                detail: "something wrote this path between the preflight and the rename, so this \
-                         host did not write it"
-                    .to_owned(),
-            };
-            service.locked()?.settle_path(order.action_id, &row)?;
-            progress.push(wire_progress(&row));
-            stopped = Some((
-                ApplyOutcomeClass::ConflictAfterPartialWrites,
-                format!(
-                    "an external write reached {} between the recheck and the rename, so this \
-                     apply stopped with {} paths already changed",
-                    kr_project::git::redact(path),
-                    changed.len()
-                ),
-            ));
-            break;
-        }
-        match install(&repository, &staging, path, bytes, *executable) {
-            Ok(after) => {
-                let row = ProgressRow {
-                    path: path.clone(),
-                    state: PathProgressState::Written,
-                    before_digest,
-                    after_digest: Some(after),
-                    detail: "the staged content was renamed over the destination".to_owned(),
-                };
-                service.locked()?.settle_path(order.action_id, &row)?;
-                progress.push(wire_progress(&row));
-                changed.push(path.clone());
-            }
-            Err(error) => {
-                let row = ProgressRow {
-                    path: path.clone(),
-                    state: PathProgressState::Unresolved,
-                    before_digest,
-                    after_digest: None,
-                    detail: error.to_string(),
-                };
-                service.locked()?.settle_path(order.action_id, &row)?;
-                progress.push(wire_progress(&row));
-                stopped = Some((
-                    ApplyOutcomeClass::UncertainOutcome,
-                    "a write failed and this host could not establish what the destination holds"
-                        .to_owned(),
-                ));
-                break;
-            }
-        }
-        #[cfg(feature = "fault-injection")]
-        if let Some(fault) = service.fault()
-            && changed.len() == fault.after_paths
-        {
-            if let Some(act) = &fault.act {
-                act();
-            }
-            if fault.stop {
-                // The apply stops here **without** settling, exactly as a daemon that died would
-                // leave it. The row stays undecided and the paths after this one keep no row at
-                // all, which is what `recover` reads.
-                return Err(ChangeSetError::OutcomeUnknown {
-                    detail: fault.detail.into(),
-                });
-            }
-        }
-        let _ = index;
-    }
     // Every path the apply did not reach is recorded as one it did not attempt, so the answer
     // lists exactly what is known rather than leaving a reader to infer it.
-    for (path, _, _) in content.iter().skip(progress.len()) {
+    for (path, _) in operations.iter().skip(progress.len()) {
         let row = ProgressRow {
             path: path.clone(),
             state: PathProgressState::Skipped,
@@ -917,39 +889,67 @@ fn direct(
         service.locked()?.settle_path(order.action_id, &row)?;
         progress.push(wire_progress(&row));
     }
-    let after = capture_destination(service, order, Some(before.change_set_id), "after")?;
+    let after = match capture_destination(service, order, Some(before.change_set_id), "after") {
+        Ok(after) => Some(after),
+        Err(error) => {
+            stopped = Some((
+                ApplyOutcomeClass::UncertainOutcome,
+                format!(
+                    "this host could not read the destination after the apply, so what it holds \
+                     now is not established: {error}"
+                ),
+            ));
+            None
+        }
+    };
+    let unresolved_paths: Vec<String> = progress
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.state,
+                PathProgressState::Planned | PathProgressState::Unresolved
+            )
+        })
+        .map(|row| row.path.clone())
+        .collect();
+    // `applied` is every requested operation resolved and nothing else. A path this host refused,
+    // skipped or could not establish keeps it out.
     let (outcome, detail) = stopped.unwrap_or_else(|| {
-        (
-            ApplyOutcomeClass::Applied,
-            format!(
-                "every one of the {} paths this apply planned is in the destination and this host \
-                 confirmed each one",
-                changed.len()
-            ),
-        )
+        if unresolved_paths.is_empty()
+            && progress
+                .iter()
+                .all(|row| row.state == PathProgressState::Written)
+        {
+            (
+                ApplyOutcomeClass::Applied,
+                format!(
+                    "every one of the {} operations this apply planned is in the destination and \
+                     this host confirmed each one",
+                    progress.len()
+                ),
+            )
+        } else {
+            (
+                ApplyOutcomeClass::UncertainOutcome,
+                format!(
+                    "{} of the {} operations this apply planned are ones it did not resolve, so \
+                     it is not an applied change",
+                    unresolved_paths.len(),
+                    progress.len()
+                ),
+            )
+        }
     });
     let now = kr_ipc::now_ms();
     service.locked()?.settle_apply(
         order.action_id,
         outcome,
-        Some((after.change_set_id, after.version)),
+        after
+            .as_ref()
+            .map(|after| (after.change_set_id, after.version)),
         &detail,
         now,
     )?;
-    let unresolved_paths: Vec<String> = unresolved
-        .into_iter()
-        .chain(
-            progress
-                .iter()
-                .filter(|row| {
-                    matches!(
-                        row.state,
-                        PathProgressState::Planned | PathProgressState::Unresolved
-                    )
-                })
-                .map(|row| row.path.clone()),
-        )
-        .collect();
     let conflicted: Vec<PathConflict> = progress
         .iter()
         .filter(|row| row.state == PathProgressState::Conflicted)
@@ -982,7 +982,7 @@ fn direct(
                 change_set_id: before.change_set_id,
                 version: before.version,
             })),
-            after_version: Nullable(Some(VersionRef {
+            after_version: Nullable(after.as_ref().map(|after| VersionRef {
                 change_set_id: after.change_set_id,
                 version: after.version,
             })),
@@ -999,17 +999,187 @@ fn direct(
     })
 }
 
+/// Decides what one requested operation puts in the destination.
+fn operation_for(
+    service: &ChangeSetService,
+    repository: &OpenedRepository,
+    order: &ApplyOrder<'_>,
+    requested: &Requested,
+) -> Result<Operation> {
+    match &requested.holds {
+        // The version does not hold this path. An apply of it takes the path away; a revert puts
+        // the base's own content back, and where the base never held it either this host reports
+        // the path rather than removing a file nobody asked it to remove.
+        None => {
+            if order.revert {
+                Ok(Operation::Refuse(
+                    "this version removed a path the base revision never held, so putting the \
+                     base back would mean removing a file, and this host does not remove a file \
+                     to revert a change"
+                        .to_owned(),
+                ))
+            } else {
+                Ok(Operation::Remove)
+            }
+        }
+        Some(entry) => {
+            if order.revert {
+                let Nullable(Some(object_id)) = &entry.base_object_id else {
+                    return Ok(Operation::Refuse(
+                        "the base revision does not hold this path, so putting it back would mean \
+                         removing a file, and this host does not remove a file to revert a change"
+                            .to_owned(),
+                    ));
+                };
+                let bytes = read_object(service.project().profile(), repository, object_id)?;
+                Ok(Operation::Install {
+                    bytes,
+                    executable: entry.executable,
+                })
+            } else {
+                Ok(Operation::Install {
+                    bytes: service.objects().get(entry.content_digest)?,
+                    executable: entry.executable,
+                })
+            }
+        }
+    }
+}
+
+/// Runs one apply's operations, recording each one's outcome as it goes.
+fn run_operations(
+    service: &ChangeSetService,
+    repository: &OpenedRepository,
+    order: &ApplyOrder<'_>,
+    operations: &[(String, Operation)],
+) -> Result<RunOutcome> {
+    // The index is read once, immediately before the writes, so an expectation about it is
+    // compared with what is there now rather than with what the preflight saw.
+    let index = read_index(service.project().profile(), repository)?;
+    let mut run = RunOutcome {
+        progress: Vec::new(),
+        changed: Vec::new(),
+        stopped: None,
+        abandoned: None,
+    };
+    for (path, operation) in operations {
+        let expected = order
+            .affected
+            .iter()
+            .find(|affected| affected.path == *path);
+        let before_digest = match read_working_tree(repository, path)? {
+            WorkingRead::Content { bytes, .. } => Some(digest_of(&bytes)),
+            _ => None,
+        };
+        #[cfg(feature = "fault-injection")]
+        let fault = service.fault();
+        let installed = install(
+            repository,
+            path,
+            operation,
+            expected,
+            &index,
+            #[cfg(feature = "fault-injection")]
+            fault
+                .as_ref()
+                .and_then(|fault| fault.before_rename.as_ref())
+                .map(|act| act.as_ref() as &dyn Fn(&str)),
+        )?;
+        let row = match &installed {
+            Installed::Written(after) => ProgressRow {
+                path: path.clone(),
+                state: PathProgressState::Written,
+                before_digest,
+                after_digest: Some(*after),
+                detail: match operation {
+                    Operation::Remove => "the path was taken away and this host confirmed it is \
+                                          gone"
+                        .to_owned(),
+                    _ => "the staged content was renamed over the destination and this host read \
+                          it back"
+                        .to_owned(),
+                },
+            },
+            Installed::Conflicted(here) => ProgressRow {
+                path: path.clone(),
+                state: PathProgressState::Conflicted,
+                before_digest: *here,
+                after_digest: *here,
+                detail: "something wrote this path between the preflight and the rename, so this \
+                         host did not write it"
+                    .to_owned(),
+            },
+            Installed::Unresolved(detail) => ProgressRow {
+                path: path.clone(),
+                state: PathProgressState::Unresolved,
+                before_digest,
+                after_digest: None,
+                detail: detail.clone(),
+            },
+        };
+        service.locked()?.settle_path(order.action_id, &row)?;
+        run.progress.push(wire_progress(&row));
+        match installed {
+            Installed::Written(_) => run.changed.push(path.clone()),
+            Installed::Conflicted(_) => {
+                run.stopped = Some((
+                    ApplyOutcomeClass::ConflictAfterPartialWrites,
+                    format!(
+                        "an external write reached {} between the recheck and the rename, so this \
+                         apply stopped with {} path(s) already changed",
+                        kr_project::git::redact(path),
+                        run.changed.len()
+                    ),
+                ));
+                break;
+            }
+            // A path this host could not resolve does not stop the apply: the caller asked for
+            // every operation, and the answer lists each one's own outcome.
+            Installed::Unresolved(_) => {}
+        }
+        #[cfg(feature = "fault-injection")]
+        if let Some(fault) = fault
+            && run.changed.len() == fault.after_paths
+        {
+            if let Some(act) = &fault.act {
+                act();
+            }
+            if fault.stop {
+                // The apply is abandoned here **without settling**, exactly as a daemon that died
+                // would leave it. The row stays undecided and the paths after this one keep the
+                // `planned` row they were given before any of them was attempted.
+                run.abandoned = Some(fault.detail.clone());
+                return Ok(run);
+            }
+        }
+    }
+    Ok(run)
+}
+
+/// What one run of an apply's operations came to.
+struct RunOutcome {
+    progress: Vec<PathProgress>,
+    changed: Vec<String>,
+    stopped: Option<(ApplyOutcomeClass, String)>,
+    /// Set when this process stopped without deciding the apply, which is what a daemon that died
+    /// leaves behind. The apply row stays open and recovery settles it.
+    abandoned: Option<String>,
+}
+
 /// Writes the validated content into a private staging directory of this host's own.
 fn stage(
     service: &ChangeSetService,
     name: &str,
-    content: &[(String, Vec<u8>, bool)],
+    operations: &[(String, Operation)],
 ) -> Result<AuthorisedDirectory> {
     let parent = service
         .root()
         .subdirectory(&RelativeName::parse(STAGING_DIRECTORY)?)?;
     let directory = parent.create_subdirectory(&RelativeName::parse(name)?)?;
-    for (path, bytes, _) in content {
+    for (path, operation) in operations {
+        let Operation::Install { bytes, .. } = operation else {
+            continue;
+        };
         let staged = staged_name(path);
         let name = RelativeName::parse(&staged)?;
         let _ = directory.remove(&name);
@@ -1043,20 +1213,57 @@ fn staged_name(path: &str) -> String {
     hex_of(digest_of(path.as_bytes()))
 }
 
-/// Renames one staged file over its destination, preserving what the destination had.
+/// What one operation does to one destination path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Operation {
+    /// Put this content there.
+    Install { bytes: Vec<u8>, executable: bool },
+    /// Take the path away, because the version does not hold it.
+    Remove,
+    /// Leave it exactly as it is, and say why this host did not resolve it.
+    Refuse(String),
+}
+
+/// What installing one path came to.
+enum Installed {
+    /// The content is in the destination and this host read it back.
+    Written(Digest256),
+    /// The destination stopped being what the request expected before anything was written.
+    Conflicted(Option<Digest256>),
+    /// This host could not establish what the destination holds.
+    Unresolved(String),
+}
+
+/// Puts one path's content in the destination, or takes the path away.
 ///
-/// The destination's own permissions are read and put on the staged copy before the rename, so a
-/// file that was executable stays executable and one that was not does not become one. The bytes
-/// are written exactly as the version holds them, so a line ending is whatever the content is.
-/// A rename replaces in one step, so the destination is either what it was or the whole new
-/// content, never half of each.
+/// Everything happens through the destination directory's **own handle**, obtained by descending
+/// from the working tree's handle level by level. Nothing resolves a path a second time, and
+/// nothing is removed to make room: an occupied temporary name is a path this host leaves alone
+/// and reports.
+///
+/// The order is what the guarantee rests on:
+///
+/// 1. the parent directories are opened, and created where the version needs one;
+/// 2. the validated bytes are written into a temporary **created exclusively in that same
+///    directory**, so the publication is a rename inside one directory and can cross no filesystem;
+/// 3. the destination's own permissions are read and put on the temporary;
+/// 4. the destination is **rechecked here**, against that same parent handle, which is as late as
+///    this platform permits;
+/// 5. the rename;
+/// 6. the destination is opened again and its content compared with what was meant to land.
+///
+/// Step 6 is why `Written` means what it says. Between steps 4 and 5 another writer is not
+/// excluded — that is the limitation this class states — but a rename that installed something
+/// other than the validated content is caught rather than recorded as a success.
+#[allow(clippy::too_many_lines)]
 fn install(
     repository: &OpenedRepository,
-    staging: &AuthorisedDirectory,
     path: &str,
-    bytes: &[u8],
-    executable: bool,
-) -> Result<Digest256> {
+    operation: &Operation,
+    expected: Option<&AffectedVersion>,
+    index: &BTreeMap<String, IndexEntry>,
+    #[cfg(feature = "fault-injection")] before_rename: Option<&dyn Fn(&str)>,
+) -> Result<Installed> {
     let name = RelativeName::parse(path)?;
     let components = name.components();
     let (leaf, parents) =
@@ -1067,56 +1274,145 @@ fn install(
             })?;
     let mut here = clone_handle(repository.work_tree())?;
     for component in parents {
-        here = descend_or_create(&here, &RelativeName::parse(component)?)?;
+        here = match descend_or_create(&here, &RelativeName::parse(component)?, operation) {
+            Ok(directory) => directory,
+            Err(error) => return Ok(Installed::Unresolved(error.to_string())),
+        };
     }
     let leaf_name = RelativeName::parse(leaf)?;
-    let staged = RelativeName::parse(&staged_name(path))?;
-    carry_permissions(staging, &staged, &here, &leaf_name, executable)?;
-    // The temporary lands beside the destination so the rename is within one directory and cannot
-    // cross a filesystem; a rename replaces the name in one step.
+    let (bytes, executable) = match operation {
+        Operation::Refuse(detail) => return Ok(Installed::Unresolved(detail.clone())),
+        Operation::Remove => {
+            // A removal has nothing to stage. The recheck is the last thing before it.
+            if let Some(conflict) = recheck(&here, &leaf_name, expected, index, path)? {
+                return Ok(conflict);
+            }
+            #[cfg(feature = "fault-injection")]
+            if let Some(act) = before_rename {
+                act(path);
+            }
+            if let Err(error) = here.remove(&leaf_name) {
+                return Ok(Installed::Unresolved(error.to_string()));
+            }
+            here.sync()?;
+            return match here.probe(&leaf_name) {
+                Err(kr_transfer::Escape::NotFound { .. }) => Ok(Installed::Written(digest_of(&[]))),
+                Ok(_) => Ok(Installed::Unresolved(
+                    "the path is still there after this host removed it".to_owned(),
+                )),
+                Err(error) => Ok(Installed::Unresolved(error.to_string())),
+            };
+        }
+        Operation::Install { bytes, executable } => (bytes, *executable),
+    };
+    // The temporary is created **exclusively**, beside the destination, so an occupied name is a
+    // file this host leaves exactly as it is rather than one it removes to make room.
     let temporary = RelativeName::parse(&format!(".kr-apply-{}", staged_name(path)))?;
-    let _ = here.remove(&temporary);
-    staging.rename_into(&staged, &here, &temporary)?;
-    here.rename_into(&temporary, &here, &leaf_name)?;
-    here.sync()?;
-    Ok(digest_of(bytes))
+    let mut staged = match here.create_new(&temporary) {
+        Ok(file) => file,
+        Err(error) => {
+            return Ok(Installed::Unresolved(format!(
+                "this host did not write anything, because the name it would have staged through \
+                 is taken and it removes nothing to make room: {error}"
+            )));
+        }
+    };
+    let outcome = (|| -> Result<Installed> {
+        staged
+            .handle_mut()
+            .write_all(bytes)
+            .map_err(ChangeSetError::storage)?;
+        staged
+            .handle_mut()
+            .sync_all()
+            .map_err(ChangeSetError::storage)?;
+        match carry_permissions(&here, &leaf_name, &temporary, executable)? {
+            Some(()) => {}
+            None => {
+                return Ok(Installed::Unresolved(
+                    "this host could not read what permissions the destination has, and it does \
+                     not replace a file whose permissions it cannot carry across"
+                        .to_owned(),
+                ));
+            }
+        }
+        // As late as this platform permits: the last thing before the rename, on the object the
+        // parent handle names rather than on a path resolved earlier.
+        if let Some(conflict) = recheck(&here, &leaf_name, expected, index, path)? {
+            return Ok(conflict);
+        }
+        #[cfg(feature = "fault-injection")]
+        if let Some(act) = before_rename {
+            act(path);
+        }
+        here.rename_into(&temporary, &here, &leaf_name)?;
+        here.sync()?;
+        // What actually landed. A rename that installed something other than the validated content
+        // is caught here rather than recorded as a success.
+        match read_destination(&here, &leaf_name)? {
+            Some(landed) if landed == digest_of(bytes) => Ok(Installed::Written(landed)),
+            Some(_) => Ok(Installed::Unresolved(
+                "the destination holds something other than the content this host installed"
+                    .to_owned(),
+            )),
+            None => Ok(Installed::Unresolved(
+                "the destination holds nothing after this host installed into it".to_owned(),
+            )),
+        }
+    })();
+    if !matches!(outcome, Ok(Installed::Written(_))) {
+        // Whatever went wrong, the temporary this host made goes away: it is a name this host
+        // created exclusively a moment ago, so removing it takes nothing anybody else wrote.
+        let _ = here.remove(&temporary);
+    }
+    outcome
 }
 
-/// Puts the destination's own permissions on the staged copy before it is renamed over it.
-#[cfg(unix)]
-fn carry_permissions(
-    staging: &AuthorisedDirectory,
-    staged: &RelativeName,
-    destination: &AuthorisedDirectory,
-    leaf: &RelativeName,
-    executable: bool,
-) -> Result<()> {
-    use cap_std::fs::PermissionsExt as _;
-    let existing = destination
-        .open_read(leaf, ObjectPolicy::ReadableFile)
-        .ok()
-        .and_then(|file| file.handle().metadata().ok())
-        .map(|metadata| metadata.permissions().mode());
-    let mode = existing.unwrap_or(if executable { 0o755 } else { 0o644 });
-    let file = staging.open_read(staged, ObjectPolicy::ReadableFile)?;
-    file.handle()
-        .set_permissions(cap_std::fs::Permissions::from_mode(mode))
-        .map_err(ChangeSetError::storage)
+/// Reads what one destination path holds now.
+fn read_destination(
+    directory: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> Result<Option<Digest256>> {
+    match directory.open_read(name, ObjectPolicy::ReadableFile) {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(file.handle_mut(), &mut bytes)
+                .map_err(ChangeSetError::storage)?;
+            Ok(Some(digest_of(&bytes)))
+        }
+        Err(kr_transfer::Escape::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
-/// Does nothing: this platform has no mode bits to carry across.
-#[cfg(not(unix))]
-fn carry_permissions(
-    _staging: &AuthorisedDirectory,
-    _staged: &RelativeName,
-    _destination: &AuthorisedDirectory,
-    _leaf: &RelativeName,
-    _executable: bool,
-) -> Result<()> {
-    Ok(())
+/// Compares the destination with what the request expects, as late as the platform permits.
+fn recheck(
+    directory: &AuthorisedDirectory,
+    name: &RelativeName,
+    expected: Option<&AffectedVersion>,
+    index: &BTreeMap<String, IndexEntry>,
+    path: &str,
+) -> Result<Option<Installed>> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    let here = match read_destination(directory, name) {
+        Ok(here) => here,
+        Err(error) => return Ok(Some(Installed::Unresolved(error.to_string()))),
+    };
+    if expected.expected_worktree_digest.0 != here {
+        return Ok(Some(Installed::Conflicted(here)));
+    }
+    if expected.check_index
+        && expected.expected_index_object_id.0
+            != index.get(path).map(|entry| entry.object_id.clone())
+    {
+        return Ok(Some(Installed::Conflicted(here)));
+    }
+    Ok(None)
 }
 
-/// Opens one directory of the destination, creating it when it is not there.
+/// Opens one directory of the destination, creating it only when a path is being installed.
 ///
 /// The user's own directories are the user's: this host neither requires nor imposes the
 /// owner-only permissions it uses for its **own** directories, because a repository whose `src` is
@@ -1125,10 +1421,13 @@ fn carry_permissions(
 fn descend_or_create(
     here: &AuthorisedDirectory,
     name: &RelativeName,
+    operation: &Operation,
 ) -> Result<AuthorisedDirectory> {
     match here.subdirectory(name) {
         Ok(directory) => Ok(directory),
-        Err(kr_transfer::Escape::NotFound { .. }) => {
+        Err(kr_transfer::Escape::NotFound { .. })
+            if matches!(operation, Operation::Install { .. }) =>
+        {
             match here.handle().create_dir(name.as_str()) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1139,6 +1438,51 @@ fn descend_or_create(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// Puts the destination's own permissions on the staged copy before it is renamed over it.
+///
+/// Returns nothing when the destination is there and this host could not read what permissions it
+/// has: replacing a file whose protection cannot be carried across is exactly what "preserve
+/// permissions" forbids, so the path is left alone instead.
+///
+/// What this carries is the platform's mode bits. An access-control list beside them is not
+/// carried, and that is stated as a limit rather than quietly lost.
+#[cfg(unix)]
+fn carry_permissions(
+    destination: &AuthorisedDirectory,
+    leaf: &RelativeName,
+    staged: &RelativeName,
+    executable: bool,
+) -> Result<Option<()>> {
+    use cap_std::fs::PermissionsExt as _;
+    let existing = match destination.open_read(leaf, ObjectPolicy::ReadableFile) {
+        Ok(file) => match file.handle().metadata() {
+            Ok(metadata) => Some(metadata.permissions().mode()),
+            Err(_) => return Ok(None),
+        },
+        // Absent is not a failure to read: there is nothing there whose permissions to carry, so
+        // the version's own bit decides.
+        Err(kr_transfer::Escape::NotFound { .. }) => None,
+        Err(_) => return Ok(None),
+    };
+    let mode = existing.unwrap_or(if executable { 0o755 } else { 0o644 });
+    let file = destination.open_read(staged, ObjectPolicy::HostOwnedFile)?;
+    file.handle()
+        .set_permissions(cap_std::fs::Permissions::from_mode(mode))
+        .map_err(ChangeSetError::storage)?;
+    Ok(Some(()))
+}
+
+/// Does nothing: this platform has no mode bits to carry across.
+#[cfg(not(unix))]
+fn carry_permissions(
+    _destination: &AuthorisedDirectory,
+    _leaf: &RelativeName,
+    _staged: &RelativeName,
+    _executable: bool,
+) -> Result<Option<()>> {
+    Ok(Some(()))
 }
 
 fn clone_handle(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
@@ -1206,39 +1550,56 @@ fn capture_destination(
 /// Overlays one apply's content onto a manifest, without writing anything.
 fn overlay(
     proposed: &mut Manifest,
-    carried: &[CapturedPath],
-    revert: bool,
+    carried: &[Requested],
+    order: &ApplyOrder<'_>,
     service: &ChangeSetService,
     repository: &OpenedRepository,
-    _source: &Manifest,
 ) -> Result<()> {
-    for entry in carried {
-        let content = if revert {
-            let Nullable(Some(object_id)) = &entry.base_object_id else {
-                // The base never held it, so reverting means the proposal simply does not hold it.
-                proposed.paths.retain(|held| held.path != entry.path);
+    for requested in carried {
+        let operation = operation_for(service, repository, order, requested)?;
+        let (bytes, executable) = match operation {
+            // The path is taken away, so the proposal simply does not hold it. A refusal leaves
+            // the proposal exactly as the destination has it, which is what refusing means.
+            Operation::Remove => {
+                proposed.paths.retain(|held| held.path != requested.path);
                 continue;
-            };
-            read_object(service.project().profile(), repository, object_id)?
-        } else {
-            service.objects().get(entry.content_digest)?
+            }
+            Operation::Refuse(_) => continue,
+            Operation::Install { bytes, executable } => (bytes, executable),
         };
-        let digest = service.objects().put(&content)?;
+        let digest = service.objects().put(&bytes)?;
+        // The metadata is the **destination's**, not the source version's: this manifest records
+        // what the destination would hold, and its base side is the destination's own base. What
+        // the source version says about its own base belongs to the source version.
+        let existing = proposed
+            .paths
+            .iter()
+            .find(|held| held.path == requested.path)
+            .cloned();
         let replacement = CapturedPath {
-            path: entry.path.clone(),
+            path: requested.path.clone(),
             content_digest: digest,
-            byte_len: U64::new(content.len() as u64),
-            executable: entry.executable,
-            content: crate::capture::classify_content(&content),
+            byte_len: U64::new(bytes.len() as u64),
+            // A direct apply preserves the destination's own permission, so a proposal of the
+            // same change says the same thing: the destination's bit where it has one, and the
+            // version's where the destination does not hold the path at all.
+            executable: existing.as_ref().map_or(executable, |held| held.executable),
+            content: crate::capture::classify_content(&bytes),
             origin: ContentOrigin::WorkingTree,
-            class: entry.class,
+            class: existing.as_ref().map_or(PathClass::UntrackedFile, |held| {
+                if held.class == PathClass::Tracked {
+                    PathClass::DirtyFile
+                } else {
+                    held.class
+                }
+            }),
             change: ChangeKind::Present,
-            base_object_id: entry.base_object_id.clone(),
+            base_object_id: existing.map_or(Nullable(None), |held| held.base_object_id),
         };
         match proposed
             .paths
             .iter_mut()
-            .find(|held| held.path == entry.path)
+            .find(|held| held.path == requested.path)
         {
             Some(held) => *held = replacement,
             None => proposed.paths.push(replacement),
@@ -1345,9 +1706,34 @@ pub fn recover(service: &ChangeSetService) -> Result<crate::service::Recovery> {
             ),
             kr_ipc::now_ms(),
         )?;
+        // The caller that asked for this apply may still be holding the action open, and a retry
+        // of it must get the interruption rather than a second apply against a destination this
+        // one has already changed. So the claim is settled here, with the answer reconstructed
+        // from what the journal holds.
+        settle_recovered_action(service, row.action_id)?;
         recovery.applies_settled += 1;
     }
     Ok(recovery)
+}
+
+/// Settles the action one recovered apply was performed under, from what the journal holds.
+///
+/// The answer a repeat of that action gets is the interruption, with exactly the paths on each
+/// side and the recovery objects, rather than a second apply. A claim nobody left open, or one
+/// somebody already settled, is left exactly as it is.
+fn settle_recovered_action(service: &ChangeSetService, action_id: ActionId) -> Result<()> {
+    let Some(claim) = service.locked()?.open_claim(action_id.get())? else {
+        return Ok(());
+    };
+    let answer = read_apply(service, action_id)?;
+    let encoded = crate::service::encode_stored(&answer)?;
+    service.settle_action(
+        &claim.actor_id,
+        action_id.get(),
+        &claim.method,
+        claim.payload_digest,
+        &crate::store::RetainedOutcome::Ok(encoded),
+    )
 }
 
 /// Returns what one apply came to, as the journal holds it.
@@ -1547,6 +1933,7 @@ mod tests {
             path: path.clone(),
             expected_worktree_digest: Nullable(Some(expected)),
             expected_index_object_id: Nullable(Some("abcdef".to_owned())),
+            check_index: true,
         }];
         let mut observed = BTreeMap::new();
         observed.insert(
@@ -1580,6 +1967,7 @@ mod tests {
             path: path.clone(),
             expected_worktree_digest: Nullable(None),
             expected_index_object_id: Nullable(None),
+            check_index: false,
         }];
         assert_eq!(conflicts(&absent, &observed).len(), 1);
     }

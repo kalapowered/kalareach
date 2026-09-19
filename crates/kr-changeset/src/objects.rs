@@ -79,15 +79,21 @@ impl ObjectStore {
             .root
             .create_subdirectory(&RelativeName::parse(fan_out)?)?;
         let final_name = RelativeName::parse(leaf)?;
-        // A name that is already taken is a blob whose content should already be there, because
-        // the name is the digest of the content. Should is not is: a damaged file, a directory or
-        // a link at that name would make this write report success and throw the valid bytes
-        // away, and every later read of it would fail. So what is there is read back first.
-        if shelf.occupied(&final_name)? && self.holds_exactly(digest)? {
-            return Ok(digest);
+        // A name that is already taken should hold this content, because the name is the digest of
+        // the content. Should is not is: a damaged file, a directory or a link at that name would
+        // make this write report success and throw the valid bytes away, and every later read of
+        // it would fail. So what is there is read back before it is believed.
+        if shelf.occupied(&final_name)? {
+            if self.holds_exactly(digest)? {
+                return Ok(digest);
+            }
+            // Damage. The name **is** the digest of the content, so a file at it that hashes to
+            // something else is not content anything can be referring to, and leaving it would
+            // make every version that names this digest undeliverable.
+            shelf.remove(&final_name)?;
         }
-        // The temporary's name carries this process's own identity and a counter, so two captures
-        // writing the same content at the same time never meet at one temporary.
+        // The temporary's name carries this process's own identity and a fresh value, so two
+        // captures writing the same content at the same time never meet at one temporary.
         let temporary = format!(
             "{leaf}.{}.{}",
             std::process::id(),
@@ -105,18 +111,11 @@ impl ObjectStore {
                 })?;
             handle.sync_all().map_err(ChangeSetError::storage)?;
         }
-        // What is at the name is either the content (a concurrent capture got there first, and a
-        // publication is a link from a complete temporary, so a name that exists holds whole
-        // content) or damage. Damage is replaced: the name **is** the digest of the content, so a
-        // file at it that hashes to something else is not content anything can be referring to,
-        // and leaving it would make every version that names this digest undeliverable. This is
-        // the one removal in this module, inside this service's own directory, of a name whose
-        // meaning this host has just read.
-        if shelf.occupied(&final_name)? {
-            shelf.remove(&final_name)?;
-        }
         // A link refuses an occupied name on every platform, so a concurrent capture that got
-        // there first keeps its blob and this one removes its own temporary.
+        // there first keeps its blob and this one removes its own temporary. **Nothing is removed
+        // to make room here**: a valid blob another writer published between the check above and
+        // this link is the content, and unlinking it would take an object a recorded version
+        // names.
         let published = shelf.link_into(&temporary, &shelf, &final_name);
         let _ = shelf.remove(&temporary);
         match published {
@@ -124,16 +123,19 @@ impl ObjectStore {
                 shelf.sync()?;
                 Ok(digest)
             }
-            // A concurrent capture got there first. What it wrote is read back before this one
-            // reports success, for the same reason the first check does.
-            Err(_) if self.holds_exactly(digest)? => Ok(digest),
-            Err(error) => Err(ChangeSetError::StorageUnavailable {
-                detail: format!(
-                    "the object {hex} could not be published and what is at its name is not its \
-                     content: {error}"
-                )
-                .into(),
-            }),
+            Err(error) => {
+                if self.holds_exactly(digest)? {
+                    Ok(digest)
+                } else {
+                    Err(ChangeSetError::StorageUnavailable {
+                        detail: format!(
+                            "the object {hex} could not be published and what is at its name is \
+                             not its content: {error}"
+                        )
+                        .into(),
+                    })
+                }
+            }
         }
     }
 

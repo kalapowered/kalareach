@@ -528,6 +528,10 @@
       "additionalProperties": false,
       "description": "What one apply established about one path before it wrote anything.",
       "properties": {
+        "check_index": {
+          "description": "Check the index as well as the working tree.\n\nA caller that only means to say what the file holds leaves this false. One that means to\napply against an exact staged state sets it, and then an index that holds anything else —\nincluding nothing, and including an unresolved merge — is a conflict.",
+          "type": "boolean"
+        },
         "expected_index_object_id": {
           "anyOf": [
             {
@@ -537,7 +541,7 @@
               "type": "null"
             }
           ],
-          "description": "The Git object the caller expects the index to hold for it."
+          "description": "The Git object the caller expects the index to hold for it.\n\nAbsent is an expectation too: the path is expected not to be in the index. A caller that\ndoes not want the index checked sets [`Self::check_index`] to false and says so."
         },
         "expected_worktree_digest": {
           "anyOf": [
@@ -548,7 +552,7 @@
               "type": "null"
             }
           ],
-          "description": "The digest of the working-tree file the caller expects to find, or nothing for an absent\npath."
+          "description": "The digest of the working-tree file the caller expects to find, or nothing for an absent\npath.\n\nAbsent is an expectation, not a wildcard: a request that carries nothing here expects the\npath not to be in the working tree, and finds a conflict when it is."
         },
         "path": {
           "description": "The path, relative to the repository's top level.",
@@ -558,7 +562,8 @@
       "required": [
         "path",
         "expected_worktree_digest",
-        "expected_index_object_id"
+        "expected_index_object_id",
+        "check_index"
       ],
       "type": "object"
     },
@@ -10537,6 +10542,13 @@
           "$ref": "#/$defs/MaterialisationId",
           "description": "Its identity."
         },
+        "observed": {
+          "description": "What this host left at each path it wrote, so a later reading can tell a file nobody\ntouched from one a run rewrote with the same bytes.",
+          "items": {
+            "$ref": "#/$defs/ObservedPath"
+          },
+          "type": "array"
+        },
         "paths_written": {
           "$ref": "#/$defs/U64",
           "description": "How many paths were written into it."
@@ -10579,6 +10591,7 @@
         "filesystem_identity",
         "paths_written",
         "unapplied",
+        "observed",
         "created_at_ms",
         "released_at_ms"
       ],
@@ -11978,6 +11991,47 @@
           "type": "string"
         }
       ]
+    },
+    "ObservedPath": {
+      "additionalProperties": false,
+      "description": "What this host left at one path of a materialisation when it wrote it.\n\nA run that changes a file and puts the same bytes back is the one case a content comparison\ncannot see. What it does change is the object and the instant the platform records for it, so\nthose are written down here when the materialisation is made and compared when a result is\nrecorded. A platform that will not report an instant leaves that field out, and the comparison\nthen rests on the object and the length alone; that is stated where the limit is.",
+      "properties": {
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Its length in bytes."
+        },
+        "device": {
+          "$ref": "#/$defs/U64",
+          "description": "The device the file was on."
+        },
+        "file_id": {
+          "$ref": "#/$defs/U64",
+          "description": "The file's own number on it."
+        },
+        "path": {
+          "description": "The path, relative to the materialisation's own directory.",
+          "type": "string"
+        },
+        "written_at_nanos": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it was last written, in whole nanoseconds since the epoch, where the platform says."
+        }
+      },
+      "required": [
+        "path",
+        "device",
+        "file_id",
+        "byte_len",
+        "written_at_nanos"
+      ],
+      "type": "object"
     },
     "ObservedResult": {
       "description": "What an observation claims the operation's result was.",
@@ -24788,6 +24842,9 @@
     },
     "notification": {
       "$ref": "#/$defs/Notification"
+    },
+    "observed_path": {
+      "$ref": "#/$defs/ObservedPath"
     },
     "offline_validity_policy": {
       "$ref": "#/$defs/OfflineValidityPolicy"

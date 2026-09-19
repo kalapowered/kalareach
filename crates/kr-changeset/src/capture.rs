@@ -267,6 +267,7 @@ struct Reading {
     reference: Option<String>,
     index: BTreeMap<String, IndexEntry>,
     differences: BTreeMap<String, BaseDifference>,
+    staged: BTreeMap<String, BaseDifference>,
     status: Vec<kr_project::workspace::StatusEntry>,
 }
 
@@ -285,13 +286,19 @@ impl Reading {
             ));
         };
         let index = read_index(profile, repository)?;
-        let differences = read_differences(profile, repository, &revision)?;
+        let differences = read_differences(profile, repository, &revision, false)?;
+        // The second diff is the index against the same commit. It is what completes the base
+        // inventory: a path whose **only** change is staged does not appear in the working-tree
+        // diff at all, and without this reading this host would have no object identifier for what
+        // the commit holds there.
+        let staged = read_differences(profile, repository, &revision, true)?;
         let status = read_status(profile, repository, grant)?;
         Ok(Self {
             revision,
             reference,
             index,
             differences,
+            staged,
             status,
         })
     }
@@ -304,7 +311,7 @@ impl Reading {
         if self.index != other.index {
             return "the index changed while this host was reading the working tree".to_owned();
         }
-        if self.differences != other.differences {
+        if self.differences != other.differences || self.staged != other.staged {
             return "what the working tree holds that the base revision does not changed"
                 .to_owned();
         }
@@ -323,21 +330,20 @@ impl Reading {
                 _ => None,
             };
         }
-        if self.staged(path) {
+        if let Some(difference) = self.staged.get(path) {
             // The working tree matches the base and the index does not, so the index's object is
-            // not the base's and this host has not read the base's.
-            return None;
+            // not the base's. The index-against-commit diff is where the base's own object for
+            // such a path comes from.
+            return match (&difference.base_mode, &difference.base_object_id) {
+                (Some(mode), Some(object_id)) => Some((mode.clone(), object_id.clone())),
+                _ => None,
+            };
         }
+        // The working tree and the index both match the commit, so the index's object is the
+        // commit's.
         self.index
             .get(path)
             .map(|entry| (entry.mode.clone(), entry.object_id.clone()))
-    }
-
-    /// Returns true when the status reports something staged for one path.
-    fn staged(&self, path: &str) -> bool {
-        self.status
-            .iter()
-            .any(|entry| entry.path == path && entry.class == InclusionClass::DirtyFile)
     }
 }
 
@@ -400,14 +406,17 @@ pub fn read_differences(
     profile: &RestrictedProfile,
     repository: &OpenedRepository,
     revision: &str,
+    staged: bool,
 ) -> Result<BTreeMap<String, BaseDifference>> {
     check_object_id(revision)?;
-    let arguments: [&OsStr; 6] = [
+    let cached: &OsStr = OsStr::new(if staged { "--cached" } else { "--no-color" });
+    let arguments: [&OsStr; 7] = [
         OsStr::new("diff"),
         OsStr::new("--raw"),
         OsStr::new("-z"),
         OsStr::new("--no-renames"),
         OsStr::new("--ignore-submodules=all"),
+        cached,
         OsStr::new(revision),
     ];
     let output = profile.run(&repository.read(&arguments))?;
@@ -550,7 +559,7 @@ fn walk(
     // The decision is made before anything beneath the prefix is listed, which is what "the grant
     // applies before capture" means for a directory. The one entry is kept so the content read
     // records the exclusion with its reason rather than the path going missing.
-    if grant::decide(grant, prefix) != GrantDecision::Permitted {
+    if !grant::may_traverse(grant, prefix) {
         out.push(kr_project::workspace::StatusEntry {
             path: prefix.to_owned(),
             class,
@@ -1244,6 +1253,17 @@ fn read_tree(
         let Some((fields, name)) = line.split_once('\t') else {
             continue;
         };
+        // Git quotes a name in this display format when it holds a tab, a newline, a quote or a
+        // byte outside ASCII, and the quoted form is a different string from the name. This host
+        // does not unquote it and guess: a repository whose commit names a path it cannot read
+        // exactly is one it will not claim to have snapshotted.
+        if name.starts_with('"') {
+            return Err(ChangeSetError::InvalidArgument(
+                "this repository's own tree names a path in a quoted form this host does not \
+                 read back, so it cannot capture that commit's tree exactly"
+                    .into(),
+            ));
+        }
         let parts: Vec<&str> = fields.split(' ').collect();
         if parts.len() < 3 || name.is_empty() {
             continue;
@@ -1376,11 +1396,17 @@ fn descend(
         } else {
             format!("{prefix}/{}", entry.name)
         };
-        if let Some(plan) = refused(request.grant, &path) {
-            manifest.exclusions.push(exclusion(&path, &plan));
-            continue;
-        }
         if entry.kind == "tree" {
+            // A directory is walked into when anything the grant selects can lie beneath it, and
+            // its own exclusion is recorded when nothing can.
+            if !grant::may_traverse(request.grant, &path) {
+                manifest.exclusions.push(Exclusion {
+                    path,
+                    reason: ExclusionReason::Grant,
+                    detail: "the file grant selects nothing beneath this directory".to_owned(),
+                });
+                continue;
+            }
             descend(
                 profile,
                 repository,
@@ -1392,6 +1418,10 @@ fn descend(
                 budget,
                 depth + 1,
             )?;
+            continue;
+        }
+        if let Some(plan) = refused(request.grant, &path) {
+            manifest.exclusions.push(exclusion(&path, &plan));
             continue;
         }
         if !REGULAR_MODES.contains(&entry.mode.as_str()) {
@@ -1452,34 +1482,33 @@ pub fn classify_content(bytes: &[u8]) -> ContentClass {
 
 /// Decides the consistency class from what the capture actually did.
 ///
-/// A capture that read the live working tree is a per-file capture unless a real mechanism made it
-/// something stronger, and the only stronger mechanism here is the one behind [`QuiescenceProbe`]:
-/// the caller stopped its own work **and** this host found nothing it knows of holding the
-/// workspace, before and after the read.
+/// A capture that read the live working tree is a **per-file capture**, and this host produces no
+/// other class for one. [`SourceConsistency::QuiescedCapture`] needs a mechanism that holds the
+/// tree still for the whole read, and nothing this host can reach does that: the project service
+/// records which sessions and runs are bound to a workspace, but a reading of that record before
+/// and after the capture says nothing about the interval between them, and an editor outside
+/// KalaReach is outside it altogether. A declaration plus two readings would be that class in name
+/// and not in fact, which is exactly what section 14 forbids.
+///
+/// The declaration is still recorded, on the version's own policy, because a caller that quiesced
+/// its work said so and a reader should see it. What it does not do is change the class.
 fn classify(request: &CaptureRequest<'_>, quiet: bool) -> (SourceConsistency, String) {
-    if request.quiescence_declared && quiet {
-        return (
-            SourceConsistency::QuiescedCapture,
-            "the caller declared the working tree quiesced, no session and no automation run this \
-             host knows of held the workspace before or after the read, and every file was the \
-             same object of the same length written at the same instant after its read as before \
-             it, with the base revision, the index and the status unchanged at the end. What this \
-             does not exclude is an editor outside KalaReach, which nothing this host can read \
-             would show"
-                .to_owned(),
-        );
-    }
     let mut detail = "files were read one at a time from a live working tree; each one was the \
                       same object of the same length written at the same instant after its read \
                       as before it, and the base revision, the index and the status were \
                       unchanged at the end, which is detection rather than one instant"
         .to_owned();
-    if request.quiescence_declared && !quiet {
-        detail.push_str(
+    if request.quiescence_declared {
+        detail.push_str(if quiet {
+            ". The caller declared the working tree quiesced and no session and no automation run \
+             this host knows of held the workspace before or after the read. That is recorded and \
+             it does not make this a quiesced capture: nothing here held the tree still for the \
+             whole read, and an editor outside KalaReach is outside what this host can see"
+        } else {
             ". The caller declared the working tree quiesced and this host found a session or an \
-             automation run holding the workspace, so the declaration alone did not decide the \
-             class",
-        );
+             automation run holding the workspace, so the declaration describes something that \
+             was not the case"
+        });
     }
     (SourceConsistency::PerFileCapture, detail)
 }
@@ -1539,11 +1568,21 @@ mod tests {
         differences: BTreeMap<String, BaseDifference>,
         status: Vec<kr_project::workspace::StatusEntry>,
     ) -> Reading {
+        staged_reading(index, differences, BTreeMap::new(), status)
+    }
+
+    fn staged_reading(
+        index: BTreeMap<String, IndexEntry>,
+        differences: BTreeMap<String, BaseDifference>,
+        staged: BTreeMap<String, BaseDifference>,
+        status: Vec<kr_project::workspace::StatusEntry>,
+    ) -> Reading {
         Reading {
             revision: "abcdef".to_owned(),
             reference: Some("refs/heads/main".to_owned()),
             index,
             differences,
+            staged,
             status,
         }
     }
@@ -1814,19 +1853,24 @@ mod tests {
     }
 
     #[test]
-    fn a_path_whose_only_change_is_staged_has_no_base_object_this_host_read() {
-        // The working tree matches the commit and the index does not, so the index's object is not
-        // the base's and this host does not claim it is.
-        let staged = reading(
+    fn a_path_whose_only_change_is_staged_names_the_commit_s_object_and_not_the_index_s() {
+        // The working tree matches the commit and the index does not. The index's object is
+        // therefore not the commit's, and the index-against-commit diff is where the commit's own
+        // object for such a path comes from.
+        let staged = staged_reading(
             index(&[("README.md", "100644", "staged", 0)]),
             differences(&[]),
+            differences(&[("README.md", Some("100644"), Some("committed"), 'M')]),
             vec![entry(
                 "README.md",
                 InclusionClass::DirtyFile,
                 ChangeKind::Present,
             )],
         );
-        assert_eq!(staged.base_of("README.md"), None);
+        assert_eq!(
+            staged.base_of("README.md"),
+            Some(("100644".to_owned(), "committed".to_owned()))
+        );
         // With nothing staged, the index's object is the base's.
         let clean = reading(
             index(&[("README.md", "100644", "committed", 0)]),
@@ -1840,31 +1884,34 @@ mod tests {
     }
 
     #[test]
-    fn a_quiescence_declaration_alone_never_decides_the_class() {
+    fn this_host_produces_no_quiesced_capture_at_all() {
+        // Section 14 forbids advertising a stronger source-consistency class without a real
+        // mechanism, and nothing this host can reach holds a working tree still for the whole of a
+        // read. So the class is one this host never assigns, and the declaration is recorded
+        // beside the class rather than deciding it.
         let policy = InclusionPolicy::base_only();
         let granted = FileGrant::default();
         let declared = CaptureRequest {
             quiescence_declared: true,
             ..request(&policy, &granted)
         };
-        let (class, detail) = classify(&declared, false);
-        assert_eq!(class, SourceConsistency::PerFileCapture);
-        assert!(
-            detail.contains("the declaration alone did not decide the class"),
-            "the detail says why: {detail}"
-        );
+        for quiet in [true, false] {
+            let (class, detail) = classify(&declared, quiet);
+            assert_eq!(class, SourceConsistency::PerFileCapture);
+            assert!(
+                detail.contains("detection rather than one instant"),
+                "the detail says what it is: {detail}"
+            );
+        }
         let (class, detail) = classify(&declared, true);
-        assert_eq!(class, SourceConsistency::QuiescedCapture);
         assert!(
-            detail.contains("no session and no automation run"),
-            "the detail names the mechanism: {detail}"
+            detail.contains("it does not make this a quiesced capture"),
+            "and says plainly that the declaration did not decide it: {detail}"
         );
-        assert!(
-            detail.contains("an editor outside KalaReach"),
-            "and the limit: {detail}"
-        );
-        // Without the declaration, quiet or not, it is a per-file capture.
-        let (class, _) = classify(&request(&policy, &granted), true);
+        // Without the declaration the detail says nothing about one.
+        let (class_without, detail_without) = classify(&request(&policy, &granted), true);
+        assert_eq!(class_without, SourceConsistency::PerFileCapture);
+        assert!(!detail_without.contains("quiesced"));
         assert_eq!(class, SourceConsistency::PerFileCapture);
     }
 

@@ -1423,6 +1423,7 @@ export interface KalaReachProtocol {
   named_approval_preview?: NamedApprovalPreview
   named_question_preview?: NamedQuestionPreview
   notification?: Notification
+  observed_path?: ObservedPath
   offline_validity_policy?: OfflineValidityPolicy
   operation_record?: OperationRecord
   organisation_policy?: OrganisationPolicy
@@ -4295,6 +4296,11 @@ export interface MaterialisationRecord {
    */
   materialisation_id: string
   /**
+   * What this host left at each path it wrote, so a later reading can tell a file nobody
+   * touched from one a run rewrote with the same bytes.
+   */
+  observed: ObservedPath[]
+  /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   paths_written: string
@@ -4324,6 +4330,37 @@ export interface FilesystemIdentity2 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   file_id: string
+}
+/**
+ * What this host left at one path of a materialisation when it wrote it.
+ *
+ * A run that changes a file and puts the same bytes back is the one case a content comparison
+ * cannot see. What it does change is the object and the instant the platform records for it, so
+ * those are written down here when the materialisation is made and compared when a result is
+ * recorded. A platform that will not report an instant leaves that field out, and the comparison
+ * then rests on the object and the length alone; that is stated where the limit is.
+ */
+export interface ObservedPath {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
+  /**
+   * The path, relative to the materialisation's own directory.
+   */
+  path: string
+  /**
+   * When it was last written, in whole nanoseconds since the epoch, where the platform says.
+   */
+  written_at_nanos: U64 | null
 }
 /**
  * One exact version of one change set.
@@ -4441,6 +4478,11 @@ export interface MaterialisationRecord1 {
    * Its identity.
    */
   materialisation_id: string
+  /**
+   * What this host left at each path it wrote, so a later reading can tell a file nobody
+   * touched from one a run rewrote with the same bytes.
+   */
+  observed: ObservedPath[]
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -6233,12 +6275,26 @@ export interface DiffApplyParams {
  */
 export interface AffectedVersion {
   /**
+   * Check the index as well as the working tree.
+   *
+   * A caller that only means to say what the file holds leaves this false. One that means to
+   * apply against an exact staged state sets it, and then an index that holds anything else —
+   * including nothing, and including an unresolved merge — is a conflict.
+   */
+  check_index: boolean
+  /**
    * The Git object the caller expects the index to hold for it.
+   *
+   * Absent is an expectation too: the path is expected not to be in the index. A caller that
+   * does not want the index checked sets [`Self::check_index`] to false and says so.
    */
   expected_index_object_id: string | null
   /**
    * The digest of the working-tree file the caller expects to find, or nothing for an absent
    * path.
+   *
+   * Absent is an expectation, not a wildcard: a request that carries nothing here expects the
+   * path not to be in the working tree, and finds a conflict when it is.
    */
   expected_worktree_digest: Digest256 | null
   /**

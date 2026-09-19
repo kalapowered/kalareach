@@ -76,8 +76,36 @@ pub enum GrantDecision {
 /// The match is on any component, so `nested/.git/config` is covered as surely as `.git/config`.
 #[must_use]
 pub fn is_administrative(path: &str) -> bool {
+    // Case-insensitively, because a filesystem that folds case reaches the same directory through
+    // `.GIT` and Git itself refuses that name for exactly this reason.
     path.split('/')
-        .any(|component| component == ADMINISTRATIVE_DIRECTORY)
+        .any(|component| component.eq_ignore_ascii_case(ADMINISTRATIVE_DIRECTORY))
+}
+
+/// Returns true when a capture may look **inside** one directory.
+///
+/// This is not [`decide`]. A grant that selects `build/generated.rs` does not select `build`, and
+/// a walk that asked [`decide`] about the directory would refuse to descend and lose the one path
+/// the caller asked for. So the question for a directory is the other way round: may anything the
+/// grant selects lie beneath it? The secret and administrative rules still stop the descent
+/// outright, because nothing beneath one of those is ever captured.
+#[must_use]
+pub fn may_traverse(grant: &FileGrant, prefix: &str) -> bool {
+    if is_administrative(prefix) || is_secret(prefix) {
+        return false;
+    }
+    if grant
+        .excluded_paths
+        .iter()
+        .any(|excluded| under(prefix, excluded))
+    {
+        return false;
+    }
+    grant.included_paths.is_empty()
+        || grant
+            .included_paths
+            .iter()
+            .any(|included| under(prefix, included) || under(included, prefix))
 }
 
 /// Returns true when a secret rule covers one path.
@@ -237,6 +265,48 @@ mod tests {
             "src/credentials_test_helper.rs",
         ] {
             assert!(!is_secret(path), "{path} is not a secret");
+        }
+    }
+
+    #[test]
+    fn a_directory_above_a_selected_path_may_be_walked_into() {
+        // A selection of one file selects the directories above it for **traversal**, and nothing
+        // else: a walk that refused to descend would lose the one path the caller asked for, and
+        // one that treated traversal as selection would capture the whole directory.
+        let grant = FileGrant {
+            included_paths: vec!["build/generated.rs".to_owned()],
+            excluded_paths: Vec::new(),
+            secret_rules_applied: true,
+        };
+        assert!(may_traverse(&grant, "build"));
+        assert!(!may_traverse(&grant, "other"));
+        // Traversal is not selection: the directory itself is still not a path the grant selects.
+        assert_eq!(
+            decide(&grant, "build/other.rs"),
+            GrantDecision::Refused(ExclusionReason::Grant)
+        );
+        assert_eq!(
+            decide(&grant, "build/generated.rs"),
+            GrantDecision::Permitted
+        );
+        // An exclusion stops the descent, and so do the rules a caller cannot select past.
+        let excluded = FileGrant {
+            included_paths: Vec::new(),
+            excluded_paths: vec!["vendor".to_owned()],
+            secret_rules_applied: true,
+        };
+        assert!(!may_traverse(&excluded, "vendor"));
+        assert!(!may_traverse(&excluded, "vendor/inner"));
+        assert!(!may_traverse(&excluded, "nested/.git"));
+        assert!(!may_traverse(&excluded, "home/.ssh"));
+        assert!(may_traverse(&excluded, "src"));
+    }
+
+    #[test]
+    fn administrative_data_is_refused_whatever_the_case_of_its_name() {
+        // A filesystem that folds case reaches the same directory through either spelling.
+        for path in [".git/config", ".GIT/config", "nested/.Git/HEAD"] {
+            assert!(is_administrative(path), "{path} is administrative data");
         }
     }
 

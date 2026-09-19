@@ -181,7 +181,24 @@ pub struct ProgressRow {
 }
 
 /// What one action's row holds: its method, its payload digest, and its outcome.
-type StoredAction = (String, Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>);
+type StoredAction = (
+    String,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+);
+
+/// One action a caller claimed and nothing has settled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenClaim {
+    /// Who claimed it.
+    pub actor_id: ActorId,
+    /// Which method it was claimed under.
+    pub method: String,
+    /// The digest of the request it was claimed for.
+    pub payload_digest: Digest256,
+}
 
 /// One action's retained outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -587,7 +604,8 @@ impl Store {
                         base_revision: row.get(2)?,
                         derived_from: row
                             .get::<_, Option<i64>>(3)?
-                            .map(|value| ChangeSetVersion::new(value as u64)),
+                            .map(|value| version_of(value, 3))
+                            .transpose()?,
                         record: row.get(4)?,
                         manifest: row.get(5)?,
                         captured_at_ms: TimestampMs::new(row.get::<_, i64>(6)? as u64),
@@ -616,14 +634,15 @@ impl Store {
             .query_map(params![uuid_bytes(change_set_id.get())], |row| {
                 Ok(VersionRow {
                     change_set_id,
-                    version: ChangeSetVersion::new(row.get::<_, i64>(0)? as u64),
+                    version: version_of(row.get::<_, i64>(0)?, 0)?,
                     content_digest: digest_column(row, 1)?,
                     consistency: consistency_of(&row.get::<_, String>(2)?)
                         .ok_or_else(|| unknown(2, "a consistency class"))?,
                     base_revision: row.get(3)?,
                     derived_from: row
                         .get::<_, Option<i64>>(4)?
-                        .map(|value| ChangeSetVersion::new(value as u64)),
+                        .map(|value| version_of(value, 4))
+                        .transpose()?,
                     record: row.get(5)?,
                     manifest: row.get(6)?,
                     captured_at_ms: TimestampMs::new(row.get::<_, i64>(7)? as u64),
@@ -706,6 +725,54 @@ impl Store {
         Ok(held)
     }
 
+    /// Refuses when one version is not there, inside the caller's own transaction.
+    ///
+    /// Every row that names a version is written under this, so a deletion that ran between a
+    /// caller's reading of the version and its write finds the write refused rather than leaving
+    /// a reference to something that is gone.
+    fn require_version(
+        transaction: &Transaction<'_>,
+        change_set_id: ChangeSetId,
+        version: ChangeSetVersion,
+    ) -> Result<()> {
+        let held: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM versions WHERE change_set_id = ?1 AND version = ?2",
+                params![uuid_bytes(change_set_id.get()), version.get() as i64],
+                |row| row.get(0),
+            )
+            .map_err(ChangeSetError::store)?;
+        if held == 0 {
+            return Err(ChangeSetError::UnknownVersion {
+                detail: format!(
+                    "version {} of change set {change_set_id} is not there any more",
+                    version.get()
+                )
+                .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Replaces the record a caller reads for one materialisation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn set_materialisation_record(
+        &self,
+        materialisation_id: MaterialisationId,
+        record: &[u8],
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE materialisations SET record = ?2 WHERE materialisation_id = ?1",
+                params![uuid_bytes(materialisation_id.get()), record],
+            )
+            .map_err(ChangeSetError::store)?;
+        Ok(())
+    }
+
     /// Removes one version, once nothing inside this store names it.
     ///
     /// The counting and the removal are **one transaction**, so nothing can record a
@@ -764,6 +831,7 @@ impl Store {
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        Self::require_version(&transaction, row.change_set_id, row.version)?;
         transaction
             .execute(
                 "INSERT INTO materialisations
@@ -819,7 +887,7 @@ impl Store {
                     Ok(MaterialisationRow {
                         materialisation_id,
                         change_set_id: ChangeSetId::new(uuid_column(row, 0)?),
-                        version: ChangeSetVersion::new(row.get::<_, i64>(1)? as u64),
+                        version: version_of(row.get::<_, i64>(1)?, 1)?,
                         purpose: purpose_of(&row.get::<_, String>(2)?)
                             .ok_or_else(|| unknown(2, "a materialisation purpose"))?,
                         record: row.get(3)?,
@@ -929,6 +997,7 @@ impl Store {
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        Self::require_version(&transaction, row.input_change_set_id, row.input_version)?;
         transaction
             .execute(
                 "INSERT INTO results
@@ -1149,6 +1218,170 @@ impl Store {
         }
     }
 
+    /// Claims one action before its effect runs.
+    ///
+    /// Returns true when this caller won the claim and may act. A caller that loses reads the
+    /// record: one action, one effect, and the loser is answered from the winner's reply rather
+    /// than performing the work a second time.
+    ///
+    /// The claim is durable and it is written **before** anything happens, which is what stops two
+    /// copies of one action both capturing, both materialising or both writing a working tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::IdConflict`] when the identifier was used for a different
+    /// request, and [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn claim_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        payload_digest: Digest256,
+    ) -> Result<bool> {
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT INTO actions (actor_id, action_id, method, payload_digest, result,
+                                      error_code, error_detail, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)
+                 ON CONFLICT (actor_id, action_id) DO NOTHING",
+                params![
+                    actor_id.as_str(),
+                    action_id.as_bytes().to_vec(),
+                    method,
+                    payload_digest.as_bytes().to_vec(),
+                    kr_ipc::now_ms().get() as i64,
+                ],
+            )
+            .map_err(ChangeSetError::store)?;
+        if inserted == 1 {
+            return Ok(true);
+        }
+        // Somebody else holds it. The identifier is checked against what it was first used for,
+        // so a different request under one identifier is a conflict rather than a second effect.
+        let stored: Option<(String, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT method, payload_digest FROM actions WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.as_bytes().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(ChangeSetError::store)?;
+        let Some((stored_method, stored_digest)) = stored else {
+            return Err(ChangeSetError::StoreUnavailable {
+                detail: "an action row that conflicted could not be read back".into(),
+            });
+        };
+        if stored_method != method || digest_of_slice(&stored_digest) != Some(payload_digest) {
+            return Err(ChangeSetError::IdConflict {
+                action: action_id.to_string().into(),
+                method: stored_method.into(),
+            });
+        }
+        Ok(false)
+    }
+
+    /// Settles one action this caller claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn settle_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        payload_digest: Digest256,
+        outcome: &RetainedOutcome,
+    ) -> Result<()> {
+        let (result, code, detail) = match outcome {
+            RetainedOutcome::Ok(result) => (Some(result.clone()), None, None),
+            RetainedOutcome::Error { code, detail } => (
+                None,
+                Some(code.as_str().to_owned()),
+                // A retained failure is read back by whoever repeats the action, and it is kept,
+                // so the rule is applied here as well as where the message was composed.
+                Some(kr_project::git::redact(detail)),
+            ),
+        };
+        self.connection
+            .execute(
+                "UPDATE actions SET result = ?5, error_code = ?6, error_detail = ?7
+                  WHERE actor_id = ?1 AND action_id = ?2 AND method = ?3 AND payload_digest = ?4
+                    AND result IS NULL AND error_code IS NULL",
+                params![
+                    actor_id.as_str(),
+                    action_id.as_bytes().to_vec(),
+                    method,
+                    payload_digest.as_bytes().to_vec(),
+                    result,
+                    code,
+                    detail,
+                ],
+            )
+            .map_err(ChangeSetError::store)?;
+        Ok(())
+    }
+
+    /// Takes one action's claim away, for an effect that decided nothing this host should keep.
+    ///
+    /// A preflight conflict is the case this exists for: section 14 says it returns
+    /// `DRAFT_CONFLICT` with **no KR writes**, so the claim that was taken to arbitrate it is
+    /// given back rather than recorded as an outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn release_action(&self, actor_id: &ActorId, action_id: Uuid) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM actions WHERE actor_id = ?1 AND action_id = ?2
+                   AND result IS NULL AND error_code IS NULL",
+                params![actor_id.as_str(), action_id.as_bytes().to_vec()],
+            )
+            .map_err(ChangeSetError::store)?;
+        Ok(())
+    }
+
+    /// Returns one action's claim when it is open, for a recovery that has to settle it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn open_claim(&self, action_id: Uuid) -> Result<Option<OpenClaim>> {
+        self.connection
+            .query_row(
+                "SELECT actor_id, method, payload_digest FROM actions
+                  WHERE action_id = ?1 AND result IS NULL AND error_code IS NULL",
+                params![action_id.as_bytes().to_vec()],
+                |row| {
+                    let digest: Vec<u8> = row.get(2)?;
+                    Ok(OpenClaim {
+                        actor_id: ActorId::new(row.get::<_, String>(0)?.as_str()).map_err(
+                            |_| {
+                                unreadable(
+                                    0,
+                                    rusqlite::types::Type::Text,
+                                    "an actor this store holds is not a principal",
+                                )
+                            },
+                        )?,
+                        method: row.get(1)?,
+                        payload_digest: digest_of_slice(&digest).ok_or_else(|| {
+                            unreadable(
+                                2,
+                                rusqlite::types::Type::Blob,
+                                "a digest this store holds is not thirty-two bytes",
+                            )
+                        })?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(ChangeSetError::store)
+    }
+
     /// Records one action's outcome, leaving an existing row alone.
     ///
     /// Returns the record that was already there, when another copy of the action recorded first.
@@ -1300,8 +1533,11 @@ impl Store {
                     path: row.get(0)?,
                     state: progress_of(&row.get::<_, String>(1)?)
                         .ok_or_else(|| unknown(1, "a path progress state"))?,
-                    before_digest: before.as_deref().and_then(digest_of_slice),
-                    after_digest: after.as_deref().and_then(digest_of_slice),
+                    // A malformed digest is a row this build cannot read, not an absent digest: a
+                    // reader told a path had no recorded content would draw the wrong conclusion
+                    // about what this host established.
+                    before_digest: optional_digest(before.as_deref(), 2)?,
+                    after_digest: optional_digest(after.as_deref(), 3)?,
                     detail: kr_project::git::redact(&row.get::<_, String>(4)?),
                 })
             })
@@ -1424,7 +1660,7 @@ fn apply_row_offset(
     Ok(ApplyRow {
         action_id,
         change_set_id: ChangeSetId::new(uuid_column(row, offset)?),
-        version: ChangeSetVersion::new(row.get::<_, i64>(offset + 1)? as u64),
+        version: version_of(row.get::<_, i64>(offset + 1)?, offset + 1)?,
         workspace_id: workspace
             .as_deref()
             .map(|bytes| uuid_of(bytes, offset + 2).map(WorkspaceId::new))
@@ -1450,13 +1686,21 @@ fn pair(
     set: Option<Vec<u8>>,
     version: Option<i64>,
 ) -> rusqlite::Result<Option<(ChangeSetId, ChangeSetVersion)>> {
-    Ok(match (set, version) {
-        (Some(set), Some(version)) => Some((
+    match (set, version) {
+        (Some(set), Some(version)) => Ok(Some((
             ChangeSetId::new(uuid_of(&set, 0)?),
-            ChangeSetVersion::new(version as u64),
+            version_of(version, 0)?,
+        ))),
+        (None, None) => Ok(None),
+        // Half a reference is a row this build cannot read. Reading it as no reference at all
+        // would tell a caller that nothing names a version when something does.
+        _ => Err(unreadable(
+            0,
+            rusqlite::types::Type::Blob,
+            "a version reference this store holds names a change set without a version, or the \
+             other way round",
         )),
-        _ => None,
-    })
+    }
 }
 
 fn uuid_bytes(value: Uuid) -> Vec<u8> {
@@ -1524,6 +1768,34 @@ fn digest_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Dige
 
 fn digest_of_slice(bytes: &[u8]) -> Option<Digest256> {
     <[u8; 32]>::try_from(bytes).ok().map(Digest256::from_bytes)
+}
+
+/// Decodes one stored digest that may be absent, refusing one that is there and malformed.
+fn optional_digest(bytes: Option<&[u8]>, index: usize) -> rusqlite::Result<Option<Digest256>> {
+    bytes
+        .map(|bytes| {
+            digest_of_slice(bytes).ok_or_else(|| {
+                unreadable(
+                    index,
+                    rusqlite::types::Type::Blob,
+                    "a digest this store holds is not thirty-two bytes",
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Decodes one stored version number, refusing a negative one.
+fn version_of(value: i64, index: usize) -> rusqlite::Result<ChangeSetVersion> {
+    u64::try_from(value)
+        .map(ChangeSetVersion::new)
+        .map_err(|_| {
+            unreadable(
+                index,
+                rusqlite::types::Type::Integer,
+                "a version number this store holds is not a counter",
+            )
+        })
 }
 
 /// Declares the two directions of one stored vocabulary, so a name and its member cannot drift.

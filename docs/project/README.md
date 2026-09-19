@@ -612,7 +612,7 @@ it actually was.
 | Class | What it rests on |
 | --- | --- |
 | `atomic_snapshot` | The base commit's **own tree**, walked from `<revision>^{tree}` through immutable tree objects and read blob by blob. The commit is immutable and so is everything under it, so the whole listing is one instant by construction. Nothing of the working tree is read |
-| `quiesced_capture` | The caller declared the tree quiesced, **and** no session and no automation run this host knows of held the workspace before or after the read, **and** every per-file and selection check passed. A declaration alone never decides it |
+| `quiesced_capture` | A mechanism that holds a working tree still for the whole of a read. **This host produces no capture of this class**: see below |
 | `per_file_capture` | Files read one at a time from a live tree, each one the same object of the same length written at the same instant after its read as before it, with the base revision, the index and the status unchanged at the end |
 
 No filesystem this service runs on offers an unprivileged atomic snapshot of a directory tree, so
@@ -621,8 +621,13 @@ a capture that cannot reach the one it asked for is refused rather than served a
 that name. A source that keeps changing is retried within a bound and then rejected with
 `SOURCE_CHANGED`.
 
-What `quiesced_capture` does **not** exclude is an editor outside KalaReach. The record says so in
-its own words.
+**Nothing here produces a quiesced capture.** A caller can declare that it quiesced its work, and
+that declaration is recorded on the version's own policy. What it does not do is change the class:
+this host can read which sessions and automation runs are bound to a workspace before and after a
+capture, and two such readings say nothing about the interval between them, while an editor outside
+KalaReach is outside what it can see at all. Calling that a quiesced capture would be the class in
+name and not in fact. It becomes reachable when something can hold the tree still for the read,
+which is a mechanism the workflow service owns rather than this one.
 
 ### What a capture will not read
 
@@ -649,18 +654,22 @@ copy the version came from is touched, so the agent whose tree was captured keep
 
 Recording a result re-reads the materialisation and says what it establishes:
 
-* it still holds the version — the result attests that version;
-* it holds something else — this host records a **derived version** with its own identity, from the
-  one reading it made, and the result attests that and says in as many words that it says nothing
-  about the version that was materialised;
-* it holds something this host cannot represent, or cannot read — the result is
-  `indeterminate` and attests nothing at all.
+* it still holds the version — the same paths, the same content, the same modes, and every file
+  still the object this host wrote, of the same length, last written at the same instant — and the
+  result attests that version;
+* it holds something else — this host records a **derived version** with its own identity, from
+  the one reading it made, and the result attests that and says in as many words that it says
+  nothing about the version that was materialised;
+* it holds something this host cannot represent, cannot read, or would not have captured in the
+  first place, or something was written into it after the run the caller reported had ended — the
+  result is `indeterminate` and attests nothing at all.
 
 The limit, stated rather than left to be discovered: this host reads the directory when the
 materialisation is made and again when the result is recorded. It does not watch it while the run
-is happening. A run that changed a file, tested the change and put the file back reads as
-unmodified from here. Binding a result to the bytes a command actually read needs a host that owns
-the execution.
+is happening. What it records at each path when it writes it — the object, the length and the
+instant it was last written — is what tells a file nobody touched from one a run rewrote with the
+same bytes; a run that restored all three together is not something two readings would show.
+Binding a result to the bytes a command actually read needs a host that owns the execution.
 
 An identical source promises nothing about network services, installed dependencies, secrets or
 graphical state. Every version and every materialisation carries that sentence.
@@ -673,36 +682,54 @@ work is the one a caller gets by asking for it plainly.
 | Class | What it is |
 | --- | --- |
 | `proposal` | Two immutable versions and no write to any working tree: what the destination holds now, and what it would hold. A person decides |
-| `versioned_reference` | Compare-and-swap on a Git reference against an expected old value. It does not atomically update a dirty working tree, and this host **states** rather than performs the update itself: its restricted execution profile runs no subcommand that writes a reference |
+| `versioned_reference` | The expected-old-value comparison, and then the limitation. This host reads the reference and compares it: a value that differs is `DRAFT_CONFLICT`. It does **not** move the reference, because its restricted execution profile runs no subcommand that writes one, so what a caller gets is the limitation rather than the update. A compare-and-swap **update** is not implemented here and this row is not closed by it |
 | `shared_existing` | The user's own working tree, written in place. Best-effort conflict detection, not universal no-clobber compare-and-swap |
 
-A direct apply to `shared_existing` cannot be chosen until the request carries back the limitation
-this host returns for it. What it then does, in order: the preflight, which compares every affected
-path with what the request expects and answers `DRAFT_CONFLICT` with **nothing written anywhere** if
-they differ; an immutable capture of the destination as it stands; the content staged in a private
-directory and read back against its digest; then, per path, `planned` recorded for every path before
-any of them is attempted, the destination rechecked as late as the platform permits, the staged file
-renamed over the destination through the directory's own handle, and the outcome replacing that
-`planned` row; and finally an immutable capture of the destination as it now stands.
+An apply carries **operations**, not only content: a path the version holds is installed, and a
+path the version's working tree deleted is taken away. A request that names no paths carries every
+one of them, and one that names paths carries exactly those.
+
+A direct apply to `shared_existing` cannot be chosen until the request carries back the limitations
+this host returns for it, and a preflight is how a caller obtains them: it writes nothing and needs
+no acknowledgement. What a direct apply then does, in order: the preflight, which compares every
+affected path with what the request expects and answers `DRAFT_CONFLICT` with **nothing written
+anywhere** if they differ; an immutable capture of the destination as it stands; the content staged
+in a private directory and read back against its digest; `planned` recorded for every operation
+before any of them is attempted; then, per operation, a temporary created exclusively **in the
+destination's own directory** and written with the validated bytes, the destination's permissions
+put on it, the destination rechecked against that same directory handle as the last thing before
+the rename, the rename, and the destination read back and compared with what was meant to land;
+and finally an immutable capture of the destination as it now stands.
+
+Nothing is removed to make room. A staging name that is already taken is a path this host reports
+and leaves exactly as it is.
 
 Permissions are the destination's own, put on the staged copy before the rename, so a file that was
-executable stays executable and one that was not does not become one. Content is written byte for
-byte, so a line ending is whatever the version holds.
+executable stays executable and one that was not does not become one. A destination whose
+permissions this host cannot read is a path it does not replace. What it carries is the platform's
+mode bits; an access-control list beside them is not carried, and a path that has one is replaced
+with its mode bits alone. Content is written byte for byte, so a line ending is whatever the version
+holds.
 
-Five outcome classes and no sixth:
+An apply comes to one of five classes. **A preflight conflict is an error, not a result**:
+`diff.apply` and `diff.revert` return `DRAFT_CONFLICT`, and a preflight that finds the destination
+as expected returns a result with no outcome class at all, because nothing ran.
 
 | Outcome | What it means |
 | --- | --- |
-| `preflight_conflict` | The destination was not what the request expected. Nothing was written, anywhere |
-| `applied` | Every path landed and this host confirmed each one |
+| `preflight_conflict` | The destination was not what the request expected. Nothing was written, anywhere. This is the class the journal records; the caller receives `DRAFT_CONFLICT` |
+| `applied` | Every operation landed and this host read each one back |
 | `conflict_after_partial_writes` | Some landed, and then the destination stopped being what the request expected |
-| `interrupted_apply` | Some landed, and this host stopped before finishing |
-| `uncertain_outcome` | This host cannot say what the destination holds |
+| `interrupted_apply` | This host stopped before finishing. Some operations may have landed and some may not; the rows say which |
+| `uncertain_outcome` | This host cannot say what the destination holds, or an operation it planned is one it did not resolve |
 
-A crash after one file cannot produce `applied`. `applied` is recorded only once every planned path
-has been confirmed, and a path whose row still says `planned` means this host did not establish what
-became of it — which is not the same as saying it did not write it. A replacement daemon settles
-such an apply as `interrupted_apply` and names exactly the paths on each side.
+A crash after one file cannot produce `applied`. `applied` is recorded only when every operation the
+apply planned is confirmed in the destination, and a path whose row still says `planned` means this
+host did not establish what became of it — which is not the same as saying it did not write it. A
+replacement daemon settles such an apply as `interrupted_apply`, names exactly the paths on each
+side, and **settles the action it was performed under with that answer**, so a caller that repeats
+the action is told what happened rather than applying a second time against a destination the first
+attempt already changed.
 
 Marking a review complete records that somebody acknowledged **that version**. It runs no Git
 invocation, writes to no working tree and removes nothing. `commit`, `push`, `revert`, `reset`,
@@ -713,10 +740,12 @@ invocation, writes to no working tree and removes nothing. `commit`, `push`, `re
 A version is not deleted while anything names it: a materialisation that has not been released, a
 review acknowledgement or any other evidence, a later version derived from it, a recorded result, an
 apply that names it on either side, or a pin the project service holds against the workspace. The
-counting and the removal are one transaction inside the change-set store, so nothing recorded in
-between is lost. The project service's pin lives in another store and is checked first; a pin
-recorded between that check and the transaction is not covered, and that is written down rather than
-hidden.
+counting and the removal are one transaction inside the change-set store, and every row that names a
+version is written under a check, in its own transaction, that the version is still there — so a
+holder recorded while a deletion is deciding is either counted or refused, and never left pointing
+at something that is gone. The project service's pin lives in another store and is checked first; a
+pin recorded between that check and the transaction is not covered, and that is written down rather
+than hidden.
 
 ### Storage layout
 

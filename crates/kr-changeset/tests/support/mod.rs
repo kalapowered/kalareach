@@ -267,6 +267,7 @@ pub fn expectations(root: &Path, paths: &[&str]) -> Vec<kr_protocol::changeset::
                     .map(|bytes| kr_changeset::objects::digest_of(&bytes)),
             ),
             expected_index_object_id: Nullable(None),
+            check_index: false,
         })
         .collect()
 }

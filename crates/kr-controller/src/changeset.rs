@@ -278,9 +278,33 @@ impl ChangeSetModule {
                     }
                 };
             }
+            // The claim is taken **before** the effect. Two copies of one action that both found
+            // no record would otherwise both capture, both materialise or both write a working
+            // tree, and returning one reply to both would not undo the second effect.
+            if !service.claim_action(&actor, action_id, name, digest)? {
+                // Another copy holds it. Either it has settled, in which case its reply is the
+                // answer, or it has not, in which case this host cannot say what became of the
+                // action and says exactly that.
+                return match service.retained_action(&actor, action_id, name, digest)? {
+                    Some(RetainedOutcome::Ok(result)) => {
+                        kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+                            .map(ParamsValue::new)
+                            .map_err(|error| {
+                                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
+                            })
+                    }
+                    Some(RetainedOutcome::Error { code, detail }) => {
+                        Err(ProtocolError::new(code, detail))
+                    }
+                    None => Err(ProtocolError::new(
+                        ErrorCode::OutcomeUnknown,
+                        "another copy of this action is running and has not said what it came to",
+                    )),
+                };
+            }
             // Every arm runs inside a closure, so a refusal the service decided reaches the
-            // retention below instead of returning from the task. An action whose failure was not
-            // retained could be performed again under the same identifier and succeed.
+            // settlement below instead of returning from the task. An action whose failure was not
+            // recorded could be performed again under the same identifier and succeed.
             let outcome = (|| -> Answer<ParamsValue> {
                 match method {
                     Method::ChangesetCapture => {
@@ -305,9 +329,17 @@ impl ChangeSetModule {
                     )),
                 }
             })();
-            // Recorded before it is returned, so the reply and the record cannot disagree about
-            // what happened. When another copy of this action recorded first, that record is the
-            // answer both callers get.
+            // Section 14: a preflight conflict returns DRAFT_CONFLICT **without KR writes**. The
+            // claim this host took to arbitrate the action is therefore given back rather than
+            // settled, so nothing of this request survives in the journal and the caller can ask
+            // again with what it now knows is there.
+            if matches!(
+                &outcome,
+                Err(error) if error.code == ErrorCode::DraftConflict
+            ) {
+                service.release_action(&actor, action_id)?;
+                return outcome;
+            }
             let record = match &outcome {
                 Ok(value) => {
                     RetainedOutcome::Ok(kr_cbor::to_canonical_vec(value).map_err(|error| {
@@ -319,19 +351,10 @@ impl ChangeSetModule {
                     detail: error.message.clone(),
                 },
             };
-            match service.record_action(&actor, action_id, name, digest, &record)? {
-                None => outcome,
-                Some(RetainedOutcome::Ok(result)) => {
-                    kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                        .map(ParamsValue::new)
-                        .map_err(|error| {
-                            ProtocolError::new(ErrorCode::OutcomeUnknown, error.to_string())
-                        })
-                }
-                Some(RetainedOutcome::Error { code, detail }) => {
-                    Err(ProtocolError::new(code, detail))
-                }
-            }
+            // Recorded before it is returned, so the reply and the record cannot disagree about
+            // what happened.
+            service.settle_action(&actor, action_id, name, digest, &record)?;
+            outcome
         })
         .await
     }

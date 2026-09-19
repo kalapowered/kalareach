@@ -271,19 +271,35 @@ impl ChangeSetService {
             }
             .into());
         }
-        if let Some(git_dir) = resolved.git_dir
-            && found.git_dir != git_dir
-        {
-            return Err(kr_project::ProjectError::IdentityChanged {
-                detail: format!(
-                    "this workspace is a working copy of the repository {git_dir}, and the tree \
-                     at its recorded path belongs to the repository {}; a recorded identity is \
-                     the object rather than the path",
-                    found.git_dir
-                )
-                .into(),
+        match resolved.git_dir {
+            Some(git_dir) if found.git_dir != git_dir => {
+                return Err(kr_project::ProjectError::IdentityChanged {
+                    detail: format!(
+                        "this workspace is a working copy of the repository {git_dir}, and the \
+                         tree at its recorded path belongs to the repository {}; a recorded \
+                         identity is the object rather than the path",
+                        found.git_dir
+                    )
+                    .into(),
+                }
+                .into());
             }
-            .into());
+            Some(_) => {}
+            // An independent clone is its own repository, and the project service records no
+            // identity for it, so there is nothing to compare its Git directory with. What is
+            // required instead is the thing that makes it an independent clone: its repository is
+            // **inside its own working tree**. A `.git` file rewritten to point at somebody else's
+            // repository fails that, and so does a working tree whose repository is elsewhere.
+            None => {
+                if !opened.git_dir_path().starts_with(opened.top_level()) {
+                    return Err(kr_project::ProjectError::IdentityChanged {
+                        detail: "this workspace is an independent clone, and the tree at its \
+                                 recorded path belongs to a repository outside it"
+                            .into(),
+                    }
+                    .into());
+                }
+            }
         }
         Ok(opened)
     }
@@ -775,6 +791,53 @@ impl ChangeSetService {
     ) -> Result<Option<crate::store::RetainedOutcome>> {
         self.locked()?
             .retained_action(actor_id, action_id, method, payload_digest)
+    }
+
+    /// Claims one action before its effect runs, returning true when this caller may act.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::IdConflict`] when the identifier was used for a different
+    /// request.
+    pub fn claim_action(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::scalars::Uuid,
+        method: &str,
+        payload_digest: kr_protocol::scalars::Digest256,
+    ) -> Result<bool> {
+        self.locked()?
+            .claim_action(actor_id, action_id, method, payload_digest)
+    }
+
+    /// Settles one action this caller claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn settle_action(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::scalars::Uuid,
+        method: &str,
+        payload_digest: kr_protocol::scalars::Digest256,
+        outcome: &crate::store::RetainedOutcome,
+    ) -> Result<()> {
+        self.locked()?
+            .settle_action(actor_id, action_id, method, payload_digest, outcome)
+    }
+
+    /// Gives one action's claim back, for an effect that wrote nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn release_action(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::scalars::Uuid,
+    ) -> Result<()> {
+        self.locked()?.release_action(actor_id, action_id)
     }
 
     /// Records one action's outcome, leaving an existing row alone.

@@ -467,6 +467,28 @@ pub enum MaterialisationPurpose {
     Inspection,
 }
 
+/// What this host left at one path of a materialisation when it wrote it.
+///
+/// A run that changes a file and puts the same bytes back is the one case a content comparison
+/// cannot see. What it does change is the object and the instant the platform records for it, so
+/// those are written down here when the materialisation is made and compared when a result is
+/// recorded. A platform that will not report an instant leaves that field out, and the comparison
+/// then rests on the object and the length alone; that is stated where the limit is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedPath {
+    /// The path, relative to the materialisation's own directory.
+    pub path: String,
+    /// The device the file was on.
+    pub device: U64,
+    /// The file's own number on it.
+    pub file_id: U64,
+    /// Its length in bytes.
+    pub byte_len: U64,
+    /// When it was last written, in whole nanoseconds since the epoch, where the platform says.
+    pub written_at_nanos: Nullable<U64>,
+}
+
 /// One independent materialisation of one exact version.
 ///
 /// It is written from the host's own content-addressed store into a private directory, so the
@@ -495,6 +517,9 @@ pub struct MaterialisationRecord {
     pub paths_written: U64,
     /// The paths the version holds that this host could not write.
     pub unapplied: Vec<String>,
+    /// What this host left at each path it wrote, so a later reading can tell a file nobody
+    /// touched from one a run rewrote with the same bytes.
+    pub observed: Vec<ObservedPath>,
     /// When it was made.
     pub created_at_ms: TimestampMs,
     /// When it was released, once it has been.
@@ -664,9 +689,21 @@ pub struct AffectedVersion {
     pub path: String,
     /// The digest of the working-tree file the caller expects to find, or nothing for an absent
     /// path.
+    ///
+    /// Absent is an expectation, not a wildcard: a request that carries nothing here expects the
+    /// path not to be in the working tree, and finds a conflict when it is.
     pub expected_worktree_digest: Nullable<Digest256>,
     /// The Git object the caller expects the index to hold for it.
+    ///
+    /// Absent is an expectation too: the path is expected not to be in the index. A caller that
+    /// does not want the index checked sets [`Self::check_index`] to false and says so.
     pub expected_index_object_id: Nullable<String>,
+    /// Check the index as well as the working tree.
+    ///
+    /// A caller that only means to say what the file holds leaves this false. One that means to
+    /// apply against an exact staged state sets it, and then an index that holds anything else —
+    /// including nothing, and including an unresolved merge — is a conflict.
+    pub check_index: bool,
 }
 
 /// The reference an apply to a versioned Git reference names, and the value it expects it at.

@@ -438,6 +438,7 @@ async fn every_change_set_method_runs_end_to_end_through_the_daemon() {
                             b"the agent has moved on\n",
                         )),
                         expected_index_object_id: Nullable::null(),
+                        check_index: false,
                     }],
                     paths: vec!["README.md".to_owned()],
                     preflight_only: false,
@@ -475,6 +476,7 @@ async fn every_change_set_method_runs_end_to_end_through_the_daemon() {
                             b"something else entirely\n",
                         )),
                         expected_index_object_id: Nullable::null(),
+                        check_index: false,
                     }],
                     paths: vec!["README.md".to_owned()],
                     preflight_only: false,
@@ -619,6 +621,148 @@ async fn a_repeated_capture_action_is_answered_from_its_record() {
         listed.versions.len(),
         1,
         "one action captured one version, however many times it was sent"
+    );
+
+    host.clients.abort();
+    let _ = host.clients.await;
+}
+
+/// KR-REQ-14.26 and 23.44: a preflight conflict through the daemon leaves **no KR writes**,
+/// including no action record, so the caller can ask again with what it now knows is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preflight_conflict_through_the_daemon_records_nothing() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let source = repository(host.work(), "conflicting");
+
+    let adopted: ProjectAdoptResult = typed(
+        &control
+            .mutate(
+                Method::ProjectAdopt,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &ProjectAdoptParams {
+                    destination: host.destination("conflicting"),
+                    label: "conflicting".to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.adopt succeeds"),
+    );
+    let created: WorkspaceCreateResult = typed(
+        &control
+            .mutate(
+                Method::WorkspaceCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkspaceCreateParams {
+                    project_repository_id: adopted.project.project_repository_id,
+                    label: "the user's own tree".to_owned(),
+                    kind: WorkspaceKind::SharedExisting,
+                    isolation: Nullable::null(),
+                    policy: include_everything(),
+                    base_revision: Nullable::null(),
+                    base_change_set_id: Nullable::null(),
+                    destination: Nullable::null(),
+                    preview_only: false,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.create succeeds"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    let captured: ChangesetCaptureResult = typed(
+        &control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &ChangesetCaptureParams {
+                    workspace_id: workspace,
+                    change_set_id: Nullable::null(),
+                    label: "the work".to_owned(),
+                    policy: include_everything(),
+                    grant: FileGrant::default(),
+                    quiescence_declared: false,
+                    required_consistency: Nullable::null(),
+                    pin: false,
+                    session_id: Nullable::null(),
+                    workflow_run_id: Nullable::null(),
+                    note: String::new(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.capture succeeds"),
+    );
+
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = DiffApplyParams {
+        change_set_id: captured.version.change_set_id,
+        version: captured.version.version,
+        destination: DestinationClass::Proposal,
+        workspace_id: Nullable::some(workspace),
+        expected_reference: Nullable::null(),
+        affected: vec![kr_protocol::changeset::AffectedVersion {
+            path: "README.md".to_owned(),
+            expected_worktree_digest: Nullable::some(kr_changeset::objects::digest_of(
+                b"something that is not there\n",
+            )),
+            expected_index_object_id: Nullable::null(),
+            check_index: false,
+        }],
+        paths: vec!["README.md".to_owned()],
+        preflight_only: false,
+        acknowledged_limitations: Vec::new(),
+    };
+    let refusal = failure(
+        control
+            .mutate(
+                Method::DiffApply,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::DraftConflict);
+    // Nothing of that request is in the journal: the same action identifier with a request that
+    // now matches the tree goes through rather than being answered from a record of the refusal.
+    let digest = kr_changeset::objects::digest_of(b"changed after the commit\n");
+    let second = DiffApplyParams {
+        affected: vec![kr_protocol::changeset::AffectedVersion {
+            path: "README.md".to_owned(),
+            expected_worktree_digest: Nullable::some(digest),
+            expected_index_object_id: Nullable::null(),
+            check_index: false,
+        }],
+        ..params
+    };
+    let applied: DiffApplyResult = typed(
+        &control
+            .mutate(
+                Method::DiffApply,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &second,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the apply succeeds once the request matches the tree"),
+    );
+    assert_eq!(applied.outcome, Nullable::some(ApplyOutcomeClass::Applied));
+    assert_eq!(
+        std::fs::read(source.join("README.md")).expect("the tree is there"),
+        b"changed after the commit\n",
+        "a proposal writes to no working tree"
     );
 
     host.clients.abort();

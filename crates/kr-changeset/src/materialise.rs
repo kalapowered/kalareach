@@ -36,8 +36,8 @@ use std::io::{Read as _, Write as _};
 use kr_protocol::changeset::{
     CapturedPath, ChangeSetVersionRecord, ContentOrigin, Exclusion, ExclusionReason,
     ExecutionReceipt, MaterialisationPurpose, MaterialisationRecord, MaterialisationResult,
-    OutputReference, PathClass, Provenance, SourceConsistency, TestedSource, ToolIdentity,
-    VersionRef,
+    ObservedPath, OutputReference, PathClass, Provenance, SourceConsistency, TestedSource,
+    ToolIdentity, VersionRef,
 };
 use kr_protocol::ids::{ChangeSetVersion, MaterialisationId};
 use kr_protocol::project::{ChangeKind, FilesystemIdentity};
@@ -86,17 +86,9 @@ pub fn materialise(
     let directory_name = materialisation_id.to_string();
     let name = RelativeName::parse(&directory_name)?;
     let directory = parent.create_subdirectory(&name)?;
-    let mut written = 0_u64;
-    let mut unapplied = Vec::new();
-    for entry in &manifest.paths {
-        match write_path(service, &directory, entry) {
-            Ok(()) => written += 1,
-            Err(_) => unapplied.push(entry.path.clone()),
-        }
-    }
-    directory.sync()?;
     let identity = directory.identity();
-    let record = MaterialisationRecord {
+    let created_at_ms = kr_ipc::now_ms();
+    let mut held = MaterialisationRecord {
         materialisation_id,
         version,
         content_digest: record.content_digest,
@@ -108,11 +100,15 @@ pub fn materialise(
             device: U64::new(identity.device),
             file_id: U64::new(identity.file_id),
         },
-        paths_written: U64::new(written),
-        unapplied,
-        created_at_ms: kr_ipc::now_ms(),
+        paths_written: U64::new(0),
+        unapplied: Vec::new(),
+        observed: Vec::new(),
+        created_at_ms,
         released_at_ms: Nullable(None),
     };
+    // The row goes in **before** a byte is written, and it refuses when the version is no longer
+    // there. A directory written first and recorded afterwards is a directory whose version a
+    // deletion could take away in between, leaving files nothing accounts for.
     service
         .locked()?
         .insert_materialisation(&MaterialisationRow {
@@ -120,13 +116,28 @@ pub fn materialise(
             change_set_id: version.change_set_id,
             version: version.version,
             purpose,
-            record: encode_stored(&record)?,
+            record: encode_stored(&held)?,
             directory_name,
             identity,
-            created_at_ms: record.created_at_ms,
+            created_at_ms,
             released_at_ms: None,
         })?;
-    Ok(record)
+    let mut written = 0_u64;
+    for entry in &manifest.paths {
+        match write_path(service, &directory, entry) {
+            Ok(observed) => {
+                written += 1;
+                held.observed.push(observed);
+            }
+            Err(_) => held.unapplied.push(entry.path.clone()),
+        }
+    }
+    directory.sync()?;
+    held.paths_written = U64::new(written);
+    service
+        .locked()?
+        .set_materialisation_record(materialisation_id, &encode_stored(&held)?)?;
+    Ok(held)
 }
 
 /// Writes one path into a materialisation, creating the directories above it.
@@ -139,7 +150,7 @@ fn write_path(
     service: &ChangeSetService,
     directory: &AuthorisedDirectory,
     entry: &CapturedPath,
-) -> Result<()> {
+) -> Result<ObservedPath> {
     let bytes = service.objects().get(entry.content_digest)?;
     let name = RelativeName::parse(&entry.path)?;
     let components = name.components();
@@ -167,7 +178,28 @@ fn write_path(
         .map_err(ChangeSetError::storage)?;
     set_executable(&file, entry.executable)?;
     here.sync()?;
-    Ok(())
+    // What this host left behind, so a re-read can tell a file nobody touched from one a run
+    // rewrote with the same bytes: the object, its length, and when it was last written.
+    let identity = file.identity();
+    Ok(ObservedPath {
+        path: entry.path.clone(),
+        device: U64::new(identity.device),
+        file_id: U64::new(identity.file_id),
+        byte_len: U64::new(bytes.len() as u64),
+        written_at_nanos: Nullable(written_at(&file).map(U64::new)),
+    })
+}
+
+/// Returns when a file was last written, as the platform counts it.
+///
+/// A whole number of nanoseconds since the epoch, so the value can be recorded and compared
+/// later. A platform that will not say answers nothing, and the comparison then rests on the
+/// identity and the length alone, which is said where the limit is stated.
+fn written_at(file: &kr_transfer::AuthorisedFile) -> Option<u64> {
+    let modified = file.handle().metadata().ok()?.modified().ok()?;
+    let system: std::time::SystemTime = modified.into_std();
+    let since = system.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_nanos()).ok()
 }
 
 /// Returns a second authority over the same open directory.
@@ -213,7 +245,7 @@ fn set_executable(_file: &kr_transfer::AuthorisedFile, _executable: bool) -> Res
 /// What re-reading one materialisation established.
 #[derive(Clone, Debug)]
 pub enum Reread {
-    /// The directory held exactly the version.
+    /// The directory held exactly the version, at exactly the objects this host wrote.
     Unmodified,
     /// It held something else, and this is what, with every byte already in the content store.
     Modified(Manifest),
@@ -223,9 +255,14 @@ pub enum Reread {
 
 /// Re-reads one materialisation and says whether it still holds the version.
 ///
-/// Every file is read **once**: its bytes go into the content store as the walk reads them, so the
+/// Every file is read **once**, with its identity and length compared across its own read, so the
 /// digest, the length, the content class and the mode a derived version records all describe the
-/// same reading. A second pass would let a concurrent edit make them describe different bytes.
+/// same reading.
+///
+/// Three things make the source indeterminate rather than merely different: something this host
+/// cannot represent in a version, a name or a directory it cannot read, and a path a rule would
+/// have kept out that the run put there — because a version that quietly left that path out would
+/// say the run used a tree that did not hold it.
 ///
 /// # Errors
 ///
@@ -233,7 +270,7 @@ pub enum Reread {
 pub fn reread(
     service: &ChangeSetService,
     materialisation_id: MaterialisationId,
-) -> Result<(MaterialisationRow, Reread)> {
+) -> Result<(MaterialisationRow, Reread, Vec<ObservedPath>)> {
     let row = service
         .locked()?
         .materialisation(materialisation_id)?
@@ -242,6 +279,7 @@ pub fn reread(
         })?;
     let original = service.manifest(row.change_set_id, row.version)?;
     let record = service.record(row.change_set_id, Some(row.version))?;
+    let held: MaterialisationRecord = decode_stored(&row.record)?;
     let parent = service
         .root()
         .subdirectory(&RelativeName::parse(MATERIALISATIONS_DIRECTORY)?)?;
@@ -253,6 +291,7 @@ pub fn reread(
                 Reread::Indeterminate(format!(
                     "this host could not open the materialisation it made: {error}"
                 )),
+                Vec::new(),
             ));
         }
     };
@@ -263,12 +302,18 @@ pub fn reread(
                 "the directory at this materialisation's name is not the object this host made"
                     .to_owned(),
             ),
+            Vec::new(),
         ));
     }
     let mut found = Manifest {
         paths: Vec::new(),
         exclusions: Vec::new(),
     };
+    let mut budget = Budget {
+        bytes: kr_protocol::changeset::MAX_CAPTURE_BYTES,
+        entries: crate::capture::MAX_WALK_ENTRIES,
+    };
+    let mut observed = Vec::new();
     if let Err(detail) = walk(
         service,
         &directory,
@@ -276,16 +321,24 @@ pub fn reread(
         &original,
         &record.policy.grant,
         &mut found,
+        &mut budget,
+        &mut observed,
         0,
     )? {
-        return Ok((row, Reread::Indeterminate(detail)));
+        return Ok((row, Reread::Indeterminate(detail), observed));
     }
     found.canonicalise();
-    if same_content(&original, &found) {
-        Ok((row, Reread::Unmodified))
+    if same_content(&original, &found) && same_objects(&held.observed, &observed) {
+        Ok((row, Reread::Unmodified, observed))
     } else {
-        Ok((row, Reread::Modified(found)))
+        Ok((row, Reread::Modified(found), observed))
     }
+}
+
+/// How much of a re-read's budget is left.
+struct Budget {
+    bytes: u64,
+    entries: usize,
 }
 
 /// Returns true when two manifests hold the same paths with the same content and the same mode.
@@ -298,12 +351,34 @@ fn same_content(left: &Manifest, right: &Manifest) -> bool {
     })
 }
 
+/// Returns true when every path is still the object this host wrote, of the same length, last
+/// written at the same instant.
+///
+/// This is what tells a file nobody touched from one a run rewrote with the same bytes: rewriting
+/// a file changes the instant the platform records for it, and replacing it changes the object.
+/// What it does not catch is a run that restored the object, the length **and** the instant, which
+/// takes deliberate work, and a platform that reports no instant at all.
+fn same_objects(before: &[ObservedPath], after: &[ObservedPath]) -> bool {
+    if before.len() != after.len() {
+        return false;
+    }
+    let mut before: Vec<&ObservedPath> = before.iter().collect();
+    let mut after: Vec<&ObservedPath> = after.iter().collect();
+    before.sort_by(|a, b| a.path.cmp(&b.path));
+    after.sort_by(|a, b| a.path.cmp(&b.path));
+    before.iter().zip(&after).all(|(a, b)| {
+        a.path == b.path
+            && a.device == b.device
+            && a.file_id == b.file_id
+            && a.byte_len == b.byte_len
+            && a.written_at_nanos == b.written_at_nanos
+    })
+}
+
 /// Reads every file beneath one materialisation into a manifest, storing each one as it goes.
 ///
 /// The outer `Result` is a failure of this host; the inner one names something that makes the
-/// tested source indeterminate rather than merely different. A link, a socket or a device is the
-/// second: this host cannot represent it in a version, and a manifest that quietly left it out
-/// would say the run used something it did not.
+/// tested source indeterminate rather than merely different.
 #[allow(clippy::too_many_arguments)]
 fn walk(
     service: &ChangeSetService,
@@ -312,6 +387,8 @@ fn walk(
     original: &Manifest,
     grant: &kr_protocol::changeset::FileGrant,
     found: &mut Manifest,
+    budget: &mut Budget,
+    observed: &mut Vec<ObservedPath>,
     depth: usize,
 ) -> Result<std::result::Result<(), String>> {
     if depth >= crate::capture::MAX_WALK_DEPTH {
@@ -347,118 +424,183 @@ fn walk(
                 kr_project::git::redact(&component)
             )));
         };
-        // The grant and the secret rules apply here as they apply to a capture. A run that wrote
-        // a credential into its own copy does not get it stored in a derived version, and the
-        // exclusion says so.
-        if let GrantDecision::Refused(reason) = grant::decide(grant, &path) {
-            found.exclusions.push(Exclusion {
-                path,
-                reason,
-                detail: "this path is one a capture of this change set would not read either"
-                    .to_owned(),
-            });
+        // What kind of thing it is is decided **before** the grant, so an unsupported object at a
+        // name a rule would have kept out is still seen. A version that left it out quietly would
+        // say the run used a tree that did not hold it.
+        let kind = match directory.probe(&name) {
+            Ok(kind) => kind,
+            Err(error) => {
+                return Ok(Err(format!("a name could not be examined: {error}")));
+            }
+        };
+        if !matches!(kind, ObjectKind::Directory | ObjectKind::File) {
+            return Ok(Err(format!(
+                "this materialisation holds {} at {}, which this host cannot represent in a \
+                 version, so what was tested cannot be established",
+                match kind {
+                    ObjectKind::Link => "a link",
+                    _ => "something that is not file content",
+                },
+                kr_project::git::redact(&path)
+            )));
+        }
+        if kind == ObjectKind::Directory {
+            if !crate::grant::may_traverse(grant, &path) {
+                // A directory a rule keeps out is one a capture of this change set would not have
+                // read either, and something under it is an input this host cannot account for.
+                return Ok(Err(format!(
+                    "this materialisation holds {}, which a capture of this change set would not \
+                     read, so what was tested cannot be established",
+                    kr_project::git::redact(&path)
+                )));
+            }
+            let Ok(child) = directory.subdirectory(&name) else {
+                return Ok(Err(format!(
+                    "a directory beneath this materialisation could not be opened: {}",
+                    kr_project::git::redact(&path)
+                )));
+            };
+            if let Err(detail) = walk(
+                service,
+                &child,
+                &path,
+                original,
+                grant,
+                found,
+                budget,
+                observed,
+                depth + 1,
+            )? {
+                return Ok(Err(detail));
+            }
             continue;
         }
-        match directory.probe(&name) {
-            Ok(ObjectKind::Directory) => {
-                let Ok(child) = directory.subdirectory(&name) else {
-                    return Ok(Err(format!(
-                        "a directory beneath this materialisation could not be opened: {}",
-                        kr_project::git::redact(&path)
-                    )));
-                };
-                if let Err(detail) =
-                    walk(service, &child, &path, original, grant, found, depth + 1)?
-                {
-                    return Ok(Err(detail));
-                }
+        // A file a rule keeps out is a source input this host may not read and may not store, and
+        // one that is there is an input a result cannot account for.
+        if let GrantDecision::Refused(_) = grant::decide(grant, &path) {
+            return Ok(Err(format!(
+                "this materialisation holds {}, which a capture of this change set would not \
+                 read, so what was tested cannot be established",
+                kr_project::git::redact(&path)
+            )));
+        }
+        if budget.entries == 0 {
+            return Ok(Err(format!(
+                "this materialisation holds more than {} paths, which is more than this host \
+                 reads back",
+                crate::capture::MAX_WALK_ENTRIES
+            )));
+        }
+        budget.entries -= 1;
+        let mut file = match directory.open_read(&name, ObjectPolicy::ReadableFile) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(Err(format!("a file could not be opened: {error}")));
             }
-            Ok(ObjectKind::File) => {
-                let mut file = match directory.open_read(&name, ObjectPolicy::ReadableFile) {
-                    Ok(file) => file,
-                    Err(error) => {
-                        return Ok(Err(format!("a file could not be opened: {error}")));
-                    }
-                };
-                let mut bytes = Vec::new();
-                let mut bounded = file
-                    .handle_mut()
-                    .take(crate::capture::MAX_CAPTURE_FILE_BYTES + 1);
-                if let Err(error) = bounded.read_to_end(&mut bytes) {
-                    return Ok(Err(format!("a file could not be read: {error}")));
-                }
-                if bytes.len() as u64 > crate::capture::MAX_CAPTURE_FILE_BYTES {
-                    return Ok(Err(format!(
-                        "a file beneath this materialisation is larger than the {} bytes this \
-                         host reads",
-                        crate::capture::MAX_CAPTURE_FILE_BYTES
-                    )));
-                }
-                let executable = is_executable(&file);
-                let previous = original.path(&path);
-                // Stored from the one reading this walk made, so the digest, the length, the
-                // content class and the mode all describe the same bytes.
-                let digest = service.objects().put(&bytes)?;
-                found.paths.push(CapturedPath {
-                    content_digest: digest,
-                    byte_len: U64::new(bytes.len() as u64),
-                    executable,
-                    content: crate::capture::classify_content(&bytes),
-                    origin: ContentOrigin::WorkingTree,
-                    // The class is recomputed against the input version: a path whose content
-                    // differs is a change of this derived version, one that matches keeps what it
-                    // was, and one the run added is untracked.
-                    class: match previous {
-                        Some(entry) if entry.content_digest == digest => entry.class,
-                        Some(_) => PathClass::DirtyFile,
-                        None => PathClass::UntrackedFile,
-                    },
-                    change: ChangeKind::Present,
-                    base_object_id: previous
-                        .map_or(Nullable(None), |entry| entry.base_object_id.clone()),
-                    path,
-                });
-            }
-            // A link, a socket or a device is something the run put there and something this host
-            // cannot represent in a version. Leaving it out would make the derived version say the
-            // run used a tree that did not hold it, so the tested source is indeterminate instead.
-            Ok(kind) => {
+        };
+        let identity = file.identity();
+        let before_len = file.byte_len();
+        let before_written = written_at(&file);
+        let executable = is_executable(&file);
+        let mut bytes = Vec::new();
+        let mut bounded = file
+            .handle_mut()
+            .take(crate::capture::MAX_CAPTURE_FILE_BYTES + 1);
+        if let Err(error) = bounded.read_to_end(&mut bytes) {
+            return Ok(Err(format!("a file could not be read: {error}")));
+        }
+        if bytes.len() as u64 > crate::capture::MAX_CAPTURE_FILE_BYTES {
+            return Ok(Err(format!(
+                "a file beneath this materialisation is larger than the {} bytes this host reads",
+                crate::capture::MAX_CAPTURE_FILE_BYTES
+            )));
+        }
+        // The same open handle is asked again, so a file that changed while this host was reading
+        // it makes the source indeterminate rather than producing a mixed reading.
+        match file.revalidate() {
+            Ok(after_len)
+                if file.identity() == identity
+                    && after_len == before_len
+                    && after_len == bytes.len() as u64
+                    && written_at(&file) == before_written => {}
+            Ok(_) => {
                 return Ok(Err(format!(
-                    "this materialisation holds {} at {}, which this host cannot represent in a \
-                     version, so what was tested cannot be established",
-                    match kind {
-                        ObjectKind::Link => "a link",
-                        _ => "something that is not file content",
-                    },
+                    "{} changed while this host was reading it, so what was tested cannot be \
+                     established",
                     kr_project::git::redact(&path)
                 )));
             }
             Err(error) => {
-                return Ok(Err(format!("a name could not be examined: {error}")));
+                return Ok(Err(format!("a file could not be read back: {error}")));
             }
         }
+        budget.bytes = match budget.bytes.checked_sub(bytes.len() as u64) {
+            Some(left) => left,
+            None => {
+                return Ok(Err(format!(
+                    "this materialisation holds more than {} bytes, which is more than this host \
+                     reads back",
+                    kr_protocol::changeset::MAX_CAPTURE_BYTES
+                )));
+            }
+        };
+        let previous = original.path(&path);
+        // Stored from the one reading this walk made, so the digest, the length, the content class
+        // and the mode all describe the same bytes.
+        let digest = service.objects().put(&bytes)?;
+        observed.push(ObservedPath {
+            path: path.clone(),
+            device: U64::new(identity.device),
+            file_id: U64::new(identity.file_id),
+            byte_len: U64::new(bytes.len() as u64),
+            written_at_nanos: Nullable(before_written.map(U64::new)),
+        });
+        found.paths.push(CapturedPath {
+            content_digest: digest,
+            byte_len: U64::new(bytes.len() as u64),
+            executable,
+            content: crate::capture::classify_content(&bytes),
+            origin: ContentOrigin::WorkingTree,
+            // The class is recomputed against the input version: a path whose content **or mode**
+            // differs is a change of this derived version, one that matches both keeps what it
+            // was, and one the run added is untracked.
+            class: match previous {
+                Some(entry) if entry.content_digest == digest && entry.executable == executable => {
+                    entry.class
+                }
+                Some(_) => PathClass::DirtyFile,
+                None => PathClass::UntrackedFile,
+            },
+            change: ChangeKind::Present,
+            base_object_id: previous.map_or(Nullable(None), |entry| entry.base_object_id.clone()),
+            path,
+        });
     }
     // A path the version held that the run removed is a deletion of the derived version, named
-    // rather than silently absent.
+    // rather than silently absent, and the input version's own exclusions that still apply are
+    // carried forward so a reader of the derived version sees the same rules.
     if prefix.is_empty() {
-        let held: std::collections::BTreeSet<&str> = found
+        let here: std::collections::BTreeSet<&str> = found
             .paths
             .iter()
             .map(|entry| entry.path.as_str())
             .collect();
         for entry in &original.paths {
-            if !held.contains(entry.path.as_str())
-                && !found
-                    .exclusions
-                    .iter()
-                    .any(|exclusion| exclusion.path == entry.path)
-            {
+            if !here.contains(entry.path.as_str()) {
                 found.exclusions.push(Exclusion {
                     path: entry.path.clone(),
                     reason: ExclusionReason::Deleted,
                     detail: "the version held this path and the materialisation no longer does"
                         .to_owned(),
                 });
+            }
+        }
+        for exclusion in &original.exclusions {
+            if matches!(
+                exclusion.reason,
+                ExclusionReason::SecretRule | ExclusionReason::Grant
+            ) {
+                found.exclusions.push(exclusion.clone());
             }
         }
     }
@@ -505,18 +647,34 @@ pub fn record_result(
     materialisation_id: MaterialisationId,
     report: &RunReport,
 ) -> Result<MaterialisationResult> {
-    let (row, state) = reread(service, materialisation_id)?;
+    let (row, state, observed) = reread(service, materialisation_id)?;
     let input_version = VersionRef {
         change_set_id: row.change_set_id,
         version: row.version,
     };
     let record = service.record(row.change_set_id, Some(row.version))?;
+    // Evidence this host can check against the caller's own report: a file written after the run
+    // ended is a file the run did not use, so a result about it would be about something else.
+    let written_after =
+        latest_write(&observed).is_some_and(|written| written > report.receipt.ended_at_ms.get());
     let (tested_source, tested_version, attestation) = match state {
+        _ if written_after => (
+            TestedSource::Indeterminate,
+            None,
+            "something wrote into this materialisation after the run the caller reported had \
+             ended, so this host cannot establish what the run read and this result attests no \
+             version"
+                .to_owned(),
+        ),
         Reread::Unmodified => (
             TestedSource::UnmodifiedVersion,
             Some(input_version),
-            "this materialisation still held exactly the version that was written into it when \
-             the result was recorded, so the result is about that version"
+            "this materialisation still held exactly the version that was written into it: the \
+             same paths, the same content, the same modes, and every file still the object this \
+             host wrote, of the same length, last written at the same instant. What this host \
+             read is the directory at two instants, when it was made and now; it did not watch it \
+             while the run was happening, so a run that restored the object, the length and the \
+             instant together is not something it would show"
                 .to_owned(),
         ),
         Reread::Modified(found) => {
@@ -528,11 +686,13 @@ pub fn record_result(
                     version: derived.version,
                 }),
                 format!(
-                    "this materialisation was changed while it was in use, so this result is \
-                     about version {} of the change set, which this host recorded from what the \
-                     directory actually held; it says nothing about version {}",
-                    derived.version.get(),
-                    row.version.get()
+                    "this materialisation was changed while it was in use, so this result says \
+                     nothing about version {}. Version {} is what the directory held when the \
+                     result was recorded, read and stored then; this host did not watch the \
+                     directory while the run was happening, so it is the source at that instant \
+                     rather than the bytes each part of the run read",
+                    row.version.get(),
+                    derived.version.get()
                 ),
             )
         }
@@ -570,6 +730,23 @@ pub fn record_result(
         recorded_at_ms: result.recorded_at_ms,
     })?;
     Ok(result)
+}
+
+/// Returns the latest instant anything beneath one materialisation was written, in milliseconds.
+///
+/// Read from the observations the re-read itself made, which are the same objects it read. A
+/// platform that reports no instant contributes nothing, and the rule that uses this then decides
+/// nothing either, which is said where the limit is stated.
+fn latest_write(observed: &[ObservedPath]) -> Option<u64> {
+    observed
+        .iter()
+        .filter_map(|observed| {
+            observed
+                .written_at_nanos
+                .0
+                .map(|value| value.get() / 1_000_000)
+        })
+        .max()
 }
 
 /// Records the version a changed materialisation actually held.

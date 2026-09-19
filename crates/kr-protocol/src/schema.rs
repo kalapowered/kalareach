@@ -41,7 +41,7 @@ use crate::changeset::{
     ChangesetCaptureResult, ChangesetMaterializeParams, ChangesetMaterializeResult,
     ChangesetReadParams, ChangesetReadResult, DiffApplyParams, DiffApplyResult, DiffEntry,
     DiffReadParams, DiffReadResult, EvidenceReference, MaterialisationRecord,
-    MaterialisationResult,
+    MaterialisationResult, ObservedPath,
 };
 use crate::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesParams,
@@ -458,6 +458,7 @@ pub fn protocol_schema() -> Value {
         "diff_read_result" => DiffReadResult,
         "evidence_reference" => EvidenceReference,
         "materialisation_record" => MaterialisationRecord,
+        "observed_path" => ObservedPath,
         "materialisation_result" => MaterialisationResult,
         // Agent contact: the questions an agent asks the person, the alerts it raises and the
         // installation of the skill that carries them. Appended for the same reason.

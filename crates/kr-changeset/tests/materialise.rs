@@ -21,7 +21,12 @@ use kr_protocol::scalars::{Nullable, U64};
 
 use support::{Fixture, include_everything, ordinary_repository, reference, write, write_bytes};
 
+/// A run that started before this moment and ended at it.
+///
+/// The end matters: this host compares it with the instant anything beneath the materialisation
+/// was last written, and a file written after the run ended is a file the run did not use.
 fn report() -> RunReport {
+    let ended = kr_ipc::now_ms();
     RunReport {
         command: "cargo test --workspace".to_owned(),
         profile: "the project's own test profile".to_owned(),
@@ -30,8 +35,10 @@ fn report() -> RunReport {
             version: "1.97.1".to_owned(),
         },
         receipt: ExecutionReceipt {
-            started_at_ms: kr_protocol::scalars::TimestampMs::new(1_000),
-            ended_at_ms: kr_protocol::scalars::TimestampMs::new(2_000),
+            started_at_ms: kr_protocol::scalars::TimestampMs::new(
+                ended.get().saturating_sub(60_000),
+            ),
+            ended_at_ms: ended,
             exit_status: Nullable(Some(U64::new(0))),
             stopped: false,
             detail: "every test passed".to_owned(),
@@ -414,10 +421,11 @@ fn a_pin_against_the_workspace_holds_the_version() {
     );
 }
 
-/// KR-REQ-14.33: a run that writes a secret into its own copy does not get it stored in a derived
-/// version, because the grant and the secret rules apply to the re-read as they do to a capture.
+/// KR-REQ-14.33 and 14.34: a run that writes a secret into its own copy neither gets it stored nor
+/// gets a result that attests a version, because a source this host may not read is a source it
+/// cannot establish.
 #[test]
-fn a_secret_a_run_left_behind_is_not_stored_in_a_derived_version() {
+fn a_secret_a_run_left_behind_is_neither_stored_nor_attested() {
     let fixture = Fixture::create();
     ordinary_repository(fixture.work(), "secretive");
     let workspace = fixture.workspace("secretive");
@@ -437,17 +445,17 @@ fn a_secret_a_run_left_behind_is_not_stored_in_a_derived_version() {
 
     let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
         .expect("the result is recorded");
-    assert_eq!(result.tested_source, TestedSource::DerivedVersion);
-    let Nullable(Some(tested)) = result.tested_version else {
-        panic!("a derived result names its version");
-    };
-    let manifest = fixture
-        .service()
-        .manifest(tested.change_set_id, tested.version)
-        .expect("its manifest");
+    assert_eq!(
+        result.tested_source,
+        TestedSource::Indeterminate,
+        "a source this host may not read is a source it cannot establish"
+    );
+    assert_eq!(result.tested_version, Nullable(None));
     assert!(
-        manifest.path(".env").is_none(),
-        "a secret rule covers it in a derived version too"
+        result.attestation.contains("would not \nread")
+            || result.attestation.contains("would not read"),
+        "the attestation says why: {}",
+        result.attestation
     );
     assert!(
         !fixture
@@ -459,17 +467,6 @@ fn a_secret_a_run_left_behind_is_not_stored_in_a_derived_version() {
             .expect("the store answers"),
         "the secret's bytes never reached the content store"
     );
-    // The change the run did make is recorded, and it is a change of the derived version.
-    let changed = manifest.path("README.md").expect("it is there");
-    assert_eq!(
-        fixture
-            .service()
-            .objects()
-            .get(changed.content_digest)
-            .expect("its content"),
-        b"and changes a file\n"
-    );
-    assert!(changed.class.is_change());
 }
 
 /// KR-REQ-14.34: something this host cannot represent in a version makes the tested source

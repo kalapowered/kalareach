@@ -868,10 +868,10 @@ fn a_nested_repository_s_own_data_is_never_captured() {
     );
 }
 
-/// KR-REQ-14.32: a live session holding the workspace stops a quiescence declaration deciding the
-/// class, and nothing holding it lets the declaration through.
+/// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
+/// because nothing this host can reach holds a working tree still for the whole of a read.
 #[test]
-fn a_live_session_stops_a_quiescence_declaration_deciding_the_class() {
+fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
     let fixture = Fixture::create();
     ordinary_repository(fixture.work(), "quiet");
     let workspace = fixture.workspace("quiet");
@@ -884,18 +884,18 @@ fn a_live_session_stops_a_quiescence_declaration_deciding_the_class() {
         .capture_declaring_quiescence(workspace)
         .expect("the capture succeeds");
     assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
+    assert!(record.policy.quiescence_declared);
     assert!(
         record
             .consistency_detail
-            .contains("the declaration alone did not decide the class"),
-        "the record says why: {}",
+            .contains("describes something that was not the case"),
+        "the record says the declaration was wrong: {}",
         record.consistency_detail
     );
-    assert!(
-        record.policy.quiescence_declared,
-        "the declaration is still recorded"
-    );
 
+    // With nothing holding the workspace the class is still a per-file capture: two readings of
+    // what holds it say nothing about the interval between them, and an editor outside KalaReach
+    // is outside what this host can see at all.
     fixture
         .project()
         .bind_session(workspace, session, false)
@@ -903,7 +903,14 @@ fn a_live_session_stops_a_quiescence_declaration_deciding_the_class() {
     let record = fixture
         .capture_declaring_quiescence(workspace)
         .expect("the capture succeeds");
-    assert_eq!(record.consistency, SourceConsistency::QuiescedCapture);
+    assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
+    assert!(
+        record
+            .consistency_detail
+            .contains("it does not make this a quiesced capture"),
+        "and says so: {}",
+        record.consistency_detail
+    );
 }
 
 /// KR-REQ-01.27: an independent clone is a workspace of its own repository, and capturing one
