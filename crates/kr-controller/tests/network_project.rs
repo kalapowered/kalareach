@@ -10,8 +10,8 @@
 //! host cannot check a device's authority over, so they are refused to one and the owner's own
 //! path is untouched. What is shown to be identical on both doors is the four reads, for the same
 //! subject, and the refusals the daemon decides about an envelope. On top of those, the grant is
-//! what a device is additionally held to, and a device's own action is answered from its own
-//! record rather than performed twice.
+//! what a device is additionally held to, and a device that submits its own action again is given
+//! the answer its first submission produced rather than the answer performing it now would give.
 //!
 //! What these do not show is the rest of those rows: the destination and source authority sections
 //! 14 and 23 ask for, which this host does not yet establish and which is why the five are
@@ -826,11 +826,19 @@ async fn a_project_envelope_naming_a_session_or_another_environment_is_refused_o
 /// The action is `project.operation.cancel`, which is the one project mutation a device reaches:
 /// the five that name their own destination are refused before the service sees them. It is
 /// submitted against an operation that does not exist yet, so the service refuses it, and a
-/// refusal is retained exactly as a result is. The owner then *creates* that operation, so a
-/// second execution of the same action would now give a different answer — section 23 puts the
-/// method under the resource owner's authority and the operation is the owner's. The retry
-/// therefore distinguishes the record from another execution: the record still says the operation
-/// was unknown, and a fresh submission of the same request says it belongs to somebody else.
+/// refusal is retained exactly as a result is. The owner then *creates* that operation, so
+/// performing the same request now would give a different answer — section 23 puts the method
+/// under the resource owner's authority and the operation is the owner's. The retry therefore
+/// distinguishes the record from what performing it now would say: the record still says the
+/// operation was unknown, and a fresh submission of the same request says it belongs to somebody
+/// else.
+///
+/// What this establishes is that the caller is given its own first answer. It does not establish
+/// that the service was not entered again, because the service records the first outcome and
+/// hands that record back whatever a second entry produced; what keeps a second entry from
+/// happening is the retained lookup that returns before the action, and this suite does not count
+/// entries. A cancellation of an operation another actor owns has no effect to observe either
+/// way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_performed_again() {
     let owner = DeviceKeys::generate().expect("owner keys");

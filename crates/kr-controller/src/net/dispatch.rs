@@ -716,13 +716,16 @@ impl RemoteConnection {
             Ok(accepted) => accepted,
             Err(error) => return failure(mutation.request_id, error),
         };
-        // The last check before the effect is admitted. Everything between here and it is
-        // synchronous, so nothing can withdraw this connection's authority in between. A
-        // revocation *after* this point reaches an action that is already on its way to a
-        // subject, and section 9 answers that where the subject is: every dispatch revalidates
-        // current authority and expiry in the worker's serial path immediately before it acts, and
-        // durable acceptance preserves neither. What this host then reports is the revocation as
-        // pending for that worker until it acknowledges the revision.
+        // The last check this connection's own turn makes before the effect is admitted. Nothing
+        // between here and the dispatch awaits, so this task is not descheduled in between; that
+        // is not the same as nothing being able to revoke, because a revocation runs on a task of
+        // its own and this check releases the connection table before it returns. What actually
+        // stops a revoked action is where section 9 puts it: every dispatch revalidates current
+        // authority and expiry in the worker's serial path immediately before it acts, durable
+        // acceptance preserves neither, and the daemon's own effects ask again inside their own
+        // transaction. This check is what keeps an already-withdrawn connection from getting that
+        // far. What this host reports meanwhile is the revocation as pending for that worker until
+        // it acknowledges the revision.
         if let Err(error) = self.authorised().await {
             return failure(mutation.request_id, error);
         }
