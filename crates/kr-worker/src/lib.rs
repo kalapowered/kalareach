@@ -13,6 +13,7 @@
 //! | [`environment`] | The root shell's environment: what is inherited, what is replaced, what is refused |
 //! | [`fence`] | The root editor's fence and detach machine, driven against the real clock and the real bridge |
 //! | [`history`] | Retained output: a resident window, an indexed spool and explicit gaps |
+//! | [`history_filter`] | The one host-side filter every history and derived-content surface shares |
 //! | [`input`] | The single input lease, its epochs and paste-delimiter framing |
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
 //! | [`lifecycle`] | What a live session is watched for: the root shell's exit, its desktop, and what it owns |
@@ -36,6 +37,7 @@ pub mod environment;
 pub mod error;
 pub mod fence;
 pub mod history;
+pub mod history_filter;
 pub mod input;
 pub mod journal;
 pub mod lifecycle;
