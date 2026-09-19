@@ -1248,10 +1248,10 @@ The confirmation is accepted against an expectation built from what the caller s
 its device identity, its endpoint, the recipient's public keys, the rights the plan hands over and a
 digest covering the whole plan. A challenge that supplied its own answers to those does not satisfy
 it. The signer and the outstanding-challenge ledger are the caller's too, so the acceptance is only
-as strong as the caller's own enrolment record. What comes out of that acceptance is evidence bound to the host it was accepted for, to the boot
-it was accepted in, and to the ceremony's own monotonic deadline, and the transfer checks all three
-before it does anything. A confirmation accepted for another host, in an earlier boot, or past its
-lifetime authorises nothing.
+as strong as the caller's own enrolment record. What comes out of that acceptance is evidence bound
+to the host it was accepted for, to the boot it was accepted in, and to the ceremony's own monotonic
+deadline, and the transfer checks all three before it does anything. A confirmation accepted for
+another host, in an earlier boot, or past its lifetime authorises nothing.
 
 The transfer hands over no more than the transferring grant carries, and it advances the revision
 and fences like any other revocation.
@@ -1299,9 +1299,9 @@ registration on its own belongs to the network half, which owns those registrati
 A remote owner publishes a signed revocation **request**, which carries no revision. Only the target
 host numbers it, from the same sequence its own revocations use, because a device that could number
 its own request would be assigning itself a place in the host's order. A record at or below the
-revision this host has accepted is refused, so replaying an old feed entry cannot put authority back,
-and a different request wearing an identity this host has already applied is refused rather than
-answered with somebody else's revision.
+revision this host has accepted is refused, so replaying an old feed entry cannot put authority
+back, and a different request wearing an identity this host has already applied is refused rather
+than answered with somebody else's revision.
 
 Revocation records are retained until every enrolled host has acknowledged them or that host is
 explicitly removed; they do not share mailbox expiry or notification coalescing. A settled record is
