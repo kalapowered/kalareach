@@ -112,6 +112,12 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Some(chosen) => (Some(chosen.palette), chosen.typed),
                 None => (None, Vec::new()),
             };
+            // From here to the attachment, anything the person typed while this terminal was
+            // being asked for its colours has nowhere to go but that attachment. It is owed from
+            // the moment it was taken, so the guard is taken before anything that can fail:
+            // opening the connection and asking this host what it creates by default both can,
+            // and a failure there would otherwise lose the count in silence.
+            let mut undelivered = kr_cli::session::UndeliveredTyping::new(typed_while_asking.len());
             let mut client = open_controller(&environment.paths, build_id()).await?;
             // The execution context is this host's own unless the command chose one. The
             // presentation is not consulted: an invisible session runs where a visible one would,
@@ -155,10 +161,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                 // of choosing it and a session's palette is fixed at creation.
                 palette: Nullable(palette),
             };
-            // From here to the attachment, anything the person typed while this terminal was
-            // being asked for its colours has nowhere to go but that attachment. A creation that
-            // fails on the way owes them the count rather than losing it in silence.
-            let mut undelivered = kr_cli::session::UndeliveredTyping::new(typed_while_asking.len());
             let outcome = client
                 .mutate(
                     Method::SessionCreate,
