@@ -27,6 +27,11 @@ portable-pty.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 rustix = { workspace = true, features = ["event", "process", "termios"] }
 serde.workspace = true
+# The gateway's core-declarative path reads a connector's frames itself, without calling a
+# component: the table says which member carries the request identifier and which carries the
+# method, and this is what reads them. A parser written here instead would be a second JSON
+# implementation inside the trusted core.
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 

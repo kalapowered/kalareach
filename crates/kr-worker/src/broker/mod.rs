@@ -22,6 +22,7 @@
 //! | [`arbitration`] | Pending resources, one resolution each, and what a reconnect does |
 //! | [`capability`] | The per-installation capability map and the probes behind it |
 //! | [`error`] | The broker's refusals, each mapped to a stable protocol code |
+//! | [`gateway`] | The core-declarative forwarding path, the closed rich table and reverse calls |
 //! | [`ledger`] | The durable records, in the worker's own journal file |
 //! | [`process`] | Launched processes, their credentials and their immutable source frames |
 //! | [`profiles`] | Launch profiles, the stale-launch refusal and one process per conversation |
@@ -38,6 +39,7 @@
 pub mod arbitration;
 pub mod capability;
 pub mod error;
+pub mod gateway;
 pub mod ledger;
 pub mod process;
 pub mod profiles;
@@ -49,13 +51,12 @@ use std::sync::Mutex;
 
 use kr_protocol::agent::AgentBindingState;
 use kr_protocol::broker::{
-    ActionName, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants, CapabilityInvalidation,
-    CapabilityMap, CapabilityRecord, DecodedProjection, DecoderLedgerEntry, DecodingTrust,
-    IntegrationMode, LaunchProfile, MAX_RETAINED_SOURCE_BYTES,
+    ActionName, ActionProvenance, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants,
+    CapabilityInvalidation, CapabilityMap, CapabilityRecord, DecodedProjection, DecoderLedgerEntry,
+    DecodingTrust, IntegrationMode, LaunchProfile, MAX_RETAINED_SOURCE_BYTES,
 };
 use kr_protocol::gateway::{
-    DownstreamRequestId, Durability, NativeClassification, PendingKind, PendingResource,
-    PendingState,
+    DownstreamRequestId, Durability, PendingKind, PendingResource, PendingState,
 };
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
@@ -71,6 +72,9 @@ pub use crate::broker::arbitration::{
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::error::{BrokerError, Result};
+pub use crate::broker::gateway::{
+    Connection, ConnectionOrigin, Forwarded, Gateway, ReverseRequest, RichInvocation,
+};
 pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
 pub use crate::broker::process::{
     BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
@@ -252,6 +256,12 @@ pub struct DispatchAdmission {
     pub method: UpstreamMethod,
     /// The upstream's own identifier for it.
     pub upstream_request_id: UpstreamRequestId,
+    /// How this answer reaches the upstream, and therefore how it is recorded.
+    ///
+    /// Section 12 requires every action to record its provenance. An answer admitted here goes
+    /// over the gateway's typed connection, so it is a typed result; the app may also offer a
+    /// terminal convenience, and that one records itself as terminal input and never as this.
+    pub provenance: ActionProvenance,
 }
 
 /// What stopping an instance actually does.
@@ -274,6 +284,7 @@ pub struct StopOutcome {
 #[derive(Debug)]
 struct BrokerState {
     ledger: Ledger,
+    gateway: Gateway,
     instances: BTreeMap<ApplicationInstanceId, Instance>,
     bindings: BTreeMap<BrokerBindingId, Binding>,
     tokens: TokenStore,
@@ -310,6 +321,7 @@ impl Broker {
         Ok(Self {
             state: Mutex::new(BrokerState {
                 ledger,
+                gateway: Gateway::new(),
                 instances: BTreeMap::new(),
                 bindings: BTreeMap::new(),
                 tokens: TokenStore::new(),
@@ -718,7 +730,101 @@ impl Broker {
 
     // -- the decoder path ---------------------------------------------------------------------
 
-    /// Offers a pending resource a decoder proposed, after every check section 11 names.
+    /// Records one opaque native request before it is forwarded, and forwards it.
+    ///
+    /// Section 11: "The broker records opaque native requests before forwarding them and
+    /// arbitrates responses by their IDs." What is recorded is the request, not an approval: its
+    /// interpretation is not verified, so no client may offer it as something a person answers.
+    /// A request the table does not classify also suspends the instance's rich mutations, because
+    /// nothing here knows what it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when the connection is not a worker-launched
+    /// native one, [`BrokerError::InvalidArgument`] when the frame is not one the table describes,
+    /// and [`BrokerError::LedgerUnavailable`] when a durable record cannot be written.
+    pub fn forward_native(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+        now: TimestampMs,
+    ) -> Result<(Forwarded, Option<PendingResource>)> {
+        let mut state = self.state();
+        let forwarded = state.gateway.forward_native(connection, frame)?;
+        let application_instance_id = state
+            .gateway
+            .connection(connection)
+            .map(|held| held.application_instance_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
+        // The native path keeps working while the journal is faulted. What the gap records is
+        // that it did.
+        state.volatile.note_native_request();
+
+        if forwarded.suspends_rich_mutations
+            && let Some(instance) = state.instances.get_mut(&application_instance_id)
+        {
+            instance.rich_suspension = Some(format!(
+                "{} is not classified by this connector's table, so what it changed is unknown",
+                forwarded.method
+            ));
+        }
+
+        let Some(request) = forwarded.request.clone() else {
+            return Ok((forwarded, None));
+        };
+        if !forwarded.expects_response {
+            return Ok((forwarded, None));
+        }
+        let source_generation = state.instances.get(&application_instance_id).map_or_else(
+            || SourceGeneration::new(1),
+            |instance| instance.source_generation,
+        );
+        let resource = PendingResource {
+            resource_id: PendingResourceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes())),
+            application_instance_id,
+            request,
+            kind: PendingKind::ReverseRpc,
+            method: forwarded.method.clone(),
+            classification: forwarded.classification,
+            source_generation,
+            state: PendingState::Pending,
+            durability: state.volatile.durability(),
+            deadline_ms: Nullable::null(),
+            recorded_at: now,
+            // Opaque. A decoder's verified interpretation is what makes it answerable.
+            interpretation_verified: false,
+        };
+        if resource.durability == Durability::Durable {
+            state.ledger.record_opaque(&resource)?;
+        }
+        state.arbitration.record(resource.clone(), None)?;
+        Ok((forwarded, Some(resource)))
+    }
+
+    /// Records the answer the upstream produced for one of its own requests.
+    ///
+    /// This is what makes a native answer win during encoding: it resolves the pending resource,
+    /// and a rich answer that reaches the claim afterwards is told the resolved state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the response carries no correlation
+    /// identifier, and [`BrokerError::Arbitration`] when the resource has already ended.
+    pub fn native_answer(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        let mut state = self.state();
+        let request = state.gateway.correlate_response(connection, frame)?;
+        state.volatile.note_native_response();
+        let transition = state.arbitration.plan_upstream_resolved(&request)?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)
+    }
+
+    /// Verifies a decoder's interpretation of a request this broker already holds.
     ///
     /// The checks are made in this order, and the order is the argument:
     ///
@@ -731,32 +837,28 @@ impl Broker {
     /// 3. **Binding and generation.** The frame is looked up by its handle in this binding's own
     ///    instance, so nothing the caller says about its generation or digest is believed, and a
     ///    frame from an execution that has gone is refused.
-    /// 4. **Non-reuse.** Consuming the source, recording the decoder and writing the pending row
+    /// 4. **Non-reuse.** Consuming the source, recording the decoder and making the row actionable
     ///    are one transaction, keyed by the broker's own event identity. A decoder gets one
-    ///    resource per event, and the claim is durable so a restart does not reopen the question.
+    ///    interpretation per event, and the claim is durable so a restart does not reopen it.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Grant`] or [`BrokerError::PermissionDenied`] for a role the binding
     /// does not have, [`BrokerError::Trust`] for a projection outside the schema policy,
-    /// [`BrokerError::UnknownSubject`] for a binding, instance or frame this broker does not hold,
-    /// and [`BrokerError::PreconditionFailed`] for a stale generation or a reused source.
-    #[allow(clippy::too_many_arguments)]
-    pub fn offer_resource(
+    /// [`BrokerError::UnknownSubject`] for a binding, instance or resource this broker does not
+    /// hold, and [`BrokerError::PreconditionFailed`] for a stale generation or a reused source.
+    pub fn interpret(
         &self,
         binding_id: BrokerBindingId,
+        resource_id: PendingResourceId,
         handle: &SourceEventHandle,
-        request: DownstreamRequestId,
-        method: UpstreamMethod,
-        classification: NativeClassification,
         projection: DecodedProjection,
         deadline_ms: Option<TimestampMs>,
         now: TimestampMs,
     ) -> Result<PendingResource> {
         let mut state = self.state();
-        // Creating a rich approval is rich work. While the journal is faulted the native
-        // forwarding path continues and this does not: a resource nobody could record is one a
-        // restart could not reconcile.
+        // Interpreting a request into something a person answers is rich work. While the journal
+        // is faulted the native forwarding path continues and this does not.
         state.volatile.require_rich_work()?;
         let binding = state
             .bindings
@@ -774,9 +876,33 @@ impl Broker {
                 detail: format!("this binding's rich capabilities are disabled: {reason}"),
             });
         }
-        if !binding.may_decode(&method) {
+        let pending = state
+            .arbitration
+            .get(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?
+            .resource
+            .clone();
+        if pending.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: pending.state,
+                },
+            ));
+        }
+        let binding = state
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        if binding.application_instance_id != pending.application_instance_id {
             return Err(BrokerError::denied(format!(
-                "this binding is not trusted to decode {method}"
+                "binding {binding_id} is not bound to {}",
+                pending.application_instance_id
+            )));
+        }
+        if !binding.may_decode(&pending.method) {
+            return Err(BrokerError::denied(format!(
+                "this binding is not trusted to decode {}",
+                pending.method
             )));
         }
         let trust = binding
@@ -784,10 +910,10 @@ impl Broker {
             .as_ref()
             .ok_or_else(|| BrokerError::denied("this binding holds no decoding trust"))?;
         trust.check_projection(&projection)?;
-        let application_instance_id = binding.application_instance_id;
         let plugin_id = binding.plugin_id.clone();
         let publisher_id = binding.publisher_id.clone();
         let package_digest = binding.package_digest;
+        let application_instance_id = pending.application_instance_id;
 
         let instance = state
             .instances
@@ -812,12 +938,6 @@ impl Broker {
                 ),
             });
         }
-        if state.arbitration.holds_request(&request) {
-            return Err(BrokerError::invalid(format!(
-                "{request} already names a pending resource"
-            )));
-        }
-
         // Section 11 requires the ledger to retain the original source, and a partial copy is not
         // the original. A request too large to keep whole is not turned into an approval: it is
         // still forwarded opaquely on the native path, which depends on nothing this host stores.
@@ -830,13 +950,14 @@ impl Broker {
                 ),
             });
         }
+
         let entry = DecoderLedgerEntry {
             binding_id,
             plugin_id,
             publisher_id,
             package_digest,
-            method: method.clone(),
-            upstream_request_id: request.upstream.clone(),
+            method: pending.method.clone(),
+            upstream_request_id: pending.request.upstream.clone(),
             source_generation: frame.generation,
             source_digest: frame.digest,
             source_bytes: Bytes::from(frame.bytes().to_vec()),
@@ -844,37 +965,28 @@ impl Broker {
             deadline_ms: Nullable::from(deadline_ms),
             decoded_at: now,
         };
-        let resource = PendingResource {
-            resource_id: PendingResourceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes())),
-            application_instance_id,
-            request,
+        let interpreted = PendingResource {
             kind: PendingKind::Approval,
-            method,
-            classification,
-            source_generation: frame.generation,
-            state: PendingState::Pending,
-            // Durable by construction: a resource is admitted only while the journal is taking
-            // writes, and it becomes volatile only by living through a gap.
-            durability: Durability::Durable,
             deadline_ms: Nullable::from(deadline_ms),
-            recorded_at: now,
             interpretation_verified: true,
+            ..pending
         };
-        let admitted = state
-            .ledger
-            .admit_resource(handle, binding_id, &entry, &resource, now)?;
+        let admitted =
+            state
+                .ledger
+                .admit_resource(handle, binding_id, &entry, &interpreted, now)?;
         if !admitted {
             return Err(BrokerError::PreconditionFailed {
-                detail: format!("source event {handle} has already produced a resource"),
+                detail: format!("source event {handle} has already produced an interpretation"),
             });
         }
         state
             .arbitration
-            .record(resource.clone(), Some(binding_id))?;
+            .set_interpretation(resource_id, interpreted.clone(), binding_id)?;
         if let Some(instance) = state.instances.get_mut(&application_instance_id) {
             instance.release(handle);
         }
-        Ok(resource)
+        Ok(interpreted)
     }
 
     /// Returns the decoder entry behind one pending resource.
@@ -1156,11 +1268,16 @@ impl Broker {
         let transition = state.arbitration.plan_dispatch(claim)?;
         state.ledger.mark_dispatched(&transition.resource)?;
         let resource = state.arbitration.commit(transition)?;
+        let provenance = state
+            .gateway
+            .provenance(resource.request.connection)
+            .unwrap_or(ActionProvenance::UpstreamTypedRpc);
         Ok(DispatchAdmission {
             resource,
             option_id: option_id.to_owned(),
             method: entry.method,
             upstream_request_id: entry.upstream_request_id,
+            provenance,
         })
     }
 
@@ -1233,6 +1350,19 @@ impl Broker {
             .arbitration
             .get(resource_id)
             .map(|pending| pending.resource.clone())
+    }
+
+    /// Returns what the ledger records about one resource, resolved or not.
+    ///
+    /// [`Broker::pending`] reads the live arbitration, which holds what can still happen. This
+    /// reads what was written down, which is how a resolved or uncertain resource is inspected
+    /// after the live record has gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn recorded(&self, resource_id: PendingResourceId) -> Result<Option<PendingResource>> {
+        self.state().ledger.pending(resource_id)
     }
 
     /// Returns every pending resource this broker currently holds.
@@ -1341,6 +1471,145 @@ impl Broker {
         application_instance_id: ApplicationInstanceId,
     ) -> Result<Option<StreamCursor>> {
         self.state().ledger.checkpoint(application_instance_id)
+    }
+
+    // -- the gateway --------------------------------------------------------------------------
+
+    /// Opens a native connection for a terminal this worker launched and authenticated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Table`] when a table does not qualify, and
+    /// [`BrokerError::PermissionDenied`] when the presented credential and process identity are
+    /// not the launch this broker made.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_native_connection(
+        &self,
+        connection: GatewayConnectionId,
+        application_instance_id: ApplicationInstanceId,
+        presented_credential: &[u8],
+        process: &ProcessStartIdentity,
+        table: kr_protocol::gateway::DeclarativeTable,
+        rich: kr_protocol::gateway::RichMethodTable,
+        installed_protocol_version: &str,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let launched = instance.process.as_ref().ok_or_else(|| {
+            BrokerError::denied(
+                "this host did not launch this application, so nothing about it is a native                  connection it can authenticate",
+            )
+        })?;
+        // Both halves. A session identifier that leaked is not a launch binding, and a process
+        // that matches without the private exchange is not one either.
+        if !launched.authenticates(presented_credential, process) {
+            return Err(BrokerError::denied(
+                "this connection does not present the launch binding and the private exchange of                  a terminal this worker started",
+            ));
+        }
+        state.gateway.open_native(
+            connection,
+            application_instance_id,
+            process.clone(),
+            table,
+            rich,
+            installed_protocol_version,
+        )
+    }
+
+    /// Opens a connection for a rich client or a component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Table`] when a table does not qualify, and
+    /// [`BrokerError::InvalidArgument`] when the caller asks for the native origin here.
+    pub fn open_connection(
+        &self,
+        connection: GatewayConnectionId,
+        application_instance_id: ApplicationInstanceId,
+        origin: ConnectionOrigin,
+        table: kr_protocol::gateway::DeclarativeTable,
+        rich: kr_protocol::gateway::RichMethodTable,
+        installed_protocol_version: &str,
+    ) -> Result<()> {
+        self.state().gateway.open(
+            connection,
+            application_instance_id,
+            origin,
+            table,
+            rich,
+            installed_protocol_version,
+        )
+    }
+
+    /// Closes one gateway connection.
+    ///
+    /// The pending resources it produced stay exactly where they are: a connection ending is not
+    /// an answer, and a reconnect is what reconciles them.
+    pub fn close_connection(&self, connection: GatewayConnectionId) {
+        self.state().gateway.close(connection);
+    }
+
+    /// Admits one rich invocation against the closed method table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Rich`] for a method with no entry or one this build does not
+    /// support, and [`BrokerError::RichWorkFenced`] while rich work is fenced.
+    pub fn admit_rich(
+        &self,
+        connection: GatewayConnectionId,
+        method: &UpstreamMethod,
+        upstream_request_id: UpstreamRequestId,
+    ) -> Result<RichInvocation> {
+        let mut state = self.state();
+        if let Err(error) = state.volatile.require_rich_work() {
+            state.volatile.note_fenced();
+            return Err(error);
+        }
+        state
+            .gateway
+            .admit_rich(connection, method, upstream_request_id)
+    }
+
+    /// Builds the reverse request the upstream asked for, with the site it runs at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] or [`BrokerError::PermissionDenied`] as the
+    /// connection requires.
+    pub fn reverse_request(
+        &self,
+        connection: GatewayConnectionId,
+        upstream_request_id: UpstreamRequestId,
+        operation: kr_protocol::gateway::ReverseOperation,
+        environment_id: kr_protocol::ids::EnvironmentId,
+        os_user: &str,
+    ) -> Result<ReverseRequest> {
+        self.state().gateway.reverse_request(
+            connection,
+            upstream_request_id,
+            operation,
+            environment_id,
+            os_user,
+        )
+    }
+
+    /// Returns every connection that observes one instance, so a resolution is fanned out to all
+    /// of them.
+    #[must_use]
+    pub fn observers(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Vec<GatewayConnectionId> {
+        self.state()
+            .gateway
+            .observers(application_instance_id)
+            .map(|connection| connection.connection)
+            .collect()
     }
 
     /// Mints the next gateway connection identifier.

@@ -367,12 +367,25 @@ impl Ledger {
             .transpose()
     }
 
-    /// Admits one decoded resource: consumes its source, records the decoder and writes the
-    /// pending row, all in one transaction.
+    /// Records one opaque native request before it is forwarded.
+    ///
+    /// Section 11: "The broker records opaque native requests before forwarding them and
+    /// arbitrates responses by their IDs." It is not an approval yet; a decoder's interpretation
+    /// makes it one, through [`Ledger::admit_resource`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn record_opaque(&self, resource: &PendingResource) -> Result<()> {
+        self.put_pending(resource, None, false)
+    }
+
+    /// Admits one decoded interpretation of a request this ledger already holds: consumes its
+    /// source, records the decoder and makes the pending row actionable, all in one transaction.
     ///
     /// The three writes are one because a crash between them would leave a source permanently
-    /// consumed with no resource to show for it, or a resource whose provenance nobody can read.
-    /// The source is consumed by the broker's own event identity, so a second decoder cannot
+    /// consumed with no interpretation to show for it, or a resource whose provenance nobody can
+    /// read. The source is consumed by the broker's own event identity, so a second decoder cannot
     /// interpret the same event and two events with identical bytes are two events.
     ///
     /// Returns `false` without writing anything when the source has already been consumed.
@@ -423,27 +436,29 @@ impl Ledger {
                 ],
             )
             .map_err(BrokerError::ledger)?;
-        {
-            transaction
-                .execute(
-                    "INSERT INTO broker_pending
-                         (resource_id, application_instance_id, connection_id,
-                          upstream_request_id, state, durability, record, dispatched,
-                          decoder_binding_id, recorded_at_ms, resolved_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, NULL)",
-                    params![
-                        resource.resource_id.get().as_bytes().as_slice(),
-                        resource.application_instance_id.get().as_bytes().as_slice(),
-                        i64::try_from(resource.request.connection.get()).unwrap_or(i64::MAX),
-                        resource.request.upstream.as_str(),
-                        resource.state.as_str(),
-                        resource.durability.as_str(),
-                        encode(resource)?,
-                        binding_id.get().as_bytes().as_slice(),
-                        i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
-                    ],
-                )
-                .map_err(BrokerError::ledger)?;
+        let updated = transaction
+            .execute(
+                "UPDATE broker_pending
+                 SET record = ?2, decoder_binding_id = ?3
+                 WHERE resource_id = ?1 AND state = 'pending'",
+                params![
+                    resource.resource_id.get().as_bytes().as_slice(),
+                    encode(resource)?,
+                    binding_id.get().as_bytes().as_slice(),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        if updated != 1 {
+            // The request this interpretation is about is not one this ledger holds as pending.
+            // Consuming its source and recording a decoder against it would leave evidence about
+            // nothing, so the whole transaction goes back.
+            transaction.rollback().map_err(BrokerError::ledger)?;
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "pending resource {} is not a pending row this ledger holds",
+                    resource.resource_id
+                ),
+            });
         }
         transaction.commit().map_err(BrokerError::ledger)?;
         Ok(true)

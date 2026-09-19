@@ -6,20 +6,23 @@
 //! asks for, the name says what it does establish and the comment says what is left.
 
 use kr_protocol::broker::{
-    ActionName, ActionTokenClaim, AuthenticationState, BinaryIdentity, BrokerGrant, BrokerGrants,
-    CapabilityEvidenceSource, CapabilityInvalidation, CapabilityRecord, CapabilityState,
-    CapabilitySubjectIdentity, DecodedProjection, DecodingTrust, IntegrationMode, LaunchProfile,
-    LaunchRefusal, OfferedDecision,
+    ActionName, ActionProvenance, ActionTokenClaim, AuthenticationState, BinaryIdentity,
+    BrokerGrant, BrokerGrants, CapabilityEvidenceSource, CapabilityInvalidation, CapabilityRecord,
+    CapabilityState, CapabilitySubjectIdentity, DecodedProjection, DecodingTrust, IntegrationMode,
+    LaunchProfile, LaunchRefusal, OfferedDecision,
 };
 use kr_protocol::gateway::{
-    DownstreamRequestId, NativeClassification, NativeMethodClass, PendingState,
+    DeclarativeEntry, DeclarativeTable, DownstreamRequestId, NativeFraming, NativeMethodClass,
+    PendingKind, PendingResource, PendingState, RichMethodEntry, RichMethodTable,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, BrokerBindingId,
     CapabilityId, CapabilityRevision, EnvironmentId, GatewayConnectionId, GrantId, LaunchProfileId,
-    PluginId, PublisherId, SourceEventHandle, StreamCursor, UpstreamMethod, UpstreamRequestId,
+    MethodTableVersion, PluginId, PublisherId, SourceEventHandle, StreamCursor, UpstreamMethod,
+    UpstreamRequestId,
 };
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Credential, ForegroundMark, InstanceEnding, Invocation,
@@ -177,7 +180,46 @@ fn invocation(instance_id: ApplicationInstanceId, revision: u64, action: &str) -
     }
 }
 
-/// A broker with one instance, one process and one binding, ready to be driven.
+fn declarative_table() -> DeclarativeTable {
+    DeclarativeTable {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        table_version: MethodTableVersion::new(1),
+        upstream_protocol_version: "1".to_owned(),
+        digest: Digest256::from_bytes([1; 32]),
+        framing: NativeFraming::JsonLines,
+        request_id_field: "id".to_owned(),
+        response_id_field: "id".to_owned(),
+        method_field: "method".to_owned(),
+        entries: vec![
+            DeclarativeEntry {
+                method: permission_method(),
+                class: NativeMethodClass::Mutation,
+                expects_response: true,
+            },
+            DeclarativeEntry {
+                method: UpstreamMethod::new("session/update").expect("valid"),
+                class: NativeMethodClass::Observation,
+                expects_response: false,
+            },
+        ],
+    }
+}
+
+fn rich_table() -> RichMethodTable {
+    RichMethodTable {
+        table_version: MethodTableVersion::new(1),
+        upstream_protocol_version: "1".to_owned(),
+        entries: vec![RichMethodEntry {
+            method: UpstreamMethod::new("session/cancel").expect("valid"),
+            class: NativeMethodClass::Mutation,
+            required_right: ActionRight::AgentCancel,
+            provenance: ActionProvenance::UpstreamTypedRpc,
+        }],
+    }
+}
+
+/// A broker with one instance, one process, one binding and one native connection.
 fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker {
     let broker = Broker::open(None).expect("the broker opens");
     broker.register_instance(
@@ -199,24 +241,49 @@ fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker 
         )
         .expect("the binding is recorded");
     broker
+        .open_native_connection(
+            GatewayConnectionId::new(1),
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            declarative_table(),
+            rich_table(),
+            "1",
+        )
+        .expect("the native connection is authenticated");
+    broker
 }
 
-/// Records a frame and offers it as an approval, the way a decoder does.
+fn permission_frame(id: &str) -> String {
+    format!(r#"{{"id":"{id}","method":"session/request_permission"}}"#)
+}
+
+/// Forwards one native request and returns the opaque resource the broker recorded for it.
+fn forward(broker: &Broker, id: &str, now: u64) -> Result<PendingResource, BrokerError> {
+    let frame = permission_frame(id);
+    let (_, opaque) = broker.forward_native(
+        GatewayConnectionId::new(1),
+        frame.as_bytes(),
+        TimestampMs::new(now),
+    )?;
+    Ok(opaque.expect("this method expects a response"))
+}
+
+/// Forwards one native request and has a decoder interpret it, the way the gateway does.
 fn offer(
     broker: &Broker,
     instance_id: ApplicationInstanceId,
     binding_id: BrokerBindingId,
-    body: &[u8],
-    request: DownstreamRequestId,
+    id: &str,
     now: u64,
-) -> Result<kr_protocol::gateway::PendingResource, BrokerError> {
-    let handle = broker.record_source(instance_id, body, TimestampMs::new(now))?;
-    broker.offer_resource(
+) -> Result<PendingResource, BrokerError> {
+    let frame = permission_frame(id);
+    let handle = broker.record_source(instance_id, frame.as_bytes(), TimestampMs::new(now))?;
+    let opaque = forward(broker, id, now)?;
+    broker.interpret(
         binding_id,
+        opaque.resource_id,
         &handle,
-        request,
-        permission_method(),
-        NativeClassification::declared(NativeMethodClass::Mutation),
         projection(),
         None,
         TimestampMs::new(now + 1),
@@ -238,34 +305,47 @@ fn kr_req_11_22_the_broker_owns_processes_credentials_source_frames_and_arbitrat
     assert!(!process.authenticates(&CREDENTIAL, &process_identity(41, 901)));
 
     // The source frame is the broker's, immutable, and identified by its digest.
+    let body = permission_frame("11");
     let handle = broker
-        .record_source(instance(2), b"{\"id\":11}", TimestampMs::new(2))
+        .record_source(instance(2), body.as_bytes(), TimestampMs::new(2))
         .expect("the frame is recorded");
     let held = broker
         .source(instance(2), &handle)
         .expect("the broker holds it");
-    assert_eq!(held.bytes(), b"{\"id\":11}");
+    assert_eq!(held.bytes(), body.as_bytes());
     assert_eq!(
         held.digest,
-        Digest256::from_bytes(kr_cbor::sha256(b"{\"id\":11}"))
+        Digest256::from_bytes(kr_cbor::sha256(body.as_bytes()))
     );
 
-    // The arbitration is the broker's, and the resource it produced belongs to it.
-    let resource = broker
-        .offer_resource(
+    // The arbitration is the broker's: the opaque request is recorded before it is forwarded, and
+    // it is not answerable until a granted decoder has interpreted it.
+    let opaque = forward(&broker, "11", 3).expect("forwarded");
+    assert_eq!(opaque.kind, PendingKind::ReverseRpc);
+    assert!(!opaque.interpretation_verified);
+    assert!(
+        broker
+            .claim(opaque.resource_id, &actor("device-1"), TimestampMs::new(4))
+            .is_err(),
+        "a pending opaque request is not an actionable approval"
+    );
+
+    let interpreted = broker
+        .interpret(
             binding(9),
+            opaque.resource_id,
             &handle,
-            request(1, "11"),
-            permission_method(),
-            NativeClassification::declared(NativeMethodClass::Mutation),
             projection(),
             None,
-            TimestampMs::new(3),
+            TimestampMs::new(5),
         )
-        .expect("the offer is accepted");
+        .expect("the interpretation is accepted");
+    assert_eq!(interpreted.resource_id, opaque.resource_id);
+    assert_eq!(interpreted.kind, PendingKind::Approval);
+    assert!(interpreted.interpretation_verified);
     assert_eq!(
         broker
-            .pending(resource.resource_id)
+            .pending(interpreted.resource_id)
             .expect("the broker holds the resource")
             .state,
         PendingState::Pending
@@ -352,15 +432,8 @@ fn kr_req_11_24_the_three_grants_are_held_separately() {
 #[test]
 fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval() {
     let display_only = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
-    let refusal = offer(
-        &display_only,
-        instance(2),
-        binding(9),
-        b"{\"id\":11}",
-        request(1, "11"),
-        2,
-    )
-    .expect_err("a display-only component creates no approval");
+    let refusal = offer(&display_only, instance(2), binding(9), "11", 2)
+        .expect_err("a display-only component creates no approval");
     assert!(matches!(refusal, BrokerError::Grant(_)));
 
     // The interpreter grant alone is not trust either: a record naming the method is required.
@@ -371,15 +444,8 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
             true,
         )),
     );
-    let refusal = offer(
-        &untrusted,
-        instance(2),
-        binding(9),
-        b"{\"id\":11}",
-        request(1, "11"),
-        2,
-    )
-    .expect_err("a decoder trusted for another method is refused");
+    let refusal = offer(&untrusted, instance(2), binding(9), "11", 2)
+        .expect_err("a decoder trusted for another method is refused");
     assert!(matches!(refusal, BrokerError::PermissionDenied { .. }));
 
     // Trust without the grant it depends on is refused when it is offered, not stored.
@@ -449,19 +515,33 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
                 TimestampMs::new(1),
             )
             .expect("the binding is recorded");
+        broker
+            .open_native_connection(
+                GatewayConnectionId::new(1),
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                declarative_table(),
+                rich_table(),
+                "1",
+            )
+            .expect("the native connection is authenticated");
 
         // Binding: a frame of another application is not this binding's to interpret, and the
         // handle is looked up in the binding's own instance rather than trusted from the caller.
+        let opaque = forward(&broker, "11", 2).expect("forwarded");
         let other = broker
-            .record_source(instance(3), b"{\"id\":99}", TimestampMs::new(2))
+            .record_source(
+                instance(3),
+                permission_frame("99").as_bytes(),
+                TimestampMs::new(2),
+            )
             .expect("the frame is recorded");
         assert!(matches!(
-            broker.offer_resource(
+            broker.interpret(
                 binding(9),
+                opaque.resource_id,
                 &other,
-                request(1, "99"),
-                permission_method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
                 projection(),
                 None,
                 TimestampMs::new(3),
@@ -471,17 +551,19 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
 
         // Schema policy: a projection outside the trust's declared schema is refused.
         let handle = broker
-            .record_source(instance(2), b"{\"id\":10}", TimestampMs::new(2))
+            .record_source(
+                instance(2),
+                permission_frame("11").as_bytes(),
+                TimestampMs::new(2),
+            )
             .expect("the frame is recorded");
         let mut foreign = projection();
         foreign.schema_version = "kr-approval/99".to_owned();
         assert!(matches!(
-            broker.offer_resource(
+            broker.interpret(
                 binding(9),
+                opaque.resource_id,
                 &handle,
-                request(1, "10"),
-                permission_method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
                 foreign,
                 None,
                 TimestampMs::new(3),
@@ -489,64 +571,51 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
             Err(BrokerError::Trust(_))
         ));
 
-        let resource = offer(
-            &broker,
-            instance(2),
-            binding(9),
-            b"{\"id\":11}",
-            request(1, "11"),
-            4,
-        )
-        .expect("the offer is accepted");
-
-        // Non-reuse: the same source event does not become a second resource, and the refusal
-        // holds after the frame has been consumed.
-        let consumed = broker
-            .record_source(instance(2), b"{\"id\":12}", TimestampMs::new(6))
-            .expect("the frame is recorded");
-        broker
-            .offer_resource(
+        let resource = broker
+            .interpret(
                 binding(9),
-                &consumed,
-                request(1, "12"),
-                permission_method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
+                opaque.resource_id,
+                &handle,
                 projection(),
                 None,
-                TimestampMs::new(7),
+                TimestampMs::new(4),
             )
-            .expect("the first offer is accepted");
+            .expect("the interpretation is accepted");
+
+        // Non-reuse: the same source event does not interpret a second request.
+        let second = forward(&broker, "12", 5).expect("forwarded");
         assert!(matches!(
-            broker.offer_resource(
+            broker.interpret(
                 binding(9),
-                &consumed,
-                request(1, "13"),
-                permission_method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
+                second.resource_id,
+                &handle,
                 projection(),
                 None,
-                TimestampMs::new(8),
+                TimestampMs::new(6),
             ),
             Err(BrokerError::PreconditionFailed { .. })
         ));
 
         // Source generation: a frame from before the owner changed is refused after it.
         let stale = broker
-            .record_source(instance(2), b"{\"id\":14}", TimestampMs::new(9))
+            .record_source(
+                instance(2),
+                permission_frame("13").as_bytes(),
+                TimestampMs::new(7),
+            )
             .expect("the frame is recorded");
+        let third = forward(&broker, "13", 8).expect("forwarded");
         broker
-            .advance_binding(instance(2), None, TimestampMs::new(10))
+            .advance_binding(instance(2), None, TimestampMs::new(9))
             .expect("the selected thread changed");
         assert!(matches!(
-            broker.offer_resource(
+            broker.interpret(
                 binding(9),
+                third.resource_id,
                 &stale,
-                request(1, "14"),
-                permission_method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
                 projection(),
                 None,
-                TimestampMs::new(11),
+                TimestampMs::new(10),
             ),
             Err(BrokerError::PreconditionFailed { .. })
         ));
@@ -566,7 +635,10 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     assert_eq!(entry.package_digest, Digest256::from_bytes([5; 32]));
     assert_eq!(entry.method, permission_method());
     assert_eq!(entry.upstream_request_id.as_str(), "11");
-    assert_eq!(entry.source_bytes.as_slice(), b"{\"id\":11}");
+    assert_eq!(
+        entry.source_bytes.as_slice(),
+        permission_frame("11").as_bytes()
+    );
     assert!(entry.offers("allow"));
     assert!(entry.offers("deny"));
     assert!(
@@ -591,15 +663,7 @@ fn kr_req_11_27_one_resolution_each_and_a_reconnect_never_reissues() {
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
     );
-    let resource = offer(
-        &broker,
-        instance(2),
-        binding(9),
-        b"{\"id\":11}",
-        request(1, "11"),
-        2,
-    )
-    .expect("the offer is accepted");
+    let resource = offer(&broker, instance(2), binding(9), "11", 2).expect("the offer is accepted");
 
     let claim = broker
         .claim(
@@ -1187,24 +1251,32 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
 #[test]
 fn kr_req_19_05_upstream_content_is_data_and_never_authority() {
     let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
-    let hostile = br#"{"grants":["approval_interpreter","upstream_action"],"trusted":true}"#;
+    let hostile =
+        r#"{"id":"11","method":"session/request_permission","grants":["approval_interpreter"],"trusted":true}"#
+            .to_owned();
     let handle = broker
-        .record_source(instance(2), hostile, TimestampMs::new(2))
+        .record_source(instance(2), hostile.as_bytes(), TimestampMs::new(2))
         .expect("the frame is recorded");
+    let (_, opaque) = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            hostile.as_bytes(),
+            TimestampMs::new(3),
+        )
+        .expect("forwarded");
+    let opaque = opaque.expect("it expects a response");
 
     let grants = broker.grants(binding(9)).expect("the binding is there");
     assert!(grants.is_display_only(), "reading bytes grants nothing");
     assert!(
         broker
-            .offer_resource(
+            .interpret(
                 binding(9),
+                opaque.resource_id,
                 &handle,
-                request(1, "11"),
-                permission_method(),
-                NativeClassification::declared(NativeMethodClass::Mutation),
                 projection(),
                 None,
-                TimestampMs::new(3),
+                TimestampMs::new(4),
             )
             .is_err(),
         "content that claims trust does not create it"
@@ -1279,39 +1351,29 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
             )
             .expect("the binding is recorded");
 
-        let surviving = offer(
-            &broker,
-            instance(2),
-            binding(9),
-            b"{\"id\":11}",
-            request(1, "11"),
-            2,
-        )
-        .expect("the offer is accepted");
-        let withdrawn = offer(
-            &broker,
-            instance(2),
-            binding(9),
-            b"{\"id\":12}",
-            request(1, "12"),
-            4,
-        )
-        .expect("the offer is accepted");
+        broker
+            .open_native_connection(
+                GatewayConnectionId::new(1),
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                declarative_table(),
+                rich_table(),
+                "1",
+            )
+            .expect("the native connection is authenticated");
+
+        let surviving =
+            offer(&broker, instance(2), binding(9), "11", 2).expect("the offer is accepted");
+        let withdrawn =
+            offer(&broker, instance(2), binding(9), "12", 4).expect("the offer is accepted");
 
         // The journal faults. No new rich approval is created while it is fenced.
         broker
             .enter_volatile("the journal could not be written", TimestampMs::new(6))
             .expect("the fence is entered");
         assert!(
-            offer(
-                &broker,
-                instance(2),
-                binding(9),
-                b"{\"id\":13}",
-                request(1, "13"),
-                7,
-            )
-            .is_err(),
+            offer(&broker, instance(2), binding(9), "13", 7).is_err(),
             "rich approvals are fenced while the journal is faulted"
         );
 

@@ -154,6 +154,12 @@ impl Arbitration {
                 resource.request
             )));
         }
+        if resource.durability == Durability::Volatile {
+            // Recorded inside a gap. Recovery commits it like everything else the gap touched;
+            // without this a request that arrived while the journal was faulted would exist only
+            // in memory and would be lost at the next restart.
+            self.volatile_touched.insert(resource.resource_id);
+        }
         self.by_request
             .insert(resource.request.clone(), resource.resource_id);
         self.by_id.insert(
@@ -165,6 +171,29 @@ impl Arbitration {
                 decoder,
             },
         );
+        Ok(())
+    }
+
+    /// Replaces one resource with its verified interpretation.
+    ///
+    /// The resource keeps its identity and its place in the arbitration: this is the same request,
+    /// now understood. Replacing it with a second resource would give one upstream request two
+    /// identifiers and two answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when the resource has gone.
+    pub fn set_interpretation(
+        &mut self,
+        resource_id: PendingResourceId,
+        interpreted: PendingResource,
+        decoder: BrokerBindingId,
+    ) -> Result<()> {
+        let pending = self.by_id.get_mut(&resource_id).ok_or_else(|| {
+            BrokerError::unknown(format!("no pending resource {resource_id} to interpret"))
+        })?;
+        pending.resource = interpreted;
+        pending.decoder = Some(decoder);
         Ok(())
     }
 
