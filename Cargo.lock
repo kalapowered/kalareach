@@ -4318,6 +4318,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-voice"
+version = "0.1.0"
+dependencies = [
+ "kr-cbor",
+ "kr-client",
+ "kr-crypto",
+ "kr-protocol",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "kr-worker"
 version = "0.1.0"
 dependencies = [

@@ -15452,6 +15452,17 @@ export interface VoiceDelegateResult {
       }
     | {
         /**
+         * One submitted intent and its receipt, generated as a UUIDv4.
+         */
+        action_id: string
+        /**
+         * What admission does not establish.
+         */
+        note: string
+        state: 'admitted'
+      }
+    | {
+        /**
          * What a person is told, and what is missing.
          */
         message: string

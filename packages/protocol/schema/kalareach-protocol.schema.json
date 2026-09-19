@@ -20320,6 +20320,30 @@
         },
         {
           "additionalProperties": false,
+          "description": "The host accepted the proposal and its effect is not established.\n\nSection 15 ¶10: an acknowledgement proves admission, not execution, and host action\nreceipts remain authoritative. A result that was admitted and not performed is reported as\nadmitted only; nothing reads it as evidence that anything ran.",
+          "properties": {
+            "action_id": {
+              "$ref": "#/$defs/ActionId",
+              "description": "The action identifier to read the receipt under."
+            },
+            "note": {
+              "description": "What admission does not establish.",
+              "type": "string"
+            },
+            "state": {
+              "const": "admitted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "action_id",
+            "note"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "The host refused it, and why.\n\nA refusal is an answer, not a failure: the delegation arrived, the check ran and the answer\nwas no. A caller that treated it as a transport failure would retry something that was\ndecided.",
           "properties": {
             "message": {

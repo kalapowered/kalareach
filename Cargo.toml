@@ -19,6 +19,7 @@ members = [
     "crates/kr-term",
     "crates/kr-transfer",
     "crates/kr-transport",
+    "crates/kr-voice",
     "crates/kr-worker",
 ]
 
@@ -75,6 +76,7 @@ kr-shell-integration = { path = "crates/kr-shell-integration", version = "=0.1.0
 kr-term = { path = "crates/kr-term", version = "=0.1.0" }
 kr-transfer = { path = "crates/kr-transfer", version = "=0.1.0" }
 kr-transport = { path = "crates/kr-transport", version = "=0.1.0" }
+kr-voice = { path = "crates/kr-voice", version = "=0.1.0" }
 kr-worker = { path = "crates/kr-worker", version = "=0.1.0" }
 # The kernel's own filesystem and network confinement, which the project service encloses every Git
 # invocation in. A safe wrapper over three system calls; the ruleset is built from opened directory

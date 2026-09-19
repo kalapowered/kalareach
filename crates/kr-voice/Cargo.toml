@@ -1,0 +1,25 @@
+[package]
+name = "kr-voice"
+description = "The KalaReach voice coordinator: context selection, delegation, the voice grant and the unlocked-screen confirmation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kr-cbor.workspace = true
+# The broker contract and the replaceable provider seam. A voice session reaches a managed call
+# through this crate and through nothing else.
+kr-client = { workspace = true, default-features = false }
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kr-cbor.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

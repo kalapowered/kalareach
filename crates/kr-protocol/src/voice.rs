@@ -830,6 +830,17 @@ pub enum VoiceDelegationOutcome {
         /// What the coordinator may say about it, bounded to what a context request carries.
         summary: String,
     },
+    /// The host accepted the proposal and its effect is not established.
+    ///
+    /// Section 15 ¶10: an acknowledgement proves admission, not execution, and host action
+    /// receipts remain authoritative. A result that was admitted and not performed is reported as
+    /// admitted only; nothing reads it as evidence that anything ran.
+    Admitted {
+        /// The action identifier to read the receipt under.
+        action_id: ActionId,
+        /// What admission does not establish.
+        note: String,
+    },
     /// The host refused it, and why.
     ///
     /// A refusal is an answer, not a failure: the delegation arrived, the check ran and the answer
