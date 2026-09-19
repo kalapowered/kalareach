@@ -2059,7 +2059,12 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         "it is being sent something, and what it is being sent is the canonical grid: {held:?}"
     );
     assert!(
-        held.iter().all(|event| !matches!(event, Event::Other(_))),
+        held.iter()
+            .take_while(|event| !matches!(event, Event::Resync(_)))
+            .all(|event| matches!(
+                event,
+                Event::Reset(_) | Event::Snapshot(_) | Event::Rows(_) | Event::Delta(_)
+            )),
         "and never bytes, which would assume its terminal is already in the session's state: \
          {held:?}"
     );
@@ -2128,7 +2133,8 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
     );
     assert!(
         !rendered.contains("after-the-handoff"),
-        "and nothing the application had not written yet: {}",
+        "and nothing from after that cursor, which the application had already written by the \
+         time this arrived: {}",
         rendered.escape_debug()
     );
     let live: Vec<u8> = batches
