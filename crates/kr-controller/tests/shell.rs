@@ -85,6 +85,7 @@ async fn host(shell_packages: Option<std::path::PathBuf>) -> Host {
         build_id: build(),
         release: "0".to_owned(),
         shell_packages,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
     .expect("the daemon starts");
@@ -115,6 +116,7 @@ fn create(
         environment_snapshot: Vec::new(),
         palette: Nullable::null(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
+        terminal: Nullable::null(),
     }
 }
 
@@ -572,6 +574,186 @@ fn the_terminal_is_chosen_in_order_and_a_host_with_none_says_so_once() {
     );
 }
 
+/// A presenter that opens nothing and records what it was asked to open.
+#[derive(Debug, Clone, Default)]
+struct RefusingTerminal {
+    asked: Arc<std::sync::Mutex<Vec<(Option<String>, Vec<String>)>>>,
+}
+
+impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
+    fn present(
+        &self,
+        requested: Option<&str>,
+        command: &[String],
+    ) -> std::result::Result<terminal::Selection, TerminalUnavailable> {
+        self.asked
+            .lock()
+            .expect("the record is not poisoned")
+            .push((requested.map(str::to_owned), command.to_vec()));
+        Err(TerminalUnavailable::NoneAvailable)
+    }
+
+    fn describe(&self) -> String {
+        "a presenter that opens nothing".to_owned()
+    }
+}
+
+/// KR-REQ-07.43, KR-REQ-07.31, KR-REQ-01.21: a terminal that cannot be opened is reported against
+/// the session that was created, and nothing creates a second one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presentation_error() {
+    let Some(worker_build) = worker_beside_this_test() else {
+        eprintln!(
+            "skipped: this suite starts a worker process and none is built beside the test \
+             binary; build it with `cargo build -p kr-worker`"
+        );
+        return;
+    };
+    let temp = kr_ipc::testing::TempHost::create();
+    // On the internal disk, and never the copy in the workspace: a worker a service manager starts
+    // is its own privacy identity, and one that opened a path on the external volume would stop
+    // for a dialog.
+    let worker = temp.root().join("kr-worker");
+    std::fs::copy(&worker_build, &worker).expect("copies the worker");
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let secrets = environment.secrets_dir();
+    let presenter = RefusingTerminal::default();
+    let controller = Controller::start(ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: kr_controller::supervision::detect(),
+        worker_program: worker,
+        build_id: build(),
+        release: "0".to_owned(),
+        shell_packages: None,
+        terminal: Box::new(presenter.clone()),
+    })
+    .await
+    .expect("the daemon starts");
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let serving = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
+        .expect("binds the rendezvous");
+    let rendezvous_serving = tokio::spawn(Arc::clone(&controller).serve_rendezvous(rendezvous));
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+
+    let mut request = create(environment_id, ShellMode::NativeCompat, Some("/bin/sh"));
+    request.presentation = Presentation::Terminal;
+    request.cwd = Nullable::some(temp.root().display().to_string());
+    let created: kr_protocol::session::SessionCreateResult = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(environment_id),
+            &request,
+        )
+        .await
+        .expect("reaches the daemon")
+        .expect("the session is created whether or not a window opened")
+        .to_typed()
+        .expect("decodes");
+
+    let refusal = created
+        .presentation_error
+        .0
+        .expect("a terminal that did not open is reported");
+    assert_eq!(refusal.code, ErrorCode::TerminalUnavailable);
+    assert_eq!(
+        created.session.state,
+        kr_protocol::session::SessionState::Live,
+        "the session is available: only the window is missing"
+    );
+    assert!(
+        created.endpoint.0.is_some(),
+        "and it can be attached to without another call"
+    );
+
+    // Exactly one, and the window it would have opened names the session's own identifier and its
+    // environment rather than a display number.
+    let asked = presenter.asked.lock().expect("the record is not poisoned");
+    assert_eq!(asked.len(), 1, "a presentation is attempted once");
+    let (requested, command) = &asked[0];
+    assert_eq!(requested.as_deref(), None);
+    assert!(command.contains(&"attach".to_owned()));
+    assert!(command.contains(&created.session.session_id.to_string()));
+    assert!(command.contains(&environment_id.to_string()));
+    assert!(
+        !command.contains(&created.session.display_number.to_string()),
+        "a window opened on a display number would attach to whichever environment resolved it"
+    );
+    drop(asked);
+
+    let listed: kr_protocol::session::SessionListResult = client
+        .request(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::some(environment_id),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("reaches the daemon")
+        .expect("lists")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        listed.sessions.len(),
+        1,
+        "a failed presentation never produces a duplicate session"
+    );
+
+    let _: kr_protocol::session::SessionCloseResult = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id,
+                session_id: Nullable::some(created.session.session_id),
+                session_epoch: Nullable::some(created.session.session_epoch),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &kr_protocol::session::SessionCloseParams {
+                session_id: created.session.session_id,
+            },
+        )
+        .await
+        .expect("reaches the daemon")
+        .expect("closes")
+        .to_typed()
+        .expect("decodes");
+    serving.abort();
+    rendezvous_serving.abort();
+}
+
+/// Returns the worker binary beside this test's own, when the build has produced one.
+fn worker_beside_this_test() -> Option<std::path::PathBuf> {
+    let mut directory = std::env::current_exe().expect("the test binary");
+    directory.pop();
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        directory.pop();
+    }
+    let worker = directory.join(if cfg!(windows) {
+        "kr-worker.exe"
+    } else {
+        "kr-worker"
+    });
+    worker.is_file().then_some(worker)
+}
+
 // --------------------------------------------------------------------------------------------
 // The built packages, when this run has them.
 // --------------------------------------------------------------------------------------------
@@ -809,6 +991,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
         build_id: build(),
         release: "0".to_owned(),
         shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
     .expect("the daemon starts");

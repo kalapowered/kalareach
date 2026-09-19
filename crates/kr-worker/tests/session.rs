@@ -1701,6 +1701,7 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
         environment_snapshot: Vec::<EnvironmentVariable>::new(),
         palette: Nullable(palette),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
+        terminal: Nullable::null(),
     };
 
     for (request, expected) in [

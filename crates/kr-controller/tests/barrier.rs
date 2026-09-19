@@ -862,6 +862,7 @@ async fn daemon_host() -> Daemon {
         build_id: build(),
         release: "0".to_owned(),
         shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
     .expect("the daemon starts");
@@ -918,6 +919,7 @@ async fn a_mutation_whose_admission_lapses_before_its_transaction_is_refused_ins
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1449,6 +1451,7 @@ async fn a_retry_reaches_its_retained_answer_after_its_window_stops_admitting_an
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1504,6 +1507,7 @@ async fn a_retained_action_is_disclosed_under_current_authority_and_not_under_wi
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1626,6 +1630,7 @@ async fn a_create_that_queues_past_its_lifetime_is_refused_without_starting_anyt
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1732,6 +1737,7 @@ async fn hosted_worker() -> Hosted {
         build_id: build(),
         release: "0".to_owned(),
         shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
     .expect("the daemon starts");
@@ -1780,6 +1786,7 @@ async fn hosted_worker() -> Hosted {
                     environment_snapshot: Vec::new(),
                     palette: Nullable::null(),
                     launch_profile: kr_protocol::session::LaunchProfile::default(),
+                    terminal: Nullable::null(),
                 })
                 .expect("encodes"),
             };

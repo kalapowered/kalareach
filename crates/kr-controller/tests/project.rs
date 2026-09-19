@@ -126,6 +126,7 @@ async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) 
             build_id: build(),
             release: "0".to_owned(),
             shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
         })
         .await;
         match attempt {

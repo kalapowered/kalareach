@@ -147,6 +147,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             release: RELEASE.to_owned(),
             // The installation's own package directory, or whatever KR_SHELL_PACKAGES names.
             shell_packages: None,
+            // The daemon is this host's local presenter: a session created here or on a paired
+            // device can ask for a local tab, and the daemon is the only party that can open one.
+            terminal: Box::new(kr_controller::supervision::InstalledTerminals),
         })
         .await?;
 

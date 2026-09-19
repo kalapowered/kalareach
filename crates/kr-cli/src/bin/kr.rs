@@ -171,6 +171,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 // of choosing it and a session's palette is fixed at creation.
                 palette: Nullable(palette),
                 launch_profile,
+                terminal: Nullable(arguments.terminal_app.clone()),
             };
             let outcome = client
                 .mutate(
@@ -744,117 +745,15 @@ async fn present(
             // left to wonder where those keystrokes went, which is what `owed` reports on its way
             // out of scope.
             let _ = typed_before;
-            open_terminal_application(created.session.session_id, created.session.environment_id)
+            let _ = paths;
+            // The window is the host's to open: a session created on a paired device can ask for a
+            // local tab too, and the daemon is the only party on this host that can open one. What
+            // this command does with the answer is report it against the session that exists.
+            created.presentation_error.as_ref().map_or(Ok(()), |error| {
+                Err(CliError::TerminalUnavailable(error.message.clone()))
+            })
         }
     }
-}
-
-/// Returns one word quoted for a shell that will re-parse it.
-#[cfg(target_vendor = "apple")]
-fn shell_quoted(word: &str) -> String {
-    // Single quotes, with an embedded single quote closed, escaped and reopened. Nothing inside
-    // single quotes is interpreted by the shell, so this is the whole rule.
-    format!("'{}'", word.replace('\'', "'\\''"))
-}
-
-/// Opens an installed terminal application on a session.
-///
-/// # Errors
-///
-/// Returns [`CliError::TerminalUnavailable`] when this host has no launcher. The session is
-/// already created, so this is reported against it rather than causing a second one.
-#[cfg(target_vendor = "apple")]
-fn open_terminal_application(
-    session_id: kr_protocol::ids::SessionId,
-    environment_id: kr_protocol::ids::EnvironmentId,
-) -> Result<()> {
-    // The session is named by its own identifier and its environment, not by a display number: two
-    // environments can each have a session number one, and the terminal that opened would then be
-    // attached to whichever the command happened to resolve.
-    let program = std::env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "kr".to_owned());
-    // `do script` hands its text to a shell, so every word of it is quoted here. The identifiers
-    // are the host's own UUIDs and the path is this executable's, but quoting a path that happens
-    // to contain a space is not optional and neither is doing it in one place.
-    let command = format!(
-        "{} attach {} --environment {}",
-        shell_quoted(&program),
-        shell_quoted(&session_id.to_string()),
-        shell_quoted(&environment_id.to_string())
-    );
-    for application in ["iTerm", "Terminal"] {
-        let script = format!(
-            "tell application \"{application}\" to activate\n\
-             tell application \"{application}\" to do script \"{}\"",
-            command.replace('\\', "\\\\").replace('"', "\\\"")
-        );
-        let started = std::process::Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(&script)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if started.is_ok_and(|status| status.success()) {
-            return Ok(());
-        }
-    }
-    Err(CliError::TerminalUnavailable(
-        "no terminal application this host can open was found".to_owned(),
-    ))
-}
-
-/// Returns one launcher's argument vector: its own separator, then the command to run.
-#[cfg(not(target_vendor = "apple"))]
-fn once(separator: &str, command: &[String]) -> Vec<String> {
-    let mut arguments = vec![separator.to_owned()];
-    arguments.extend_from_slice(command);
-    arguments
-}
-
-/// Opens an installed terminal application on a session.
-///
-/// # Errors
-///
-/// Returns [`CliError::TerminalUnavailable`] when this host has no launcher.
-#[cfg(not(target_vendor = "apple"))]
-fn open_terminal_application(
-    session_id: kr_protocol::ids::SessionId,
-    environment_id: kr_protocol::ids::EnvironmentId,
-) -> Result<()> {
-    let program = std::env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "kr".to_owned());
-    // Each candidate is invoked as a vector, never as a command line a shell would re-parse, and
-    // the session is named by its own identifier and environment: two environments can each have a
-    // session number one, and a terminal opened on the number would attach to whichever the
-    // command happened to resolve.
-    let attach: Vec<String> = vec![
-        program.clone(),
-        "attach".to_owned(),
-        session_id.to_string(),
-        "--environment".to_owned(),
-        environment_id.to_string(),
-    ];
-    let candidates: [(&str, Vec<String>); 4] = [
-        ("x-terminal-emulator", once("-e", &attach)),
-        ("gnome-terminal", once("--", &attach)),
-        ("konsole", once("-e", &attach)),
-        ("xterm", once("-e", &attach)),
-    ];
-    for (launcher, arguments) in candidates {
-        let started = std::process::Command::new(launcher)
-            .args(&arguments)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if started.is_ok() {
-            return Ok(());
-        }
-    }
-    Err(CliError::TerminalUnavailable(
-        "no terminal application this host can open was found".to_owned(),
-    ))
 }
 
 /// Resolves a selector that names no live descriptor, through what the daemon retains.

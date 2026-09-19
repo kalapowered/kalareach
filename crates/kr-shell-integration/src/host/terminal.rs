@@ -71,6 +71,14 @@ pub enum TerminalUnavailable {
     /// Nothing supported is installed, or there is no desktop launcher to open one with.
     #[error("no supported terminal application is available on this host")]
     NoneAvailable,
+    /// The chosen application is installed and would not open a window.
+    #[error("{application} is installed and did not open a window: {detail}")]
+    CouldNotOpen {
+        /// Which application was chosen.
+        application: String,
+        /// What the platform said.
+        detail: String,
+    },
 }
 
 impl TerminalUnavailable {
@@ -131,6 +139,116 @@ pub fn select(
             source: Source::Detected,
         })
         .ok_or(TerminalUnavailable::NoneAvailable)
+}
+
+/// Opens the chosen terminal application on a command.
+///
+/// The command is an argument vector, never a command line: nothing here is assembled by
+/// interpolating text, and the one platform whose launcher re-parses what it is given quotes every
+/// word of it before handing it over.
+///
+/// # Errors
+///
+/// Returns [`TerminalUnavailable::CouldNotOpen`] when the application is installed and no window
+/// appeared.
+#[cfg(target_vendor = "apple")]
+pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUnavailable> {
+    // `do script` hands its text to a shell, so every word of it is quoted here. The identifiers
+    // are the host's own and the path is an executable's, but quoting a path that happens to
+    // contain a space is not optional and neither is doing it in one place.
+    let line = command
+        .iter()
+        .map(|word| shell_quoted(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let application = match selection.application.id.as_str() {
+        "iterm2" => "iTerm",
+        _ => "Terminal",
+    };
+    let script = format!(
+        "tell application \"{application}\" to activate\n\
+         tell application \"{application}\" to do script \"{}\"",
+        line.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let started = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match started {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(TerminalUnavailable::CouldNotOpen {
+            application: selection.application.name.clone(),
+            detail: format!("the script ended with {status}"),
+        }),
+        Err(error) => Err(TerminalUnavailable::CouldNotOpen {
+            application: selection.application.name.clone(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
+/// Returns one word quoted for a shell that will re-parse it.
+#[cfg(target_vendor = "apple")]
+fn shell_quoted(word: &str) -> String {
+    // Single quotes, with an embedded single quote closed, escaped and reopened. Nothing inside
+    // single quotes is interpreted by the shell, so this is the whole rule.
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Opens the chosen terminal application on a command.
+///
+/// # Errors
+///
+/// Returns [`TerminalUnavailable::CouldNotOpen`] when the application is installed and no window
+/// appeared.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUnavailable> {
+    // Each launcher takes its own separator before the vector, and the vector is passed as
+    // arguments rather than as a line a shell would re-parse.
+    let separator = match selection.application.id.as_str() {
+        "gnome-terminal" => "--",
+        _ => "-e",
+    };
+    let mut arguments = vec![separator.to_owned()];
+    arguments.extend_from_slice(command);
+    std::process::Command::new(&selection.application.id)
+        .args(&arguments)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| TerminalUnavailable::CouldNotOpen {
+            application: selection.application.name.clone(),
+            detail: error.to_string(),
+        })
+}
+
+/// Opens the chosen terminal application on a command.
+///
+/// # Errors
+///
+/// Returns [`TerminalUnavailable::CouldNotOpen`] when the application is installed and no window
+/// appeared.
+#[cfg(not(unix))]
+pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUnavailable> {
+    let (program, prefix): (&str, &[&str]) = match selection.application.id.as_str() {
+        "windows-terminal" => ("wt.exe", &[]),
+        _ => ("cmd.exe", &["/c", "start", ""]),
+    };
+    let mut process = std::process::Command::new(program);
+    process.args(prefix);
+    process.args(command);
+    process
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| TerminalUnavailable::CouldNotOpen {
+            application: selection.application.name.clone(),
+            detail: error.to_string(),
+        })
 }
 
 /// Returns the terminals this host has, in the platform's own preference order.

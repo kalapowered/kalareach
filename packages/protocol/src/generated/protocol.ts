@@ -4353,6 +4353,14 @@ export interface SessionCreateParams {
    */
   shell_mode: 'managed' | 'native_compat'
   /**
+   * The terminal application a `terminal` presentation opens in, by its stable identifier.
+   *
+   * The first step of section 7's order. Null leaves the choice to the host, which detects what
+   * is installed; a named application this host does not have is `TERMINAL_UNAVAILABLE` rather
+   * than a substitution, because somebody asked for that terminal.
+   */
+  terminal: string | null
+  /**
    * How long a worker's execution context lasts.
    *
    * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
@@ -13649,6 +13657,14 @@ export interface SessionCreateParams1 {
    * The shell integration mode.
    */
   shell_mode: 'managed' | 'native_compat'
+  /**
+   * The terminal application a `terminal` presentation opens in, by its stable identifier.
+   *
+   * The first step of section 7's order. Null leaves the choice to the host, which detects what
+   * is installed; a named application this host does not have is `TERMINAL_UNAVAILABLE` rather
+   * than a substitution, because somebody asked for that terminal.
+   */
+  terminal: string | null
   /**
    * How long a worker's execution context lasts.
    *

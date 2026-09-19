@@ -765,6 +765,12 @@ pub struct SessionCreateParams {
     pub palette: Nullable<PaletteRequest>,
     /// How this session starts its root shell and what may be launched inside it.
     pub launch_profile: LaunchProfile,
+    /// The terminal application a `terminal` presentation opens in, by its stable identifier.
+    ///
+    /// The first step of section 7's order. Null leaves the choice to the host, which detects what
+    /// is installed; a named application this host does not have is `TERMINAL_UNAVAILABLE` rather
+    /// than a substitution, because somebody asked for that terminal.
+    pub terminal: Nullable<String>,
 }
 
 impl SessionCreateParams {
@@ -941,6 +947,7 @@ mod tests {
             environment_snapshot: Vec::<EnvironmentVariable>::new(),
             palette,
             launch_profile: LaunchProfile::default(),
+            terminal: Nullable::null(),
         };
         let probed = Nullable::some(PaletteRequest::Probe(ProbedPalette {
             foreground: crate::projection::Rgb {

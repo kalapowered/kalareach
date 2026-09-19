@@ -304,6 +304,7 @@ impl Host {
             build_id: build(),
             release: "0".to_owned(),
             shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
         })
         .await
         .expect("the daemon starts");
@@ -454,6 +455,7 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
             },
         ],
         launch_profile: kr_protocol::session::LaunchProfile::default(),
+        terminal: Nullable::null(),
     }
 }
 

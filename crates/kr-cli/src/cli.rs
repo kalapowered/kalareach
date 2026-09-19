@@ -336,6 +336,12 @@ pub struct NewArguments {
     /// which is what section 7 states.
     #[arg(long, default_value = "host-default")]
     pub startup: String,
+    /// The terminal application `--terminal` opens in, by its identifier.
+    ///
+    /// The host detects what is installed when this is absent. A named application this host does
+    /// not have is `TERMINAL_UNAVAILABLE`, never a different one.
+    #[arg(long)]
+    pub terminal_app: Option<String>,
     /// Refuse `shell.launch` in this session.
     ///
     /// Everything else a managed session has stays: the editor fence, the empty-prompt end-of-file

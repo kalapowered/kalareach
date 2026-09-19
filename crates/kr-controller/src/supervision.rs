@@ -40,6 +40,8 @@ use std::path::{Path, PathBuf};
 use kr_protocol::identity::{ProcessStartIdentity, WorkerProfile};
 use kr_protocol::worker::ReservationId;
 
+use kr_shell_integration::host::terminal::{self, Selection, TerminalUnavailable};
+
 use crate::error::{ControllerError, Result};
 
 /// What a worker needs to be told through its job definition.
@@ -774,6 +776,76 @@ fn parse_pid(output: &str) -> Option<u32> {
         .split_whitespace()
         .rev()
         .find_map(|word| word.trim_end_matches('.').parse::<u32>().ok())
+}
+
+/// Opens a local terminal window on a session this host created.
+///
+/// Section 7's `terminal` presentation opens an installed terminal application running `kr attach`
+/// on the new session, and a session created on a remote device can ask for one too: the daemon is
+/// the only party on this host that can open it. Opening one is a separate step from creating the
+/// session, so a host that cannot open a window still has the session and says so.
+pub trait TerminalPresenter: Send + Sync + std::fmt::Debug {
+    /// Opens a window running `command`, and says which application took it.
+    ///
+    /// `requested` is the application the create request named, which is the first step of section
+    /// 7's order and an error rather than a substitution when this host does not have it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no window appeared. The session it was for exists either way.
+    fn present(
+        &self,
+        requested: Option<&str>,
+        command: &[String],
+    ) -> std::result::Result<Selection, TerminalUnavailable>;
+
+    /// Names this presenter for diagnostics.
+    fn describe(&self) -> String;
+}
+
+/// The terminal applications installed on this host.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstalledTerminals;
+
+impl TerminalPresenter for InstalledTerminals {
+    fn present(
+        &self,
+        requested: Option<&str>,
+        command: &[String],
+    ) -> std::result::Result<Selection, TerminalUnavailable> {
+        // The order section 7 fixes: what the request named, then the saved preference, then what
+        // is detected. This host keeps no saved terminal preference, so the middle step has
+        // nothing to offer and detection decides where the request named nothing.
+        let available = terminal::detect();
+        let selection = terminal::select(requested, None, &available)?;
+        terminal::open(&selection, command)?;
+        Ok(selection)
+    }
+
+    fn describe(&self) -> String {
+        "the terminal applications installed on this host".to_owned()
+    }
+}
+
+/// A host with no terminal application to open.
+///
+/// A headless installation has no window server and no desktop launcher, so a presentation request
+/// is answered with the session and the reason rather than with a window.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoTerminal;
+
+impl TerminalPresenter for NoTerminal {
+    fn present(
+        &self,
+        _requested: Option<&str>,
+        _command: &[String],
+    ) -> std::result::Result<Selection, TerminalUnavailable> {
+        Err(TerminalUnavailable::NoneAvailable)
+    }
+
+    fn describe(&self) -> String {
+        "a host with no terminal application".to_owned()
+    }
 }
 
 #[cfg(test)]

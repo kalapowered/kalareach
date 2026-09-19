@@ -85,6 +85,7 @@ async fn host() -> Host {
         build_id: build(),
         release: "0".to_owned(),
         shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
     .expect("the daemon starts");
@@ -209,6 +210,7 @@ fn create_params(host: &Host) -> SessionCreateParams {
             value: "/usr/bin:/bin".to_owned(),
         }],
         launch_profile: kr_protocol::session::LaunchProfile::default(),
+        terminal: Nullable::null(),
     }
 }
 

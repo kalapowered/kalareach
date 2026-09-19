@@ -321,6 +321,7 @@ pub struct Controller {
     release: String,
     /// Where this host's qualified shell packages are, when it keeps them somewhere of its own.
     shell_packages: Option<PathBuf>,
+    terminal: Box<dyn crate::supervision::TerminalPresenter>,
     started_at_ms: TimestampMs,
     /// The desktop this host has, as last read, and the capability revision that reading is
     /// evidence for.
@@ -527,6 +528,7 @@ impl Controller {
             release: setup.release,
             started_at_ms,
             shell_packages: setup.shell_packages,
+            terminal: setup.terminal,
             desktop: Mutex::new(DesktopReading {
                 context: crate::desktop::current(boot.clone()),
                 revision: recorded_revision.unwrap_or_else(|| CapabilityRevision::new(0)),
@@ -4690,12 +4692,57 @@ impl Controller {
         // decides whether it does. That is looked at beside this answer rather than before it:
         // what the host does about its own sleep policy is no reason to hold a caller's receipt.
         self.review_power_soon();
+        // Last, and never before the session exists: opening a window is a separate step, so a
+        // host that cannot open one answers with the session it made and the reason. Nothing here
+        // creates a second session, and a repeated create token never reaches this line, so a
+        // retry cannot open a second window either.
+        let presentation_error = self.present(&create, reservation.session_id);
         encode(&SessionCreateResult {
             session: summary,
             endpoint: Nullable::some(ready.endpoint),
             deduplicated: false,
-            presentation_error: Nullable::null(),
+            presentation_error: Nullable(presentation_error),
         })
+    }
+
+    /// Opens the local terminal a `terminal` presentation asks for.
+    ///
+    /// Section 7: a session created anywhere, including on a paired device, can ask for a local
+    /// tab, and failing to open it leaves the session available and returns a separate
+    /// presentation error rather than creating a duplicate session. The window runs `kr attach` on
+    /// the session's own identifier and environment, never on a display number: two environments
+    /// can each have a session one, and a window opened on the number would attach to whichever
+    /// the command happened to resolve.
+    fn present(
+        &self,
+        create: &SessionCreateParams,
+        session_id: SessionId,
+    ) -> Option<kr_protocol::error::ProtocolError> {
+        if create.presentation != kr_protocol::session::Presentation::Terminal {
+            return None;
+        }
+        let command = vec![
+            self.attach_program().display().to_string(),
+            "attach".to_owned(),
+            session_id.to_string(),
+            "--environment".to_owned(),
+            create.environment_id.to_string(),
+        ];
+        self.terminal
+            .present(create.terminal.0.as_deref(), &command)
+            .err()
+            .map(|unavailable| unavailable.to_protocol_error())
+    }
+
+    /// Returns the client executable a terminal window runs.
+    ///
+    /// Beside this daemon's own, because they are installed together and a host with two
+    /// installations must open the one it is running.
+    fn attach_program(&self) -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("kr")))
+            .unwrap_or_else(|| PathBuf::from("kr"))
     }
 
     /// Resolves a reservation that never reached a launch, and releases what it was holding.
@@ -5723,6 +5770,12 @@ pub struct ControllerSetup {
     /// names. A host that keeps its packages somewhere else is told, rather than being expected to
     /// arrange a variable for every process that needs to know.
     pub shell_packages: Option<PathBuf>,
+    /// How a `terminal` presentation opens its window.
+    ///
+    /// This daemon is the only party on the host that can open one for a session created from
+    /// somewhere else, so the presentation is its work. A host that opens nothing says so with
+    /// [`NoTerminal`](crate::supervision::NoTerminal).
+    pub terminal: Box<dyn crate::supervision::TerminalPresenter>,
 }
 
 fn closed_summary(
@@ -6107,6 +6160,7 @@ mod a_create_that_launches_nothing {
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
             launch_profile: LaunchProfile::default(),
+            terminal: Nullable::null(),
         }
     }
 
@@ -6221,6 +6275,7 @@ mod a_create_that_launches_nothing {
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
             shell_packages,
+            terminal: Box::new(crate::supervision::NoTerminal),
         })
         .await
         .expect("the daemon starts");
@@ -7382,6 +7437,7 @@ mod a_close_a_worker_never_answers {
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
             shell_packages: None,
+            terminal: Box::new(crate::supervision::NoTerminal),
         })
         .await
         .expect("the daemon starts");

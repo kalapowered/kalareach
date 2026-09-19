@@ -33,16 +33,24 @@ The presentation flags are mutually exclusive:
 | Flag | What happens |
 | --- | --- |
 | `--attach` | Create and attach in this terminal. The default when input and output are terminals |
-| `--terminal` | Create a session and open an installed terminal application on it |
+| `--terminal` | Create a session and ask the host to open an installed terminal application on it |
 | `--invisible` | Create a session with no local terminal attachment |
 
 Without a terminal and without a flag the command stops and asks for one, rather than choosing.
+
+`--terminal` opens the window through the control daemon, which is the only party on the host that
+can open one for a session created somewhere else: a paired device asking for a local tab takes the
+same path. Choosing a terminal and creating a session are separate steps, so a host that cannot
+open a window still has the session. The command then exits with `TERMINAL_UNAVAILABLE` and the
+reason, and the session is there to attach to; running `kr new` again would make a second session
+rather than a second attempt at the window.
 
 Two flags decide the session's launch profile, which is fixed when the session is created and read
 back by `kr status`:
 
 | Flag | What happens |
 | --- | --- |
+| `--terminal-app <id>` | Which terminal application `--terminal` opens in. The host detects what is installed when this is absent, and an application it does not have is `TERMINAL_UNAVAILABLE` rather than a different one |
 | `--startup <host-default\|interactive\|login>` | Which startup files the root shell reads. The host default is login startup on macOS and the interactive startup alone elsewhere |
 | `--no-fenced-launch` | Refuse `shell.launch` in this session. The fence, the empty-prompt Ctrl-D and the attributed acceptance all stay; what goes is installing a command the person did not type |
 
