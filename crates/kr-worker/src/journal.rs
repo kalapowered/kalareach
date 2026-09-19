@@ -2483,6 +2483,27 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))
     }
 
+    /// Returns the schema version a store on disk records, without opening it as a journal.
+    ///
+    /// It is the question the archive asks before it decides whether a store needs bringing
+    /// forward. It opens read-only and creates nothing, so asking it of a file that is not a
+    /// journal is an error rather than a new database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the file cannot be opened or records no
+    /// version.
+    pub fn recorded_schema_version(path: impl AsRef<std::path::Path>) -> Result<i64> {
+        let connection = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(unavailable)?;
+        connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .map_err(unavailable)
+    }
+
     /// Opens a journal for reading only.
     ///
     /// A controller reads a closed session's journal to recover what the worker recorded: the
@@ -3254,6 +3275,33 @@ impl Journal {
         let count: i64 = self
             .connection
             .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Returns how many actions this store still holds in a state recovery would resolve.
+    ///
+    /// An accepted intent with no dispatch marker and a dispatch marker with no authoritative
+    /// outcome are what section 9's recovery rules settle. A store that still holds either has
+    /// not had those rules run over it, which is a different answer from a store that has: a
+    /// reader served from it is being served a session whose last actions have no ending.
+    ///
+    /// It is a read, so the archive can ask it of a store it opened read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn unresolved_work(&self) -> Result<u64> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM receipts WHERE state IN (?1, ?2)",
+                params![
+                    ReceiptState::Accepted.as_str(),
+                    ReceiptState::Dispatching.as_str()
+                ],
+                |row| row.get(0),
+            )
             .map_err(|error| faulted(&self.health, error))?;
         Ok(u64::try_from(count).unwrap_or(0))
     }

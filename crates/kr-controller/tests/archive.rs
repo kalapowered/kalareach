@@ -111,13 +111,18 @@ fn a_closed_session_is_served_from_what_it_left_behind() {
     assert_eq!(read.receipts, 1);
     // This session produced no output, so it has no spool, and this host cannot tell a spool that
     // never existed from one that is gone: it says the range is missing rather than reporting an
-    // archive with nothing missing.
+    // archive with nothing missing. It also holds one action that was admitted and never
+    // dispatched, and no recovery pass has run over this store, so the archive says that too
+    // rather than serving a session whose last action has no ending.
     assert_eq!(
         read.incompleteness,
-        vec![Incompleteness::HistoryLost {
-            from_cursor: 0,
-            to_cursor: 0
-        }]
+        vec![
+            Incompleteness::RecoveryUnfinished { unresolved: 1 },
+            Incompleteness::HistoryLost {
+                from_cursor: 0,
+                to_cursor: 0
+            }
+        ]
     );
 
     // And the receipt itself, with no worker anywhere. It was admitted and never dispatched, and
@@ -555,4 +560,115 @@ fn a_session_whose_journal_cannot_be_read_keeps_what_was_submitted_to_it() {
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
     std::fs::write(&path, b"this is not a database").expect("a file that is not a journal");
     assert!(archive.retains_submissions(session_id).expect("answers"));
+}
+
+#[test]
+fn a_recovery_that_did_not_run_is_part_of_what_the_archive_reports() {
+    // Residual 19's reader half. A closure can be written for a session whose store this host
+    // never reconciled - the kernel would not confirm the death, or the pass itself failed - and
+    // the closure says nothing about that, because section 23 defines its durability as whether
+    // the *record* was written. What a reader needs is the store's own answer, so the archive
+    // reads it: an action still accepted or still dispatching is one the recovery rules never
+    // settled.
+    let (_temp, archive) = host();
+    let session_id = session();
+    let actor = ActorId::new("test:archive").expect("an actor");
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_session(&summary(session_id))
+            .expect("records the summary");
+        journal
+            .record_closure(&closure(session_id, ClosureReason::WorkerCrash))
+            .expect("records the closure");
+        journal.accept(&submission(4)).expect("an accepted intent");
+        journal
+            .mark_dispatching(
+                actor.clone(),
+                kr_worker::journal::action_id_from([4; 16]),
+                kr_ipc::now_ms(),
+            )
+            .expect("a dispatch marker with no outcome");
+    }
+    let before = archive.archive(session_id).expect("reads the archive");
+    assert!(
+        before
+            .incompleteness
+            .contains(&Incompleteness::RecoveryUnfinished { unresolved: 1 }),
+        "a store nothing recovered is reported as such: {:?}",
+        before.incompleteness
+    );
+
+    // Once the pass has run under ownership, it is not reported any more: the marker has an
+    // ending, and the archive says what is missing rather than repeating itself.
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    archive.recover_journal(&ownership).expect("recovers");
+    let after = archive
+        .archive(session_id)
+        .expect("reads the archive again");
+    assert!(
+        !after
+            .incompleteness
+            .iter()
+            .any(|missing| matches!(missing, Incompleteness::RecoveryUnfinished { .. })),
+        "the pass ran: {:?}",
+        after.incompleteness
+    );
+}
+
+#[test]
+fn a_session_closed_by_an_earlier_build_is_brought_forward_rather_than_refused() {
+    // Section 24's forward-only migration reaches a session that has no worker left to run it. A
+    // store an earlier build wrote records an earlier schema, and this build reads one current
+    // schema; without this the shell, the directory, the geometry and the creation time a person
+    // is shown for a closed session would be lost the moment this build shipped.
+    let (_temp, archive) = host();
+    let session_id = session();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_session(&summary(session_id))
+            .expect("records the summary");
+        journal
+            .record_closure(&closure(session_id, ClosureReason::CloseRequested))
+            .expect("records the closure");
+    }
+    // The store as an earlier build left it: the version it recorded, and none of the objects the
+    // steps after it added.
+    let path = archive.paths().journal_database(session_id);
+    {
+        let connection = rusqlite::Connection::open(&path).expect("opens the store");
+        connection
+            .execute_batch(
+                "DROP TABLE privacy;
+                 DROP TABLE outbox;
+                 DROP TABLE outbox_cursors;
+                 DROP TABLE journal_gaps;
+                 UPDATE schema_version SET version = 3;",
+            )
+            .expect("puts it back to the earlier shape");
+    }
+    assert_eq!(
+        kr_worker::journal::Journal::recorded_schema_version(&path).expect("reads the version"),
+        3
+    );
+
+    let read = archive.archive(session_id).expect("reads the archive");
+    assert!(
+        read.summary.is_some(),
+        "the session an earlier build recorded is still described: {:?}",
+        read.incompleteness
+    );
+    assert_eq!(
+        read.closure.as_ref().expect("the closure survived").reason,
+        ClosureReason::CloseRequested
+    );
+    assert_eq!(
+        kr_worker::journal::Journal::recorded_schema_version(&path).expect("reads the version"),
+        kr_worker::persistence::migration::CURRENT,
+        "the store was brought forward once rather than read twice"
+    );
 }

@@ -15,9 +15,21 @@
 //!   the reservation the first one made rather than by starting a second execution.
 //! * **A lost or corrupt journal produces an explicit incomplete archive.** Not an error, and not
 //!   an empty success: [`Archive::incompleteness`] names what is missing, so a reader is told the
-//!   record has holes rather than reading continuity into it.
-//! * **A worker crash closes the session.** The closure is recorded, the owned processes are
-//!   fenced by the boundary the worker established, and nothing is rebuilt from terminal history.
+//!   record has holes rather than reading continuity into it. It names a missing or unreadable
+//!   store, a missing closure or summary, a lost range of output, an interval durable writing was
+//!   lost, and a recovery pass that did not run. It does not name a *hole* inside the retained
+//!   range: a middle spool segment that has gone reads as an empty page, which is the handoff's
+//!   residual 21.
+//! * **Privacy mode is the worker's, not the archive's.** A store recovered here is not checked
+//!   for an unfinished privacy cleanup, and a content read is not held while one is owed, so a
+//!   host that crashed between recording privacy mode and removing what it was asked to remove
+//!   serves that content from here. That is the handoff's residual 18.
+//! * **A worker crash closes the session.** The closure is recorded and nothing is rebuilt from
+//!   terminal history. What this module does *not* do is stop what the session still owned:
+//!   [`ArchiveService::fence_owned`] removes the worker's published endpoint and descriptor and
+//!   stops no process, because this build records no boundary a later daemon could act on. The
+//!   closure's coverage says so, and section 7's cleaning half is open - the handoff's residual
+//!   12 carries it.
 //!
 //! The transfer service's one retention question is answered here too. Section 14 gives a
 //! submitted attachment its session's retention rather than the seven-day unused window, and the
@@ -70,6 +82,16 @@ pub enum Incompleteness {
         /// The first cursor that is present again.
         to_cursor: u64,
     },
+    /// Actions are still in a state recovery would have resolved.
+    ///
+    /// The archive runs section 9's recovery rules under ownership. A store that still holds an
+    /// accepted intent with no marker, or a marker with no outcome, is one those rules never ran
+    /// over: either ownership could not be taken, or the pass itself failed. A reader is told,
+    /// because a session whose last actions have no ending is not a complete record of it.
+    RecoveryUnfinished {
+        /// How many actions are still in one of those states.
+        unresolved: u64,
+    },
     /// Durable writing was unavailable for an interval, so the record has a hole in it.
     DurabilityLost {
         /// When the fault was observed.
@@ -96,6 +118,10 @@ impl Incompleteness {
                 from_cursor,
                 to_cursor,
             } => format!("retained output from {from_cursor} to {to_cursor} is no longer held"),
+            Self::RecoveryUnfinished { unresolved } => format!(
+                "{unresolved} of this session's actions have no ending, because the recovery pass \
+                 that settles them did not run over this store"
+            ),
             Self::DurabilityLost { from_ms, to_ms } => {
                 format!("durable writing was unavailable from {from_ms} to {to_ms}")
             }
@@ -335,6 +361,40 @@ impl ArchiveService {
         ))
     }
 
+    /// Brings a store an earlier build wrote forward, so this build's one reader can read it.
+    ///
+    /// Section 24 asks for forward-only migrations and one current schema read by code. A worker
+    /// migrates its own store when it opens it. A session that closed before this build shipped
+    /// has no worker to do that, and its store would otherwise be refused for ever by the
+    /// read-only opener, taking with it the shell, the directory, the geometry and the creation
+    /// time a person is shown for a closed session.
+    ///
+    /// So the archive does it once, here, and only here: the store is opened writable, migrated,
+    /// and closed again before anything reads it. It runs on a session with no live worker, which
+    /// is what every caller of this establishes first, because migrating a store a worker still
+    /// owns would be a second writer.
+    ///
+    /// A store already at the current version is not opened at all. A store older than the ladder
+    /// is left alone and reported by the reader, because restoring one in part is worse than
+    /// saying it cannot be read.
+    pub fn bring_forward(&self, session_id: SessionId) {
+        let path = self.paths.journal_database(session_id);
+        if !path.exists() {
+            return;
+        }
+        let Ok(recorded) = Journal::recorded_schema_version(&path) else {
+            return;
+        };
+        if recorded == kr_worker::persistence::migration::CURRENT
+            || kr_worker::persistence::migration::plan(recorded).is_err()
+        {
+            return;
+        }
+        // `Journal::open` migrates and then holds the current schema. Dropping it immediately is
+        // what keeps this a migration rather than a second reader.
+        drop(Journal::open(&path));
+    }
+
     /// Removes the worker's published endpoint and descriptor, and returns whether anything went.
     ///
     /// Fencing is not a message to the worker. A worker that has crashed cannot be told anything;
@@ -489,6 +549,7 @@ impl ArchiveService {
         session_id: SessionId,
         recorded: Option<ClosureRecord>,
     ) -> Result<Archive> {
+        self.bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         let mut incompleteness = Vec::new();
         let mut archive = Archive {
@@ -530,6 +591,15 @@ impl ArchiveService {
                         incompleteness.push(Incompleteness::ClosureMissing);
                     }
                     Ok(None) => {}
+                    Err(error) => incompleteness.push(Incompleteness::JournalUnreadable {
+                        detail: error.to_string(),
+                    }),
+                }
+                match journal.unresolved_work() {
+                    Ok(0) => {}
+                    Ok(unresolved) => {
+                        incompleteness.push(Incompleteness::RecoveryUnfinished { unresolved });
+                    }
                     Err(error) => incompleteness.push(Incompleteness::JournalUnreadable {
                         detail: error.to_string(),
                     }),
@@ -614,6 +684,7 @@ impl ArchiveService {
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
     ) -> Result<ActionReadResult> {
+        self.bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         if !path.exists() {
             return Err(ControllerError::UnknownSession {
