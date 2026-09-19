@@ -1313,6 +1313,7 @@ async fn copy(from: Arc<tokio::net::UnixStream>, to: Arc<tokio::net::UnixStream>
 }
 
 /// Returns whether this session's integration is registered and reporting ready.
+#[cfg(target_os = "linux")]
 fn wired_ready(runtime: &Arc<SessionRuntime>) -> bool {
     runtime
         .session()
