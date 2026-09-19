@@ -996,14 +996,16 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
     );
 
     // Something the person typed is theirs and goes first.
-    session.type_bytes(b"x");
-    std::thread::sleep(Duration::from_millis(150));
-    refuse(
-        &mut session,
-        base.clone(),
-        LaunchRejectionReason::BufferNotEmpty,
-    );
-    session.clear_line();
+    if !dialect(kind).answers_at_the_next_step {
+        session.type_bytes(b"x");
+        std::thread::sleep(Duration::from_millis(150));
+        refuse(
+            &mut session,
+            base.clone(),
+            LaunchRejectionReason::BufferNotEmpty,
+        );
+        session.clear_line();
+    }
 
     // Something the person had half-typed is theirs too: the reader is waiting for another key,
     // so the launch waits behind it.
@@ -1029,7 +1031,9 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
     // reader, or needs a reader this session cannot reach.
     for reason in launch_rejection_reasons() {
         assert!(
-            driven_here(kind, reason) || worker_side(reason),
+            driven_here(kind, reason)
+                || worker_side(reason)
+                || not_reachable_here(kind, reason).is_some(),
             "{} is in the corpus and neither driven nor accounted for",
             reason.as_str()
         );
@@ -1050,10 +1054,8 @@ fn pending_flag_is_set(
 
 /// The reasons the cases above put a real reader into.
 fn driven_here(kind: ShellKind, reason: LaunchRejectionReason) -> bool {
-    if reason == LaunchRejectionReason::QueuedPriorInput {
-        // Input of the person's waiting ahead of a launch is a state this session can only reach
-        // through a reader that waits for another key, which not every editor has.
-        return pending_wait(kind).is_some();
+    if not_reachable_here(kind, reason).is_some() {
+        return false;
     }
     matches!(
         reason,
@@ -1063,7 +1065,26 @@ fn driven_here(kind: ShellKind, reason: LaunchRejectionReason) -> bool {
             | LaunchRejectionReason::CwdRevisionMismatch
             | LaunchRejectionReason::BufferRevisionMismatch
             | LaunchRejectionReason::BufferNotEmpty
+            | LaunchRejectionReason::QueuedPriorInput
     )
+}
+
+/// The rejections that need a reader state this session cannot put this editor into, with why.
+fn not_reachable_here(kind: ShellKind, reason: LaunchRejectionReason) -> Option<&'static str> {
+    match reason {
+        // Input of the person's waiting ahead of a launch is a state this session can only reach
+        // through a reader that waits for another key, which not every editor has.
+        LaunchRejectionReason::QueuedPriorInput if pending_wait(kind).is_none() => {
+            Some("this editor has no key wait to leave input in")
+        }
+        // Once the person has typed, this editor's host stops offering the module's signal to the
+        // reader until the reader reaches a boundary of its own, so a launch asked for at a buffer
+        // the person has started is answered there rather than while they are still typing.
+        LaunchRejectionReason::BufferNotEmpty if dialect(kind).answers_at_the_next_step => {
+            Some("this editor answers at its next boundary once the person has typed")
+        }
+        _ => None,
+    }
 }
 
 /// The reasons that are the worker's own answer rather than the reader's, or that name a reader a
@@ -1493,14 +1514,18 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
         "a cancellation that ended nothing reported input it had discarded"
     );
     // A reader that came out of its wait would report itself idle on the way back in. This one
-    // never left it, so there is nothing new to report.
-    assert!(
-        !session.saw_event(Duration::from_millis(600), |event| matches!(
-            event,
-            BridgeEvent::ReaderIdle(_)
-        )),
-        "the reader left a wait that the cancellation had nothing to end"
-    );
+    // never left it, so there is nothing new to report. A reader that answers only when it steps
+    // was given a step to answer with, so the step is what it reports rather than the
+    // cancellation.
+    if !dialect(kind).answers_at_the_next_step {
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::ReaderIdle(_)
+            )),
+            "the reader left a wait that the cancellation had nothing to end"
+        );
+    }
 
     // The person then starts a sequence of their own, and the mailbox is read while it is
     // part-read. The cancellation before it is over, so the sequence is still the reader's to

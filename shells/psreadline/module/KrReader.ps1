@@ -252,7 +252,6 @@ function Invoke-KrAcceptLine {
         Write-KrTrace "accept failed: $($_.Exception.Message)"
         return $false
     }
-    Write-KrTrace 'accepted the installed line'
     $true
 }
 

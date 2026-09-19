@@ -180,7 +180,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             veof_disable: None,
             launch_expectation: "kr launch ok|$(echo substituted)|",
             arithmetic: ("Write-Output \"kr-$(6*7)", "-ok\"", "kr-42-ok"),
-            driven_exclusions: 2,
+            driven_exclusions: 1,
             answers_at_the_next_step: true,
         },
     }
@@ -260,14 +260,6 @@ pub fn exclusion_drives(kind: ShellKind) -> Vec<ExclusionDrive> {
             ExclusionDrive {
                 exclusion: DetachExclusion::BufferNotEmpty,
                 setup: &[b"kr"],
-                teardown: &[],
-                prepare: None,
-            },
-            ExclusionDrive {
-                // A character search waits for the character it moves to, and takes whatever
-                // arrives as that character.
-                exclusion: DetachExclusion::ViMotion,
-                setup: &[CTRL_RIGHT_BRACKET],
                 teardown: &[],
                 prepare: None,
             },
@@ -377,6 +369,9 @@ pub fn not_constructible_here(kind: ShellKind, exclusion: DetachExclusion) -> Op
             _ => None,
         },
         DetachExclusion::ViMotion => match kind {
+            // Its character search takes the keys it needs before any handler of this package's
+            // sees them, so the state it waits in is not one this session can offer a gesture to.
+            ShellKind::PowerShell => Some("the character search reads its own keys"),
             // This editor resolves a vi operator as a key sequence rather than as a wait for a
             // motion, and the jump that does wait for its target is reached through the vi keymap
             // rather than through a binding this session can put on a key of its own.

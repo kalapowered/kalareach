@@ -350,7 +350,6 @@ function Invoke-KalaReachReadLine {
     [CmdletBinding()]
     param()
 
-    Write-KrTrace 'readline wrapper entered'
     if (-not $script:Hooks.Activated) {
         # The profile has run by the time the host asks for a line, and the reader has not started.
         Enable-KalaReachHooks
@@ -405,12 +404,16 @@ function Invoke-KalaReachService {
     # The reader's own thread and no other. The host decides where it delivers this signal, and
     # the editor's state belongs to the thread that is reading: touching it from anywhere else
     # would be reaching into a reader that is running.
-    if ([System.Threading.Thread]::CurrentThread.ManagedThreadId -ne $script:State.ReaderThreadId) {
+    if ($script:State.ReaderThreadId -eq 0 -or
+        [System.Threading.Thread]::CurrentThread.ManagedThreadId -ne $script:State.ReaderThreadId) {
         return
     }
     try {
         if (-not $script:Kr.Registered) { return }
         if ($script:State.InsideReader -le 0 -or -not $script:State.EntryReported) { return }
+        # What the person typed is theirs and goes first: nothing of the worker's is answered
+        # while the editor still has keys of its own to act on.
+        if ((Get-KrQueuedKeys) -gt 0) { return }
         if (-not $script:State.IdleReported) {
             # The reader has nothing left to read, which is one of the three points a worker
             # retries a withheld fence at.
@@ -691,5 +694,4 @@ Export-ModuleMember -Function @(
 )
 
 # The bridge loads with the module: the marked profile block imports it before the first prompt.
-Write-KrTrace 'module loaded'
 Initialize-KalaReachBridge

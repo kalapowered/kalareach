@@ -197,7 +197,6 @@ function Send-KrBytes {
 function Send-KrFrame {
     param($Value)
     $body = ConvertTo-KrCbor $Value
-    Write-KrTrace ("frame " + [Convert]::ToBase64String($body))
     if ($body.Length -gt $script:KR_MAX_FRAME) { return $false }
     $framed = [byte[]]::new($body.Length + 4)
     $framed[0] = [byte](($body.Length -shr 24) -band 0xFF)
@@ -222,7 +221,6 @@ function Receive-KrAvailable {
             if (-not $socket.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)) { break }
             $count = $socket.Receive($buffer, 0, $buffer.Length, 'None')
             if ($count -eq 0) { Disconnect-KrEndpoint; return $false }
-            Write-KrTrace "received $count bytes"
             for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
         } catch [System.Net.Sockets.SocketException] {
             if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::WouldBlock) { break }
@@ -292,7 +290,6 @@ function New-KrGesture {
 function Send-KrEvent {
     param([string]$Name, [hashtable]$Payload)
     if (-not $script:Kr.Registered) { return }
-    Write-KrTrace "event $Name"
     $script:Kr.EventCounter++
     Send-KrFrame @{
         event = @{
@@ -376,8 +373,7 @@ function Wait-KrHandshake {
     while ($true) {
         $frame = Read-KrFrame
         if ($null -ne $frame) {
-            Write-KrTrace "handshake frame of $($frame.Length) bytes"
-            $value = try { ConvertFrom-KrCbor $frame } catch { Write-KrTrace "decode failed: $_"; $null }
+            $value = try { ConvertFrom-KrCbor $frame } catch { Write-KrTrace "the accept did not decode: $_"; $null }
             $outcome = if ($null -eq $value) { $null } else { Get-KrVariant $value }
             if ($null -eq $outcome -or $outcome.Name -ne 'handshake') {
                 Write-KrTrace "not a handshake: $($outcome.Name)"
@@ -665,7 +661,6 @@ function Invoke-KrAnswerLaunch {
     param([uint64]$Id, [hashtable]$Request, [bool]$Revoked)
     $transaction = [byte[]]$Request['transaction']
     $fenceId = [byte[]]$Request['fence_id']
-    Write-KrTrace "launch request t=$($transaction.Length) f=$($fenceId.Length) revoked=$Revoked"
     if ($null -eq $transaction -or $transaction.Length -ne 16) { Write-KrTrace 'launch: no transaction'; return }
     if ($null -eq $fenceId -or $fenceId.Length -ne 16) { Write-KrTrace 'launch: no fence'; return }
     $expectedPrompt = [uint64]$Request['expected_prompt_generation']
@@ -890,7 +885,6 @@ function Invoke-KrFrame {
             $id = [uint64]$variant.Payload['id']
             $request = Get-KrVariant $variant.Payload['request']
             if ($null -eq $request) { return }
-            Write-KrTrace "request $($request.Name) id=$id"
             switch ($request.Name) {
                 'fence' { Invoke-KrAnswerFence $id $request.Payload }
                 'launch' {
@@ -928,7 +922,6 @@ function Invoke-KrService {
         while ($true) {
             $body = Read-KrFrame
             if ($null -eq $body -or -not $script:Kr.Registered) { break }
-            Write-KrTrace "handling a frame of $($body.Length) bytes"
             $script:Kr.FrameAtMs = Get-KrNowMs
             Invoke-KrFrame $body
             if ($script:State.CancelRequested) { break }

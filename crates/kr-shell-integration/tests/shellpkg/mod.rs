@@ -687,14 +687,14 @@ impl Session {
 
     /// Gives a reader that reaches its own queue only when it steps one step to take.
     ///
-    /// The key is one the editor has nothing bound to, so the step is the whole of its effect: the
-    /// buffer, the revisions and the queues are where they were. A person at the keyboard gives
-    /// the reader the same step by typing at all.
+    /// The key is one the editor has nothing bound to and the line discipline makes nothing of, so
+    /// the step is the whole of its effect: the buffer, the revisions and the queues are where
+    /// they were. A person at the keyboard gives the reader the same step by typing at all.
     pub fn nudge(&mut self) {
         if !dialect(self.package_kind).answers_at_the_next_step {
             return;
         }
-        self.type_bytes(&[0x1c]);
+        self.type_bytes(&[0x1e]);
         // The step is over before anything is asked of the reader: a key it has not taken yet is
         // input of the person's, and the contract puts that ahead of anything the worker asks for.
         std::thread::sleep(Duration::from_millis(60));
