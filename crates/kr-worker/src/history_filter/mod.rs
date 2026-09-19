@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{ApprovalRequestId, QuestionId};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::sharing::{LiveScreenPreview, MAX_PREVIEW_LINE_CHARS, MAX_PREVIEW_LINES};
+use kr_protocol::sharing::LiveScreenPreview;
 
 mod preview;
 
@@ -620,9 +620,9 @@ impl HistoryFilter {
 
     /// Builds the live-screen preview an issuer is shown before an invitation exists.
     ///
-    /// Bounded by [`MAX_PREVIEW_LINES`] and [`MAX_PREVIEW_LINE_CHARS`], and marked when it was
-    /// cut, so the issuer is never shown a preview that quietly says less than the recipient will
-    /// see.
+    /// Bounded by [`kr_protocol::sharing::MAX_PREVIEW_LINES`] and
+    /// [`kr_protocol::sharing::MAX_PREVIEW_LINE_CHARS`], and marked when it was cut, so the issuer
+    /// is never shown a preview that quietly says less than the recipient will see.
     #[must_use]
     pub fn preview_live_screen<'a>(
         &self,

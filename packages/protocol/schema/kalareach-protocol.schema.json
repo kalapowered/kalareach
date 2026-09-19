@@ -6630,6 +6630,14 @@
       "additionalProperties": false,
       "description": "Parameters of `grant.create`.",
       "properties": {
+        "accepted_notices": {
+          "description": "The notices the issuer states it was shown and accepted.\n\nThe host computes the notices the grant actually carries and refuses the request when the\ntwo sets differ. Section 25 makes a controller's terminal input conditional on the issuer\naccepting its account-level implications, and a surface that showed a softer set than the\ngrant carries therefore cannot get the grant written.",
+          "items": {
+            "$ref": "#/$defs/AuthorityNotice"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "lifetime_ms": {
           "anyOf": [
             {
@@ -6682,6 +6690,7 @@
         "parent_grant_id",
         "selection",
         "lifetime_ms",
+        "accepted_notices",
         "owner_confirmation"
       ],
       "type": "object"

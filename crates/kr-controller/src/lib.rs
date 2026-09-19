@@ -18,7 +18,9 @@
 //! | [`singleton`] | The per-environment lock and the persistent generation |
 //! | [`supervision`] | Starting a worker through the platform's own service manager |
 //! | [`directory`] | The verified directory of workers, rebuilt by challenge after a restart |
+//! | [`grants`] | The grant store, the delegation rule, the revocation cascade and the policy intersection |
 //! | [`service`] | Admission, the rendezvous and the local endpoint |
+//! | [`sharing`] | Roles compiled to grants, single-use invitations and transfer of control |
 //! | [`transfer`] | The environment's transfer service, its attachment-chunk endpoint and its sweep |
 //! | [`project`] | The environment's project service: repositories, workspaces and the restricted Git profile |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
@@ -28,9 +30,11 @@ pub mod authority;
 pub mod desktop;
 pub mod directory;
 pub mod error;
+pub mod grants;
 pub mod project;
 pub mod registry;
 pub mod service;
+pub mod sharing;
 pub mod singleton;
 pub mod supervision;
 pub mod transfer;

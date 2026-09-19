@@ -500,6 +500,13 @@ pub struct GrantCreateParams {
     pub selection: RoleSelection,
     /// How long the invitation lasts. Null takes [`DEFAULT_INVITATION_LIFETIME_MS`].
     pub lifetime_ms: Nullable<DurationMs>,
+    /// The notices the issuer states it was shown and accepted.
+    ///
+    /// The host computes the notices the grant actually carries and refuses the request when the
+    /// two sets differ. Section 25 makes a controller's terminal input conditional on the issuer
+    /// accepting its account-level implications, and a surface that showed a softer set than the
+    /// grant carries therefore cannot get the grant written.
+    pub accepted_notices: CanonicalSet<AuthorityNotice>,
     /// The owner's confirmation, when the request enlarges persistent authority.
     pub owner_confirmation: Nullable<OwnerConfirmationProof>,
 }

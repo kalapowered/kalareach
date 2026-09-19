@@ -409,10 +409,6 @@ export type ApprovalRequestId = string
  */
 export type QuestionId = string
 /**
- * A duration in milliseconds, as a decimal string in JSON.
- */
-export type DurationMs = string
-/**
  * One consequence of a grant that the issuer is shown before the grant exists.
  *
  * Section 10 forbids a label that implies a restrictive sandbox the upstream does not enforce, so
@@ -422,6 +418,10 @@ export type DurationMs = string
  */
 export type AuthorityNotice =
   'account_access' | 'agent_permissions' | 'environment_writes' | 'delegation'
+/**
+ * A duration in milliseconds, as a decimal string in JSON.
+ */
+export type DurationMs = string
 /**
  * The host's answer to a `hello` offer.
  *
@@ -5807,6 +5807,15 @@ export interface OrganisationRequirement {
  * Parameters of `grant.create`.
  */
 export interface GrantCreateParams {
+  /**
+   * The notices the issuer states it was shown and accepted.
+   *
+   * The host computes the notices the grant actually carries and refuses the request when the
+   * two sets differ. Section 25 makes a controller's terminal input conditional on the issuer
+   * accepting its account-level implications, and a surface that showed a softer set than the
+   * grant carries therefore cannot get the grant written.
+   */
+  accepted_notices: AuthorityNotice[]
   /**
    * How long the invitation lasts. Null takes [`DEFAULT_INVITATION_LIFETIME_MS`].
    */

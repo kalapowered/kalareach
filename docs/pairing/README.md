@@ -306,3 +306,24 @@ value that drifts in one language fails in both.
 Pin `spake2` 0.4.0 with its resolved dependency graph and its interoperability vectors, alongside
 the cryptography pins in [docs/crypto/README.md](../crypto/README.md). The profile is the crate's
 own, so a different version could be a different profile.
+
+## What the host does with a grant afterwards
+
+This crate issues grants and validates the rules for the kind being issued. What happens to a grant
+after it exists belongs to the control daemon, and `docs/host/README.md` states it: the intersection
+the host takes on every request, the revocation cascade along the parent link, the per-worker
+dispatch barrier a revocation completes through, the organisation lease that stops a grant while the
+transport stays connected, and the bounded offline-validity policy an owner may choose.
+
+Two rules cross the boundary and are worth stating on both sides.
+
+**Only the host issues revisions.** A revocation request carries none, and a host rejects a revision
+record that does not follow the one it last accepted. The daemon keeps the highest revision it has
+ever accepted as a floor, so a restored old policy cannot revive authority that has already been
+withdrawn.
+
+**Owner confirmation is for persistent enlargement.** Both halves of that phrase are checked: the
+grant never expires, *and* it carries a right the recipient does not already hold. A bounded session
+invitation is not a persistent enlargement however wide it is, and re-issuing what a device already
+holds enlarges nothing. Transfer of control is separate and always confirmed, because it changes who
+holds authority.

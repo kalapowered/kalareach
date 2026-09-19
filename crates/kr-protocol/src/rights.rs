@@ -336,3 +336,94 @@ mod attachment_capability_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Section 10 lists the vocabulary. This is that list, in the section's own order, so a right
+    /// added or renamed has to be reconciled with the specification rather than with this file.
+    const SECTION_TEN: [&str; 21] = [
+        "session.view",
+        "terminal.input",
+        "terminal.geometry",
+        "terminal.geometry.transfer",
+        "terminal.palette",
+        "agent.prompt",
+        "agent.cancel",
+        "agent.approval.respond",
+        "question.respond",
+        "files.read",
+        "files.upload",
+        "files.apply_diff",
+        "project.create",
+        "workspace.manage",
+        "changeset.create",
+        "session.create",
+        "session.rename",
+        "session.close",
+        "session.share",
+        "automation.manage",
+        "host.manage",
+    ];
+
+    #[test]
+    fn the_vocabulary_is_exactly_the_one_section_ten_declares() {
+        let declared: Vec<&str> = ActionRight::ALL
+            .iter()
+            .map(|right| right.as_str())
+            .collect();
+        assert_eq!(declared, SECTION_TEN);
+    }
+
+    #[test]
+    fn the_vocabulary_is_closed() {
+        // A name that is not in the list resolves to nothing. A method that needs an effect the
+        // vocabulary does not cover is denied, not approximated under a neighbouring name.
+        for near_miss in [
+            "terminal.write",
+            "session.admin",
+            "files.write",
+            "agent.respond",
+            "TERMINAL.INPUT",
+            "",
+        ] {
+            assert_eq!(
+                ActionRight::from_wire(near_miss),
+                None,
+                "{near_miss} resolved to a right"
+            );
+            assert!(near_miss.parse::<ActionRight>().is_err());
+        }
+    }
+
+    #[test]
+    fn every_right_round_trips_through_its_wire_string() {
+        for right in ActionRight::ALL {
+            assert_eq!(ActionRight::from_wire(right.as_str()), Some(*right));
+            assert_eq!(right.as_str().parse::<ActionRight>(), Ok(*right));
+            assert_eq!(right.to_string(), right.as_str());
+        }
+    }
+
+    #[test]
+    fn a_set_of_rights_encodes_in_wire_order_rather_than_declaration_order() {
+        // The order a reader can verify from the encoded values alone. Section 10 declares
+        // `session.view` first and `host.manage` last; sorted by wire string, `agent.cancel` comes
+        // before both.
+        let mut rights = vec![
+            ActionRight::HostManage,
+            ActionRight::SessionView,
+            ActionRight::AgentCancel,
+        ];
+        rights.sort_unstable();
+        assert_eq!(
+            rights,
+            vec![
+                ActionRight::AgentCancel,
+                ActionRight::HostManage,
+                ActionRight::SessionView
+            ]
+        );
+    }
+}

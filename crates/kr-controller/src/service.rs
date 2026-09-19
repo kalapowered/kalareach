@@ -256,6 +256,23 @@ pub struct Controller {
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
     project: Arc<crate::project::ProjectModule>,
+    /// The environment's grants and invitations, which the sharing and device method groups act on.
+    sharing: Arc<crate::sharing::SharingService>,
+    /// The paired devices, for the device method group.
+    ///
+    /// A view on this daemon's own registry database, which is the file the network half keeps its
+    /// device records in, so the two see one set of devices whether or not this host is on a
+    /// network.
+    devices: Arc<net::devices::DeviceDirectory>,
+    /// What is true of this host rather than of one grant: the revision in force, the organisation
+    /// leases it holds and the optional bounded offline-validity policy its owner chose.
+    ///
+    /// Every request intersects its grant with this, so it is read far more often than it is
+    /// written and a plain lock is what it wants.
+    policy: std::sync::Mutex<crate::grants::HostPolicy>,
+    /// This host's half of the remote authority feed: the revisions only it issues, the revocation
+    /// records it retains, and the synchronisation it owes before it serves remote work again.
+    feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
     /// The serial boundary every contact-skill installation passes through.
     ///
     /// Reading an action's record, writing its dispatch marker, changing the files and recording
@@ -409,6 +426,19 @@ impl Controller {
         // that instead of beneath the directory this daemon was started in. It is resolved before
         // the daemon is built, because what builds it cannot fail.
         let worker_program = kr_ipc::paths::resolve_here(setup.worker_program)?;
+        // The grants and the invitations live in the daemon's own registry database, beside the
+        // devices that hold them, so an authority object and the device it was issued to are in
+        // one file and one backup.
+        let sharing = Arc::new(crate::sharing::SharingService::new(
+            crate::grants::GrantDirectory::open(setup.paths.registry_database())?,
+            crate::sharing::InvitationLedger::open(setup.paths.registry_database())?,
+        ));
+        // This host's own device identity is derived from its environment, the same way the
+        // network half derives it, so the feed speaks for the same host across restarts.
+        let host_device_id = kr_protocol::ids::DeviceId::new(setup.environment_id.get());
+        let devices = Arc::new(net::devices::DeviceDirectory::open(
+            setup.paths.registry_database(),
+        )?);
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -432,6 +462,13 @@ impl Controller {
             supervisor: setup.supervisor,
             transfer,
             project,
+            sharing,
+            devices,
+            policy: std::sync::Mutex::new(crate::grants::HostPolicy::personal(authority_revision)),
+            feed: std::sync::Mutex::new(crate::grants::AuthorityFeed::new(
+                host_device_id,
+                authority_revision,
+            )),
             agent_tools: tokio::sync::Mutex::new(()),
             worker_program,
             build_id: setup.build_id,
@@ -1087,6 +1124,88 @@ impl Controller {
         // waiting for its peer is stopped by its connection closing, not by the next check.
         self.fence_network_connections().await;
         self.announce_authority_revision().await
+    }
+
+    /// The environment's grants and invitations.
+    #[must_use]
+    pub fn sharing(&self) -> &Arc<crate::sharing::SharingService> {
+        &self.sharing
+    }
+
+    /// This host's policy, for the intersection every request takes.
+    pub fn policy(&self) -> std::sync::MutexGuard<'_, crate::grants::HostPolicy> {
+        self.policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// This host's half of the remote authority feed.
+    pub fn authority_feed(&self) -> std::sync::MutexGuard<'_, crate::grants::AuthorityFeed> {
+        self.feed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Revokes a grant, its descendants, and everything they were being used for.
+    ///
+    /// The order is the one section 10 requires and the one a revocation cannot be correct
+    /// without. The grants go first, because a grant still in the store is a grant the next
+    /// request would be decided against. Then the revision advances, which invalidates every
+    /// outstanding dispatch lease at once and deregisters the connections admitted under the
+    /// authority just withdrawn. Then the connections holding those registrations are fenced, so a
+    /// subscription already open is closed rather than left reading. Then the revision is
+    /// announced to every worker, and what comes back is the per-worker completion status: a
+    /// revocation is complete for a worker once that worker has acknowledged the revision and
+    /// fenced the undispatched actions it affects, or once it is confirmed ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the grant store or the registry cannot be read or written.
+    pub async fn revoke_grant(
+        &self,
+        grant_id: kr_protocol::ids::GrantId,
+    ) -> Result<kr_protocol::sharing::RevocationResult> {
+        let revocation = self.sharing.revoke(grant_id, kr_ipc::now_ms().get())?;
+        let barrier = self.revoke_authority().await?;
+        self.policy()
+            .advance_authority_revision(barrier.authority_revision);
+        Ok(kr_protocol::sharing::RevocationResult {
+            authority_revision: barrier.authority_revision,
+            revoked_grants: revocation.revoked.iter().copied().collect(),
+            barrier,
+        })
+    }
+
+    /// Revokes every grant one device holds, then revokes the device itself.
+    ///
+    /// The grants go first for the same reason as above. The device's own revocation is the
+    /// network half's, because it is the half that withdraws the registration and closes the
+    /// connection's write boundary; when this host is not on a network there is nothing to
+    /// withdraw, and advancing the revision is the whole of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the grant store, the device record or the registry cannot be written.
+    pub async fn revoke_device_authority(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+    ) -> Result<kr_protocol::sharing::RevocationResult> {
+        let revocation = self
+            .sharing
+            .grants()
+            .revoke_device(device_id, kr_ipc::now_ms().get())?;
+        // The device record is marked revoked before the revision advances, so nothing can be
+        // authorised against it in between. The directory is a view on this daemon's own registry
+        // database, which is where the network half keeps it too.
+        self.devices.revoke(device_id, kr_ipc::now_ms())?;
+        let barrier = self.revoke_authority().await?;
+        self.policy()
+            .advance_authority_revision(barrier.authority_revision);
+        Ok(kr_protocol::sharing::RevocationResult {
+            authority_revision: barrier.authority_revision,
+            revoked_grants: revocation.revoked.iter().copied().collect(),
+            barrier,
+        })
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.
@@ -1875,6 +1994,51 @@ impl Controller {
                 }
                 let _: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
             }
+            // Sharing acts on a session, and the session it acts on is the one its target names.
+            Method::GrantCreate => {
+                let named = mutation
+                    .target
+                    .session_id
+                    .as_ref()
+                    .copied()
+                    .ok_or_else(|| {
+                        ControllerError::InvalidArgument(format!(
+                            "{} names the session it shares",
+                            entry.name
+                        ))
+                    })?;
+                let params: kr_protocol::sharing::GrantCreateParams = parse(&mutation.params)?;
+                if params.session_id != named {
+                    return Err(ControllerError::InvalidArgument(
+                        "the request's target and its parameters name different sessions"
+                            .to_owned(),
+                    ));
+                }
+            }
+            // A revocation acts on a grant or a device, both of which belong to this host rather
+            // than to one session: a grant can cover several sessions, and a device holds several
+            // grants. A request that named a session here would be asking for a revocation scoped
+            // to something revocations do not have.
+            Method::GrantRevoke => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a grant belongs to this host, not to one session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
+            }
+            Method::DeviceRevoke => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a device belongs to this host, not to one session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
+            }
+            Method::DevicePreviewKeyUpdate => {
+                let _: kr_protocol::sharing::DevicePreviewKeyUpdateParams =
+                    parse(&mutation.params)?;
+            }
             _ if crate::transfer::TransferModule::serves(method) => {
                 crate::transfer::TransferModule::check_subject(method, mutation)?;
             }
@@ -2342,6 +2506,8 @@ impl Controller {
             Method::SessionList => self.session_list(&request.params).await,
             Method::SessionRead => self.session_read(&request.params).await,
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
+            Method::GrantList => self.grant_list(&request.params),
+            Method::DeviceList => self.device_list(&request.params).await,
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
                 method.as_str()
@@ -2467,12 +2633,158 @@ impl Controller {
                 self.agent_tools_change(actor_id, mutation, method, connection_id, accepted)
                     .await
             }
+            Method::GrantCreate => self.grant_create(mutation, carried).await,
+            Method::GrantRevoke => self.grant_revoke(mutation, carried).await,
+            Method::DeviceRevoke => self.device_revoke(mutation, carried).await,
+            Method::DevicePreviewKeyUpdate => Err(ControllerError::PermissionDenied {
+                detail: "a device rotates its own notification-preview key through its paired \
+                         proof, which a local caller does not hold"
+                    .to_owned(),
+            }),
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()
             ))),
         };
         respond(mutation.request_id, outcome)
+    }
+
+    /// Lists the grants this host's owner may see.
+    ///
+    /// A local caller is the operating-system owner of this environment, so the issuer it lists
+    /// grants for is this host itself: the grants it issued, and everything delegated from them.
+    fn grant_list(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::GrantListParams = parse(params)?;
+        let result = self.sharing.list_for_issuer(
+            self.host_device_id(),
+            params.session_id.as_ref().copied(),
+            params.include_resolved,
+            kr_ipc::now_ms().get(),
+        )?;
+        encode(&result)
+    }
+
+    /// Lists the paired devices, with each one's last authority acknowledgement.
+    ///
+    /// Section 10 puts the acknowledgement in the list because an offline host cannot apply a
+    /// revocation it has not received, and a person deciding whether a revocation has taken effect
+    /// needs to see which hosts have answered. The feed's staleness is beside it for the same
+    /// reason: a list that looked current because nothing had contradicted it would be worse than
+    /// no list.
+    async fn device_list(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::DeviceListParams = parse(params)?;
+        let records = self.devices.devices()?;
+        let status = self.authority_feed().status();
+        let mut devices = Vec::new();
+        for record in records {
+            if record.revoked_at_ms.is_some() && !params.include_revoked {
+                continue;
+            }
+            let acknowledged = self.authority_feed().last_acknowledgement(record.device_id);
+            devices.push(kr_protocol::sharing::DeviceSummary {
+                device_id: record.device_id,
+                display_name: record.device_name.as_str().to_owned(),
+                grant_id: record.grant.grant_id,
+                paired_at_ms: record.paired_at_ms,
+                acknowledged_revision: kr_protocol::scalars::Nullable(acknowledged),
+                acknowledged_at_ms: kr_protocol::scalars::Nullable::null(),
+                revoked: record.revoked_at_ms.is_some(),
+            });
+        }
+        devices.sort_by_key(|device| device.device_id);
+        encode(&kr_protocol::sharing::DeviceListResult {
+            devices,
+            authority_revision: status.accepted_revision,
+            feed_synchronised_at_ms: status.last_synchronised_at_ms,
+            feed_stale: status.stale,
+        })
+    }
+
+    /// Shares a session: compiles the role, previews it, and writes the grant and its invitation.
+    async fn grant_create(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::GrantCreateParams = parse(&mutation.params)?;
+        if params.owner_confirmation.is_present() {
+            return Err(ControllerError::InvalidArgument(
+                "an owner confirmation is completed through the owner-confirmation methods, and \
+                 a local caller acts under its authenticated operating-system identity"
+                    .to_owned(),
+            ));
+        }
+        // A host that cannot show the issuer the screen does not share the screen. Section 25
+        // requires the preview to show what is being shared, and this daemon holds no screen
+        // content of its own: the worker does. An invitation that included it here would be one
+        // whose issuer was shown nothing.
+        if params.selection.include_live_screen {
+            return Err(ControllerError::InvalidArgument(
+                "this host cannot preview the screen this invitation would share, so it does not \
+                 share it"
+                    .to_owned(),
+            ));
+        }
+        let request = crate::sharing::ShareRequest {
+            invitation_id: kr_protocol::ids::InvitationId::new(kr_ipc::new_uuid()),
+            grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+            environment_id: self.paths.environment_id(),
+            session_id: params.session_id,
+            issuer_device_id: self.host_device_id(),
+            recipient_device_id: params.recipient_device_id,
+            parent_grant_id: params.parent_grant_id.as_ref().copied(),
+            selection: params.selection.clone(),
+            lifetime_ms: params.lifetime_ms.as_ref().map(|lifetime| lifetime.get()),
+            accepted_notices: params.accepted_notices.clone(),
+            live_screen: None,
+            named_questions: Vec::new(),
+            named_approvals: Vec::new(),
+            authority_revision: self.policy().authority_revision(),
+            owner_confirmed: false,
+            now_ms: kr_ipc::now_ms().get(),
+        };
+        // The admission is checked last, under the registry lock, so the grant is written against
+        // authority that still stands at the moment it is written rather than at the moment the
+        // request arrived.
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        let result = self.sharing.share(&request)?;
+        drop(registry);
+        encode(&result)
+    }
+
+    /// Revokes a grant, its descendants, and everything they were being used for.
+    async fn grant_revoke(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
+        {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+        }
+        encode(&self.revoke_grant(params.grant_id).await?)
+    }
+
+    /// Revokes a device, every grant it holds, and everything they were being used for.
+    async fn device_revoke(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
+        {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+        }
+        encode(&self.revoke_device_authority(params.device_id).await?)
+    }
+
+    /// This host's own device identity, derived from its environment.
+    #[must_use]
+    fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
+        kr_protocol::ids::DeviceId::new(self.paths.environment_id().get())
     }
 
     /// Reports what is installed for one agent.

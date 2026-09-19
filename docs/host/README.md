@@ -1161,3 +1161,129 @@ generation's previous connection; it refuses a lower generation and requires a s
 from a replacement. The daemon's identity key is created once and loaded thereafter: a missing key
 on a later start is a recovery condition, not an invitation to make a new one, because every live
 worker holds the public half and rotation is a procedure that closes them all.
+
+## Grants, sharing and revocation
+
+A grant is the authority a request is decided against. It names its issuer and its recipient, the
+authority revision it was issued under, the environments and sessions it covers, the actions it
+permits, how far back it may see, when it stops and which organisation membership it requires.
+`crates/kr-controller/src/grants/` holds the store, and `grants::decide` is the intersection the
+host takes **on every request**, in this order:
+
+1. The method has to be in the registry and reachable from the caller's ingress class. An unlisted
+   name is denied whatever the caller holds.
+2. The grant has to be live: not revoked, no revoked ancestor, not expired, and issued under a
+   revision this host has not replaced.
+3. The host's own policy has to permit it: the organisation lease it requires, and the bounded
+   offline-validity policy when the owner chose one.
+4. The selectors have to admit the environment and the session the request names.
+5. The intersected rights have to carry every right the method requires under the conditions this
+   request meets.
+
+The rights come from `kr_protocol::method::REGISTRY`, which is section 23's table with one entry
+per method. Nothing here restates that table: a second copy drifts, and the copy that drifts is
+always the one an authorisation check happens to read.
+
+**Expiry does not downgrade.** A grant whose deadline has passed refuses the request. It does not
+quietly keep serving reads, because continued reads still need valid authority and a narrower grant
+is something the person chooses.
+
+**Delegation narrows.** A child grant can never reach further than its parent in rights, resources,
+history or lifetime, and it can never drop an organisation requirement its parent carries. The rule
+is checked where a grant is composed and again where it is written, so it does not depend on a
+caller remembering to ask.
+
+**Revoking a parent revokes its descendants.** The parent link is a column in the store, so the
+cascade is a property of the store rather than a loop somebody has to remember to write. A grant
+already revoked keeps the moment and the ancestor it was first revoked under.
+
+**Roles are not authority.** Viewer, reviewer, controller and owner compile to explicit actions when
+a grant is written, and the grant carries no role afterwards. Only controller and owner include
+`question.respond`; a viewer or reviewer receives it through an explicit invitation option that
+carries the notice explaining that an answer, including free text, is input the agent may act on
+under its own permissions.
+
+**An issuer is shown what it is sharing.** `grant.create` computes the preview with the same code
+that writes the grant, and refuses the request when the notices the issuer states it accepted are
+not the ones the grant carries. A shared live screen can hold text printed long before the
+invitation, so the preview shows the text. A new recipient receives no historical attachment keys.
+
+**Invitations are single use and they expire.** The default is `session.view` for one hour; the
+issuer may choose less or extend it to at most 30 days. A lifetime past the bound is refused rather
+than clamped, because a silently shortened invitation is one whose issuer believes something untrue
+about it. Persistent co-owner access is explicit owner pairing, not a longer invitation.
+
+**Nothing is lent through an intermediary.** What an actor may do through a plugin action, an
+attachment action or a workflow is the *intersection* of what the actor holds and what the
+intermediary declares. A view-only invitation calling a plugin that declares `terminal.input`
+obtains no terminal input.
+
+### Revocation
+
+`Controller::revoke_grant` and `Controller::revoke_device_authority` run in the order a revocation
+cannot be correct without:
+
+1. The grants go first, because a grant still in the store is a grant the next request would be
+   decided against.
+2. The revision advances, which invalidates every outstanding dispatch lease at once and
+   deregisters the connections admitted under the authority just withdrawn.
+3. The connections holding those registrations are fenced, so a subscription already open is closed
+   rather than left reading.
+4. The revision is announced to every worker, and what comes back is the per-worker completion
+   status.
+
+A revocation is complete for a worker once that worker has acknowledged the revision and fenced the
+undispatched actions it affects, or once it is confirmed ended. Anything else is `pending`, and the
+answer says which worker and why. Already dispatched effects and content already copied cannot be
+undone.
+
+### The remote authority feed
+
+A remote owner publishes a signed revocation **request**, which carries no revision. This host
+validates it and issues the ordered revision itself, because a device that could number its own
+request would be assigning itself a place in the host's order. A record at or below the revision
+this host has accepted is refused, so replaying an old feed entry cannot put authority back.
+
+Revocation records are retained until every enrolled host has acknowledged them or that host is
+explicitly removed; they do not share mailbox expiry or notification coalescing. `device.list` shows
+each host's last acknowledgement beside the feed's own staleness, because an offline host cannot
+apply a revocation it has not received and a list that looked current because nothing had
+contradicted it would be worse than no list. A host synchronises at reconnect before it serves
+affected remote work, and polls every 30 seconds while online.
+
+### What the host policy holds
+
+`grants::policy` holds what is true of this host rather than of one grant.
+
+* **Organisation leases.** A signed membership lease lasts at most 15 minutes. It is checked against
+  the clock on every request, never against whether a socket is open, so an expired membership
+  blocks further organisation-mediated reads and mutations while the transport stays connected.
+  Personal local owner access continues through an organisation outage unless the host was
+  explicitly enrolled as exclusively organisation-managed.
+* **The bounded offline-validity policy.** Optional, and off by default: the non-expiring owner
+  grant stays account-free and usable without an authority-feed dependency. An owner who chooses a
+  bound gets that bound, measured from the last successful synchronisation, with the stale status
+  and the last sync visible beside it.
+* **Revalidation after wake and reboot.** Expiry is decided from the clock, so waking re-decides it.
+  A policy document restored from a backup names an older revision and is refused: the host keeps
+  the highest revision it has ever accepted, and that floor only rises. A signature proves who wrote
+  a policy, not that the policy is the current one.
+
+### The shared history filter
+
+One filter enforces a grant's history lower bound, in `crates/kr-worker/src/history_filter/`, and
+nine surfaces share it: event pages, terminal and semantic snapshots, loaded conversations,
+attachment references, exports, summaries, changed-since-last-visit and voice context. A surface
+that built its own would be the one place a bound was forgotten.
+
+Content is admitted by **when it was produced**, never by when it was read, re-read or summarised,
+so a summary generated now from an hour-old conversation is an hour-old conversation. Derived data
+carries the interval and the resources it was built from; when that interval crosses the viewer's
+scope the answer is recomputed from the part inside it, or omitted when nothing is left.
+
+A live-only invitation reaches the currently visible screen and nothing else. Snapshot installation
+goes through the filtered projection rather than the worker's unrestricted state, so the buffer that
+is not showing is neither drawn nor described: not its rows, not its saved cursor, not its keyboard
+negotiation. Attachment bytes are a second question from the attachment reference, and need their
+own `files.read`. An invitation may name current questions or approval requests explicitly, which
+permits those exact decisions and not the conversation they came from.

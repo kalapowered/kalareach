@@ -1406,3 +1406,162 @@ pub fn decide(name: &str, version: MethodVersion, ingress: ActorIngress) -> Auth
     }
     AuthorityDecision::Listed(entry)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rights::ActionRight;
+
+    fn entry(name: &str) -> &'static MethodEntry {
+        REGISTRY
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the registry"))
+    }
+
+    fn unconditional(name: &str) -> Vec<ActionRight> {
+        let mut rights: Vec<ActionRight> = entry(name).unconditional_rights().collect();
+        rights.sort_unstable();
+        rights
+    }
+
+    /// Section 23's "Exact method-to-right mappings are required in section 23", stated here as
+    /// the mapping itself. A method whose required right changes has to change this table too,
+    /// which is the point: an authority check that quietly stops asking for a right is the failure
+    /// this guards against.
+    const MAPPING: &[(&str, &[ActionRight])] = &[
+        // Input. Every one of them types, so every one of them needs the right that exposes the
+        // shell user's account.
+        ("input.acquire", &[ActionRight::TerminalInput]),
+        ("input.release", &[ActionRight::TerminalInput]),
+        ("input.interrupt", &[ActionRight::TerminalInput]),
+        ("input.write", &[ActionRight::TerminalInput]),
+        ("shell.launch", &[ActionRight::TerminalInput]),
+        // Attachments. Transfer and palette each need their own explicit right; observation needs
+        // only the view.
+        (
+            "terminal.geometry.transfer",
+            &[ActionRight::TerminalGeometryTransfer],
+        ),
+        ("terminal.palette.set", &[ActionRight::TerminalPalette]),
+        ("session.attach", &[ActionRight::SessionView]),
+        // Agent mutations: prompt, queue and steer share one right; cancel and approval have their
+        // own, so a grant that may stop a turn cannot start one.
+        ("agent.prompt.submit", &[ActionRight::AgentPrompt]),
+        ("agent.prompt.queue", &[ActionRight::AgentPrompt]),
+        ("agent.turn.steer", &[ActionRight::AgentPrompt]),
+        ("agent.turn.cancel", &[ActionRight::AgentCancel]),
+        (
+            "agent.approval.respond",
+            &[ActionRight::AgentApprovalRespond],
+        ),
+        // Questions: reading is a view, answering and cancelling are the answer right.
+        ("question.read", &[ActionRight::SessionView]),
+        ("question.answer", &[ActionRight::QuestionRespond]),
+        ("question.cancel", &[ActionRight::QuestionRespond]),
+        // Sessions: create, close and rename are three rights, not one.
+        ("session.create", &[ActionRight::SessionCreate]),
+        ("session.close", &[ActionRight::SessionClose]),
+        ("session.rename", &[ActionRight::SessionRename]),
+        // Changes and diffs: content is a read, applying is a write, capture and materialisation
+        // are their own.
+        ("diff.read", &[ActionRight::FilesRead]),
+        ("diff.apply", &[ActionRight::FilesApplyDiff]),
+        ("diff.revert", &[ActionRight::FilesApplyDiff]),
+        ("changeset.capture", &[ActionRight::ChangesetCreate]),
+        ("changeset.materialize", &[ActionRight::WorkspaceManage]),
+        // Workspaces: view and read never imply deletion.
+        ("workspace.create", &[ActionRight::WorkspaceManage]),
+        ("workspace.remove", &[ActionRight::WorkspaceManage]),
+        // Project repositories.
+        ("project.init", &[ActionRight::ProjectCreate]),
+        ("project.clone", &[ActionRight::ProjectCreate]),
+        ("project.adopt", &[ActionRight::ProjectCreate]),
+        // Host configuration: devices, catalogues, plugins.
+        ("device.list", &[ActionRight::HostManage]),
+        ("device.revoke", &[ActionRight::HostManage]),
+        ("catalogue.add", &[ActionRight::HostManage]),
+        ("plugin.install", &[ActionRight::HostManage]),
+        // Sharing.
+        ("grant.create", &[ActionRight::SessionShare]),
+        ("grant.revoke", &[ActionRight::SessionShare]),
+        ("grant.list", &[ActionRight::SessionShare]),
+        // Automation.
+        ("workflow.install", &[ActionRight::AutomationManage]),
+        ("workflow.run", &[ActionRight::AutomationManage]),
+        // State recovery and agent state: all reads of the session.
+        ("events.subscribe", &[ActionRight::SessionView]),
+        ("events.snapshot", &[ActionRight::SessionView]),
+        ("history.page", &[ActionRight::SessionView]),
+        ("agent.snapshot", &[ActionRight::SessionView]),
+    ];
+
+    #[test]
+    fn every_method_maps_to_exactly_the_rights_section_twenty_three_names() {
+        for (name, expected) in MAPPING {
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(unconditional(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_read_never_requires_the_right_that_would_let_somebody_type() {
+        for entry in REGISTRY
+            .iter()
+            .filter(|entry| entry.effect == EffectClass::Read)
+        {
+            assert!(
+                !entry
+                    .unconditional_rights()
+                    .any(|right| right == ActionRight::TerminalInput),
+                "{} is a read that demands terminal input",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_right_in_the_vocabulary_is_required_by_some_method() {
+        for right in ActionRight::ALL {
+            assert!(
+                REGISTRY.iter().any(|entry| entry
+                    .required_rights
+                    .iter()
+                    .any(|required| required.authority
+                        == crate::authority::RequiredAuthority::Right { right: *right })),
+                "{right} is in the vocabulary and no method asks for it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_in_the_registry_is_denied_rather_than_approximated() {
+        for invented in ["terminal.write", "grant.enlarge", "device.trust", "session"] {
+            assert!(
+                matches!(
+                    decide(invented, MethodVersion::V1, ActorIngress::PairedDevice),
+                    AuthorityDecision::Denied(_)
+                ),
+                "{invented} resolved to a method"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capability_requirement_is_never_a_substitute_for_a_right() {
+        // Every method that requires capability evidence also states the rights it needs. A
+        // capability says a binding could do something; whether it may is the grant's answer.
+        for entry in REGISTRY
+            .iter()
+            .filter(|entry| entry.effect == EffectClass::Write)
+            .filter(|entry| !matches!(entry.capability, CapabilityRequirement::None))
+        {
+            assert!(
+                !entry.required_rights.is_empty(),
+                "{} demands capability evidence and no authority at all",
+                entry.name
+            );
+        }
+    }
+}
