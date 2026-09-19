@@ -736,6 +736,9 @@ async fn drive(
                                     return AttachOutcome::Disconnected;
                                 }
                                 outstanding.insert(request_id, Outstanding::Scrollback);
+                                // Like every other report that names a position: a size report
+                                // sent before this is answered carries what this asked for.
+                                requested = Some(None);
                             }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
@@ -828,8 +831,7 @@ async fn drive(
                                                 requested.unwrap_or_else(|| {
                                                     display
                                                         .window_above_the_live_page()
-                                                        .flatten()
-                                                        .or(parked)
+                                                        .unwrap_or(parked)
                                                         .map(|row| {
                                                             ViewportPosition::Row(U64::new(row))
                                                         })
@@ -1024,8 +1026,7 @@ async fn drive(
                             // said about it: a screen is newer than an answer that crossed it.
                             display
                                 .window_above_the_live_page()
-                                .flatten()
-                                .or(parked)
+                                .unwrap_or(parked)
                                 .map(|row| ViewportPosition::Row(U64::new(row)))
                         })),
                     };
