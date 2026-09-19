@@ -156,24 +156,39 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 /// The bytes a terminal sends when a bracketed paste ends.
 const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// What a read says about a bracketed paste, when it says anything.
+/// Whether a bracketed paste is open, watched across the reads that go past.
 ///
-/// The delimiter nearest the end of the read decides: a read ending in a start is a paste opening,
-/// one ending in an end is a paste closing, and a read with neither leaves the answer where it was.
-/// Nothing is held back, rewritten or reordered by this; it decides only whether a later read may
-/// be read as one of this terminal's own keys, and a paste whose delimiters a read boundary cut in
-/// half leaves it wrong until another delimiter arrives whole.
-fn paste_state(bytes: &[u8]) -> Option<bool> {
-    let last = |needle: &[u8]| {
-        bytes
-            .windows(needle.len())
-            .rposition(|window| window == needle)
-    };
-    match (last(PASTE_START), last(PASTE_END)) {
-        (None, None) => None,
-        (Some(_), None) => Some(true),
-        (None, Some(_)) => Some(false),
-        (Some(start), Some(end)) => Some(start > end),
+/// It holds nothing back, rewrites nothing and reorders nothing: every byte is forwarded as it
+/// arrives, and this only remembers what it saw so that a later read can be told apart from one of
+/// this terminal's own keys. A delimiter a read boundary cut in half is still that delimiter,
+/// because what carries across the boundary is how much of one the last read ended inside.
+#[derive(Debug, Default)]
+struct PasteWatch {
+    /// Whether a paste is open.
+    open: bool,
+    /// How many bytes of a delimiter the last read ended inside, for each delimiter.
+    partial: [usize; 2],
+}
+
+impl PasteWatch {
+    /// Reads one batch and answers whether a paste is open after it.
+    fn observe(&mut self, bytes: &[u8]) -> bool {
+        for byte in bytes {
+            for (which, delimiter) in [PASTE_START, PASTE_END].into_iter().enumerate() {
+                let matched = self.partial[which];
+                if delimiter[matched] == *byte {
+                    self.partial[which] = matched + 1;
+                    if self.partial[which] == delimiter.len() {
+                        self.open = which == 0;
+                        self.partial = [0, 0];
+                    }
+                } else {
+                    // Start again from this byte, which may itself be a delimiter's first.
+                    self.partial[which] = usize::from(delimiter[0] == *byte);
+                }
+            }
+        }
+        self.open
     }
 }
 
@@ -523,7 +538,10 @@ enum Outstanding {
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
     /// Where this terminal's window is now looking, after a scroll-back key.
-    Scrollback,
+    ///
+    /// It carries how many whole screens this terminal had been given when it went out, because a
+    /// screen that arrived since is a newer answer to the same question.
+    Scrollback(u64),
 }
 
 /// Runs the attachment's input, output and connection in one loop.
@@ -565,17 +583,22 @@ async fn drive(
     // the live screen. It is reported with every size report as well, so a window the person has
     // scrolled back to stays where they put it when they resize their terminal.
     let mut parked: Option<u64> = None;
-    // Where the scroll-back report in flight asked the window to go, when one is in flight. A size
-    // report sent meanwhile carries that rather than the position the window has left, because the
-    // session answers them in the order they arrive and the later one is the one it keeps.
-    let mut requested: Option<Option<u64>> = None;
+    // What the report in flight asked for, when one is in flight, exactly as it asked: a distance
+    // above the live screen is not the row it resolves to, and a size report that turned one into
+    // the other would name somewhere else. A size report sent meanwhile carries this rather than
+    // the position the window has left, because the session answers them in the order they arrive
+    // and the later one is the one it keeps.
+    let mut requested: Option<Option<ViewportPosition>> = None;
+    // How many whole screens this terminal has been given. An answer about a request that was in
+    // flight while a newer screen arrived says nothing about where the window is now.
+    let mut screens = 0_u64;
     // Movement the person has asked for and the session has not answered yet, the step it was
     // measured with, and the size that report carried.
     let mut queued = 0_i64;
     let mut step = 1_u64;
     let mut dimensions_now = attached.dimensions;
     // Whether a bracketed paste is open, so that nothing inside one is read as a key.
-    let mut pasting = false;
+    let mut paste = PasteWatch::default();
     // The output cursor of the last whole screen this terminal was given, which is how it tells a
     // screen the session had something new to say from one it asked for itself.
     let mut drawn_at: Option<u64> = None;
@@ -630,6 +653,13 @@ async fn drive(
                         // itself. The renderer is shared with the client library, so this terminal
                         // and the companion application put a canonical cell in the same place.
                         if crate::render::is_projection_event(notification.event_type.as_str()) {
+                            // A reset replaces the screen, so an answer about a request sent
+                            // before it describes a window that has since been drawn again.
+                            if notification.event_type.as_str()
+                                == kr_protocol::projection::PROJECTION_RESET_EVENT
+                            {
+                                screens = screens.saturating_add(1);
+                            }
                             let Some(event) =
                                 crate::render::decode(
                                     notification.event_type.as_str(),
@@ -713,7 +743,7 @@ async fn drive(
                                 {
                                     return AttachOutcome::Disconnected;
                                 }
-                                outstanding.insert(request_id, Outstanding::Scrollback);
+                                outstanding.insert(request_id, Outstanding::Scrollback(screens));
                             }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
@@ -803,8 +833,10 @@ async fn drive(
                                                 u64::from(size.rows),
                                             ),
                                             position: Nullable(
-                                                requested.unwrap_or(parked).map(|row| {
-                                                    ViewportPosition::Row(U64::new(row))
+                                                requested.unwrap_or_else(|| {
+                                                    parked.map(|row| {
+                                                        ViewportPosition::Row(U64::new(row))
+                                                    })
                                                 }),
                                             ),
                                         };
@@ -893,11 +925,15 @@ async fn drive(
                             // session has given up becomes the oldest one it still holds, and a
                             // row inside the live page becomes the live screen. The pages that
                             // cover it arrive as ordinary output.
-                            (Outstanding::Scrollback, outcome) => {
+                            (Outstanding::Scrollback(asked_after), outcome) => {
                                 if let kr_protocol::envelope::Outcome::Ok(value) = outcome
                                     && let Ok(result) = value.to_typed::<
                                         kr_protocol::attachment::AttachmentViewportResult,
                                     >()
+                                    // A whole screen arrived while this was in flight, and a
+                                    // screen says where the window is. An answer about a request
+                                    // older than that says where it was.
+                                    && screens == asked_after
                                 {
                                     parked = landed(result.position.0);
                                 }
@@ -930,8 +966,8 @@ async fn drive(
                                     {
                                         return AttachOutcome::Disconnected;
                                     }
-                                    outstanding.insert(request_id, Outstanding::Scrollback);
-                                    requested = Some(landed(position));
+                                    outstanding.insert(request_id, Outstanding::Scrollback(screens));
+                                    requested = Some(position);
                                 }
                             }
                             // The screen follows as ordinary output. A refusal means the session no
@@ -991,11 +1027,9 @@ async fn drive(
                     let params = kr_protocol::attachment::AttachmentViewportParams {
                         attachment_id,
                         dimensions,
-                        position: Nullable(
-                            requested
-                                .unwrap_or(parked)
-                                .map(|row| ViewportPosition::Row(U64::new(row))),
-                        ),
+                        position: Nullable(requested.unwrap_or_else(|| {
+                            parked.map(|row| ViewportPosition::Row(U64::new(row)))
+                        })),
                     };
                     (
                         send_geometry(
@@ -1033,9 +1067,7 @@ async fn drive(
                 // session byte for byte, whatever it happens to contain. The delimiters are read
                 // whole, like everything else here, so a paste is open from the read that begins
                 // with one to the read that ends with the other.
-                if let Some(open) = paste_state(&bytes) {
-                    pasting = open;
-                }
+                let pasting = paste.observe(&bytes);
                 let mine = !pasting && display.holds_screen() && display.showing_history_buffer();
                 if mine
                     && let Some(steps) = scroll_keys(&bytes)
@@ -1059,7 +1091,7 @@ async fn drive(
                     queued = queued.saturating_add(steps);
                     if !outstanding
                         .values()
-                        .any(|what| matches!(what, Outstanding::Scrollback))
+                        .any(|what| matches!(what, Outstanding::Scrollback(_)))
                     {
                         // A movement the window cannot make is spent rather than kept: a window on
                         // the live screen asked to go forward has nowhere to go, and holding that
@@ -1085,8 +1117,8 @@ async fn drive(
                         {
                             return AttachOutcome::Disconnected;
                         }
-                        outstanding.insert(request_id, Outstanding::Scrollback);
-                        requested = Some(landed(position));
+                        outstanding.insert(request_id, Outstanding::Scrollback(screens));
+                        requested = Some(position);
                         }
                     }
                     // The key was this terminal's, so nothing of it reaches the session, whether
@@ -1427,21 +1459,59 @@ mod tests {
     /// A paste is open from the delimiter that opens it to the one that closes it.
     #[test]
     fn a_delimiter_anywhere_in_a_read_decides_the_paste() {
-        use super::paste_state;
+        use super::PasteWatch;
 
-        assert_eq!(paste_state(b"ls -l"), None, "an ordinary read says nothing");
-        assert_eq!(paste_state(b"x\x1b[200~"), Some(true), "a paste opening");
-        assert_eq!(paste_state(b"\x1b[201~x"), Some(false), "and one closing");
-        assert_eq!(
-            paste_state(b"\x1b[200~text\x1b[201~"),
-            Some(false),
+        let mut paste = PasteWatch::default();
+        assert!(!paste.observe(b"ls -l"), "an ordinary read opens nothing");
+        assert!(paste.observe(b"x\x1b[200~"), "a paste opening");
+        assert!(paste.observe(b"text"), "and it stays open");
+        assert!(!paste.observe(b"\x1b[201~x"), "until one closes it");
+        assert!(
+            !paste.observe(b"\x1b[200~text\x1b[201~"),
             "a whole paste in one read is closed at the end of it"
         );
-        assert_eq!(
-            paste_state(b"\x1b[201~\x1b[200~more"),
-            Some(true),
+        assert!(
+            paste.observe(b"\x1b[201~\x1b[200~more"),
             "and one paste ending while another begins is open"
         );
+    }
+
+    /// A delimiter a read boundary cut in half is still that delimiter.
+    #[test]
+    fn a_delimiter_split_across_reads_is_still_a_delimiter() {
+        use super::PasteWatch;
+
+        let mut paste = PasteWatch::default();
+        assert!(!paste.observe(b"\x1b[20"), "half of a start delimiter");
+        assert!(paste.observe(b"0~"), "and the rest of it opens the paste");
+        assert!(
+            paste.observe(super::SCROLL_BACK_KEY),
+            "a key inside it is pasted text and the paste stays open"
+        );
+        assert!(
+            paste.observe(b"\x1b[201"),
+            "half of an end delimiter closes nothing yet"
+        );
+        assert!(!paste.observe(b"~"), "and the rest of it closes the paste");
+        assert!(
+            !paste.observe(super::SCROLL_BACK_KEY),
+            "so the key after it is a key again"
+        );
+    }
+
+    /// Something that starts like a delimiter and is not one leaves the paste alone.
+    #[test]
+    fn a_sequence_that_is_not_a_delimiter_opens_nothing() {
+        use super::PasteWatch;
+
+        let mut paste = PasteWatch::default();
+        assert!(!paste.observe(b"\x1b[2"), "the beginning of many things");
+        assert!(!paste.observe(b"J"), "which turned out to be an erase");
+        assert!(
+            !paste.observe(b"\x1b[200"),
+            "and a start delimiter that never finishes"
+        );
+        assert!(!paste.observe(b"x"), "opens no paste either");
     }
 
     #[test]
