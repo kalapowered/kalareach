@@ -862,14 +862,15 @@ async fn a_device_without_session_view_still_recovers_its_own_project_result() {
     host.stop().await;
 }
 
-/// KR-REQ-23.42: what `action.read` says about an action this host performed itself.
+/// KR-REQ-23.42: what `action.read` says about an action that belongs to this host.
 ///
 /// A receipt lives in the journal of the session an action was performed on, and a repository
-/// mutation is performed on no session. This host keeps what such an action produced where the
-/// service that performed it keeps it, which is not a receipt in the shape this method answers
-/// with, so the request is refused and the refusal says how the result is actually recovered.
+/// mutation belongs to no session. What such an action leaves is kept by the service, which is not
+/// a receipt in the shape this method answers with, so the request is refused and the refusal says
+/// how the outcome is obtained instead. An action nothing recorded reads differently, because it
+/// means something different.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn action_read_says_how_to_recover_a_result_this_host_holds_itself() {
+async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let device = net_support::Device::create().await;
@@ -906,11 +907,11 @@ async fn action_read_says_how_to_recover_a_result_this_host_holds_itself() {
             &kr_protocol::receipt::ActionReadParams { action_id },
         )
         .await
-        .expect_err("this host keeps no receipt for an action it performed itself");
+        .expect_err("this host keeps no receipt for an action of its own");
     assert_eq!(refused.code(), ErrorCode::InvalidArgument);
     assert!(
         refused.to_string().contains("submit the action again"),
-        "the refusal says how the result is recovered: {refused}"
+        "the refusal says how the outcome is obtained: {refused}"
     );
 
     // An action nothing recorded reads differently, because it means something different.

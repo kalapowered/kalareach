@@ -74,7 +74,10 @@ async fn a_device_reads_the_desktop_capability_records_the_owner_reads() {
         "the capability records are the same answer on both ingresses"
     );
 
-    // The distinctions the row asks for, in the answer the device holds.
+    // The answer the device holds carries the display server the records are about. Which server
+    // that is depends on the machine this runs on, so what this establishes is that the
+    // distinction travels rather than that any particular one was made; the platform reader's own
+    // tests are where X11, Wayland and the compositor combinations are told apart.
     assert!(
         !remotely.desktop.records.is_empty(),
         "the host reports one record per capability in the section 11 shape"
@@ -97,18 +100,43 @@ async fn a_device_reads_the_desktop_capability_records_the_owner_reads() {
     }
     assert_named_by_capability(&remotely.desktop);
 
-    // Selecting a desktop is not evidence for anything it can do: there is no aggregate record,
-    // and a device cannot reach a method that controls one, whatever its grant says.
+    // Selecting a desktop is not evidence for anything it can do: there is no aggregate record to
+    // mistake for a permission, and the registry as a whole has no method that controls a desktop.
     assert!(
         remotely.desktop.record("desktop.automation").is_none(),
-        "there is no aggregate desktop-automation capability to mistake for a permission"
+        "there is no aggregate desktop-automation capability"
     );
-    for name in ["desktop.control", "desktop.automation", "gui.control"] {
-        assert!(
-            kr_protocol::method::Method::from_wire(name).is_none(),
-            "{name} is not a method this protocol has"
-        );
-    }
+    let controls_a_desktop: Vec<&str> = Method::ALL
+        .iter()
+        .map(|method| method.as_str())
+        .filter(|name| name.starts_with("desktop.") || name.starts_with("gui."))
+        .collect();
+    assert!(
+        controls_a_desktop.is_empty(),
+        "this protocol exposes no GUI-control method: {controls_a_desktop:?}"
+    );
+    // `automation.manage` is the one right whose name could be read as desktop control, and the
+    // methods that require it are workflow definitions.
+    let under_automation: Vec<&str> = Method::ALL
+        .iter()
+        .filter(|method| {
+            method.entry().required_rights.iter().any(|required| {
+                matches!(
+                    required.authority,
+                    kr_protocol::authority::RequiredAuthority::Right {
+                        right: ActionRight::AutomationManage
+                    }
+                )
+            })
+        })
+        .map(|method| method.as_str())
+        .collect();
+    assert!(
+        under_automation
+            .iter()
+            .all(|name| name.starts_with("workflow.") || name.starts_with("automation.")),
+        "automation.manage covers workflow definitions and nothing else: {under_automation:?}"
+    );
 
     session.close();
     host.stop().await;
@@ -175,12 +203,13 @@ async fn a_device_asking_about_another_environment_is_refused_as_the_owner_is() 
     host.stop().await;
 }
 
-/// KR-REQ-03.27: the sleep setting and its reason reach a device, and nothing it does turns it on.
+/// KR-REQ-03.27, in part: a device reads the sleep state, and no method lets it change one.
 ///
-/// Setup offers mains-only inhibition; starting a host never enables it. A device reads that state
-/// in host information, together with the reason an assertion is held when one is, and there is no
-/// method in the registry through which a paired device could change it: host configuration is
-/// `host.manage` over the local surface, and the setting is not a protocol method at all.
+/// Starting a host never enables inhibition, so a host nobody has configured reports the setting
+/// off and holds nothing. What a device can do about that is nothing: the registry admits a paired
+/// device to no method that writes anything in the host-and-environment group, which is where a
+/// power setting would live. What this does not show is the setup assistant's own offer, or the
+/// separate choice between mains and battery, neither of which is a protocol method.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -235,31 +264,37 @@ async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
         .expect("environment.capabilities is served to the device");
     assert_eq!(capabilities.power, remotely.power);
 
-    // And there is nothing a device can call to change it. The vocabulary has no sleep right, and
-    // the two host-configuration surfaces the registry does have are private to local IPC.
+    // And there is nothing a device can call to change it. Every method the registry admits a
+    // paired device to is checked, not a handful of names this test invented: none of them writes
+    // anything in the host-and-environment group, which is where a power setting would live.
+    let writes_host_configuration: Vec<&str> = Method::ALL
+        .iter()
+        .filter(|method| {
+            let entry = method.entry();
+            entry.group == kr_protocol::method::MethodGroup::HostAndEnvironment
+                && entry.effect == kr_protocol::authority::EffectClass::Write
+                && entry
+                    .ingress
+                    .contains(&kr_protocol::actor::ActorIngress::PairedDevice)
+        })
+        .map(|method| method.as_str())
+        .collect();
     assert!(
-        ActionRight::ALL
-            .iter()
-            .all(|right| !right.as_str().contains("sleep")),
-        "the action vocabulary has no sleep right to grant"
+        writes_host_configuration.is_empty(),
+        "a device reads this host's state and changes none of it: {writes_host_configuration:?}"
     );
-    for name in ["host.power.set", "host.sleep.set", "host.config.set"] {
-        assert!(
-            Method::from_wire(name).is_none(),
-            "{name} is not a method this protocol has"
-        );
-    }
 
     session.close();
     host.stop().await;
 }
 
-/// KR-REQ-03.27: what a device is told about inhibition is what the owner chose.
+/// KR-REQ-03.27, in part: what a device is told about inhibition is what the owner chose.
 ///
 /// Battery use is a separate explicit choice, so the setting is a choice between named values
-/// rather than a switch, and the host says why it is holding nothing when the setting is on. A
-/// device reads all of it: the choice, whether an assertion is held, the reason when one is, and
-/// the reason none is when the setting says otherwise.
+/// rather than a switch, and the host says why it is holding nothing when the setting is on. What
+/// this shows is that a stored choice reaches a device with the reason no assertion is held under
+/// it. It does not show an assertion being held: that needs work outstanding, which needs a live
+/// session, which needs a worker process this suite does not start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_inhibition_a_device_reads_is_the_one_the_owner_chose_and_says_why() {
     let owner = DeviceKeys::generate().expect("owner keys");

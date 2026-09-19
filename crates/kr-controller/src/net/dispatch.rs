@@ -1272,20 +1272,23 @@ impl RemoteConnection {
         let session_id = match routed {
             Some(routed) => match routed.session_id {
                 Some(session_id) => session_id,
-                // This host performed the action itself: a create, or a repository or workspace
-                // mutation. It records what those produced where the service that performed them
-                // keeps it, and it holds no receipt in the shape this method answers with, so
-                // there is nothing here to read. Submitting the action again under the same
-                // identity is how its result is recovered, and that is what the sentence says
-                // rather than leaving a caller to guess that a recorded action is missing.
+                // The route says this host owns whatever this identifier produced rather than a
+                // session: a create, or a repository or workspace mutation. The route is claimed
+                // before the action is admitted, so it says where an outcome would live rather
+                // than that anything ran. Either way there is no receipt here to read, because
+                // what such an action leaves is kept by the service that would have performed it
+                // and not in the shape this method answers with. Submitting the action again
+                // under the same identifier is what gives the caller its outcome, and the
+                // sentence says so rather than leaving a caller to conclude that a recorded
+                // action has gone missing.
                 None => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "action {} was performed by this host rather than by a session, and                              this host keeps no receipt for one; submit the action again under                              the same identifier to be given its result",
-                            params.action_id
-                        ),
-                    ));
+                    let detail = format!(
+                        "action {} belongs to this host rather than to a session, and this host \
+                         keeps no receipt for one; submit the action again under the same \
+                         identifier to be given its outcome",
+                        params.action_id
+                    );
+                    return Err(ProtocolError::new(ErrorCode::InvalidArgument, detail));
                 }
             },
             // Nothing recorded it. An action nobody recorded is not an action this device can be

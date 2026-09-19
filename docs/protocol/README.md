@@ -444,7 +444,8 @@ convention:
 
 - **Asking is not holding.** A request for a capability the grant does not carry yields an
   attachment without it. `AttachmentSummary.granted` reports what was actually given, and every
-  later operation on that attachment is checked against it.
+  later operation on that attachment is checked against it *as well as* against the grant's current
+  rights for the method it asks for. The two are separate checks and neither replaces the other.
 - **An attachment identifier is not permission.** It names an attachment; what that attachment may
   do is the granted set, which the host wrote when it admitted it.
 - **A caller acting under no grant is not narrowed.** A locally authenticated caller's authority is

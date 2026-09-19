@@ -281,9 +281,11 @@ reports an agent at work, a session waiting for a decision to be answered, or a 
 still stopping processes and draining their output. Work begins and ends without this daemon being
 told, so while the setting is on it looks at the question every fifteen seconds as well as whenever
 a session is created or closed and whenever it is asked; while the setting is off nothing looks at
-anything. A close that arrived over the network is the same outstanding work as a local one and
-reaches the same review, so a closure a device asked for keeps the machine awake while it finishes
-rather than releasing an assertion the host never took. Each session gets half a second to answer and the whole round two seconds, so the answer
+anything. A close that arrived over the network reaches the same review at the same point, when
+the worker has accepted it, so a closure a device asked for is looked at under the owner's setting
+rather than releasing an assertion the host never took. The review runs on its own task and the
+device's answer does not wait for it, so what this establishes is that the setting is looked at
+rather than that an assertion is held for every instant of every closure. Each session gets half a second to answer and the whole round two seconds, so the answer
 does not get slower as sessions are added. Host status, `kr status` and `kr doctor` each print what
 is held and why.
 
@@ -698,9 +700,15 @@ was checked against, capability by capability:
 The table is `kr_protocol::rights::attachment_capability_right`, beside the action vocabulary, so a
 right added to the vocabulary has to be decided for the capabilities rather than defaulting into
 one. The intersection is made in the worker, where the attachment is admitted, because that is
-where the attachment's own record is written: the summary the caller is given then says what it
-actually holds, and every later operation — resizing, transferring the size, acquiring the lease,
-writing input — is checked against that record rather than against the grant a second time.
+where the attachment's own record is written, and the summary the caller is given then says what it
+actually holds.
+
+Every later operation on that attachment — resizing, transferring the size, acquiring the lease,
+writing input — passes two checks, not one. The daemon checks the grant's current rights for the
+method, as it does for every request. The worker then checks the capability the attachment was
+granted. The second is what the intersection buys: a device whose grant carries `terminal.input`
+but whose attachment was admitted without the input capability is refused by the worker, and a
+device whose grant has since lost the right is refused by the daemon.
 
 Asking for a capability the grant does not carry is not a refusal. A client that asks for
 everything it can use gets an attachment without the parts its grant does not reach, which is what
@@ -736,22 +744,31 @@ Two limits of that, stated rather than implied:
   copy: `project.create` reaches any directory this host can open. What the resolution does
   establish is that the directory it opened is the one the effect writes into, by the identity it
   recorded, so nothing is substituted underneath it.
-* **`action.read` does not answer for an action this host performed itself.** A receipt lives in
-  the journal of the session an action was performed on, and a create or a repository mutation is
-  performed on no session. What such an action produced is kept where the service that performed it
-  keeps it, which is not a receipt in the shape that method answers with, so the request is refused
-  and the refusal says how to recover the result: submit the action again under the same
-  identifier. That is the recovery section 9 puts first, and it works — the service answers the
-  repeat from its own record without performing anything twice.
+* **A workspace's source is not separately authorised either.** `workspace.manage` covers creating
+  and removing a working copy of a repository this environment already holds; `project.create`
+  covers bringing a repository into the environment in the first place. Neither carries a further
+  check on which repository a working copy is taken from, so a grant that carries
+  `workspace.manage` reaches every repository the environment holds.
+* **`action.read` does not answer for an action this host owns.** A receipt lives in the journal of
+  the session an action was performed on, and a create or a repository mutation belongs to no
+  session. What such an action leaves is kept by the service, which is not a receipt in the shape
+  that method answers with, so the request is refused and the refusal says how the outcome is
+  obtained: submit the action again under the same identifier. That is the recovery section 9 puts
+  first, and it works — the service answers the repeat from its own record without performing
+  anything twice.
 
 The admission a project mutation carries is asked about twice. Once where the daemon accepts it,
 under the registry lock, and once inside the service's own blocking work, immediately after it has
-failed to find a retained record and immediately before it acts. The second is what covers the
-waiting in between: a blocking task to be scheduled and a store to be opened, with a clone or a
-materialisation behind them. It reads the registration and the clock from memory, so there is
-nothing left to wait for between the answer and the effect. A retry never reaches it, because the
-retained record answered it first: section 9 keeps a receipt readable after the freshness that
-admitted it is gone.
+failed to find a retained record and immediately before it acts. The second reads the registration
+and the clock from memory, so it costs nothing and covers the waiting that the first cannot: a
+blocking task to be scheduled and a retained record to be looked for. A retry never reaches it,
+because the retained record answered first.
+
+What neither covers is the service's own preparation. Resolving a destination and taking the
+store's lock happen after the second answer, and a clone or a materialisation runs behind them, so
+a revocation that completes in there reaches an action this host had already admitted. Section 9
+lets such an action finish under the deadline it was admitted with; narrowing the window further
+means asking inside the service's own transaction, which the service would have to offer.
 
 ## What the host owes the transport
 
