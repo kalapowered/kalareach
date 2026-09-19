@@ -114,10 +114,10 @@ impl Host {
     /// Installs a qualified Zsh package for the daemon, and none for the worker.
     ///
     /// The daemon is told where this installation's packages are, so a managed create naming that
-    /// shell is admitted. The worker is pointed at a directory that holds none, so it starts,
-    /// claims its reservation, finds nothing it can serve and says so. That is the only way to
-    /// make a worker report that it could not start, and both halves are this test's own: neither
-    /// depends on what the machine happens to have installed.
+    /// shell is admitted. The package it resolves travels to the worker, and the binary that
+    /// package names cannot be executed, so the worker starts, claims its reservation, fails to
+    /// start the root shell and says so. Everything here is this test's own: nothing depends on
+    /// what the machine happens to have installed.
     fn with_shell_package(mut self) -> Self {
         use kr_shell_integration::contract::qualification::ShellKind;
         use kr_shell_integration::host::package::{
@@ -130,6 +130,16 @@ impl Host {
         std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
         let executable = directory.join("bin").join("zsh");
         std::fs::copy("/bin/cat", &executable).expect("copies a program");
+        // A file the package record can name and the worker cannot run. Both the daemon's check
+        // and the worker's read ask whether the executable is a file, which it is; what fails is
+        // starting it, which is the worker's own work and the only part of it this test is about.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600))
+                .expect("a program this worker cannot execute");
+        }
         std::fs::create_dir_all(directory.join("startup")).expect("creates the entry directory");
         std::fs::write(
             directory.join("startup/entry"),
@@ -164,9 +174,9 @@ impl Host {
 
         // Where the worker this daemon starts looks for its own packages: a directory this test
         // made and left empty. The value is set on the child rather than on this process, whose
-        // environment every other test in this binary shares. Without it the worker would read the
-        // installation's own root, and whether it found a package there would depend on the
-        // machine rather than on the test.
+        // environment every other test in this binary shares. A managed create carries the
+        // package the daemon resolved, so this decides nothing for one; what it does is keep the
+        // worker away from the installation's own root on every other path.
         let empty = self.temp.root().join("no-packages");
         std::fs::create_dir_all(&empty).expect("creates an empty package root");
         self.worker_packages = Some(empty);
@@ -496,10 +506,10 @@ async fn a_daemon_restart_keeps_the_session_and_its_shell() {
 /// A worker that reports it could not start resolves its own reservation, and the directory the
 /// host prepared for it goes back.
 ///
-/// Managed shell mode is the one thing a worker can be asked for and refuse before it has a
-/// session: it needs a qualified shell package resolved from its own environment. The daemon is
-/// told where this installation's packages are, so the create is admitted; the worker is not, so it
-/// starts, claims its reservation, says it cannot go on, and exits.
+/// A root shell that cannot be started is the thing a worker reports before it has a session. The
+/// daemon admits the create, resolves the package and sends it; the binary that package names is a
+/// file the worker cannot execute, so the worker starts, claims its reservation, says it cannot go
+/// on, and exits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
     let host = Host::create().with_shell_package();
@@ -522,14 +532,14 @@ async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
     // The daemon reports that it could not start a worker, and carries the worker's own words.
     assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
     assert!(
-        refused.message.contains("SHELL_INTEGRATION_UNSUPPORTED"),
+        refused.message.contains("start the root shell"),
         "the worker's own words reach the caller: {refused}"
     );
     assert!(
-        refused
-            .message
-            .contains("zsh has no qualified KalaReach package"),
-        "and they are the report this test arranged, made before the shell was started: {refused}"
+        refused.message.to_lowercase().contains("denied")
+            || refused.message.to_lowercase().contains("permission"),
+        "and they are the report this test arranged, made when the root shell would not start: \
+         {refused}"
     );
     // The reservation the report resolved stops occupying the environment, and what was prepared
     // for that worker is given back with it.

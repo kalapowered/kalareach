@@ -267,9 +267,11 @@ these commands in one process are serialised against each other; two `kr` proces
 ## The command hooks
 
 Two of the integration's hooks ask the session rather than the fence machine, and the session
-answers each on the step that carried it, after everything the same stimulus released.
+answers each on the step that carried it, after everything the same stimulus released. Both travel
+on the bridge endpoint as its own frames, like the reader's idle report and the gesture change, so
+neither is a method a client could name.
 
-`root.command.resolve` runs in front of an interactive invocation, before the command starts. The
+The resolve hook runs in front of an interactive invocation, before the command starts. The
 session answers with the argument vector to run: the command name and the vector the person typed,
 plus the flags an enabled integration for that command adds. Four things bypass it, and each keeps
 the invocation exactly as typed and is given no backend at all: a command invoked by absolute path,
@@ -279,7 +281,7 @@ is answered with the worker-owned backend the session established *before* it an
 gateway exists before the program does. There is no other route to one: a program already running
 never acquires a backend afterwards, because this hook is the only place one is made.
 
-`root.command.block` reports one command block: the command line the editor accepted, when it
+The block hook reports one command block: the command line the editor accepted, when it
 started, how long it ran, what it exited with and the directory it ran in, with the
 working-directory revision a launch is checked against. Each block arrives twice, once with no
 status when the command starts and once when it ends, and the second replaces the first, so a
@@ -289,9 +291,8 @@ reader's own boundaries.
 
 ## Section 23's private group
 
-`root.editor.enter`, `root.editor.leave`, `root.editor.fence`, `root.eof.detach`,
-`root.command.accepted`, `root.command.resolve` and `root.command.block` are reachable from a
-validated root registration over private IPC and
+`root.editor.enter`, `root.editor.leave`, `root.editor.fence`, `root.eof.detach` and
+`root.command.accepted` are reachable from a validated root registration over private IPC and
 nowhere else. That is true of the transport rather than only of an authority table: they travel on
 the bridge endpoint as its own frames, and there is no frame on the worker's client endpoint that
 carries one — a request naming one of them is refused by the dispatch, because no handler serves it.
