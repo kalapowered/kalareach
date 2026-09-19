@@ -283,6 +283,7 @@ impl LinkDispatch {
                 plugin_id,
                 action,
                 draft_id,
+                draft_revision,
                 parameters,
                 operation,
                 token,
@@ -305,11 +306,20 @@ impl LinkDispatch {
                          to encode",
                     )
                 })?;
+                // An action that names a draft names the revision this host checked it at. The
+                // identifier on its own denotes whatever the draft holds when the frame lands,
+                // and an upstream given only that would act on a draft nobody admitted.
+                if draft_id.is_some() != draft_revision.is_some() {
+                    return Err(BrokerError::invalid(
+                        "a draft-bearing action carries the revision its draft was admitted at",
+                    ));
+                }
                 serde_json::json!({
                     "plugin_id": plugin_id.as_str(),
                     "action": action.as_str(),
                     "operation": operation.as_str(),
                     "draft_id": draft_id.as_ref().map(ToString::to_string),
+                    "draft_revision": draft_revision.map(|revision| revision.get()),
                     "parameters": arguments,
                     // Section 11: the effect plan may use only what this invocation permits, and
                     // the token is what says which invocation that is.
@@ -730,6 +740,66 @@ mod tests {
                 "and nothing is left over"
             );
         }
+    }
+
+    /// One prepared plugin action, as an admission hands it to a transport.
+    fn plugin_action(
+        draft_id: Option<kr_protocol::ids::DraftId>,
+        draft_revision: Option<kr_protocol::scalars::U64>,
+    ) -> UpstreamRequest {
+        UpstreamRequest {
+            admitted: crate::broker::methods::Admitted::new(),
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([2; 16]),
+            ),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            operation: kr_protocol::gateway::RichOperation::PluginAction,
+            turn_id: None,
+            body: UpstreamBody::PluginAction {
+                plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),
+                action: kr_protocol::broker::ActionName::new("draft.attach").expect("valid"),
+                draft_id,
+                draft_revision,
+                parameters: b"{}".to_vec(),
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamAttachment),
+                token: None,
+            },
+        }
+    }
+
+    /// KR-REQ-23.30: what goes on the wire names the draft revision the host checked.
+    ///
+    /// A draft identifier denotes whatever the draft holds when the frame lands. The revision the
+    /// admission was taken against travels with it, so the upstream acts on the draft this host
+    /// admitted or on nothing.
+    #[test]
+    fn a_draft_bearing_action_encodes_the_revision_it_was_admitted_at() {
+        let draft_id =
+            kr_protocol::ids::DraftId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16]));
+        let encoded = LinkDispatch::parameters(&plugin_action(
+            Some(draft_id),
+            Some(kr_protocol::scalars::U64::new(7)),
+        ))
+        .expect("a validated action encodes");
+        assert_eq!(
+            encoded["draft_id"],
+            serde_json::json!(draft_id.to_string()),
+            "the draft it acts on"
+        );
+        assert_eq!(
+            encoded["draft_revision"],
+            serde_json::json!(7),
+            "and the revision that draft stood at when it was admitted"
+        );
+
+        // An action that names no draft names no revision, and neither half travels alone.
+        let none = LinkDispatch::parameters(&plugin_action(None, None)).expect("it encodes");
+        assert_eq!(none["draft_id"], serde_json::Value::Null);
+        assert_eq!(none["draft_revision"], serde_json::Value::Null);
+        assert!(
+            LinkDispatch::parameters(&plugin_action(Some(draft_id), None)).is_err(),
+            "a draft with no checked revision is not something this host transmits"
+        );
     }
 
     #[test]

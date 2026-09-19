@@ -115,6 +115,12 @@ pub enum UpstreamBody {
         action: ActionName,
         /// The draft it acts on, where it acts on one.
         draft_id: Option<kr_protocol::ids::DraftId>,
+        /// The revision that draft stood at when the invocation was admitted.
+        ///
+        /// The identifier alone does not say what it denotes: a draft that moves afterwards keeps
+        /// its identifier and changes its content. The revision the host checked travels with it,
+        /// so the upstream acts on the draft this invocation was admitted against or on nothing.
+        draft_revision: Option<kr_protocol::scalars::U64>,
         /// The action's own parameters, canonically encoded.
         parameters: Vec<u8>,
         /// The operation the validated plan prepares.
@@ -943,6 +949,10 @@ impl Broker {
                 plugin_id: params.plugin_id.clone(),
                 action: params.action.clone(),
                 draft_id: params.draft_id.as_ref().copied(),
+                // The revision the draft stood at when it was resolved for this admission. The
+                // frame carries it, so what the upstream acts on is the draft this host checked
+                // rather than whatever the identifier denotes by the time the bytes land.
+                draft_revision: draft.as_ref().map(|snapshot| snapshot.revision),
                 parameters: arguments.clone(),
                 operation: None,
                 token: None,

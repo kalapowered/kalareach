@@ -3255,7 +3255,9 @@ with it, and the plan the component returns is refused unless the declaration in
 one the invocation was admitted under: a package that re-registered the action while its component
 was working has withdrawn the invitation. The draft is resolved before the admission takes its lock
 and the snapshot is what the admission binds to; a draft that moved before the plan arrived is
-`DRAFT_CONFLICT`. The arguments a plan is for are the arguments that will execute: the host
+`DRAFT_CONFLICT`. The frame carries that revision beside the draft identifier, because the
+identifier on its own denotes whatever the draft holds when the frame lands: an upstream given
+only the identifier would act on a draft this host never admitted. The arguments a plan is for are the arguments that will execute: the host
 computes their digest itself and compares it with the token's and the plan's, because a hash a
 component supplied says only that the component can write a hash. The arguments are read once at
 admission and written back in the one form this host will transmit, so the digest covers the bytes

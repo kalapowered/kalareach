@@ -29,8 +29,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, GrantLowerBound, ManagedProcess,
-    RegisteredAction, TransportHandle, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command,
-    subject,
+    RegisteredAction, TransportHandle, UpstreamBody, UpstreamDispatch, UpstreamOutcome,
+    UpstreamRequest, command, subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -872,6 +872,20 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
     );
     invoke("draft.attach", Nullable::some(draft))
         .expect("and it runs once the draft is one this host can resolve");
+    // And what goes to the upstream names the revision the draft stood at when it was admitted,
+    // not only the identifier: the identifier alone would denote whatever the draft holds by the
+    // time the frame lands.
+    let carried = upstream.submitted();
+    let UpstreamBody::PluginAction {
+        draft_id: carried_draft,
+        draft_revision,
+        ..
+    } = &carried.last().expect("the action was carried").body
+    else {
+        panic!("a plugin action was carried");
+    };
+    assert_eq!(*carried_draft, Some(draft));
+    assert_eq!(*draft_revision, Some(kr_protocol::scalars::U64::new(1)));
 
     // The grant is the binding's, not the action's wish: withdrawing it refuses the action.
     broker
