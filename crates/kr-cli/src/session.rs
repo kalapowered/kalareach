@@ -786,8 +786,74 @@ async fn drive(
     }
     loop {
         tokio::select! {
-            // Biased towards the worker, so output and refusals are seen before more input is sent.
+            // Biased towards the worker, so output and refusals are seen before more input is
+            // sent. What comes before even that is a held prefix whose moment has passed: it is
+            // the person's own bytes, and a session that keeps printing must not keep them.
             biased;
+            () = pointer_expiry(pointer_deadline) => {
+                // Nothing came to finish it, so it was not a report. What was held is the
+                // person's, and it goes to the application now.
+                pointer_deadline = None;
+                let held = pointers.release();
+                if !held.is_empty() {
+                    // Typing brings a following window back to the live screen, wherever in this
+                    // loop the typing turns out to have been.
+                    if follow_live
+                        && showing_history
+                        && let Ok(size) = terminal.size()
+                        && size.columns > 0
+                        && size.rows > 0
+                    {
+                        let request_id = kr_protocol::ids::RequestId::new(next_request);
+                        next_request += 1;
+                        let params = kr_protocol::attachment::AttachmentViewportParams {
+                            attachment_id,
+                            dimensions: Dimensions::new(
+                                u64::from(size.columns),
+                                u64::from(size.rows),
+                            ),
+                            position: Nullable(None),
+                        };
+                        if !send_geometry(
+                            client,
+                            descriptor,
+                            request_id,
+                            Method::AttachmentViewport,
+                            &params,
+                        )
+                        .await
+                        {
+                            return AttachOutcome::Disconnected;
+                        }
+                        outstanding.insert(request_id, Outstanding::Scrollback);
+                        requested.insert(request_id, None);
+                        queued = 0;
+                    }
+                }
+                if !held.is_empty()
+                    && let Some(epoch) = epoch
+                {
+                    let request_id = kr_protocol::ids::RequestId::new(next_request);
+                    next_request += 1;
+                    if !send_input(
+                        client,
+                        request_id,
+                        session_id,
+                        attachment_id,
+                        epoch,
+                        sequence,
+                        held,
+                    )
+                    .await
+                    {
+                        return AttachOutcome::DeliveryUncertain(
+                            "the connection ended while input was being sent".to_owned(),
+                        );
+                    }
+                    outstanding.insert(request_id, Outstanding::Input(sequence));
+                    sequence += 1;
+                }
+            }
             message = client.recv() => {
                 match message {
                     Ok(ControlFrame::Notification(notification)) => {
@@ -1224,35 +1290,6 @@ async fn drive(
                     return AttachOutcome::Disconnected;
                 }
                 outstanding.insert(request_id, what);
-            }
-            () = pointer_expiry(pointer_deadline) => {
-                // Nothing came to finish it, so it was not a report. What was held is the
-                // person's, and it goes to the application now.
-                pointer_deadline = None;
-                let held = pointers.release();
-                if !held.is_empty()
-                    && let Some(epoch) = epoch
-                {
-                    let request_id = kr_protocol::ids::RequestId::new(next_request);
-                    next_request += 1;
-                    if !send_input(
-                        client,
-                        request_id,
-                        session_id,
-                        attachment_id,
-                        epoch,
-                        sequence,
-                        held,
-                    )
-                    .await
-                    {
-                        return AttachOutcome::DeliveryUncertain(
-                            "the connection ended while input was being sent".to_owned(),
-                        );
-                    }
-                    outstanding.insert(request_id, Outstanding::Input(sequence));
-                    sequence += 1;
-                }
             }
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {
