@@ -1108,12 +1108,15 @@ the environment archive service, which is a controller module and not a survivin
 
 **Ownership is taken, and only after the worker is gone.** The archive asks the kernel whether the
 recorded process is the process that was recorded - both the identifier and the start value,
-because the kernel reuses identifiers - and only a confirmed ending is death. Then it fences the
-worker's published endpoint and descriptor, and only then is anything opened, so nothing reaches
-the stores until the endpoint is gone. The order is that way round because the answer can be *no*:
-a daemon that fenced before it asked would delete a working session's socket on the way to finding
-out that it was working. A query the platform declines is not death either, and the archive leaves
-the session alone.
+because the kernel reuses identifiers - and only a confirmed ending is death. Then it removes the
+worker's published endpoint and descriptor, and only then is anything opened. The order is that
+way round because the answer can be *no*: a daemon that fenced before it asked would delete a
+working session's socket on the way to finding out that it was working. A query the platform
+declines is not death either, and the archive leaves the session alone.
+
+The removal is best effort and the answer says which halves went. What makes the stores safe to
+open is the death this host confirmed, not the socket file: a worker the kernel says has ended
+cannot answer a socket whether or not the file is still on disk.
 
 A read of a closed session asks the same question first. A session this daemon has verified is
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still

@@ -100,6 +100,64 @@ pub enum MigrationError {
 /// command this build does not ship would send a person somewhere there is nothing to run.
 pub const IMPORTER: &str = "an explicit versioned import of a store this build cannot migrate";
 
+/// Returns the tables a store recording `version` must hold.
+///
+/// A recorded version is not a schema. Migration creates what is absent, so a journal that has
+/// lost a table would come back as a journal with an empty one and the loss would never be
+/// reported. This is what a store of each version really had, so a store that records a version
+/// and is missing one of these has lost it rather than never having had it.
+#[must_use]
+pub fn tables_at(version: i64) -> &'static [&'static str] {
+    match version {
+        // `927ecc84`, the first build of this schema: the receipt table and nothing else.
+        1 => &["schema_version", "receipts"],
+        2 => &["schema_version", "receipts", "session", "host_events"],
+        3 => &[
+            "schema_version",
+            "receipts",
+            "session",
+            "host_events",
+            "observations",
+            "host_time",
+            "fence_evidence",
+            "fence_state",
+            "fence_delivery",
+            "fence_forgotten",
+        ],
+        4 => &[
+            "schema_version",
+            "receipts",
+            "session",
+            "host_events",
+            "observations",
+            "host_time",
+            "fence_evidence",
+            "fence_state",
+            "fence_delivery",
+            "fence_forgotten",
+            "outbox",
+            "outbox_cursors",
+            "journal_gaps",
+        ],
+        _ => &[
+            "schema_version",
+            "receipts",
+            "session",
+            "host_events",
+            "observations",
+            "host_time",
+            "fence_evidence",
+            "fence_state",
+            "fence_delivery",
+            "fence_forgotten",
+            "outbox",
+            "outbox_cursors",
+            "journal_gaps",
+            "privacy",
+        ],
+    }
+}
+
 /// Returns the steps that bring a store at `found` to [`CURRENT`].
 ///
 /// # Errors
@@ -174,6 +232,26 @@ mod tests {
                 current: CURRENT,
             })
         );
+    }
+
+    #[test]
+    fn each_version_names_the_tables_a_store_of_it_really_had() {
+        // Every version's set contains the one before it, because no step of this ladder has ever
+        // dropped a table. A version this build does not list answers with the current set, which
+        // is the strictest of them.
+        for step in LADDER {
+            let before = tables_at(step.from);
+            let after = tables_at(step.to);
+            assert!(
+                before.iter().all(|table| after.contains(table)),
+                "version {} lost a table version {} had",
+                step.to,
+                step.from
+            );
+            assert!(after.len() > before.len(), "every step adds a table");
+        }
+        assert_eq!(tables_at(1), ["schema_version", "receipts"]);
+        assert!(tables_at(CURRENT).contains(&"privacy"));
     }
 
     #[test]

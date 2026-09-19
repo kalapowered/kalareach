@@ -631,6 +631,96 @@ fn a_session_whose_privacy_state_cannot_be_read_retains_nothing_and_owes_its_cle
     );
     assert!(!session.reconcile_privacy(&[]).is_complete());
     assert!(session.privacy_cleanup_failure().is_some());
+
+    // And a maintenance pass does not clear it: the journal is still unopenable, so nothing this
+    // host owes has been done. Clearing one obligation on the strength of work it could not do is
+    // what would make the cleanup report complete over content that is still there.
+    session.collect_expired();
+    assert!(!session.reconcile_privacy(&[]).is_complete());
+    assert!(session.privacy_cleanup_failure().is_some());
+    assert!(
+        session.disable_privacy().is_err(),
+        "privacy mode this host cannot see is not privacy mode it may turn off"
+    );
+}
+
+#[test]
+fn content_settled_under_privacy_is_taken_where_it_settles_rather_than_at_the_next_tick() {
+    // A crash between a settlement and the next maintenance pass would leave the content for the
+    // archive to serve, so it goes in the settlement's own wake rather than later.
+    let (_temp, mut session) = session_on_disk();
+    session.enable_privacy(&mut []).expect("enables");
+    let action = kr_worker::journal::action_id_from([9; 16]);
+    {
+        let journal = session.journal_mut().expect("a journal");
+        journal.accept(&submission(9)).expect("an action");
+        journal
+            .mark_dispatching(actor(), action, kr_ipc::now_ms())
+            .expect("marks");
+        journal
+            .settle(
+                actor(),
+                action,
+                kr_protocol::receipt::ReceiptState::Applied,
+                Some(b"what the action answered"),
+                None,
+                kr_ipc::now_ms(),
+            )
+            .expect("settles");
+    }
+    // What the dispatch path does the moment the outcome is committed, with no tick in between.
+    session.redact_settled_action(&actor(), action);
+    let journal = session.journal_mut().expect("a journal");
+    assert!(
+        journal
+            .read_result(&actor(), action)
+            .expect("reads")
+            .is_none(),
+        "the content went where the action settled"
+    );
+    assert!(
+        journal
+            .read_intent(&actor(), action)
+            .expect("reads")
+            .is_none()
+    );
+    assert_eq!(
+        journal
+            .read(actor(), action)
+            .expect("reads")
+            .expect("the receipt is still there")
+            .state,
+        kr_protocol::receipt::ReceiptState::Applied,
+        "the metadata is kept"
+    );
+}
+
+#[test]
+fn privacy_is_not_turned_off_while_its_own_cleanup_is_unfinished() {
+    // Turning it off over an unfinished purge would resume retention beside it: output kept
+    // afterwards would join the history the purge still owes, and a restart would lose the
+    // obligation altogether.
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    for _ in 0..4 {
+        session.ingest_output(&[b'x'; 4096]);
+    }
+    let spool = temp.environment().session_spool(session_id);
+    std::fs::create_dir(spool.join("boundary")).expect("blocks the boundary file");
+    session.enable_privacy(&mut []).expect("enables");
+    assert!(session.privacy_cleanup_failure().is_some());
+
+    let refused = session
+        .disable_privacy()
+        .expect_err("privacy mode is not turned off over an unfinished cleanup");
+    assert!(refused.to_string().contains("unfinished"), "{refused}");
+    assert!(session.privacy().is_enabled());
+
+    // Once the obstruction is gone, the retry finishes it and the change is allowed.
+    std::fs::remove_dir(spool.join("boundary")).expect("unblocks it");
+    session.collect_expired();
+    session.disable_privacy().expect("disables");
+    assert!(!session.privacy().is_enabled());
 }
 
 // ---------------------------------------------------------------------------------------------

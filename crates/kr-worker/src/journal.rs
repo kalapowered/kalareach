@@ -257,9 +257,10 @@ impl Journal {
         };
         // A version row is not a schema. Migration creates what is absent, so a journal that has
         // lost a table would come back from this as a journal with an empty one, and the loss
-        // would never be reported. Every version of this ladder has had these three since the
-        // first, so a store that records a version and is missing one of them has lost it.
-        for table in ["receipts", "receipt_events", "results"] {
+        // would never be reported. The ladder says what a store of that version really had, so a
+        // store that records a version and is missing one of those has lost it rather than never
+        // having had it.
+        for table in crate::persistence::migration::tables_at(recorded) {
             let present: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -2272,7 +2273,7 @@ impl Journal {
         // The rows are read *inside* the transaction that moves them. Reading them outside would
         // let a second pass select what the first had already moved and then write an event for
         // a transition that did not happen.
-        let moving = identities_in(&transaction, from)?;
+        let moving = identities_in(&self.health, &transaction, from)?;
         if moving.is_empty() {
             return Ok(0);
         }
@@ -2670,6 +2671,40 @@ impl Journal {
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
         Ok(results as u64 + intents as u64)
+    }
+
+    /// Removes the content one settled receipt carries, keeping its metadata.
+    ///
+    /// The same policy as [`Self::redact_settled_content`], applied to one action where it
+    /// settles. Privacy mode is prospective, and waiting for a maintenance pass would leave the
+    /// content of everything that settled in between for a crash to preserve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn redact_action_content(&mut self, actor_id: &ActorId, action_id: ActionId) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
+        transaction
+            .execute(
+                "DELETE FROM results WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        transaction
+            .execute(
+                "UPDATE receipts SET intent = NULL
+                 WHERE actor_id = ?1 AND action_id = ?2
+                   AND state IN ('applied', 'refused', 'rejected', 'unknown')",
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(())
     }
 
     /// Returns the schema version this store records.
@@ -3334,20 +3369,21 @@ struct NamedAction<'a> {
 
 /// Returns the receipts in one state, read through the caller's own transaction.
 fn identities_in(
+    health: &crate::persistence::fault::JournalHealth,
     transaction: &rusqlite::Transaction<'_>,
     state: ReceiptState,
 ) -> Result<Vec<(ActorId, ActionId)>> {
     let mut statement = transaction
         .prepare("SELECT actor_id, action_id FROM receipts WHERE state = ?1")
-        .map_err(unavailable)?;
+        .map_err(|error| faulted(health, error))?;
     let rows = statement
         .query_map(params![state.as_str()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
-        .map_err(unavailable)?;
+        .map_err(|error| faulted(health, error))?;
     let mut found = Vec::new();
     for row in rows {
-        let (actor, action) = row.map_err(unavailable)?;
+        let (actor, action) = row.map_err(|error| faulted(health, error))?;
         found.push((parse_actor(actor)?, parse_action(&action)?));
     }
     Ok(found)

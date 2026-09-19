@@ -2404,7 +2404,18 @@ impl WorkerService {
         // freshness window and the subject preconditions decide whether a *new* action is
         // admitted, and applying them here would refuse a caller its own completed result because
         // its own effect moved the subject on.
-        let stopping = method == Method::SessionClose;
+        // What section 7 and section 11 keep available when the store has failed, and what they
+        // do not. `session.close` is the authorised stop; `input.interrupt` is the interruption
+        // the live input lease keeps, which is the one way a person has of stopping a running
+        // command on a host whose journal has stopped answering. Everything else is rich work and
+        // is refused before dispatch. Neither exception authorises a hidden rich retry: what they
+        // lose is the receipt, which is what `durability=volatile` says for the close.
+        let work = match method {
+            Method::SessionClose => crate::persistence::fault::WorkClass::AuthorisedStop,
+            Method::InputInterrupt => crate::persistence::fault::WorkClass::NativeTerminal,
+            _ => crate::persistence::fault::WorkClass::RichMutation,
+        };
+        let volatile_permitted = work.survives_a_journal_fault();
         match self.retained(&actor_id, mutation, digest) {
             Ok(Some(retained)) => return Ok(Answered::Retained(retained)),
             Ok(None) => {}
@@ -2417,7 +2428,7 @@ impl WorkerService {
             // for every method, and there is no stop to admit because the action the caller named
             // is not this one. Reading it as a storage failure would also mark durability lost over
             // a journal that is working perfectly.
-            Err(error) if stopping && is_storage_failure(&error) => {
+            Err(error) if volatile_permitted && is_storage_failure(&error) => {
                 self.runtime
                     .session()
                     .note_journal_failure(error.to_string());
@@ -2489,16 +2500,6 @@ impl WorkerService {
         //
         // The two named exceptions pass: section 7's authorised stop and section 11's raw
         // terminal input, which does not travel this path at all.
-        // Section 7 names two exceptions and this path carries both. `session.close` is the
-        // authorised stop. `input.interrupt` is the other half of "raw terminal input and
-        // interruption remain available under the live input lease": the raw bytes travel as a
-        // read, and the interrupt travels here, so fencing it would take away the one way a
-        // person has of stopping a running command on a host whose store has failed.
-        let work = match method {
-            Method::SessionClose => crate::persistence::fault::WorkClass::AuthorisedStop,
-            Method::InputInterrupt => crate::persistence::fault::WorkClass::NativeTerminal,
-            _ => crate::persistence::fault::WorkClass::RichMutation,
-        };
         let posture = session.durability_posture();
         if !posture.admits(work) {
             let kind = posture
@@ -2521,13 +2522,13 @@ impl WorkerService {
         let admitted = match session.journal_mut() {
             Some(journal) => match journal.accept(&submission) {
                 Ok(_) => true,
-                Err(error) if stopping && is_storage_failure(&error) => {
+                Err(error) if volatile_permitted && is_storage_failure(&error) => {
                     session.note_journal_failure(error.to_string());
                     false
                 }
                 Err(error) => return Err(error),
             },
-            None if stopping => false,
+            None if volatile_permitted => false,
             None => {
                 return Err(WorkerError::JournalUnavailable {
                     detail:
@@ -2582,7 +2583,7 @@ impl WorkerService {
             if let Err(error) =
                 journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())
             {
-                if !stopping {
+                if !volatile_permitted {
                     return Err(error);
                 }
                 session.note_journal_failure(error.to_string());
@@ -2651,6 +2652,14 @@ impl WorkerService {
                 }
             }
             (_, None) => {}
+        }
+        // Privacy mode is prospective, and this is where an action admitted under it settles. The
+        // content its receipt carries goes now rather than on the next maintenance pass, because
+        // a crash in between would leave it for the archive to serve. A failure is recorded as
+        // cleanup this host still owes rather than turned into a refusal of an effect that has
+        // already happened.
+        if session.privacy().is_enabled() {
+            session.redact_settled_action(&caller.actor_id, mutation.action_id);
         }
         drop(session);
 
