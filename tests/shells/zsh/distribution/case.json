@@ -4,7 +4,6 @@
   "stack": "distribution",
   "title": "an ordinary distribution startup customisation: completion, history and terminal key bindings",
   "supported": true,
-  "notes": "This customisation loads the completion system, whose own widgets run between the reader's boundaries, and a change to the terminal's end-of-file character is not observable here within the time this case gives it. The gesture following the line discipline is driven on this shell in the plain and starship cases.",
   "requires": [],
   "order": [
     "user-top",
@@ -21,7 +20,8 @@
     "gesture_is_native_outside_the_condition",
     "every_exclusion_accounted_for",
     "escape_then_gesture_is_native",
-    "unattributable_gesture_hints"
+    "unattributable_gesture_hints",
+    "gesture_follows_the_line_discipline"
   ],
   "covers": [
     "KR-REQ-07.87",

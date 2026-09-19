@@ -50,14 +50,17 @@ fail() {
 }
 
 # The run's own root, on the internal disk, with the binaries beside it.
-run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-fence.XXXXXX")"
+# Short on purpose: a Unix socket address is 103 bytes on this platform, and the endpoint a case
+# binds is under a directory of its own beneath the temporary directory. A run root of the usual
+# length leaves a case no room for one.
+run_root="$(mktemp -d "${TMPDIR:-/tmp}/kr-fence.XXXXXX")"
 mkdir -p "$run_root/bin" "$run_root/r" "$run_root/s" "$run_root/cwd"
 chmod 700 "$run_root/r" "$run_root/s"
-export TMPDIR="$run_root"
 
 started_pids=()
 
 cleanup() {
+  local status=$?
   for session in $("$run_root/bin/kr" list --json 2>/dev/null | /usr/bin/env python3 -c \
     'import json,sys
 try:
@@ -83,6 +86,11 @@ for entry in document.get("sessions", []):
     echo "no process this run started is still running"
   fi
   rm -rf "${run_root:?}"
+  # A run whose processes outlived it did not pass, whatever the last command returned.
+  if [ "$failed" -ne 0 ] && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 

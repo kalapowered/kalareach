@@ -4,7 +4,7 @@
   "stack": "fzf",
   "title": "fzf's key bindings on the packaged fish, which claim keys in every bind mode",
   "supported": true,
-  "notes": "These widgets claim keys in every bind mode this shell ships, including the one this session would bind a sequence in to leave the reader waiting for another key. The takeover is driven on this shell under its own bindings in the plain case instead.",
+  "notes": "A takeover while this reader waits for the rest of a key sequence is not driven on this shell in this corpus. The sequence this session binds to reach that wait shares its bind modes with these widgets, and the fence asked inside it named a reader that had moved. What ends such a wait is driven through the package suite instead, and driving it here is unfinished.",
   "requires": [
     "fzf",
     "fzf-shell"

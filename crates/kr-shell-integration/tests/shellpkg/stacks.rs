@@ -774,11 +774,11 @@ impl Session {
         // An editor that takes the terminal out of its own line mode can still be between one
         // read and the next, where the two bytes go to the line discipline instead. The key is
         // offered again once; what the binding writes is the same text either way.
-        for attempt in 0..2 {
+        for attempt in 0..3 {
             self.ensure_reading();
             self.type_bytes(USER_BINDING_KEY);
-            let within = if attempt == 0 {
-                Duration::from_secs(4)
+            let within = if attempt < 2 {
+                Duration::from_secs(6)
             } else {
                 REPLY
             };

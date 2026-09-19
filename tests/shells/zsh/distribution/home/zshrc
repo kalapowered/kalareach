@@ -13,7 +13,6 @@ HISTSIZE=1000
 SAVEHIST=1000
 setopt no_beep
 setopt hist_ignore_dups
-setopt extended_glob
 unsetopt zle_rprompt_indent 2>/dev/null
 
 bindkey -e

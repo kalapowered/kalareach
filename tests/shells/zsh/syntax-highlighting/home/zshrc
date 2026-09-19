@@ -1,6 +1,7 @@
 # This plugin's own instructions put it at the end of the startup file, after everything that
-# binds a key, because it wraps every widget it finds. The integration's marked entry is therefore
-# before it, and the end-of-file decision this qualification drives is behind that wrapping.
+# binds a key, because it hooks the reader's own redrawing and the widgets it finds there. The
+# integration's marked entry is therefore before it, and the end-of-file decision this
+# qualification drives is behind that hooking.
 print -r -- user-top >> "$KR_TEST_ORDER"
 
 PROMPT='KR> '

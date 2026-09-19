@@ -2,7 +2,7 @@
   "id": "zsh-powerlevel10k",
   "shell": "zsh",
   "stack": "powerlevel10k",
-  "title": "Powerlevel10k with its instant prompt, which draws a reader before the startup file finishes",
+  "title": "Powerlevel10k with its instant prompt, which draws a prompt before the startup file finishes",
   "supported": true,
   "requires": [
     "powerlevel10k"

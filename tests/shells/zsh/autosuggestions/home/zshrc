@@ -13,8 +13,9 @@ HISTSIZE=200
 SAVEHIST=0
 typeset -g KR_TEST_USER_CONFIGURATION=1
 
-# The suggestion this plugin draws is written into the reader's own line and taken out again on
-# every keystroke, which is the state section 7 says a prompt hook cannot tell from an empty one.
+# What this plugin draws after the cursor is the reader's own post-display rather than its buffer,
+# and accepting it is what puts text nobody typed into the line. Both are states section 7 says a
+# prompt hook cannot tell from an empty one.
 ZSH_AUTOSUGGEST_STRATEGY=(history)
 ZSH_AUTOSUGGEST_MANUAL_REBIND=1
 source "$KR_STACK_ZSH_AUTOSUGGESTIONS/zsh-autosuggestions.zsh"
