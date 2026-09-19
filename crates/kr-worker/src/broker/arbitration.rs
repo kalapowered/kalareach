@@ -41,6 +41,13 @@ pub struct Pending {
     /// dispatched can go back to pending; one that was dispatched and never confirmed is
     /// uncertain, and an uncertain resource is never answered a second time.
     pub dispatched: bool,
+    /// Which writer holds the one admission to transmit an answer, once one does.
+    ///
+    /// A resource has two possible writers: the rich answer a component encoded, and the native
+    /// client's own answer travelling the forwarding path. Both consume this, and there is one, so
+    /// the second one to arrive is refused *before* its bytes go rather than recorded as a
+    /// competing answer afterwards.
+    pub transmitter: Option<Transmitter>,
     /// The binding whose decoder produced it, where one did.
     pub decoder: Option<BrokerBindingId>,
     /// The source event this request was recorded from.
@@ -49,6 +56,37 @@ pub struct Pending {
     /// request from another's bytes, and the ledger would record the wrong original beside the
     /// wrong identifier.
     pub source: Option<kr_protocol::ids::SourceEventHandle>,
+}
+
+/// Which writer holds the one admission to transmit an answer for a pending resource.
+///
+/// Section 11 gives every pending resource one resolution, and a resolution is bytes reaching the
+/// upstream. Two writers can produce those bytes, so the admission is exclusive and named: a rich
+/// answer is admitted under the claim that encoded it, and the native client's own answer is
+/// admitted on the forwarding path it travels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transmitter {
+    /// A rich answer, admitted under the claim named.
+    Rich(Uuid),
+    /// The native client's own answer, admitted as it was forwarded.
+    Native,
+    /// An answer that went before this process started, read back from the dispatch marker.
+    ///
+    /// Which writer sent it is not recorded, because nothing needs it: what the marker says is
+    /// that the one admission is spent, and that is what stops either writer taking it again.
+    Spent,
+}
+
+impl Transmitter {
+    /// Returns what a refusal calls this writer.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rich(_) => "a rich answer",
+            Self::Native => "the native client's own answer",
+            Self::Spent => "an answer this host had already sent",
+        }
+    }
 }
 
 /// What a claim gives its holder.
@@ -85,6 +123,8 @@ pub struct Transition {
     holds_claim: bool,
     /// Whether this transition also sets the dispatch marker.
     dispatched: bool,
+    /// The writer this transition admits to transmit, when it admits one.
+    transmitter: Option<Transmitter>,
 }
 
 impl Transition {
@@ -92,6 +132,12 @@ impl Transition {
     #[must_use]
     pub fn claim(&self) -> Option<&Claim> {
         self.claim.as_ref()
+    }
+
+    /// Returns true when this transition sets the dispatch marker.
+    #[must_use]
+    pub const fn sets_marker(&self) -> bool {
+        self.dispatched
     }
 }
 
@@ -175,6 +221,7 @@ impl Arbitration {
                 resource,
                 claim: None,
                 dispatched: false,
+                transmitter: None,
                 decoder,
                 source,
             },
@@ -242,6 +289,10 @@ impl Arbitration {
                 resource,
                 claim: None,
                 dispatched,
+                // A resource whose marker was committed comes back with its one admission already
+                // spent. Which writer spent it is not recorded and does not matter: what matters
+                // is that neither may take it again, which is the whole of "never reissue".
+                transmitter: dispatched.then_some(Transmitter::Spent),
                 decoder,
                 source: None,
             },
@@ -298,6 +349,15 @@ impl Arbitration {
             .get(&resource_id)
             .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
         check_transition(pending.resource.state, PendingState::Claimed)?;
+        // The one admission to transmit is already held, so there is no answer left to encode.
+        // Without this a native answer on the wire would still leave the resource claimable, and
+        // the claim would end in a second set of bytes for one request.
+        if let Some(held) = pending.transmitter {
+            return Err(BrokerError::denied(format!(
+                "{} has already been admitted to transmit for {resource_id}",
+                held.as_str()
+            )));
+        }
         if !pending.resource.interpretation_verified {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
@@ -325,6 +385,7 @@ impl Arbitration {
             }),
             holds_claim: true,
             dispatched: false,
+            transmitter: None,
         })
     }
 
@@ -337,7 +398,7 @@ impl Arbitration {
     /// admission to dispatch is a second answer.
     pub fn plan_dispatch(&self, claim: &Claim) -> Result<Transition> {
         let pending = self.claimed_by(claim)?;
-        if pending.dispatched {
+        if pending.dispatched || pending.transmitter.is_some() {
             return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
         }
         Ok(Transition {
@@ -346,6 +407,84 @@ impl Arbitration {
             claim: Some(claim.clone()),
             holds_claim: true,
             dispatched: true,
+            transmitter: Some(Transmitter::Rich(claim.claim_id)),
+        })
+    }
+
+    /// Plans the exclusive admission of the native client's own answer, before its bytes go.
+    ///
+    /// This is the other half of section 11's one resolution per resource. A native answer that
+    /// arrives while a rich answer is still encoding wins: the claim it beats has not taken the
+    /// admission, so this takes it and the rich answer is told the resolved state at its recheck.
+    /// A native answer that arrives after a rich answer has been admitted is refused **here**,
+    /// before it is forwarded, because forwarding it would be the second answer to one request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier,
+    /// [`BrokerError::Arbitration`] when the resource has already ended, and
+    /// [`BrokerError::PermissionDenied`] when the one admission is already held.
+    pub fn plan_native_dispatch(&self, request: &DownstreamRequestId) -> Result<Transition> {
+        let pending = self.require_request(request)?;
+        if pending.resource.state.is_terminal() {
+            return Err(BrokerError::Arbitration(
+                ArbitrationError::AlreadyResolved {
+                    state: pending.resource.state,
+                },
+            ));
+        }
+        if let Some(held) = pending.transmitter {
+            return Err(BrokerError::denied(format!(
+                "{} has already been admitted to transmit for {}",
+                held.as_str(),
+                pending.resource.resource_id
+            )));
+        }
+        // The native writer takes the resource's one claim, which is what the state machine
+        // already means by `claimed`: one answer is on its way and no other may start. A rich
+        // claim this beats is discharged, because its holder has nothing left to dispatch and the
+        // recheck tells it so.
+        let mut resource = pending.resource.clone();
+        resource.state = PendingState::Claimed;
+        Ok(Transition {
+            resource,
+            from: pending.resource.state,
+            claim: None,
+            holds_claim: false,
+            dispatched: true,
+            transmitter: Some(Transmitter::Native),
+        })
+    }
+
+    /// Plans the end of a native answer this arbitration admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier,
+    /// [`BrokerError::PermissionDenied`] when the native writer does not hold the admission, and
+    /// [`BrokerError::Arbitration`] when the state cannot reach the one asked for.
+    pub fn plan_native_settled(
+        &self,
+        request: &DownstreamRequestId,
+        to: PendingState,
+    ) -> Result<Transition> {
+        let pending = self.require_request(request)?;
+        if pending.transmitter != Some(Transmitter::Native) {
+            return Err(BrokerError::denied(format!(
+                "the native writer does not hold the admission on {}",
+                pending.resource.resource_id
+            )));
+        }
+        check_transition(pending.resource.state, to)?;
+        let mut resource = pending.resource.clone();
+        resource.state = to;
+        Ok(Transition {
+            resource,
+            from: pending.resource.state,
+            claim: None,
+            holds_claim: false,
+            dispatched: true,
+            transmitter: None,
         })
     }
 
@@ -420,6 +559,7 @@ impl Arbitration {
             claim: None,
             holds_claim: false,
             dispatched: pending.dispatched,
+            transmitter: None,
         })
     }
 
@@ -445,6 +585,9 @@ impl Arbitration {
             None
         };
         pending.dispatched = pending.dispatched || transition.dispatched;
+        if let Some(admitted) = transition.transmitter {
+            pending.transmitter = Some(admitted);
+        }
         Ok(pending.resource.clone())
     }
 
@@ -531,6 +674,7 @@ impl Arbitration {
                 claim: None,
                 holds_claim: false,
                 dispatched: pending.dispatched,
+                transmitter: None,
             });
         }
         (result, transitions)
@@ -620,7 +764,18 @@ impl Arbitration {
             claim: Some(claim.clone()),
             holds_claim: false,
             dispatched,
+            transmitter: None,
         })
+    }
+
+    fn require_request(&self, request: &DownstreamRequestId) -> Result<&Pending> {
+        let resource_id = *self
+            .by_request
+            .get(request)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource for {request}")))?;
+        self.by_id
+            .get(&resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))
     }
 
     fn claimed_by(&self, claim: &Claim) -> Result<&Pending> {

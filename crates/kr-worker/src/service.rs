@@ -3441,28 +3441,32 @@ impl WorkerService {
                     &params.target,
                     capability,
                     crate::broker::UpstreamOperation::PromptSubmit,
+                    None,
+                    kr_ipc::now_ms(),
                 )?;
                 Ok(())
             }
             Method::AgentTurnSteer => {
                 let params: kr_protocol::agent::AgentSteerParams = parse(&mutation.params)?;
-                self.broker.check_turn(&params.target, &params.turn_id)?;
                 self.broker.check_mutation(
                     &Self::broker_caller(caller),
                     &params.target,
                     "agent.steer",
                     crate::broker::UpstreamOperation::TurnSteer,
+                    Some(params.turn_id.clone()),
+                    kr_ipc::now_ms(),
                 )?;
                 Ok(())
             }
             Method::AgentTurnCancel => {
                 let params: kr_protocol::agent::AgentCancelParams = parse(&mutation.params)?;
-                self.broker.check_turn(&params.target, &params.turn_id)?;
                 self.broker.check_mutation(
                     &Self::broker_caller(caller),
                     &params.target,
                     "agent.cancel",
                     crate::broker::UpstreamOperation::TurnCancel,
+                    Some(params.turn_id.clone()),
+                    kr_ipc::now_ms(),
                 )?;
                 Ok(())
             }
@@ -3474,6 +3478,8 @@ impl WorkerService {
                     &params.target,
                     "agent.approval",
                     crate::broker::UpstreamOperation::ApprovalRespond,
+                    None,
+                    kr_ipc::now_ms(),
                 )?;
                 self.broker.check_answerable(
                     &params.target,
@@ -3489,8 +3495,12 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
-                self.broker
-                    .check_invocable(&Self::broker_caller(caller), binding_id, &params)?;
+                self.broker.check_invocable(
+                    &Self::broker_caller(caller),
+                    binding_id,
+                    &params,
+                    kr_ipc::now_ms(),
+                )?;
                 Ok(())
             }
             Method::ActionCancel => {
@@ -4406,23 +4416,30 @@ impl WorkerService {
             Method::AgentPromptSubmit | Method::AgentPromptQueue => {
                 let params: kr_protocol::agent::AgentPromptParams = parse(params)?;
                 let queued = method == Method::AgentPromptQueue;
-                let result =
-                    self.broker
-                        .agent_prompt(&Self::broker_caller(caller), &params, queued)?;
+                let result = self.broker.agent_prompt(
+                    &Self::broker_caller(caller),
+                    &params,
+                    queued,
+                    kr_ipc::now_ms(),
+                )?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::AgentTurnSteer => {
                 let params: kr_protocol::agent::AgentSteerParams = parse(params)?;
-                let result = self
-                    .broker
-                    .agent_steer(&Self::broker_caller(caller), &params)?;
+                let result = self.broker.agent_steer(
+                    &Self::broker_caller(caller),
+                    &params,
+                    kr_ipc::now_ms(),
+                )?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::AgentTurnCancel => {
                 let params: kr_protocol::agent::AgentCancelParams = parse(params)?;
-                let result = self
-                    .broker
-                    .agent_cancel(&Self::broker_caller(caller), &params)?;
+                let result = self.broker.agent_cancel(
+                    &Self::broker_caller(caller),
+                    &params,
+                    kr_ipc::now_ms(),
+                )?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::AgentApprovalRespond => {

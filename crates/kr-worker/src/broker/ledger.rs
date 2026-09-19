@@ -575,24 +575,33 @@ impl Ledger {
     /// upstream. A crash after it leaves a record that says an answer may already have been sent,
     /// which is what stops a restart from sending a second one.
     ///
+    /// The write is conditional on the state the resource is in and on the marker being unset, so
+    /// it is the one write that can succeed for one resource. A rich answer is marked from
+    /// `claimed`; the native client's own answer is marked from whatever state it beat, which is
+    /// `pending` when nothing was encoding and `claimed` when something was.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails or the row is not claimed.
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails or the row is not in that
+    /// state with its marker unset.
     pub fn mark_dispatched(&self, resource: &PendingResource) -> Result<()> {
         let updated = self
             .connection
             .execute(
                 "UPDATE broker_pending SET dispatched = 1
-                 WHERE resource_id = ?1 AND state = 'claimed' AND dispatched = 0",
-                params![resource.resource_id.get().as_bytes().as_slice()],
+                 WHERE resource_id = ?1 AND state = ?2 AND dispatched = 0",
+                params![
+                    resource.resource_id.get().as_bytes().as_slice(),
+                    resource.state.as_str(),
+                ],
             )
             .map_err(BrokerError::ledger)?;
         if updated == 1 {
             Ok(())
         } else {
             Err(BrokerError::ledger(format!(
-                "pending resource {} is not a claimed, undispatched row in the ledger",
-                resource.resource_id
+                "pending resource {} is not an undispatched {} row in the ledger",
+                resource.resource_id, resource.state
             )))
         }
     }

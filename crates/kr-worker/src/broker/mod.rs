@@ -72,12 +72,13 @@ use kr_protocol::ids::{
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 
 pub use crate::broker::arbitration::{
-    Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition,
+    Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::error::{BrokerError, Result};
 pub use crate::broker::gateway::{
-    Connection, ConnectionOrigin, Forwarded, Gateway, ReverseRequest, RichInvocation,
+    Connection, ConnectionOrigin, Forwarded, Gateway, PreparedResponse, ReverseRequest,
+    RichInvocation,
 };
 pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
 pub use crate::broker::listener::{
@@ -276,12 +277,30 @@ pub struct DispatchAdmission {
     pub method: UpstreamMethod,
     /// The upstream's own identifier for it.
     pub upstream_request_id: UpstreamRequestId,
+    /// The gateway connection the answer goes out on, which namespaces its identifier.
+    pub connection: GatewayConnectionId,
+    /// The answer itself, prepared by the core from that connection's qualified table.
+    pub response: crate::broker::gateway::PreparedResponse,
     /// How this answer reaches the upstream, and therefore how it is recorded.
     ///
     /// Section 12 requires every action to record its provenance. An answer admitted here goes
     /// over the gateway's typed connection, so it is a typed result; the app may also offer a
     /// terminal convenience, and that one records itself as terminal input and never as this.
     pub provenance: ActionProvenance,
+}
+
+/// The native client's own answer, admitted to be forwarded once.
+///
+/// It exists only as the return value of [`Broker::admit_native_answer`], which commits the
+/// durable marker and takes the resource's one transmission admission before it hands one out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeAnswer {
+    /// The namespaced identifier this answer resolves.
+    pub request: DownstreamRequestId,
+    /// The resource it answers.
+    pub resource_id: PendingResourceId,
+    /// The bytes to forward, exactly as the native client wrote them.
+    pub frame: Vec<u8>,
 }
 
 /// What stopping an instance actually does.
@@ -934,27 +953,109 @@ impl Broker {
         Ok((forwarded, Some(resource)))
     }
 
-    /// Records the answer the upstream produced for one of its own requests.
+    /// Admits the native client's own answer to be forwarded, exclusively.
     ///
-    /// This is what makes a native answer win during encoding: it resolves the pending resource,
-    /// and a rich answer that reaches the claim afterwards is told the resolved state.
+    /// This is what makes a native answer win during encoding. The admission is taken **before**
+    /// the bytes go, so it is the same one admission a rich answer takes at
+    /// [`Broker::admit_dispatch`]: whichever writer reaches it first may transmit, and the other
+    /// is refused rather than recorded as a competing answer afterwards. A rich answer that
+    /// reaches its recheck after this is told the resolved state.
+    ///
+    /// The caller forwards [`NativeAnswer::frame`] and then reports what happened through
+    /// [`Broker::native_answer_sent`] or [`Broker::native_answer_uncertain`].
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the response carries no correlation
-    /// identifier, and [`BrokerError::Arbitration`] when the resource has already ended.
-    pub fn native_answer(
+    /// identifier, [`BrokerError::Arbitration`] when the resource has already ended, and
+    /// [`BrokerError::PermissionDenied`] when a rich answer already holds the one admission.
+    pub fn admit_native_answer(
         &self,
         connection: GatewayConnectionId,
         frame: &[u8],
         now: TimestampMs,
-    ) -> Result<PendingResource> {
+    ) -> Result<NativeAnswer> {
         let mut state = self.state();
         let request = state.gateway.correlate_response(connection, frame)?;
+        let transition = state.arbitration.plan_native_dispatch(&request)?;
+        let resource_id = transition.resource.resource_id;
+        // The marker before the bytes, exactly as the rich path does it. A crash between them
+        // leaves a record saying an answer may already have gone, which is what stops a restart
+        // from sending a second one.
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)?;
         state.volatile.note_native_response();
-        let transition = state.arbitration.plan_upstream_resolved(&request)?;
+        Ok(NativeAnswer {
+            request,
+            resource_id,
+            frame: frame.to_vec(),
+        })
+    }
+
+    /// Records that an admitted native answer reached the upstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when the native writer does not hold the
+    /// admission, and [`BrokerError::Arbitration`] when the resource has already ended.
+    pub fn native_answer_sent(
+        &self,
+        answer: &NativeAnswer,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        self.settle_native(answer, PendingState::Resolved, now)
+    }
+
+    /// Records that an admitted native answer went and nothing confirmed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures [`Broker::native_answer_sent`] does.
+    pub fn native_answer_uncertain(
+        &self,
+        answer: &NativeAnswer,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        self.settle_native(answer, PendingState::Uncertain, now)
+    }
+
+    fn settle_native(
+        &self,
+        answer: &NativeAnswer,
+        to: PendingState,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        let mut state = self.state();
+        let transition = state.arbitration.plan_native_settled(&answer.request, to)?;
         state.write_transition(&transition, now)?;
         state.arbitration.commit(transition)
+    }
+
+    /// Admits one native answer, forwards it and records what happened, in that order.
+    ///
+    /// The order is the contract and this is where a transport gets it for free: nothing is
+    /// forwarded until the one admission is held, and the outcome is recorded only after the
+    /// forwarding has been attempted. A send that fails leaves the resource uncertain, because an
+    /// answer whose fate nobody can establish is never answered a second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Broker::admit_native_answer`] refuses, and whatever `send` refuses.
+    pub fn native_answer_through(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+        now: TimestampMs,
+        send: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<PendingResource> {
+        let answer = self.admit_native_answer(connection, frame, now)?;
+        match send(&answer.frame) {
+            Ok(()) => self.native_answer_sent(&answer, now),
+            Err(error) => {
+                let _ = self.native_answer_uncertain(&answer, now);
+                Err(error)
+            }
+        }
     }
 
     /// Verifies a decoder's interpretation of a request this broker already holds.
@@ -1160,10 +1261,7 @@ impl Broker {
         invocation: &Invocation,
         now: TimestampMs,
     ) -> Result<ActionToken> {
-        let mut state = self.state();
-        state.volatile.require_rich_work()?;
-        let grants = state.check_invocation(binding_id, invocation)?;
-        state.tokens.issue(binding_id, &grants, invocation, now)
+        self.state().issue_token_in(binding_id, invocation, now)
     }
 
     /// Spends an action token against a returned effect plan.
@@ -1178,23 +1276,7 @@ impl Broker {
     /// other than what was presented, and the same authority failures [`Broker::issue_token`]
     /// returns.
     pub fn spend_token(&self, claim: &ActionTokenClaim) -> Result<ActionToken> {
-        let mut state = self.state();
-        state.volatile.require_rich_work()?;
-        let (token, binding_id, capability) = state.tokens.spend_checked(claim)?;
-        // The token has been consumed. Whatever follows, it cannot be spent again, so a failed
-        // authority check costs the caller its invocation rather than giving it another attempt.
-        let invocation = Invocation {
-            actor_id: token.actor_id.clone(),
-            grant: token.grant,
-            grant_id: token.grant_id.as_ref().copied(),
-            application_instance_id: token.application_instance_id,
-            binding_revision: token.binding_revision,
-            action: token.action.clone(),
-            capability: capability.clone(),
-            parameters: Vec::new(),
-        };
-        state.check_invocation(binding_id, &invocation)?;
-        Ok(token)
+        self.state().spend_token_in(claim)
     }
 
     // -- launch profiles ----------------------------------------------------------------------
@@ -1359,17 +1441,7 @@ impl Broker {
         actor_id: &ActorId,
         now: TimestampMs,
     ) -> Result<Claim> {
-        let mut state = self.state();
-        state.volatile.require_rich_work()?;
-        state.recheck_answerable(resource_id)?;
-        let transition = state.arbitration.plan_claim(resource_id, actor_id, now)?;
-        let claim = transition
-            .claim()
-            .cloned()
-            .ok_or_else(|| BrokerError::invalid("a claim transition carries a claim"))?;
-        state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition)?;
-        Ok(claim)
+        self.state().claim_in(resource_id, actor_id, now)
     }
 
     /// Admits one answer to dispatch, and commits the marker before it goes.
@@ -1389,38 +1461,7 @@ impl Broker {
     /// request offered, [`BrokerError::Arbitration`] when an answer has already been admitted, and
     /// [`BrokerError::LedgerUnavailable`] when the marker cannot be committed.
     pub fn admit_dispatch(&self, claim: &Claim, option_id: &str) -> Result<DispatchAdmission> {
-        let mut state = self.state();
-        // Fenced rich work is fenced here too. Without this a claim taken before the journal
-        // faulted could dispatch inside the gap, with no durable marker to stop a second answer.
-        state.volatile.require_rich_work()?;
-        state.recheck_answerable(claim.resource_id)?;
-        let entry = state.ledger.decoding(claim.resource_id)?.ok_or_else(|| {
-            BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{} has no recorded interpretation, so there is nothing to answer",
-                    claim.resource_id
-                ),
-            }
-        })?;
-        if !entry.offers(option_id) {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("{option_id} is not one of the decisions this request offered"),
-            });
-        }
-        let transition = state.arbitration.plan_dispatch(claim)?;
-        state.ledger.mark_dispatched(&transition.resource)?;
-        let resource = state.arbitration.commit(transition)?;
-        let provenance = state
-            .gateway
-            .provenance(resource.request.connection)
-            .unwrap_or(ActionProvenance::UpstreamTypedRpc);
-        Ok(DispatchAdmission {
-            resource,
-            option_id: option_id.to_owned(),
-            method: entry.method,
-            upstream_request_id: entry.upstream_request_id,
-            provenance,
-        })
+        self.state().admit_dispatch_in(claim, option_id)
     }
 
     /// Resolves a claimed resource: the upstream confirmed the answer.
@@ -1445,10 +1486,7 @@ impl Broker {
     ///
     /// Returns [`BrokerError::Arbitration`] when an answer has already gone for the resource.
     pub fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        let mut state = self.state();
-        let transition = state.arbitration.plan_release(claim)?;
-        state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition)
+        self.state().release_claim_in(claim, now)
     }
 
     /// Leaves a claimed resource uncertain: an answer went and nothing confirmed it.
@@ -2048,6 +2086,275 @@ impl Broker {
 }
 
 impl BrokerState {
+    /// Takes the claim on one pending resource. See [`Broker::claim`].
+    fn claim_in(
+        &mut self,
+        resource_id: PendingResourceId,
+        actor_id: &ActorId,
+        now: TimestampMs,
+    ) -> Result<Claim> {
+        self.volatile.require_rich_work()?;
+        self.recheck_answerable(resource_id)?;
+        let transition = self.arbitration.plan_claim(resource_id, actor_id, now)?;
+        let claim = transition
+            .claim()
+            .cloned()
+            .ok_or_else(|| BrokerError::invalid("a claim transition carries a claim"))?;
+        self.write_transition(&transition, now)?;
+        self.arbitration.commit(transition)?;
+        Ok(claim)
+    }
+
+    /// Gives a claim back. See [`Broker::release_claim`].
+    fn release_claim_in(&mut self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+        let transition = self.arbitration.plan_release(claim)?;
+        self.write_transition(&transition, now)?;
+        self.arbitration.commit(transition)
+    }
+
+    /// Admits one answer to dispatch, and commits the marker before it goes. See
+    /// [`Broker::admit_dispatch`].
+    fn admit_dispatch_in(&mut self, claim: &Claim, option_id: &str) -> Result<DispatchAdmission> {
+        // Fenced rich work is fenced here too. Without this a claim taken before the journal
+        // faulted could dispatch inside the gap, with no durable marker to stop a second answer.
+        self.volatile.require_rich_work()?;
+        self.recheck_answerable(claim.resource_id)?;
+        let entry = self.ledger.decoding(claim.resource_id)?.ok_or_else(|| {
+            BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{} has no recorded interpretation, so there is nothing to answer",
+                    claim.resource_id
+                ),
+            }
+        })?;
+        if !entry.offers(option_id) {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("{option_id} is not one of the decisions this request offered"),
+            });
+        }
+        let transition = self.arbitration.plan_dispatch(claim)?;
+        let connection = transition.resource.request.connection;
+        // The answer is prepared before the marker, from the connection's own qualified table, so
+        // the admission and the bytes it authorises are one object. Preparing it afterwards would
+        // leave a marker committed for an answer that turned out to be unencodable.
+        let response = self.gateway.prepare_response(
+            connection,
+            &entry.upstream_request_id,
+            &entry.method,
+            option_id,
+        )?;
+        self.ledger.mark_dispatched(&transition.resource)?;
+        let resource = self.arbitration.commit(transition)?;
+        let provenance = self
+            .gateway
+            .provenance(connection)
+            .unwrap_or(ActionProvenance::UpstreamTypedRpc);
+        Ok(DispatchAdmission {
+            resource,
+            option_id: option_id.to_owned(),
+            method: entry.method,
+            upstream_request_id: entry.upstream_request_id,
+            connection,
+            response,
+            provenance,
+        })
+    }
+
+    /// Issues an action token for one invocation. See [`Broker::issue_token`].
+    fn issue_token_in(
+        &mut self,
+        binding_id: BrokerBindingId,
+        invocation: &Invocation,
+        now: TimestampMs,
+    ) -> Result<ActionToken> {
+        self.volatile.require_rich_work()?;
+        let grants = self.check_invocation(binding_id, invocation)?;
+        self.tokens.issue(binding_id, &grants, invocation, now)
+    }
+
+    /// Spends an action token against a returned effect plan. See [`Broker::spend_token`].
+    fn spend_token_in(&mut self, claim: &ActionTokenClaim) -> Result<ActionToken> {
+        self.volatile.require_rich_work()?;
+        let (token, binding_id, capability) = self.tokens.spend_checked(claim)?;
+        // The token has been consumed. Whatever follows, it cannot be spent again, so a failed
+        // authority check costs the caller its invocation rather than giving it another attempt.
+        let invocation = Invocation {
+            actor_id: token.actor_id.clone(),
+            grant: token.grant,
+            grant_id: token.grant_id.as_ref().copied(),
+            application_instance_id: token.application_instance_id,
+            binding_revision: token.binding_revision,
+            action: token.action.clone(),
+            capability: capability.clone(),
+            parameters: Vec::new(),
+        };
+        self.check_invocation(binding_id, &invocation)?;
+        Ok(token)
+    }
+
+    /// Admits one agent mutation, with every check and the transport in one operation.
+    ///
+    /// Section 11 puts arbitration and authority behind one serial boundary, and this is where a
+    /// mutation crosses it. Everything the operation depends on is read and checked against the
+    /// state as it stands here: the fence, the instance, its suspension, the binding revision, the
+    /// turn, the component answerable for the dispatch and the capability. The transport is taken
+    /// too rather than looked up later, so the admission a caller holds is authority over a
+    /// specific upstream rather than permission to go and find one.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_mutation_in(
+        &mut self,
+        target: &kr_protocol::agent::AgentMutationTarget,
+        capability: Option<CapabilityId>,
+        operation: crate::broker::methods::UpstreamOperation,
+        turn_id: Option<AgentTurnId>,
+        responsible: crate::broker::methods::Responsible,
+        body: crate::broker::methods::UpstreamBody,
+        now: TimestampMs,
+    ) -> Result<crate::broker::methods::MutationAdmission> {
+        let application_instance_id = target.subject.application_instance_id;
+        if self.session_id != target.subject.session_id {
+            return Err(BrokerError::unknown(format!(
+                "this worker does not serve session {}",
+                target.subject.session_id
+            )));
+        }
+        // Rich work is fenced while the journal is faulted, and a mutation is rich work. The
+        // refusal is counted in the gap, because a gap that does not say what it cost is a gap
+        // nobody can reconcile.
+        if let Err(error) = self.volatile.require_rich_work() {
+            self.volatile.note_fenced();
+            return Err(error);
+        }
+        let instance = self
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        // Nothing carries an operation to an instance with no transport bound. Section 9 makes a
+        // refusal this host can decide a rejection rather than an outcome nobody can establish.
+        let dispatch =
+            instance
+                .dispatch
+                .clone()
+                .ok_or_else(|| BrokerError::UnsupportedCapability {
+                    detail: format!(
+                        "nothing carries a {operation} to {application_instance_id}: this instance \
+                     has no upstream transport bound, so the operation is refused rather than \
+                     reported as applied"
+                    ),
+                })?;
+        if let Some(reason) = instance.rich_suspension.as_ref() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("rich mutations are suspended: {reason}"),
+            });
+        }
+        if instance.binding_revision != target.binding_revision {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "{operation} was prepared at binding revision {} and the binding is at {}",
+                    target.binding_revision, instance.binding_revision
+                ),
+            });
+        }
+        // The turn a mutation names is the turn this instance is running, read here rather than
+        // before the lock: a turn that ended between the two would otherwise be steered.
+        if let Some(turn_id) = turn_id.as_ref()
+            && instance.turn_id.as_ref() != Some(turn_id)
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("{turn_id} is not the turn this instance is running"),
+            });
+        }
+        let binding_revision = instance.binding_revision;
+        self.check_responsible(application_instance_id, responsible)?;
+        // The capability is rechecked independently of everything else, because it answers its own
+        // question: the grant says whether this actor may, and this says whether it would work. An
+        // operation that names none has none to recheck.
+        if let Some(capability_id) = capability.as_ref() {
+            self.capabilities
+                .recheck(application_instance_id, capability_id, None)?;
+        }
+        Ok(crate::broker::methods::MutationAdmission::new(
+            crate::broker::methods::UpstreamRequest {
+                application_instance_id,
+                binding_revision,
+                operation,
+                turn_id,
+                body,
+            },
+            dispatch,
+            responsible,
+            capability,
+            now,
+        ))
+    }
+
+    /// Returns one pending resource, or says this broker does not hold it.
+    fn pending_resource(&self, resource_id: PendingResourceId) -> Result<&Pending> {
+        self.arbitration
+            .get(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))
+    }
+
+    /// Returns the binding whose decoder interpreted one resource, where one did.
+    fn decoder_of(&self, resource_id: PendingResourceId) -> Option<BrokerBindingId> {
+        self.arbitration
+            .get(resource_id)
+            .and_then(|pending| pending.decoder)
+    }
+
+    /// Checks the component answerable for one dispatch, at admission.
+    ///
+    /// A fault disables one binding's rich capabilities. Asking only whether *every* binding is
+    /// disabled would let an unrelated working component admit a mutation through the one that is
+    /// not working, so the binding that actually carries this dispatch is the one checked.
+    fn check_responsible(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        responsible: crate::broker::methods::Responsible,
+    ) -> Result<()> {
+        match responsible {
+            crate::broker::methods::Responsible::Binding(binding_id) => {
+                let binding = self
+                    .bindings
+                    .get(&binding_id)
+                    .ok_or_else(|| unknown_binding(binding_id))?;
+                if binding.application_instance_id != application_instance_id {
+                    return Err(BrokerError::denied(format!(
+                        "binding {binding_id} is not bound to {application_instance_id}"
+                    )));
+                }
+                if let Some(reason) = binding.rich_disabled.as_ref() {
+                    return Err(BrokerError::UnsupportedCapability {
+                        detail: format!(
+                            "the component answerable for this operation has had its rich \
+                             capabilities disabled: {reason}"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            // No component gives a prompt, a steer or a cancellation its meaning: the connector
+            // that owns the connection encodes it. What would stop one is every component of the
+            // instance being disabled, because then nothing is interpreting this upstream at all.
+            crate::broker::methods::Responsible::Transport => {
+                let mut bound = self
+                    .bindings
+                    .values()
+                    .filter(|binding| binding.application_instance_id == application_instance_id)
+                    .peekable();
+                if bound.peek().is_some() && bound.all(|binding| binding.rich_disabled.is_some()) {
+                    return Err(BrokerError::UnsupportedCapability {
+                        detail: format!(
+                            "every component bound to {application_instance_id} has had its rich \
+                             capabilities disabled"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Writes one planned transition durably, conditional on the state it expects to find.
     ///
     /// A volatile record is not written: that is what volatile means, and writing it would be the
@@ -2063,7 +2370,7 @@ impl BrokerState {
         self.ledger.settle_pending(
             &transition.resource,
             transition.from,
-            transition.resource.state == PendingState::Uncertain,
+            transition.sets_marker(),
             now,
         )
     }

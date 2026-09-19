@@ -438,7 +438,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
         text: Nullable::some(PromptText::new("hello").expect("valid")),
     };
     let applied = broker
-        .agent_prompt(&caller(), &prompt, false)
+        .agent_prompt(&caller(), &prompt, false, TimestampMs::new(20))
         .expect("the prompt applies");
     assert_eq!(applied.binding_revision, AgentBindingRevision::new(1));
     assert_eq!(applied.provenance, ActionProvenance::UpstreamTypedRpc);
@@ -448,7 +448,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
         "the answer names what the upstream called it"
     );
     broker
-        .agent_prompt(&caller(), &prompt, true)
+        .agent_prompt(&caller(), &prompt, true, TimestampMs::new(21))
         .expect("and so does a queued one");
     broker
         .agent_steer(
@@ -458,6 +458,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
                 turn_id: AgentTurnId::new("turn-1").expect("valid"),
                 text: PromptText::new("try the other file").expect("valid"),
             },
+            TimestampMs::new(22),
         )
         .expect("the steer applies to the turn that is running");
     broker
@@ -467,6 +468,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
                 target: target(1),
                 turn_id: AgentTurnId::new("turn-1").expect("valid"),
             },
+            TimestampMs::new(23),
         )
         .expect("the cancellation applies");
 
@@ -491,7 +493,9 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
     // as applied.
     let unreachable = agent_broker();
     assert!(
-        unreachable.agent_prompt(&caller(), &prompt, false).is_err(),
+        unreachable
+            .agent_prompt(&caller(), &prompt, false, TimestampMs::new(20))
+            .is_err(),
         "a prompt with no transport is refused, not applied"
     );
 
@@ -504,6 +508,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
                     target: target(1),
                     turn_id: AgentTurnId::new("turn-9").expect("valid"),
                 },
+                TimestampMs::new(23),
             )
             .is_err()
     );
@@ -513,7 +518,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
         .advance_binding(instance(), None, TimestampMs::new(10))
         .expect("the selected thread changed");
     let stale = broker
-        .agent_prompt(&caller(), &prompt, false)
+        .agent_prompt(&caller(), &prompt, false, TimestampMs::new(20))
         .expect_err("a prompt prepared against the old conversation is stale");
     assert_eq!(stale.code(), ErrorCode::StaleSession);
 
@@ -527,7 +532,8 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
                     draft_id: Nullable::null(),
                     text: Nullable::null(),
                 },
-                false
+                false,
+                TimestampMs::new(24),
             )
             .is_err()
     );
@@ -591,7 +597,10 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
         ActionProvenance::UpstreamTypedRpc
     );
     assert_eq!(
-        admission.upstream_request_id,
+        admission
+            .approval()
+            .expect("the admission carries the approval it answers")
+            .upstream_request_id,
         UpstreamRequestId::new("11").expect("valid")
     );
 
@@ -781,6 +790,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
                         draft_id: Nullable::null(),
                         parameters: Bytes::from(b"{}".to_vec()),
                     },
+                    TimestampMs::new(25),
                 )
                 .expect_err("the withdrawn grant is found before the marker"),
             BrokerError::Grant(_)
@@ -936,4 +946,168 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
         "a range that was evicted is a visible gap, not a shorter answer"
     );
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.22 and KR-REQ-12.06: one broker admission carries every check a mutation depends on,
+/// so nothing it checked can move before the answer is transmitted.
+///
+/// The admission is the only authority `dispatch_mutation` takes, and only the broker makes one.
+/// What this establishes is that every refusal happens at the admission rather than during the
+/// dispatch, and that the transport is taken there too: an admission is authority over a specific
+/// upstream rather than permission to go and find one afterwards.
+#[test]
+fn kr_req_11_22_one_admission_carries_every_check_and_the_transport_it_will_use() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let prompt = AgentPromptParams {
+        target: target(1),
+        draft_id: Nullable::null(),
+        text: Nullable::some(PromptText::new("hello").expect("valid")),
+    };
+
+    // The admission carries the prepared operation, the revision it was taken at and the
+    // capability it was rechecked against.
+    let admitted = broker
+        .admit_prompt(&caller(), &prompt, false, TimestampMs::new(2))
+        .expect("the prompt is admitted");
+    assert_eq!(admitted.binding_revision(), AgentBindingRevision::new(1));
+    assert_eq!(
+        admitted.capability(),
+        Some(&capability("agent.prompt")),
+        "the admission names what it rechecked"
+    );
+    assert_eq!(
+        admitted.request().operation,
+        kr_worker::broker::UpstreamOperation::PromptSubmit
+    );
+    assert!(
+        upstream.submitted().is_empty(),
+        "admitting reaches no upstream"
+    );
+
+    // Nothing was transmitted until the admission was spent, and spending it is what reaches the
+    // upstream.
+    broker
+        .dispatch_mutation(&admitted, TimestampMs::new(3))
+        .expect("the admitted operation is carried");
+    assert_eq!(upstream.submitted().len(), 1);
+
+    // Every one of these is refused at the admission. A mutation that reaches `dispatch_mutation`
+    // has already passed all of them, under one lock, at one moment.
+    broker
+        .suspend_rich_mutations(instance(), "a native selection could not be observed")
+        .expect("suspended");
+    let suspended = broker
+        .admit_prompt(&caller(), &prompt, false, TimestampMs::new(4))
+        .expect_err("a suspended instance admits nothing");
+    assert_eq!(suspended.code(), ErrorCode::DraftConflict);
+    broker.resume_rich_mutations(instance()).expect("resumed");
+
+    let wrong_turn = broker
+        .admit_steer(
+            &caller(),
+            &AgentSteerParams {
+                target: target(1),
+                turn_id: AgentTurnId::new("turn-9").expect("valid"),
+                text: PromptText::new("try the other file").expect("valid"),
+            },
+            TimestampMs::new(5),
+        )
+        .expect_err("a turn that is not running is refused at the admission");
+    assert_eq!(wrong_turn.code(), ErrorCode::DraftConflict);
+
+    broker.invalidate_capabilities(
+        InstanceInvalidation::BindingChanged,
+        "the binary changed",
+        TimestampMs::new(6),
+    );
+    let unusable = broker
+        .admit_prompt(&caller(), &prompt, false, TimestampMs::new(7))
+        .expect_err("an invalidated capability is refused at the admission");
+    assert_eq!(unusable.code(), ErrorCode::UnsupportedCapability);
+
+    // And an instance with nothing bound to carry its operations is refused before anything is
+    // admitted, rather than discovered when the dispatch goes looking for a transport.
+    let unreachable = agent_broker();
+    let nothing = unreachable
+        .admit_prompt(&caller(), &prompt, false, TimestampMs::new(8))
+        .expect_err("no transport is bound");
+    assert_eq!(nothing.code(), ErrorCode::UnsupportedCapability);
+
+    // A stale revision is the admission's refusal too.
+    let broker = agent_broker_with(std::sync::Arc::new(RecordingUpstream::default()));
+    broker
+        .advance_binding(instance(), None, TimestampMs::new(9))
+        .expect("the selected thread changed");
+    let stale = broker
+        .admit_prompt(&caller(), &prompt, false, TimestampMs::new(10))
+        .expect_err("a prompt prepared against the old conversation is stale");
+    assert_eq!(stale.code(), ErrorCode::StaleSession);
+}
+
+/// KR-REQ-11.31: a dispatch is refused by the component answerable for it, not by the set of
+/// components the instance happens to have.
+///
+/// This is the per-binding half of the fence. A second component that is working cannot admit an
+/// action through the one whose rich capabilities a fault disabled.
+#[test]
+fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_one() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("prompt.submit").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+            }],
+        )
+        .expect("the actions are registered");
+    // A second component, bound to the same instance and working perfectly.
+    let other = BrokerBindingId::new(Uuid::from_bytes([11; 16]));
+    broker
+        .bind(
+            other,
+            instance(),
+            PluginId::new("kalareach.other").expect("valid"),
+            PublisherId::new("kalareach").expect("valid"),
+            Digest256::from_bytes([6; 32]),
+            BrokerGrants::granted([BrokerGrant::Observation]),
+            None,
+            TimestampMs::new(1),
+        )
+        .expect("the second binding is recorded");
+
+    let invoke = PluginActionInvokeParams {
+        target: target(1),
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        action: ActionName::new("prompt.submit").expect("valid"),
+        draft_id: Nullable::null(),
+        parameters: Bytes::from(b"{}".to_vec()),
+    };
+    broker
+        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(2))
+        .expect("the action is admitted while its own component works");
+
+    // The component that would run the action faults. The other one is untouched, and under the
+    // old rule that was enough to let this action through.
+    broker.disable_rich(binding(), "the component trapped");
+    let refusal = broker
+        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(3))
+        .expect_err("the component answerable for this action is disabled");
+    assert_eq!(refusal.code(), ErrorCode::UnsupportedCapability);
+    assert!(
+        broker
+            .check_invocable(&caller(), binding(), &invoke, TimestampMs::new(4))
+            .is_err(),
+        "and the same refusal is reachable before anything is marked"
+    );
+    assert_eq!(
+        upstream.submitted().len(),
+        0,
+        "nothing reached the upstream through a disabled provider"
+    );
 }

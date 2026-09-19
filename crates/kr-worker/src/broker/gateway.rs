@@ -123,6 +123,26 @@ pub struct RichInvocation {
     pub request: DownstreamRequestId,
 }
 
+/// The answer one admitted decision becomes on the wire.
+///
+/// It is prepared by the core, from the connection's own qualified table, rather than left to
+/// whatever writes it. Two things follow. The namespaced identifier travels with the bytes, so the
+/// writer cannot answer a resource other than the one that was admitted; and the frame is fixed at
+/// admission, so the exclusive admission and the bytes it authorises are one object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedResponse {
+    /// The namespaced identifier the answer resolves, which names the connection it goes out on.
+    pub request: DownstreamRequestId,
+    /// The upstream's own identifier for the request, as it wrote it.
+    pub upstream_request_id: UpstreamRequestId,
+    /// The method the original request named.
+    pub method: UpstreamMethod,
+    /// The decision, one of the ones the request offered.
+    pub option_id: String,
+    /// The response frame, built from the table's own member names.
+    pub frame: Vec<u8>,
+}
+
 /// One reverse request the upstream asked this host to perform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReverseRequest {
@@ -361,6 +381,66 @@ impl Gateway {
                 ))
             })??;
         Ok(DownstreamRequestId::new(connection, upstream))
+    }
+
+    /// Prepares the answer one decision becomes, in the connection's own frame shape.
+    ///
+    /// The identifier is written back exactly as the upstream wrote it, with its JSON type: the
+    /// string eleven goes back as `"11"` and the number eleven as `11`, because they are two
+    /// identifiers and a response to one must not resolve the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when the connection is unknown, and
+    /// [`BrokerError::InvalidArgument`] when the identifier is not one this host can write back.
+    pub fn prepare_response(
+        &self,
+        connection: GatewayConnectionId,
+        upstream_request_id: &UpstreamRequestId,
+        method: &UpstreamMethod,
+        option_id: &str,
+    ) -> Result<PreparedResponse> {
+        let held = self
+            .connections
+            .get(&connection)
+            .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
+        let identifier: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
+            .map_err(|error| {
+                BrokerError::invalid(format!(
+                    "{upstream_request_id} is not an identifier this host can write back: {error}"
+                ))
+            })?;
+        if !matches!(
+            identifier,
+            serde_json::Value::String(_) | serde_json::Value::Number(_)
+        ) {
+            return Err(BrokerError::invalid(format!(
+                "{upstream_request_id} is not a string or a number, so it is not a request \
+                 identifier"
+            )));
+        }
+        let mut frame = serde_json::Map::new();
+        frame.insert(held.table.response_id_field.clone(), identifier);
+        frame.insert(
+            held.table.result_field.clone(),
+            serde_json::json!({ "option_id": option_id }),
+        );
+        let frame = serde_json::to_vec(&serde_json::Value::Object(frame)).map_err(|error| {
+            BrokerError::invalid(format!("this answer will not encode: {error}"))
+        })?;
+        if frame.len() > MAX_NATIVE_FRAME_BYTES {
+            return Err(BrokerError::invalid(format!(
+                "this answer is {} bytes and a native frame is at most {MAX_NATIVE_FRAME_BYTES}",
+                frame.len()
+            )));
+        }
+        Ok(PreparedResponse {
+            request: DownstreamRequestId::new(connection, upstream_request_id.clone()),
+            upstream_request_id: upstream_request_id.clone(),
+            method: method.clone(),
+            option_id: option_id.to_owned(),
+            frame,
+        })
     }
 
     /// Admits one rich invocation against the closed method table.

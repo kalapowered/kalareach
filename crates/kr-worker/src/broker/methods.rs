@@ -24,14 +24,15 @@ use kr_protocol::agent::{
     PluginActionInvokeParams, PluginActionInvokeResult,
 };
 use kr_protocol::authority::EffectClass;
-use kr_protocol::broker::{ActionName, ActionProvenance, BrokerGrant};
+use kr_protocol::broker::{ActionName, ActionProvenance, ActionToken, BrokerGrant};
 use kr_protocol::gateway::PendingState;
 use kr_protocol::ids::{
-    ActorId, ApplicationInstanceId, BrokerBindingId, CapabilityId, CapabilityRevision, GrantId,
+    ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, CapabilityId, GrantId,
     SessionId, StreamCursor,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
+use crate::broker::arbitration::Claim;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::semantic::HistoryFilter;
 use crate::broker::tokens::Invocation;
@@ -121,6 +122,11 @@ pub enum UpstreamBody {
         method: kr_protocol::ids::UpstreamMethod,
         /// The decision, one of the ones the request offered.
         option_id: String,
+        /// The answer the core prepared from the connection's own qualified table.
+        ///
+        /// It names the connection the answer goes out on, so a connector cannot answer a
+        /// resource other than the one that was admitted.
+        response: crate::broker::gateway::PreparedResponse,
     },
     /// A registered plugin action.
     PluginAction {
@@ -132,6 +138,12 @@ pub enum UpstreamBody {
         draft_id: Option<kr_protocol::ids::DraftId>,
         /// The action's own parameters, canonically encoded.
         parameters: Vec<u8>,
+        /// The action token this invocation runs under.
+        ///
+        /// Section 11 binds it to the actor, the grant, the revision, the action and the parameter
+        /// hash, and the component that prepares the effect receives it: an effect plan may use
+        /// only what this invocation permits.
+        token: Option<ActionToken>,
     },
 }
 
@@ -163,6 +175,158 @@ pub trait UpstreamDispatch: Send + Sync + core::fmt::Debug {
     /// framing connection cannot safely continue; section 11 forbids opening a second backend or
     /// replaying an unknown request instead.
     fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome>;
+}
+
+/// Which component is answerable for one mutation reaching its upstream.
+///
+/// A fault disables the rich capabilities of the binding it happened to, and section 11 keeps
+/// native traffic out of it. What that means for a mutation is decided here: the mutation is
+/// checked against *its own* provider rather than against the instance's bindings as a set, so an
+/// unrelated component that is still working cannot admit one through a component that is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Responsible {
+    /// The instance's own transport carries it and no component gives it its meaning.
+    ///
+    /// A prompt, a steer and a cancellation are this: they are encoded by the connector that owns
+    /// the connection, not by a component the broker holds a binding for.
+    Transport,
+    /// One component: the decoder that interpreted an approval, or the package whose action runs.
+    Binding(BrokerBindingId),
+}
+
+/// Permission to carry one agent mutation to its upstream, and everything it was admitted against.
+///
+/// Only [`Broker::admit_mutation`] and its two siblings make one, under the broker's own lock, in
+/// one operation with the checks. A caller holding one is therefore a caller whose complete
+/// invocation was valid against the state the broker had at a single moment: a fence, a
+/// suspension, a turn change or a capability invalidation cannot land between the check and the
+/// transmission, because there is nothing between them.
+///
+/// It carries the transport rather than naming it, so the submission does not have to go back to
+/// the broker to find one, which is what lets a caller release its own locks before it transmits.
+#[derive(Debug)]
+pub struct MutationAdmission {
+    request: UpstreamRequest,
+    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    responsible: Responsible,
+    capability: Option<CapabilityId>,
+    admitted_at: TimestampMs,
+    provenance: ActionProvenance,
+    approval: Option<(Claim, DispatchAdmission)>,
+    token: Option<ActionToken>,
+}
+
+impl MutationAdmission {
+    pub(crate) const fn new(
+        request: UpstreamRequest,
+        dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+        responsible: Responsible,
+        capability: Option<CapabilityId>,
+        admitted_at: TimestampMs,
+    ) -> Self {
+        Self {
+            request,
+            dispatch,
+            responsible,
+            capability,
+            admitted_at,
+            provenance: ActionProvenance::UpstreamTypedRpc,
+            approval: None,
+            token: None,
+        }
+    }
+
+    pub(crate) fn with_body(mut self, body: UpstreamBody) -> Self {
+        self.request.body = body;
+        self
+    }
+
+    pub(crate) fn with_approval(mut self, claim: Claim, admission: DispatchAdmission) -> Self {
+        self.provenance = admission.provenance;
+        self.approval = Some((claim, admission));
+        self
+    }
+
+    pub(crate) fn with_action_token(mut self, token: ActionToken) -> Self {
+        // The token reaches the component that prepares the effect, so it travels with the body
+        // the connector encodes rather than beside it.
+        if let UpstreamBody::PluginAction { token: carried, .. } = &mut self.request.body {
+            *carried = Some(token.clone());
+        }
+        self.token = Some(token);
+        self
+    }
+
+    pub(crate) fn claim(&self) -> Option<&Claim> {
+        self.approval.as_ref().map(|(claim, _)| claim)
+    }
+
+    /// Returns the prepared operation, as it will reach the upstream.
+    #[must_use]
+    pub const fn request(&self) -> &UpstreamRequest {
+        &self.request
+    }
+
+    /// Returns the instance this mutation acts on.
+    #[must_use]
+    pub const fn application_instance_id(&self) -> ApplicationInstanceId {
+        self.request.application_instance_id
+    }
+
+    /// Returns the binding revision it was admitted at.
+    #[must_use]
+    pub const fn binding_revision(&self) -> AgentBindingRevision {
+        self.request.binding_revision
+    }
+
+    /// Returns which component is answerable for it.
+    #[must_use]
+    pub const fn responsible(&self) -> Responsible {
+        self.responsible
+    }
+
+    /// Returns the capability it was rechecked against, where it names one.
+    #[must_use]
+    pub const fn capability(&self) -> Option<&CapabilityId> {
+        self.capability.as_ref()
+    }
+
+    /// Returns the host time the admission was taken at.
+    #[must_use]
+    pub const fn admitted_at(&self) -> TimestampMs {
+        self.admitted_at
+    }
+
+    /// Returns how the answer will be recorded as having reached the upstream.
+    #[must_use]
+    pub const fn provenance(&self) -> ActionProvenance {
+        self.provenance
+    }
+
+    /// Returns the dispatch admission of the approval this carries, when it carries one.
+    #[must_use]
+    pub fn approval(&self) -> Option<&DispatchAdmission> {
+        self.approval.as_ref().map(|(_, admission)| admission)
+    }
+
+    /// Returns the action token this invocation was admitted under, when it has one.
+    #[must_use]
+    pub const fn token(&self) -> Option<&ActionToken> {
+        self.token.as_ref()
+    }
+
+    /// Carries the operation to the upstream and returns what it answered.
+    ///
+    /// Nothing is held while this runs. That is the point of separating admission from
+    /// transmission: the caller has already committed everything a crash would need, so the
+    /// transport work happens with no lock of the broker's or the session's held.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport refuses.
+    pub fn submit(&self) -> Result<UpstreamOutcome> {
+        self.dispatch.submit(&self.request)
+    }
 }
 
 /// One action a package registered, and everything the broker checks before it runs.
@@ -256,211 +420,321 @@ impl Broker {
         })
     }
 
-    /// Applies `agent.prompt.submit` or `agent.prompt.queue`.
+    /// Admits one agent mutation, under the broker's own lock, in one operation.
+    ///
+    /// This is the gate every mutation passes: the session, the fence, the instance, its
+    /// suspension, the binding revision, the turn, the component answerable for the dispatch, the
+    /// capability and the transport, all against the state at one moment. What comes back is the
+    /// authority to transmit, and it is the only thing that is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] for a session or instance this worker does not
+    /// serve, [`BrokerError::UpstreamUnavailable`] while rich work is fenced,
+    /// [`BrokerError::UnsupportedCapability`] when nothing carries the operation or the component
+    /// answerable for it is disabled, [`BrokerError::StaleBinding`] when the revision has moved,
+    /// and [`BrokerError::PreconditionFailed`] when rich mutations are suspended or the turn named
+    /// is not the one running.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_mutation(
+        &self,
+        caller: &Caller,
+        target: &AgentMutationTarget,
+        capability: &str,
+        operation: UpstreamOperation,
+        turn_id: Option<kr_protocol::ids::AgentTurnId>,
+        body: UpstreamBody,
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        let _ = caller;
+        let capability_id = CapabilityId::new(capability)
+            .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;
+        self.state().admit_mutation_in(
+            target,
+            Some(capability_id),
+            operation,
+            turn_id,
+            Responsible::Transport,
+            body,
+            now,
+        )
+    }
+
+    /// Admits `agent.prompt.submit` or `agent.prompt.queue`.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the call names neither a draft nor text, or
-    /// both, and whatever [`Broker::check_mutation`] refuses.
-    pub fn agent_prompt(
+    /// both, and whatever [`Broker::admit_mutation`] refuses.
+    pub fn admit_prompt(
         &self,
         caller: &Caller,
         params: &AgentPromptParams,
         queued: bool,
-    ) -> Result<AgentMutationResult> {
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
         params.validate().map_err(BrokerError::invalid)?;
-        let capability = if queued {
-            "agent.prompt.queue"
+        let (capability, operation) = if queued {
+            ("agent.prompt.queue", UpstreamOperation::PromptQueue)
         } else {
-            "agent.prompt"
+            ("agent.prompt", UpstreamOperation::PromptSubmit)
         };
-        let operation = if queued {
-            UpstreamOperation::PromptQueue
-        } else {
-            UpstreamOperation::PromptSubmit
-        };
-        let admitted = self.check_mutation(caller, &params.target, capability, operation)?;
-        self.dispatch_mutation(
+        self.admit_mutation(
+            caller,
             &params.target,
-            admitted,
+            capability,
             operation,
             None,
             UpstreamBody::Prompt {
                 draft_id: params.draft_id.as_ref().copied(),
                 text: params.text.as_ref().map(|text| text.as_str().to_owned()),
             },
+            now,
         )
+    }
+
+    /// Admits `agent.turn.steer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Broker::admit_mutation`] refuses.
+    pub fn admit_steer(
+        &self,
+        caller: &Caller,
+        params: &AgentSteerParams,
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        self.admit_mutation(
+            caller,
+            &params.target,
+            "agent.steer",
+            UpstreamOperation::TurnSteer,
+            Some(params.turn_id.clone()),
+            UpstreamBody::Steer {
+                text: params.text.as_str().to_owned(),
+            },
+            now,
+        )
+    }
+
+    /// Admits `agent.turn.cancel`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Broker::admit_mutation`] refuses.
+    pub fn admit_cancel(
+        &self,
+        caller: &Caller,
+        params: &AgentCancelParams,
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        self.admit_mutation(
+            caller,
+            &params.target,
+            "agent.cancel",
+            UpstreamOperation::TurnCancel,
+            Some(params.turn_id.clone()),
+            UpstreamBody::Cancel,
+            now,
+        )
+    }
+
+    /// Applies `agent.prompt.submit` or `agent.prompt.queue`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Broker::admit_prompt`] and the transport refuse.
+    pub fn agent_prompt(
+        &self,
+        caller: &Caller,
+        params: &AgentPromptParams,
+        queued: bool,
+        now: TimestampMs,
+    ) -> Result<AgentMutationResult> {
+        let admitted = self.admit_prompt(caller, params, queued, now)?;
+        self.dispatch_mutation(&admitted, now)
     }
 
     /// Applies `agent.turn.steer`.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::PreconditionFailed`] when the turn named is not the one running,
-    /// and whatever [`Broker::check_mutation`] refuses.
+    /// Returns whatever [`Broker::admit_steer`] and the transport refuse.
     pub fn agent_steer(
         &self,
         caller: &Caller,
         params: &AgentSteerParams,
+        now: TimestampMs,
     ) -> Result<AgentMutationResult> {
-        self.check_turn(&params.target, &params.turn_id)?;
-        let admitted = self.check_mutation(
-            caller,
-            &params.target,
-            "agent.steer",
-            UpstreamOperation::TurnSteer,
-        )?;
-        self.dispatch_mutation(
-            &params.target,
-            admitted,
-            UpstreamOperation::TurnSteer,
-            Some(params.turn_id.clone()),
-            UpstreamBody::Steer {
-                text: params.text.as_str().to_owned(),
-            },
-        )
+        let admitted = self.admit_steer(caller, params, now)?;
+        self.dispatch_mutation(&admitted, now)
     }
 
     /// Applies `agent.turn.cancel`.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::PreconditionFailed`] when the turn named is not the one running,
-    /// and whatever [`Broker::check_mutation`] refuses.
+    /// Returns whatever [`Broker::admit_cancel`] and the transport refuse.
     pub fn agent_cancel(
         &self,
         caller: &Caller,
         params: &AgentCancelParams,
+        now: TimestampMs,
     ) -> Result<AgentMutationResult> {
-        self.check_turn(&params.target, &params.turn_id)?;
-        let admitted = self.check_mutation(
-            caller,
-            &params.target,
-            "agent.cancel",
-            UpstreamOperation::TurnCancel,
-        )?;
-        self.dispatch_mutation(
-            &params.target,
-            admitted,
-            UpstreamOperation::TurnCancel,
-            Some(params.turn_id.clone()),
-            UpstreamBody::Cancel,
-        )
+        let admitted = self.admit_cancel(caller, params, now)?;
+        self.dispatch_mutation(&admitted, now)
     }
 
-    /// Applies `agent.approval.respond`: claims the resource, admits the answer and resolves it.
+    /// Admits `agent.approval.respond`: the mutation, the resource, the claim and the marker, in
+    /// one operation under the broker's lock.
     ///
-    /// This is the encode, recheck, claim and dispatch transaction as a method sees it. The
-    /// decision is checked against the ones the request actually offered, and the durable marker
-    /// is committed before the answer would go.
+    /// This is the encode, recheck, claim and dispatch transaction as a method sees it, and the
+    /// whole of it happens here so that nothing the checks read can move before the marker. The
+    /// admission carries the answer the core prepared from the connection's own table, so the
+    /// bytes that go are the bytes that were admitted.
     ///
     /// # Errors
     ///
-    /// Returns whatever [`Broker::check_mutation`], [`Broker::claim`] and
-    /// [`Broker::admit_dispatch`] refuse.
-    pub fn agent_approval_respond(
+    /// Returns whatever [`Broker::admit_mutation`] refuses, [`BrokerError::UnknownSubject`] when
+    /// the resource is not one this broker holds, [`BrokerError::PermissionDenied`] when it
+    /// belongs to another instance or its decoder may no longer answer,
+    /// [`BrokerError::Arbitration`] when it has already been answered, and
+    /// [`BrokerError::PreconditionFailed`] when the deadline has passed or the decision is not one
+    /// the request offered.
+    pub fn admit_approval(
         &self,
         caller: &Caller,
         params: &AgentApprovalRespondParams,
         now: TimestampMs,
-    ) -> Result<(AgentApprovalRespondResult, DispatchAdmission)> {
-        let mutation = self.check_mutation(
-            caller,
-            &params.target,
-            "agent.approval",
-            UpstreamOperation::ApprovalRespond,
-        )?;
-        let resource = self.pending(params.resource_id).ok_or_else(|| {
-            BrokerError::unknown(format!("no pending resource {}", params.resource_id))
-        })?;
+    ) -> Result<MutationAdmission> {
+        let _ = caller;
+        let mut state = self.state();
+        let resource = state.pending_resource(params.resource_id)?.resource.clone();
         if resource.application_instance_id != params.target.subject.application_instance_id {
             return Err(BrokerError::denied(format!(
                 "{} belongs to another application instance",
                 params.resource_id
             )));
         }
-        // The decision is checked before the claim is taken. Claiming and then discovering the
-        // answer was never on offer would leave the resource held by a caller that has nothing to
-        // spend it on.
-        let entry =
-            self.decoding(params.resource_id)?
-                .ok_or_else(|| BrokerError::PreconditionFailed {
-                    detail: format!(
-                        "{} has no recorded interpretation, so there is nothing to answer",
-                        params.resource_id
-                    ),
-                })?;
-        if !entry.offers(&params.option_id) {
+        // One resolution per pending resource. A resource that has already reached an answer, been
+        // cancelled or been left uncertain is not answerable again, and saying so here is what
+        // keeps the claim from being the thing that discovers it.
+        if resource.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: resource.state,
+                },
+            ));
+        }
+        if let Some(deadline) = resource.deadline_ms.as_ref()
+            && deadline.get() <= now.get()
+        {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
-                    "{} is not one of the decisions this request offered",
-                    params.option_id
+                    "{}'s upstream deadline passed at {}, so this answer would reach nothing",
+                    params.resource_id,
+                    deadline.get()
                 ),
             });
         }
-        // Nothing carries the answer to this upstream: refuse before the claim, so the resource
-        // is not held behind an answer that can never be sent.
-        let dispatch = self
-            .dispatch_for(params.target.subject.application_instance_id)
-            .ok_or_else(|| BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "nothing carries an answer to {}: this instance has no upstream transport \
-                     bound, so the approval is refused rather than reported as answered",
-                    params.target.subject.application_instance_id
-                ),
-            })?;
-
-        let claim = self.claim(params.resource_id, &caller.actor_id, now)?;
+        // The component answerable for an approval is the decoder that interpreted it: it is the
+        // one whose meaning the answer carries, and a fault in it disables this dispatch whatever
+        // else is bound to the instance.
+        let responsible = state
+            .decoder_of(params.resource_id)
+            .map_or(Responsible::Transport, Responsible::Binding);
+        let capability_id = CapabilityId::new("agent.approval")
+            .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;
+        let admitted = state.admit_mutation_in(
+            &params.target,
+            Some(capability_id),
+            UpstreamOperation::ApprovalRespond,
+            None,
+            responsible,
+            UpstreamBody::Cancel,
+            now,
+        )?;
+        let claim = state.claim_in(params.resource_id, &caller.actor_id, now)?;
         // From here the claim is held, so anything that fails before the marker gives it back
         // rather than leaving the resource stuck behind a claim nobody will spend.
-        let admission = match self.admit_dispatch(&claim, &params.option_id) {
-            Ok(admission) => admission,
+        let dispatch = match state.admit_dispatch_in(&claim, &params.option_id) {
+            Ok(dispatch) => dispatch,
             Err(error) => {
-                let _ = self.release_claim(&claim, now);
+                let _ = state.release_claim_in(&claim, now);
                 return Err(error);
             }
         };
-        // The marker is committed. From here the answer may have gone, so a failure leaves the
-        // resource uncertain rather than answerable: asking again could apply it twice.
-        let outcome = match dispatch.submit(&UpstreamRequest {
-            application_instance_id: params.target.subject.application_instance_id,
-            binding_revision: mutation.binding_revision,
-            operation: UpstreamOperation::ApprovalRespond,
-            turn_id: None,
-            body: UpstreamBody::Approval {
-                resource_id: params.resource_id,
-                upstream_request_id: admission.upstream_request_id.clone(),
-                method: admission.method.clone(),
-                option_id: params.option_id.clone(),
-            },
-        }) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = self.uncertain(&claim, now);
-                return Err(error);
-            }
+        let body = UpstreamBody::Approval {
+            resource_id: params.resource_id,
+            upstream_request_id: dispatch.upstream_request_id.clone(),
+            method: dispatch.method.clone(),
+            option_id: params.option_id.clone(),
+            response: dispatch.response.clone(),
         };
-        let resolved = self.resolve(&claim, now)?;
-        Ok((
-            AgentApprovalRespondResult {
-                mutation: AgentMutationResult {
-                    provenance: outcome.provenance,
-                    upstream_request_id: Nullable::some(admission.upstream_request_id.clone()),
-                    turn_id: Nullable::from(outcome.turn_id),
-                    ..mutation
-                },
-                resource_id: params.resource_id,
-                state: resolved.state,
-            },
-            admission,
-        ))
+        Ok(admitted.with_body(body).with_approval(claim, dispatch))
     }
 
-    /// Applies `plugin.action.invoke`.
+    /// Applies `agent.approval.respond`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Broker::admit_approval`] and the transport refuse.
+    pub fn agent_approval_respond(
+        &self,
+        caller: &Caller,
+        params: &AgentApprovalRespondParams,
+        now: TimestampMs,
+    ) -> Result<(AgentApprovalRespondResult, MutationAdmission)> {
+        let admitted = self.admit_approval(caller, params, now)?;
+        let result = self.record_approval(&admitted, now)?;
+        Ok((result, admitted))
+    }
+
+    /// Carries an admitted approval to its upstream and records the outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport refuses, after leaving the resource uncertain: the marker is
+    /// committed, so asking again could apply the answer twice.
+    pub fn record_approval(
+        &self,
+        admitted: &MutationAdmission,
+        now: TimestampMs,
+    ) -> Result<AgentApprovalRespondResult> {
+        let dispatch = admitted.approval().ok_or_else(|| {
+            BrokerError::invalid("this admission does not carry an approval to answer")
+        })?;
+        let claim = admitted
+            .claim()
+            .ok_or_else(|| BrokerError::invalid("this admission holds no claim"))?;
+        let outcome = match admitted.submit() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = self.uncertain(claim, now);
+                return Err(error);
+            }
+        };
+        let resolved = self.resolve(claim, now)?;
+        Ok(AgentApprovalRespondResult {
+            mutation: AgentMutationResult {
+                binding_revision: admitted.binding_revision(),
+                provenance: outcome.provenance,
+                upstream_request_id: Nullable::some(dispatch.upstream_request_id.clone()),
+                turn_id: Nullable::from(outcome.turn_id),
+            },
+            resource_id: dispatch.resource.resource_id,
+            state: resolved.state,
+        })
+    }
+
+    /// Admits `plugin.action.invoke`: the action, the authority, the token and the transport, in
+    /// one operation under the broker's lock.
     ///
     /// Section 23's row names four things this validates before anything runs: the registered
     /// action, the actor's grant, the effect class and the input, draft and request preconditions.
-    /// The action token that comes out is the authority for the one invocation that follows.
+    /// The action token that comes out is the authority for the one invocation that follows, and
+    /// it is issued and spent here so that the recheck it performs reads the same state the rest
+    /// of the admission did.
     ///
     /// # Errors
     ///
@@ -468,6 +742,45 @@ impl Broker {
     /// [`BrokerError::Grant`] when the binding does not hold the grant the action declares,
     /// [`BrokerError::InvalidArgument`] for an effect class that disagrees with the call, and
     /// [`BrokerError::PreconditionFailed`] when a draft the action needs was not named.
+    pub fn admit_plugin_action(
+        &self,
+        caller: &Caller,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        let registered = self.check_action(binding_id, params)?;
+        let invocation = Self::invocation_for(caller, &registered, params);
+        let mut state = self.state();
+        let admitted = state.admit_mutation_in(
+            &params.target,
+            registered.capability.clone(),
+            UpstreamOperation::PluginAction,
+            None,
+            Responsible::Binding(binding_id),
+            UpstreamBody::PluginAction {
+                plugin_id: params.plugin_id.clone(),
+                action: params.action.clone(),
+                draft_id: params.draft_id.as_ref().copied(),
+                parameters: params.parameters.as_slice().to_vec(),
+                token: None,
+            },
+            now,
+        )?;
+        let token = state.issue_token_in(binding_id, &invocation, now)?;
+        // The token is spent here, before the effect: spending is what rechecks the binding, the
+        // grant, the revision and the capability against the present, and doing it afterwards
+        // would refuse an action that had already happened. Spending it under the same lock the
+        // rest of the admission took is what leaves no window between the two.
+        let spent = state.spend_token_in(&kr_protocol::broker::ActionTokenClaim::from(&token))?;
+        Ok(admitted.with_action_token(spent))
+    }
+
+    /// Applies `plugin.action.invoke`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Broker::admit_plugin_action`] and the transport refuse.
     pub fn plugin_action_invoke(
         &self,
         caller: &Caller,
@@ -475,58 +788,69 @@ impl Broker {
         params: &PluginActionInvokeParams,
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
-        let registered = self.check_action(binding_id, params)?;
-        let invocation = Self::invocation_for(caller, &registered, params);
-        let dispatch = self
-            .dispatch_for(params.target.subject.application_instance_id)
-            .ok_or_else(|| BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "nothing carries {} to {}: this instance has no upstream transport bound, so \
-                     the action is refused rather than reported as applied",
-                    params.action, params.target.subject.application_instance_id
-                ),
-            })?;
-        let token = self.issue_token(binding_id, &invocation, now)?;
-        // The token is spent *before* the effect: spending is what rechecks the binding, the
-        // grant, the revision and the capability against the present, and doing it afterwards
-        // would refuse an action that had already happened. It also means a preparation this host
-        // abandons leaves no token behind to fill the store.
-        let spent = self.spend_token(&kr_protocol::broker::ActionTokenClaim::from(&token))?;
-        let outcome = dispatch.submit(&UpstreamRequest {
-            application_instance_id: params.target.subject.application_instance_id,
-            binding_revision: params.target.binding_revision,
-            operation: UpstreamOperation::PluginAction,
-            turn_id: None,
-            body: UpstreamBody::PluginAction {
-                plugin_id: params.plugin_id.clone(),
-                action: params.action.clone(),
-                draft_id: params.draft_id.as_ref().copied(),
-                parameters: params.parameters.as_slice().to_vec(),
-            },
-        })?;
+        let admitted = self.admit_plugin_action(caller, binding_id, params, now)?;
+        self.record_plugin_action(&admitted, now)
+    }
+
+    /// Carries an admitted plugin action to its upstream and records the outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport refuses.
+    pub fn record_plugin_action(
+        &self,
+        admitted: &MutationAdmission,
+        now: TimestampMs,
+    ) -> Result<PluginActionInvokeResult> {
+        let _ = now;
+        let token = admitted
+            .token()
+            .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?
+            .clone();
+        let outcome = admitted.submit()?;
         Ok(PluginActionInvokeResult {
             mutation: AgentMutationResult {
-                binding_revision: spent.binding_revision,
+                binding_revision: token.binding_revision,
                 provenance: outcome.provenance,
                 upstream_request_id: Nullable::from(outcome.upstream_request_id),
                 turn_id: Nullable::from(outcome.turn_id),
             },
-            action: spent.action,
+            action: token.action,
         })
     }
 
-    /// Checks everything an agent mutation depends on, and returns what it did.
+    /// Checks everything one agent mutation would be refused for, without admitting it.
+    ///
+    /// Section 9 makes a refusal this host can decide a rejection rather than an outcome nobody
+    /// can establish, so the service asks this before it writes a dispatch marker. It asks exactly
+    /// what the admission asks, by taking one and letting it go: a check that drifts from the
+    /// admission it stands for is worse than no check at all.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::StaleBinding`] when the revision has moved,
-    /// [`BrokerError::PreconditionFailed`] when rich mutations are suspended, and
+    /// Returns whatever [`Broker::admit_mutation`] refuses.
+    pub fn check_mutation(
+        &self,
+        caller: &Caller,
+        target: &AgentMutationTarget,
+        capability: &str,
+        action: UpstreamOperation,
+        turn_id: Option<kr_protocol::ids::AgentTurnId>,
+        now: TimestampMs,
+    ) -> Result<()> {
+        self.admit_mutation(
+            caller,
+            target,
+            capability,
+            action,
+            turn_id,
+            UpstreamBody::Cancel,
+            now,
+        )
+        .map(|_| ())
+    }
+
     /// Checks what every rich operation on one instance needs, whatever the operation is.
-    ///
-    /// The subject exists, the journal is not fenced, something carries an operation to the
-    /// upstream, and at least one component still gives rich work its meaning. Each of these is a
-    /// refusal this host can make on its own, so it is made before any receipt marker is written
-    /// rather than discovered during dispatch.
     ///
     /// # Errors
     ///
@@ -535,88 +859,17 @@ impl Broker {
     /// [`BrokerError::UnsupportedCapability`] when no transport is bound or every component's
     /// rich capabilities are disabled.
     pub fn check_dispatchable(&self, target: &AgentMutationTarget) -> Result<()> {
-        self.check_dispatchable_for(target, UpstreamOperation::PluginAction)
-    }
-
-    fn check_dispatchable_for(
-        &self,
-        target: &AgentMutationTarget,
-        action: UpstreamOperation,
-    ) -> Result<()> {
-        self.check_subject(&target.subject)?;
-        // Rich work is fenced while the journal is faulted, and a mutation is rich work. Without
-        // this a prompt submitted during the gap would be answered as applied with no durable
-        // record of it at all.
-        self.require_rich_work()?;
-        // And nothing carries an operation to an instance with no transport bound. It is decided
-        // here rather than at the submission, because it is a refusal this host can make and
-        // section 9 makes such a refusal a rejection rather than an outcome nobody can establish.
-        if self
-            .dispatch_for(target.subject.application_instance_id)
-            .is_none()
-        {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "nothing carries a {action} to {}: this instance has no upstream transport \
-                     bound, so the operation is refused rather than reported as applied",
-                    target.subject.application_instance_id
-                ),
-            });
-        }
-        // A component fault disables the rich capabilities of the binding it happened to. When
-        // every binding of this instance is disabled there is nothing left to give a rich
-        // mutation its meaning, and the mutation waits with them.
-        if self.rich_bindings_all_disabled(target.subject.application_instance_id) {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "every component bound to {} has had its rich capabilities disabled",
-                    target.subject.application_instance_id
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    /// [`BrokerError::UnsupportedCapability`] when the capability is not usable here.
-    pub fn check_mutation(
-        &self,
-        caller: &Caller,
-        target: &AgentMutationTarget,
-        capability: &str,
-        action: UpstreamOperation,
-    ) -> Result<AgentMutationResult> {
-        let _ = caller;
-        self.check_dispatchable_for(target, action)?;
-        let binding = self.binding_state(target.subject.application_instance_id)?;
-        if binding.rich_mutations_suspended {
-            return Err(BrokerError::PreconditionFailed {
-                detail: binding.suspension_reason.as_ref().map_or_else(
-                    || "rich mutations are suspended".to_owned(),
-                    |reason| format!("rich mutations are suspended: {reason}"),
-                ),
-            });
-        }
-        if binding.binding_revision != target.binding_revision {
-            return Err(BrokerError::StaleBinding {
-                detail: format!(
-                    "{action} was prepared at binding revision {} and the binding is at {}",
-                    target.binding_revision, binding.binding_revision
-                ),
-            });
-        }
-        let capability_id = CapabilityId::new(capability)
-            .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;
-        self.recheck_capability(
-            target.subject.application_instance_id,
-            &capability_id,
-            None::<CapabilityRevision>,
-        )?;
-        Ok(AgentMutationResult {
-            binding_revision: binding.binding_revision,
-            provenance: ActionProvenance::UpstreamTypedRpc,
-            upstream_request_id: Nullable::null(),
-            turn_id: Nullable::null(),
-        })
+        self.state()
+            .admit_mutation_in(
+                target,
+                None,
+                UpstreamOperation::PluginAction,
+                None,
+                Responsible::Transport,
+                UpstreamBody::Cancel,
+                TimestampMs::new(0),
+            )
+            .map(|_| ())
     }
 
     /// Checks that the turn a mutation names is the one this instance is running.
@@ -732,11 +985,20 @@ impl Broker {
         caller: &Caller,
         binding_id: BrokerBindingId,
         params: &PluginActionInvokeParams,
+        now: TimestampMs,
     ) -> Result<()> {
         let registered = self.check_action(binding_id, params)?;
-        self.check_dispatchable(&params.target)?;
         let invocation = Self::invocation_for(caller, &registered, params);
-        let state = self.state();
+        let mut state = self.state();
+        state.admit_mutation_in(
+            &params.target,
+            registered.capability.clone(),
+            UpstreamOperation::PluginAction,
+            None,
+            Responsible::Binding(binding_id),
+            UpstreamBody::Cancel,
+            now,
+        )?;
         state.check_invocation(binding_id, &invocation)?;
         // And there has to be a token to issue. A full table refuses every invocation whatever
         // the caller does, so it is refused here rather than after the marker.
@@ -800,41 +1062,23 @@ impl Broker {
 
     /// Carries one admitted mutation to the upstream, and records what it answered.
     ///
-    /// This is the half that happens: everything before it decided whether the operation may
-    /// happen, and this is the only place in the broker that reaches an upstream at all. An
-    /// instance with no transport bound has no upstream this host can reach, and the refusal says
-    /// so rather than reporting the operation as applied.
+    /// The argument is a [`MutationAdmission`], which only the broker makes. That is the whole
+    /// change from a result the caller could have built: an admission is proof that the complete
+    /// invocation was valid against the broker's state at one moment, and a result is a shape.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnsupportedCapability`] when nothing carries operations to this
-    /// instance, and whatever the transport itself refuses.
+    /// Returns whatever the transport itself refuses.
     pub fn dispatch_mutation(
         &self,
-        target: &AgentMutationTarget,
-        admitted: AgentMutationResult,
-        operation: UpstreamOperation,
-        turn_id: Option<kr_protocol::ids::AgentTurnId>,
-        body: UpstreamBody,
+        admitted: &MutationAdmission,
+        now: TimestampMs,
     ) -> Result<AgentMutationResult> {
-        let dispatch = self
-            .dispatch_for(target.subject.application_instance_id)
-            .ok_or_else(|| BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "nothing carries a {operation} to {}: this instance has no upstream transport \
-                     bound, so the operation is refused rather than reported as applied",
-                    target.subject.application_instance_id
-                ),
-            })?;
-        let outcome = dispatch.submit(&UpstreamRequest {
-            application_instance_id: target.subject.application_instance_id,
-            binding_revision: admitted.binding_revision,
-            operation,
-            turn_id: turn_id.clone(),
-            body,
-        })?;
+        let _ = now;
+        let turn_id = admitted.request().turn_id.clone();
+        let outcome = admitted.submit()?;
         Ok(AgentMutationResult {
-            binding_revision: admitted.binding_revision,
+            binding_revision: admitted.binding_revision(),
             provenance: outcome.provenance,
             upstream_request_id: Nullable::from(outcome.upstream_request_id),
             turn_id: Nullable::from(outcome.turn_id.or(turn_id)),

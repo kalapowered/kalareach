@@ -310,13 +310,14 @@ fn kr_req_11_31_a_disabled_component_stops_rich_meaning_and_no_native_recording(
 
     // And its answer is still arbitrated.
     let answered = broker
-        .native_answer(
+        .native_answer_through(
             GatewayConnectionId::new(1),
             response("2").as_bytes(),
             TimestampMs::new(6),
+            |_| Ok(()),
         )
         .expect("the native answer is arbitrated");
-    assert_eq!(answered.state, PendingState::Cancelled);
+    assert_eq!(answered.state, PendingState::Resolved);
 
     // The rich meaning is what stopped.
     let refusal = approval(&broker, "3", 7).expect_err("rich interpretation is disabled");
@@ -410,15 +411,16 @@ fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_t
     let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
 
     // The component has encoded its answer. Before the rich answer reaches the recheck, the
-    // upstream answers itself.
+    // person answers in the terminal and the native path takes the one admission.
     let answered = broker
-        .native_answer(
+        .native_answer_through(
             GatewayConnectionId::new(1),
             response("1").as_bytes(),
             TimestampMs::new(5),
+            |_| Ok(()),
         )
-        .expect("the upstream answered its own request");
-    assert_eq!(answered.state, PendingState::Cancelled);
+        .expect("the native client answered first");
+    assert_eq!(answered.state, PendingState::Resolved);
 
     // The rich answer now reaches the recheck, and there is nothing to claim.
     let refusal = broker
@@ -434,7 +436,7 @@ fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_t
             .pending(resource.resource_id)
             .expect("the resource is still recorded")
             .state,
-        PendingState::Cancelled,
+        PendingState::Resolved,
         "the later rich response is told the resolved state"
     );
 
@@ -506,15 +508,16 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
 
     // Answering on one connection resolves that connection's resource and not the other's.
     broker
-        .native_answer(
+        .native_answer_through(
             GatewayConnectionId::new(1),
             response("1").as_bytes(),
             TimestampMs::new(4),
+            |_| Ok(()),
         )
         .expect("arbitrated");
     assert_eq!(
         broker.pending(first.resource_id).expect("recorded").state,
-        PendingState::Cancelled
+        PendingState::Resolved
     );
     assert_eq!(
         broker.pending(second.resource_id).expect("recorded").state,
@@ -524,10 +527,11 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
     // And a second answer to the same identifier is refused rather than applied twice.
     assert!(
         broker
-            .native_answer(
+            .native_answer_through(
                 GatewayConnectionId::new(1),
                 response("1").as_bytes(),
                 TimestampMs::new(5),
+                |_| Ok(()),
             )
             .is_err(),
         "one resource takes one response transition"
@@ -639,10 +643,11 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
 
     // The upstream answers the numeric one. The string one is untouched.
     let answered = broker
-        .native_answer(
+        .native_answer_through(
             GatewayConnectionId::new(1),
             response("11").as_bytes(),
             TimestampMs::new(4),
+            |_| Ok(()),
         )
         .expect("the response correlates");
     assert_eq!(answered.resource_id, number.resource_id);
@@ -657,10 +662,11 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
     // A second request that carries a live identifier is still a request.
     assert!(
         broker
-            .native_answer(
+            .native_answer_through(
                 GatewayConnectionId::new(1),
                 frame("\"11\"", "fs/write_text_file").as_bytes(),
                 TimestampMs::new(5),
+                |_| Ok(()),
             )
             .is_err(),
         "a frame that names a method is a request and resolves nothing"
@@ -673,10 +679,11 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
     ] {
         assert!(
             broker
-                .native_answer(
+                .native_answer_through(
                     GatewayConnectionId::new(1),
                     not_a_response.as_bytes(),
                     TimestampMs::new(6),
+                    |_| Ok(()),
                 )
                 .is_err(),
             "a response names exactly one of its result and its error"
@@ -703,10 +710,11 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
     ] {
         assert!(
             broker
-                .native_answer(
+                .native_answer_through(
                     GatewayConnectionId::new(1),
                     not_a_failure.as_bytes(),
                     TimestampMs::new(7),
+                    |_| Ok(()),
                 )
                 .is_err(),
             "an error carries a code and a message or it resolves nothing"
@@ -751,10 +759,11 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
             .1
             .expect("it expects a response");
         let answered = broker
-            .native_answer(
+            .native_answer_through(
                 GatewayConnectionId::new(1),
                 spelling.as_bytes(),
                 TimestampMs::new(10),
+                |_| Ok(()),
             )
             .unwrap_or_else(|error| panic!("an integral code is an integer: {spelling}: {error}"));
         assert_eq!(answered.resource_id, opened.resource_id);
@@ -762,10 +771,11 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
 
     // The upstream's own failure is an answer.
     let failed = broker
-        .native_answer(
+        .native_answer_through(
             GatewayConnectionId::new(1),
             r#"{"id":"11","error":{"code":-32601,"message":"no such method"}}"#.as_bytes(),
             TimestampMs::new(8),
+            |_| Ok(()),
         )
         .expect("an error response correlates");
     assert_eq!(failed.resource_id, text.resource_id);
@@ -889,10 +899,11 @@ fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the
         .expect("it expects a response");
     assert_eq!(opaque.durability, Durability::Volatile);
     broker
-        .native_answer(
+        .native_answer_through(
             GatewayConnectionId::new(1),
             response("2").as_bytes(),
             TimestampMs::new(7),
+            |_| Ok(()),
         )
         .expect("the native answer is arbitrated in memory");
 
@@ -1250,4 +1261,88 @@ fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal
         Some(kr_protocol::ids::StreamCursor::new(40))
     );
     let _ = std::fs::remove_dir_all(path.parent().expect("a directory"));
+}
+
+/// KR-REQ-11.27 and KR-REQ-11.33: one exclusive admission carries one answer, whichever writer
+/// takes it, and the second writer is refused before its bytes go.
+///
+/// Recording competing answers afterwards is not the contract. Section 11 gives every pending
+/// resource one resolution, and a resolution is bytes reaching the upstream, so what has to be
+/// impossible is the second transmission.
+#[test]
+fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_takes_it() {
+    let broker = gateway(None);
+
+    // The rich writer takes the admission first. The native answer that follows is refused, and
+    // the frame is never forwarded: the closure below would have run if it had been.
+    let first = approval(&broker, "1", 2).expect("the interpretation is accepted");
+    let claim = broker
+        .claim(first.resource_id, &actor("device-1"), TimestampMs::new(3))
+        .expect("claimed");
+    let admission = broker
+        .admit_dispatch(&claim, "allow")
+        .expect("the rich answer is admitted");
+    assert_eq!(admission.connection, GatewayConnectionId::new(1));
+    assert_eq!(
+        admission.response.request, admission.resource.request,
+        "the prepared answer names the resource it was admitted for"
+    );
+    let forwarded = std::cell::Cell::new(false);
+    let refusal = broker
+        .native_answer_through(
+            GatewayConnectionId::new(1),
+            response("1").as_bytes(),
+            TimestampMs::new(4),
+            |_| {
+                forwarded.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a rich answer already holds the one admission");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        !forwarded.get(),
+        "the second answer is refused before its bytes go, not recorded after they have gone"
+    );
+
+    // The other order. The native writer takes the admission, and the rich claim that reaches the
+    // recheck afterwards finds nothing to claim.
+    let second = approval(&broker, "2", 5).expect("another interpretation");
+    let answer = broker
+        .admit_native_answer(
+            GatewayConnectionId::new(1),
+            response("2").as_bytes(),
+            TimestampMs::new(6),
+        )
+        .expect("the native client's answer is admitted");
+    assert_eq!(answer.resource_id, second.resource_id);
+    let taken = broker
+        .claim(second.resource_id, &actor("device-1"), TimestampMs::new(7))
+        .expect_err("the native writer holds the admission");
+    assert_eq!(taken.code(), ErrorCode::QuestionResolved);
+    broker
+        .native_answer_sent(&answer, TimestampMs::new(8))
+        .expect("the native answer reached the upstream");
+    assert_eq!(
+        broker.pending(second.resource_id).expect("recorded").state,
+        PendingState::Resolved
+    );
+
+    // And an answer whose fate nobody can establish leaves the resource uncertain rather than
+    // answerable, so a reconnect never reissues it.
+    let third = approval(&broker, "3", 9).expect("a third interpretation");
+    let lost = broker
+        .admit_native_answer(
+            GatewayConnectionId::new(1),
+            response("3").as_bytes(),
+            TimestampMs::new(10),
+        )
+        .expect("admitted");
+    broker
+        .native_answer_uncertain(&lost, TimestampMs::new(11))
+        .expect("the send failed after the marker");
+    assert_eq!(
+        broker.pending(third.resource_id).expect("recorded").state,
+        PendingState::Uncertain
+    );
 }
