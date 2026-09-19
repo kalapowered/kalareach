@@ -364,6 +364,11 @@ impl Store {
                      recorded_at_ms INTEGER NOT NULL,
                      PRIMARY KEY (actor_id, action_id)
                  );
+                 CREATE TABLE IF NOT EXISTS clone_repositories (
+                     workspace_id   BLOB NOT NULL PRIMARY KEY,
+                     git_dir        TEXT NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
                  CREATE TABLE IF NOT EXISTS apply_progress (
                      action_id     BLOB NOT NULL,
                      path          TEXT NOT NULL,
@@ -537,7 +542,15 @@ impl Store {
             .optional()
             .map_err(ChangeSetError::store)?
             .flatten();
-        Ok(highest.map(|value| ChangeSetVersion::new(value as u64)))
+        highest
+            .map(|value| {
+                u64::try_from(value)
+                    .map(ChangeSetVersion::new)
+                    .map_err(|_| ChangeSetError::StoreUnavailable {
+                        detail: "a version number this store holds is not a counter".into(),
+                    })
+            })
+            .transpose()
     }
 
     /// Takes the next version number one change set hands out, and moves it on.
@@ -1005,6 +1018,11 @@ impl Store {
             .transaction()
             .map_err(ChangeSetError::store)?;
         Self::require_version(&transaction, row.input_change_set_id, row.input_version)?;
+        if let Some((change_set_id, version)) = row.tested_version
+            && (change_set_id, version) != (row.input_change_set_id, row.input_version)
+        {
+            Self::require_version(&transaction, change_set_id, version)?;
+        }
         transaction
             .execute(
                 "INSERT INTO results
@@ -1162,6 +1180,50 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(ChangeSetError::store)?;
         Ok(rows)
+    }
+
+    // ----- repositories ------------------------------------------------------------------------
+
+    /// Returns the repository this host first found behind one independent clone.
+    ///
+    /// An independent clone is its own repository, so the project service records no repository
+    /// identity for it and there is nothing outside this service to compare against. What there
+    /// is instead is what this host itself found the first time it read that workspace, kept here
+    /// so a repository substituted underneath the same path is refused rather than captured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn clone_repository(&self, workspace_id: WorkspaceId) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT git_dir FROM clone_repositories WHERE workspace_id = ?1",
+                params![workspace_id.get().as_bytes()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ChangeSetError::store)
+    }
+
+    /// Records the repository behind one independent clone, the first time this host reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn record_clone_repository(
+        &self,
+        workspace_id: WorkspaceId,
+        git_dir: &str,
+        now: TimestampMs,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO clone_repositories (workspace_id, git_dir, recorded_at_ms) \
+                 VALUES (?1, ?2, ?3)",
+                params![workspace_id.get().as_bytes(), git_dir, now.get() as i64],
+            )
+            .map(|_| ())
+            .map_err(ChangeSetError::store)
     }
 
     // ----- actions ---------------------------------------------------------------------------
@@ -1389,6 +1451,36 @@ impl Store {
             .map_err(ChangeSetError::store)
     }
 
+    /// Returns every apply whose action claim is still open, whether or not the apply is decided.
+    ///
+    /// A daemon that stopped between settling an apply and answering its action leaves exactly
+    /// this: an apply that says what it came to and a caller that would be told nothing. Recovery
+    /// reads them back together and answers from the apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn applies_with_open_claims(&self) -> Result<Vec<ActionId>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT applies.action_id FROM applies
+                   JOIN actions ON actions.action_id = applies.action_id
+                  WHERE actions.result IS NULL AND actions.error_code IS NULL
+                  ORDER BY applies.started_at_ms",
+            )
+            .map_err(ChangeSetError::store)?;
+        let rows = statement
+            .query_map([], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                Ok(ActionId::new(uuid_of(&id, 0)?))
+            })
+            .map_err(ChangeSetError::store)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChangeSetError::store)?;
+        Ok(rows)
+    }
+
     /// Records one action's outcome, leaving an existing row alone.
     ///
     /// Returns the record that was already there, when another copy of the action recorded first.
@@ -1448,8 +1540,19 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn begin_apply(&self, row: &ApplyRow) -> Result<()> {
-        self.connection
+    pub fn begin_apply(&mut self, row: &ApplyRow) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(ChangeSetError::store)?;
+        // Every version this apply names is required inside the transaction that records it, so a
+        // deletion cannot take away the change set an apply carries or the reading it would
+        // recover from.
+        Self::require_version(&transaction, row.change_set_id, row.version)?;
+        if let Some((change_set_id, version)) = row.before_version {
+            Self::require_version(&transaction, change_set_id, version)?;
+        }
+        transaction
             .execute(
                 "INSERT INTO applies
                    (action_id, change_set_id, version, workspace_id, destination, outcome,
@@ -1470,7 +1573,7 @@ impl Store {
                 ],
             )
             .map_err(ChangeSetError::store)?;
-        Ok(())
+        transaction.commit().map_err(ChangeSetError::store)
     }
 
     /// Records one path as planned, before anything is attempted for it.
@@ -1560,14 +1663,21 @@ impl Store {
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
     pub fn settle_apply(
-        &self,
+        &mut self,
         action_id: ActionId,
         outcome: ApplyOutcomeClass,
         after: Option<(ChangeSetId, ChangeSetVersion)>,
         detail: &str,
         at_ms: TimestampMs,
     ) -> Result<()> {
-        self.connection
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(ChangeSetError::store)?;
+        if let Some((change_set_id, version)) = after {
+            Self::require_version(&transaction, change_set_id, version)?;
+        }
+        transaction
             .execute(
                 "UPDATE applies
                     SET outcome = ?2, after_change_set_id = ?3, after_version = ?4, detail = ?5,
@@ -1583,7 +1693,7 @@ impl Store {
                 ],
             )
             .map_err(ChangeSetError::store)?;
-        Ok(())
+        transaction.commit().map_err(ChangeSetError::store)
     }
 
     /// Records the staging directory one apply's validated content went through.
@@ -1855,7 +1965,6 @@ vocabulary!(
     tested_of,
     TestedSource,
     UnmodifiedVersion => "unmodified_version",
-    DerivedVersion => "derived_version",
     Indeterminate => "indeterminate",
 );
 
@@ -1982,9 +2091,11 @@ mod tests {
     fn a_planned_path_survives_until_its_outcome_replaces_it() {
         // The whole of residual "planned is not unwritten": a row written before the attempt and
         // replaced after it, so a daemon that dies between the two leaves `planned`.
-        let store = store();
+        let mut store = store();
         let action_id = ActionId::new(kr_ipc::new_uuid());
         let change_set_id = change_set(&store);
+        let row = version_row(change_set_id, 1);
+        store.insert_version(&row, &[]).expect("a version");
         store
             .begin_apply(&ApplyRow {
                 action_id,

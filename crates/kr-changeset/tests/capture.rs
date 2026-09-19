@@ -454,10 +454,6 @@ fn a_deletion_is_carried_by_absence_and_says_so() {
     std::fs::remove_file(path.join("src/lib.rs")).expect("the user deletes a tracked file");
     let workspace = fixture.workspace("deleted");
     let record = fixture.capture(workspace, &include_everything());
-    assert_eq!(
-        exclusion(&record, "src/lib.rs").reason,
-        ExclusionReason::Deleted
-    );
     let manifest = fixture
         .service()
         .manifest(record.change_set_id, record.version)
@@ -465,6 +461,17 @@ fn a_deletion_is_carried_by_absence_and_says_so() {
     assert!(
         manifest.path("src/lib.rs").is_none(),
         "the captured tree does not hold it"
+    );
+    // The deletion is an operation of the version, with what the base held recorded beside it, so
+    // an apply can carry it and a revert can put the file back.
+    let deleted = manifest
+        .deletions
+        .iter()
+        .find(|deleted| deleted.path == "src/lib.rs")
+        .expect("the version records the deletion");
+    assert!(
+        deleted.base_object_id.is_some(),
+        "and what the base held for it"
     );
     assert_eq!(record.summary.deleted_paths.get(), 1);
 }
@@ -680,9 +687,44 @@ fn the_base_is_the_commit_and_never_the_index() {
     );
     assert!(manifest.path("added.txt").is_some());
     assert!(manifest.path("src/lib.rs").is_none());
+    assert!(
+        manifest
+            .deletions
+            .iter()
+            .any(|deleted| deleted.path == "src/lib.rs"),
+        "the deletion is carried as an operation of the version"
+    );
+}
+
+/// KR-REQ-14.25: a file taken out of the index and left on disk is captured, not deleted.
+#[test]
+fn a_file_the_index_lost_and_the_working_tree_kept_is_captured() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "uncached");
+    git_raw(&path, ["rm", "--cached", "--quiet", "src/lib.rs"]);
+    write(&path, "src/lib.rs", "pub fn answer() -> u32 { 43 }\n");
+    let workspace = fixture.workspace("uncached");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
     assert_eq!(
-        exclusion(&record, "src/lib.rs").reason,
-        ExclusionReason::Deleted
+        fixture
+            .service()
+            .objects()
+            .get(
+                manifest
+                    .path("src/lib.rs")
+                    .expect("the file on disk is captured rather than recorded as deleted")
+                    .content_digest
+            )
+            .expect("its content"),
+        b"pub fn answer() -> u32 { 43 }\n"
+    );
+    assert!(
+        manifest.deletions.is_empty(),
+        "nothing was deleted: the file is there"
     );
 }
 
@@ -969,6 +1011,27 @@ fn an_independent_clone_workspace_can_be_captured() {
             .project
             .filesystem_identity,
         "an independent clone is its own repository"
+    );
+
+    // The repository behind the clone is replaced with another one inside the same working tree.
+    // It satisfies the rule that makes a clone independent, and it is not the repository this host
+    // read the first time, which is what decides.
+    let clone = fixture.work().join("clone-tree");
+    std::fs::rename(clone.join(".git"), clone.join(".git-was")).expect("the clone's own data");
+    let substitute = ordinary_repository(fixture.work(), "substitute");
+    std::fs::rename(substitute.join(".git"), clone.join(".git")).expect("another repository");
+    let refusal = fixture
+        .service()
+        .open_repository(
+            &fixture
+                .service()
+                .resolve(created.workspace_id)
+                .expect("the workspace resolves"),
+        )
+        .expect_err("a repository this host has not seen before is refused");
+    assert!(
+        refusal.to_string().contains("independent clone"),
+        "and says why: {refusal}"
     );
 }
 

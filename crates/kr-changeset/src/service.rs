@@ -107,6 +107,8 @@ pub struct CaptureOrder<'a> {
 pub struct Recovery {
     /// How many applies an earlier daemon left undecided and this one settled.
     pub applies_settled: u64,
+    /// How many decided applies an earlier daemon left without an answer to their action.
+    pub actions_settled: u64,
 }
 
 /// The change-set service of one environment.
@@ -286,10 +288,10 @@ impl ChangeSetService {
             }
             Some(_) => {}
             // An independent clone is its own repository, and the project service records no
-            // identity for it, so there is nothing to compare its Git directory with. What is
-            // required instead is the thing that makes it an independent clone: its repository is
-            // **inside its own working tree**. A `.git` file rewritten to point at somebody else's
-            // repository fails that, and so does a working tree whose repository is elsewhere.
+            // identity for it. Two things are required of it instead. The first is what makes it
+            // an independent clone: its repository is **inside its own working tree**. A `.git`
+            // file rewritten to point at somebody else's repository fails that, and so does a
+            // working tree whose repository is elsewhere.
             None => {
                 if !opened.git_dir_path().starts_with(opened.top_level()) {
                     return Err(kr_project::ProjectError::IdentityChanged {
@@ -298,6 +300,32 @@ impl ChangeSetService {
                             .into(),
                     }
                     .into());
+                }
+                // The second is that it is still the repository this host read the first time. A
+                // repository inside the working tree satisfies the containment rule whatever its
+                // name, so a second one put there under another name would pass it. What this
+                // host itself found is therefore kept, and every later read is against that.
+                let found = opened.identity().git_dir.to_string();
+                let store = self.locked()?;
+                match store.clone_repository(resolved.summary.workspace_id)? {
+                    Some(first) if first != found => {
+                        return Err(kr_project::ProjectError::IdentityChanged {
+                            detail: format!(
+                                "this workspace is an independent clone of the repository \
+                                 {first}, and the tree at its recorded path now belongs to the \
+                                 repository {found}; a recorded identity is the object rather \
+                                 than the path"
+                            )
+                            .into(),
+                        }
+                        .into());
+                    }
+                    Some(_) => {}
+                    None => store.record_clone_repository(
+                        resolved.summary.workspace_id,
+                        &found,
+                        kr_ipc::now_ms(),
+                    )?,
                 }
             }
         }

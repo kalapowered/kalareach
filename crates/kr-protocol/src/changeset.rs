@@ -530,17 +530,27 @@ pub struct MaterialisationRecord {
 }
 
 /// What a result was actually run against.
+///
+/// Two members, because those are the two things a host that does not own the execution can
+/// establish. Section 14 asks for a result to record "the derived tested version **or** an
+/// indeterminate-source result"; where the source was changed, this host records the derived
+/// version in [`MaterialisationResult::derived_output_version`] and says the source is
+/// indeterminate, because reading a directory before and after a run establishes what it holds now
+/// and not what each part of the run read. A run that changed a file, tested the change and put
+/// the file back would otherwise be attested against a version it never used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TestedSource {
     /// The materialisation still held exactly the version, so the result attests that version.
+    ///
+    /// Exactly means all of it: the same paths, the same content, the same modes, and every file
+    /// still the object this host wrote, of the same length, last written at the same instant.
     UnmodifiedVersion,
-    /// The materialisation was modified, so the result attests a derived version of its own.
-    DerivedVersion,
     /// This host could not establish what was tested, so the result attests nothing.
     ///
-    /// A result must not say the unmodified version passed when the tested source cannot be
-    /// established. This is what it says instead.
+    /// A result must not say the unmodified version passed when the tested source was changed or
+    /// cannot be established. This is what it says instead, and what the directory held is
+    /// recorded beside it as a derived output version.
     Indeterminate,
 }
 
@@ -596,9 +606,15 @@ pub struct MaterialisationResult {
     pub tested_source: TestedSource,
     /// The version the result attests, when it attests one.
     ///
-    /// The input version for [`TestedSource::UnmodifiedVersion`], the derived version for
-    /// [`TestedSource::DerivedVersion`], and nothing at all for [`TestedSource::Indeterminate`].
+    /// The input version for [`TestedSource::UnmodifiedVersion`], and nothing at all for
+    /// [`TestedSource::Indeterminate`].
     pub tested_version: Nullable<VersionRef>,
+    /// What the materialisation held when the result was recorded, when that was not the version.
+    ///
+    /// A version of its own, with its own identity, recorded from one reading of the directory. It
+    /// is **not** an attestation: it says what was there when this host looked, which is the
+    /// nearest thing to the tested source that a host outside the execution can establish.
+    pub derived_output_version: Nullable<VersionRef>,
     /// The command that was executed, as the caller names it.
     pub command: String,
     /// The profile it was executed under, as the caller names it.
@@ -701,11 +717,16 @@ pub struct AffectedVersion {
     /// Absent is an expectation too: the path is expected not to be in the index. A caller that
     /// does not want the index checked sets [`Self::check_index`] to false and says so.
     pub expected_index_object_id: Nullable<String>,
+    /// The mode the caller expects the index to record, such as `100644`.
+    ///
+    /// Compared only when [`Self::check_index`] is set. A path whose content is what the request
+    /// expects and whose mode is not is a path the request did not describe.
+    pub expected_index_mode: Nullable<String>,
     /// Check the index as well as the working tree.
     ///
     /// A caller that only means to say what the file holds leaves this false. One that means to
     /// apply against an exact staged state sets it, and then an index that holds anything else —
-    /// including nothing, and including an unresolved merge — is a conflict.
+    /// including nothing, a different mode, and an unresolved merge — is a conflict.
     pub check_index: bool,
 }
 

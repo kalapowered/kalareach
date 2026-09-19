@@ -34,10 +34,9 @@
 use std::io::{Read as _, Write as _};
 
 use kr_protocol::changeset::{
-    CapturedPath, ChangeSetVersionRecord, ContentOrigin, Exclusion, ExclusionReason,
-    ExecutionReceipt, MaterialisationPurpose, MaterialisationRecord, MaterialisationResult,
-    ObservedPath, OutputReference, PathClass, Provenance, SourceConsistency, TestedSource,
-    ToolIdentity, VersionRef,
+    CapturedPath, ChangeSetVersionRecord, ContentOrigin, ExecutionReceipt, MaterialisationPurpose,
+    MaterialisationRecord, MaterialisationResult, ObservedPath, OutputReference, PathClass,
+    Provenance, SourceConsistency, TestedSource, ToolIdentity, VersionRef,
 };
 use kr_protocol::ids::{ChangeSetVersion, MaterialisationId};
 use kr_protocol::project::{ChangeKind, FilesystemIdentity};
@@ -86,6 +85,23 @@ pub fn materialise(
     let directory_name = materialisation_id.to_string();
     let name = RelativeName::parse(&directory_name)?;
     let directory = parent.create_subdirectory(&name)?;
+    // The name is an identifier this host generated a moment ago, and creating a directory that is
+    // already there opens it rather than failing, so emptiness is what establishes that this is
+    // the directory this host just made. Something already at the name is refused rather than
+    // adopted, which is what keeps a later release from emptying somebody else's directory.
+    if directory
+        .handle()
+        .entries()
+        .map_err(ChangeSetError::storage)?
+        .next()
+        .is_some()
+    {
+        return Err(ChangeSetError::StorageUnavailable {
+            detail: "something is already at the name this host would have made a materialisation \
+                     at, so it made none"
+                .into(),
+        });
+    }
     let identity = directory.identity();
     let created_at_ms = kr_ipc::now_ms();
     let mut held = MaterialisationRecord {
@@ -109,7 +125,7 @@ pub fn materialise(
     // The row goes in **before** a byte is written, and it refuses when the version is no longer
     // there. A directory written first and recorded afterwards is a directory whose version a
     // deletion could take away in between, leaving files nothing accounts for.
-    service
+    let recorded = service
         .locked()?
         .insert_materialisation(&MaterialisationRow {
             materialisation_id,
@@ -117,11 +133,20 @@ pub fn materialise(
             version: version.version,
             purpose,
             record: encode_stored(&held)?,
-            directory_name,
+            directory_name: directory_name.clone(),
             identity,
             created_at_ms,
             released_at_ms: None,
-        })?;
+        });
+    if let Err(error) = recorded {
+        // The row is what accounts for this directory. Without one there is nothing to release it
+        // later, so the empty directory this host had just made goes now. It holds nothing: not a
+        // byte is written until the row is in.
+        drop(directory);
+        let _ = parent.handle().remove_dir(&directory_name);
+        let _ = parent.sync();
+        return Err(error);
+    }
     let mut written = 0_u64;
     for entry in &manifest.paths {
         match write_path(service, &directory, entry) {
@@ -308,6 +333,7 @@ pub fn reread(
     let mut found = Manifest {
         paths: Vec::new(),
         exclusions: Vec::new(),
+        deletions: Vec::new(),
     };
     let mut budget = Budget {
         bytes: kr_protocol::changeset::MAX_CAPTURE_BYTES,
@@ -444,6 +470,14 @@ fn walk(
                 kr_project::git::redact(&path)
             )));
         }
+        if budget.entries == 0 {
+            return Ok(Err(format!(
+                "this materialisation holds more than {} entries, which is more than this host \
+                 reads back",
+                crate::capture::MAX_WALK_ENTRIES
+            )));
+        }
+        budget.entries -= 1;
         if kind == ObjectKind::Directory {
             if !crate::grant::may_traverse(grant, &path) {
                 // A directory a rule keeps out is one a capture of this change set would not have
@@ -484,14 +518,6 @@ fn walk(
                 kr_project::git::redact(&path)
             )));
         }
-        if budget.entries == 0 {
-            return Ok(Err(format!(
-                "this materialisation holds more than {} paths, which is more than this host \
-                 reads back",
-                crate::capture::MAX_WALK_ENTRIES
-            )));
-        }
-        budget.entries -= 1;
         let mut file = match directory.open_read(&name, ObjectPolicy::ReadableFile) {
             Ok(file) => file,
             Err(error) => {
@@ -587,20 +613,27 @@ fn walk(
             .collect();
         for entry in &original.paths {
             if !here.contains(entry.path.as_str()) {
-                found.exclusions.push(Exclusion {
+                found.deletions.push(crate::version::DeletedPath {
                     path: entry.path.clone(),
-                    reason: ExclusionReason::Deleted,
-                    detail: "the version held this path and the materialisation no longer does"
-                        .to_owned(),
+                    base_object_id: entry.base_object_id.0.clone(),
+                    base_mode: None,
                 });
             }
         }
+        // Every exclusion the input version carries that is still true of this reading: the rules
+        // a caller cannot select past were applied here too, and a path neither tree holds is
+        // still one neither tree holds.
         for exclusion in &original.exclusions {
-            if matches!(
-                exclusion.reason,
-                ExclusionReason::SecretRule | ExclusionReason::Grant
-            ) {
+            if !here.contains(exclusion.path.as_str()) {
                 found.exclusions.push(exclusion.clone());
+            }
+        }
+        // And the deletions, with what the base holds for each, so a derived version can be
+        // reverted exactly as the version it came from can. A path the run put back is not one of
+        // them any more.
+        for deleted in &original.deletions {
+            if !here.contains(deleted.path.as_str()) {
+                found.deletions.push(deleted.clone());
             }
         }
     }
@@ -657,9 +690,10 @@ pub fn record_result(
     // ended is a file the run did not use, so a result about it would be about something else.
     let written_after =
         latest_write(&observed).is_some_and(|written| written > report.receipt.ended_at_ms.get());
-    let (tested_source, tested_version, attestation) = match state {
+    let (tested_source, tested_version, derived, attestation) = match state {
         _ if written_after => (
             TestedSource::Indeterminate,
+            None,
             None,
             "something wrote into this materialisation after the run the caller reported had \
              ended, so this host cannot establish what the run read and this result attests no \
@@ -669,6 +703,7 @@ pub fn record_result(
         Reread::Unmodified => (
             TestedSource::UnmodifiedVersion,
             Some(input_version),
+            None,
             "this materialisation still held exactly the version that was written into it: the \
              same paths, the same content, the same modes, and every file still the object this \
              host wrote, of the same length, last written at the same instant. What this host \
@@ -680,24 +715,33 @@ pub fn record_result(
         Reread::Modified(found) => {
             let derived = derive_from(service, &record, &found, materialisation_id)?;
             (
-                TestedSource::DerivedVersion,
+                // What the directory holds now is not what the run read: a run that changed a
+                // file, tested the change and put the file back would be attested against a
+                // version it never used. So the source is indeterminate and the reading is
+                // recorded beside it as a derived output version, which is what section 14 asks
+                // for when a materialisation is modified.
+                TestedSource::Indeterminate,
+                None,
                 Some(VersionRef {
                     change_set_id: derived.change_set_id,
                     version: derived.version,
                 }),
                 format!(
-                    "this materialisation was changed while it was in use, so this result says \
-                     nothing about version {}. Version {} is what the directory held when the \
-                     result was recorded, read and stored then; this host did not watch the \
-                     directory while the run was happening, so it is the source at that instant \
-                     rather than the bytes each part of the run read",
+                    "this materialisation was changed while it was in use, so this result attests \
+                     no version at all: it says nothing about version {}, and it does not say \
+                     that version {} is what the run read either. Version {} is what the \
+                     directory held when the result was recorded, read and stored then, and \
+                     establishing which of them a command actually read needs a host that owns \
+                     the execution",
                     row.version.get(),
+                    derived.version.get(),
                     derived.version.get()
                 ),
             )
         }
         Reread::Indeterminate(detail) => (
             TestedSource::Indeterminate,
+            None,
             None,
             format!(
                 "this host could not establish what was tested, so this result attests no \
@@ -710,6 +754,7 @@ pub fn record_result(
         input_version,
         tested_source,
         tested_version: Nullable(tested_version),
+        derived_output_version: Nullable(derived),
         command: report.command.clone(),
         profile: report.profile.clone(),
         environment_id: service.environment_id(),

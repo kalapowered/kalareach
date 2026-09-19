@@ -74,6 +74,11 @@ pub enum ChangeSetError {
         /// The method it was first used for.
         method: Diagnostic,
     },
+    /// Another copy of this action holds its claim, so this one did nothing.
+    ///
+    /// One action, one effect: the copy that took the claim is the one that acts, and this one is
+    /// answered from that copy's reply rather than performing the work a second time.
+    ActionHeldElsewhere,
     /// A request field is malformed.
     InvalidArgument(Diagnostic),
     /// A faithful interpretation of the request needs something this host does not do.
@@ -112,6 +117,7 @@ impl ChangeSetError {
             Self::OutcomeUnknown { .. } => "OutcomeUnknown",
             Self::WrongState { .. } => "WrongState",
             Self::QuotaExceeded { .. } => "QuotaExceeded",
+            Self::ActionHeldElsewhere => "ActionHeldElsewhere",
             Self::IdConflict { .. } => "IdConflict",
             Self::InvalidArgument(_) => "InvalidArgument",
             Self::Unsupported { .. } => "Unsupported",
@@ -127,6 +133,9 @@ impl ChangeSetError {
             }
             Self::StorageUnavailable { detail } => {
                 format!("the change-set service's directories are unavailable: {detail}")
+            }
+            Self::ActionHeldElsewhere => {
+                "another copy of this action holds it and has not said what it came to".to_owned()
             }
             Self::IdConflict { action, method } => {
                 format!("action {action} was already used for {method}")
@@ -173,6 +182,7 @@ impl ChangeSetError {
             Self::OutcomeUnknown { .. } => ErrorCode::OutcomeUnknown,
             Self::WrongState { .. } => ErrorCode::ResourceUnavailable,
             Self::QuotaExceeded { .. } => ErrorCode::QuotaExceeded,
+            Self::ActionHeldElsewhere => ErrorCode::OutcomeUnknown,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::Unsupported { .. } => ErrorCode::UnsupportedCapability,
@@ -270,6 +280,7 @@ mod tests {
             ChangeSetError::QuotaExceeded {
                 detail: HOSTILE.into(),
             },
+            ChangeSetError::ActionHeldElsewhere,
             ChangeSetError::IdConflict {
                 action: HOSTILE.into(),
                 method: HOSTILE.into(),

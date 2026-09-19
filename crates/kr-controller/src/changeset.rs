@@ -278,29 +278,24 @@ impl ChangeSetModule {
                     }
                 };
             }
-            // The claim is taken **before** the effect. Two copies of one action that both found
-            // no record would otherwise both capture, both materialise or both write a working
-            // tree, and returning one reply to both would not undo the second effect.
-            if !service.claim_action(&actor, action_id, name, digest)? {
+            // The claim is taken before the effect. Two copies of one action that both found no
+            // record would otherwise both capture, both materialise or both write a working tree,
+            // and returning one reply to both would not undo the second effect.
+            //
+            // An apply takes it one moment later, through the deferred claim below. Section 14
+            // says a preflight conflict returns `DRAFT_CONFLICT` **without KR writes**, and a
+            // claim row written before the preflight is a KR write that a crash would leave
+            // behind for the next attempt to find. So the preflight runs first, reading only, and
+            // the claim is taken the instant it passes and before anything is written. A capture
+            // and a materialisation have no such reading phase and claim straight away.
+            let deferred = DeferredClaim::new(&service, &actor, action_id, name, digest);
+            if !matches!(method, Method::DiffApply | Method::DiffRevert)
+                && !service.claim_action(&actor, action_id, name, digest)?
+            {
                 // Another copy holds it. Either it has settled, in which case its reply is the
                 // answer, or it has not, in which case this host cannot say what became of the
                 // action and says exactly that.
-                return match service.retained_action(&actor, action_id, name, digest)? {
-                    Some(RetainedOutcome::Ok(result)) => {
-                        kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                            .map(ParamsValue::new)
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                            })
-                    }
-                    Some(RetainedOutcome::Error { code, detail }) => {
-                        Err(ProtocolError::new(code, detail))
-                    }
-                    None => Err(ProtocolError::new(
-                        ErrorCode::OutcomeUnknown,
-                        "another copy of this action is running and has not said what it came to",
-                    )),
-                };
+                return answer_from_retained(&service, &actor, action_id, name, digest);
             }
             // Every arm runs inside a closure, so a refusal the service decided reaches the
             // settlement below instead of returning from the task. An action whose failure was not
@@ -319,6 +314,7 @@ impl ChangeSetModule {
                         ActionId::new(action_id),
                         &typed(&params)?,
                         method == Method::DiffRevert,
+                        Some(&deferred),
                     )?),
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,
@@ -329,15 +325,15 @@ impl ChangeSetModule {
                     )),
                 }
             })();
-            // Section 14: a preflight conflict returns DRAFT_CONFLICT **without KR writes**. The
-            // claim this host took to arbitrate the action is therefore given back rather than
-            // settled, so nothing of this request survives in the journal and the caller can ask
-            // again with what it now knows is there.
-            if matches!(
-                &outcome,
-                Err(error) if error.code == ErrorCode::DraftConflict
-            ) {
-                service.release_action(&actor, action_id)?;
+            // The claim went to another copy of this action. That copy is the one that acts, and
+            // this one answers from its reply rather than recording a second outcome over it.
+            if deferred.lost() {
+                return answer_from_retained(&service, &actor, action_id, name, digest);
+            }
+            // An apply that refused before its claim wrote nothing at all, and there is nothing to
+            // settle or to give back: the action is untouched and the caller can ask again with
+            // what it now knows is there. That is every `DRAFT_CONFLICT` an apply returns.
+            if matches!(method, Method::DiffApply | Method::DiffRevert) && !deferred.taken() {
                 return outcome;
             }
             let record = match &outcome {
@@ -449,6 +445,91 @@ fn materialise_version(
     })
 }
 
+/// One action's claim, taken the instant the apply's preflight has passed.
+///
+/// It remembers what became of it, because the two outcomes the caller has to tell apart are
+/// "nothing was claimed, so nothing was written" and "another copy holds this action".
+struct DeferredClaim<'a> {
+    service: &'a ChangeSetService,
+    actor: &'a ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    method: &'a str,
+    digest: kr_protocol::scalars::Digest256,
+    state: std::cell::Cell<ClaimState>,
+}
+
+/// What became of a deferred claim.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimState {
+    /// It was never asked for: the work refused before it reached the moment it is taken.
+    Untried,
+    /// This copy of the action holds it.
+    Taken,
+    /// Another copy of the action holds it.
+    Lost,
+}
+
+impl<'a> DeferredClaim<'a> {
+    fn new(
+        service: &'a ChangeSetService,
+        actor: &'a ActorId,
+        action_id: kr_protocol::scalars::Uuid,
+        method: &'a str,
+        digest: kr_protocol::scalars::Digest256,
+    ) -> Self {
+        Self {
+            service,
+            actor,
+            action_id,
+            method,
+            digest,
+            state: std::cell::Cell::new(ClaimState::Untried),
+        }
+    }
+
+    fn taken(&self) -> bool {
+        self.state.get() == ClaimState::Taken
+    }
+
+    fn lost(&self) -> bool {
+        self.state.get() == ClaimState::Lost
+    }
+}
+
+impl kr_changeset::apply::ActionClaim for DeferredClaim<'_> {
+    fn claim(&self) -> kr_changeset::Result<bool> {
+        let held =
+            self.service
+                .claim_action(self.actor, self.action_id, self.method, self.digest)?;
+        self.state.set(if held {
+            ClaimState::Taken
+        } else {
+            ClaimState::Lost
+        });
+        Ok(held)
+    }
+}
+
+/// Answers from the record another copy of this action left, or says nothing is known yet.
+fn answer_from_retained(
+    service: &ChangeSetService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    method: &str,
+    digest: kr_protocol::scalars::Digest256,
+) -> Answer<ParamsValue> {
+    match service.retained_action(actor, action_id, method, digest)? {
+        Some(RetainedOutcome::Ok(result)) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+            .map(ParamsValue::new)
+            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())),
+        Some(RetainedOutcome::Error { code, detail }) => Err(ProtocolError::new(code, detail)),
+        None => Err(ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            "another copy of this action is running and has not said what it came to",
+        )),
+    }
+}
+
 /// Applies or reverts one version at one destination.
 fn run_apply(
     service: &ChangeSetService,
@@ -456,6 +537,7 @@ fn run_apply(
     action_id: ActionId,
     params: &DiffApplyParams,
     revert: bool,
+    claim: Option<&dyn kr_changeset::apply::ActionClaim>,
 ) -> kr_changeset::Result<DiffApplyResult> {
     let order = ApplyOrder {
         action_id,
@@ -480,6 +562,7 @@ fn run_apply(
             derivation: String::new(),
             note: String::new(),
         },
+        claim,
     };
     apply::apply(service, &order)
 }

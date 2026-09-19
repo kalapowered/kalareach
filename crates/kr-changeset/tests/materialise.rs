@@ -164,8 +164,8 @@ fn a_result_about_an_unmodified_materialisation_attests_that_version() {
     );
 }
 
-/// KR-REQ-14.34: a result about a materialisation somebody changed attests a **derived** version
-/// with its own identity, and never says the unmodified version passed.
+/// KR-REQ-14.34: a result about a materialisation somebody changed attests no version at all, and
+/// records the **derived** version, with its own identity, beside it as what the directory held.
 #[test]
 fn a_changed_materialisation_is_recorded_as_a_derived_version() {
     let fixture = Fixture::create();
@@ -191,11 +191,17 @@ fn a_changed_materialisation_is_recorded_as_a_derived_version() {
 
     let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
         .expect("the result is recorded");
-    assert_eq!(result.tested_source, TestedSource::DerivedVersion);
-    let Nullable(Some(tested)) = result.tested_version else {
-        panic!("a derived result names the version it attests");
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+    assert_eq!(
+        result.tested_version,
+        Nullable(None),
+        "a changed materialisation attests no version at all"
+    );
+    let Nullable(Some(derived)) = result.derived_output_version else {
+        panic!("a changed materialisation records the version the directory held");
     };
-    assert_ne!(tested, reference(&record), "it is not the input version");
+    assert_ne!(derived, reference(&record), "it is not the input version");
+    let tested = derived;
     assert_eq!(result.input_version, reference(&record));
     assert!(
         result.attestation.contains("says nothing about version 1"),
@@ -537,12 +543,12 @@ fn a_derived_version_describes_itself_rather_than_its_parent() {
 
     let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
         .expect("the result is recorded");
-    let Nullable(Some(tested)) = result.tested_version else {
-        panic!("a derived result names its version");
+    let Nullable(Some(observed)) = result.derived_output_version else {
+        panic!("a changed materialisation records the version the directory held");
     };
     let derived = fixture
         .service()
-        .record(tested.change_set_id, Some(tested.version))
+        .record(observed.change_set_id, Some(observed.version))
         .expect("the derived version is readable");
     // Its class is the one its own reading was, not the one its parent claimed.
     assert_eq!(
@@ -576,14 +582,21 @@ fn a_derived_version_describes_itself_rather_than_its_parent() {
             .collect::<Vec<_>>()
     );
     // And the removal is named rather than silently absent.
+    assert_eq!(
+        derived.summary.deleted_paths.get(),
+        1,
+        "the removed file is carried as a deletion of the derived version"
+    );
+    let manifest = fixture
+        .service()
+        .manifest(observed.change_set_id, observed.version)
+        .expect("the derived manifest");
     assert!(
-        derived
-            .exclusions
+        manifest
+            .deletions
             .iter()
-            .any(|entry| entry.path == "src/lib.rs"
-                && entry.reason == kr_protocol::changeset::ExclusionReason::Deleted),
-        "the removed file is named: {:?}",
-        derived.exclusions
+            .any(|deleted| deleted.path == "src/lib.rs"),
+        "and it is the file the run removed"
     );
 }
 

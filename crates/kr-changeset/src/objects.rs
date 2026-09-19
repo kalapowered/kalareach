@@ -43,6 +43,16 @@ pub fn hex_of(digest: Digest256) -> String {
     text
 }
 
+/// What reading one object's name back established.
+enum ReadBack {
+    /// The content the name says it is.
+    Content,
+    /// Something this host read, that is not that content.
+    Damaged,
+    /// Nothing this host could read.
+    Unreadable(String),
+}
+
 /// The blobs of every captured tree in one environment.
 #[derive(Debug)]
 pub struct ObjectStore {
@@ -84,13 +94,31 @@ impl ObjectStore {
         // make this write report success and throw the valid bytes away, and every later read of
         // it would fail. So what is there is read back before it is believed.
         if shelf.occupied(&final_name)? {
-            if self.holds_exactly(digest)? {
-                return Ok(digest);
+            match self.reads_back(digest)? {
+                ReadBack::Content => {
+                    // Somebody's publication is already there. The directory entry is made durable
+                    // before this returns, because a caller is about to commit a version row that
+                    // names this object and a name that is not durable is a version whose content
+                    // a power failure can take away.
+                    shelf.sync()?;
+                    return Ok(digest);
+                }
+                // The name **is** the digest of the content, so a file at it that hashes to
+                // something else is not content anything can be referring to, and leaving it would
+                // make every version that names this digest undeliverable.
+                ReadBack::Damaged => shelf.remove(&final_name)?,
+                // Something is at the name and this host could not read it. That is not evidence
+                // of damage, and removing it would take away an object a version may name.
+                ReadBack::Unreadable(detail) => {
+                    return Err(ChangeSetError::StorageUnavailable {
+                        detail: format!(
+                            "the object {hex} is at its name and this host could not read it, so \
+                             it neither replaced it nor reported it stored: {detail}"
+                        )
+                        .into(),
+                    });
+                }
             }
-            // Damage. The name **is** the digest of the content, so a file at it that hashes to
-            // something else is not content anything can be referring to, and leaving it would
-            // make every version that names this digest undeliverable.
-            shelf.remove(&final_name)?;
         }
         // The temporary's name carries this process's own identity and a fresh value, so two
         // captures writing the same content at the same time never meet at one temporary.
@@ -124,7 +152,8 @@ impl ObjectStore {
                 Ok(digest)
             }
             Err(error) => {
-                if self.holds_exactly(digest)? {
+                if matches!(self.reads_back(digest)?, ReadBack::Content) {
+                    shelf.sync()?;
                     Ok(digest)
                 } else {
                     Err(ChangeSetError::StorageUnavailable {
@@ -139,14 +168,39 @@ impl ObjectStore {
         }
     }
 
-    /// Returns true when the store holds exactly the content one digest names.
+    /// Returns what reading one digest's name back established.
     ///
-    /// Reads the blob back and hashes it, which is what tells a blob that is there from a name
-    /// that is taken.
-    fn holds_exactly(&self, digest: Digest256) -> Result<bool> {
-        match self.get(digest) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+    /// The three answers are different things and this host acts differently on each: content is
+    /// content, damage is something it replaces, and a name it could not read is one it leaves
+    /// exactly as it is.
+    fn reads_back(&self, digest: Digest256) -> Result<ReadBack> {
+        let hex = hex_of(digest);
+        let (fan_out, leaf) = hex.split_at(2);
+        let shelf = match self.root.subdirectory(&RelativeName::parse(fan_out)?) {
+            Ok(shelf) => shelf,
+            Err(kr_transfer::Escape::NotFound { .. }) => {
+                return Ok(ReadBack::Unreadable("it is not there".to_owned()));
+            }
+            Err(error) => return Ok(ReadBack::Unreadable(error.to_string())),
+        };
+        let mut file =
+            match shelf.open_read(&RelativeName::parse(leaf)?, ObjectPolicy::ReadableFile) {
+                Ok(file) => file,
+                Err(kr_transfer::Escape::NotFound { .. }) => {
+                    return Ok(ReadBack::Unreadable("it is not there".to_owned()));
+                }
+                // A directory or a link at the name is not a blob this host wrote, and it is not
+                // something this host can read as one either.
+                Err(error) => return Ok(ReadBack::Unreadable(error.to_string())),
+            };
+        let mut bytes = Vec::new();
+        if let Err(error) = file.handle_mut().read_to_end(&mut bytes) {
+            return Ok(ReadBack::Unreadable(error.to_string()));
+        }
+        if digest_of(&bytes) == digest {
+            Ok(ReadBack::Content)
+        } else {
+            Ok(ReadBack::Damaged)
         }
     }
 

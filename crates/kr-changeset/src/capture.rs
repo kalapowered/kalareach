@@ -96,6 +96,26 @@ pub const MAX_WALK_DEPTH: usize = 64;
 /// rather than after.
 pub const MAX_CAPTURE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// One capture's request, together with what this host worked out about the repository itself.
+///
+/// The administrative prefix is not the caller's to state: it is where this repository actually
+/// keeps its own data, read from the repository at the moment the capture opens it. A `.git`
+/// **file** can point at a directory of any name inside the same tree, which the name rule cannot
+/// see, so the resolved location travels beside the request and the walk refuses it as well.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    request: &'a CaptureRequest<'a>,
+    administrative_prefix: Option<&'a str>,
+}
+
+impl<'a> std::ops::Deref for Scope<'a> {
+    type Target = CaptureRequest<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        self.request
+    }
+}
+
 /// The Git file modes a captured tree can hold.
 ///
 /// `100644` and `100755` are file content. `120000` is a symbolic link, whose object holds the
@@ -164,6 +184,21 @@ pub struct BaseDifference {
 /// not, and the record says so.
 pub type QuiescenceProbe<'a> = &'a dyn Fn() -> Result<bool>;
 
+/// Returns where one repository keeps its administrative data, relative to its working tree.
+///
+/// `.git` on an ordinary repository. A `.git` **file** can point at a directory of any name inside
+/// the same tree, and the name rule alone would not see that one, so the resolved location is
+/// worked out once and carried with the request.
+#[must_use]
+pub fn administrative_prefix(repository: &OpenedRepository) -> Option<String> {
+    let inside = repository
+        .git_dir_path()
+        .strip_prefix(repository.top_level())
+        .ok()?;
+    let relative = inside.to_str()?;
+    (!relative.is_empty()).then(|| relative.replace('\\', "/"))
+}
+
 /// Reads a working tree into a captured tree.
 ///
 /// # Errors
@@ -179,12 +214,24 @@ pub fn capture(
     request: &CaptureRequest<'_>,
     quiet: QuiescenceProbe<'_>,
 ) -> Result<Captured> {
+    // Where this repository actually keeps its administrative data, read from the repository this
+    // capture opened rather than assumed to be `.git`.
+    let administrative = administrative_prefix(repository);
+    let request = Scope {
+        request,
+        administrative_prefix: administrative.as_deref(),
+    };
     if request.required_consistency == Some(SourceConsistency::AtomicSnapshot) {
         return snapshot(profile, repository, store, request);
     }
     let mut last_change = String::new();
     for attempt in 0..=MAX_CAPTURE_RETRIES {
-        let before = Reading::take(profile, repository, request.grant)?;
+        let before = Reading::take(
+            profile,
+            repository,
+            request.grant,
+            request.administrative_prefix,
+        )?;
         let quiet_before = quiet()?;
         let planned = plan(&before, request);
         let read = read_content(profile, repository, store, &planned, request);
@@ -199,7 +246,12 @@ pub fn capture(
         // Everything the selection was decided from is read again. A file this host did not touch
         // changing is exactly what a per-file capture cannot exclude, and what it must not
         // describe as one instant.
-        let after = Reading::take(profile, repository, request.grant)?;
+        let after = Reading::take(
+            profile,
+            repository,
+            request.grant,
+            request.administrative_prefix,
+        )?;
         if after != before {
             last_change = format!(
                 "the working tree changed while this host was reading it: {}",
@@ -276,6 +328,7 @@ impl Reading {
         profile: &RestrictedProfile,
         repository: &OpenedRepository,
         grant: &FileGrant,
+        administrative_prefix: Option<&str>,
     ) -> Result<Self> {
         let (revision, reference) = repository.head(profile)?;
         let Some(revision) = revision else {
@@ -292,7 +345,7 @@ impl Reading {
         // diff at all, and without this reading this host would have no object identifier for what
         // the commit holds there.
         let staged = read_differences(profile, repository, &revision, true)?;
-        let status = read_status(profile, repository, grant)?;
+        let status = read_status(profile, repository, grant, administrative_prefix)?;
         Ok(Self {
             revision,
             reference,
@@ -410,10 +463,14 @@ pub fn read_differences(
 ) -> Result<BTreeMap<String, BaseDifference>> {
     check_object_id(revision)?;
     let cached: &OsStr = OsStr::new(if staged { "--cached" } else { "--no-color" });
-    let arguments: [&OsStr; 7] = [
+    let arguments: [&OsStr; 8] = [
         OsStr::new("diff"),
         OsStr::new("--raw"),
         OsStr::new("-z"),
+        // Git abbreviates an object identifier in this format by default, and an abbreviation can
+        // become ambiguous as a repository grows and resolves to something else in another
+        // repository. A content revision is exact or it is not one.
+        OsStr::new("--no-abbrev"),
         OsStr::new("--no-renames"),
         OsStr::new("--ignore-submodules=all"),
         cached,
@@ -474,6 +531,7 @@ pub fn read_status(
     profile: &RestrictedProfile,
     repository: &OpenedRepository,
     grant: &FileGrant,
+    administrative_prefix: Option<&str>,
 ) -> Result<Vec<kr_project::workspace::StatusEntry>> {
     // `--ignore-submodules=all` is not an optimisation. Checking a submodule's dirtiness runs Git
     // *inside* the submodule, under a configuration the project service's audit never read.
@@ -500,6 +558,7 @@ pub fn read_status(
                 prefix,
                 entry.class,
                 grant,
+                administrative_prefix,
                 &mut expanded,
                 &mut budget,
                 0,
@@ -543,6 +602,7 @@ fn walk(
     prefix: &str,
     class: InclusionClass,
     grant: &FileGrant,
+    administrative_prefix: Option<&str>,
     out: &mut Vec<kr_project::workspace::StatusEntry>,
     budget: &mut usize,
     depth: usize,
@@ -559,7 +619,9 @@ fn walk(
     // The decision is made before anything beneath the prefix is listed, which is what "the grant
     // applies before capture" means for a directory. The one entry is kept so the content read
     // records the exclusion with its reason rather than the path going missing.
-    if !grant::may_traverse(grant, prefix) {
+    if !grant::may_traverse(grant, prefix)
+        || administrative_prefix.is_some_and(|name| grant::under(prefix, name))
+    {
         out.push(kr_project::workspace::StatusEntry {
             path: prefix.to_owned(),
             class,
@@ -603,20 +665,29 @@ fn walk(
         })?;
         let child = format!("{prefix}/{file_name}");
         let kind = entry.file_type().map_err(ChangeSetError::storage)?;
-        if kind.is_dir() {
-            walk(tree, &child, class, grant, out, budget, depth + 1)?;
-            continue;
-        }
         if *budget == 0 {
             return Err(ChangeSetError::QuotaExceeded {
                 detail: format!(
-                    "this capture would walk into more than {MAX_WALK_ENTRIES} paths that Git \
+                    "this capture would walk into more than {MAX_WALK_ENTRIES} entries that Git \
                      reported as whole directories; narrow the grant or the policy"
                 )
                 .into(),
             });
         }
         *budget -= 1;
+        if kind.is_dir() {
+            walk(
+                tree,
+                &child,
+                class,
+                grant,
+                administrative_prefix,
+                out,
+                budget,
+                depth + 1,
+            )?;
+            continue;
+        }
         // A link, a socket or a device is not file content. It is kept as an entry so the content
         // read names it as unsupported rather than leaving it out with no record.
         out.push(kr_project::workspace::StatusEntry {
@@ -649,19 +720,34 @@ enum Plan {
         reason: ExclusionReason,
         detail: String,
     },
+    /// The working tree deleted it, and this is what the base holds for it.
+    ///
+    /// A deletion is an operation rather than an absence: an apply performs it, a diff read names
+    /// it, and a revert puts the base's own content back, which needs the base's own object.
+    Deleted {
+        base_object_id: Option<String>,
+        base_mode: Option<String>,
+    },
 }
 
 /// Decides what to do about every path, from the index, the base difference and the status alone.
 ///
 /// Nothing is opened here. That is the point: the grant and the secret rules decide before the
 /// capture reads anything, so a secret is never read, let alone stored.
-fn plan(reading: &Reading, request: &CaptureRequest<'_>) -> BTreeMap<String, Plan> {
+fn plan(reading: &Reading, request: Scope<'_>) -> BTreeMap<String, Plan> {
     let mut planned: BTreeMap<String, Plan> = BTreeMap::new();
-    let status: BTreeMap<&str, &kr_project::workspace::StatusEntry> = reading
-        .status
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect();
+    // One path can appear twice: a file removed from the index and still on disk is reported both
+    // as a staged deletion and as untracked. What the working tree holds is the entry that
+    // decides, so a present entry is kept over an absent one whichever order they arrive in.
+    let mut status: BTreeMap<&str, &kr_project::workspace::StatusEntry> = BTreeMap::new();
+    for entry in &reading.status {
+        match status.get(entry.path.as_str()) {
+            Some(held) if held.change != ChangeKind::Deleted => {}
+            _ => {
+                status.insert(entry.path.as_str(), entry);
+            }
+        }
+    }
 
     // Every path the base revision holds, and every tracked path the working tree holds.
     let mut tracked: Vec<&String> = reading.index.keys().collect();
@@ -671,7 +757,7 @@ fn plan(reading: &Reading, request: &CaptureRequest<'_>) -> BTreeMap<String, Pla
     tracked.dedup();
 
     for path in tracked {
-        if let Some(refusal) = refused(request.grant, path) {
+        if let Some(refusal) = refused_here(request, path) {
             planned.insert(path.clone(), refusal);
             continue;
         }
@@ -723,26 +809,16 @@ fn plan(reading: &Reading, request: &CaptureRequest<'_>) -> BTreeMap<String, Pla
         if planned.contains_key(&entry.path) {
             continue;
         }
-        if let Some(refusal) = refused(request.grant, &entry.path) {
+        if let Some(refusal) = refused_here(request, &entry.path) {
             planned.insert(entry.path.clone(), refusal);
             continue;
         }
-        let class = match entry.class {
-            InclusionClass::UntrackedFile => PathClass::UntrackedFile,
-            InclusionClass::GeneratedArtefact => PathClass::GeneratedArtefact,
-            InclusionClass::Submodule => PathClass::Submodule,
-            _ => PathClass::DirtyFile,
-        };
+        let class = class_of(entry.class);
         if class == PathClass::Submodule {
             planned.insert(entry.path.clone(), unsupported_submodule());
             continue;
         }
-        let choice = match class {
-            PathClass::UntrackedFile => request.policy.untracked_files,
-            PathClass::GeneratedArtefact => request.policy.generated_artefacts,
-            _ => InclusionChoice::Exclude,
-        };
-        if choice == InclusionChoice::Exclude {
+        if choice_for(request.policy, class) == InclusionChoice::Exclude {
             planned.insert(
                 entry.path.clone(),
                 Plan::Exclude {
@@ -775,13 +851,20 @@ fn plan_difference(
     difference: &BaseDifference,
     index: Option<&IndexEntry>,
     status: Option<&&kr_project::workspace::StatusEntry>,
-    request: &CaptureRequest<'_>,
+    request: Scope<'_>,
 ) -> Plan {
     if difference.status == 'U' || status.is_some_and(|entry| entry.change == ChangeKind::Unmerged)
     {
         return unresolved_merge();
     }
     let base = reading.base_of(path);
+    // A path the index lost while the working tree kept a file of that name is not a deletion,
+    // and the class it became decides it rather than the dirty-file policy.
+    if difference.status == 'D'
+        && let Some(entry) = status.filter(|entry| entry.change != ChangeKind::Deleted)
+    {
+        return plan_recreated(entry, base, request);
+    }
     if request.policy.dirty_files == InclusionChoice::Exclude {
         // Excluding a dirty tracked file means the captured tree holds the **base's** version, not
         // that the path is absent. A path the base does not hold at all is simply absent, which is
@@ -807,10 +890,12 @@ fn plan_difference(
         };
     }
     if difference.status == 'D' {
-        return Plan::Exclude {
-            reason: ExclusionReason::Deleted,
-            detail: "the working tree has deleted this path and the capture carries the deletion"
-                .to_owned(),
+        let (base_mode, base_object_id) = base.map_or((None, None), |(mode, object_id)| {
+            (Some(mode), Some(object_id))
+        });
+        return Plan::Deleted {
+            base_object_id,
+            base_mode,
         };
     }
     Plan::WorkingTree {
@@ -818,6 +903,59 @@ fn plan_difference(
         change: status.map_or(ChangeKind::Present, |entry| entry.change),
         base_object_id: base.map(|(_, object_id)| object_id),
         index_mode: index.map(|entry| entry.mode.clone()),
+    }
+}
+
+/// Returns the plan for a path the index no longer holds but the working tree still does.
+///
+/// `D` in a diff against the commit says the **index** lost the path, not that the file is gone:
+/// `git rm --cached` leaves the file there, now untracked, and status reports the path twice, once
+/// as a staged deletion and once as untracked. Recording a deletion for it would throw away
+/// content that is sitting in the working tree, so the class the status gives decides instead, and
+/// the base object travels with it so a revert still has somewhere to go back to.
+fn plan_recreated(
+    entry: &kr_project::workspace::StatusEntry,
+    base: Option<(String, String)>,
+    request: Scope<'_>,
+) -> Plan {
+    let class = class_of(entry.class);
+    if class == PathClass::Submodule {
+        return unsupported_submodule();
+    }
+    if choice_for(request.policy, class) == InclusionChoice::Exclude {
+        return Plan::Exclude {
+            reason: ExclusionReason::Policy,
+            detail: format!(
+                "the policy excludes {}, which is what this path became when it left the index",
+                class.as_str()
+            ),
+        };
+    }
+    Plan::WorkingTree {
+        class,
+        change: entry.change,
+        base_object_id: base.map(|(_, object_id)| object_id),
+        index_mode: None,
+    }
+}
+
+/// Returns what one path's class is called in a captured tree.
+fn class_of(class: InclusionClass) -> PathClass {
+    match class {
+        InclusionClass::UntrackedFile => PathClass::UntrackedFile,
+        InclusionClass::GeneratedArtefact => PathClass::GeneratedArtefact,
+        InclusionClass::Submodule => PathClass::Submodule,
+        _ => PathClass::DirtyFile,
+    }
+}
+
+/// Returns the policy's decision about one class.
+fn choice_for(policy: &InclusionPolicy, class: PathClass) -> InclusionChoice {
+    match class {
+        PathClass::DirtyFile => policy.dirty_files,
+        PathClass::UntrackedFile => policy.untracked_files,
+        PathClass::GeneratedArtefact => policy.generated_artefacts,
+        _ => InclusionChoice::Exclude,
     }
 }
 
@@ -848,6 +986,30 @@ fn unsupported_mode(mode: &str) -> Plan {
             kr_project::git::redact(mode)
         ),
     }
+}
+
+/// Returns true when one path is this repository's own administrative data.
+///
+/// Two rules: any `.git` component, whatever its case, and the directory this repository actually
+/// keeps its administrative data in, which a `.git` file can point anywhere inside the tree.
+fn administrative(request: Scope<'_>, path: &str) -> bool {
+    crate::grant::is_administrative(path)
+        || request
+            .administrative_prefix
+            .is_some_and(|prefix| crate::grant::under(path, prefix))
+}
+
+/// Returns the refusal a grant or a secret rule makes, when it makes one.
+fn refused_here(request: Scope<'_>, path: &str) -> Option<Plan> {
+    if administrative(request, path) {
+        return Some(Plan::Exclude {
+            reason: ExclusionReason::Unsupported,
+            detail: "this path is this repository's own administrative data rather than its \
+                     content"
+                .to_owned(),
+        });
+    }
+    refused(request.grant, path)
 }
 
 /// Returns the refusal a grant or a secret rule makes, when it makes one.
@@ -900,7 +1062,7 @@ fn read_content(
     repository: &OpenedRepository,
     store: &ObjectStore,
     planned: &BTreeMap<String, Plan>,
-    request: &CaptureRequest<'_>,
+    request: Scope<'_>,
 ) -> Result<Manifest> {
     let object_reads = planned
         .values()
@@ -923,6 +1085,7 @@ fn read_content(
     let mut manifest = Manifest {
         paths: Vec::new(),
         exclusions: Vec::new(),
+        deletions: Vec::new(),
     };
     for (path, plan) in planned {
         match plan {
@@ -930,6 +1093,14 @@ fn read_content(
                 path: path.clone(),
                 reason: *reason,
                 detail: detail.clone(),
+            }),
+            Plan::Deleted {
+                base_object_id,
+                base_mode,
+            } => manifest.deletions.push(crate::version::DeletedPath {
+                path: path.clone(),
+                base_object_id: base_object_id.clone(),
+                base_mode: base_mode.clone(),
             }),
             Plan::GitObject {
                 class,
@@ -969,10 +1140,12 @@ fn read_content(
                 base_object_id,
                 index_mode,
             } => match read_working_tree(repository, path)? {
-                WorkingRead::Gone => manifest.exclusions.push(Exclusion {
+                // The status said the path was there and it is not any more. That is a deletion
+                // the working tree holds, recorded with whatever the base has for it.
+                WorkingRead::Gone => manifest.deletions.push(crate::version::DeletedPath {
                     path: path.clone(),
-                    reason: ExclusionReason::Deleted,
-                    detail: "the working tree no longer holds this path".to_owned(),
+                    base_object_id: base_object_id.clone(),
+                    base_mode: None,
                 }),
                 WorkingRead::Unsupported(detail) => manifest.exclusions.push(Exclusion {
                     path: path.clone(),
@@ -1040,7 +1213,7 @@ fn binary_exclusion(path: &str) -> Exclusion {
 /// includes dirty files and excludes binaries leaves that one out. An ordinary tracked file is not
 /// subject to it, because leaving it out would make the captured tree short of the base rather
 /// than short of a change.
-fn leave_out_binary(request: &CaptureRequest<'_>, class: PathClass, content: ContentClass) -> bool {
+fn leave_out_binary(request: Scope<'_>, class: PathClass, content: ContentClass) -> bool {
     class.is_change()
         && content == ContentClass::Binary
         && request.policy.binary_files == InclusionChoice::Exclude
@@ -1287,7 +1460,7 @@ fn snapshot(
     profile: &RestrictedProfile,
     repository: &OpenedRepository,
     store: &ObjectStore,
-    request: &CaptureRequest<'_>,
+    request: Scope<'_>,
 ) -> Result<Captured> {
     // A policy that would include uncommitted work cannot be served from a commit, and serving it
     // a weaker class under the name it asked for is exactly what section 14 forbids.
@@ -1326,6 +1499,7 @@ fn snapshot(
     let mut manifest = Manifest {
         paths: Vec::new(),
         exclusions: Vec::new(),
+        deletions: Vec::new(),
     };
     let mut budget = Budget {
         bytes: MAX_CAPTURE_BYTES,
@@ -1376,7 +1550,7 @@ fn descend(
     store: &ObjectStore,
     tree_id: &str,
     prefix: &str,
-    request: &CaptureRequest<'_>,
+    request: Scope<'_>,
     manifest: &mut Manifest,
     budget: &mut Budget,
     depth: usize,
@@ -1399,7 +1573,7 @@ fn descend(
         if entry.kind == "tree" {
             // A directory is walked into when anything the grant selects can lie beneath it, and
             // its own exclusion is recorded when nothing can.
-            if !grant::may_traverse(request.grant, &path) {
+            if !grant::may_traverse(request.grant, &path) || administrative(request, &path) {
                 manifest.exclusions.push(Exclusion {
                     path,
                     reason: ExclusionReason::Grant,
@@ -1420,7 +1594,7 @@ fn descend(
             )?;
             continue;
         }
-        if let Some(plan) = refused(request.grant, &path) {
+        if let Some(plan) = refused_here(request, &path) {
             manifest.exclusions.push(exclusion(&path, &plan));
             continue;
         }
@@ -1492,7 +1666,7 @@ pub fn classify_content(bytes: &[u8]) -> ContentClass {
 ///
 /// The declaration is still recorded, on the version's own policy, because a caller that quiesced
 /// its work said so and a reader should see it. What it does not do is change the class.
-fn classify(request: &CaptureRequest<'_>, quiet: bool) -> (SourceConsistency, String) {
+fn classify(request: Scope<'_>, quiet: bool) -> (SourceConsistency, String) {
     let mut detail = "files were read one at a time from a live working tree; each one was the \
                       same object of the same length written at the same instant after its read \
                       as before it, and the base revision, the index and the status were \
@@ -1596,6 +1770,13 @@ mod tests {
         }
     }
 
+    fn scope<'a>(request: &'a CaptureRequest<'a>) -> Scope<'a> {
+        Scope {
+            request,
+            administrative_prefix: None,
+        }
+    }
+
     #[test]
     fn a_secret_is_left_out_before_anything_is_opened() {
         // The plan is built from the index, the base difference and the status alone. A secret's
@@ -1621,7 +1802,7 @@ mod tests {
                     ChangeKind::Present,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         assert!(matches!(
             planned[".env"],
@@ -1651,7 +1832,7 @@ mod tests {
                     ChangeKind::Present,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         match &planned["README.md"] {
             Plan::GitObject {
@@ -1682,7 +1863,7 @@ mod tests {
                     ChangeKind::Present,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         assert!(matches!(
             planned["added.txt"],
@@ -1709,7 +1890,7 @@ mod tests {
                     ChangeKind::Deleted,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         match &planned["gone.txt"] {
             Plan::GitObject { object_id, .. } => assert_eq!(object_id, "committed"),
@@ -1731,7 +1912,7 @@ mod tests {
                     ChangeKind::Present,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         assert!(matches!(
             planned["notes.txt"],
@@ -1759,15 +1940,86 @@ mod tests {
                     ChangeKind::Deleted,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
-        assert!(matches!(
-            planned["gone.txt"],
-            Plan::Exclude {
-                reason: ExclusionReason::Deleted,
-                ..
+        // A deletion is an operation of its own, and it carries what the base held so a revert has
+        // somewhere to put back.
+        match &planned["gone.txt"] {
+            Plan::Deleted {
+                base_object_id,
+                base_mode,
+            } => {
+                assert_eq!(base_object_id.as_deref(), Some("committed"));
+                assert_eq!(base_mode.as_deref(), Some("100644"));
             }
-        ));
+            other => panic!("a deletion is planned as one: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_path_the_index_lost_is_captured_when_the_working_tree_still_holds_it() {
+        // `git rm --cached` leaves the file where it is and takes it out of the index. The diff
+        // against the commit calls that `D`, and status reports the path twice: once as a staged
+        // deletion and once as untracked. Recording a deletion for it would throw away a file that
+        // is sitting there, so what the working tree holds is what decides.
+        let policy = InclusionPolicy {
+            untracked_files: InclusionChoice::Include,
+            ..InclusionPolicy::base_only()
+        };
+        let granted = FileGrant::default();
+        let planned = plan(
+            &reading(
+                index(&[]),
+                differences(&[("kept.txt", Some("100644"), Some("committed"), 'D')]),
+                vec![
+                    entry("kept.txt", InclusionClass::DirtyFile, ChangeKind::Deleted),
+                    entry(
+                        "kept.txt",
+                        InclusionClass::UntrackedFile,
+                        ChangeKind::Present,
+                    ),
+                ],
+            ),
+            scope(&request(&policy, &granted)),
+        );
+        match &planned["kept.txt"] {
+            Plan::WorkingTree {
+                class,
+                base_object_id,
+                ..
+            } => {
+                assert_eq!(*class, PathClass::UntrackedFile);
+                assert_eq!(
+                    base_object_id.as_deref(),
+                    Some("committed"),
+                    "the base object travels with it, so a revert has somewhere to go back to"
+                );
+            }
+            other => panic!("the working tree's file is what is captured: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_path_the_index_lost_and_the_working_tree_lost_too_is_a_deletion() {
+        let policy = InclusionPolicy {
+            untracked_files: InclusionChoice::Include,
+            dirty_files: InclusionChoice::Include,
+            ..InclusionPolicy::base_only()
+        };
+        let granted = FileGrant::default();
+        let planned = plan(
+            &reading(
+                index(&[]),
+                differences(&[("gone.txt", Some("100644"), Some("committed"), 'D')]),
+                vec![entry(
+                    "gone.txt",
+                    InclusionClass::DirtyFile,
+                    ChangeKind::Deleted,
+                )],
+            ),
+            scope(&request(&policy, &granted)),
+        );
+        assert!(matches!(planned["gone.txt"], Plan::Deleted { .. }));
     }
 
     #[test]
@@ -1787,7 +2039,7 @@ mod tests {
                     ChangeKind::Unmerged,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         assert!(matches!(
             planned["merged.txt"],
@@ -1811,7 +2063,7 @@ mod tests {
                 differences(&[]),
                 Vec::new(),
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         assert!(matches!(
             planned["vendor/lib"],
@@ -1838,7 +2090,7 @@ mod tests {
                     ChangeKind::Present,
                 )],
             ),
-            &request(&policy, &granted),
+            scope(&request(&policy, &granted)),
         );
         match &planned["link"] {
             Plan::Exclude { reason, detail } => {
@@ -1896,20 +2148,20 @@ mod tests {
             ..request(&policy, &granted)
         };
         for quiet in [true, false] {
-            let (class, detail) = classify(&declared, quiet);
+            let (class, detail) = classify(scope(&declared), quiet);
             assert_eq!(class, SourceConsistency::PerFileCapture);
             assert!(
                 detail.contains("detection rather than one instant"),
                 "the detail says what it is: {detail}"
             );
         }
-        let (class, detail) = classify(&declared, true);
+        let (class, detail) = classify(scope(&declared), true);
         assert!(
             detail.contains("it does not make this a quiesced capture"),
             "and says plainly that the declaration did not decide it: {detail}"
         );
         // Without the declaration the detail says nothing about one.
-        let (class_without, detail_without) = classify(&request(&policy, &granted), true);
+        let (class_without, detail_without) = classify(scope(&request(&policy, &granted)), true);
         assert_eq!(class_without, SourceConsistency::PerFileCapture);
         assert!(!detail_without.contains("quiesced"));
         assert_eq!(class, SourceConsistency::PerFileCapture);

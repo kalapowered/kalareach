@@ -24,6 +24,12 @@ uuid.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Reads a file's access-control list, so a destination whose protection this host cannot carry
+# across a replacement is refused rather than replaced with its mode bits alone. Used to refuse,
+# never to grant.
+exacl.workspace = true
+
 [features]
 # The seam a test uses to stop an apply exactly where a crash would stop it, so the journal can be
 # read afterwards. On by default so a plain `cargo test` reaches it; a binary that ships this crate

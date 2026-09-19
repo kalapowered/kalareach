@@ -248,6 +248,7 @@ pub fn apply_order<'a>(
         acknowledged_limitations: acknowledged,
         revert: false,
         provenance: provenance(),
+        claim: None,
     }
 }
 
@@ -267,6 +268,7 @@ pub fn expectations(root: &Path, paths: &[&str]) -> Vec<kr_protocol::changeset::
                     .map(|bytes| kr_changeset::objects::digest_of(&bytes)),
             ),
             expected_index_object_id: Nullable(None),
+            expected_index_mode: Nullable(None),
             check_index: false,
         })
         .collect()

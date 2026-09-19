@@ -31,6 +31,25 @@ use support::{
     write_bytes,
 };
 
+/// An action claim that remembers whether it was ever asked for.
+#[derive(Default)]
+struct RecordingClaim {
+    asked: std::cell::Cell<bool>,
+}
+
+impl RecordingClaim {
+    fn taken(&self) -> bool {
+        self.asked.get()
+    }
+}
+
+impl apply::ActionClaim for RecordingClaim {
+    fn claim(&self) -> kr_changeset::Result<bool> {
+        self.asked.set(true);
+        Ok(true)
+    }
+}
+
 /// KR-REQ-14.04 and 14.25: a read identifies its repository, its workspace, its base and its head,
 /// and names every tracked, untracked and binary change with the content revision of each side.
 #[test]
@@ -115,8 +134,20 @@ fn a_preflight_conflict_returns_draft_conflict_and_writes_nothing() {
         &limitations,
     );
     let action = order.action_id;
+    // Nothing durable is written for a refused preflight, and the claim on the action is part of
+    // that: it is taken only once the preflight has passed, so a host that stops here leaves
+    // nothing behind for the next attempt to trip over.
+    let claim = RecordingClaim::default();
+    let order = ApplyOrder {
+        claim: Some(&claim),
+        ..order
+    };
     let failure = apply::apply(fixture.service(), &order).expect_err("the preflight refuses");
     assert_eq!(failure.code(), ErrorCode::DraftConflict);
+    assert!(
+        !claim.taken(),
+        "a refused preflight never asks for the action's claim"
+    );
     assert!(
         failure.to_string().contains("nothing was written"),
         "the refusal says so: {failure}"

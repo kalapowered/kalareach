@@ -12,8 +12,7 @@
 //! anybody but the actor that produced it.
 
 use kr_protocol::changeset::{
-    CaptureCount, CapturedPath, ContentOrigin, Exclusion, ExclusionReason, PathClass,
-    SourceConsistency, TreeSummary,
+    CaptureCount, CapturedPath, ContentOrigin, Exclusion, PathClass, SourceConsistency, TreeSummary,
 };
 use kr_protocol::ids::{EnvironmentId, ProjectRepositoryId, WorkspaceId};
 use kr_protocol::project::{
@@ -42,13 +41,33 @@ pub struct Manifest {
     pub paths: Vec<CapturedPath>,
     /// Every path the capture left out, sorted by path.
     pub exclusions: Vec<Exclusion>,
+    /// Every path the working tree deleted, with what the base revision holds for it.
+    ///
+    /// A deletion is a change like any other: it is an operation an apply performs, an entry a
+    /// diff read names, and a thing a revert has to be able to undo. Recording only that the path
+    /// is absent would leave a revert with nothing to put back, so the base's own object and mode
+    /// travel with it.
+    #[serde(default)]
+    pub deletions: Vec<DeletedPath>,
+}
+
+/// One path the working tree deleted, and what the base revision holds for it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeletedPath {
+    /// The path, relative to the repository's top level.
+    pub path: String,
+    /// The object the base revision holds for it, when this host read one.
+    pub base_object_id: Option<String>,
+    /// The mode the base revision records for it.
+    pub base_mode: Option<String>,
 }
 
 impl Manifest {
-    /// Sorts both lists, so a manifest built in any order has one form.
+    /// Sorts every list, so a manifest built in any order has one form.
     pub fn canonicalise(&mut self) {
         self.paths.sort_by(|a, b| a.path.cmp(&b.path));
         self.exclusions.sort_by(|a, b| a.path.cmp(&b.path));
+        self.deletions.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
     /// Returns the captured path with this name, when the tree holds one.
@@ -68,12 +87,7 @@ impl Manifest {
             total_bytes: U64::new(0),
             from_git_objects: U64::new(0),
             from_working_tree: U64::new(0),
-            deleted_paths: U64::new(
-                self.exclusions
-                    .iter()
-                    .filter(|exclusion| exclusion.reason == ExclusionReason::Deleted)
-                    .count() as u64,
-            ),
+            deleted_paths: U64::new(self.deletions.len() as u64),
         };
         let mut bytes = 0_u64;
         let mut objects = 0_u64;
@@ -269,6 +283,10 @@ pub fn identity_digest(subject: &Subject<'_>, manifest: &Manifest) -> Digest256 
     for exclusion in &manifest.exclusions {
         absorb.text(&exclusion.path).text(exclusion.reason.as_str());
     }
+    absorb.number(manifest.deletions.len() as u64);
+    for deleted in &manifest.deletions {
+        absorb.text(&deleted.path);
+    }
     absorb.finish()
 }
 
@@ -322,6 +340,7 @@ pub fn limitations() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::changeset::ExclusionReason;
     use kr_protocol::scalars::Nullable;
 
     fn path(name: &str, content: &[u8], origin: ContentOrigin) -> CapturedPath {
@@ -383,6 +402,7 @@ mod tests {
                 reason: ExclusionReason::SecretRule,
                 detail: "a secret rule covers it".to_owned(),
             }],
+            deletions: Vec::new(),
         };
         manifest.canonicalise();
         (

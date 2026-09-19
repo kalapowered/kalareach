@@ -4514,6 +4514,14 @@ export interface MaterialisationResult {
    */
   command: string
   /**
+   * What the materialisation held when the result was recorded, when that was not the version.
+   *
+   * A version of its own, with its own identity, recorded from one reading of the directory. It
+   * is **not** an attestation: it says what was there when this host looked, which is the
+   * nearest thing to the tested source that a host outside the execution can establish.
+   */
+  derived_output_version: VersionRef | null
+  /**
    * The environment it ran in.
    */
   environment_id: string
@@ -4538,12 +4546,12 @@ export interface MaterialisationResult {
   /**
    * What was actually tested.
    */
-  tested_source: 'unmodified_version' | 'derived_version' | 'indeterminate'
+  tested_source: 'unmodified_version' | 'indeterminate'
   /**
    * The version the result attests, when it attests one.
    *
-   * The input version for [`TestedSource::UnmodifiedVersion`], the derived version for
-   * [`TestedSource::DerivedVersion`], and nothing at all for [`TestedSource::Indeterminate`].
+   * The input version for [`TestedSource::UnmodifiedVersion`], and nothing at all for
+   * [`TestedSource::Indeterminate`].
    */
   tested_version: VersionRef | null
   tool: ToolIdentity
@@ -6279,9 +6287,16 @@ export interface AffectedVersion {
    *
    * A caller that only means to say what the file holds leaves this false. One that means to
    * apply against an exact staged state sets it, and then an index that holds anything else —
-   * including nothing, and including an unresolved merge — is a conflict.
+   * including nothing, a different mode, and an unresolved merge — is a conflict.
    */
   check_index: boolean
+  /**
+   * The mode the caller expects the index to record, such as `100644`.
+   *
+   * Compared only when [`Self::check_index`] is set. A path whose content is what the request
+   * expects and whose mode is not is a path the request did not describe.
+   */
+  expected_index_mode: string | null
   /**
    * The Git object the caller expects the index to hold for it.
    *

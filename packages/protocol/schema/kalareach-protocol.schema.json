@@ -529,8 +529,19 @@
       "description": "What one apply established about one path before it wrote anything.",
       "properties": {
         "check_index": {
-          "description": "Check the index as well as the working tree.\n\nA caller that only means to say what the file holds leaves this false. One that means to\napply against an exact staged state sets it, and then an index that holds anything else —\nincluding nothing, and including an unresolved merge — is a conflict.",
+          "description": "Check the index as well as the working tree.\n\nA caller that only means to say what the file holds leaves this false. One that means to\napply against an exact staged state sets it, and then an index that holds anything else —\nincluding nothing, a different mode, and an unresolved merge — is a conflict.",
           "type": "boolean"
+        },
+        "expected_index_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The mode the caller expects the index to record, such as `100644`.\n\nCompared only when [`Self::check_index`] is set. A path whose content is what the request\nexpects and whose mode is not is a path the request did not describe."
         },
         "expected_index_object_id": {
           "anyOf": [
@@ -563,6 +574,7 @@
         "path",
         "expected_worktree_digest",
         "expected_index_object_id",
+        "expected_index_mode",
         "check_index"
       ],
       "type": "object"
@@ -10609,6 +10621,17 @@
           "description": "The command that was executed, as the caller names it.",
           "type": "string"
         },
+        "derived_output_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the materialisation held when the result was recorded, when that was not the version.\n\nA version of its own, with its own identity, recorded from one reading of the directory. It\nis **not** an attestation: it says what was there when this host looked, which is the\nnearest thing to the tested source that a host outside the execution can establish."
+        },
         "environment_id": {
           "$ref": "#/$defs/EnvironmentId",
           "description": "The environment it ran in."
@@ -10653,7 +10676,7 @@
               "type": "null"
             }
           ],
-          "description": "The version the result attests, when it attests one.\n\nThe input version for [`TestedSource::UnmodifiedVersion`], the derived version for\n[`TestedSource::DerivedVersion`], and nothing at all for [`TestedSource::Indeterminate`]."
+          "description": "The version the result attests, when it attests one.\n\nThe input version for [`TestedSource::UnmodifiedVersion`], and nothing at all for\n[`TestedSource::Indeterminate`]."
         },
         "tool": {
           "$ref": "#/$defs/ToolIdentity",
@@ -10665,6 +10688,7 @@
         "input_version",
         "tested_source",
         "tested_version",
+        "derived_output_version",
         "command",
         "profile",
         "environment_id",
@@ -21327,21 +21351,16 @@
       "type": "object"
     },
     "TestedSource": {
-      "description": "What a result was actually run against.",
+      "description": "What a result was actually run against.\n\nTwo members, because those are the two things a host that does not own the execution can\nestablish. Section 14 asks for a result to record \"the derived tested version **or** an\nindeterminate-source result\"; where the source was changed, this host records the derived\nversion in [`MaterialisationResult::derived_output_version`] and says the source is\nindeterminate, because reading a directory before and after a run establishes what it holds now\nand not what each part of the run read. A run that changed a file, tested the change and put\nthe file back would otherwise be attested against a version it never used.",
       "oneOf": [
         {
           "const": "unmodified_version",
-          "description": "The materialisation still held exactly the version, so the result attests that version.",
-          "type": "string"
-        },
-        {
-          "const": "derived_version",
-          "description": "The materialisation was modified, so the result attests a derived version of its own.",
+          "description": "The materialisation still held exactly the version, so the result attests that version.\n\nExactly means all of it: the same paths, the same content, the same modes, and every file\nstill the object this host wrote, of the same length, last written at the same instant.",
           "type": "string"
         },
         {
           "const": "indeterminate",
-          "description": "This host could not establish what was tested, so the result attests nothing.\n\nA result must not say the unmodified version passed when the tested source cannot be\nestablished. This is what it says instead.",
+          "description": "This host could not establish what was tested, so the result attests nothing.\n\nA result must not say the unmodified version passed when the tested source was changed or\ncannot be established. This is what it says instead, and what the directory held is\nrecorded beside it as a derived output version.",
           "type": "string"
         }
       ]
