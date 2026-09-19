@@ -103,16 +103,17 @@ struct Clock;
 
 impl kr_pairing::platform::PairingClock for Clock {
     fn monotonic_ms(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("a clock after the epoch")
-            .as_millis() as u64
+        kr_ipc::clock::SharedClock::boot_elapsed_ms(&kr_ipc::clock::SystemSharedClock)
     }
 
     fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
-        // One boot for the whole of a test. What the deadline inside the ceremony needs is that it
-        // does not change while the ceremony runs, not that it identifies this machine.
-        kr_pairing::platform::BootIdentity([7; 32])
+        // This machine's own boot, derived the way the daemon derives it, so evidence this helper
+        // produces is evidence the daemon accepts. A fixed value would make every confirmation
+        // built here look like one from another boot.
+        let value = kr_ipc::identity::boot_identity()
+            .map(|identity| identity.value.as_slice().to_vec())
+            .unwrap_or_default();
+        kr_pairing::platform::BootIdentity(kr_cbor::sha256(&value))
     }
 
     fn wall_clock_ms(&self) -> u64 {
@@ -135,8 +136,15 @@ fn recipient_keys() -> kr_protocol::pairing::DevicePublicKeys {
 }
 
 fn transfer_host(keys: &kr_protocol::pairing::DevicePublicKeys) -> TransferHost<'_> {
+    transfer_host_for(device_id(0xf0), keys)
+}
+
+fn transfer_host_for(
+    host_device_id: DeviceId,
+    keys: &kr_protocol::pairing::DevicePublicKeys,
+) -> TransferHost<'_> {
     TransferHost {
-        device_id: device_id(0xf0),
+        device_id: host_device_id,
         endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([3; 32]),
         recipient_keys: keys,
     }
@@ -146,9 +154,17 @@ fn confirm_transfer(
     plan: &TransferPlan,
     owner_key: &kr_crypto::keys::AuthorisationKeyPair,
 ) -> ConfirmedTransfer {
+    confirm_transfer_for(plan, device_id(0xf0), owner_key)
+}
+
+fn confirm_transfer_for(
+    plan: &TransferPlan,
+    host_device_id: DeviceId,
+    owner_key: &kr_crypto::keys::AuthorisationKeyPair,
+) -> ConfirmedTransfer {
     let clock = Clock;
     let keys = recipient_keys();
-    let host = transfer_host(&keys);
+    let host = transfer_host_for(host_device_id, &keys);
     let request = kr_pairing::confirm::request_confirmation(
         &clock,
         TransferPlan::sensitive_action(),
@@ -564,7 +580,13 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
     };
     let elsewhere = confirm_transfer(&elsewhere_plan, &owner_key);
     let error = service
-        .transfer_control(&plan, &elsewhere, AuthorityRevision::new(1), NOW + 2)
+        .transfer_control(
+            &plan,
+            &elsewhere,
+            &Clock,
+            AuthorityRevision::new(1),
+            NOW + 2,
+        )
         .expect_err("a confirmation is about one exact transfer");
     assert!(
         error.to_string().contains("different transfer"),
@@ -581,7 +603,13 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
 
     let confirmed = confirm_transfer(&plan, &owner_key);
     let done = service
-        .transfer_control(&plan, &confirmed, AuthorityRevision::new(1), NOW + 2)
+        .transfer_control(
+            &plan,
+            &confirmed,
+            &Clock,
+            AuthorityRevision::new(1),
+            NOW + 2,
+        )
         .expect("the owner confirmed this transfer");
 
     // The recipient holds active authority immediately: there is no invitation left to redeem.
@@ -1219,7 +1247,18 @@ async fn transferring_control_through_the_daemon_completes_through_the_barrier()
         actions: transfer::transferable_actions(&owner.grant),
     };
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
-    let confirmed = confirm_transfer(&plan, &owner_key);
+    // Evidence the owner gave for **another** host does not authorise a transfer on this one, even
+    // though the plan and the signature are otherwise the same.
+    let elsewhere = confirm_transfer_for(&plan, device_id(0xee), &owner_key);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.transfer_control(&plan, &elsewhere),
+    )
+    .await
+    .expect("the refusal is prompt")
+    .expect_err("this host is not the one the owner confirmed for");
+
+    let confirmed = confirm_transfer_for(&plan, host_device_id, &owner_key);
     let before = controller.policy().authority_revision();
     let (transfer, completed) = tokio::time::timeout(
         Duration::from_secs(20),

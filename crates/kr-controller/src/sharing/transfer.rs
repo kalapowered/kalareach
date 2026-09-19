@@ -104,8 +104,15 @@ impl TransferPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfirmedTransfer {
     action_digest: Digest256,
-    /// The challenge's own deadline, carried so a use of this evidence after it is refused.
-    expires_at_ms: u64,
+    /// The host the challenge was verified against. Evidence accepted for one host says nothing
+    /// about another, so this travels with it and is checked where the transfer happens.
+    host_device_id: DeviceId,
+    /// The boot the confirmation was accepted in, and the monotonic moment its lifetime ends.
+    ///
+    /// The wall clock is what the signer reads; the deadline this host enforces is monotonic and
+    /// tied to a boot, because a clock wound back would otherwise lengthen a confirmation.
+    boot: kr_pairing::platform::BootIdentity,
+    expires_at_monotonic_ms: u64,
 }
 
 impl ConfirmedTransfer {
@@ -160,9 +167,16 @@ impl ConfirmedTransfer {
         .map_err(|error| ControllerError::PermissionDenied {
             detail: format!("the owner's confirmation does not authorise this transfer: {error}"),
         })?;
+        // The lifetime the ledger enforces, measured from now on this host's own monotonic clock
+        // and bound to this boot. `expires_at_ms` inside the request is the same interval on the
+        // wall clock, for the signer to read.
         Ok(Self {
             action_digest,
-            expires_at_ms: request.expires_at_ms.get(),
+            host_device_id: host.device_id,
+            boot: clock.boot_identity(),
+            expires_at_monotonic_ms: clock
+                .monotonic_ms()
+                .saturating_add(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS),
         })
     }
 
@@ -179,13 +193,28 @@ impl ConfirmedTransfer {
     /// Returns [`ControllerError::PermissionDenied`] when it is about something else, or when the
     /// challenge's short expiry has passed: a confirmation is for a decision the owner is making
     /// now, and one carried past its deadline is not that.
-    pub fn covers(&self, plan: &TransferPlan, now_ms: u64) -> Result<()> {
+    pub fn covers(
+        &self,
+        plan: &TransferPlan,
+        host_device_id: DeviceId,
+        clock: &dyn kr_pairing::platform::PairingClock,
+    ) -> Result<()> {
         if plan.action_digest()? != self.action_digest {
             return Err(ControllerError::PermissionDenied {
                 detail: "the owner's confirmation is for a different transfer".to_owned(),
             });
         }
-        if now_ms >= self.expires_at_ms {
+        if self.host_device_id != host_device_id {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the owner's confirmation was accepted for another host".to_owned(),
+            });
+        }
+        if clock.boot_identity() != self.boot {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the owner's confirmation was accepted in an earlier boot".to_owned(),
+            });
+        }
+        if clock.monotonic_ms() >= self.expires_at_monotonic_ms {
             return Err(ControllerError::PermissionDenied {
                 detail: "the owner's confirmation for this transfer has expired".to_owned(),
             });

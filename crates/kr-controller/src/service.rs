@@ -184,6 +184,32 @@ pub const WINDOW_RENEWAL: std::time::Duration =
 /// so the control stream carries one itself.
 pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The clock the owner-confirmation ceremony reads, which is this daemon's own.
+///
+/// The monotonic reading and the boot identity are what a confirmation's deadline is measured on,
+/// so a wall clock that moves cannot lengthen one.
+#[derive(Debug)]
+struct PairingTime;
+
+impl kr_pairing::platform::PairingClock for PairingTime {
+    fn monotonic_ms(&self) -> u64 {
+        kr_ipc::clock::SharedClock::boot_elapsed_ms(&kr_ipc::clock::SystemSharedClock)
+    }
+
+    fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
+        // The daemon's own boot value, hashed to the fixed width this clock's identity uses. Two
+        // boots differ here whenever they differ there, which is the whole of what it is for.
+        let value = kr_ipc::identity::boot_identity()
+            .map(|identity| identity.value.as_slice().to_vec())
+            .unwrap_or_default();
+        kr_pairing::platform::BootIdentity(kr_cbor::sha256(&value))
+    }
+
+    fn wall_clock_ms(&self) -> u64 {
+        kr_ipc::now_ms().get()
+    }
+}
+
 /// The control daemon.
 pub struct Controller {
     /// This daemon, as something a task started from a method that has no counted reference can
@@ -1227,15 +1253,21 @@ impl Controller {
         // its own withdrawal owes a fence in its own right, keyed by the device's identity. The
         // intent is written **before** the record changes, because a debt recorded after a
         // withdrawal that then failed to record would be a withdrawal nothing fences.
-        let intent = kr_protocol::ids::GrantId::new(device_id.get());
-        let mine = self.sharing.grants().owe_fence([intent], now_ms)?;
-        if !self.devices.revoke(device_id, TimestampMs::new(now_ms))? && !mine.is_empty() {
-            // The record was already revoked, so this call withdrew nothing, and the intent this
-            // call wrote was for work that turned out to be done. Only what *this* call wrote is
-            // cleared: an intent that was already there belongs to an attempt that has not been
-            // fenced, and erasing it would leave that withdrawal unfenced for ever.
-            self.sharing.grants().fence_completed(&mine)?;
+        // The intent is written only when there is a withdrawal to fence, and once written it is
+        // never taken back: a caller that decided its own work was done and deleted the row could
+        // delete the row another caller was relying on. Reading the record first is what keeps a
+        // repeat from fencing the host again, and two callers racing the first revocation both
+        // fence, which is the harmless direction.
+        if self
+            .devices
+            .record_for_device(device_id)?
+            .is_some_and(|record| record.revoked_at_ms.is_none())
+        {
+            self.sharing
+                .grants()
+                .owe_fence([kr_protocol::ids::GrantId::new(device_id.get())], now_ms)?;
         }
+        self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
     }
@@ -1260,9 +1292,9 @@ impl Controller {
     )> {
         let now_ms = self.settled_now_ms();
         let revision = self.policy().authority_revision();
-        let transfer = self
-            .sharing
-            .transfer_control(plan, confirmation, revision, now_ms)?;
+        let transfer =
+            self.sharing
+                .transfer_control(plan, confirmation, &PairingTime, revision, now_ms)?;
         let completed = self
             .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), now_ms)
             .await?;
@@ -1366,9 +1398,11 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         policy.observe_utc(now_ms);
         let settled = policy.settled_now(now_ms);
-        let snapshot = policy.snapshot();
-        drop(policy);
-        let _ = self.sharing.grants().store_policy(&snapshot);
+        // Written while the lock is held, like every other accepted change, so two callers cannot
+        // reach the store out of order and leave the older floor on disk. A failure leaves the
+        // raised floor in memory, because a floor only moves forward and keeping it is the
+        // stricter answer.
+        let _ = self.sharing.grants().store_policy(&policy.snapshot());
         settled
     }
 

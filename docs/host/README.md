@@ -1242,13 +1242,18 @@ beside live authority.
 **Transfer of control is not a delegation.** The transferring device does not keep what it hands
 over: the recipient receives an active grant over the session named in the plan, and the
 transferring device's grant is revoked with its descendants, both in one commit. It changes who
-holds authority, so it takes the owner's confirmation every time. The challenge is verified and
-consumed where the transfer happens, against an expectation this host builds from what it knows —
-its own identity, the recipient's keys from its device record, the rights the plan hands over and a
-digest covering the whole plan — so a challenge that supplied its own answers to those does not
-authorise anything. The evidence carries the challenge's deadline and is refused after it. The
-transfer hands over no more than the transferring grant carries, and it advances the revision and
-fences like any other revocation.
+holds authority, so it takes the owner's confirmation every time.
+
+The confirmation is accepted against an expectation built from what the caller states this host is:
+its device identity, its endpoint, the recipient's public keys, the rights the plan hands over and a
+digest covering the whole plan. A challenge that supplied its own answers to those does not satisfy
+it. What comes out of that acceptance is evidence bound to the host it was accepted for, to the boot
+it was accepted in, and to the ceremony's own monotonic deadline, and the transfer checks all three
+before it does anything. A confirmation accepted for another host, in an earlier boot, or past its
+lifetime authorises nothing.
+
+The transfer hands over no more than the transferring grant carries, and it advances the revision
+and fences like any other revocation.
 
 **Nothing is lent through an intermediary.** The rule for a plugin action, an attachment action or a
 workflow is the *intersection* of what the actor holds and what the intermediary declares: an

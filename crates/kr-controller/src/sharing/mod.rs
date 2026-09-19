@@ -448,10 +448,13 @@ impl SharingService {
         &self,
         plan: &TransferPlan,
         confirmation: &transfer::ConfirmedTransfer,
+        clock: &dyn kr_pairing::platform::PairingClock,
         authority_revision: AuthorityRevision,
         now_ms: u64,
     ) -> Result<ControlTransfer> {
-        confirmation.covers(plan, now_ms)?;
+        // Against **this** host. Evidence accepted for another host, in another boot, or past the
+        // ceremony's own lifetime authorises nothing here.
+        confirmation.covers(plan, self.host_device_id, clock)?;
         // Built from the source rather than from the caller, so a transfer cannot widen the
         // environment or the history the source reached. The source is read again inside the
         // transaction; this copy is only to build the record, and the transaction's own check is

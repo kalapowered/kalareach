@@ -235,6 +235,24 @@ impl GrantDirectory {
                  );",
             )
             .map_err(ControllerError::registry)?;
+        // A store written by an earlier build has the receipts table without its lease column.
+        // `CREATE TABLE IF NOT EXISTS` leaves that table alone, so the column is added here and
+        // every existing claim's lease starts from the moment it was claimed. Without this a host
+        // that upgraded would fail on its first authority change, reading a column that is not
+        // there.
+        let has_lease = connection
+            .prepare("SELECT leased_at_ms FROM authority_receipts LIMIT 1")
+            .is_ok();
+        if !has_lease {
+            connection
+                .execute_batch(
+                    "ALTER TABLE authority_receipts
+                         ADD COLUMN leased_at_ms INTEGER NOT NULL DEFAULT 0;
+                     UPDATE authority_receipts SET leased_at_ms = claimed_at_ms
+                      WHERE leased_at_ms = 0;",
+                )
+                .map_err(ControllerError::registry)?;
+        }
         Ok(Self {
             connection: std::sync::Mutex::new(connection),
         })
@@ -471,12 +489,18 @@ impl GrantDirectory {
             if let Some(session_id) = record.session_id {
                 sessions.insert(session_id);
             }
-            connection
-                .execute(
-                    "INSERT OR IGNORE INTO fence_debt (grant_id, recorded_at_ms) VALUES (?1, ?2)",
-                    params![record.grant.grant_id.get().as_bytes().as_slice(), moment],
-                )
-                .map_err(ControllerError::registry)?;
+            if record.is_active() {
+                // Debt only for authority that was live. Withdrawing a proposal nobody redeemed
+                // takes nothing away from anybody, so there is nothing to fence, and recording it
+                // would make an ordinary cancellation fence the host later.
+                connection
+                    .execute(
+                        "INSERT OR IGNORE INTO fence_debt (grant_id, recorded_at_ms)
+                         VALUES (?1, ?2)",
+                        params![record.grant.grant_id.get().as_bytes().as_slice(), moment],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
             revoked.push(record.grant.grant_id);
         }
         Ok(GrantRevocation {
@@ -932,9 +956,12 @@ impl GrantDirectory {
                     return Ok(ActionClaim::Answered { result });
                 }
                 // A claim with no result is somebody inside the effect. It is not a claim for
-                // ever: a mutation cannot outlive its own maximum lifetime, so a claim older than
-                // that belonged to an attempt that crashed or was cut off, and this caller takes
-                // it over rather than finding the identifier wedged.
+                // ever: a lease older than the longest lifetime a mutation may be admitted for
+                // belongs to an attempt that is no longer being awaited, and this caller takes it
+                // over rather than finding the identifier wedged. What the lease does **not**
+                // establish is that the earlier holder stopped running; an executor that woke up
+                // afterwards could still reach its effect, and the record it would write is
+                // refused because a completed receipt is never replaced.
                 let claimed = u64::try_from(claimed_at_ms).unwrap_or_default();
                 let leased = u64::try_from(leased_at_ms).unwrap_or_default();
                 let stale =
