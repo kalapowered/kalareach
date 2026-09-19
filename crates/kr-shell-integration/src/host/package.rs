@@ -135,40 +135,57 @@ impl ShellPackage {
     /// [`PackageSet::discover`] refuses a record whose paths say neither.
     fn own(&self, recorded: &Path) -> PathBuf {
         match self.inside(recorded) {
+            // Nothing inside the package: the package itself, which a module search path may name.
+            Some(tail) if tail.as_os_str().is_empty() => self.directory.clone(),
             Some(tail) => self.directory.join(tail),
             None => recorded.to_path_buf(),
         }
     }
 
     /// Returns where one recorded path sits inside the package, when it sits inside one.
+    ///
+    /// One root for the whole record, taken from the executable: every path a build recorded was
+    /// installed under the same directory, so stripping each one against a root of its own would
+    /// let two paths disagree about which installation they came from.
     fn inside(&self, recorded: &Path) -> Option<PathBuf> {
-        if let Ok(tail) = recorded.strip_prefix(&self.directory) {
-            return contained(tail).then(|| tail.to_path_buf());
-        }
-        if !recorded.is_absolute() {
-            return contained(recorded).then(|| recorded.to_path_buf());
-        }
-        inside_package(recorded, self.kind(), &self.manifest.identity)
+        let tail = if let Ok(tail) = recorded.strip_prefix(&self.directory) {
+            tail.to_path_buf()
+        } else if recorded.is_absolute() {
+            let root = package_root(
+                &self.manifest.shell.executable,
+                self.kind(),
+                &self.manifest.identity,
+            )?;
+            recorded.strip_prefix(&root).ok()?.to_path_buf()
+        } else {
+            recorded.to_path_buf()
+        };
+        within(&tail)
     }
 
     /// Returns whether every path this record names is one this package can answer for.
     ///
     /// A record that names something outside the package describes some other installation, and a
-    /// path that climbs out of the package with `..` names one too.
+    /// path that climbs out of the package with `..` names one too. A file has to be a file inside
+    /// the package; a module search path may be the package's own directory, which is a place
+    /// rather than a file.
     fn owns_its_paths(&self) -> bool {
-        !self.manifest.identity.is_empty()
-            && std::iter::once(self.manifest.shell.executable.as_path())
-                .chain(
-                    self.manifest
-                        .shell
-                        .modules
-                        .iter()
-                        .map(|module| Path::new(&module.search_path)),
-                )
-                .chain(std::iter::once(Path::new(
-                    &self.manifest.startup_entry.file,
-                )))
-                .all(|recorded| self.inside(recorded).is_some())
+        if self.manifest.identity.is_empty() {
+            return false;
+        }
+        let files = [
+            self.manifest.shell.executable.as_path(),
+            Path::new(&self.manifest.startup_entry.file),
+        ];
+        files.iter().all(|recorded| {
+            self.inside(recorded)
+                .is_some_and(|tail| !tail.as_os_str().is_empty())
+        }) && self
+            .manifest
+            .shell
+            .modules
+            .iter()
+            .all(|module| self.inside(Path::new(&module.search_path)).is_some())
     }
 
     /// Returns the guarded startup entry this package installs.
@@ -552,18 +569,17 @@ fn manifest_candidates(directory: &Path) -> Result<Vec<PathBuf>, PackageFault> {
     Ok(nested)
 }
 
-/// Returns where an installed path sits inside the package a build wrote it for.
+/// Returns the package directory an installed path belongs to.
 ///
 /// A build installs a package at `<root>/<shell>/<identity>`, so the ancestor whose own name is
-/// that identity and whose parent's name is that shell is the package's own directory, and what
-/// follows it is where the file sits inside it however many components deep: `bin/zsh`,
-/// `lib/zsh/5.9`, `startup/kr-zshrc.zsh`. The deepest such ancestor, because an installation root
-/// may hold a directory of either name and the one nearest the file is the one that installed it.
-fn inside_package(recorded: &Path, kind: ShellKind, identity: &str) -> Option<PathBuf> {
+/// that identity and whose parent's name is that shell is the package's own directory. The deepest
+/// such ancestor, because an installation root may hold a directory of either name and the one
+/// nearest the file is the one that installed it. The path may be that directory itself.
+fn package_root(recorded: &Path, kind: ShellKind, identity: &str) -> Option<PathBuf> {
     if identity.is_empty() {
         return None;
     }
-    let mut ancestor = recorded.parent();
+    let mut ancestor = Some(recorded);
     while let Some(directory) = ancestor {
         let named = directory.file_name().is_some_and(|name| name == identity);
         let under = directory
@@ -571,23 +587,29 @@ fn inside_package(recorded: &Path, kind: ShellKind, identity: &str) -> Option<Pa
             .and_then(Path::file_name)
             .is_some_and(|name| name == kind.as_str());
         if named && under {
-            let tail = recorded.strip_prefix(directory).ok()?;
-            return contained(tail).then(|| tail.to_path_buf());
+            return Some(directory.to_path_buf());
         }
         ancestor = directory.parent();
     }
     None
 }
 
-/// Returns whether a relative path stays inside whatever it is joined onto.
+/// Returns a suffix that stays inside whatever it is joined onto, with nothing redundant left in.
 ///
-/// Nothing empty, nothing rooted and nothing that climbs: a path with `..` in it names a place
-/// outside the package however it is joined.
-fn contained(tail: &Path) -> bool {
-    !tail.as_os_str().is_empty()
-        && tail
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
+/// Nothing rooted and nothing that climbs: a path with `..` in it names a place outside the
+/// package however it is joined. A leading `.` says nothing and is dropped. An empty result is the
+/// directory itself, which is a place rather than a file, and the caller decides whether that is
+/// an answer to the question it asked.
+fn within(tail: &Path) -> Option<PathBuf> {
+    let mut inside = PathBuf::new();
+    for component in tail.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => inside.push(part),
+            _ => return None,
+        }
+    }
+    Some(inside)
 }
 
 /// Returns the alternative name a shell's binary is installed under.
@@ -811,15 +833,80 @@ mod tests {
         }
 
         // And one this host can: the identity appears in the installation root as well, so a search
-        // that took the first component of that name would have kept the wrong tail.
+        // that took the first component of that name would have found the wrong directory.
         assert_eq!(
-            inside_package(
+            package_root(
                 Path::new("/opt/identity-1/shells/zsh/identity-1/bin/zsh"),
                 ShellKind::Zsh,
                 "identity-1"
             ),
-            Some(PathBuf::from("bin/zsh")),
+            Some(PathBuf::from("/opt/identity-1/shells/zsh/identity-1")),
             "the package's own directory is the one nearest the file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_path_in_one_record_is_taken_from_the_same_installation() {
+        // A package may hold a directory named as it is: `lib/zsh/<identity>` is a real layout.
+        // Each path answered on its own would then find a different root, and the module tree of a
+        // copied package would point at a directory that is not in it.
+        let original = tempfile::tempdir().expect("a directory");
+        let installed = original.path().join("zsh/identity-1");
+        let mut record = manifest(ShellKind::Zsh);
+        record.identity = "identity-1".to_owned();
+        record.shell.executable = installed.join("bin/zsh");
+        record.shell.modules = vec![
+            ModuleEntry {
+                name: "zsh/zle".to_owned(),
+                search_path: installed
+                    .join("lib/zsh/identity-1/modules")
+                    .display()
+                    .to_string(),
+                editor_abi: "zle-5.9".to_owned(),
+            },
+            // A module search path may be the package's own directory, which is a place rather
+            // than a file: it is not empty of meaning, only of components.
+            ModuleEntry {
+                name: "zsh/root".to_owned(),
+                search_path: installed.display().to_string(),
+                editor_abi: "zle-5.9".to_owned(),
+            },
+        ];
+        // A leading `.` says nothing, and a build that writes one is not writing a stray path.
+        record.startup_entry.file = "./startup/kr-zshrc.zsh".to_owned();
+
+        let copy = tempfile::tempdir().expect("a directory");
+        let there = copy.path().join("zsh/identity-1");
+        std::fs::create_dir_all(there.join("bin")).expect("creates the copy");
+        std::fs::write(there.join("bin/zsh"), b"#!/bin/sh\n").expect("writes the binary");
+        std::fs::write(
+            there.join(MANIFEST_BASENAME),
+            serde_json::to_string(&record).expect("encodes"),
+        )
+        .expect("writes the record");
+        std::fs::write(copy.path().join("zsh/current"), "identity-1").expect("names one");
+
+        let set = PackageSet::discover(copy.path()).expect("reads the copy");
+        let package = set.get(ShellKind::Zsh).expect("the copy");
+        let identity = package.identity();
+        assert_eq!(
+            identity.modules[0].search_path,
+            there
+                .join("lib/zsh/identity-1/modules")
+                .display()
+                .to_string(),
+            "the module tree is stripped against the root the executable named"
+        );
+        assert_eq!(
+            identity.modules[1].search_path,
+            there.display().to_string(),
+            "and a module directory that is the package itself is the copy's own"
+        );
+        assert_eq!(
+            package.startup_entry(),
+            there.join("startup/kr-zshrc.zsh"),
+            "a leading dot is not a place"
         );
     }
 
