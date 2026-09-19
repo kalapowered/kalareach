@@ -1057,12 +1057,21 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
         }
         match builder.create(path) {
             Ok(()) => {}
-            // Another process made it between the walk and here, which is not a failure: what this
-            // call wanted was for the directory to be there.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Another opener made it between the walk and here, which is not a failure: what this
+            // call wanted was for the directory to be there. Something that is *not* a directory
+            // under that name is a different matter, and it is not one to write a store into.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+                continue;
+            }
             Err(error) => return Err(error),
         }
         sync_directory(holder_of(path))?;
+    }
+    if !directory.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", directory.display()),
+        ));
     }
     #[cfg(unix)]
     {
@@ -1072,7 +1081,31 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         }
     }
+    flush_path_names(directory);
     Ok(())
+}
+
+/// Flushes the directory entry of every name on this path.
+///
+/// Creating the levels this call was missing is not enough. Another opener may have created one a
+/// moment ago and not yet flushed it, and a store that returned success under such a name would be
+/// a store whose own path a crash could lose. Flushing them all costs a handful of operations once
+/// per store, which is what opening one is.
+///
+/// A failure is not reported. An ancestor this call did not create belongs to whoever did, and a
+/// directory a caller cannot open for reading is a directory this store has no business failing
+/// over: the levels it made itself were flushed above, where a failure *is* reported.
+fn flush_path_names(directory: &Path) {
+    let mut level = directory;
+    while let Some(parent) = level.parent() {
+        if parent.as_os_str().is_empty() {
+            // A relative path of one component: the working directory holds that name.
+            let _ = sync_directory(Path::new("."));
+            return;
+        }
+        let _ = sync_directory(parent);
+        level = parent;
+    }
 }
 
 /// The directory one name lives in.
@@ -1429,6 +1462,37 @@ mod tests {
         assert_eq!(holder_of(Path::new("beside-me")), Path::new("."));
         assert_eq!(holder_of(Path::new("support/drafts")), Path::new("support"));
         assert_eq!(holder_of(&deep), deep.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_directory_is_refused_rather_than_written_into() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let occupied = directory.path().join("drafts");
+        std::fs::write(&occupied, b"not a directory").expect("a file in the way");
+        #[cfg(unix)]
+        let before = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(&occupied)
+                .expect("the file")
+                .permissions()
+                .mode()
+        };
+
+        let error = DraftStore::open(&occupied, device()).expect_err("a file is not a store");
+        assert!(error.to_string().contains("could not be used"), "{error}");
+        assert!(occupied.is_file(), "the file is still a file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let after = std::fs::metadata(&occupied)
+                .expect("the file")
+                .permissions()
+                .mode();
+            assert_eq!(
+                after, before,
+                "a file in the way had its permissions changed"
+            );
+        }
     }
 
     #[test]

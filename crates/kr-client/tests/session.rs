@@ -1806,17 +1806,27 @@ async fn restore_a_screen(
 
     // And there is a screen to draw.
     let screen = projection.screen().expect("a screen");
+    assert_eq!(screen.dimensions.rows.get(), PERF_ROWS);
+    assert_eq!(screen.dimensions.columns.get(), PERF_COLUMNS);
     let painted =
         kr_client::projection::paint::install(screen, Window::of(screen), Keyboard::EVERYTHING);
-    (started.elapsed(), painted.bytes.len())
+    let elapsed = started.elapsed();
+
+    // Every row of the screen is in what a terminal would be sent, which is what "usable state"
+    // means: not that bytes were produced, but that the screen is in them.
+    let drawn = String::from_utf8(painted.bytes).expect("the paint is text and escapes");
+    let row = "x".repeat(usize::try_from(PERF_COLUMNS).expect("a column count"));
+    (elapsed, drawn.matches(&row).count())
 }
 
 #[tokio::test]
 async fn a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget() {
     // KR-PERF-006: usable state within two seconds for a 120x40 screen, measured from where the
-    // transport returns. What is measured here is the client's own half: the round trip it makes,
-    // the retry policy that goes through, folding the screen in and painting it. What a host spends
-    // answering is the host's, and `scripts/performance.sh` is what measures the whole of it.
+    // transport returns. What is measured here is the client's own half against a host that answers
+    // at once: the round trip it makes, the retry policy that goes through, folding the screen in
+    // and painting every row of it. What a real host spends answering, and the attach that precedes
+    // a subscription, are not in this figure, so passing it is a necessary condition for the row
+    // rather than the row's own measurement.
     let client = side(2, false).await;
     let stream_id = StreamId::new("session:1").expect("a stream identifier");
 
@@ -1830,8 +1840,12 @@ async fn a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget() {
         Some(receiver),
     );
     let session = connect(&client, &first_host).await;
-    let (elapsed, drawn) = restore_a_screen(&session, &pushes, &stream_id).await;
-    assert!(drawn > 0, "the screen was painted");
+    let (elapsed, rows_drawn) = restore_a_screen(&session, &pushes, &stream_id).await;
+    assert_eq!(
+        u64::try_from(rows_drawn).expect("a row count"),
+        PERF_ROWS,
+        "every row of the screen is in what a terminal would be sent"
+    );
     assert!(
         elapsed < kr_client::retry::RECONNECT_BUDGET,
         "a restoration took {elapsed:?}, over the {:?} budget",
@@ -1853,8 +1867,8 @@ async fn a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget() {
         Some(receiver),
     );
     let session = connect(&client, &second_host).await;
-    let (with_retries, drawn) = restore_a_screen(&session, &pushes, &stream_id).await;
-    assert!(drawn > 0, "the screen was painted");
+    let (with_retries, rows_drawn) = restore_a_screen(&session, &pushes, &stream_id).await;
+    assert_eq!(u64::try_from(rows_drawn).expect("a row count"), PERF_ROWS);
     assert_eq!(
         script.reads.load(Ordering::Acquire),
         2,

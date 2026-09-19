@@ -47,11 +47,13 @@ The attempt count and the backoff are bounded so that retrying is not what makes
 Section 27 gives a reconnect two seconds to a usable screen, and a restoration is idempotent reads,
 which is exactly what this library retries. The most the delays can add to *one* read is 700
 milliseconds, which `a_retry_cannot_spend_a_reconnects_budget` holds them to; each read has its own
-budget, so a restoration that made several would have several. What a whole restoration costs is
-measured rather than argued: `a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget`
-goes from an available transport through the subscription to a painted 120x40 screen, once against
-a host that answers and once against one that refuses the read first, and holds both inside the two
-seconds.
+budget, so a restoration that made several would have several. What the client's own half of a
+restoration costs is measured rather than argued:
+`a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget` goes from an available
+transport through the subscription to a painted 120x40 screen, once against a host that answers at
+once and once against one that refuses the read first, and holds both inside the two seconds. It is
+a necessary condition for the row and not the row's own measurement: it leaves out the attach that
+precedes a subscription, and everything a real host spends answering.
 
 | Code | Step | What a person is offered |
 | --- | --- | --- |
