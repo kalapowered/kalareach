@@ -1678,8 +1678,21 @@ fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
     let path = directory.path().join("attention.db");
     {
         let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        // The producer vouched for the clock its record was stamped on, which is what lets the
+        // interval be measured against a later reading rather than started again.
         attention
-            .apply(&adapter_failed(1, 0), reading(0))
+            .apply(
+                &SourceEvent::proven(
+                    EventCursor::new(AttentionSource::Semantic, 1),
+                    TimestampMs::new(NOON),
+                    EventKind::AdapterFailed {
+                        plugin_id: PluginId::new("git").expect("an identifier"),
+                        session_id: Some(session(1)),
+                        detail: "the helper exited".to_owned(),
+                    },
+                ),
+                reading(0),
+            )
             .expect("the store records the decision");
         assert_eq!(
             whole_inbox(&attention).remove(0).level,
@@ -3335,26 +3348,122 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
 
 #[test]
 fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
+    // The moments are all noon-relative, so the wrong arithmetic would give an hour rather than a
+    // negative number that clamps to nought and passes for the wrong reason.
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(0, 1_000, false))
+        let mut attention = Attention::open(&path, HostReading::new(0, NOON, false))
             .expect("the feature store opens");
         attention
-            .apply(
-                &adapter_failed(1, 0),
-                HostReading::new(10_000, 1_000, false),
-            )
+            .apply(&adapter_failed(1, 0), HostReading::new(10_000, NOON, false))
             .expect("the store records the decision");
+        assert_eq!(whole_inbox(&attention)[0].level, AttentionLevel::Notable);
     }
-    let mut reopened = Attention::open(&path, HostReading::new(12_000, 3_603_000, true))
-        .expect("the feature store reopens");
+    let later = NOON + 3_602_000;
+    let mut reopened =
+        Attention::open(&path, HostReading::new(12_000, later, true)).expect("the store reopens");
     reopened
-        .tick(HostReading::new(12_000, 3_603_000, true))
+        .tick(HostReading::new(12_000, later, true))
         .expect("the store records the decision");
     assert_eq!(
         whole_inbox(&reopened)[0].level,
         AttentionLevel::Notable,
         "an adapter that failed two seconds ago has not been down for five minutes"
+    );
+    // And the escalation is late rather than lost.
+    reopened
+        .tick(HostReading::new(
+            12_000 + ADAPTER_ESCALATION_MS + 1,
+            later,
+            true,
+        ))
+        .expect("the store records the decision");
+    assert_eq!(whole_inbox(&reopened)[0].level, AttentionLevel::Urgent);
+}
+
+#[test]
+fn a_moment_no_producer_vouched_for_is_not_measured_against_this_host_s_proved_clock() {
+    // The event is consumed for the first time *after* the clock was corrected and proved. Its own
+    // moment was taken before that, by a producer that said nothing about its clock, so the two
+    // are not on one scale and the wait is measured inside the event instead.
+    let mut attention = engine();
+    attention
+        .apply(
+            &event(
+                AttentionSource::Questions,
+                1,
+                0,
+                EventKind::QuestionPending {
+                    question_id: question(9),
+                    session_id: session(1),
+                    verified: true,
+                    pending_since_ms: TimestampMs::new(NOON),
+                    summary: "which branch?".to_owned(),
+                },
+            ),
+            HostReading::new(12_000, NOON + 3_602_000, true),
+        )
+        .expect("the store records the decision");
+    let decided = attention
+        .tick(HostReading::new(12_000, NOON + 3_602_000, true))
+        .expect("the store records the decision");
+    assert!(
+        !raised(&decided).contains(&AttentionRule::InputIdleReminder),
+        "a wait nobody vouched for is not an hour: {decided:?}"
+    );
+
+    // A producer that *can* vouch for its own clock says so, and the wait counts from there.
+    let mut vouched = engine();
+    vouched
+        .apply(
+            &SourceEvent::proven(
+                EventCursor::new(AttentionSource::Questions, 1),
+                TimestampMs::new(NOON),
+                EventKind::QuestionPending {
+                    question_id: question(9),
+                    session_id: session(1),
+                    verified: true,
+                    pending_since_ms: TimestampMs::new(NOON),
+                    summary: "which branch?".to_owned(),
+                },
+            ),
+            HostReading::new(12_000, NOON + 3_602_000, true),
+        )
+        .expect("the store records the decision");
+    let owed = vouched
+        .tick(HostReading::new(12_000, NOON + 3_602_000, true))
+        .expect("the store records the decision");
+    assert!(
+        raised(&owed).contains(&AttentionRule::InputIdleReminder),
+        "and a wait the producer vouched for is measured from where it started: {owed:?}"
+    );
+}
+
+#[test]
+fn a_store_that_holds_state_and_has_lost_its_key_secret_is_refused() {
+    // Every key in it was derived under a secret this build cannot reproduce, so a resolution
+    // would look for an item under a name nothing there carries and the condition would stay
+    // outstanding for ever. Refusing says so; serving it would not.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&approval(1, 1_000, "req-1"), reading(0))
+            .expect("the store records the decision");
+    }
+    {
+        let connection = rusqlite::Connection::open(&path).expect("the store is a database");
+        connection
+            .execute("DELETE FROM attention_key_secret", [])
+            .expect("the row goes");
+    }
+    assert!(
+        matches!(
+            Attention::open(&path, reading(1_000)),
+            Err(kr_attention::Error::StoreUnreadable { .. })
+        ),
+        "a store that lost the secret its keys were derived under is refused"
     );
 }

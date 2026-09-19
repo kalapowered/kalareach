@@ -539,6 +539,12 @@ impl Attention {
 /// `verified` is whether the worker admitted the source that created the question, which is what
 /// section 25 means by a verified pending request. The label a caller gave itself is not part of
 /// it, and neither is anything the question's text says.
+///
+/// The event says nothing about the clock its moments were taken on, because the ledger records a
+/// moment without recording what could be proved about the clock at the time. The engine therefore
+/// measures the wait inside the event's own moments rather than against the clock it reads now,
+/// which makes a reminder late rather than immediate. A ledger that comes to record that evidence
+/// builds the event with `SourceEvent::proven` instead.
 #[must_use]
 pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEvent) -> SourceEvent {
     let kind = match event.kind {
@@ -577,6 +583,9 @@ pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEven
 /// A recorded side effect is by definition one that had no attachment to go to: section 8 sends it
 /// to the lease holder, and this record exists because there was none. That is why the notice says
 /// no lease was held, and why section 25 routes it through the owner's notification policy.
+///
+/// As with a question, the record carries a moment and no evidence about the clock that stamped
+/// it, so the event does not claim any.
 #[must_use]
 pub fn host_event(
     sequence: u64,

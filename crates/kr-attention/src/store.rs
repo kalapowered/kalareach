@@ -421,12 +421,18 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        // A store that has never been written has no secret and no state, and the fresh secret is
+        // the one it starts with. A store that holds state and has lost its secret is a different
+        // thing: every key in it was derived under one this build cannot reproduce, so a
+        // resolution would look for an item under a name nothing there carries, and the condition
+        // would stay outstanding for ever. That is refused rather than served.
         let keys = match secret {
             Some(bytes) => crate::key::KeySecret::from_bytes(
                 <[u8; crate::key::SECRET_BYTES]>::try_from(bytes.as_slice())
                     .map_err(|_| unreadable("key secret"))?,
             ),
-            None => crate::key::KeySecret::fresh(),
+            None if self.is_empty()? => crate::key::KeySecret::fresh(),
+            None => return Err(unreadable("key secret")),
         };
         let announcement: Option<i64> = self
             .connection
@@ -461,6 +467,25 @@ impl Store {
             summaries: self.load_summaries()?,
             visits: self.load_visits()?,
         })
+    }
+
+    /// Returns whether this store has never had any state written to it.
+    ///
+    /// Every table one write replaces is asked, because any row in any of them means the state was
+    /// written under a secret, a key derivation and a schema this build has to be able to read
+    /// back exactly.
+    fn is_empty(&self) -> Result<bool> {
+        for table in TABLES {
+            let held: i64 = self.connection.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+                [],
+                |row| row.get(0),
+            )?;
+            if held != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Replaces the stored state with `state`, in one transaction.

@@ -338,6 +338,7 @@ struct Raise {
     summary: String,
     routing: AttentionRouting,
     at_ms: TimestampMs,
+    at_proven: bool,
 }
 
 impl Engine {
@@ -812,6 +813,7 @@ impl Engine {
                     summary: summary.clone(),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
+                    at_proven: event.at_proven,
                 },
                 reading,
                 mode,
@@ -832,7 +834,7 @@ impl Engine {
                     // not admit is a claim rather than a request.
                     return Vec::new();
                 }
-                let waited = Self::waited(*pending_since_ms, event.at_ms, reading);
+                let waited = Self::waited(*pending_since_ms, event.at_ms, event.at_proven, reading);
                 self.bound_pending_inputs(*question_id);
                 self.pending_inputs.insert(
                     *question_id,
@@ -842,7 +844,7 @@ impl Engine {
                         pending_since_ms: *pending_since_ms,
                         waited: Elapsed::already(waited, reading),
                         reminded: false,
-                        anchor_wall_proven: reading.wall_proven,
+                        anchor_wall_proven: event.at_proven,
                     },
                 );
                 self.raise(
@@ -854,6 +856,7 @@ impl Engine {
                         summary: summary.clone(),
                         routing: AttentionRouting::OwnerPolicy,
                         at_ms: event.at_ms,
+                        at_proven: event.at_proven,
                     },
                     reading,
                     mode,
@@ -885,6 +888,7 @@ impl Engine {
                         summary: format!("{command} exited {exit_code}"),
                         routing: AttentionRouting::OwnerPolicy,
                         at_ms: event.at_ms,
+                        at_proven: event.at_proven,
                     },
                     reading,
                     mode,
@@ -904,6 +908,7 @@ impl Engine {
                     summary: summary.clone(),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
+                    at_proven: event.at_proven,
                 },
                 reading,
                 mode,
@@ -925,6 +930,7 @@ impl Engine {
                     summary: format!("{plugin_id}: {detail}"),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
+                    at_proven: event.at_proven,
                 },
                 reading,
                 mode,
@@ -941,6 +947,7 @@ impl Engine {
                     summary: detail.clone(),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
+                    at_proven: event.at_proven,
                 },
                 reading,
                 mode,
@@ -966,6 +973,7 @@ impl Engine {
                         summary,
                         routing,
                         at_ms: event.at_ms,
+                        at_proven: event.at_proven,
                     },
                     reading,
                     mode,
@@ -1003,11 +1011,19 @@ impl Engine {
 
     /// Returns how long a request has been pending at this reading.
     ///
-    /// The proven wall clock is preferred, because the delay between the host recording the event
-    /// and the engine consuming it is part of the wait. Without a proven clock the recorded moment
-    /// is all there is, which understates the wait rather than overstating it.
-    fn waited(since: TimestampMs, at_ms: TimestampMs, reading: HostReading) -> u64 {
-        if reading.wall_proven {
+    /// Measuring against the clock this host reads now counts the delay between the producer
+    /// recording the event and the engine consuming it, which is part of the wait. It is only
+    /// arithmetic anybody can trust when both ends were taken on a clock somebody could vouch for:
+    /// this reading, and the moment the event names. Where either cannot be vouched for, the wait
+    /// is measured inside the event's own moments, which are one producer's readings of one clock
+    /// whatever anyone could prove about it. That understates the wait rather than inventing one.
+    fn waited(
+        since: TimestampMs,
+        at_ms: TimestampMs,
+        at_proven: bool,
+        reading: HostReading,
+    ) -> u64 {
+        if reading.wall_proven && at_proven {
             reading.wall_ms.get().saturating_sub(since.get())
         } else {
             at_ms.get().saturating_sub(since.get())
@@ -1073,14 +1089,17 @@ impl Engine {
             first_seen_ms: raise.at_ms,
             last_seen_ms: raise.at_ms,
             notification: NotificationState::Pending,
-            anchor_wall_proven: reading.wall_proven,
+            anchor_wall_proven: raise.at_proven,
             last_notified_ms: None,
             announced_wall_proven: false,
             announced_level: None,
             announcements: 0,
             pending_handoff: None,
             uncertain: false,
-            age: Elapsed::already(Self::waited(raise.at_ms, raise.at_ms, reading), reading),
+            age: Elapsed::already(
+                Self::waited(raise.at_ms, raise.at_ms, raise.at_proven, reading),
+                reading,
+            ),
             since_notified: None,
             deferred: false,
         };
@@ -1307,6 +1326,9 @@ impl Engine {
                     summary,
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: reading.wall_ms,
+                    // The reminder is raised now, on the reading this host is holding, so its
+                    // anchor is exactly as vouched for as that reading is.
+                    at_proven: reading.wall_proven,
                 },
                 reading,
                 Mode::Live,

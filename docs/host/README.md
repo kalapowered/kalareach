@@ -1237,6 +1237,13 @@ Maintenance otherwise wakes at the earlier of its own cadence and the moment the
 timer is due, so a five-minute reminder is five minutes from the request rather than five minutes
 rounded up to the next time the host happened to look.
 
+Every interval the engine measures needs both of its ends on a clock somebody could vouch for: the
+reading it holds now, and the moment it is measuring from. An event says whether the producer could
+vouch for the clock that stamped it, and one that does not say is taken not to know, so the
+interval is measured inside the event's own moments or started again. Both answers make a reminder
+late; the arithmetic across two clocks that were never on one scale would make it immediate, and a
+reminder raised seconds after a request because a clock was corrected is the failure that matters.
+
 ### The rule set
 
 Eight rules, each with a stable identifier that outlives any change to the wording it produces.

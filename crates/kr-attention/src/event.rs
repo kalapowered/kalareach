@@ -195,17 +195,38 @@ pub struct SourceEvent {
     pub cursor: EventCursor,
     /// When the host recorded it.
     pub at_ms: TimestampMs,
+    /// Whether the clock that stamped [`SourceEvent::at_ms`] could be proved at the time.
+    ///
+    /// The engine measures an interval from a moment an event names - how long a request has been
+    /// pending, how long an adapter has been down - against the clock it reads now. Those two are
+    /// on the same scale only when both were taken on a clock somebody could vouch for, and the
+    /// producer is the only one that knows about its own. An event that does not say is taken not
+    /// to know, so the interval is measured inside the event's own moments instead, which
+    /// understates the wait rather than inventing one.
+    pub at_proven: bool,
     /// What it says.
     pub kind: EventKind,
 }
 
 impl SourceEvent {
-    /// Builds an event.
+    /// Builds an event whose recorded moment nobody has vouched for.
     #[must_use]
     pub const fn new(cursor: EventCursor, at_ms: TimestampMs, kind: EventKind) -> Self {
         Self {
             cursor,
             at_ms,
+            at_proven: false,
+            kind,
+        }
+    }
+
+    /// Builds an event whose recorded moment was taken on a clock the producer could prove.
+    #[must_use]
+    pub const fn proven(cursor: EventCursor, at_ms: TimestampMs, kind: EventKind) -> Self {
+        Self {
+            cursor,
+            at_ms,
+            at_proven: true,
             kind,
         }
     }
