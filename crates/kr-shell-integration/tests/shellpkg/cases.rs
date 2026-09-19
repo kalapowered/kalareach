@@ -543,7 +543,11 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             std::thread::sleep(Duration::from_millis(80));
         }
         session.clear_line();
-        assert!(session.alive(), "{} ended the shell", drive.exclusion.as_str());
+        assert!(
+            session.alive(),
+            "{} ended the shell",
+            drive.exclusion.as_str()
+        );
         driven.push(drive.exclusion);
     }
 
@@ -1041,10 +1045,7 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
 }
 
 /// Whether the reader raised the flag this wait is supposed to raise.
-fn pending_flag_is_set(
-    pending: &kr_protocol::root::PendingReaderInput,
-    flag: PendingFlag,
-) -> bool {
+fn pending_flag_is_set(pending: &kr_protocol::root::PendingReaderInput, flag: PendingFlag) -> bool {
     match flag {
         PendingFlag::MultikeySequence => pending.multikey_sequence,
         PendingFlag::ViMotion => pending.vi_motion,
@@ -1327,7 +1328,10 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
         return;
     };
     let Some(wait) = pending_wait(kind) else {
-        println!("skipped: {} has no key wait a takeover can end", kind.as_str());
+        println!(
+            "skipped: {} has no key wait a takeover can end",
+            kind.as_str()
+        );
         return;
     };
     let mut session = Session::start(&package);
@@ -1578,7 +1582,10 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
 /// KR-REQ-07.72: the person's own IGNORE_EOF setting is left as they set it.
 pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
     if dialect(kind).ignore_eof_on.is_none() {
-        println!("skipped: {} has no end-of-file setting of its own", kind.as_str());
+        println!(
+            "skipped: {} has no end-of-file setting of its own",
+            kind.as_str()
+        );
         return;
     }
     let Some(package) = Package::found(kind) else {
@@ -1594,7 +1601,10 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
             "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
         ),
         _ => {
-            println!("skipped: {} has no end-of-file setting of its own", kind.as_str());
+            println!(
+                "skipped: {} has no end-of-file setting of its own",
+                kind.as_str()
+            );
             return;
         }
     };

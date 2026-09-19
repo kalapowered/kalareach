@@ -114,15 +114,17 @@ pub fn child_probe(kind: ShellKind, executable: &Path) -> String {
 pub fn dialect(kind: ShellKind) -> Dialect {
     match kind {
         ShellKind::Zsh => Dialect {
-            bootstrap_probe:
-                "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
+            bootstrap_probe: "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
             bootstrap_gone: "kr-endpoint=[unset] kr-secret=[unset]",
             user_configuration_probe: "echo kr-config=$KR_TEST_USER_CONFIGURATION",
             ignore_eof_on: Some("setopt ignoreeof; echo kr-ready"),
             ignore_eof_report: Some(
                 "echo kr-ignoreeof=$([[ -o ignoreeof ]] && echo on || echo off)",
             ),
-            continuation: Some(("echo 'kr-continuation", "' >/dev/null; echo kr-continuation-ok")),
+            continuation: Some((
+                "echo 'kr-continuation",
+                "' >/dev/null; echo kr-continuation-ok",
+            )),
             veof_change: Some("stty eof ^G; echo kr-veof-set"),
             veof_disable: Some("stty eof undef; echo kr-veof-undef"),
             launch_expectation: "kr launch ok|$(echo substituted)|",
@@ -131,15 +133,17 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             answers_at_the_next_step: false,
         },
         ShellKind::Bash => Dialect {
-            bootstrap_probe:
-                "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
+            bootstrap_probe: "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
             bootstrap_gone: "kr-endpoint=[unset] kr-secret=[unset]",
             user_configuration_probe: "echo kr-config=$KR_TEST_USER_CONFIGURATION",
             ignore_eof_on: Some("set -o ignoreeof; echo kr-ready"),
             ignore_eof_report: Some(
                 "case $- in *o*) :;; esac; echo kr-ignoreeof=$(set -o | grep -q 'ignoreeof.*on' && echo on || echo off)",
             ),
-            continuation: Some(("echo 'kr-continuation", "' >/dev/null; echo kr-continuation-ok")),
+            continuation: Some((
+                "echo 'kr-continuation",
+                "' >/dev/null; echo kr-continuation-ok",
+            )),
             veof_change: Some("stty eof ^G; echo kr-veof-set"),
             veof_disable: Some("stty eof undef; echo kr-veof-undef"),
             launch_expectation: "kr launch ok|$(echo substituted)|",
@@ -148,8 +152,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             answers_at_the_next_step: false,
         },
         ShellKind::Fish => Dialect {
-            bootstrap_probe:
-                "echo \"kr-endpoint=[$(set -q KR_SHELL_BRIDGE; and echo $KR_SHELL_BRIDGE; or echo unset)] kr-secret=[$(set -q KR_SHELL_BRIDGE_SECRET; and echo $KR_SHELL_BRIDGE_SECRET; or echo unset)]\"",
+            bootstrap_probe: "echo \"kr-endpoint=[$(set -q KR_SHELL_BRIDGE; and echo $KR_SHELL_BRIDGE; or echo unset)] kr-secret=[$(set -q KR_SHELL_BRIDGE_SECRET; and echo $KR_SHELL_BRIDGE_SECRET; or echo unset)]\"",
             bootstrap_gone: "kr-endpoint=[unset] kr-secret=[unset]",
             user_configuration_probe: "echo kr-config=$KR_TEST_USER_CONFIGURATION",
             // This shell has no end-of-file setting of its own; the editor's own answer to the
@@ -256,14 +259,12 @@ pub fn exclusion_drives(kind: ShellKind) -> Vec<ExclusionDrive> {
                 prepare: None,
             },
         ],
-        ShellKind::PowerShell => vec![
-            ExclusionDrive {
-                exclusion: DetachExclusion::BufferNotEmpty,
-                setup: &[b"kr"],
-                teardown: &[],
-                prepare: None,
-            },
-        ],
+        ShellKind::PowerShell => vec![ExclusionDrive {
+            exclusion: DetachExclusion::BufferNotEmpty,
+            setup: &[b"kr"],
+            teardown: &[],
+            prepare: None,
+        }],
     }
 }
 

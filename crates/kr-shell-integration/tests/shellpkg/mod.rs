@@ -218,7 +218,8 @@ fn install_startup(package: &Package, home: &Path, prompt: &str) {
     let entry = startup_entry(package);
     match package.kind {
         ShellKind::Zsh => {
-            std::fs::write(home.join(".zshrc"), format!("{user}{entry}")).expect("the startup file");
+            std::fs::write(home.join(".zshrc"), format!("{user}{entry}"))
+                .expect("the startup file");
         }
         ShellKind::Bash => {
             std::fs::write(home.join(".bashrc"), format!("{user}{entry}"))
@@ -374,8 +375,9 @@ impl Session {
         let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
         let collected = Arc::clone(&output);
         let finished = Arc::clone(&stopped);
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(pty.master.take_writer().expect("a terminal writer")));
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+            pty.master.take_writer().expect("a terminal writer"),
+        ));
         let answering = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
