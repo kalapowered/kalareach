@@ -7,7 +7,7 @@
 //! makes a lost reply something to resolve rather than a reason to start a second shell.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_ipc::client::LocalClient;
@@ -4445,17 +4445,7 @@ impl Controller {
     /// shell rather than substituting another, and it happens before a reservation is recorded, so
     /// an unsupported request costs the caller an error rather than a session that closes itself.
     fn check_qualified_package(&self, requested: Option<&str>) -> Result<PathBuf> {
-        use kr_shell_integration::host::package::{PackageSet, default_package_root};
-
-        let installed = match self.shell_packages.as_ref() {
-            Some(root) => PackageSet::discover(root),
-            None => PackageSet::installed(&default_package_root()),
-        }
-        .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))?;
-        installed
-            .select(requested)
-            .map(|package| package.directory.clone())
-            .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))
+        qualified_package(self.shell_packages.as_deref(), requested)
     }
 
     /// Reserves a session and starts its worker.
@@ -4494,8 +4484,23 @@ impl Controller {
         // a caller on the network reaches it directly. The answer is worked out here, before the
         // registry is locked, because finding a package reads directories and opens files and a
         // filesystem that answers slowly must not hold up every other request in this environment.
-        let qualified = (create.shell_mode == kr_protocol::session::ShellMode::Managed)
-            .then(|| self.check_qualified_package(create.shell.0.as_deref()));
+        // Finding a package reads directories and opens files, which is work for a thread that may
+        // block: a package root on a filesystem that has stopped answering would otherwise occupy
+        // one of the runtime's own threads until the platform gave up on it.
+        let qualified = match create.shell_mode {
+            kr_protocol::session::ShellMode::Managed => {
+                let root = self.shell_packages.clone();
+                let requested = create.shell.0.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        qualified_package(root.as_deref(), requested.as_deref())
+                    })
+                    .await
+                    .map_err(|error| ControllerError::supervision(error.to_string()))?,
+                )
+            }
+            kr_protocol::session::ShellMode::NativeCompat => None,
+        };
         let admission = {
             let mut registry = self.registry.lock().await;
             // The token is looked at under the same lock the reservation is taken under, and the
@@ -5843,6 +5848,28 @@ pub struct ControllerSetup {
     pub terminal: Box<dyn crate::supervision::TerminalPresenter>,
 }
 
+/// Resolves the qualified package a create request selects, against one package root.
+///
+/// Free of the controller on purpose: it reads the filesystem, so it runs on a thread that may
+/// block rather than on the runtime this daemon serves its clients on.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::ShellIntegrationUnsupported`] naming the shell, never a substitution.
+fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<PathBuf> {
+    use kr_shell_integration::host::package::{PackageSet, default_package_root};
+
+    let installed = match root {
+        Some(root) => PackageSet::discover(root),
+        None => PackageSet::installed(&default_package_root()),
+    }
+    .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))?;
+    installed
+        .select(requested)
+        .map(|package| package.directory.clone())
+        .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))
+}
+
 /// Reads the create request a reservation recorded.
 ///
 /// A reservation outlives the request that made it: its row is written before the worker starts
@@ -6910,18 +6937,116 @@ mod a_create_that_launches_nothing {
         looking.abort();
     }
 
+    /// A worker's own report and a look at *its* reservation do not overlap.
+    ///
+    /// The hold is per reservation, and the point of it is this: a challenge presents a generation
+    /// token, and one presented while that reservation's own report is being published fences the
+    /// connection the daemon has just opened. The two therefore take turns, and which of them goes
+    /// first does not matter as long as neither is inside the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_report_waits_for_a_look_at_its_own_reservation() {
+        use kr_crypto::keys::AuthorisationKeyPair;
+        use kr_ipc::endpoint::Listener;
+
+        let (temp, controller, _asked) = daemon().await;
+        let environment = temp.environment();
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+
+        // One reservation, whose worker accepts a connection and answers nothing. A look at it
+        // therefore stays inside its challenge for as long as this test needs.
+        let reservation = seed_claim(&controller, &actor_id).await;
+        let endpoint = environment
+            .worker_endpoint(reservation.display_number)
+            .expect("an endpoint");
+        let _listener = Listener::bind(&endpoint).expect("binds the silent worker");
+
+        let keys = AuthorisationKeyPair::generate().expect("a key");
+        let process = kr_ipc::identity::current_process_start_identity().expect("this process");
+        let claim = kr_protocol::worker::WorkerRendezvous {
+            reservation_id: kr_protocol::worker::ReservationId::new(
+                reservation.reservation_id.get(),
+            ),
+            session_id: reservation.session_id,
+            worker_public_key: *keys.public(),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            process_start_identity: process.clone(),
+            signature: kr_crypto::sign::sign_elements(&keys, "kr-test/record-ready", Vec::new())
+                .expect("a signature"),
+        };
+        let report = kr_protocol::worker::WorkerReady {
+            session_id: reservation.session_id,
+            endpoint: endpoint.as_text(),
+            root_process: process,
+            shell_path: "/bin/cat".to_owned(),
+            dimensions: kr_protocol::session::Dimensions::new(80, 24),
+        };
+
+        // The look starts first and is inside this reservation's challenge.
+        let looking = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.recover_claims().await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!looking.is_finished(), "the look is inside its challenge");
+
+        // The report is about the same reservation, so it waits rather than publishing underneath
+        // a challenge that is still in flight.
+        let held = tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.record_ready(reservation.reservation_id, &claim, &report),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "a report does not publish while a look at its own reservation is in flight"
+        );
+        assert!(
+            controller
+                .directory
+                .lock()
+                .await
+                .get(reservation.session_id)
+                .is_none(),
+            "and nothing of it reached the directory"
+        );
+
+        // The look ends, and the report goes through on its own.
+        looking.abort();
+        let _ = looking.await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            controller.record_ready(reservation.reservation_id, &claim, &report),
+        )
+        .await
+        .expect("the report goes through once the look has let go")
+        .expect("records the worker");
+        assert!(
+            controller
+                .directory
+                .lock()
+                .await
+                .get(reservation.session_id)
+                .is_some(),
+            "and the session it published is there"
+        );
+    }
+
     /// Records a reservation in the phase a worker's claim leaves it in.
     async fn seed_claim(
         controller: &Controller,
         actor_id: &kr_protocol::ids::ActorId,
     ) -> crate::registry::Reservation {
         let mut registry = controller.registry.lock().await;
+        // A reservation records the create request it was made for, because that is what a later
+        // launch and a later publication both read the session's own context out of.
+        let intent = kr_cbor::to_canonical_vec(&create_params(controller.paths.environment_id()))
+            .expect("encodes");
         let admission = registry
             .reserve(
                 actor_id,
                 kr_ipc::new_uuid(),
                 kr_protocol::scalars::Digest256::from_bytes([0x3c; 32]),
-                b"an intent",
+                &intent,
                 kr_ipc::now_ms(),
             )
             .expect("reserves");

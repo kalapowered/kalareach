@@ -989,6 +989,203 @@ async fn a_gesture_with_a_stale_fence_is_refused_rather_than_becoming_an_end_of_
 }
 
 // --------------------------------------------------------------------------------------------
+// KR-REQ-07.22, KR-REQ-07.24: a bridge that closes only the side it reads from.
+// --------------------------------------------------------------------------------------------
+
+/// KR-REQ-07.22, KR-REQ-07.24: the loss is reported when the peer half-closes the connection.
+///
+/// A peer can close the side it reads from and leave the side it writes to open. The worker's
+/// writes then fail while its read waits for a frame that is never coming, and nothing else would
+/// report the loss. The condition is produced here rather than described: the bridge reaches the
+/// worker through a relay of this test's own, which forwards bytes in both directions and, when
+/// the test says so, shuts down the side it reads the worker's frames on.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_closes_only_what_it_reads_from_is_reported_as_a_lost_bridge() {
+    use std::os::fd::AsFd as _;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let config = configuration(&temp, ShellMode::Managed);
+    let session_id = config.session_id;
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let host_endpoint = HostEndpoint::open_for_session(
+        environment.runtime_root(),
+        environment.runtime_dir(),
+        session_id,
+    )
+    .expect("binds the bridge");
+    let worker_address = host_endpoint.address().clone();
+    let secret = host_endpoint.secret().clone();
+
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    session.install_fence(FenceDriver::new(
+        session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::new(SystemContinuousClock::new()),
+    ));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
+    let bridge_task = tokio::spawn(
+        kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            host_endpoint,
+            WorkerExpectation {
+                session_id,
+                root_process: process.clone(),
+                supported_editor_abis: vec!["zle-5.9".to_owned()],
+                supported_integration_versions: vec!["1".to_owned()],
+                launched_package: None,
+                already_registered: false,
+                gesture: EofGesture::default(),
+            },
+        )
+        .serve(),
+    );
+
+    // The relay sits between the bridge and the worker, in the same owner-only runtime directory.
+    // It parses nothing: what reaches the worker is exactly what the bridge sent.
+    let relay_path = environment.runtime_dir().join("relay");
+    let relay = tokio::net::UnixListener::bind(&relay_path).expect("binds the relay");
+    let (half_close, halved) = tokio::sync::oneshot::channel::<()>();
+    let worker_path = worker_address.path.clone();
+    let relaying = tokio::spawn(async move {
+        let (inbound, _peer) = relay.accept().await.expect("the bridge connects");
+        let outbound = tokio::net::UnixStream::connect(&worker_path)
+            .await
+            .expect("the relay reaches the worker");
+        let inbound = Arc::new(inbound);
+        let outbound = Arc::new(outbound);
+        // Both directions are copied byte for byte. Nothing here parses a frame: what reaches the
+        // worker is exactly what the bridge sent, and the other way round.
+        let forward = copy(Arc::clone(&inbound), Arc::clone(&outbound));
+        let back = copy(Arc::clone(&outbound), Arc::clone(&inbound));
+        let shut = {
+            let outbound = Arc::clone(&outbound);
+            async move {
+                if halved.await.is_ok() {
+                    // The half-close: the relay stops reading what the worker writes and keeps
+                    // its own write side open. This is the condition, produced on a real socket.
+                    // A duplicate of the descriptor shuts down the socket both name.
+                    if let Ok(duplicate) = outbound.as_fd().try_clone_to_owned() {
+                        let socket = std::os::unix::net::UnixStream::from(duplicate);
+                        let _ = socket.shutdown(std::net::Shutdown::Read);
+                    }
+                }
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            () = forward => {}
+            () = back => {}
+            () = shut => {}
+        }
+    });
+
+    // The bridge registers through the relay. Its proof is taken over the endpoint the worker
+    // owns, which is what the worker rebuilds the transcript from; the path it dials is the
+    // relay's.
+    let hello = qualified_hello(&reference(), session_id, &worker_address, process, &secret)
+        .expect("a hello");
+    let relay_address = kr_shell_integration::contract::transport::BridgeEndpoint::unix(
+        relay_path.display().to_string(),
+    );
+    let (mut bridge, outcome) =
+        tokio::time::timeout(SOON, ScriptedBridge::connect(&relay_address, &hello))
+            .await
+            .expect("the worker answered")
+            .expect("connects");
+    assert!(
+        matches!(outcome, HandshakeOutcome::Accepted(_)),
+        "a qualified root shell registers through the relay: {outcome:?}"
+    );
+    bridge
+        .send_event(BridgeEvent::HooksActivated(HooksActivated {
+            session_id,
+            prompt_generation: PromptGeneration::new(1),
+        }))
+        .await
+        .expect("reports");
+    tokio::time::timeout(SOON, async {
+        loop {
+            if wired_ready(&runtime) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the integration qualified");
+
+    // Now the peer closes only what it reads from. The worker goes on being told things, so it
+    // goes on answering, and its answers are what find the closed half.
+    half_close.send(()).expect("the relay is listening");
+    let lost = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if !wired_ready(&runtime) {
+                return;
+            }
+            let _ = bridge.send_event(idle(session_id, 1, 1)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        lost.is_ok(),
+        "a peer that closed the side it reads from is reported as a lost bridge rather than \
+         leaving the read waiting for a frame that is never coming"
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+    relaying.abort();
+    bridge_task.abort();
+}
+
+/// Copies every byte one socket receives into another, until either end stops.
+#[cfg(unix)]
+async fn copy(from: Arc<tokio::net::UnixStream>, to: Arc<tokio::net::UnixStream>) {
+    let mut buffer = vec![0_u8; 8 * 1024];
+    loop {
+        if from.readable().await.is_err() {
+            return;
+        }
+        let read = match from.try_read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => return,
+        };
+        let mut written = 0;
+        while written < read {
+            if to.writable().await.is_err() {
+                return;
+            }
+            match to.try_write(&buffer[written..read]) {
+                Ok(0) => return,
+                Ok(sent) => written += sent,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+/// Returns whether this session's integration is registered and reporting ready.
+fn wired_ready(runtime: &Arc<SessionRuntime>) -> bool {
+    runtime
+        .session()
+        .fence()
+        .is_some_and(|driver| driver.phase().reports_ready())
+}
+
+// --------------------------------------------------------------------------------------------
 // KR-REQ-07.16, KR-REQ-07.17, KR-REQ-07.44: a real qualified package, launched by this host.
 // --------------------------------------------------------------------------------------------
 
