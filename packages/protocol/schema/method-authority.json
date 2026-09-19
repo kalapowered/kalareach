@@ -4136,6 +4136,14 @@
         {
           "authority": "voice_grant",
           "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "voice.use"
+            }
+          },
+          "when": "always"
         }
       ],
       "resource_selectors": [
@@ -4161,6 +4169,14 @@
       "required_rights": [
         {
           "authority": "voice_grant",
+          "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "voice.use"
+            }
+          },
           "when": "always"
         }
       ],
@@ -4223,6 +4239,14 @@
         {
           "authority": "voice_grant",
           "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "voice.use"
+            }
+          },
+          "when": "always"
         }
       ],
       "resource_selectors": [
@@ -4248,6 +4272,14 @@
       "required_rights": [
         {
           "authority": "voice_grant",
+          "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "voice.use"
+            }
+          },
           "when": "always"
         },
         {

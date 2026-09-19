@@ -489,6 +489,7 @@ fn the_action_vocabulary_is_the_closed_section_10_set() {
         "session.share",
         "automation.manage",
         "host.manage",
+        "voice.use",
     ];
     let actual: Vec<&str> = ActionRight::ALL
         .iter()

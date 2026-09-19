@@ -92,6 +92,8 @@ action_rights! {
         "Install, enable, pause and run automation definitions.";
     HostManage => "host.manage",
         "Change host configuration: devices, catalogues, plugins and installation state.";
+    VoiceUse => "voice.use",
+        "Hold a voice session on this host, delegate through it and read its selected context.";
 }
 
 /// Ordered by the wire string, so a set of rights encodes in an order a reader can verify from the
@@ -343,7 +345,7 @@ mod tests {
 
     /// Section 10 lists the vocabulary. This is that list, in the section's own order, so a right
     /// added or renamed has to be reconciled with the specification rather than with this file.
-    const SECTION_TEN: [&str; 21] = [
+    const SECTION_TEN: [&str; 22] = [
         "session.view",
         "terminal.input",
         "terminal.geometry",
@@ -365,6 +367,7 @@ mod tests {
         "session.share",
         "automation.manage",
         "host.manage",
+        "voice.use",
     ];
 
     #[test]

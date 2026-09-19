@@ -340,6 +340,7 @@ export type ActionRight =
   | 'session.share'
   | 'automation.manage'
   | 'host.manage'
+  | 'voice.use'
 /**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
@@ -677,6 +678,14 @@ export type StreamCursor = string
  * The name of one event stream.
  */
 export type StreamId = string
+/**
+ * An opaque provider delegation identifier. Correlation data, never authority.
+ */
+export type VoiceDelegationId = string
+/**
+ * One voice session, independent of the terminal sessions it may reach.
+ */
+export type VoiceSessionId = string
 /**
  * One automation definition.
  */
@@ -1106,6 +1115,42 @@ export type NetworkHint = string
  * One revision of one synchronised object. A fresh 128-bit value per accepted write.
  */
 export type SyncRevisionId = string
+/**
+ * A class of content the default context excludes.
+ */
+export type VoiceContextClass =
+  'file_contents' | 'environment_variables' | 'terminal_scrollback' | 'attachment_bytes'
+/**
+ * One thing a voice session may ask the host to do.
+ *
+ * Section 15 ¶13 divides these three ways, and the divisions are the methods on this type rather
+ * than rules restated at each call site:
+ *
+ * * the default grant permits session navigation, status queries, briefing and prompt
+ *   composition, and nothing else ([`Self::in_default_scope`]);
+ * * submitting a prompt requires a clear spoken confirmation naming the destination session
+ *   ([`Self::needs_spoken_destination`]), and an approval decision requires the verified
+ *   request's details and an explicit answer ([`Self::needs_verified_request`]);
+ * * session closure, grant changes, arbitrary shell input, diff application and external
+ *   delivery require a confirmation on an unlocked screen ([`Self::needs_unlocked_screen`]).
+ *
+ * [`Self::required_right`] is the other half: every voice action names the ordinary right the
+ * host already checks for the same effect, so a voice grant can never reach an effect the device
+ * could not reach by typing.
+ */
+export type VoiceAction =
+  | 'navigate'
+  | 'status'
+  | 'brief'
+  | 'compose_prompt'
+  | 'submit_prompt'
+  | 'answer_approval'
+  | 'cancel_turn'
+  | 'close_session'
+  | 'change_grant'
+  | 'shell_input'
+  | 'apply_diff'
+  | 'deliver_externally'
 
 /**
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
@@ -1294,6 +1339,8 @@ export interface KalaReachProtocol {
     stream_cursor?: StreamCursor
     stream_id?: StreamId
     transfer_id?: TransferId
+    voice_delegation_id?: VoiceDelegationId
+    voice_session_id?: VoiceSessionId
     workflow_id?: WorkflowId
     workflow_run_id?: WorkflowRunId
     workspace_id?: WorkspaceId
@@ -1462,6 +1509,23 @@ export interface KalaReachProtocol {
   visit_acknowledge_result?: VisitAcknowledgeResult
   visit_changed_params?: VisitChangedParams
   visit_changed_result?: VisitChangedResult
+  voice_action_plan?: VoiceActionPlan
+  voice_confirmation_proof?: VoiceConfirmationProof
+  voice_confirmation_request?: VoiceConfirmationRequest1
+  voice_context_params?: VoiceContextParams
+  voice_context_result?: VoiceContextResult
+  voice_context_selection?: VoiceContextSelection1
+  voice_delegate_params?: VoiceDelegateParams
+  voice_delegate_result?: VoiceDelegateResult
+  voice_grant_params?: VoiceGrantParams
+  voice_grant_result?: VoiceGrantResult
+  voice_grant_statement?: VoiceGrantStatement1
+  voice_instructions?: VoiceInstructions
+  voice_session_descriptor?: VoiceSessionDescriptor
+  voice_start_params?: VoiceStartParams
+  voice_start_result?: VoiceStartResult
+  voice_stop_params?: VoiceStopParams
+  voice_stop_result?: VoiceStopResult
   worker_descriptor?: WorkerDescriptor
   worker_launch_spec?: WorkerLaunchSpec
   worker_ready?: WorkerReady
@@ -7728,6 +7792,7 @@ export interface RequiredRight {
             | 'session.share'
             | 'automation.manage'
             | 'host.manage'
+            | 'voice.use'
         }
       }
     | 'resource_owner'
@@ -14893,6 +14958,849 @@ export interface VisitChangedResult {
    * The log views this actor retained, with any gap retention left in them.
    */
   views: RetainedLogView[]
+}
+/**
+ * What a voice action is hashed over, so one confirmation authorises one action.
+ *
+ * The digest is built from the plan rather than from the challenge: a challenge that carried the
+ * only copy of what was agreed to would be a challenge an attacker could rewrite.
+ */
+export interface VoiceActionPlan {
+  /**
+   * The class of action.
+   */
+  action:
+    | 'navigate'
+    | 'status'
+    | 'brief'
+    | 'compose_prompt'
+    | 'submit_prompt'
+    | 'answer_approval'
+    | 'cancel_turn'
+    | 'close_session'
+    | 'change_grant'
+    | 'shell_input'
+    | 'apply_diff'
+    | 'deliver_externally'
+  /**
+   * The delegation it was interpreted from, when a delegation caused it.
+   */
+  delegation_id: VoiceDelegationId | null
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  payload_digest: string
+  /**
+   * The session it acts on, when it acts on one.
+   */
+  session_id: SessionId | null
+  /**
+   * The voice session proposing it.
+   */
+  voice_session_id: string
+}
+/**
+ * The paired device's answer to a voice confirmation challenge.
+ *
+ * The ceremony that produces it is the native client's: device-owner authentication on an
+ * unlocked screen. What the host verifies is this object, and a model statement that the user
+ * agreed to something cannot produce one.
+ */
+export interface VoiceConfirmationProof {
+  request: VoiceConfirmationRequest
+  /**
+   * The Ed25519 signature over `CBOR(["kr-voice/confirm/1", request])`.
+   */
+  signature: string
+  /**
+   * The key identifier of the device identity key that produced it.
+   */
+  signer_key_id: string
+}
+/**
+ * The challenge this proof answers, byte for byte.
+ */
+export interface VoiceConfirmationRequest {
+  /**
+   * The class of action being confirmed.
+   */
+  action:
+    | 'navigate'
+    | 'status'
+    | 'brief'
+    | 'compose_prompt'
+    | 'submit_prompt'
+    | 'answer_approval'
+    | 'cancel_turn'
+    | 'close_session'
+    | 'change_grant'
+    | 'shell_input'
+    | 'apply_diff'
+    | 'deliver_externally'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+  /**
+   * The voice session the action belongs to.
+   */
+  voice_session_id: string
+}
+/**
+ * A host-issued challenge for one voice action that needs an unlocked screen.
+ *
+ * This is not a [`SensitiveAction`](crate::pairing::SensitiveAction). The owner-confirmation
+ * ceremony of section 10 confirms a change to persistent authority; this confirms one action of
+ * one voice session, and binding it to the exact action hash and the current request is what
+ * stops a confirmation for one action authorising another.
+ *
+ * Everything the host relies on is inside the signed bytes. A field beside an unsigned signature
+ * would be the signer's unauthenticated claim.
+ */
+export interface VoiceConfirmationRequest1 {
+  /**
+   * The class of action being confirmed.
+   */
+  action:
+    | 'navigate'
+    | 'status'
+    | 'brief'
+    | 'compose_prompt'
+    | 'submit_prompt'
+    | 'answer_approval'
+    | 'cancel_turn'
+    | 'close_session'
+    | 'change_grant'
+    | 'shell_input'
+    | 'apply_diff'
+    | 'deliver_externally'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+  /**
+   * The voice session the action belongs to.
+   */
+  voice_session_id: string
+}
+/**
+ * Parameters of `voice.context`.
+ */
+export interface VoiceContextParams {
+  /**
+   * The delegation this context belongs to, or null for context that belongs to the call.
+   */
+  delegation_id: VoiceDelegationId | null
+  /**
+   * Content classes the person has selected on top of the default.
+   *
+   * Section 15 ¶12 excludes file contents, environment variables, raw terminal scrollback and
+   * attachment bytes unless the user selects them, so selecting one is a field rather than a
+   * setting somewhere else.
+   */
+  selected: VoiceContextClass[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The voice session asking.
+   */
+  voice_session_id: string
+}
+/**
+ * The result of `voice.context`.
+ *
+ * Section 15 ¶9: selected context and host results return from the paired client to the managed
+ * broker as bounded context requests. This is what the host hands back to the paired client; the
+ * host never sends it to the broker itself.
+ */
+export interface VoiceContextResult {
+  /**
+   * What the person is told before a call about what is sent and who can read it.
+   */
+  disclosure: string[]
+  provenance: VoiceContextProvenance
+  selection: VoiceContextSelection
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The voice session it was selected for.
+   */
+  voice_session_id: string
+  /**
+   * What the grant's history bound kept out, so a gap is visible rather than silent.
+   */
+  withheld: VoiceWithheld[]
+}
+/**
+ * The interval and resources the selection was built from.
+ *
+ * Section 10: derived data identifies its source interval and resources.
+ */
+export interface VoiceContextProvenance {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  from_ms: string
+  /**
+   * The resources read, as the host names them.
+   */
+  resources: string[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  to_ms: string
+}
+/**
+ * What the coordinator selected, as project text.
+ */
+export interface VoiceContextSelection {
+  /**
+   * The active application.
+   */
+  active_application: string
+  /**
+   * Summaries of the decisions waiting on a person.
+   */
+  pending_decisions: string[]
+  /**
+   * The last semantic messages, oldest first, at most
+   * [`VOICE_CONTEXT_MESSAGE_COUNT`] of them.
+   */
+  recent_messages: string[]
+  /**
+   * How many secret-looking runs were replaced.
+   *
+   * Section 15 ¶12: stripping configured secret patterns is a secondary measure. A count above
+   * zero says something was replaced; a count of zero says nothing was matched, and neither says
+   * the remainder holds no secrets.
+   */
+  secrets_stripped: number
+  /**
+   * Content classes the person selected, with what each contributed.
+   */
+  selected: VoiceSelectedContent[]
+  /**
+   * The session's description.
+   */
+  session_description: string
+  /**
+   * What stripping does and does not establish, carried with every selection.
+   */
+  stripping_note: string
+  /**
+   * Text tokens the selection counts against [`VOICE_CONTEXT_TOKEN_CAP`].
+   */
+  text_tokens: number
+  /**
+   * True when the cap cut the selection short.
+   */
+  truncated: boolean
+  /**
+   * The current working directory.
+   */
+  working_directory: string
+}
+/**
+ * One class of content the person selected, and what it contributed.
+ */
+export interface VoiceSelectedContent {
+  /**
+   * A class of content the default context excludes.
+   */
+  class: 'file_contents' | 'environment_variables' | 'terminal_scrollback' | 'attachment_bytes'
+  /**
+   * The text it contributed, already filtered, capped and stripped.
+   */
+  text: string
+}
+/**
+ * A run of content the history filter kept out of a selection.
+ */
+export interface VoiceWithheld {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * Why it was kept out.
+   */
+  reason: string
+}
+/**
+ * The default context of section 15 ¶12, bounded and separated from coordinator instructions.
+ *
+ * Every field here is **project text**: data the coordinator submits, never instructions it
+ * follows. The separation is in the types rather than in a comment — nothing in this structure
+ * can become an instruction, because the instruction side is [`VoiceInstructions`] and the two
+ * never share a field.
+ */
+export interface VoiceContextSelection1 {
+  /**
+   * The active application.
+   */
+  active_application: string
+  /**
+   * Summaries of the decisions waiting on a person.
+   */
+  pending_decisions: string[]
+  /**
+   * The last semantic messages, oldest first, at most
+   * [`VOICE_CONTEXT_MESSAGE_COUNT`] of them.
+   */
+  recent_messages: string[]
+  /**
+   * How many secret-looking runs were replaced.
+   *
+   * Section 15 ¶12: stripping configured secret patterns is a secondary measure. A count above
+   * zero says something was replaced; a count of zero says nothing was matched, and neither says
+   * the remainder holds no secrets.
+   */
+  secrets_stripped: number
+  /**
+   * Content classes the person selected, with what each contributed.
+   */
+  selected: VoiceSelectedContent[]
+  /**
+   * The session's description.
+   */
+  session_description: string
+  /**
+   * What stripping does and does not establish, carried with every selection.
+   */
+  stripping_note: string
+  /**
+   * Text tokens the selection counts against [`VOICE_CONTEXT_TOKEN_CAP`].
+   */
+  text_tokens: number
+  /**
+   * True when the cap cut the selection short.
+   */
+  truncated: boolean
+  /**
+   * The current working directory.
+   */
+  working_directory: string
+}
+/**
+ * Parameters of `voice.delegate`.
+ *
+ * Section 15 ¶7: the delegation event supplies an identifier and a timeline offset, not task
+ * text. There is deliberately no field for what the model said the user wants; the coordinator
+ * uses the accumulated transcripts and current host state.
+ */
+export interface VoiceDelegateParams {
+  /**
+   * The action the device asks the coordinator to propose.
+   */
+  action:
+    | 'navigate'
+    | 'status'
+    | 'brief'
+    | 'compose_prompt'
+    | 'submit_prompt'
+    | 'answer_approval'
+    | 'cancel_turn'
+    | 'close_session'
+    | 'change_grant'
+    | 'shell_input'
+    | 'apply_diff'
+    | 'deliver_externally'
+  /**
+   * The approval the answer belongs to, when the action answers one.
+   */
+  approval: VerifiedApprovalAnswer | null
+  /**
+   * The confirmation from the device's unlocked screen, when the action needs one.
+   */
+  confirmation: VoiceConfirmationProof | null
+  /**
+   * An opaque provider delegation identifier. Correlation data, never authority.
+   */
+  delegation_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  offset_ms: string
+  /**
+   * The session it acts on, when it acts on one.
+   */
+  session_id: SessionId | null
+  /**
+   * The spoken confirmation naming the destination session, when the action needs one.
+   */
+  spoken_destination: SpokenDestination | null
+  /**
+   * The turn being cancelled, when the action cancels one.
+   */
+  turn_id: AgentTurnId | null
+  /**
+   * The voice session the delegation belongs to.
+   */
+  voice_session_id: string
+}
+/**
+ * An approval answer, with the details of the request it answers.
+ *
+ * Section 15 ¶13: an approval decision requires the verified request's details and an explicit
+ * answer. The host compares the details against the approval it holds, so a model that invented
+ * them is refused rather than believed.
+ */
+export interface VerifiedApprovalAnswer {
+  /**
+   * An upstream approval request identifier. Opaque to KalaReach.
+   */
+  approval_request_id: string
+  /**
+   * The explicit answer. Nothing is inferred from a transcript.
+   */
+  approved: boolean
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  details_digest: string
+}
+/**
+ * A spoken confirmation that names the destination session.
+ *
+ * Section 15 ¶13 requires the confirmation to name the destination, so the host checks the name
+ * against the session it is about to submit to rather than accepting that one was given.
+ */
+export interface SpokenDestination {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The words the speaker used, as the transcript recorded them. Data, never authority.
+   */
+  spoken_text: string
+}
+/**
+ * The result of `voice.delegate`.
+ */
+export interface VoiceDelegateResult {
+  /**
+   * An opaque provider delegation identifier. Correlation data, never authority.
+   */
+  delegation_id: string
+  /**
+   * What the coordinator proposed and what the host did about it.
+   */
+  outcome:
+    | {
+        /**
+         * One submitted intent and its receipt, generated as a UUIDv4.
+         */
+        action_id: string
+        state: 'performed'
+        /**
+         * What the coordinator may say about it, bounded to what a context request carries.
+         */
+        summary: string
+      }
+    | {
+        /**
+         * What a person is told, and what is missing.
+         */
+        message: string
+        /**
+         * Which rule refused it.
+         */
+        reason:
+          | 'unknown_voice_session'
+          | 'unannounced_delegation'
+          | 'outside_voice_grant'
+          | 'outside_device_grant'
+          | 'no_such_effect'
+          | 'confirmation_required'
+          | 'confirmation_mismatch'
+          | 'confirmation_spent'
+          | 'destination_not_named'
+          | 'approval_not_verified'
+          | 'turn_not_named'
+          | 'session_outside_voice_session'
+        state: 'refused'
+      }
+}
+/**
+ * Parameters of `voice.grant`.
+ */
+export interface VoiceGrantParams {
+  /**
+   * The actions to permit. Absent takes the default scope of section 15 ¶13.
+   */
+  actions: VoiceAction[] | null
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * The sessions the grant covers. Empty covers every session the device's own grant covers.
+   */
+  session_ids: SessionId[]
+}
+/**
+ * The result of `voice.grant`.
+ */
+export interface VoiceGrantResult {
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * Actions the request asked for that the device's own grant does not carry.
+   *
+   * A voice grant is intersected with the device's ordinary grant, so asking for more than the
+   * device holds narrows rather than enlarges. Naming what was dropped is what stops a person
+   * believing they granted something they did not.
+   */
+  not_held_by_device: VoiceAction[]
+  statement: VoiceGrantStatement
+}
+/**
+ * What it permits, stated action by action.
+ */
+export interface VoiceGrantStatement {
+  /**
+   * The actions the grant permits.
+   */
+  actions: VoiceAction[]
+  /**
+   * One sentence per action, in the order the actions are listed.
+   */
+  statements: string[]
+  /**
+   * The actions that still need a confirmation on an unlocked screen every time they are used.
+   *
+   * Holding the action in the grant is not holding the confirmation. Section 15 ¶8 makes them
+   * two separate things, and this field says so where the person reads the grant.
+   */
+  unlocked_screen_actions: VoiceAction[]
+}
+/**
+ * What a voice grant permits, as the person who chose it is told.
+ *
+ * Section 15 ¶13: "the change must state which actions it permits". The statement is computed
+ * from the action set rather than written beside it, so a grant and its description cannot drift.
+ */
+export interface VoiceGrantStatement1 {
+  /**
+   * The actions the grant permits.
+   */
+  actions: VoiceAction[]
+  /**
+   * One sentence per action, in the order the actions are listed.
+   */
+  statements: string[]
+  /**
+   * The actions that still need a confirmation on an unlocked screen every time they are used.
+   *
+   * Holding the action in the grant is not holding the confirmation. Section 15 ¶8 makes them
+   * two separate things, and this field says so where the person reads the grant.
+   */
+  unlocked_screen_actions: VoiceAction[]
+}
+/**
+ * Application-authored instructions, which are never project text.
+ *
+ * Section 15 ¶9 and ¶12 both ask for this separation. It is a separate type with a separate field
+ * on the wire so a coordinator cannot accidentally put a session's text where its own
+ * instructions go, and a reader can tell which is which without knowing where the value came
+ * from.
+ */
+export interface VoiceInstructions {
+  /**
+   * The instruction text the application wrote.
+   */
+  text: string
+}
+/**
+ * A running voice session, as the paired device needs to see it.
+ */
+export interface VoiceSessionDescriptor {
+  /**
+   * The provider's SDP answer, to be applied to the caller's own connection.
+   */
+  answer_sdp: string
+  /**
+   * The broker's origin, so the device does not have to be configured with it separately.
+   */
+  broker_origin: string
+  /**
+   * The broker's identifier for the call. The control socket is addressed by it.
+   */
+  call_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  closes_at_ms: string
+  /**
+   * Path on the broker's origin the control socket is opened on.
+   */
+  control_path: string
+  /**
+   * What the provider and the managed operator can see, stated where the choice is made.
+   */
+  disclosure: string[]
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * Seconds between heartbeats the device is expected to send.
+   */
+  heartbeat_seconds: number
+  /**
+   * The model the call is running on.
+   */
+  model: string
+  /**
+   * The provider's own session identifier. Opaque; never parsed or constructed.
+   */
+  provider_session_id: string
+  /**
+   * The sessions this voice session may reach.
+   */
+  session_ids: SessionId[]
+  statement: VoiceGrantStatement2
+  /**
+   * The host's identity for this voice session.
+   */
+  voice_session_id: string
+}
+/**
+ * What that grant permits, stated action by action.
+ */
+export interface VoiceGrantStatement2 {
+  /**
+   * The actions the grant permits.
+   */
+  actions: VoiceAction[]
+  /**
+   * One sentence per action, in the order the actions are listed.
+   */
+  statements: string[]
+  /**
+   * The actions that still need a confirmation on an unlocked screen every time they are used.
+   *
+   * Holding the action in the grant is not holding the confirmation. Section 15 ¶8 makes them
+   * two separate things, and this field says so where the person reads the grant.
+   */
+  unlocked_screen_actions: VoiceAction[]
+}
+/**
+ * Parameters of `voice.start`.
+ */
+export interface VoiceStartParams {
+  /**
+   * Seconds of call the caller is asking to be authorised for.
+   */
+  duration_seconds: number
+  /**
+   * The caller's own SDP offer, as its WebRTC stack produced it.
+   *
+   * The host forwards it to the managed broker unchanged and terminates no media: audio flows
+   * between the device and the provider. The host never generates an offer of its own.
+   */
+  offer_sdp: string
+  /**
+   * Minor units to hold for reasoning and tools, held separately from the call.
+   */
+  reasoning_budget_minor: U64 | null
+  /**
+   * The sessions this voice session may reach. Empty takes every session the voice grant covers.
+   */
+  session_ids: SessionId[]
+}
+/**
+ * The result of `voice.start`.
+ */
+export interface VoiceStartResult {
+  /**
+   * Which of the three outcomes happened.
+   */
+  outcome:
+    | {
+        session: VoiceSessionDescriptor1
+        state: 'started'
+      }
+    | {
+        /**
+         * The creation attempt, for a later reconciliation to name.
+         */
+        attempt_id: string
+        /**
+         * What a person is told. Never a provider credential and never a blame of the host.
+         */
+        message: string
+        state: 'creation_unknown'
+      }
+    | {
+        /**
+         * Paths that still work. A voice session stopping leaves the agent running.
+         */
+        alternatives: string[]
+        /**
+         * What a person is told.
+         */
+        message: string
+        /**
+         * The broker's own reason, in its vocabulary.
+         */
+        reason: string
+        state: 'unavailable'
+      }
+}
+/**
+ * Everything the device needs to use it.
+ */
+export interface VoiceSessionDescriptor1 {
+  /**
+   * The provider's SDP answer, to be applied to the caller's own connection.
+   */
+  answer_sdp: string
+  /**
+   * The broker's origin, so the device does not have to be configured with it separately.
+   */
+  broker_origin: string
+  /**
+   * The broker's identifier for the call. The control socket is addressed by it.
+   */
+  call_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  closes_at_ms: string
+  /**
+   * Path on the broker's origin the control socket is opened on.
+   */
+  control_path: string
+  /**
+   * What the provider and the managed operator can see, stated where the choice is made.
+   */
+  disclosure: string[]
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * Seconds between heartbeats the device is expected to send.
+   */
+  heartbeat_seconds: number
+  /**
+   * The model the call is running on.
+   */
+  model: string
+  /**
+   * The provider's own session identifier. Opaque; never parsed or constructed.
+   */
+  provider_session_id: string
+  /**
+   * The sessions this voice session may reach.
+   */
+  session_ids: SessionId[]
+  statement: VoiceGrantStatement2
+  /**
+   * The host's identity for this voice session.
+   */
+  voice_session_id: string
+}
+/**
+ * Parameters of `voice.stop`.
+ */
+export interface VoiceStopParams {
+  /**
+   * The voice session to end.
+   */
+  voice_session_id: string
+}
+/**
+ * The result of `voice.stop`.
+ */
+export interface VoiceStopResult {
+  /**
+   * Whether the broker was told to finalise the call.
+   *
+   * False is not a failure of the stop. The grant is gone either way; what the broker does with
+   * the money is settled on its own schedule, and a host that waited for it would be holding a
+   * revocation open for a reason that has nothing to do with authority.
+   */
+  broker_notified: boolean
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  revoked_at_ms: string
+  /**
+   * One host-issued authority object.
+   */
+  revoked_grant_id: string
+  /**
+   * The terminal sessions this voice session reached, which keep running.
+   *
+   * Section 15 ¶1: a voice session is not a shell session, and voice can stop while the agent
+   * continues.
+   */
+  sessions_left_running: SessionId[]
+  /**
+   * The voice session that ended.
+   */
+  voice_session_id: string
 }
 /**
  * What the controller publishes so a client can reach a worker without asking the controller.

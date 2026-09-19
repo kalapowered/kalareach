@@ -1299,14 +1299,15 @@ methods! {
 
     // ----- Voice ----------------------------------------------------------------------------
     VoiceStart = "voice.start", Voice,
-    effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant)],
+    effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant), req(VoiceUse)],
     selectors: [Session, VoiceSession],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Start a voice session. Budget and account checks happen at the managed broker.";
 
     VoiceStop = "voice.stop", Voice,
-    effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant)], selectors: [VoiceSession],
+    effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant), req(VoiceUse)],
+    selectors: [VoiceSession],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Stop a voice session. Ending it revokes its voice grant immediately.";
@@ -1324,7 +1325,7 @@ methods! {
           broaden its own; changing another device's needs host-management authority.";
 
     VoiceDelegate = "voice.delegate", Voice,
-    effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant)],
+    effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant), req(VoiceUse)],
     selectors: [Session, VoiceSession],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
@@ -1332,7 +1333,8 @@ methods! {
           correlation data, never authority.";
 
     VoiceContext = "voice.context", Voice,
-    effect: Read, ingress: [PairedDevice], rights: [basis(VoiceGrant), req(SessionView)],
+    effect: Read, ingress: [PairedDevice],
+    rights: [basis(VoiceGrant), req(VoiceUse), req(SessionView)],
     selectors: [Session, VoiceSession],
     history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,

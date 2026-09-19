@@ -298,6 +298,11 @@
           "const": "host.manage",
           "description": "Change host configuration: devices, catalogues, plugins and installation state.",
           "type": "string"
+        },
+        {
+          "const": "voice.use",
+          "description": "Hold a voice session on this host, delegate through it and read its selected context.",
+          "type": "string"
         }
       ]
     },
@@ -18582,6 +18587,25 @@
       "minLength": 1,
       "type": "string"
     },
+    "SpokenDestination": {
+      "additionalProperties": false,
+      "description": "A spoken confirmation that names the destination session.\n\nSection 15 ¶13 requires the confirmation to name the destination, so the host checks the name\nagainst the session it is about to submit to rather than accepting that one was given.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the speaker named."
+        },
+        "spoken_text": {
+          "description": "The words the speaker used, as the transcript recorded them. Data, never authority.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "spoken_text"
+      ],
+      "type": "object"
+    },
     "StoredEnvelopeKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte X25519 stored-envelope public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
@@ -19555,6 +19579,30 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "VerifiedApprovalAnswer": {
+      "additionalProperties": false,
+      "description": "An approval answer, with the details of the request it answers.\n\nSection 15 ¶13: an approval decision requires the verified request's details and an explicit\nanswer. The host compares the details against the approval it holds, so a model that invented\nthem is refused rather than believed.",
+      "properties": {
+        "approval_request_id": {
+          "$ref": "#/$defs/ApprovalRequestId",
+          "description": "The approval being answered."
+        },
+        "approved": {
+          "description": "The explicit answer. Nothing is inferred from a transcript.",
+          "type": "boolean"
+        },
+        "details_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the request's details as the host read them out."
+        }
+      },
+      "required": [
+        "approval_request_id",
+        "details_digest",
+        "approved"
+      ],
+      "type": "object"
+    },
     "ViewportPosition": {
       "description": "Where an attachment's window sits in the session's rows.\n\nA window is normally on the live screen, which is what no position at all means. A client\nlooking through its scrollback names where it is looking instead, and the host installs the\nhistory pages that cover it. Scrolling is a presentation choice and never touches the input\nlease: section 8 puts passive scrollback with focus events and terminal replies.",
       "oneOf": [
@@ -19726,6 +19774,1075 @@
         "more",
         "summary",
         "views"
+      ],
+      "type": "object"
+    },
+    "VoiceAction": {
+      "description": "One thing a voice session may ask the host to do.\n\nSection 15 ¶13 divides these three ways, and the divisions are the methods on this type rather\nthan rules restated at each call site:\n\n* the default grant permits session navigation, status queries, briefing and prompt\n  composition, and nothing else ([`Self::in_default_scope`]);\n* submitting a prompt requires a clear spoken confirmation naming the destination session\n  ([`Self::needs_spoken_destination`]), and an approval decision requires the verified\n  request's details and an explicit answer ([`Self::needs_verified_request`]);\n* session closure, grant changes, arbitrary shell input, diff application and external\n  delivery require a confirmation on an unlocked screen ([`Self::needs_unlocked_screen`]).\n\n[`Self::required_right`] is the other half: every voice action names the ordinary right the\nhost already checks for the same effect, so a voice grant can never reach an effect the device\ncould not reach by typing.",
+      "oneOf": [
+        {
+          "const": "navigate",
+          "description": "Move between the sessions the grant covers.",
+          "type": "string"
+        },
+        {
+          "const": "status",
+          "description": "Read a session's current status.",
+          "type": "string"
+        },
+        {
+          "const": "brief",
+          "description": "Hear a briefing built from the selected context.",
+          "type": "string"
+        },
+        {
+          "const": "compose_prompt",
+          "description": "Compose a prompt without submitting it.",
+          "type": "string"
+        },
+        {
+          "const": "submit_prompt",
+          "description": "Submit a composed prompt to a named session.",
+          "type": "string"
+        },
+        {
+          "const": "answer_approval",
+          "description": "Answer an approval request the host has verified and read out.",
+          "type": "string"
+        },
+        {
+          "const": "cancel_turn",
+          "description": "Cancel the upstream agent's current turn.",
+          "type": "string"
+        },
+        {
+          "const": "close_session",
+          "description": "Close a session.",
+          "type": "string"
+        },
+        {
+          "const": "change_grant",
+          "description": "Create or change a grant.",
+          "type": "string"
+        },
+        {
+          "const": "shell_input",
+          "description": "Send arbitrary bytes to a terminal.",
+          "type": "string"
+        },
+        {
+          "const": "apply_diff",
+          "description": "Apply or revert a diff.",
+          "type": "string"
+        },
+        {
+          "const": "deliver_externally",
+          "description": "Deliver content to an external destination.",
+          "type": "string"
+        }
+      ]
+    },
+    "VoiceActionPlan": {
+      "additionalProperties": false,
+      "description": "What a voice action is hashed over, so one confirmation authorises one action.\n\nThe digest is built from the plan rather than from the challenge: a challenge that carried the\nonly copy of what was agreed to would be a challenge an attacker could rewrite.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/VoiceAction",
+          "description": "The class of action."
+        },
+        "delegation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceDelegationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The delegation it was interpreted from, when a delegation caused it."
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The exact parameters, canonically encoded by the caller that proposes them.\n\nOpaque bytes here: this module hashes what the host will perform rather than restating each\nmethod's shape a second time."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session it acts on, when it acts on one."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session proposing it."
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "action",
+        "session_id",
+        "delegation_id",
+        "payload_digest"
+      ],
+      "type": "object"
+    },
+    "VoiceConfirmationProof": {
+      "additionalProperties": false,
+      "description": "The paired device's answer to a voice confirmation challenge.\n\nThe ceremony that produces it is the native client's: device-owner authentication on an\nunlocked screen. What the host verifies is this object, and a model statement that the user\nagreed to something cannot produce one.",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/VoiceConfirmationRequest",
+          "description": "The challenge this proof answers, byte for byte."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over `CBOR([\"kr-voice/confirm/1\", request])`."
+        },
+        "signer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The key identifier of the device identity key that produced it."
+        }
+      },
+      "required": [
+        "request",
+        "signer_key_id",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "VoiceConfirmationRequest": {
+      "additionalProperties": false,
+      "description": "A host-issued challenge for one voice action that needs an unlocked screen.\n\nThis is not a [`SensitiveAction`](crate::pairing::SensitiveAction). The owner-confirmation\nceremony of section 10 confirms a change to persistent authority; this confirms one action of\none voice session, and binding it to the exact action hash and the current request is what\nstops a confirmation for one action authorising another.\n\nEverything the host relies on is inside the signed bytes. A field beside an unsigned signature\nwould be the signer's unauthenticated claim.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/VoiceAction",
+          "description": "The class of action being confirmed."
+        },
+        "action_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the exact action. One confirmation authorises one digest."
+        },
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The request this confirmation is for. One confirmation authorises one request."
+        },
+        "confirmation_id": {
+          "$ref": "#/$defs/ConfirmationId",
+          "description": "The challenge identity. Single use."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The paired device that must sign it, with the identity key that signs its\nauthority-bearing requests. Never a session key."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The short expiry, in UTC milliseconds."
+        },
+        "host_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host that issued the challenge."
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The host's fresh challenge nonce."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session the action belongs to."
+        }
+      },
+      "required": [
+        "confirmation_id",
+        "voice_session_id",
+        "action",
+        "action_digest",
+        "action_id",
+        "host_device_id",
+        "device_id",
+        "nonce",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "VoiceContextClass": {
+      "description": "A class of content the default context excludes.",
+      "oneOf": [
+        {
+          "const": "file_contents",
+          "description": "The contents of files.",
+          "type": "string"
+        },
+        {
+          "const": "environment_variables",
+          "description": "Environment variables.",
+          "type": "string"
+        },
+        {
+          "const": "terminal_scrollback",
+          "description": "Raw terminal scrollback.",
+          "type": "string"
+        },
+        {
+          "const": "attachment_bytes",
+          "description": "The bytes of an attachment.",
+          "type": "string"
+        }
+      ]
+    },
+    "VoiceContextParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.context`.",
+      "properties": {
+        "delegation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceDelegationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The delegation this context belongs to, or null for context that belongs to the call."
+        },
+        "selected": {
+          "description": "Content classes the person has selected on top of the default.\n\nSection 15 ¶12 excludes file contents, environment variables, raw terminal scrollback and\nattachment bytes unless the user selects them, so selecting one is a field rather than a\nsetting somewhere else.",
+          "items": {
+            "$ref": "#/$defs/VoiceContextClass"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the context is about."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session asking."
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "session_id",
+        "selected",
+        "delegation_id"
+      ],
+      "type": "object"
+    },
+    "VoiceContextProvenance": {
+      "additionalProperties": false,
+      "description": "Where a selection's content came from.",
+      "properties": {
+        "from_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The earliest source read, in UTC milliseconds."
+        },
+        "resources": {
+          "description": "The resources read, as the host names them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "to_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The latest source read, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "from_ms",
+        "to_ms",
+        "resources"
+      ],
+      "type": "object"
+    },
+    "VoiceContextResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.context`.\n\nSection 15 ¶9: selected context and host results return from the paired client to the managed\nbroker as bounded context requests. This is what the host hands back to the paired client; the\nhost never sends it to the broker itself.",
+      "properties": {
+        "disclosure": {
+          "description": "What the person is told before a call about what is sent and who can read it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "$ref": "#/$defs/VoiceContextProvenance",
+          "description": "The interval and resources the selection was built from.\n\nSection 10: derived data identifies its source interval and resources."
+        },
+        "selection": {
+          "$ref": "#/$defs/VoiceContextSelection",
+          "description": "What the coordinator selected, as project text."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session it is about."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session it was selected for."
+        },
+        "withheld": {
+          "description": "What the grant's history bound kept out, so a gap is visible rather than silent.",
+          "items": {
+            "$ref": "#/$defs/VoiceWithheld"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "session_id",
+        "selection",
+        "provenance",
+        "withheld",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "VoiceContextSelection": {
+      "additionalProperties": false,
+      "description": "The default context of section 15 ¶12, bounded and separated from coordinator instructions.\n\nEvery field here is **project text**: data the coordinator submits, never instructions it\nfollows. The separation is in the types rather than in a comment — nothing in this structure\ncan become an instruction, because the instruction side is [`VoiceInstructions`] and the two\nnever share a field.",
+      "properties": {
+        "active_application": {
+          "description": "The active application.",
+          "type": "string"
+        },
+        "pending_decisions": {
+          "description": "Summaries of the decisions waiting on a person.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recent_messages": {
+          "description": "The last semantic messages, oldest first, at most\n[`VOICE_CONTEXT_MESSAGE_COUNT`] of them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "secrets_stripped": {
+          "description": "How many secret-looking runs were replaced.\n\nSection 15 ¶12: stripping configured secret patterns is a secondary measure. A count above\nzero says something was replaced; a count of zero says nothing was matched, and neither says\nthe remainder holds no secrets.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected": {
+          "description": "Content classes the person selected, with what each contributed.",
+          "items": {
+            "$ref": "#/$defs/VoiceSelectedContent"
+          },
+          "type": "array"
+        },
+        "session_description": {
+          "description": "The session's description.",
+          "type": "string"
+        },
+        "stripping_note": {
+          "description": "What stripping does and does not establish, carried with every selection.",
+          "type": "string"
+        },
+        "text_tokens": {
+          "description": "Text tokens the selection counts against [`VOICE_CONTEXT_TOKEN_CAP`].",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "True when the cap cut the selection short.",
+          "type": "boolean"
+        },
+        "working_directory": {
+          "description": "The current working directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_description",
+        "working_directory",
+        "active_application",
+        "pending_decisions",
+        "recent_messages",
+        "selected",
+        "text_tokens",
+        "truncated",
+        "secrets_stripped",
+        "stripping_note"
+      ],
+      "type": "object"
+    },
+    "VoiceDelegateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.delegate`.\n\nSection 15 ¶7: the delegation event supplies an identifier and a timeline offset, not task\ntext. There is deliberately no field for what the model said the user wants; the coordinator\nuses the accumulated transcripts and current host state.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/VoiceAction",
+          "description": "The action the device asks the coordinator to propose."
+        },
+        "approval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerifiedApprovalAnswer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The approval the answer belongs to, when the action answers one."
+        },
+        "confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceConfirmationProof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The confirmation from the device's unlocked screen, when the action needs one."
+        },
+        "delegation_id": {
+          "$ref": "#/$defs/VoiceDelegationId",
+          "description": "The provider's delegation identifier, as the device received it on the data channel."
+        },
+        "offset_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "Where in the call it happened, in milliseconds from the start."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session it acts on, when it acts on one."
+        },
+        "spoken_destination": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpokenDestination"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The spoken confirmation naming the destination session, when the action needs one."
+        },
+        "turn_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn being cancelled, when the action cancels one."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session the delegation belongs to."
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "delegation_id",
+        "offset_ms",
+        "action",
+        "session_id",
+        "spoken_destination",
+        "approval",
+        "turn_id",
+        "confirmation"
+      ],
+      "type": "object"
+    },
+    "VoiceDelegateResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.delegate`.",
+      "properties": {
+        "delegation_id": {
+          "$ref": "#/$defs/VoiceDelegationId",
+          "description": "The delegation this answers."
+        },
+        "outcome": {
+          "$ref": "#/$defs/VoiceDelegationOutcome",
+          "description": "What the coordinator proposed and what the host did about it."
+        }
+      },
+      "required": [
+        "delegation_id",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "VoiceDelegationId": {
+      "description": "An opaque provider delegation identifier. Correlation data, never authority.",
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+    },
+    "VoiceDelegationOutcome": {
+      "description": "What one delegation became.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host performed it, and its receipt is the authority for that.",
+          "properties": {
+            "action_id": {
+              "$ref": "#/$defs/ActionId",
+              "description": "The action identifier of the host action. Its receipt is read the ordinary way."
+            },
+            "state": {
+              "const": "performed",
+              "type": "string"
+            },
+            "summary": {
+              "description": "What the coordinator may say about it, bounded to what a context request carries.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "action_id",
+            "summary"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host refused it, and why.\n\nA refusal is an answer, not a failure: the delegation arrived, the check ran and the answer\nwas no. A caller that treated it as a transport failure would retry something that was\ndecided.",
+          "properties": {
+            "message": {
+              "description": "What a person is told, and what is missing.",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/VoiceRefusal",
+              "description": "Which rule refused it."
+            },
+            "state": {
+              "const": "refused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason",
+            "message"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceGrantParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.grant`.",
+      "properties": {
+        "actions": {
+          "anyOf": [
+            {
+              "description": "A set encoded as a sequence in strictly ascending order. A sequence that is unsorted or repeats a member is rejected.",
+              "items": {
+                "$ref": "#/$defs/VoiceAction"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The actions to permit. Absent takes the default scope of section 15 ¶13."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device whose voice grant this is. A device broadening its own names itself; naming\nanother device is a host-management change."
+        },
+        "session_ids": {
+          "description": "The sessions the grant covers. Empty covers every session the device's own grant covers.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "device_id",
+        "session_ids",
+        "actions"
+      ],
+      "type": "object"
+    },
+    "VoiceGrantResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.grant`.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device it was issued to."
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant that was written, in the host's one authority store."
+        },
+        "not_held_by_device": {
+          "description": "Actions the request asked for that the device's own grant does not carry.\n\nA voice grant is intersected with the device's ordinary grant, so asking for more than the\ndevice holds narrows rather than enlarges. Naming what was dropped is what stops a person\nbelieving they granted something they did not.",
+          "items": {
+            "$ref": "#/$defs/VoiceAction"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "statement": {
+          "$ref": "#/$defs/VoiceGrantStatement",
+          "description": "What it permits, stated action by action."
+        }
+      },
+      "required": [
+        "grant_id",
+        "device_id",
+        "statement",
+        "not_held_by_device"
+      ],
+      "type": "object"
+    },
+    "VoiceGrantStatement": {
+      "additionalProperties": false,
+      "description": "What a voice grant permits, as the person who chose it is told.\n\nSection 15 ¶13: \"the change must state which actions it permits\". The statement is computed\nfrom the action set rather than written beside it, so a grant and its description cannot drift.",
+      "properties": {
+        "actions": {
+          "description": "The actions the grant permits.",
+          "items": {
+            "$ref": "#/$defs/VoiceAction"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "statements": {
+          "description": "One sentence per action, in the order the actions are listed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "unlocked_screen_actions": {
+          "description": "The actions that still need a confirmation on an unlocked screen every time they are used.\n\nHolding the action in the grant is not holding the confirmation. Section 15 ¶8 makes them\ntwo separate things, and this field says so where the person reads the grant.",
+          "items": {
+            "$ref": "#/$defs/VoiceAction"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "actions",
+        "statements",
+        "unlocked_screen_actions"
+      ],
+      "type": "object"
+    },
+    "VoiceInstructions": {
+      "additionalProperties": false,
+      "description": "Application-authored instructions, which are never project text.\n\nSection 15 ¶9 and ¶12 both ask for this separation. It is a separate type with a separate field\non the wire so a coordinator cannot accidentally put a session's text where its own\ninstructions go, and a reader can tell which is which without knowing where the value came\nfrom.",
+      "properties": {
+        "text": {
+          "description": "The instruction text the application wrote.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "VoiceRefusal": {
+      "description": "Why a delegation was refused.",
+      "oneOf": [
+        {
+          "const": "unknown_voice_session",
+          "description": "The voice session does not exist, or is not this device's.",
+          "type": "string"
+        },
+        {
+          "const": "unannounced_delegation",
+          "description": "The provider never announced this delegation identifier to this call.",
+          "type": "string"
+        },
+        {
+          "const": "outside_voice_grant",
+          "description": "The voice grant does not permit this action.",
+          "type": "string"
+        },
+        {
+          "const": "outside_device_grant",
+          "description": "The device's own grant does not carry the right this action needs.",
+          "type": "string"
+        },
+        {
+          "const": "no_such_effect",
+          "description": "This release has no host effect for the action.",
+          "type": "string"
+        },
+        {
+          "const": "confirmation_required",
+          "description": "The action needs a confirmation on an unlocked screen and none was presented.",
+          "type": "string"
+        },
+        {
+          "const": "confirmation_mismatch",
+          "description": "A confirmation was presented and does not authorise this action or this request.",
+          "type": "string"
+        },
+        {
+          "const": "confirmation_spent",
+          "description": "A confirmation was presented and has expired or was already used.",
+          "type": "string"
+        },
+        {
+          "const": "destination_not_named",
+          "description": "Submitting a prompt needs a spoken confirmation naming the destination session.",
+          "type": "string"
+        },
+        {
+          "const": "approval_not_verified",
+          "description": "An approval decision needs the verified request's details and an explicit answer.",
+          "type": "string"
+        },
+        {
+          "const": "turn_not_named",
+          "description": "Cancelling a turn needs the typed request and the current turn identifier.",
+          "type": "string"
+        },
+        {
+          "const": "session_outside_voice_session",
+          "description": "The session named is not one this voice session may reach.",
+          "type": "string"
+        }
+      ]
+    },
+    "VoiceSelectedContent": {
+      "additionalProperties": false,
+      "description": "One class of content the person selected, and what it contributed.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/VoiceContextClass",
+          "description": "Which class."
+        },
+        "text": {
+          "description": "The text it contributed, already filtered, capped and stripped.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "class",
+        "text"
+      ],
+      "type": "object"
+    },
+    "VoiceSessionDescriptor": {
+      "additionalProperties": false,
+      "description": "A running voice session, as the paired device needs to see it.",
+      "properties": {
+        "answer_sdp": {
+          "description": "The provider's SDP answer, to be applied to the caller's own connection.",
+          "type": "string"
+        },
+        "broker_origin": {
+          "description": "The broker's origin, so the device does not have to be configured with it separately.",
+          "type": "string"
+        },
+        "call_id": {
+          "description": "The broker's identifier for the call. The control socket is addressed by it.",
+          "type": "string"
+        },
+        "closes_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the broker closes the call, whatever else happens, in UTC milliseconds."
+        },
+        "control_path": {
+          "description": "Path on the broker's origin the control socket is opened on.",
+          "type": "string"
+        },
+        "disclosure": {
+          "description": "What the provider and the managed operator can see, stated where the choice is made.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The session-bound voice grant this session runs under. Stopping revokes it."
+        },
+        "heartbeat_seconds": {
+          "description": "Seconds between heartbeats the device is expected to send.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "description": "The model the call is running on.",
+          "type": "string"
+        },
+        "provider_session_id": {
+          "description": "The provider's own session identifier. Opaque; never parsed or constructed.",
+          "type": "string"
+        },
+        "session_ids": {
+          "description": "The sessions this voice session may reach.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "statement": {
+          "$ref": "#/$defs/VoiceGrantStatement",
+          "description": "What that grant permits, stated action by action."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The host's identity for this voice session."
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "grant_id",
+        "statement",
+        "session_ids",
+        "call_id",
+        "provider_session_id",
+        "answer_sdp",
+        "model",
+        "control_path",
+        "broker_origin",
+        "heartbeat_seconds",
+        "closes_at_ms",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "VoiceSessionId": {
+      "description": "One voice session, independent of the terminal sessions it may reach.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "VoiceStartOutcome": {
+      "description": "What `voice.start` answered.\n\nThree outcomes, because three things can be true and only one of them is a running call.\nSection 23 makes `creation_unknown` a typed resource state with its own result schema rather\nthan an error-code spelling, and this is that schema.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A call is running.",
+          "properties": {
+            "session": {
+              "$ref": "#/$defs/VoiceSessionDescriptor",
+              "description": "Everything the device needs to use it."
+            },
+            "state": {
+              "const": "started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "session"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The broker could not tell whether the provider created a session.\n\nNo SDP answer exists for that attempt, nothing is retried, and the reservation is the\nbroker's to reconcile. The voice session and its grant are not created.",
+          "properties": {
+            "attempt_id": {
+              "description": "The creation attempt, for a later reconciliation to name.",
+              "type": "string"
+            },
+            "message": {
+              "description": "What a person is told. Never a provider credential and never a blame of the host.",
+              "type": "string"
+            },
+            "state": {
+              "const": "creation_unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "attempt_id",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Managed voice could not be started, and what still works.",
+          "properties": {
+            "alternatives": {
+              "description": "Paths that still work. A voice session stopping leaves the agent running.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "message": {
+              "description": "What a person is told.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "The broker's own reason, in its vocabulary.",
+              "type": "string"
+            },
+            "state": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason",
+            "message",
+            "alternatives"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceStartParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.start`.",
+      "properties": {
+        "duration_seconds": {
+          "description": "Seconds of call the caller is asking to be authorised for.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offer_sdp": {
+          "description": "The caller's own SDP offer, as its WebRTC stack produced it.\n\nThe host forwards it to the managed broker unchanged and terminates no media: audio flows\nbetween the device and the provider. The host never generates an offer of its own.",
+          "type": "string"
+        },
+        "reasoning_budget_minor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Minor units to hold for reasoning and tools, held separately from the call."
+        },
+        "session_ids": {
+          "description": "The sessions this voice session may reach. Empty takes every session the voice grant covers.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "session_ids",
+        "offer_sdp",
+        "duration_seconds",
+        "reasoning_budget_minor"
+      ],
+      "type": "object"
+    },
+    "VoiceStartResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.start`.",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/VoiceStartOutcome",
+          "description": "Which of the three outcomes happened."
+        }
+      },
+      "required": [
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "VoiceStopParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.stop`.",
+      "properties": {
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session to end."
+        }
+      },
+      "required": [
+        "voice_session_id"
+      ],
+      "type": "object"
+    },
+    "VoiceStopResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.stop`.",
+      "properties": {
+        "broker_notified": {
+          "description": "Whether the broker was told to finalise the call.\n\nFalse is not a failure of the stop. The grant is gone either way; what the broker does with\nthe money is settled on its own schedule, and a host that waited for it would be holding a\nrevocation open for a reason that has nothing to do with authority.",
+          "type": "boolean"
+        },
+        "revoked_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the grant was revoked, in UTC milliseconds.\n\nSection 15 ¶8: ending the native voice session revokes its voice grant immediately,\nindependently of provider billing finalisation. This moment is the host's own."
+        },
+        "revoked_grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant that was revoked with it."
+        },
+        "sessions_left_running": {
+          "description": "The terminal sessions this voice session reached, which keep running.\n\nSection 15 ¶1: a voice session is not a shell session, and voice can stop while the agent\ncontinues.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session that ended."
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "revoked_grant_id",
+        "revoked_at_ms",
+        "broker_notified",
+        "sessions_left_running"
+      ],
+      "type": "object"
+    },
+    "VoiceWithheld": {
+      "additionalProperties": false,
+      "description": "A run of content the history filter kept out of a selection.",
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many items."
+        },
+        "reason": {
+          "description": "Why it was kept out.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "count"
       ],
       "type": "object"
     },
@@ -21091,6 +22208,12 @@
         "transfer_id": {
           "$ref": "#/$defs/TransferId"
         },
+        "voice_delegation_id": {
+          "$ref": "#/$defs/VoiceDelegationId"
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId"
+        },
         "workflow_id": {
           "$ref": "#/$defs/WorkflowId"
         },
@@ -21594,6 +22717,57 @@
     },
     "visit_changed_result": {
       "$ref": "#/$defs/VisitChangedResult"
+    },
+    "voice_action_plan": {
+      "$ref": "#/$defs/VoiceActionPlan"
+    },
+    "voice_confirmation_proof": {
+      "$ref": "#/$defs/VoiceConfirmationProof"
+    },
+    "voice_confirmation_request": {
+      "$ref": "#/$defs/VoiceConfirmationRequest"
+    },
+    "voice_context_params": {
+      "$ref": "#/$defs/VoiceContextParams"
+    },
+    "voice_context_result": {
+      "$ref": "#/$defs/VoiceContextResult"
+    },
+    "voice_context_selection": {
+      "$ref": "#/$defs/VoiceContextSelection"
+    },
+    "voice_delegate_params": {
+      "$ref": "#/$defs/VoiceDelegateParams"
+    },
+    "voice_delegate_result": {
+      "$ref": "#/$defs/VoiceDelegateResult"
+    },
+    "voice_grant_params": {
+      "$ref": "#/$defs/VoiceGrantParams"
+    },
+    "voice_grant_result": {
+      "$ref": "#/$defs/VoiceGrantResult"
+    },
+    "voice_grant_statement": {
+      "$ref": "#/$defs/VoiceGrantStatement"
+    },
+    "voice_instructions": {
+      "$ref": "#/$defs/VoiceInstructions"
+    },
+    "voice_session_descriptor": {
+      "$ref": "#/$defs/VoiceSessionDescriptor"
+    },
+    "voice_start_params": {
+      "$ref": "#/$defs/VoiceStartParams"
+    },
+    "voice_start_result": {
+      "$ref": "#/$defs/VoiceStartResult"
+    },
+    "voice_stop_params": {
+      "$ref": "#/$defs/VoiceStopParams"
+    },
+    "voice_stop_result": {
+      "$ref": "#/$defs/VoiceStopResult"
     },
     "worker_descriptor": {
       "$ref": "#/$defs/WorkerDescriptor"

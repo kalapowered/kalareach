@@ -131,6 +131,12 @@ use crate::transfer::{
     UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadStatusParams,
     UploadStatusResult,
 };
+use crate::voice::{
+    VoiceActionPlan, VoiceConfirmationProof, VoiceConfirmationRequest, VoiceContextParams,
+    VoiceContextResult, VoiceContextSelection, VoiceDelegateParams, VoiceDelegateResult,
+    VoiceGrantParams, VoiceGrantResult, VoiceGrantStatement, VoiceInstructions,
+    VoiceSessionDescriptor, VoiceStartParams, VoiceStartResult, VoiceStopParams, VoiceStopResult,
+};
 use crate::worker::{
     AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
     GenerationChallenge, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
@@ -448,6 +454,25 @@ pub fn protocol_schema() -> Value {
         "change_manifest" => ChangeManifest,
         "change_operation" => ChangeOperation,
         "installed_file" => InstalledFile,
+        // Voice: the five method shapes, the voice grant's statement and the confirmation a
+        // paired device signs on an unlocked screen. Appended for the same reason.
+        "voice_action_plan" => VoiceActionPlan,
+        "voice_confirmation_proof" => VoiceConfirmationProof,
+        "voice_confirmation_request" => VoiceConfirmationRequest,
+        "voice_context_params" => VoiceContextParams,
+        "voice_context_result" => VoiceContextResult,
+        "voice_context_selection" => VoiceContextSelection,
+        "voice_delegate_params" => VoiceDelegateParams,
+        "voice_delegate_result" => VoiceDelegateResult,
+        "voice_grant_params" => VoiceGrantParams,
+        "voice_grant_result" => VoiceGrantResult,
+        "voice_grant_statement" => VoiceGrantStatement,
+        "voice_instructions" => VoiceInstructions,
+        "voice_session_descriptor" => VoiceSessionDescriptor,
+        "voice_start_params" => VoiceStartParams,
+        "voice_start_result" => VoiceStartResult,
+        "voice_stop_params" => VoiceStopParams,
+        "voice_stop_result" => VoiceStopResult,
     }
     properties.insert(
         "identifiers".to_owned(),
@@ -559,6 +584,8 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "stream_cursor" => ids::StreamCursor,
         "stream_id" => ids::StreamId,
         "transfer_id" => ids::TransferId,
+        "voice_delegation_id" => crate::voice::VoiceDelegationId,
+        "voice_session_id" => ids::VoiceSessionId,
         "workflow_id" => ids::WorkflowId,
         "workflow_run_id" => ids::WorkflowRunId,
         "workspace_id" => ids::WorkspaceId,

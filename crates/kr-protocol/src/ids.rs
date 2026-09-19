@@ -386,6 +386,14 @@ uuid_id!(
     "One owner-confirmation challenge: single use and bound to one action digest."
 );
 uuid_id!(
+    /// One voice session, which is not a terminal session and does not end one.
+    ///
+    /// A voice session has its own life: it carries the voice grant the host created for it, and
+    /// ending it revokes that grant. The terminal sessions it may reach keep running.
+    VoiceSessionId,
+    "One voice session, independent of the terminal sessions it may reach."
+);
+uuid_id!(
     /// One native application installation registered with a push gateway.
     InstallationId,
     "One native application installation registered with a push gateway."
