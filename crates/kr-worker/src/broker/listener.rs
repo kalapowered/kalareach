@@ -183,10 +183,12 @@ pub struct Registration {
 ///
 /// `Debug` is written rather than derived, because the derived one would print the credential
 /// byte by byte and a connection failure is exactly when something logs one of these.
-#[derive(Clone)]
 pub struct BridgeHello {
     /// The credential it read from the registration.
-    pub credential: Vec<u8>,
+    ///
+    /// It lives in the host's own zeroising buffer, so it is wiped when the hello is dropped and
+    /// there is no `Clone` to leave an ordinary copy behind.
+    pub credential: kr_crypto::secret::SecretVec,
     /// The process it is.
     pub process: ProcessStartIdentity,
     /// A session identifier it found in its environment, if any.
@@ -252,7 +254,7 @@ impl Registration {
                 hello.process.pid, self.expected_process.pid
             )));
         }
-        if !process.authenticates(&hello.credential, &hello.process) {
+        if !process.authenticates(hello.credential.expose(), &hello.process) {
             return Err(BrokerError::denied(
                 "this connection did not present the private exchange of the launch it claims",
             ));
@@ -370,7 +372,7 @@ mod tests {
 
     fn hello() -> BridgeHello {
         BridgeHello {
-            credential: vec![9; CREDENTIAL_BYTES],
+            credential: kr_crypto::secret::SecretVec::new(vec![9; CREDENTIAL_BYTES]),
             process: process(41, 900),
             environment_session_id: Some("KR_SESSION=abc".to_owned()),
         }
@@ -399,8 +401,9 @@ mod tests {
 
         // The session identifier, and nothing else.
         let bare = BridgeHello {
-            credential: Vec::new(),
-            ..hello()
+            credential: kr_crypto::secret::SecretVec::new(Vec::new()),
+            process: process(41, 900),
+            environment_session_id: None,
         };
         assert!(
             registration.authenticate(&bare, true, &managed).is_err(),
@@ -409,8 +412,9 @@ mod tests {
 
         // The secret from the wrong process.
         let elsewhere = BridgeHello {
+            credential: kr_crypto::secret::SecretVec::new(vec![9; CREDENTIAL_BYTES]),
             process: process(42, 900),
-            ..hello()
+            environment_session_id: None,
         };
         assert!(
             registration
@@ -427,8 +431,9 @@ mod tests {
 
         // A recycled process identifier.
         let recycled = BridgeHello {
+            credential: kr_crypto::secret::SecretVec::new(vec![9; CREDENTIAL_BYTES]),
             process: process(41, 901),
-            ..hello()
+            environment_session_id: None,
         };
         assert!(
             registration

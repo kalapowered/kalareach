@@ -845,7 +845,12 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
             .expect("the reconnect reconciles");
         assert_eq!(reconciliation.still_pending, vec![surviving.resource_id]);
         assert_eq!(reconciliation.uncertain, vec![answered.resource_id]);
-        assert_eq!(finished.to, GatewayMode::Normal);
+        assert_eq!(
+            finished
+                .expect("this was the last upstream that owed one")
+                .to,
+            GatewayMode::Normal
+        );
         assert_eq!(broker.mode(), GatewayMode::Normal);
         assert!(
             broker.gap().is_none(),
@@ -883,6 +888,134 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
         "the one the upstream still has comes back answerable"
     );
     let _ = std::fs::remove_dir_all(path.parent().expect("a directory"));
+}
+
+/// An unfinished recovery survives a restart, and so does the connection numbering.
+///
+/// A crash between committing the gap and reconciling the upstream must not leave a resource this
+/// host may already have answered claimable again, and a restarted worker must not put a new
+/// connection's identifiers in an old connection's namespace.
+#[test]
+fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_wrote() {
+    let path = journal_path();
+    let resource_id = {
+        let broker = gateway(Some(&path));
+        let resource = approval(&broker, "1", 2).expect("an interpretation");
+        broker
+            .enter_volatile("the journal could not be written", TimestampMs::new(4))
+            .expect("the fence is entered");
+        broker
+            .recover(TimestampMs::new(5))
+            .expect("the gap is committed");
+        assert_eq!(broker.mode(), GatewayMode::Recovering);
+        // And here the worker dies, before any upstream said what it still holds.
+        resource.resource_id
+    };
+
+    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
+    assert_eq!(
+        restarted.mode(),
+        GatewayMode::Recovering,
+        "a recovery this host did not finish is one it comes back in the middle of"
+    );
+    assert!(
+        restarted
+            .claim(resource_id, &actor("device-1"), TimestampMs::new(10))
+            .is_err(),
+        "nothing is claimable until an upstream has been reconciled"
+    );
+    assert!(
+        restarted.next_connection().get() > 1,
+        "a new connection is numbered above every identifier this ledger holds"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().expect("a directory"));
+}
+
+/// Rich work comes back when every upstream that owed a reconciliation has given one.
+#[test]
+fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
+    let broker = gateway(None);
+    broker
+        .register_instance(
+            instance(3),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(3))),
+        )
+        .expect("the instance is registered");
+    broker
+        .open_native_connection(
+            GatewayConnectionId::new(2),
+            instance(3),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            table(),
+            rich(),
+            "1",
+        )
+        .expect("a second native connection");
+
+    let first = approval(&broker, "1", 2).expect("an interpretation");
+    let second = broker
+        .forward_native(
+            GatewayConnectionId::new(2),
+            frame("2", "fs/write_text_file").as_bytes(),
+            TimestampMs::new(3),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+
+    broker
+        .enter_volatile("the journal could not be written", TimestampMs::new(4))
+        .expect("the fence is entered");
+    broker
+        .recover(TimestampMs::new(5))
+        .expect("the gap is committed");
+
+    let (_, finished) = broker
+        .reconcile_recovered(
+            ReconcileScope {
+                application_instance_id: instance(2),
+                connection: GatewayConnectionId::new(1),
+            },
+            &[Broker::downstream(
+                GatewayConnectionId::new(1),
+                UpstreamRequestId::new("1").expect("valid"),
+            )],
+            TimestampMs::new(6),
+        )
+        .expect("the first upstream reconciles");
+    assert!(
+        finished.is_none(),
+        "one upstream says nothing about another's pending identifiers"
+    );
+    assert_eq!(broker.mode(), GatewayMode::Recovering);
+    assert!(
+        broker
+            .claim(first.resource_id, &actor("device-1"), TimestampMs::new(7))
+            .is_err()
+    );
+
+    let (_, finished) = broker
+        .reconcile_recovered(
+            ReconcileScope {
+                application_instance_id: instance(3),
+                connection: GatewayConnectionId::new(2),
+            },
+            &[Broker::downstream(
+                GatewayConnectionId::new(2),
+                UpstreamRequestId::new("2").expect("valid"),
+            )],
+            TimestampMs::new(8),
+        )
+        .expect("the second upstream reconciles");
+    assert!(finished.is_some(), "and that was the last one that owed");
+    assert_eq!(broker.mode(), GatewayMode::Normal);
+    assert!(broker.pending(second.resource_id).is_some());
+    broker
+        .claim(first.resource_id, &actor("device-1"), TimestampMs::new(9))
+        .expect("rich work is back");
 }
 
 /// KR-REQ-12.10: the worker's own agent, terminal and gateway request state survives a restart of

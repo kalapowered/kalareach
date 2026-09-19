@@ -85,8 +85,53 @@ pub struct UpstreamRequest {
     pub operation: UpstreamOperation,
     /// The turn it acts on, where it acts on one.
     pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
-    /// The operation's own body, as the connector encodes it.
-    pub payload: Vec<u8>,
+    /// What the operation is, with everything the connector needs to encode it.
+    pub body: UpstreamBody,
+}
+
+/// What one prepared operation actually asks for.
+///
+/// It is a union rather than bytes because the connector encodes it, and a connector cannot encode
+/// what it was not told: an approval needs the request it answers and the decision chosen, and a
+/// plugin action needs the package, the action and the draft it acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpstreamBody {
+    /// A prompt, by the draft it lives in or the text it carries.
+    Prompt {
+        /// The draft, when the prompt is one.
+        draft_id: Option<kr_protocol::ids::DraftId>,
+        /// The text, when the prompt travels inline.
+        text: Option<String>,
+    },
+    /// Steering text for the turn the request names.
+    Steer {
+        /// What to steer with.
+        text: String,
+    },
+    /// A cancellation of the turn the request names.
+    Cancel,
+    /// An answer to one pending approval.
+    Approval {
+        /// The resource being answered.
+        resource_id: kr_protocol::ids::PendingResourceId,
+        /// The upstream's own identifier for the request.
+        upstream_request_id: kr_protocol::ids::UpstreamRequestId,
+        /// The method the original request named.
+        method: kr_protocol::ids::UpstreamMethod,
+        /// The decision, one of the ones the request offered.
+        option_id: String,
+    },
+    /// A registered plugin action.
+    PluginAction {
+        /// The package whose action it is.
+        plugin_id: kr_protocol::ids::PluginId,
+        /// The action.
+        action: ActionName,
+        /// The draft it acts on, where it acts on one.
+        draft_id: Option<kr_protocol::ids::DraftId>,
+        /// The action's own parameters, canonically encoded.
+        parameters: Vec<u8>,
+    },
 }
 
 /// What the upstream answered.
@@ -180,10 +225,13 @@ impl Broker {
     ) -> Result<AgentSnapshotResult> {
         self.check_subject(&params.subject)?;
         let binding = self.binding_state(params.subject.application_instance_id)?;
+        // `from_node` names the first node the reader wants, which is what a continuation
+        // carries. `replay` starts *after* the cursor it is given, so the cursor is one before.
         let from = params
             .from_node
             .as_ref()
-            .map(|node| StreamCursor::new(node.get()));
+            .and_then(|node| node.get().checked_sub(1))
+            .map(StreamCursor::new);
         let replay = self.replay(params.subject.application_instance_id, from, filter)?;
         Ok(AgentSnapshotResult {
             binding,
@@ -231,7 +279,16 @@ impl Broker {
             UpstreamOperation::PromptSubmit
         };
         let admitted = self.check_mutation(caller, &params.target, capability, operation)?;
-        self.dispatch_mutation(&params.target, admitted, operation, None, Vec::new())
+        self.dispatch_mutation(
+            &params.target,
+            admitted,
+            operation,
+            None,
+            UpstreamBody::Prompt {
+                draft_id: params.draft_id.as_ref().copied(),
+                text: params.text.as_ref().map(|text| text.as_str().to_owned()),
+            },
+        )
     }
 
     /// Applies `agent.turn.steer`.
@@ -257,7 +314,9 @@ impl Broker {
             admitted,
             UpstreamOperation::TurnSteer,
             Some(params.turn_id.clone()),
-            params.text.as_str().as_bytes().to_vec(),
+            UpstreamBody::Steer {
+                text: params.text.as_str().to_owned(),
+            },
         )
     }
 
@@ -284,7 +343,7 @@ impl Broker {
             admitted,
             UpstreamOperation::TurnCancel,
             Some(params.turn_id.clone()),
-            Vec::new(),
+            UpstreamBody::Cancel,
         )
     }
 
@@ -367,7 +426,12 @@ impl Broker {
             binding_revision: mutation.binding_revision,
             operation: UpstreamOperation::ApprovalRespond,
             turn_id: None,
-            payload: params.option_id.as_bytes().to_vec(),
+            body: UpstreamBody::Approval {
+                resource_id: params.resource_id,
+                upstream_request_id: admission.upstream_request_id.clone(),
+                method: admission.method.clone(),
+                option_id: params.option_id.clone(),
+            },
         }) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -434,17 +498,23 @@ impl Broker {
                 ),
             })?;
         let token = self.issue_token(binding_id, &invocation, now)?;
-        // The token is the authority for the one invocation that follows. The invocation happens
-        // here; the token is spent afterwards, which is the broker checking that the authority it
-        // issued is still the authority the effect ran under.
+        // The token is spent *before* the effect: spending is what rechecks the binding, the
+        // grant, the revision and the capability against the present, and doing it afterwards
+        // would refuse an action that had already happened. It also means a preparation this host
+        // abandons leaves no token behind to fill the store.
+        let spent = self.spend_token(&kr_protocol::broker::ActionTokenClaim::from(&token))?;
         let outcome = dispatch.submit(&UpstreamRequest {
             application_instance_id: params.target.subject.application_instance_id,
             binding_revision: params.target.binding_revision,
             operation: UpstreamOperation::PluginAction,
             turn_id: None,
-            payload: params.parameters.as_slice().to_vec(),
+            body: UpstreamBody::PluginAction {
+                plugin_id: params.plugin_id.clone(),
+                action: params.action.clone(),
+                draft_id: params.draft_id.as_ref().copied(),
+                parameters: params.parameters.as_slice().to_vec(),
+            },
         })?;
-        let spent = self.spend_token(&kr_protocol::broker::ActionTokenClaim::from(&token))?;
         Ok(PluginActionInvokeResult {
             mutation: AgentMutationResult {
                 binding_revision: spent.binding_revision,
@@ -476,6 +546,32 @@ impl Broker {
         // this a prompt submitted during the gap would be answered as applied with no durable
         // record of it at all.
         self.require_rich_work()?;
+        // And nothing carries an operation to an instance with no transport bound. It is decided
+        // here rather than at the submission, because it is a refusal this host can make and
+        // section 9 makes such a refusal a rejection rather than an outcome nobody can establish.
+        if self
+            .dispatch_for(target.subject.application_instance_id)
+            .is_none()
+        {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "nothing carries a {action} to {}: this instance has no upstream transport \
+                     bound, so the operation is refused rather than reported as applied",
+                    target.subject.application_instance_id
+                ),
+            });
+        }
+        // A component fault disables the rich capabilities of the binding it happened to. When
+        // every binding of this instance is disabled there is nothing left to give a rich
+        // mutation its meaning, and the mutation waits with them.
+        if self.rich_bindings_all_disabled(target.subject.application_instance_id) {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "every component bound to {} has had its rich capabilities disabled",
+                    target.subject.application_instance_id
+                ),
+            });
+        }
         let binding = self.binding_state(target.subject.application_instance_id)?;
         if binding.rich_mutations_suspended {
             return Err(BrokerError::PreconditionFailed {
@@ -617,7 +713,7 @@ impl Broker {
         admitted: AgentMutationResult,
         operation: UpstreamOperation,
         turn_id: Option<kr_protocol::ids::AgentTurnId>,
-        payload: Vec<u8>,
+        body: UpstreamBody,
     ) -> Result<AgentMutationResult> {
         let dispatch = self
             .dispatch_for(target.subject.application_instance_id)
@@ -633,7 +729,7 @@ impl Broker {
             binding_revision: admitted.binding_revision,
             operation,
             turn_id: turn_id.clone(),
-            payload,
+            body,
         })?;
         Ok(AgentMutationResult {
             binding_revision: admitted.binding_revision,

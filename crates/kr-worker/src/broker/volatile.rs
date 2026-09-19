@@ -34,6 +34,15 @@ pub struct VolatileState {
     gap: Option<EvidenceGap>,
     /// The ledger row of the open gap, so committing it updates the record it opened.
     row: Option<i64>,
+    /// The upstreams a recovery still owes a reconciliation.
+    ///
+    /// Rich work comes back when the set is empty and not before: reconciling one upstream says
+    /// nothing about another's pending identifiers, and finishing on the first would make every
+    /// other upstream's resources claimable again unreconciled.
+    owed: std::collections::BTreeSet<(
+        kr_protocol::ids::ApplicationInstanceId,
+        kr_protocol::ids::GatewayConnectionId,
+    )>,
 }
 
 impl Default for VolatileState {
@@ -42,6 +51,7 @@ impl Default for VolatileState {
             mode: GatewayMode::Normal,
             gap: None,
             row: None,
+            owed: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -51,6 +61,61 @@ impl VolatileState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Comes back in the middle of a recovery this host began and did not finish.
+    ///
+    /// The gap is the one that was committed; what has not happened is the reconciliation, and
+    /// until it does rich work stays fenced.
+    pub fn restore_recovering(
+        &mut self,
+        row: i64,
+        gap: EvidenceGap,
+        owed: impl IntoIterator<
+            Item = (
+                kr_protocol::ids::ApplicationInstanceId,
+                kr_protocol::ids::GatewayConnectionId,
+            ),
+        >,
+    ) {
+        self.mode = GatewayMode::Recovering;
+        self.gap = Some(gap);
+        self.row = Some(row);
+        self.owed = owed.into_iter().collect();
+    }
+
+    /// Records which upstreams this recovery owes a reconciliation.
+    pub fn owe_reconciliation(
+        &mut self,
+        owed: impl IntoIterator<
+            Item = (
+                kr_protocol::ids::ApplicationInstanceId,
+                kr_protocol::ids::GatewayConnectionId,
+            ),
+        >,
+    ) {
+        self.owed = owed.into_iter().collect();
+    }
+
+    /// Records that one upstream has been reconciled, and returns what is still owed.
+    pub fn reconciled(
+        &mut self,
+        application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+        connection: kr_protocol::ids::GatewayConnectionId,
+    ) -> usize {
+        self.owed.remove(&(application_instance_id, connection));
+        self.owed.len()
+    }
+
+    /// Returns the upstreams this recovery still owes a reconciliation.
+    #[must_use]
+    pub fn owed(
+        &self,
+    ) -> Vec<(
+        kr_protocol::ids::ApplicationInstanceId,
+        kr_protocol::ids::GatewayConnectionId,
+    )> {
+        self.owed.iter().copied().collect()
     }
 
     /// Returns the current mode.
@@ -168,6 +233,12 @@ impl VolatileState {
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the gateway is not recovering.
     pub fn finish_recovery(&mut self) -> Result<VolatileTransition> {
+        if !self.owed.is_empty() {
+            return Err(BrokerError::invalid(format!(
+                "this recovery still owes {} upstream reconciliation(s)",
+                self.owed.len()
+            )));
+        }
         let transition = self.transition(GatewayMode::Normal, |_| {})?;
         self.gap = None;
         self.row = None;

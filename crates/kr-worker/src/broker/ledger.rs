@@ -159,6 +159,7 @@ impl Ledger {
                      sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
                      opened_at_ms INTEGER NOT NULL,
                      closed_at_ms INTEGER,
+                     reconciled   INTEGER NOT NULL DEFAULT 0,
                      record       BLOB NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS broker_checkpoints (
@@ -826,6 +827,69 @@ impl Ledger {
             )
             .map_err(BrokerError::ledger)?;
         Ok(())
+    }
+
+    /// Marks one gap's recovery as finished, because its upstreams have been reconciled.
+    ///
+    /// Committing a gap and finishing its recovery are two facts, and they are recorded
+    /// separately because a crash between them must leave the fence in place: a resource this
+    /// host may already have answered is not claimable again until an upstream has said what it
+    /// still holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn finish_recovery(&self, row: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE broker_gaps SET reconciled = 1 WHERE sequence = ?1",
+                params![row],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Returns the gap whose recovery has not finished, when there is one.
+    ///
+    /// A restarted worker reads this and comes back fenced rather than normal, because what ends
+    /// a recovery is the upstream, and the upstream has not spoken to this process yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn unfinished_recovery(&self) -> Result<Option<(i64, EvidenceGap)>> {
+        self.connection
+            .query_row(
+                "SELECT sequence, record FROM broker_gaps
+                 WHERE reconciled = 0 ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(BrokerError::ledger)?
+            .map(|(row, bytes)| Ok((row, decode(&bytes)?)))
+            .transpose()
+    }
+
+    /// Returns the highest gateway connection identifier this ledger has seen.
+    ///
+    /// A restarted worker numbers its connections above it. Reusing one would put a new
+    /// connection's identifiers in an old connection's namespace, where a response could
+    /// correlate to a request this host recorded before the restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn highest_connection(&self) -> Result<u64> {
+        let highest: Option<i64> = self
+            .connection
+            .query_row("SELECT MAX(connection_id) FROM broker_pending", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(BrokerError::ledger)?
+            .flatten();
+        Ok(highest.map_or(0, |value| u64::try_from(value).unwrap_or(0)))
     }
 
     /// Reads every recorded gap, oldest first.

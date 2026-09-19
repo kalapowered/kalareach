@@ -3070,9 +3070,14 @@ suspends that instance's rich mutations until the binding is reconciled. The ter
 throughout: suspension is a state a client reads, not an error it hits.
 
 Downstream request identifiers are namespaced by connection, so two connections that both call
-their first request `1` are two different pending resources. The upstream's own identifier is
-carried as text exactly as it wrote it; an upstream identifier never becomes a KalaReach
-identifier. One resource takes one response transition.
+their first request `1` are two different pending resources, and a restarted worker numbers its
+connections above every identifier its ledger holds rather than starting again at one. The
+upstream's own identifier is carried as the text it wrote; an upstream identifier never becomes a
+KalaReach identifier. One resource takes one response transition.
+
+What is not distinguished yet is a numeric `11` from a string `"11"`: both become the same
+identifier text, and a protocol that uses both spellings for different requests would have them
+correlated to one resource.
 
 A frame is read strictly: it is bounded in both directions, it must be a top-level object, and a
 frame that names a member twice is refused rather than resolved, because another participant in the
@@ -3088,9 +3093,10 @@ unsupported is rejected with its own reason. Both tables are pinned to an upstre
 and refused against another.
 
 An upstream reverse request for a filesystem or terminal operation names the agent's own host
-environment and the user the agent runs as. The site comes from the connection rather than from the
-request, so it cannot be pointed at a phone or another desktop client's filesystem. Performing the
-operation is the worker's file and terminal paths' work and is not wired to this yet.
+environment and the user the agent runs as. The instance comes from the connection rather than from
+the request, so it cannot be pointed at another application; the environment and the user are the
+caller's arguments, and deriving them from the launch is work that lands with the transport.
+Performing the operation is the worker's file and terminal paths' and is not wired to this yet.
 
 Every action records how it actually reached the upstream: a typed remote procedure call, an
 authenticated hook response, or terminal input. Terminal input is never an authoritative typed
@@ -3119,7 +3125,9 @@ Storage returning commits the gap: one transaction over the gap and every resour
 in whatever state each actually reached, including the ones the upstream withdrew inside it. A
 failure part way leaves nothing committed and the fence back in place. The gateway is then
 *recovering*, which admits no rich work; what ends that is reconciling the pending identifiers with
-the same upstream, and rich work returns with the reconciliation. Volatile operations are never
+**every** upstream that still had one, and rich work returns with the last of them. A worker that
+dies between the commit and the reconciliation comes back recovering, because what ends a recovery
+is an upstream and no upstream has spoken to the new process. Volatile operations are never
 replayed to manufacture durable history: a resource that lived through a gap says so for the rest
 of its life, and its later transitions are written down like anything else.
 
@@ -3147,8 +3155,9 @@ credential, and neither does any address a diagnostic prints or any argument vec
 
 The credential itself travels in an owner-only file the launched process opens. On a platform where
 the host cannot read back the owning user and the mode bits of the directory it wrote into, that
-file is not written at all: a secret in a file whose protection cannot be proved is worse than no
-file, and the launch authenticates over the endpoint's own access-controlled channel instead.
+file is **not written at all**: a secret in a file whose protection cannot be proved is worse than
+no file. What replaces it there is an exchange over the endpoint's own access-controlled channel,
+which is planned and not built, so bridge registration is a Unix path today.
 
 An executable upgrade affects new launches. An existing binding keeps the binary identity, schema
 and adapter version it was bound to, because the identity is pinned when the process starts and
@@ -3160,9 +3169,10 @@ The method registry decides what an actor must present. The broker decides every
 instance, and the two are separate because a caller can hold every right in the table and still be
 acting on a conversation that changed underneath it.
 
-An agent read names one exact application instance, answers with the capability evidence it was
-answered under, and says how many entries the history filter withheld and whether the range the
-reader asked for had been evicted. A gap is reported, never filled: nothing reconstructs an
+An agent read names one exact application instance. `agent.capabilities` answers with the
+installation's capability map; a snapshot and a command list answer with the binding state they
+were answered at, and a snapshot says how many entries the history filter withheld and whether the
+range the reader asked for had been evicted. A gap is reported, never filled: nothing reconstructs an
 unobserved pending approval from a transcript or a screen.
 
 The shared host-side history filter is not here. A local caller reads the whole retained history,
@@ -3177,10 +3187,16 @@ cancellation names the turn it acts on and is refused rather than redirected whe
 the one running. An approval answer is one of the decisions the request actually offered, checked
 against the retained list before the claim is taken, and it happens once.
 
-Every one of those refusals is decided before the dispatch marker, so a request this host can
-refuse leaves a rejection rather than an outcome nobody can establish. What carries an admitted
-mutation to the upstream is the connector's own transport, and an instance with none bound is one
-whose mutations are refused rather than reported as applied.
+Every refusal named above is decided before the dispatch marker, so a request this host can refuse
+leaves a rejection rather than an outcome nobody can establish. That includes an instance with no
+transport bound and one whose every component has had its rich capabilities disabled: both are
+refused before anything is marked. What a refusal after the marker still covers is the transport's
+own failure, which is what `OUTCOME_UNKNOWN` is for.
+
+What carries an admitted mutation to the upstream is the connector's own transport. The broker
+holds it under `UpstreamDispatch` and submits while the session lock is held, so a transport that
+does not return promptly holds up the session it belongs to; giving the submission its own deadline
+and moving it outside that lock is the work that finishes this.
 
 `plugin.action.invoke` validates the registered action, the grant that action declares, its effect
 class and whether a draft the action needs was named, and then issues the action token that

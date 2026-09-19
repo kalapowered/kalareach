@@ -122,6 +122,31 @@ impl ProfileStore {
         now: &ForegroundMark,
         application_instance_id: ApplicationInstanceId,
     ) -> Result<LaunchProfile> {
+        self.check_executable(intent, now, application_instance_id)?;
+        if let Some(conversation) = intent.saved_conversation.as_ref() {
+            self.conversations
+                .insert(conversation.clone(), application_instance_id);
+        }
+        self.instances
+            .insert(application_instance_id, intent.profile.profile_id.clone());
+        Ok(intent.profile.clone())
+    }
+
+    /// Answers every refusal an execution can make, without publishing anything.
+    ///
+    /// The caller writes the profile's record between this and [`ProfileStore::execute`], so a
+    /// failed write leaves no reservation behind for a launch that never happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Launch`] with the refusal that applies.
+    pub fn check_executable(
+        &self,
+        intent: &LaunchIntent,
+        now: &ForegroundMark,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<()> {
+        let _ = application_instance_id;
         if !now.is_idle() {
             return Err(BrokerError::Launch(LaunchRefusal::ForegroundChanged));
         }
@@ -137,13 +162,7 @@ impl ProfileStore {
                 },
             ));
         }
-        if let Some(conversation) = intent.saved_conversation.as_ref() {
-            self.conversations
-                .insert(conversation.clone(), application_instance_id);
-        }
-        self.instances
-            .insert(application_instance_id, intent.profile.profile_id.clone());
-        Ok(intent.profile.clone())
+        Ok(())
     }
 
     /// Records a manual launch the host detected rather than started.

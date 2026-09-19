@@ -61,9 +61,7 @@ use kr_protocol::broker::{
     CapabilityInvalidation, CapabilityMap, CapabilityRecord, DecodedProjection, DecoderLedgerEntry,
     DecodingTrust, IntegrationMode, LaunchProfile, MAX_RETAINED_SOURCE_BYTES,
 };
-use kr_protocol::gateway::{
-    DownstreamRequestId, Durability, PendingKind, PendingResource, PendingState,
-};
+use kr_protocol::gateway::{DownstreamRequestId, PendingKind, PendingResource, PendingState};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, AgentTurnId, ApplicationInstanceId,
@@ -86,7 +84,7 @@ pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
 pub use crate::broker::methods::{
-    Caller, RegisteredAction, UpstreamDispatch, UpstreamOperation, UpstreamOutcome,
+    Caller, RegisteredAction, UpstreamBody, UpstreamDispatch, UpstreamOperation, UpstreamOutcome,
     UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
@@ -341,6 +339,27 @@ impl Broker {
         }
         let mut profiles = ProfileStore::new();
         profiles.restore(ledger.profiles()?);
+        // A recovery this host began and did not finish comes back as a recovery: what ends one
+        // is an upstream saying what it still holds, and no upstream has spoken to this process.
+        // Starting normal would make a resource this host may already have answered claimable
+        // again.
+        let mut volatile = VolatileState::new();
+        if let Some((row, gap)) = ledger.unfinished_recovery()? {
+            let owed: Vec<(ApplicationInstanceId, GatewayConnectionId)> = arbitration
+                .iter()
+                .filter(|pending| !pending.resource.state.is_terminal())
+                .map(|pending| {
+                    (
+                        pending.resource.application_instance_id,
+                        pending.resource.request.connection,
+                    )
+                })
+                .collect();
+            volatile.restore_recovering(row, gap, owed);
+        }
+        // And connection identifiers are numbered above everything this ledger has seen, so a new
+        // connection never lands in an old one's namespace.
+        let next_connection = ledger.highest_connection()?;
         Ok(Self {
             state: Mutex::new(BrokerState {
                 session_id,
@@ -352,8 +371,8 @@ impl Broker {
                 profiles,
                 arbitration,
                 capabilities: CapabilityOwner::new(),
-                volatile: VolatileState::new(),
-                next_connection: 0,
+                volatile,
+                next_connection,
             }),
         })
     }
@@ -753,6 +772,24 @@ impl Broker {
         }
     }
 
+    /// Returns true when this instance has bindings and every one of them is rich-disabled.
+    ///
+    /// One disabled binding stops that binding's rich capabilities. All of them disabled stops
+    /// the instance's, because there is nothing left to interpret or prepare with.
+    #[must_use]
+    pub fn rich_bindings_all_disabled(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> bool {
+        let state = self.state();
+        let mut bound = state
+            .bindings
+            .values()
+            .filter(|binding| binding.application_instance_id == application_instance_id)
+            .peekable();
+        bound.peek().is_some() && bound.all(|binding| binding.rich_disabled.is_some())
+    }
+
     /// Returns why one binding's rich capabilities are disabled, when they are.
     #[must_use]
     pub fn rich_disabled(&self, binding_id: BrokerBindingId) -> Option<String> {
@@ -850,20 +887,22 @@ impl Broker {
         }
         // The frame *is* the source event, and the broker records it here rather than trusting a
         // caller to record it and then to name the right one. That is what ties an interpretation
-        // to the bytes it is an interpretation of.
+        // to the bytes it is an interpretation of. It is built now and retained only once the
+        // admission has been written, because retaining evicts, and a refused request must not
+        // cost an accepted one its source.
         let instance = state
             .instances
-            .get_mut(&application_instance_id)
+            .get(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         let source_generation = instance.source_generation;
         let source = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
             .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
-        instance.retain(SourceFrame::new(
-            source.clone(),
-            source_generation,
-            frame,
-            now,
-        )?);
+        let source_frame = SourceFrame::new(source.clone(), source_generation, frame, now)?;
+        if state.arbitration.holds_request(&request) {
+            return Err(BrokerError::invalid(format!(
+                "{request} already names a pending resource"
+            )));
+        }
         let resource = PendingResource {
             resource_id: PendingResourceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes())),
             application_instance_id,
@@ -879,12 +918,19 @@ impl Broker {
             // Opaque. A decoder's verified interpretation is what makes it answerable.
             interpretation_verified: false,
         };
-        if resource.durability == Durability::Durable {
+        // What decides whether the row is written is whether the ledger can take a write now,
+        // the same predicate every later transition uses. What the record *says* about itself is
+        // the mode's own durability, which is the honest label for a resource admitted while a
+        // gap was open.
+        if state.volatile.writes_are_durable() {
             state.ledger.record_opaque(&resource)?;
         }
         state
             .arbitration
             .record(resource.clone(), None, Some(source))?;
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            instance.retain(source_frame);
+        }
         Ok((forwarded, Some(resource)))
     }
 
@@ -1185,13 +1231,16 @@ impl Broker {
         application_instance_id: ApplicationInstanceId,
     ) -> Result<LaunchProfile> {
         let mut state = self.state();
-        let profile = state
+        // Refuse first, write second, publish third. A reservation published before its record
+        // was written would outlive a failed write, and the retry would be refused for a launch
+        // that never happened.
+        state
             .profiles
-            .execute(intent, now, application_instance_id)?;
+            .check_executable(intent, now, application_instance_id)?;
         state
             .ledger
-            .put_profile(&profile, Some(application_instance_id))?;
-        Ok(profile)
+            .put_profile(&intent.profile, Some(application_instance_id))?;
+        state.profiles.execute(intent, now, application_instance_id)
     }
 
     /// Records a launch the host detected rather than started.
@@ -1570,18 +1619,35 @@ impl Broker {
                 .fall_back("storage failed again during recovery", carried, now)?;
             return Err(error);
         }
+        // Every upstream that still has an unresolved resource owes a reconciliation before rich
+        // work comes back. Reconciling one says nothing about another's pending identifiers.
+        let owed: Vec<(ApplicationInstanceId, GatewayConnectionId)> = state
+            .arbitration
+            .iter()
+            .filter(|pending| !pending.resource.state.is_terminal())
+            .map(|pending| {
+                (
+                    pending.resource.application_instance_id,
+                    pending.resource.request.connection,
+                )
+            })
+            .collect();
+        state.volatile.owe_reconciliation(owed);
         state.arbitration.clear_volatile_records();
         // Rich work does not come back here. Section 11 requires the pending identifiers to be
         // reconciled with the same upstream first, and that is `reconcile_recovered`, because it
-        // needs something this host does not have yet: what the upstream still holds.
+        // needs something this host does not have yet: what each upstream still holds.
         Ok(beginning)
     }
 
-    /// Finishes recovery, once the upstream has said what it still holds.
+    /// Reconciles one upstream that a recovery owes, and finishes the recovery when it was the
+    /// last one.
     ///
     /// This is the second half of section 11's "commit the gap and reconcile pending IDs with the
     /// same upstream before restoring rich mutation". The reconciliation runs first, so a resource
-    /// this host may already have answered is uncertain before anything can claim it again.
+    /// this host may already have answered is uncertain before anything can claim it again, and
+    /// rich work comes back only when every upstream that had an unresolved resource has said
+    /// what it still holds. The transition is `None` while any of them has not.
     ///
     /// # Errors
     ///
@@ -1592,7 +1658,7 @@ impl Broker {
         scope: ReconcileScope,
         still_open: &[DownstreamRequestId],
         now: TimestampMs,
-    ) -> Result<(Reconciliation, VolatileTransition)> {
+    ) -> Result<(Reconciliation, Option<VolatileTransition>)> {
         {
             let state = self.state();
             if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
@@ -1604,8 +1670,20 @@ impl Broker {
         }
         let reconciliation = self.reconcile_within(scope, still_open, now)?;
         let mut state = self.state();
+        // This upstream is reconciled. Rich work comes back when every one that owed a
+        // reconciliation has given it, and not before.
+        if state
+            .volatile
+            .reconciled(scope.application_instance_id, scope.connection)
+            > 0
+        {
+            return Ok((reconciliation, None));
+        }
+        if let Some(row) = state.volatile.row() {
+            state.ledger.finish_recovery(row)?;
+        }
         let finished = state.volatile.finish_recovery()?;
-        Ok((reconciliation, finished))
+        Ok((reconciliation, Some(finished)))
     }
 
     // -- adapter checkpoints ------------------------------------------------------------------

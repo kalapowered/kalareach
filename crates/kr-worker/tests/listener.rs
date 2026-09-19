@@ -50,7 +50,7 @@ fn registration(address: ListenerAddress) -> Registration {
 
 fn hello() -> BridgeHello {
     BridgeHello {
-        credential: CREDENTIAL.to_vec(),
+        credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
         process: process(41, 900),
         environment_session_id: Some("KR_SESSION=abc".to_owned()),
     }
@@ -104,8 +104,9 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
     let registration = registration(address.clone());
     let managed = managed(process(41, 900));
     let unauthenticated = BridgeHello {
-        credential: Vec::new(),
-        ..hello()
+        credential: kr_crypto::secret::SecretVec::new(Vec::new()),
+        process: process(41, 900),
+        environment_session_id: None,
     };
     assert!(
         registration
@@ -148,7 +149,7 @@ fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_t
 
     // The session identifier from the environment, and nothing else.
     let session_only = BridgeHello {
-        credential: Vec::new(),
+        credential: kr_crypto::secret::SecretVec::new(Vec::new()),
         process: process(41, 900),
         environment_session_id: Some("KR_SESSION=abc".to_owned()),
     };
@@ -161,8 +162,9 @@ fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_t
 
     // The private exchange from a process this host did not launch.
     let elsewhere = BridgeHello {
+        credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
         process: process(77, 900),
-        ..hello()
+        environment_session_id: None,
     };
     assert!(
         registration
@@ -172,8 +174,9 @@ fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_t
 
     // The right process with a recycled identifier.
     let recycled = BridgeHello {
+        credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
         process: process(41, 999),
-        ..hello()
+        environment_session_id: None,
     };
     assert!(
         registration
