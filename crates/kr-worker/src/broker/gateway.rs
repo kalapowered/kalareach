@@ -433,6 +433,38 @@ impl Gateway {
     }
 }
 
+/// Reads one JSON number as a JSON-RPC error code, or returns `None` when it is not one.
+///
+/// A code is valid when the number is finite and its value is a whole number in the signed 64-bit
+/// range, whatever the upstream spelled it as: `-32601`, `-32601.0`, `-3.2601e4` and `-0` are one
+/// code, and `-32601.5`, `0.5`, a value outside the range, and the infinities and not-a-numbers a
+/// lenient parser might produce are not codes at all.
+///
+/// One limitation is worth naming, because the value is all this host sees. A number that needed
+/// more precision than a double has already been rounded by the time it arrives, so
+/// `1.00000000000000001` is read as `1`. Distinguishing the two needs the number's own text.
+fn error_code(code: &serde_json::Number) -> Option<i64> {
+    if let Some(value) = code.as_i64() {
+        return Some(value);
+    }
+    let value = code.as_f64()?;
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    // The bounds are the powers of two either side of the range, because i64::MAX has no exact
+    // double and comparing against its rounded form would admit one value too many.
+    const LOWEST: f64 = -9_223_372_036_854_775_808.0;
+    const PAST_HIGHEST: f64 = 9_223_372_036_854_775_808.0;
+    if !(LOWEST..PAST_HIGHEST).contains(&value) {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the value is whole and inside the signed 64-bit range"
+    )]
+    Some(value as i64)
+}
+
 /// Checks that an error member carries an error.
 ///
 /// JSON-RPC 2.0 §5.1: an error is an object with a numeric `code` and a `message` string. A member
@@ -444,23 +476,14 @@ fn check_error_payload(error: &serde_json::Value, field: &str) -> Result<()> {
             "{field} is not an object, so it reports no failure"
         ))
     })?;
-    // JSON-RPC §5.1 asks for an integer value, and not for one that fits a signed 64-bit word: a
-    // code above that range is still an integer and is accepted.
-    //
-    // A code that parsed as a floating number is refused instead of being tested for an integral
-    // value, because by then parsing has already rounded it: 1.00000000000000001 arrives as 1.0
-    // and 1e-400 as 0.0, so a fractional code would be admitted as the whole one it became, and
-    // the resource would resolve on a code the upstream never sent. The cost is that -32601.0,
-    // -3.2601e4 and -0 are refused although their values are integers. Accepting those without
-    // accepting a rounded one needs the number's own text, which this host cannot see: the
-    // handoff records what that needs.
-    let integral = object
+    if object
         .get("code")
         .and_then(serde_json::Value::as_number)
-        .is_some_and(|code| code.is_i64() || code.is_u64());
-    if !integral {
+        .and_then(error_code)
+        .is_none()
+    {
         return Err(BrokerError::invalid(format!(
-            "{field} carries no integer code, so it reports no failure"
+            "{field} carries no integer code in the signed 64-bit range, so it reports no failure"
         )));
     }
     if !object
@@ -991,6 +1014,53 @@ mod tests {
                 .forward_native(GatewayConnectionId::new(1), &oversized)
                 .is_err()
         );
+    }
+
+    /// D-074: a code is valid when the number is finite and its value is a whole number in the
+    /// signed 64-bit range, whatever the upstream spelled it as. Every example the reviews of this
+    /// path raised is listed here with the verdict the rule gives it.
+    #[test]
+    fn an_error_code_is_a_whole_number_in_range_however_it_is_spelled() {
+        for (spelling, expected) in [
+            ("-32601", Some(-32601)),
+            ("-32601.0", Some(-32601)),
+            ("-3.2601e4", Some(-32601)),
+            ("-0", Some(0)),
+            ("0", Some(0)),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            // Whole, and outside the range a code is read into.
+            ("9223372036854775808", None),
+            ("1e30", None),
+            // Not whole.
+            ("-32601.5", None),
+            ("0.5", None),
+            ("-3.5", None),
+            // Rounded by the parser before this host sees it. The rule reads the value it was
+            // given, and the limitation is named where the rule is: each of these is one unit of
+            // last place away from a value that is in range and whole.
+            ("1.00000000000000001", Some(1)),
+            ("1e-400", Some(0)),
+            ("-9223372036854775809", Some(i64::MIN)),
+        ] {
+            let number: serde_json::Number =
+                serde_json::from_str(spelling).expect("the example is a JSON number");
+            assert_eq!(
+                error_code(&number),
+                expected,
+                "{spelling} is {}",
+                if expected.is_some() {
+                    "a code"
+                } else {
+                    "not a code"
+                }
+            );
+        }
+        // A lenient producer's infinities and not-a-numbers are not codes either. `serde_json`
+        // will not parse them, so they are built rather than read.
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(serde_json::Number::from_f64(value).is_none());
+        }
     }
 
     #[test]

@@ -698,14 +698,8 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
         r#"{"id":"11","error":{"message":"no such method"}}"#,
         r#"{"id":"11","error":{"code":"-32601","message":"no such method"}}"#,
         r#"{"id":"11","error":{"code":-3.5,"message":"no such method"}}"#,
-        // A code that parsed as a floating number has already been rounded, so this host cannot
-        // tell 1.00000000000000001 from the 1 it became, and does not resolve a resource on a
-        // code the upstream may never have sent. The cost is that an integer spelled with a point
-        // or an exponent is refused too.
-        r#"{"id":"11","error":{"code":1.00000000000000001,"message":"no such method"}}"#,
-        r#"{"id":"11","error":{"code":1e-400,"message":"no such method"}}"#,
-        r#"{"id":"11","error":{"code":-32601.0,"message":"no such method"}}"#,
-        r#"{"id":"11","error":{"code":-3.2601e4,"message":"no such method"}}"#,
+        // Whole, and outside the range a code is read into.
+        r#"{"id":"11","error":{"code":9223372036854775808,"message":"no such method"}}"#,
     ] {
         assert!(
             broker
@@ -726,8 +720,9 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
         PendingState::Pending
     );
 
-    // A code beyond a signed 64-bit word is still an integer, and refusing it would leave a
-    // resource pending on a real answer.
+    // An integer is an integer however it is spelled, so refusing one of these would leave a
+    // resource pending on a real answer. The rule itself is exercised in full by the gateway's
+    // own unit test.
     for (id, spelling) in [
         (
             "21",
@@ -735,7 +730,15 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
         ),
         (
             "22",
-            r#"{"id":22,"error":{"code":9223372036854775808,"message":"no such method"}}"#,
+            r#"{"id":22,"error":{"code":-32601.0,"message":"no such method"}}"#,
+        ),
+        (
+            "23",
+            r#"{"id":23,"error":{"code":-3.2601e4,"message":"no such method"}}"#,
+        ),
+        (
+            "24",
+            r#"{"id":24,"error":{"code":-0,"message":"no such method"}}"#,
         ),
     ] {
         let opened = broker
