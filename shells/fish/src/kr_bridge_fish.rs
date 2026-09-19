@@ -191,8 +191,12 @@ struct BridgeState {
     pending_target: bool,
     /// True while `get-key` waits for the literal key it reports rather than acts on.
     pending_literal_key: bool,
-    /// True while the decoder holds the first bytes of a character it has not finished.
-    partial_character: bool,
+    /// The byte a character or sequence the decoder has not finished started with.
+    partial_character: Option<u8>,
+    /// How many bytes it is holding, which are what a cancellation throws away.
+    partial_bytes: usize,
+    /// True once a takeover has ended the decoder's wait, until the decoder has given the bytes up.
+    decoder_cancelled: bool,
     /// True while the reader holds characters it has taken and not yet put in the buffer.
     accumulated_characters: bool,
     /// True when the character being judged came from the reader's own queue.
@@ -240,7 +244,9 @@ static STATE: BridgeStateCell = BridgeStateCell(UnsafeCell::new(BridgeState {
     key_selected: false,
     pending_target: false,
     pending_literal_key: false,
-    partial_character: false,
+    partial_character: None,
+    partial_bytes: 0,
+    decoder_cancelled: false,
     accumulated_characters: false,
     source_pushed_back: false,
     idle_reported: false,
@@ -451,7 +457,7 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
     // counts.
     out.partial_key_drained = c_int::from(
         !(state.in_key_wait && state.peeked_keys > 0)
-            && !state.partial_character
+            && state.partial_character.is_none()
             && !state.accumulated_characters
             && data.input_data.paste_buffer.is_none()
             && !state.pending_target
@@ -547,9 +553,16 @@ pub unsafe extern "C" fn kr_shell_cancel_key_wait(out: *mut KrCancellation) {
     });
     let state = state();
     let partial = state.in_key_wait && state.peeked_keys > 0;
+    // Bytes the decoder is holding are part of a key that has not been resolved either, and the
+    // byte they start with is what tells an unfinished escape sequence from an unfinished
+    // character.
+    let decoding = state.partial_character.is_some();
 
-    out.partial_escape = c_int::from(partial && state.invoking_keys.first() == Some(&0x1b));
-    out.multikey_sequence = c_int::from(partial);
+    out.partial_escape = c_int::from(
+        (partial && state.invoking_keys.first() == Some(&0x1b))
+            || state.partial_character == Some(0x1b),
+    );
+    out.multikey_sequence = c_int::from(partial || (decoding && state.partial_character != Some(0x1b)));
     out.quoted_insertion = c_int::from(state.pending_literal_key);
     out.vi_motion = c_int::from(state.pending_target);
     out.macro_input = c_int::from(queued > 0);
@@ -564,12 +577,17 @@ pub unsafe extern "C" fn kr_shell_cancel_key_wait(out: *mut KrCancellation) {
         || out.vi_motion != 0
         || out.macro_input != 0
     {
-        // What the drain will throw away: the bytes the person's own queued input arrived as,
-        // and the bytes of the sequence this reader had peeked and not resolved.
-        out.discarded_bytes = (queued_bytes + state.peeked_bytes) as c_ulong;
+        // What the drain will throw away: the bytes the person's own queued input arrived as, the
+        // bytes of the sequence this reader had peeked and not resolved, and the bytes the
+        // decoder is holding for a character or sequence it has not finished.
+        out.discarded_bytes = (queued_bytes + state.peeked_bytes + state.partial_bytes) as c_ulong;
         // The reader is inside something, so it is brought out of it: the wait ends here and the
         // old lease's undelivered input is dropped at the boundary that follows.
         state.cancel_requested = true;
+        if decoding {
+            // The decoder is inside a wait of its own, and what it is holding goes no further.
+            state.decoder_cancelled = true;
+        }
     } else {
         // Nothing was in progress, so there is nothing to unwind and nothing to throw away. The
         // reader stays in the wait it is in, and a sequence the person starts afterwards is not
@@ -723,7 +741,13 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
         // it is still underneath, so it comes back when this one leaves.
         emit_leave(reader, KR_LEAVE_READER_TAKEOVER);
     }
-    state().reader_depth += 1;
+    {
+        let state = state();
+        state.reader_depth += 1;
+        // A reader that is starting announces itself; whatever was waiting to be announced is
+        // underneath this one and waits for it to leave.
+        state.resume_pending = false;
+    }
     let primary = reader.kr_is_primary();
     {
         let state = state();
@@ -734,6 +758,9 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
         state.invoking_keys.clear();
         state.peeked_keys = 0;
         state.peeked_bytes = 0;
+        state.partial_character = None;
+        state.partial_bytes = 0;
+        state.decoder_cancelled = false;
         state.in_key_wait = false;
         state.key_selected = false;
         state.pending_target = false;
@@ -1036,9 +1063,30 @@ pub fn note_pending_literal_key(active: bool) {
     state().pending_literal_key = active;
 }
 
-/// The decoder holding the first bytes of a character it has not finished.
-pub fn note_partial_character(active: bool) {
-    state().partial_character = active;
+/// The decoder holding the first bytes of a character or a sequence it has not finished.
+///
+/// `first` is the byte it started with, which is what tells an unfinished escape sequence from an
+/// unfinished character; `None` says it is holding nothing.
+pub fn note_partial_character(first: Option<u8>) {
+    let state = state();
+    state.partial_character = first;
+    state.partial_bytes = usize::from(first.is_some());
+}
+
+/// One more byte taken for the character or sequence the decoder is holding.
+pub fn note_partial_byte() {
+    let state = state();
+    if state.partial_character.is_some() {
+        state.partial_bytes += 1;
+    }
+}
+
+/// True once, when a takeover ended the wait the decoder was in.
+///
+/// The decoder asks this where it would turn what it holds into a key. A cancellation ended that
+/// wait, so the bytes are the old lease's undelivered input and nothing is made of them.
+pub fn decoder_cancelled() -> bool {
+    std::mem::take(&mut state().decoder_cancelled)
 }
 
 /// The reader holding characters it has taken from the terminal and not yet put in the buffer.

@@ -165,18 +165,19 @@
  use super::{
      binding::match_key_event_to_key,
      input::{
-@@ -43,6 +45,10 @@
+@@ -43,6 +45,11 @@
  
  trait InputEventQueuerExt: InputEventQueuer {
      fn on_byte_read(&mut self, read_byte: u8) {
 +        // Bytes this reader has taken and not yet turned into a key are input it still owes the
 +        // buffer, so it is not between operations while it holds them. This covers the rest of a
-+        // character and the rest of an escape sequence alike.
-+        kr_bridge::note_partial_character(true);
++        // character and the rest of an escape sequence alike, and the byte it starts with is
++        // what tells one from the other.
++        kr_bridge::note_partial_character(Some(read_byte));
          let mut buffer = vec![read_byte];
          let escape_sequence = if read_byte == b'\x1b' {
              self.parse_escape_sequence(&mut buffer, false)
-@@ -57,12 +63,31 @@
+@@ -57,12 +64,31 @@
              }
          };
          let (decoded_buffer, mut is_err) = match decode_utf8_at_least_one(&mut buffer, |buffer| {
@@ -214,15 +215,21 @@
          }) {
              Ok(decoded) => (decoded, false),
              Err(evt) => {
-@@ -70,6 +95,7 @@
+@@ -70,6 +96,13 @@
                  (Default::default(), true)
              }
          };
-+        kr_bridge::note_partial_character(false);
++        kr_bridge::note_partial_character(None);
++        if kr_bridge::decoder_cancelled() {
++            // A takeover ended the wait for the rest of this character or sequence. The bytes it
++            // was holding are the old lease's undelivered input, so they are dropped here rather
++            // than turned into a key: nothing of them reaches a binding or the edit buffer.
++            return;
++        }
          is_err |= matches!(escape_sequence.state, EscapeSequenceParseState::Error);
          let mut evt = (!is_err).then(|| {
              match escape_sequence.state {
-@@ -707,7 +733,9 @@
+@@ -707,7 +740,9 @@
  
  fn decode_utf8_at_least_one(
      buffer: &mut Vec<u8>,
@@ -235,7 +242,15 @@
      loop {
 --- a/src/input/input.rs
 +++ b/src/input/input.rs
-@@ -21,7 +21,7 @@
+@@ -13,6 +13,7 @@
+     universal_notifier::default_notifier,
+     wutil::{fish_is_pua, fish_wcstol},
+ };
++use crate::reader::kr_bridge;
+ use fish_common::read_blocked;
+ use fish_feature_flags::{FeatureFlag, feature_test};
+ use nix::errno::Errno;
+@@ -21,7 +22,7 @@
      collections::VecDeque,
      os::fd::{BorrowedFd, RawFd},
      sync::atomic::{AtomicUsize, Ordering},
@@ -244,7 +259,7 @@
  };
  
  #[derive(Clone, Debug, PartialEq)]
-@@ -482,9 +482,18 @@
+@@ -482,9 +483,18 @@
                  return mevt;
              }
  
@@ -263,7 +278,7 @@
                  if self.is_blocked_querying() {
                      Timeout::Duration(self.get_input_data().blocking_query_timeout.unwrap())
                  } else {
-@@ -507,6 +516,10 @@
+@@ -507,6 +517,10 @@
                      self.ioport_notified();
                  }
  
@@ -274,7 +289,7 @@
                  InputEventTrigger::Byte(read_byte) => {
                      on_byte_read(self, read_byte);
                  }
-@@ -537,11 +550,36 @@
+@@ -537,11 +551,36 @@
              return Some(evt);
          }
  
@@ -316,7 +331,7 @@
      }
  
      /// Return the fd from which to read.
-@@ -554,6 +592,33 @@
+@@ -554,6 +593,33 @@
          -1
      }
  
@@ -350,7 +365,7 @@
      /// Return the input data. This is to be implemented by the concrete type.
      fn get_input_data(&self) -> &InputData;
      fn get_input_data_mut(&mut self) -> &mut InputData;
-@@ -710,16 +775,16 @@
+@@ -710,16 +776,16 @@
                  Duration::from_millis(ms)
              }
          };
@@ -377,7 +392,11 @@
              flog!(
                  reader,
                  format!("Incomplete escape sequence: {}", DisplayBytes(buffer))
-@@ -740,6 +805,36 @@
+@@ -737,9 +803,40 @@
+         }
+         let next = readb(fd)?;
+         buffer.push(next);
++        kr_bridge::note_partial_byte();
          Some(next)
      }
  
@@ -414,7 +433,7 @@
      /// Return if we have any lookahead.
      #[cfg(test)]
      fn has_lookahead(&self) -> bool {
-@@ -775,6 +870,9 @@
+@@ -775,6 +872,9 @@
      // Our ioport reported a change, so service main thread requests.
      IOPortNotified,
  
@@ -424,7 +443,7 @@
      // No file descriptor was ready within the query timeout.
      TimeoutElapsed,
  }
-@@ -795,6 +893,8 @@
+@@ -795,6 +895,8 @@
  pub(super) fn next_input_event(
      in_fd: RawFd,
      ioport_fd: RawFd,
@@ -433,7 +452,7 @@
      timeout: Timeout,
  ) -> InputEventTrigger {
      let mut fdset = FdReadableSet::new();
-@@ -805,6 +905,13 @@
+@@ -805,6 +907,13 @@
          // Add the completion ioport (possibly -1 - a no-op).
          fdset.add(ioport_fd);
  
@@ -447,7 +466,7 @@
          // Get the uvar notifier fd (possibly none).
          let notifier = default_notifier();
          let notifier_fd = notifier.notification_fd();
-@@ -843,6 +950,12 @@
+@@ -843,6 +952,12 @@
              return readb(in_fd).map_or(InputEventTrigger::Eof, InputEventTrigger::Byte);
          }
  
@@ -460,7 +479,7 @@
          // Check for iothread completions only if there is no data to be read from the stdin.
          // This gives priority to the foreground.
          if fdset.test(ioport_fd) {
-@@ -851,6 +964,9 @@
+@@ -851,6 +966,9 @@
      }
  }
  
