@@ -134,15 +134,22 @@ impl HomeLayout {
         const PROFILE: &str = "Microsoft.PowerShell_profile.ps1";
 
         if cfg!(windows) {
-            // `Documents` is redirected when OneDrive's known-folder move is on, and the variable
-            // it sets is what says where. Without it the profile directory is under the user's own
-            // profile, which `USERPROFILE` names and `HOME` usually does not.
-            let documents = self
+            // `Documents` is redirected when OneDrive's known-folder move is on, and the directory
+            // that exists is what says whether it was: OneDrive can be installed without the move,
+            // and a profile written where PowerShell does not read it is an entry that never runs.
+            // Without either, the profile directory is under the user's own profile, which
+            // `USERPROFILE` names and `HOME` usually does not.
+            let redirected = self
                 .onedrive
-                .clone()
-                .or_else(|| self.user_profile.clone())
-                .unwrap_or_else(|| self.home.clone())
-                .join("Documents");
+                .as_ref()
+                .map(|onedrive| onedrive.join("Documents"))
+                .filter(|documents| documents.is_dir());
+            let documents = redirected.unwrap_or_else(|| {
+                self.user_profile
+                    .clone()
+                    .unwrap_or_else(|| self.home.clone())
+                    .join("Documents")
+            });
             return documents.join("PowerShell").join(PROFILE);
         }
         self.xdg_config_home
@@ -187,7 +194,15 @@ fn sources_bashrc(line: &str) -> bool {
     if line.starts_with('#') {
         return false;
     }
-    let words: Vec<&str> = line.split_whitespace().collect();
+    // A comment starts at a `#` that begins a word, and everything after it is text rather than a
+    // command: `export EDITOR=vim # source ~/.bashrc` runs nothing of the kind.
+    let mut words = Vec::new();
+    for word in line.split_whitespace() {
+        if word.starts_with('#') {
+            break;
+        }
+        words.push(word);
+    }
     words.windows(2).any(|pair| {
         let verb = pair[0].trim_start_matches([';', '&', '|']);
         if verb != "source" && verb != "." {
@@ -337,41 +352,94 @@ pub fn remove(path: &Path) -> std::io::Result<Change> {
 /// How long a startup write waits for another one to finish before it gives up.
 const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How old a lock file has to be before it is taken for one nobody is holding.
-///
-/// A startup write is a read, a rebuild and a rename of a small file. One that has held the lock
-/// for this long is not running; it is a process that died with the file still there, and leaving
-/// it would make every later write fail on a machine that had crashed once.
-const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// A lock beside one startup file, held for a whole read-rebuild-write.
 ///
 /// This is what closes the window between the check before the rename and the rename itself, for
 /// the writer that window was about: another `kr` process installing or removing the same entry.
-/// The lock is a file created exclusively beside the startup file, so the two processes need no
-/// agreement beyond the directory they are both writing in.
+/// The lock file sits beside the startup file, so the two processes need no agreement beyond the
+/// directory they are both writing in.
+///
+/// On Unix the lock is the kernel's, taken on the open file with `flock`, so a holder that dies
+/// releases it and no staleness rule is needed. Elsewhere it is the exclusive creation of the file
+/// itself, and a lock file a crash left behind is reclaimed after [`LOCK_STALE_AFTER`].
 ///
 /// It says nothing about an editor. A person who saves the file between the check and the rename
 /// still has that save replaced, and closing that would need the platform to offer a comparison
 /// and a rename in one step.
+#[derive(Debug)]
 struct FileLock {
+    /// The lock file, while this guard holds it.
     path: PathBuf,
+    /// The open file the kernel's lock is on, released when this guard drops it.
+    #[cfg(unix)]
+    held: Option<std::fs::File>,
 }
 
 impl FileLock {
+    /// Returns where one startup file's lock lives.
+    fn beside(path: &Path) -> std::io::Result<PathBuf> {
+        let target = resolved(path)?;
+        let directory = target
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let name = target.file_name().map_or_else(
+            || String::from("startup"),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        // The directory has to be there before anything in it can be locked, and it is this
+        // command's to create: a first-time setup writes a profile into a directory the user does
+        // not have yet, and a write with no lock taken is the thing this exists to prevent.
+        std::fs::create_dir_all(&directory)?;
+        Ok(directory.join(format!(".{name}.kalareach-lock")))
+    }
+
     /// Takes the lock for one startup file, waiting for a holder that is still working.
     ///
     /// # Errors
     ///
     /// Returns the underlying failure, or a timeout when another writer held it throughout.
+    #[cfg(unix)]
     fn take(path: &Path) -> std::io::Result<Self> {
-        let target = resolved(path)?;
-        let directory = target.parent().unwrap_or_else(|| Path::new("."));
-        let name = target.file_name().map_or_else(
-            || String::from("startup"),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        let lock = directory.join(format!(".{name}.kalareach-lock"));
+        let lock = Self::beside(path)?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)?;
+        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: lock,
+                        held: Some(file),
+                    });
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => {}
+                Err(error) => return Err(std::io::Error::from(error)),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "another kr process is writing {}; nothing was written",
+                        path.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// Takes the lock for one startup file, waiting for a holder that is still working.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying failure, or a timeout when another writer held it throughout.
+    #[cfg(not(unix))]
+    fn take(path: &Path) -> std::io::Result<Self> {
+        let lock = Self::beside(path)?;
         let deadline = std::time::Instant::now() + LOCK_PATIENCE;
         loop {
             match std::fs::OpenOptions::new()
@@ -387,46 +455,55 @@ impl FileLock {
                     let _ = writeln!(file, "kr {}", std::process::id());
                     return Ok(Self { path: lock });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock
-                        .metadata()
-                        .and_then(|data| data.modified())
-                        .is_ok_and(|written| {
-                            written.elapsed().is_ok_and(|age| age > LOCK_STALE_AFTER)
-                        })
-                    {
-                        // Nobody is holding it. Removing it races another writer doing the same,
-                        // and the loser simply takes the lock the winner released.
-                        let _ = std::fs::remove_file(&lock);
-                        continue;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!(
-                                "another kr process is writing {}; nothing was written",
-                                target.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                // The directory is not there yet, which is the caller's to create. A lock it
-                // cannot take is not a reason to refuse the write: the file cannot exist either.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Self {
-                        path: PathBuf::new(),
-                    });
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
+            // The deadline is checked on every path out of the attempt, including the one that
+            // reclaims a lock file nobody is holding: a removal that keeps failing must not loop
+            // for ever.
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "another kr process is writing {}; nothing was written",
+                        path.display()
+                    ),
+                ));
+            }
+            if lock
+                .metadata()
+                .and_then(|data| data.modified())
+                .is_ok_and(|written| written.elapsed().is_ok_and(|age| age > LOCK_STALE_AFTER))
+            {
+                // Nobody is holding it. Removing it races another writer doing the same, and the
+                // loser simply takes the lock the winner released.
+                let _ = std::fs::remove_file(&lock);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
 }
 
+/// How old a lock file has to be before it is taken for one nobody is holding.
+///
+/// Only where the kernel will not hold the lock for us. A startup write is a read, a rebuild and a
+/// rename of a small file; one that has held the lock for this long is a process that died with
+/// the file still there, and leaving it would make every later write fail on a machine that had
+/// crashed once.
+#[cfg(not(unix))]
+const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Drop for FileLock {
     fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() {
+        #[cfg(unix)]
+        {
+            // The file is removed while the lock is still held, so nobody can be waiting on the
+            // name this removes; the kernel releases the lock when the file closes with this guard.
+            let _ = std::fs::remove_file(&self.path);
+            drop(self.held.take());
+        }
+        #[cfg(not(unix))]
+        {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -663,6 +740,8 @@ mod tests {
             "echo 'see .bashrc for the aliases'\n",
             "BASHRC=~/.bashrc\n",
             "# . ~/.bashrc\n",
+            "export EDITOR=vim # source ~/.bashrc\n",
+            "PS1='> ' ## . ~/.bashrc\n",
         ] {
             std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
             assert_eq!(
@@ -698,23 +777,14 @@ mod tests {
 
         // A lock is taken for the whole read-rebuild-write, so a writer that is not this process
         // is kept out rather than racing the rename.
+        let lock = FileLock::beside(&path).expect("names the lock");
         let held = FileLock::take(&path).expect("takes the lock");
-        let lock = root
-            .path()
-            .join(".{}.kalareach-lock".replace("{}", ".zshrc"));
         assert!(lock.is_file(), "the lock is beside the file it is about");
+        // A second attempt waits for the first and gives up rather than writing beside it.
+        let refused = FileLock::take(&path).expect_err("one writer at a time");
+        assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
         drop(held);
         assert!(!lock.exists(), "and it goes when the write is finished");
-
-        // A lock nobody is holding does not stop a write for ever.
-        std::fs::write(&lock, "kr 1\n").expect("writes a lock file");
-        let stale =
-            std::time::SystemTime::now() - LOCK_STALE_AFTER - std::time::Duration::from_secs(1);
-        std::fs::File::open(&lock)
-            .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(stale)))
-            .expect("ages the lock file");
-        let reclaimed = FileLock::take(&path).expect("reclaims a lock nobody is holding");
-        drop(reclaimed);
 
         let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
@@ -725,6 +795,25 @@ mod tests {
             "the user's own line is still first"
         );
         assert!(!lock.exists(), "and no lock is left behind");
+    }
+
+    /// KR-REQ-07.29: a first-time setup creates the directory and still takes a lock in it.
+    #[test]
+    fn a_profile_in_a_directory_that_is_not_there_yet_is_written_under_a_lock() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join("config/powershell/profile.ps1");
+        let lock = FileLock::beside(&path).expect("names the lock");
+        assert!(
+            lock.parent().expect("a directory").is_dir(),
+            "the directory the lock lives in is created before the lock is taken"
+        );
+        let held = FileLock::take(&path).expect("takes the lock");
+        assert!(lock.is_file());
+        drop(held);
+
+        let body = entry(ShellKind::PowerShell, Path::new("/opt/kr/entry.ps1"), false);
+        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert!(installed(&path));
     }
 
     /// KR-REQ-07.40: a filesystem whose identity numbers move does not refuse a legitimate write.

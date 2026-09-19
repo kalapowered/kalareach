@@ -232,48 +232,69 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     // The reading has a deadline. A session facility that has stopped answering must not hold this
     // probe open: what a command that did not finish in time establishes is nothing, which is what
     // `NotRun` means, and never that a desktop ended.
-    // Both pipes are drained while the wait runs. A command that prints more than one pipe holds
-    // blocks until somebody reads it, and a wait that was not reading would call that a timeout.
-    let collecting = |stream: Option<std::process::ChildStdout>| {
+    // Both pipes are drained while the wait runs, by threads that send what they read rather than
+    // by joins this wait would sit on: a command that prints more than one pipe holds blocks until
+    // somebody reads it, and a descendant that inherited a pipe can hold it open after the child
+    // this host started has gone. Neither may outlast the deadline.
+    let reading = |stream: Option<std::process::ChildStdout>| {
         stream.map(|mut stream| {
+            let (said, heard) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 use std::io::Read as _;
 
-                let mut said = Vec::new();
-                let _ = stream.read_to_end(&mut said);
-                said
-            })
+                let mut read = Vec::new();
+                let _ = stream.read_to_end(&mut read);
+                let _ = said.send(read);
+            });
+            heard
         })
     };
-    let out = collecting(child.stdout.take());
+    let out = reading(child.stdout.take());
     let err = child.stderr.take().map(|mut stream| {
+        let (said, heard) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::Read as _;
 
-            let mut said = Vec::new();
-            let _ = stream.read_to_end(&mut said);
-            said
-        })
+            let mut read = Vec::new();
+            let _ = stream.read_to_end(&mut read);
+            let _ = said.send(read);
+        });
+        heard
     });
     let deadline = std::time::Instant::now() + PROBE_DEADLINE;
+    let mut ended = false;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                ended = true;
+                break Some(status);
+            }
             Ok(None) => {}
+            // The wait itself failed, which says nothing about the child: it is ended and reaped
+            // here rather than left behind.
             Err(_) => break None,
         }
         if std::time::Instant::now() >= deadline {
-            // Terminated and reaped: a child left running would outlive every probe after it, and
-            // one left unreaped would outlive the process.
-            let _ = child.kill();
-            let _ = child.wait();
             break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    let taken = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
-        reader
-            .and_then(|reader| reader.join().ok())
+    if !ended {
+        // Terminated and reaped: a child left running would outlive every probe after it, and one
+        // left unreaped would outlive the process.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // What the readers managed to send by the deadline. A reader that is still waiting on a pipe
+    // some descendant holds open is left to end on its own; this reading is over.
+    let taken = |heard: Option<std::sync::mpsc::Receiver<Vec<u8>>>| {
+        heard
+            .and_then(|heard| {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                heard
+                    .recv_timeout(left.max(std::time::Duration::from_millis(50)))
+                    .ok()
+            })
             .unwrap_or_default()
     };
     let printed = taken(out);

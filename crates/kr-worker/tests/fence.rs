@@ -431,19 +431,22 @@ async fn wired_profiled(
     register: bool,
     launch_profile: kr_protocol::session::LaunchProfile,
 ) -> Wired {
+    wired_built(mode, register, move |config| {
+        config.launch_profile = launch_profile.clone();
+    })
+    .await
+}
+
+async fn wired_built(
+    mode: ShellMode,
+    register: bool,
+    describe: impl FnOnce(&mut SessionConfig),
+) -> Wired {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let mut config = configuration(&temp, mode);
-    config.launch_profile = launch_profile;
-    // The endpoint this session answers on, which is what a worker-owned backend is. It is bound
-    // below, before anything reaches it.
-    config.worker_endpoint = Some(
-        environment
-            .worker_endpoint(DisplayNumber::new(1))
-            .expect("an endpoint")
-            .as_text(),
-    );
+    describe(&mut config);
     let session_id = config.session_id;
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -1052,6 +1055,15 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
         }
 
         let wired = wired_desktop_bound().await;
+        assert!(
+            wired
+                .runtime
+                .session()
+                .desktop_probe(std::time::Instant::now())
+                .is_some(),
+            "a desktop-bound session wants a reading, which is what is queued behind the occupied \
+             blocking thread"
+        );
         let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
             .await
             .expect("connects");
@@ -1083,6 +1095,10 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
             delivered.is_ok(),
             "the held input reached the terminal while the desktop reading was still outstanding"
         );
+        assert!(
+            !holding.is_finished(),
+            "the only blocking thread is still occupied, so the reading had not been taken"
+        );
         holding.abort();
         wired.close().await;
     });
@@ -1090,11 +1106,10 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
 
 /// A managed session bound to this host's desktop, with its bridge registered.
 async fn wired_desktop_bound() -> Wired {
-    wired_profiled(
-        ShellMode::Managed,
-        true,
-        kr_protocol::session::LaunchProfile::default(),
-    )
+    wired_built(ShellMode::Managed, true, |config| {
+        // Desktop-bound, so its watch wants a reading of its own rather than reporting none.
+        config.worker_profile = WorkerProfile::DesktopBound;
+    })
     .await
 }
 
@@ -1108,8 +1123,14 @@ async fn wired_desktop_bound() -> Wired {
 /// writes then fail while its read waits for a frame that is never coming, and nothing else would
 /// report the loss. The condition is produced here rather than described: the bridge reaches the
 /// worker through a relay of this test's own, which forwards bytes in both directions and, when
-/// the test says so, shuts down the side it reads the worker's frames on.
-#[cfg(unix)]
+/// the test says so, shuts down the side it reads the worker's frames on. The relay's other
+/// direction goes on running, so what ends the worker's read is its writer rather than an ordinary
+/// end of the peer's stream.
+///
+/// Linux, because that is where a write to a socket whose peer has shut down reading is reported
+/// to the writer. The same worker code answers a write that fails for any other reason the same
+/// way, and two tests in `crates/kr-worker/src/fence/bridge.rs` pin that on every platform.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_that_closes_only_what_it_reads_from_is_reported_as_a_lost_bridge() {
     use std::os::fd::AsFd as _;
@@ -1191,9 +1212,13 @@ async fn a_peer_that_closes_only_what_it_reads_from_is_reported_as_a_lost_bridge
                 std::future::pending::<()>().await;
             }
         };
+        // The forward direction outlives the back one. A half-close makes the relay's own read of
+        // the worker end, and a relay that stopped there would close the whole connection, which
+        // the worker's read would notice by itself: the assertion below would then pass for a
+        // reason that is not the one it is about.
+        tokio::spawn(back);
         tokio::select! {
             () = forward => {}
-            () = back => {}
             () = shut => {}
         }
     });
@@ -1259,7 +1284,7 @@ async fn a_peer_that_closes_only_what_it_reads_from_is_reported_as_a_lost_bridge
 }
 
 /// Copies every byte one socket receives into another, until either end stops.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 async fn copy(from: Arc<tokio::net::UnixStream>, to: Arc<tokio::net::UnixStream>) {
     let mut buffer = vec![0_u8; 8 * 1024];
     loop {
@@ -1566,74 +1591,12 @@ async fn a_bridge_that_declares_another_build_is_refused_on_the_real_endpoint() 
     bridge_task.abort();
 }
 
-/// KR-REQ-12.07: an enabled integration adds its flags and the backend exists before the command.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_enabled_integration_adds_its_flags_and_hands_back_a_backend() {
-    let mut wired = wired_profiled(
-        ShellMode::Managed,
-        true,
-        kr_protocol::session::LaunchProfile {
-            command_integrations: vec![kr_protocol::session::CommandIntegration {
-                command: "codex".to_owned(),
-                flags: vec!["--kr-gateway".to_owned()],
-                enabled: true,
-            }],
-            ..kr_protocol::session::LaunchProfile::default()
-        },
-    )
-    .await;
-    let resolved = resolve_over(&mut wired, &["codex", "--model", "opus"], true).await;
-    assert_eq!(
-        resolved.arguments,
-        vec![
-            "codex".to_owned(),
-            "--model".to_owned(),
-            "opus".to_owned(),
-            "--kr-gateway".to_owned()
-        ],
-        "the command name and the vector the person typed are preserved, and the flags follow"
-    );
-    assert_eq!(resolved.added, vec!["--kr-gateway".to_owned()]);
-    assert!(resolved.bypass.0.is_none());
-    let backend = resolved.backend.0.expect("a worker-owned backend");
-    assert_eq!(backend.session_id, wired.session_id);
-    assert_eq!(backend.prompt_generation, PromptGeneration::new(1));
-    assert!(
-        backend
-            .environment
-            .iter()
-            .any(|variable| variable.name == "KR_SESSION"),
-        "the backend names the session the gateway belongs to"
-    );
-    assert!(
-        backend
-            .environment
-            .iter()
-            .any(|variable| variable.name == "KR_WORKER_ENDPOINT"),
-        "and the endpoint it reaches this session on"
-    );
-
-    // The same line asked twice is one binding, not two: nothing here makes a second gateway for
-    // a program that is already running.
-    let again = resolve_at(&mut wired, PromptGeneration::new(1), &["codex"], true).await;
-    assert_eq!(again.backend.0.expect("the same binding"), backend);
-
-    // A session that is closing starts nothing new, whatever its integration last reported.
-    wired
-        .runtime
-        .session()
-        .begin_close(ClosureReason::CloseRequested);
-    let refused = resolve_at(&mut wired, PromptGeneration::new(2), &["codex"], true).await;
-    assert_eq!(
-        refused.bypass.0,
-        Some(kr_protocol::root::CommandBypassReason::SessionClosing)
-    );
-    assert!(refused.backend.0.is_none());
-    assert_eq!(refused.arguments, vec!["codex".to_owned()]);
-    wired.close().await;
-}
-
-/// KR-REQ-12.07: an integration the host cannot put a backend behind adds no flags.
+/// KR-REQ-12.07: an integration this host can put no backend behind adds no flags.
+///
+/// Section 12 requires the worker-owned backend and its gateway to exist before the native program
+/// does. This host establishes none, so an invocation that would need one runs exactly as it was
+/// typed: an agent started with integration flags and nothing behind them is worse off than one
+/// started without them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_integration_with_no_backend_behind_it_runs_the_invocation_as_typed() {
     let mut wired = wired_profiled(
@@ -1649,20 +1612,34 @@ async fn an_integration_with_no_backend_behind_it_runs_the_invocation_as_typed()
         },
     )
     .await;
-    // A session with no endpoint of its own has nothing to put behind an integrated invocation.
-    wired.runtime.session().forget_worker_endpoint();
-    let resolved = resolve_over(&mut wired, &["codex"], true).await;
+    let resolved = resolve_over(&mut wired, &["codex", "--model", "opus"], true).await;
     assert_eq!(
         resolved.bypass.0,
         Some(kr_protocol::root::CommandBypassReason::BackendUnavailable)
     );
     assert_eq!(
         resolved.arguments,
-        vec!["codex".to_owned()],
-        "an agent started with the flags and no gateway behind them is worse off than one without"
+        vec!["codex".to_owned(), "--model".to_owned(), "opus".to_owned()],
+        "the command name and the vector the person typed are what runs"
     );
     assert!(resolved.added.is_empty());
-    assert!(resolved.backend.0.is_none());
+    assert!(
+        resolved.backend.0.is_none(),
+        "and no gateway is claimed for it, then or later"
+    );
+
+    // A session that is closing starts nothing new, whatever its integration last reported.
+    wired
+        .runtime
+        .session()
+        .begin_close(ClosureReason::CloseRequested);
+    let refused = resolve_at(&mut wired, PromptGeneration::new(2), &["codex"], true).await;
+    assert_eq!(
+        refused.bypass.0,
+        Some(kr_protocol::root::CommandBypassReason::SessionClosing)
+    );
+    assert!(refused.backend.0.is_none());
+    assert_eq!(refused.arguments, vec!["codex".to_owned()]);
     wired.close().await;
 }
 

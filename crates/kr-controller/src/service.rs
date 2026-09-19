@@ -2114,11 +2114,17 @@ impl Controller {
         // rather than left to find one in its own environment: the two can differ, and a session
         // must run the package its create was admitted against.
         let shell_package = if create.shell_mode == kr_protocol::session::ShellMode::Managed {
-            Nullable::some(
-                self.check_qualified_package(create.shell.0.as_deref())?
-                    .display()
-                    .to_string(),
-            )
+            // On a thread that may block, for the same reason the admission check is: finding a
+            // package reads directories and opens files, and a package root that has stopped
+            // answering must not occupy one of the runtime's own threads.
+            let root = self.shell_packages.clone();
+            let requested = create.shell.0.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                qualified_package(root.as_deref(), requested.as_deref())
+            })
+            .await
+            .map_err(|error| ControllerError::supervision(error.to_string()))??;
+            Nullable::some(resolved.display().to_string())
         } else {
             Nullable::null()
         };
@@ -4458,14 +4464,6 @@ impl Controller {
 
     /// Refuses a managed create whose shell no installed package qualifies.
     ///
-    /// Section 7: an unqualified system shell may be a child application or an explicitly selected
-    /// `native_compat` top-level shell; it cannot claim the managed contract. The refusal names the
-    /// shell rather than substituting another, and it happens before a reservation is recorded, so
-    /// an unsupported request costs the caller an error rather than a session that closes itself.
-    fn check_qualified_package(&self, requested: Option<&str>) -> Result<PathBuf> {
-        qualified_package(self.shell_packages.as_deref(), requested)
-    }
-
     /// Reserves a session and starts its worker.
     ///
     /// `connection_id` is the connection that asked, on whichever ingress. A create is the one
@@ -5714,12 +5712,8 @@ impl Controller {
             }
         };
         match result {
-            Ok(value) => {
-                let read: SessionReadResult = value
-                    .to_typed()
-                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-                Ok(read)
-            }
+            Ok(value) => reported_read(&value)
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string())),
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }
     }
@@ -5868,6 +5862,12 @@ pub struct ControllerSetup {
 
 /// Resolves the qualified package a create request selects, against one package root.
 ///
+/// Section 7: an unqualified system shell may be a child application or an explicitly selected
+/// `native_compat` top-level shell; it cannot claim the managed contract. The refusal names the
+/// shell rather than substituting another, and at admission it happens before a reservation is
+/// recorded, so an unsupported request costs the caller an error rather than a session that closes
+/// itself.
+///
 /// Free of the controller on purpose: it reads the filesystem, so it runs on a thread that may
 /// block rather than on the runtime this daemon serves its clients on.
 ///
@@ -5886,6 +5886,54 @@ fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<Pat
         .select(requested)
         .map(|package| package.directory.clone())
         .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))
+}
+
+/// Reads a worker's answer to `session.read`.
+///
+/// A daemon is replaced without its workers: an upgrade restarts this process and leaves every
+/// live session's worker running the build that started it. Such a worker answers with the fields
+/// its own build has, and the ones this build added — the launch profile, the last command block
+/// and the outstanding launch count — are not among them. It is read through [`ReportedRead`]
+/// instead, which is that answer with those three absent, so an upgraded daemon goes on listing
+/// and describing the sessions it inherited.
+///
+/// Remove `ReportedRead` and this fallback once no worker from a build before those fields can
+/// still be running, which is when every session that was live across the upgrade has closed.
+///
+/// # Errors
+///
+/// Returns the decoding failure when the answer is neither shape.
+fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
+    match value.to_typed::<SessionReadResult>() {
+        Ok(read) => Ok(read),
+        Err(error) => match value.to_typed::<ReportedRead>() {
+            Ok(reported) => Ok(reported.into()),
+            // Neither shape, so it is reported as the answer this build cannot read rather than
+            // as an older worker's.
+            Err(_) => Err(error.to_string()),
+        },
+    }
+}
+
+/// A session read as a worker from a build before the launch profile answers it.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportedRead {
+    session: SessionSummary,
+    endpoint: Nullable<String>,
+}
+
+impl From<ReportedRead> for SessionReadResult {
+    fn from(reported: ReportedRead) -> Self {
+        Self {
+            session: reported.session,
+            endpoint: reported.endpoint,
+            // A worker that does not report these says nothing about them, which is what null is.
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+        }
+    }
 }
 
 /// Reads the create request a reservation recorded.

@@ -4250,6 +4250,7 @@ dependencies = [
  "kr-ipc",
  "kr-protocol",
  "portable-pty",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",

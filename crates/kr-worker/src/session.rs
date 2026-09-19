@@ -231,14 +231,6 @@ pub struct Session {
     >,
     /// Commands a reader installed after their transaction had been revoked.
     late_installations: Vec<kr_protocol::root::ShellLaunchResult>,
-    /// The worker-owned backends this session established, by the generation each is bound to.
-    ///
-    /// Bounded by the same rule as the blocks: one per accepted line, released when that line's
-    /// command ends, when the bridge goes and when the session closes.
-    command_backends: std::collections::BTreeMap<
-        kr_protocol::root::PromptGeneration,
-        kr_protocol::root::CommandBackend,
-    >,
     /// The command blocks the private hooks have reported, oldest first.
     ///
     /// Bounded: a session that runs for a week must not grow a record of every command it ever
@@ -524,7 +516,6 @@ impl Session {
             takeover_receipt: None,
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
-            command_backends: std::collections::BTreeMap::new(),
             command_blocks: std::collections::VecDeque::new(),
             interrupt_failed: None,
             held_input_bytes: 0,
@@ -668,16 +659,6 @@ impl Session {
     pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
         use crate::fence::Step;
 
-        // A bridge that has gone has ended every command it was reporting on, and nothing it
-        // reported afterwards would be this integration's word. The backends go with it.
-        if self
-            .fence
-            .as_ref()
-            .is_some_and(|driver| !driver.phase().reports_ready())
-        {
-            self.command_backends.clear();
-        }
-
         self.held_input_bytes = self
             .held_input_bytes
             .saturating_add(effects.held_added)
@@ -764,11 +745,6 @@ impl Session {
             }
             crate::fence::CommandHook::Block(block) => {
                 let prompt_generation = block.prompt_generation;
-                // A block that reports a status is a command that has ended, and a command that
-                // has ended has no backend to reach this session with any more.
-                if block.finished() {
-                    self.release_command_backend(prompt_generation);
-                }
                 self.record_command_block(*block);
                 EventOutcome::CommandBlockRecorded(kr_protocol::root::RootCommandBlockResult {
                     prompt_generation,
@@ -835,65 +811,23 @@ impl Session {
         }
     }
 
-    /// Establishes the worker-owned backend one integrated invocation runs behind.
+    /// Returns the worker-owned backend an integrated invocation would run behind.
     ///
-    /// It is this session's own private endpoint, bound to one prompt generation and recorded as
-    /// the session's own. Both halves belong to the worker: the endpoint is owner-only, and the
-    /// session identifier is a candidate rather than an authority, which is what lets the host
-    /// validate a child process's local peer and its session binding before it accepts anything
-    /// quoted from there.
-    ///
-    /// `None` when this session has no endpoint to offer, which is a session opened without a
-    /// listener of its own.
-    fn establish_command_backend(
-        &mut self,
-        prompt_generation: kr_protocol::root::PromptGeneration,
+    /// Section 12 requires the backend and its gateway to exist before the native program does.
+    /// This host establishes none: the gateway an integrated agent speaks to is supplied by the
+    /// agent's own plugin, not by the worker, so there is nothing here to bind an invocation to
+    /// and nothing to hand it. An invocation that would need one is therefore answered as a
+    /// bypass and runs exactly as it was typed, which is better for the person than an agent
+    /// started with integration flags and nothing behind them.
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the session that would own a backend"
+    )]
+    const fn establish_command_backend(
+        &self,
+        _prompt_generation: kr_protocol::root::PromptGeneration,
     ) -> Option<kr_protocol::root::CommandBackend> {
-        if let Some(existing) = self.command_backends.get(&prompt_generation) {
-            return Some(existing.clone());
-        }
-        let endpoint = self.config.worker_endpoint.clone()?;
-        let backend = kr_protocol::root::CommandBackend {
-            session_id: self.config.session_id,
-            prompt_generation,
-            environment: vec![
-                kr_protocol::session::EnvironmentVariable {
-                    name: crate::environment::SESSION_VARIABLE.to_owned(),
-                    value: self.config.session_id.to_string(),
-                },
-                kr_protocol::session::EnvironmentVariable {
-                    name: crate::environment::WORKER_ENDPOINT_VARIABLE.to_owned(),
-                    value: endpoint,
-                },
-            ],
-        };
-        // Recorded before the answer goes out, so the binding is this session's own fact rather
-        // than something the answer asserts.
-        self.command_backends
-            .insert(prompt_generation, backend.clone());
-        Some(backend)
-    }
-
-    /// Releases the backend bound to one prompt generation.
-    ///
-    /// A command that has ended has nothing left to reach the session with, and a bridge that has
-    /// gone has ended every command it was reporting on.
-    fn release_command_backend(&mut self, prompt_generation: kr_protocol::root::PromptGeneration) {
-        self.command_backends.remove(&prompt_generation);
-    }
-
-    /// Releases every backend this session established.
-    pub fn release_command_backends(&mut self) {
-        self.command_backends.clear();
-    }
-
-    /// Gives up the endpoint this session offers a worker-owned backend on.
-    ///
-    /// A session with none establishes no backend, so an integrated invocation is answered as a
-    /// bypass rather than with flags nothing is listening behind.
-    pub fn forget_worker_endpoint(&mut self) {
-        self.config.worker_endpoint = None;
-        self.command_backends.clear();
+        None
     }
 
     /// Records one command block, keeping the most recent [`Self::RETAINED_COMMAND_BLOCKS`].
@@ -1024,6 +958,12 @@ impl Session {
     /// the bridge reader out of it for as long as the platform took to answer.
     #[must_use]
     pub fn desktop_probe(&self, now: std::time::Instant) -> Option<crate::desktop::Probe> {
+        // A session that is closing asks nothing more of the platform: what it is bound to stops
+        // mattering the moment it begins to stop, and a reading in flight then has nothing left
+        // to decide.
+        if !self.state.is_running() || self.state == SessionState::Closing {
+            return None;
+        }
         self.desktop.due(now)
     }
 
@@ -1051,6 +991,12 @@ impl Session {
         probe: &crate::desktop::Probe,
         sample: &crate::desktop::Sample,
     ) -> bool {
+        // A reading that came back after the session began to close decides nothing, and writing
+        // the binding it adopted into the journal then would record a desktop for a session that
+        // is already stopping.
+        if !self.state.is_running() || self.state == SessionState::Closing {
+            return self.desktop.lost();
+        }
         let lost = self.desktop.apply(now, probe, sample);
         // A watch that had nothing to bind to when the shell started adopts the desktop as soon as
         // the platform answers. What it adopted is what this session reports from then on, so the
@@ -3602,9 +3548,6 @@ impl Session {
                     let effects = driver.session_closing();
                     let _ = self.apply_fence_effects(effects);
                 }
-                // The backends this session established go with it: a command that outlives the
-                // shell has nothing left to reach.
-                self.release_command_backends();
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),

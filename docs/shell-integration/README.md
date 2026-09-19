@@ -76,7 +76,8 @@ The nested objects of the handshake:
 | `abi` | `mailbox`, `pre_eof`, `fence_proof`, `cancellation`, `launch_delivery` |
 | `accepted` | `protocol`, `session_id`, `editor_abi`, `hold_ms`, `gesture`, `hint`, `secret_location`, `unexport` |
 | `refused.error` | `code`, `message`, `retry`, `diagnostic_id` |
-| `event_result` | `editor_entered`, `editor_left`, `detached`, `command_recorded`, `received`, or `refused` with an error |
+| `backend` | `session_id`, `prompt_generation`, `environment`, or null where the host establishes none |
+| `event_result` | `editor_entered`, `editor_left`, `detached`, `command_recorded`, `command_resolved`, `command_block_recorded`, `received`, or `refused` with an error |
 
 A bridge holds a fence only between a `published` and the `invalidated` that ends it: every reason
 the worker drops one, from a reader entry to a detach to a lost integration, reaches the bridge that
@@ -84,8 +85,8 @@ way.
 
 Each side allocates the identifiers it sends, so an answer belongs to its question rather than to
 whatever is in flight. Events are answered too: `event_result` carries `editor_entered`,
-`editor_left`, `detached`, `command_recorded`, `received` for an event that needs no answer, or
-`refused` with the session's error. A refused detach is the one every bridge must handle, because
+`editor_left`, `detached`, `command_recorded`, `command_resolved`, `command_block_recorded`,
+`received` for an event that needs no answer, or `refused` with the session's error. A refused detach is the one every bridge must handle, because
 the gesture has already left the reader.
 
 An enum on the wire is externally tagged: a variant with fields is a single-entry map whose key names
@@ -215,6 +216,8 @@ Everything below comes from the reader itself, at the moment the reader does the
 | `reader_idle` | The reader has nothing left to read | `session_id`, `prompt_generation`, `reader_revision`, `reader_context`, `snapshot`, `editor`, `cwd_revision` |
 | `eof_detach` | An eligible gesture at an empty primary prompt, under a fence | `session_id`, `fence_id`, `prompt_generation`, `input_epoch` |
 | `command_accepted` | At acceptance, inside the fenced context, before the reader leaves | `session_id`, `fence_id`, `prompt_generation`, `origin` |
+| `command_resolve` | In front of an interactive invocation, before the command starts | `session_id`, `prompt_generation`, `argv`, `interactive` |
+| `command_block` | When a command starts and again when it ends | `session_id`, `prompt_generation`, `command`, `started_at_ms`, `duration_ms`, `exit_status`, `cwd`, `cwd_revision` |
 | `gesture_changed` | The line discipline's `VEOF` changed, or the configured PSReadLine gesture did | `session_id`, `gesture`, `effective_at` |
 | `pre_eof_consumed` | An eligible gesture was consumed because it could not be attributed | `session_id`, `prompt_generation`, `reason`, `hint_printed` |
 | `hooks_activated` | Once, after the user's startup files have run and before the first primary reader | `session_id`, `prompt_generation` |
@@ -240,6 +243,8 @@ The nested objects those fields carry:
 | `event_result.editor_left` | `state` |
 | `event_result.detached` | `detached_attachment`, `state`, `discarded_input_bytes` |
 | `event_result.command_recorded` | `origin`, `state` |
+| `event_result.command_resolved` | `arguments`, `added`, `bypass` (`not_integrated`, `disabled`, `absolute_path`, `unmanaged_shell`, `not_interactive`, `backend_unavailable`, `session_closing`, or null), `backend` |
+| `event_result.command_block_recorded` | `prompt_generation`, `retained` |
 
 Three ordering rules matter. Leaving invalidates the fence, so `command_accepted` is sent first, from
 the reader, inside the fence; a record sent after the leave could only ever say `unverifiable`. A

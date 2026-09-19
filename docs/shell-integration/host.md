@@ -262,7 +262,13 @@ contents are checked immediately before the rename, after the write and the flus
 the file's own identity, so a file that was replaced rather than edited is caught too. What is left
 is the interval between that check and the rename: a comparison and a rename are two steps on every
 platform this runs on, and an editor that saves inside that interval has its save replaced. Two of
-these commands in one process are serialised against each other; two `kr` processes are not.
+these commands in one process are serialised against each other, and two `kr` processes are
+serialised by a lock beside the startup file, held for the whole read, rebuild and write.
+
+The identity half of the check is used only where the filesystem's own numbers hold still. A
+filesystem that gives a different number for the same unchanged file is read twice and, when the
+two readings disagree, decided by the contents alone: refusing a write there would refuse one that
+should have been made.
 
 ## The command hooks
 
@@ -273,13 +279,15 @@ neither is a method a client could name.
 
 The resolve hook runs in front of an interactive invocation, before the command starts. The
 session answers with the argument vector to run: the command name and the vector the person typed,
-plus the flags an enabled integration for that command adds. Four things bypass it, and each keeps
+plus the flags an enabled integration for that command adds. Several things bypass it, and each keeps
 the invocation exactly as typed and is given no backend at all: a command invoked by absolute path,
 an integration the user has not enabled, a line of a script rather than an interactive invocation,
-and a shell whose integration is not a managed KalaReach root shell yet. An integrated invocation
-is answered with the worker-owned backend the session established *before* it answered, so the
-gateway exists before the program does. There is no other route to one: a program already running
-never acquires a backend afterwards, because this hook is the only place one is made.
+a shell whose integration is not a managed KalaReach root shell yet, and a session that is closing. An invocation that would take the
+integration is answered as a bypass too, for a fifth reason: this host establishes no worker-owned
+backend. Section 12 requires the backend and its gateway to exist before the native program does,
+and the gateway an integrated agent speaks to is supplied by that agent's own plugin rather than by
+the worker, so there is nothing here to bind an invocation to. Adding the flags without it would
+start an agent that expects a gateway and has none, so the flags are not added.
 
 The block hook reports one command block: the command line the editor accepted, when it
 started, how long it ran, what it exited with and the directory it ran in, with the
