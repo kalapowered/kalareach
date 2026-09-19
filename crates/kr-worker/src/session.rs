@@ -1002,18 +1002,41 @@ impl Session {
         }
     }
 
+    /// Returns the reading this session's desktop watch wants next, when it wants one.
+    ///
+    /// Asked under the session, answered outside it. Taking a reading talks to the platform and
+    /// can run a command, and a session held while that happened would keep the fence timer and
+    /// the bridge reader out of it for as long as the platform took to answer.
+    #[must_use]
+    pub fn desktop_probe(&self, now: std::time::Instant) -> Option<crate::desktop::Probe> {
+        self.desktop.due(now)
+    }
+
     /// Returns whether the login session a desktop-bound worker was bound to has ended.
     ///
     /// A headless worker is bound to nothing and answers false: outliving a logout is what that
     /// profile is for. A desktop-bound one is bound to one graphical login, and a login that has
     /// ended means the desktop this session belongs to is gone with it.
     ///
-    /// The supervision asks this on every wake, so the answer costs one kernel query about the
-    /// process that owns the login session, taken at most once a second. Once the desktop has
-    /// gone the answer stays: a new login is a different desktop and nothing is ever rebound to
-    /// it.
-    pub fn desktop_lost(&mut self) -> bool {
-        let lost = self.desktop.lost(std::time::Instant::now());
+    /// This asks nothing: it reports what the watch is already holding, and a reading reaches it
+    /// through [`Self::apply_desktop_reading`]. Once the desktop has gone the answer stays: a new
+    /// login is a different desktop and nothing is ever rebound to it.
+    #[must_use]
+    pub const fn desktop_lost(&self) -> bool {
+        self.desktop.lost()
+    }
+
+    /// Folds one desktop reading in, and says whether the desktop has gone.
+    ///
+    /// A reading taken for a question the watch has since stopped asking is discarded by the watch
+    /// itself, so a sample that was in flight while the binding moved decides nothing.
+    pub fn apply_desktop_reading(
+        &mut self,
+        now: std::time::Instant,
+        probe: &crate::desktop::Probe,
+        sample: &crate::desktop::Sample,
+    ) -> bool {
+        let lost = self.desktop.apply(now, probe, sample);
         // A watch that had nothing to bind to when the shell started adopts the desktop as soon as
         // the platform answers. What it adopted is what this session reports from then on, so the
         // record, the closure and a status read never name a different desktop from the one being

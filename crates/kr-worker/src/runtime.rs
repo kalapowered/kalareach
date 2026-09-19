@@ -805,7 +805,32 @@ impl SessionRuntime {
             // here instead. Nothing is observed on this first look; the boundary was recorded as it
             // was established.
             let mut wake = crate::lifecycle::Wake::Session;
+            // One probe at a time. A reading that is still being taken is not asked for again,
+            // whatever the cadence says: the platform is answering slowly, and a second question
+            // would only wait beside the first.
+            let mut probing: Option<
+                tokio::task::JoinHandle<(
+                    std::time::Instant,
+                    crate::desktop::Probe,
+                    crate::desktop::Sample,
+                )>,
+            > = None;
             loop {
+                // What the watch wants next, decided under the session and taken outside it: a
+                // session held while a login facility answered would keep the fence timer and the
+                // bridge reader out of it for as long as that took.
+                if probing.is_none() {
+                    let wanted = monitor_session
+                        .lock()
+                        .ok()
+                        .and_then(|session| session.desktop_probe(Instant::now()));
+                    if let Some(probe) = wanted {
+                        probing = Some(tokio::task::spawn_blocking(move || {
+                            let sample = probe.take();
+                            (Instant::now(), probe, sample)
+                        }));
+                    }
+                }
                 let initiated = {
                     let Ok(mut session) = monitor_session.lock() else {
                         break;
@@ -846,7 +871,29 @@ impl SessionRuntime {
                     .release();
                     break;
                 }
-                wake = supervision.next().await;
+                // The next wake, or the probe coming back first. A reading is applied as soon as
+                // the platform answers rather than at whatever the cadence would next have woken
+                // this loop for, so a desktop that has gone is found when it is said to have gone.
+                // The wake this loop is on is unchanged by a probe: what the probe decides is the
+                // watch, and the root shell is asked about on this loop's own schedule either way.
+                wake = match probing.as_mut() {
+                    Some(running) => {
+                        tokio::select! {
+                            biased;
+                            taken = &mut *running => {
+                                probing = None;
+                                if let Ok((at, probe, sample)) = taken
+                                    && let Ok(mut session) = monitor_session.lock()
+                                {
+                                    session.apply_desktop_reading(at, &probe, &sample);
+                                }
+                                wake
+                            }
+                            next = supervision.next() => next,
+                        }
+                    }
+                    None => supervision.next().await,
+                };
             }
         });
 

@@ -220,21 +220,82 @@ enum Printed {
 /// into a command line: the argument vector is a vector.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn run(program: &str, arguments: &[&str]) -> Printed {
-    let Ok(output) = std::process::Command::new(program)
+    let Ok(mut child) = std::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
     else {
         return Printed::NotRun;
     };
-    if output.status.success() {
-        Printed::Output(String::from_utf8_lossy(&output.stdout).into_owned())
+    // The reading has a deadline. A session facility that has stopped answering must not hold this
+    // probe open: what a command that did not finish in time establishes is nothing, which is what
+    // `NotRun` means, and never that a desktop ended.
+    // Both pipes are drained while the wait runs. A command that prints more than one pipe holds
+    // blocks until somebody reads it, and a wait that was not reading would call that a timeout.
+    let collecting = |stream: Option<std::process::ChildStdout>| {
+        stream.map(|mut stream| {
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+
+                let mut said = Vec::new();
+                let _ = stream.read_to_end(&mut said);
+                said
+            })
+        })
+    };
+    let out = collecting(child.stdout.take());
+    let err = child.stderr.take().map(|mut stream| {
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+
+            let mut said = Vec::new();
+            let _ = stream.read_to_end(&mut said);
+            said
+        })
+    });
+    let deadline = std::time::Instant::now() + PROBE_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if std::time::Instant::now() >= deadline {
+            // Terminated and reaped: a child left running would outlive every probe after it, and
+            // one left unreaped would outlive the process.
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let taken = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default()
+    };
+    let printed = taken(out);
+    let failed = taken(err);
+    let Some(status) = status else {
+        return Printed::NotRun;
+    };
+    if status.success() {
+        Printed::Output(String::from_utf8_lossy(&printed).into_owned())
     } else {
-        let mut said = String::from_utf8_lossy(&output.stderr).into_owned();
-        said.push_str(&String::from_utf8_lossy(&output.stdout));
+        let mut said = String::from_utf8_lossy(&failed).into_owned();
+        said.push_str(&String::from_utf8_lossy(&printed));
         Printed::Failed(said.to_ascii_lowercase())
     }
 }
+
+/// How long a platform command is given before the reading is abandoned.
+///
+/// Generous for a question that normally answers in milliseconds, and short enough that a facility
+/// which has stopped answering is noticed within one watch cadence.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Returns whether a platform's own words say the thing asked about is not there.
 ///

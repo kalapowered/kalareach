@@ -275,6 +275,51 @@ fn is_container() -> bool {
     })
 }
 
+/// A reading a watch wants, stated without taking it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// Ask the platform's own session facilities what graphical login this process is in.
+    Session,
+    /// Ask about the process that owns the login session, and the facilities when it cannot say.
+    Anchor(ProcessStartIdentity),
+}
+
+impl Probe {
+    /// Takes the reading this probe names.
+    ///
+    /// This blocks: it queries the kernel and, on two of the three platforms, runs a command. It
+    /// is called with no lock held, on a thread that may block, and everything it can wait on is
+    /// bounded, so a session facility that has stopped answering costs this reading and nothing
+    /// else.
+    #[must_use]
+    pub fn take(&self) -> Sample {
+        match self {
+            Self::Session => Sample {
+                presence: None,
+                live: Some(current()),
+            },
+            Self::Anchor(anchor) => {
+                let presence = platform::presence(Some(anchor));
+                Sample {
+                    presence: Some(presence),
+                    // The fall-through is part of the same reading, so it is taken here rather
+                    // than left for the caller to take under the lock.
+                    live: matches!(presence, Presence::Unknown).then(current),
+                }
+            }
+        }
+    }
+}
+
+/// What one probe found.
+#[derive(Clone, Debug)]
+pub struct Sample {
+    /// What the anchored process said, when one was asked about.
+    pub presence: Option<Presence>,
+    /// What the platform's session facilities said, when they were asked.
+    pub live: Option<Reading>,
+}
+
 /// What one desktop-bound session watches.
 #[derive(Debug)]
 pub struct Watch {
@@ -389,76 +434,109 @@ impl Watch {
             .filter(|recorded| recorded.desktop_session_id.is_present())
     }
 
-    /// Returns whether the desktop this session was bound to has gone.
+    /// Returns whether the desktop this session was bound to has already gone.
     ///
-    /// The question is asked at most once per [`RECHECK_INTERVAL`] and the answer kept in between,
-    /// so a caller that asks on every wake pays for one reading a second rather than one per wake.
-    /// Where the platform named no owning process there is nothing to query, and the platform's own
-    /// session facilities are asked again on the slower [`REREAD_INTERVAL`].
-    pub fn lost(&mut self, now: Instant) -> bool {
+    /// A fact this watch is holding, never a question it asks: taking a reading is
+    /// [`Self::due`]'s and [`Self::apply`]'s, and the two are separate so that no reading is ever
+    /// taken while the caller is holding the session.
+    #[must_use]
+    pub const fn lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Returns the reading this watch wants next, when it wants one.
+    ///
+    /// Nothing here talks to the platform and nothing here changes: it says what to ask, and the
+    /// caller asks it somewhere a slow answer costs nobody else anything. The question is wanted
+    /// at most once per cadence, which is [`RECHECK_INTERVAL`] where there is a process to ask
+    /// about and the slower [`REREAD_INTERVAL`] where the platform's own facilities have to be
+    /// asked instead.
+    #[must_use]
+    pub fn due(&self, now: Instant) -> Option<Probe> {
         if self.lost {
-            return true;
+            return None;
         }
-        let Some(bound) = self.bound.as_ref() else {
-            return false;
-        };
-        // A watch with nothing to compare against yet takes the first reading it can get, on the
-        // slower cadence, because taking it costs a conversation with the platform.
-        if !bound.recorded.desktop_session_id.is_present()
-            && !bound.recorded.login_generation.is_present()
-        {
-            if self
-                .asked
-                .is_some_and(|asked| now.saturating_duration_since(asked) < REREAD_INTERVAL)
-            {
-                return false;
-            }
-            self.asked = Some(now);
-            match current() {
-                Reading::Desktop(live) => {
-                    if let Some(bound) = self.bound.as_mut() {
-                        bound.recorded = binding_of(&live);
-                        bound.anchor = live.anchor;
-                    }
-                }
-                Reading::None => self.lost = true,
-                Reading::Unavailable => {}
-            }
-            return self.lost;
-        }
-        let interval = if bound.anchor.is_some() {
-            RECHECK_INTERVAL
-        } else {
+        let bound = self.bound.as_ref()?;
+        let adopting = !bound.recorded.desktop_session_id.is_present()
+            && !bound.recorded.login_generation.is_present();
+        let interval = if adopting || bound.anchor.is_none() {
             REREAD_INTERVAL
+        } else {
+            RECHECK_INTERVAL
         };
         if self
             .asked
             .is_some_and(|asked| now.saturating_duration_since(asked) < interval)
         {
-            return false;
+            return None;
         }
+        Some(if adopting {
+            Probe::Session
+        } else {
+            match bound.anchor.as_ref() {
+                Some(anchor) => Probe::Anchor(anchor.clone()),
+                None => Probe::Session,
+            }
+        })
+    }
+
+    /// Folds one reading in, and says whether the desktop has gone.
+    ///
+    /// A sample taken for a question this watch is no longer asking is discarded: the watch may
+    /// have adopted a desktop, been rebound to another process or been established as lost while
+    /// the reading was being taken, and a stale answer must not decide any of those again.
+    pub fn apply(&mut self, now: Instant, probe: &Probe, sample: &Sample) -> bool {
+        if self.lost {
+            return true;
+        }
+        if self.due(now).as_ref().is_none_or(|wanted| wanted != probe) {
+            // Either the watch no longer wants this question or it wants a different one. Either
+            // way this answer is about a state that has moved.
+            return self.lost;
+        }
+        let Some(bound) = self.bound.as_ref() else {
+            return false;
+        };
         self.asked = Some(now);
-        match platform::presence(bound.anchor.as_ref()) {
-            Presence::Present => {}
-            Presence::Ended => self.lost = true,
-            // Either nothing was anchored or the kernel would not answer, so the platform is asked
-            // again about the session itself. A reading that describes the recorded desktop also
-            // supplies the process to ask about from here on; one that describes a different
-            // desktop, or none at all, is a desktop that has ended; one the platform would not
-            // give leaves the answer where it was.
-            Presence::Unknown => match current() {
-                Reading::Desktop(live) => match describes(&live, &bound.recorded) {
-                    Some(true) => {
-                        if let Some(bound) = self.bound.as_mut() {
-                            bound.anchor = live.anchor;
-                        }
+        let adopting = !bound.recorded.desktop_session_id.is_present()
+            && !bound.recorded.login_generation.is_present();
+        if adopting {
+            match sample.live.as_ref() {
+                Some(Reading::Desktop(live)) => {
+                    if let Some(bound) = self.bound.as_mut() {
+                        bound.recorded = binding_of(live);
+                        bound.anchor = live.anchor.clone();
                     }
-                    Some(false) => self.lost = true,
-                    None => {}
-                },
-                Reading::None => self.lost = true,
-                Reading::Unavailable => {}
+                }
+                Some(Reading::None) => self.lost = true,
+                // A reading this host could not take is not evidence that anything ended.
+                Some(Reading::Unavailable) | None => {}
+            }
+            return self.lost;
+        }
+        match sample.presence {
+            Some(Presence::Present) => return false,
+            Some(Presence::Ended) => {
+                self.lost = true;
+                return true;
+            }
+            // Either nothing was anchored or the kernel would not answer, so the platform's own
+            // facilities decide instead.
+            Some(Presence::Unknown) | None => {}
+        }
+        let recorded = bound.recorded.clone();
+        match sample.live.as_ref() {
+            Some(Reading::Desktop(live)) => match describes(live, &recorded) {
+                Some(true) => {
+                    if let Some(bound) = self.bound.as_mut() {
+                        bound.anchor = live.anchor.clone();
+                    }
+                }
+                Some(false) => self.lost = true,
+                None => {}
             },
+            Some(Reading::None) => self.lost = true,
+            Some(Reading::Unavailable) | None => {}
         }
         self.lost
     }
@@ -706,6 +784,20 @@ mod tests {
         assert_eq!(context.worker_profile, WorkerProfile::HeadlessUser);
     }
 
+    /// Asks a watch what it wants, takes that reading and folds it in.
+    ///
+    /// What the supervision does, with the reading taken between the two calls rather than inside
+    /// either: a watch that wants nothing right now reports what it is already holding.
+    fn probed(watch: &mut Watch, now: Instant) -> bool {
+        match watch.due(now) {
+            Some(probe) => {
+                let sample = probe.take();
+                watch.apply(now, &probe, &sample)
+            }
+            None => watch.lost(),
+        }
+    }
+
     #[test]
     fn a_headless_session_is_never_lost() {
         let mut watch = Watch::bind(
@@ -718,7 +810,7 @@ mod tests {
             },
         );
         assert!(
-            !watch.lost(Instant::now()),
+            !probed(&mut watch, Instant::now()),
             "outliving a logout is what the profile is for"
         );
     }
@@ -732,7 +824,7 @@ mod tests {
             // nothing recorded is still in a login session, and one that watched nothing could
             // never report losing it.
             Reading::Desktop(_) => {
-                assert!(!watch.lost(now));
+                assert!(!probed(&mut watch, now));
                 assert!(
                     watch.bound_name().is_some(),
                     "the watch adopted the desktop this worker is in"
@@ -746,9 +838,9 @@ mod tests {
                 );
             }
             // The platform says there is no graphical login, and this session was created for one.
-            Reading::None => assert!(watch.lost(now)),
+            Reading::None => assert!(probed(&mut watch, now)),
             // Nothing established either way.
-            Reading::Unavailable => assert!(!watch.lost(now)),
+            Reading::Unavailable => assert!(!probed(&mut watch, now)),
         }
     }
 
@@ -769,9 +861,12 @@ mod tests {
             },
         );
         let now = Instant::now();
-        assert!(watch.lost(now), "the recorded desktop is not the live one");
         assert!(
-            watch.lost(now + RECHECK_INTERVAL * 10),
+            probed(&mut watch, now),
+            "the recorded desktop is not the live one"
+        );
+        assert!(
+            probed(&mut watch, now + RECHECK_INTERVAL * 10),
             "a lost desktop is never rebound"
         );
     }

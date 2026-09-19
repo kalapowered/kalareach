@@ -989,6 +989,114 @@ async fn a_gesture_with_a_stale_fence_is_refused_rather_than_becoming_an_end_of_
 }
 
 // --------------------------------------------------------------------------------------------
+// A-17: a desktop reading never stands between the fence and the terminal.
+// --------------------------------------------------------------------------------------------
+
+/// A-17: asking whether the desktop has gone costs no conversation with the platform.
+///
+/// The watch holds the answer and a reading reaches it from outside the session, so a session held
+/// while a login facility was answering is not a thing that can happen. This is the shape of the
+/// fix: a reading taken back under the lock would make this question as slow as the platform is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn asking_whether_the_desktop_has_gone_takes_no_reading() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let mut config = configuration(&temp, ShellMode::Managed);
+    config.worker_profile = WorkerProfile::DesktopBound;
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+
+    // What a reading costs, taken here, on this thread, exactly as the supervision takes it.
+    let probing = std::time::Instant::now();
+    let _ = kr_worker::desktop::Probe::Session.take();
+    let reading = probing.elapsed();
+
+    let asking = std::time::Instant::now();
+    for _ in 0..1_000 {
+        assert!(!session.desktop_lost(), "this session's desktop is here");
+    }
+    let asked = asking.elapsed();
+    assert!(
+        asked < Duration::from_millis(50),
+        "a thousand answers cost {asked:?}, and one reading costs {reading:?}: the answer is a \
+         field of the watch rather than a question for the platform"
+    );
+}
+
+/// A-17: held input reaches the writer at its own deadline while a desktop reading is outstanding.
+///
+/// The session is desktop-bound, so its supervision wants a reading; the reading is taken on a
+/// blocking thread, and this runtime has one, which this test occupies. The probe is therefore
+/// outstanding for the whole of what follows, and what follows is the fence releasing what it held
+/// at the deadline A-17 gives it.
+#[test]
+fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        // One blocking thread, taken below, so the supervision's reading is queued behind it and
+        // stays outstanding.
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let occupied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let taken = Arc::clone(&occupied);
+        let holding = tokio::task::spawn_blocking(move || {
+            taken.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(20));
+        });
+        while !occupied.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let wired = wired_desktop_bound().await;
+        let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let holder = holder_over(&mut client, &wired).await;
+        let epoch = wired.runtime.session().lease().epoch.get();
+        // A reader enters, which starts an exchange this test never answers, so the batch below is
+        // held for the machine's own deadline and no longer.
+        {
+            let mut session = wired.runtime.session();
+            let driver = session.fence_mut().expect("a driver");
+            let _ = driver.bridge_event(
+                kr_protocol::ids::RequestId::new(9),
+                &enter(wired.session_id, 1, 1),
+            );
+            session
+                .write_input(holder, epoch, 0, b"held\n", None, std::time::Instant::now())
+                .expect("accepted");
+        }
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if contains(&retained(&wired.runtime.session()), b"held") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            delivered.is_ok(),
+            "the held input reached the terminal while the desktop reading was still outstanding"
+        );
+        holding.abort();
+        wired.close().await;
+    });
+}
+
+/// A managed session bound to this host's desktop, with its bridge registered.
+async fn wired_desktop_bound() -> Wired {
+    wired_profiled(
+        ShellMode::Managed,
+        true,
+        kr_protocol::session::LaunchProfile::default(),
+    )
+    .await
+}
+
+// --------------------------------------------------------------------------------------------
 // KR-REQ-07.22, KR-REQ-07.24: a bridge that closes only the side it reads from.
 // --------------------------------------------------------------------------------------------
 

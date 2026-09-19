@@ -474,6 +474,20 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
 
 /// KR-REQ-01.10, KR-REQ-03.19: an invisible session keeps the selected desktop's graphical access,
 /// and the presentation neither migrates execution nor changes its permission context.
+/// Asks a watch what it wants, takes that reading and folds it in.
+///
+/// What the supervision does, with the reading taken between the two calls rather than inside
+/// either: a watch that wants nothing right now reports what it is already holding.
+fn probed(watch: &mut desktop::Watch, now: std::time::Instant) -> bool {
+    match watch.due(now) {
+        Some(probe) => {
+            let sample = probe.take();
+            watch.apply(now, &probe, &sample)
+        }
+        None => watch.lost(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invisible_session_keeps_the_desktop_and_the_presentation_changes_nothing_else() {
     let host = Host::create();
@@ -654,11 +668,11 @@ async fn a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends() 
             desktop::Watch::bind(WorkerProfile::DesktopBound, &desktop::binding(&context));
         let now = std::time::Instant::now();
         assert!(
-            !watch.lost(now),
+            !probed(&mut watch, now),
             "a session bound to this host's own desktop has not lost it"
         );
         assert!(
-            !watch.lost(now + desktop::RECHECK_INTERVAL * 3),
+            !probed(&mut watch, now + desktop::RECHECK_INTERVAL * 3),
             "and asking again does not change that"
         );
         assert_eq!(
@@ -1321,9 +1335,9 @@ async fn the_default_context_is_the_hosts_own_and_the_receipt_records_what_was_u
         },
     );
     let now = std::time::Instant::now();
-    assert!(watch.lost(now));
+    assert!(probed(&mut watch, now));
     assert!(
-        watch.lost(now + desktop::REREAD_INTERVAL * 4),
+        probed(&mut watch, now + desktop::REREAD_INTERVAL * 4),
         "a new login is a different desktop and nothing is rebound to it"
     );
 
