@@ -3391,6 +3391,18 @@ fn record_from_an_earlier_run(path: &std::path::Path, action: u8) {
         .expect("the record reads as an earlier run's");
 }
 
+/// What this host's time contract says about its wall clock, for a message that has to explain a
+/// collection that did not run.
+fn clock_state(session: &Session) -> String {
+    let time = session.time();
+    format!(
+        "{:?}, may_collect_expired={}, reading={:?}",
+        time.trust(),
+        time.may_collect_expired(),
+        time.checkpoint().map(|checkpoint| checkpoint.reading)
+    )
+}
+
 /// Waits for `condition` to hold, and says whether it did.
 async fn within(timeout: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + timeout;
@@ -3425,7 +3437,8 @@ async fn a_live_host_collects_records_past_the_retention_period_on_its_own() {
     .await;
     assert!(
         gone,
-        "a live host collects what the retention period covers"
+        "a live host collects what the retention period covers; this host's clock is {}",
+        clock_state(&host.service.runtime().session())
     );
 
     // And it is a schedule, not something every request drags along: a second record that arrives
@@ -4194,7 +4207,8 @@ fn a_collection_that_fails_is_recorded_and_the_session_keeps_serving() {
     assert_eq!(session.collect_expired(), 0);
     assert!(
         session.journal_failure().is_some(),
-        "a collection this host could not finish is recorded"
+        "a collection this host could not finish is recorded; this host's clock is {}",
+        clock_state(&session)
     );
     assert_eq!(
         session.state(),
