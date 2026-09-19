@@ -24,13 +24,14 @@ use std::cell::UnsafeCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_ulong};
 use std::os::fd::RawFd;
 
-use super::reader::{Reader, ReaderData, kr_terminal_eof};
+use super::reader::{Reader, ReaderData, kr_terminal_eof, read_generation_count};
 use crate::env::{EnvMode, EnvSetMode, EnvStack, Environment as _};
 use crate::input::{
     CharEvent, DEFAULT_BIND_MODE, InputEventQueuer as _, KeyNameStyle, ReadlineCmd, bindings,
     input_function_get_code, input_get_bind_mode,
 };
 use crate::key::Key;
+use crate::key::Modifiers;
 use crate::parser::Parser;
 use crate::prelude::*;
 use crate::threads::assert_is_main_thread;
@@ -132,6 +133,7 @@ unsafe extern "C" {
     fn kr_bridge_pre_eof(key: c_int, source: c_int) -> c_int;
     fn kr_bridge_service();
     fn kr_bridge_fd() -> c_int;
+    fn kr_bridge_wants_write() -> c_int;
     fn kr_bridge_cancel_settled();
     fn kr_bridge_lost(loss: c_int, detail: *const c_char);
     fn kr_bridge_launch_pending() -> c_int;
@@ -159,17 +161,28 @@ struct BridgeState {
     prompt_generation: u64,
     /// Counts every reader, so a reader started inside a prompt is a different reader.
     reader_revision: u64,
-    /// Changes when the buffer's contents change, which a launch's expectation is checked against.
-    buffer_revision: u64,
-    buffer_hash: u64,
+    /// Counts the directory changes a launch's expectation is checked against.
+    ///
+    /// The buffer's own revision is the reader's own edit generation, which counts edits rather
+    /// than differences: a binding that changes the line and puts it back has changed it twice.
     cwd_revision: u64,
-    cwd_seen: Option<WString>,
-    inside_reader: bool,
+    /// How many readers are running, because one can start inside another.
+    reader_depth: usize,
 
     /// The sequence that invoked the operation running now, which is this reader's `$KEYS`.
+    ///
+    /// These are the reader's own decoded keys rather than the bytes the terminal sent: one key
+    /// can arrive as a whole escape sequence under a keyboard protocol, and a gesture is one key
+    /// whatever encoding carried it.
     invoking_keys: Vec<u8>,
+    /// How many keys that sequence holds, which is what tells one key from a binding of several.
+    invoking_key_count: usize,
+    /// The character the single key that invoked it stands for, when it was one key.
+    invoking_byte: Option<u8>,
     /// How many events the reader has peeked for a sequence it has not resolved yet.
     peeked_keys: usize,
+    /// How many bytes those events arrived as, which is what a cancellation throws away.
+    peeked_bytes: usize,
     /// True while the reader waits for another key, which is what makes a sequence partial.
     in_key_wait: bool,
     /// True while a resolved sequence has not run: the person typed it, so it goes first.
@@ -178,6 +191,10 @@ struct BridgeState {
     pending_target: bool,
     /// True while `get-key` waits for the literal key it reports rather than acts on.
     pending_literal_key: bool,
+    /// True while the decoder holds the first bytes of a character it has not finished.
+    partial_character: bool,
+    /// True while the reader holds characters it has taken and not yet put in the buffer.
+    accumulated_characters: bool,
     /// True when the character being judged came from the reader's own queue.
     source_pushed_back: bool,
     /// Whether this wait has already reported the reader idle.
@@ -191,12 +208,17 @@ struct BridgeState {
     installed: Option<WString>,
     /// Set by the core when it accepts a line; acted on once the core's call has returned.
     accept_requested: bool,
+    /// True once the acceptance has been submitted and the reader has not left with it yet.
+    accept_submitted: bool,
 
-    /// The gesture key the named binding is installed on, and what was bound there before it.
+    /// The gesture key the named binding is installed on, and what was bound in each mode it
+    /// went on before it.
     gesture_key: Option<Key>,
-    gesture_previous: Vec<WString>,
-    gesture_mode: Option<WString>,
+    gesture_previous: Vec<(WString, Vec<WString>)>,
     gesture_bound: bool,
+    /// True once the gesture has been looked at, so a terminal that starts with none is still
+    /// followed when the person gives it one.
+    gesture_followed: bool,
 }
 
 struct BridgeStateCell(UnsafeCell<BridgeState>);
@@ -205,27 +227,30 @@ unsafe impl Sync for BridgeStateCell {}
 static STATE: BridgeStateCell = BridgeStateCell(UnsafeCell::new(BridgeState {
     prompt_generation: 0,
     reader_revision: 0,
-    buffer_revision: 0,
-    buffer_hash: 0,
     cwd_revision: 0,
-    cwd_seen: None,
-    inside_reader: false,
+    reader_depth: 0,
     invoking_keys: Vec::new(),
+    invoking_key_count: 0,
+    invoking_byte: None,
     peeked_keys: 0,
+    peeked_bytes: 0,
     in_key_wait: false,
     key_selected: false,
     pending_target: false,
     pending_literal_key: false,
+    partial_character: false,
+    accumulated_characters: false,
     source_pushed_back: false,
     idle_reported: false,
     cancel_requested: false,
     cancel_drain: false,
     installed: None,
     accept_requested: false,
+    accept_submitted: false,
     gesture_key: None,
     gesture_previous: Vec::new(),
-    gesture_mode: None,
     gesture_bound: false,
+    gesture_followed: false,
 }));
 
 /// The bridge's own state. Main thread only, like the reader it belongs to.
@@ -270,17 +295,29 @@ fn parked_parser() -> Option<&'static mut Parser> {
     unsafe { (*PARKED.0.get()).as_ref().map(|parked| &mut *parked.parser) }
 }
 
-/// A hash of the buffer's contents, so a revision counts changes rather than reads.
-fn hash_line(text: &wstr) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for c in text.chars() {
-        for byte in u32::from(c).to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// The character a key stands for, where it stands for one.
+///
+/// The reader names a control character by the letter it is typed with and a modifier, so the
+/// gesture the terminal's line discipline holds as one byte is that letter and `ctrl` here. This
+/// is the way back, and it is what the end-of-file decision and the fence snapshot both carry:
+/// under a keyboard protocol one key arrives as a whole escape sequence, and neither the last byte
+/// of that sequence nor its length says anything about which key it was.
+fn control_byte(key: Key) -> Option<u8> {
+    let plain = !key.modifiers.alt && !key.modifiers.shift && !key.modifiers.sup;
+    if key.modifiers.ctrl && plain {
+        if key.codepoint.is_ascii_lowercase() {
+            return Some(key.codepoint as u8 - b'a' + 1);
         }
+        // The control characters above the letters, which the reader names in upper case.
+        if ('A'..='_').contains(&key.codepoint) {
+            return Some(key.codepoint as u8 - b'A' + 1);
+        }
+        return None;
     }
-    hash ^= text.len() as u64;
-    hash.wrapping_mul(0x0000_0100_0000_01b3)
+    if key.modifiers == Modifiers::default() && key.codepoint.is_ascii() {
+        return Some(key.codepoint as u8);
+    }
+    None
 }
 
 /// How many bytes the terminal is still holding for this reader.
@@ -296,6 +333,15 @@ fn terminal_typeahead(fd: RawFd) -> u64 {
     } else {
         u64::try_from(available).unwrap_or(0)
     }
+}
+
+/// One of the shell's own variables, as a string, or empty when it is not set.
+fn named_value(parser: &Parser, name: &wstr) -> WString {
+    parser
+        .vars()
+        .get(name)
+        .map(|value| value.as_string())
+        .unwrap_or_default()
 }
 
 /// The keymap the editor is in, as the contract names them.
@@ -345,28 +391,20 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
         out.tty_typeahead_drained = 1;
         out.macro_input_drained = 1;
         out.partial_key_drained = 1;
-        out.buffer_revision = state.buffer_revision as c_ulong;
+        out.buffer_revision = read_generation_count() as c_ulong;
         out.cwd_revision = state.cwd_revision as c_ulong;
         return;
     };
 
+    let mut vi_count = false;
+    let mut vi_operator = false;
     if let Some(parser) = parked_parser() {
-        // A binding can change directory and come back to the same prompt, so this is read where
-        // it is reported rather than once at entry.
-        if let Some(pwd) = parser.vars().get(L!("PWD")) {
-            let pwd = pwd.as_string();
-            if state.cwd_seen.as_deref() != Some(pwd.as_utfstr()) {
-                state.cwd_seen = Some(pwd);
-                state.cwd_revision += 1;
-            }
-        }
         out.keymap = keymap_of(parser);
-    }
-
-    let hash = hash_line(data.kr_command_line());
-    if hash != state.buffer_hash {
-        state.buffer_hash = hash;
-        state.buffer_revision += 1;
+        // This reader's own vi bindings accumulate a count and wait for an operator's motion in
+        // the shell's own variables, and they are where those two states are.
+        vi_count = !named_value(parser, L!("__fish_vi_count")).is_empty();
+        vi_operator = !named_value(parser, L!("__fish_vi_operator")).is_empty()
+            || input_get_bind_mode(parser.vars()) == L!("operator");
     }
 
     out.reader_context = if data.kr_is_primary() {
@@ -376,7 +414,9 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
         // `read` builtin pushes.
         KR_CONTEXT_READ_BUILTIN
     };
-    out.buffer_revision = state.buffer_revision as c_ulong;
+    // The reader's own edit generation: one for every edit the line went through, which is what
+    // makes a change and a change back two changes rather than none.
+    out.buffer_revision = read_generation_count() as c_ulong;
     out.buffer_empty = c_int::from(data.kr_command_line().is_empty());
 
     // fish has no quoted insertion of its own; `get-key` is the operation that waits for a literal
@@ -385,10 +425,10 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
     // Events queued ahead of the terminal are the reader's own input, not the person's.
     out.pending_macro_input = c_int::from(!data.input_data.queue.is_empty());
     out.pending_search = c_int::from(data.kr_search_active());
-    // fish accumulates no numeric argument, so nothing can be in the middle of one.
-    out.pending_numeric_argument = 0;
+    out.pending_numeric_argument = c_int::from(vi_count);
     out.pending_multikey_sequence = c_int::from(state.in_key_wait && state.peeked_keys > 0);
-    out.pending_vi_motion = c_int::from(state.pending_target);
+    // A jump waiting for its target, and an operator waiting for the motion it applies to.
+    out.pending_vi_motion = c_int::from(state.pending_target || vi_operator);
     out.pending_paste = c_int::from(data.input_data.paste_buffer.is_some());
 
     let keys = state.invoking_keys.len().min(KR_KEYS_MAX);
@@ -400,7 +440,20 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
 
     out.tty_typeahead_drained = c_int::from(out.pending_bytes == 0);
     out.macro_input_drained = c_int::from(out.queued_keys == 0);
-    out.partial_key_drained = c_int::from(!(state.in_key_wait && state.peeked_keys > 0));
+    // Anything that owns input the reader has taken and not acted on holds this queue: a sequence
+    // it has peeked and not resolved, the first bytes of a character it has not finished,
+    // characters it has read and not yet put in the buffer, an input function waiting for its
+    // target, `get-key` waiting for a literal key, an operator waiting for the motion it applies
+    // to, and a count waiting for the command it counts.
+    out.partial_key_drained = c_int::from(
+        !(state.in_key_wait && state.peeked_keys > 0)
+            && !state.partial_character
+            && !state.accumulated_characters
+            && !state.pending_target
+            && !state.pending_literal_key
+            && !vi_operator
+            && !vi_count,
+    );
 
     out.cwd_revision = state.cwd_revision as c_ulong;
 }
@@ -425,30 +478,36 @@ pub unsafe extern "C" fn kr_shell_install_command(text: *const c_char, len: usiz
 
     let installed = data.kr_command_line().to_owned();
     let state = state();
-    state.buffer_hash = hash_line(&installed);
-    state.buffer_revision += 1;
     let went_in = !installed.is_empty();
     state.installed = went_in.then_some(installed);
     c_int::from(went_in)
 }
 
 /// Removes text a launch installed that has not been accepted. Returns non-zero when it came out.
+///
+/// The acceptance this bridge submitted goes with it: a line that was on its way to the editor's
+/// own execute is taken off that way as well as out of the buffer, so a revoked launch leaves
+/// nothing behind wherever the reader had got to.
 #[unsafe(no_mangle)]
 pub extern "C" fn kr_shell_remove_installed() -> c_int {
     let Some(installed) = state().installed.take() else {
         return 0;
     };
-    state().accept_requested = false;
+    {
+        let state = state();
+        state.accept_requested = false;
+        state.accept_submitted = false;
+    }
     let Some(data) = parked_data() else {
         return 0;
     };
+    // The acceptance this bridge put in the queue has not run yet if it is still there.
+    data.input_data.queue.retain(|event| {
+        !matches!(event, CharEvent::Readline(readline) if readline.cmd == ReadlineCmd::Execute)
+    });
     // Only the text this launch installed comes out, and only while it is still all there.
     if data.kr_command_line() == installed {
         data.kr_clear_command_line();
-        let text = data.kr_command_line().to_owned();
-        let state = state();
-        state.buffer_hash = hash_line(&text);
-        state.buffer_revision += 1;
     }
     1
 }
@@ -471,7 +530,16 @@ pub extern "C" fn kr_shell_accept_line() {
 pub unsafe extern "C" fn kr_shell_cancel_key_wait(out: *mut KrCancellation) {
     // Safety: the core passes a pointer to one of its own live structures.
     let out = unsafe { &mut *out };
-    let queued = parked_data().map_or(0, |data| data.input_data.queue.len());
+    let queued = parked_data().map_or(0, |data| {
+        data.input_data
+            .queue
+            .iter()
+            .filter(|event| event.is_char())
+            .count()
+    });
+    let queued_bytes: usize = parked_data().map_or(0, |data| {
+        data.input_data.queue.iter().map(event_bytes).sum()
+    });
     let state = state();
     let partial = state.in_key_wait && state.peeked_keys > 0;
 
@@ -491,7 +559,9 @@ pub unsafe extern "C" fn kr_shell_cancel_key_wait(out: *mut KrCancellation) {
         || out.vi_motion != 0
         || out.macro_input != 0
     {
-        out.discarded_bytes = (queued + state.peeked_keys) as c_ulong;
+        // What the drain will throw away: the bytes the person's own queued input arrived as,
+        // and the bytes of the sequence this reader had peeked and not resolved.
+        out.discarded_bytes = (queued_bytes + state.peeked_bytes) as c_ulong;
         // The reader is inside something, so it is brought out of it: the wait ends here and the
         // old lease's undelivered input is dropped at the boundary that follows.
         state.cancel_requested = true;
@@ -643,22 +713,22 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
     if !registered() {
         return;
     }
-    if state().inside_reader {
-        // A reader starting inside another is a takeover: the one that was running is over.
-        editor_leave(reader, KR_LEAVE_READER_TAKEOVER);
+    if state().reader_depth > 0 {
+        // A reader starting inside another is a takeover: the one that was running is over, and
+        // it is still underneath, so it comes back when this one leaves.
+        emit_leave(reader, KR_LEAVE_READER_TAKEOVER);
     }
+    state().reader_depth += 1;
     let primary = reader.kr_is_primary();
-    let hash = hash_line(reader.kr_command_line());
     {
         let state = state();
         state.reader_revision += 1;
         if primary {
             state.prompt_generation += 1;
         }
-        state.buffer_hash = hash;
-        state.buffer_revision += 1;
         state.invoking_keys.clear();
         state.peeked_keys = 0;
+        state.peeked_bytes = 0;
         state.in_key_wait = false;
         state.key_selected = false;
         state.pending_target = false;
@@ -669,12 +739,17 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
         state.cancel_drain = false;
         state.installed = None;
         state.accept_requested = false;
-        state.inside_reader = true;
+        state.accept_submitted = false;
     }
 
     // A reassigned gesture takes effect at the prompt it names, which is this one.
     follow_gesture(reader);
 
+    emit_enter(reader);
+}
+
+/// Reports one reader's entry.
+fn emit_enter(reader: &mut Reader<'_>) {
     with_reader(reader, || {
         // Safety: the reader is parked for the whole of both calls.
         unsafe {
@@ -685,20 +760,8 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
     });
 }
 
-/// The reader is leaving. An accepted line is reported first, from inside the fence.
-pub fn editor_leave(reader: &mut Reader<'_>, reason: c_int) {
-    if !registered() || !state().inside_reader {
-        state().inside_reader = false;
-        return;
-    }
-    {
-        let state = state();
-        state.inside_reader = false;
-        state.installed = None;
-        state.accept_requested = false;
-        state.cancel_requested = false;
-        state.cancel_drain = false;
-    }
+/// Reports one reader's departure, with the accepted line first when there was one.
+fn emit_leave(reader: &mut Reader<'_>, reason: c_int) {
     with_reader(reader, || {
         // Safety: the reader is parked for the whole of these calls.
         unsafe {
@@ -711,6 +774,46 @@ pub fn editor_leave(reader: &mut Reader<'_>, reason: c_int) {
             kr_bridge_editor_leave(reason);
         }
     });
+}
+
+/// The reader is leaving. An accepted line is reported first, from inside the fence.
+///
+/// A reader that was running underneath this one comes back, and it is a different reader from the
+/// one that just left: it gets its own revision and its own entry, so a fence taken against the
+/// reader that has gone is stale rather than mistaken for the one running now.
+pub fn editor_leave(reader: &mut Reader<'_>, reason: c_int) {
+    if !registered() || state().reader_depth == 0 {
+        return;
+    }
+    {
+        let state = state();
+        state.reader_depth -= 1;
+        state.installed = None;
+        state.accept_requested = false;
+        state.accept_submitted = false;
+        state.cancel_requested = false;
+        state.cancel_drain = false;
+    }
+    emit_leave(reader, reason);
+
+    if state().reader_depth > 0 {
+        {
+            let state = state();
+            state.reader_revision += 1;
+            state.invoking_keys.clear();
+            state.invoking_key_count = 0;
+            state.invoking_byte = None;
+            state.peeked_keys = 0;
+            state.peeked_bytes = 0;
+            state.in_key_wait = false;
+            state.key_selected = false;
+            state.pending_target = false;
+            state.pending_literal_key = false;
+            state.source_pushed_back = false;
+            state.idle_reported = false;
+        }
+        emit_enter(reader);
+    }
 }
 
 /// Reads the mailbox and answers what is in it.
@@ -733,8 +836,10 @@ pub fn service(reader: &mut Reader<'_>) -> bool {
 fn settle(reader: &mut Reader<'_>) -> bool {
     let mut interrupted = false;
     if std::mem::take(&mut state().accept_requested) {
-        state().installed = None;
-        // The line goes through the editor's own acceptance, submitted at this boundary.
+        // The line goes through the editor's own acceptance, submitted at this boundary. The
+        // record of what was installed stays until the reader actually leaves with it: until
+        // then a revocation still has text to take back out.
+        state().accept_submitted = true;
         reader.push_front(CharEvent::from_readline(ReadlineCmd::Execute, vec![]));
         interrupted = true;
     }
@@ -744,13 +849,11 @@ fn settle(reader: &mut Reader<'_>) -> bool {
         // buffer is not touched by any of it.
         reader.push_front(CharEvent::from_check_exit());
         // The part-read sequence comes back to the queue behind that event, and it is the old
-        // lease's undelivered input, so it goes at the boundary this pass ends at.
+        // lease's undelivered input, so it goes at the boundary this pass ends at. Nothing more
+        // is read or answered until the reader has come out of what the cancellation ended,
+        // which is that boundary rather than this one.
         state().cancel_drain = true;
         state().idle_reported = false;
-        with_reader(reader, || {
-            // Safety: the reader is parked for the whole of the call.
-            unsafe { kr_bridge_cancel_settled() };
-        });
         interrupted = true;
     }
     interrupted
@@ -827,8 +930,18 @@ pub fn pass_end(reader: &mut Reader<'_>) {
         // input goes here rather than reaching the person's next prompt. The edit buffer, which
         // is not input, stays exactly as it was.
         reader.input_data.queue.retain(|event| !event.is_char());
-        state().peeked_keys = 0;
-        state().idle_reported = false;
+        {
+            let state = state();
+            state.peeked_keys = 0;
+            state.peeked_bytes = 0;
+            state.pending_target = false;
+            state.pending_literal_key = false;
+            state.idle_reported = false;
+        }
+        with_reader(reader, || {
+            // Safety: the reader is parked for the whole of the call.
+            unsafe { kr_bridge_cancel_settled() };
+        });
     }
     let _ = service(reader);
 }
@@ -840,29 +953,55 @@ pub fn launch_pending() -> bool {
 }
 
 /// Records the sequence that invoked the operation about to run, which is this reader's `$KEYS`.
+///
+/// What is recorded is the reader's own keys, one entry per key, rather than the bytes that
+/// carried them: under a keyboard protocol one key arrives as a whole escape sequence, and a
+/// gesture is one key however it was encoded.
 pub fn record_invoking_keys(events: &[CharEvent]) {
     let state = state();
     state.invoking_keys.clear();
+    state.invoking_key_count = 0;
+    state.invoking_byte = None;
     for event in events {
         let Some(key) = event.get_key() else {
             continue;
         };
-        if !key.seq.is_empty() {
-            state.invoking_keys.extend(wcs2bytes(&key.seq));
-        } else if let Some(text) = key.key.text_to_insert() {
-            state
-                .invoking_keys
-                .extend(wcs2bytes(&WString::from_iter(text)));
-        } else if u32::from(key.key.codepoint) < 0x80 {
-            state.invoking_keys.push(key.key.codepoint as u8);
+        state.invoking_key_count += 1;
+        state.invoking_byte = control_byte(key.key.key);
+        match state.invoking_byte {
+            Some(byte) => state.invoking_keys.push(byte),
+            None => {
+                let mut encoded = [0u8; 4];
+                state
+                    .invoking_keys
+                    .extend(key.key.key.codepoint.encode_utf8(&mut encoded).as_bytes().iter());
+            }
         }
+    }
+    if state.invoking_key_count != 1 {
+        state.invoking_byte = None;
     }
     state.invoking_keys.truncate(KR_KEYS_MAX);
 }
 
-/// Counts the events the reader has peeked for a sequence it has not resolved.
-pub fn note_peeked(count: usize) {
-    state().peeked_keys = count;
+/// Records the events the reader has peeked for a sequence it has not resolved.
+///
+/// Both how many there are and the bytes they arrived as: one key can be a whole escape sequence,
+/// and what a cancellation throws away is counted in bytes.
+pub fn note_peeked(events: &[CharEvent]) {
+    let state = state();
+    state.peeked_keys = events.len();
+    state.peeked_bytes = events.iter().map(event_bytes).sum();
+}
+
+/// How many bytes of the terminal's own input this event carried.
+///
+/// An event the reader made for itself carries none: a readline command pushed by a binding is
+/// not input the person typed, and throwing it away discards no bytes of theirs.
+fn event_bytes(event: &CharEvent) -> usize {
+    event
+        .get_key()
+        .map_or(0, |key| wcs2bytes(&key.seq).len())
 }
 
 /// Records which of the reader's own input sources the character being judged came from.
@@ -880,82 +1019,139 @@ pub fn note_pending_literal_key(active: bool) {
     state().pending_literal_key = active;
 }
 
+/// The decoder holding the first bytes of a character it has not finished.
+pub fn note_partial_character(active: bool) {
+    state().partial_character = active;
+}
+
+/// The reader holding characters it has taken from the terminal and not yet put in the buffer.
+pub fn note_accumulated_characters(active: bool) {
+    state().accumulated_characters = active;
+}
+
+/// A directory change, which is one whether or not it ends where it started.
+pub fn note_cwd_changed() {
+    state().cwd_revision += 1;
+}
+
+/// True while the bridge holds an answer it could not finish writing.
+pub fn wants_write() -> bool {
+    // Safety: the core keeps this and asks nothing of ours to report it.
+    registered() && unsafe { kr_bridge_wants_write() != 0 }
+}
+
 // ---- the named reader binding ------------------------------------------------------------------
 
-/// Puts the named binding on the gesture key, keeping whatever was bound there.
+/// Every bind mode this reader can be in, so a gesture is a gesture in all of them.
+///
+/// The shell's own vi bindings move between modes as the person types, and a key bound in one of
+/// them is the editor's own everywhere else. The modes below are the ones the shipped bindings
+/// use, plus whichever the reader is in now.
+fn gesture_modes(parser: &Parser) -> Vec<WString> {
+    let mut modes: Vec<WString> = [
+        DEFAULT_BIND_MODE,
+        L!("insert"),
+        L!("visual"),
+        L!("replace"),
+        L!("replace_one"),
+        L!("operator"),
+        L!("paste"),
+    ]
+    .iter()
+    .map(|mode| (*mode).to_owned())
+    .collect();
+    let current = input_get_bind_mode(parser.vars());
+    if !modes.contains(&current) {
+        modes.push(current);
+    }
+    modes
+}
+
+/// Puts the named binding on the gesture key in every mode, keeping whatever was bound there.
 ///
 /// The previous commands are kept rather than discarded: outside the detach condition the binding
 /// runs them, so the person's own key keeps doing what they bound it to.
 fn bind_gesture(reader: &mut Reader<'_>) {
     let veof = kr_shell_veof();
     let key = u8::try_from(veof).ok().map(Key::from_single_byte);
-    if state().gesture_bound && state().gesture_key == key {
+    if state().gesture_followed && state().gesture_bound && state().gesture_key == key {
         return;
     }
+    state().gesture_followed = true;
     if state().gesture_bound {
         unbind_gesture();
     }
     let Some(key) = key else {
-        // A terminal with no end-of-file character has no gesture to bind.
+        // A terminal with no end-of-file character has no gesture to bind. The next prompt looks
+        // again, so a terminal that is given one later is followed.
         state().gesture_key = None;
         return;
     };
 
-    let mode = DEFAULT_BIND_MODE.to_owned();
+    let modes = gesture_modes(reader.parser);
+    let mut previous: Vec<(WString, Vec<WString>)> = Vec::with_capacity(modes.len());
     let mut bindings = bindings();
-    let previous: Vec<WString> = bindings
-        .get(&[key], Some(&mode), /*user=*/ true)
-        .first()
-        .map(|binding| binding.commands.clone())
-        .unwrap_or_default();
-    bindings.add(
-        vec![key],
-        KeyNameStyle::Normal,
-        vec![L!("kr-eof-decide").to_owned()],
-        mode.clone(),
-        None,
-        /*user=*/ true,
-        None,
-    );
+    for mode in modes {
+        // What this key does in this mode now: the person's own binding where they made one, and
+        // the editor's own where they did not. Whichever it is, that is what runs outside the
+        // detach condition, so the key keeps doing what it did.
+        let mut before: Vec<WString> = bindings
+            .get(&[key], Some(&mode), /*user=*/ true)
+            .first()
+            .map(|binding| binding.commands.clone())
+            .unwrap_or_default();
+        if before.is_empty() {
+            before = bindings
+                .get(&[key], Some(&mode), /*user=*/ false)
+                .first()
+                .map(|binding| binding.commands.clone())
+                .unwrap_or_default();
+        }
+        bindings.add(
+            vec![key],
+            KeyNameStyle::Normal,
+            vec![L!("kr-eof-decide").to_owned()],
+            mode.clone(),
+            None,
+            /*user=*/ true,
+            None,
+        );
+        previous.push((mode, before));
+    }
     drop(bindings);
-    // The reader's own bindings are read from this set, so nothing else has to be told.
-    let _ = reader;
 
     let state = state();
     state.gesture_key = Some(key);
     state.gesture_previous = previous;
-    state.gesture_mode = Some(mode);
     state.gesture_bound = true;
 }
 
-/// Takes the named binding off the gesture key and gives the key back what it had.
+/// Takes the named binding off the gesture key and gives every mode back what it had.
 fn unbind_gesture() {
     let state = state();
     let Some(key) = state.gesture_key else {
         state.gesture_bound = false;
         return;
     };
-    let mode = state
-        .gesture_mode
-        .take()
-        .unwrap_or_else(|| DEFAULT_BIND_MODE.to_owned());
     let previous = std::mem::take(&mut state.gesture_previous);
     state.gesture_bound = false;
     state.gesture_key = None;
 
     let mut bindings = bindings();
-    if previous.is_empty() {
-        bindings.erase(&[key], &mode, /*user=*/ true);
-    } else {
-        bindings.add(
-            vec![key],
-            KeyNameStyle::Normal,
-            previous,
-            mode,
-            None,
-            /*user=*/ true,
-            None,
-        );
+    for (mode, commands) in previous {
+        if commands.is_empty() {
+            bindings.erase(&[key], &mode, /*user=*/ true);
+        } else {
+            bindings.add(
+                vec![key],
+                KeyNameStyle::Normal,
+                commands,
+                mode,
+                None,
+                /*user=*/ true,
+                None,
+            );
+        }
     }
 }
 
@@ -964,7 +1160,7 @@ fn unbind_gesture() {
 /// The character the reader is holding was typed under the gesture that was in force when it was
 /// typed, so the binding moves between prompts rather than inside one.
 pub fn follow_gesture(reader: &mut Reader<'_>) {
-    if !registered() || !state().gesture_bound {
+    if !registered() || !state().gesture_followed {
         return;
     }
     bind_gesture(reader);
@@ -985,16 +1181,14 @@ pub fn eof_decide(reader: &mut Reader<'_>) {
         } else {
             KR_SOURCE_TERMINAL
         };
-        let key = state
-            .invoking_keys
-            .last()
-            .copied()
-            .or_else(|| {
-                state
-                    .gesture_key
-                    .and_then(|key| u8::try_from(key.codepoint).ok())
-            })
-            .unwrap_or(0x04);
+        // The decoded key, and only when one key invoked this: a binding of several keys is that
+        // binding's, and the character at the end of it belongs to the sequence rather than being
+        // a gesture somebody made.
+        let key = if state.invoking_key_count == 1 {
+            state.invoking_byte.unwrap_or(0)
+        } else {
+            0
+        };
         (source, key)
     };
 
@@ -1010,12 +1204,19 @@ pub fn eof_decide(reader: &mut Reader<'_>) {
     replay_previous_binding(reader);
 }
 
-/// Runs what was bound to the gesture key before the named binding went on it.
+/// Runs what was bound to the gesture key, in this mode, before the named binding went on it.
 fn replay_previous_binding(reader: &mut Reader<'_>) {
-    let commands = state().gesture_previous.clone();
+    let mode = input_get_bind_mode(reader.parser.vars());
+    let commands = state()
+        .gesture_previous
+        .iter()
+        .find(|(bound, _)| *bound == mode)
+        .map(|(_, commands)| commands.clone())
+        .unwrap_or_default();
     if commands.is_empty() {
-        // Nothing of the person's was on this key, so the editor's own end-of-file command runs.
-        reader.push_front(CharEvent::from_readline(ReadlineCmd::DeleteOrExit, vec![]));
+        // Nothing was on this key in this mode, and an unbound key is one the editor does
+        // nothing with. Substituting its end-of-file command here would end a shell over a key
+        // that never had that meaning.
         return;
     }
     // The same order `bind` itself uses: the commands run front to back, so they go on in reverse.

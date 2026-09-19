@@ -1,3 +1,124 @@
+--- a/src/env/environment.rs
++++ b/src/env/environment.rs
+@@ -279,6 +279,11 @@
+ 
+         let ret: ModResult = self.lock().set(key, mode, vals);
+         if ret.status == EnvStackSetResult::Ok {
++            if key == "PWD" && crate::threads::is_main_thread() {
++                // A launch is judged against the directory the reader was in when it was asked
++                // for, so a change away and a change back are two changes rather than none.
++                crate::reader::kr_bridge::note_cwd_changed();
++            }
+             // Dispatch changes if we modified the global state or have 'dispatches_var_changes' set.
+             // Important to not hold the lock here.
+             if ret.global_modified || self.dispatches_var_changes {
+--- a/src/fd_readable_set.rs
++++ b/src/fd_readable_set.rs
+@@ -47,6 +47,8 @@
+ pub struct FdReadableSet {
+     // The underlying fdset and nfds value to pass to select().
+     fdset_: libc::fd_set,
++    // The descriptors watched for room to write, which is usually none of them.
++    writefds_: libc::fd_set,
+     nfds_: c_int,
+ }
+ 
+@@ -59,7 +61,16 @@
+             libc::FD_ZERO(fdset_.as_mut_ptr());
+             fdset_.assume_init()
+         };
+-        FdReadableSet { fdset_, nfds_: 0 }
++        let mut writefds_ = std::mem::MaybeUninit::uninit();
++        let writefds_ = unsafe {
++            libc::FD_ZERO(writefds_.as_mut_ptr());
++            writefds_.assume_init()
++        };
++        FdReadableSet {
++            fdset_,
++            writefds_,
++            nfds_: 0,
++        }
+     }
+ 
+     /// Reset back to an empty set.
+@@ -67,6 +78,7 @@
+         self.nfds_ = 0;
+         unsafe {
+             libc::FD_ZERO(&mut self.fdset_);
++            libc::FD_ZERO(&mut self.writefds_);
+         }
+     }
+ 
+@@ -88,10 +100,25 @@
+         fd >= 0 && unsafe { libc::FD_ISSET(fd, &self.fdset_) }
+     }
+ 
++    /// Also watch `fd` for room to write. The fd is ignored if negative (for convenience).
++    pub fn add_writable(&mut self, fd: RawFd) {
++        if fd >= (libc::FD_SETSIZE as RawFd) {
++            return;
++        }
++        if fd >= 0 {
++            unsafe { libc::FD_SET(fd, &mut self.writefds_) };
++            self.nfds_ = std::cmp::max(self.nfds_, fd + 1);
++        }
++    }
++
++    /// Returns `true` when `fd` was watched for room to write and has it.
++    pub fn test_writable(&self, fd: RawFd) -> bool {
++        fd >= 0 && unsafe { libc::FD_ISSET(fd, &self.writefds_) }
++    }
++
+     /// Call `select()`. Note this destructively modifies the set. Returns the result of
+     /// `select()`.
+     pub fn check_readable(&mut self, timeout: Timeout) -> c_int {
+-        let null = std::ptr::null_mut();
+         let mut tvs;
+         let timeout = match timeout {
+             Timeout::Forever => std::ptr::null_mut(),
+@@ -103,7 +130,15 @@
+                 &mut tvs
+             }
+         };
+-        unsafe { libc::select(self.nfds_, &mut self.fdset_, null, null, timeout) }
++        unsafe {
++            libc::select(
++                self.nfds_,
++                &mut self.fdset_,
++                &mut self.writefds_,
++                std::ptr::null_mut(),
++                timeout,
++            )
++        }
+     }
+ 
+     /// Check if a single fd is readable, with a given timeout.
+@@ -168,6 +203,25 @@
+                 revents: 0,
+             },
+         );
++    }
++
++    /// Also watch `fd` for room to write. The fd is ignored if negative (for convenience), and
++    /// must already be in the set.
++    pub fn add_writable(&mut self, fd: RawFd) {
++        if fd < 0 {
++            return;
++        }
++        if let Ok(pos) = self.pollfds_.binary_search_by_key(&fd, Self::pollfd_get_fd) {
++            self.pollfds_[pos].events |= libc::POLLOUT;
++        }
++    }
++
++    /// Returns `true` when `fd` was watched for room to write and has it.
++    pub fn test_writable(&self, fd: RawFd) -> bool {
++        if let Ok(pos) = self.pollfds_.binary_search_by_key(&fd, Self::pollfd_get_fd) {
++            return self.pollfds_[pos].revents & libc::POLLOUT != 0;
++        }
++        false
+     }
+ 
+     /// Returns `true` if the given `fd` has input available to read or has been HUP'd.
 --- a/src/input/binding.rs
 +++ b/src/input/binding.rs
 @@ -5,7 +5,7 @@
@@ -38,25 +159,77 @@
              .iter()
 --- a/src/input/decode.rs
 +++ b/src/input/decode.rs
-@@ -58,7 +58,14 @@
+@@ -1,3 +1,5 @@
++use crate::reader::kr_bridge;
++
+ use super::{
+     binding::match_key_event_to_key,
+     input::{
+@@ -56,13 +58,27 @@
+                 unconsumed_escapes: 0,
+             }
          };
++        // The bytes of a character this reader has taken and not yet decoded are input it still
++        // owes the buffer, so it is not between operations while it holds them.
++        kr_bridge::note_partial_character(true);
          let (decoded_buffer, mut is_err) = match decode_utf8_at_least_one(&mut buffer, |buffer| {
-             buffer.push(
+-            buffer.push(
 -                match next_input_event(self.get_in_fd(), self.get_ioport_fd(), Timeout::Forever) {
-+                // The bridge is left out here: the rest of one character is not a boundary, and
-+                // a frame that arrived mid-sequence waits for the one that follows it.
+-                    InputEventTrigger::Byte(b) => b,
+-                    _ => 0,
+-                },
+-            );
++            // The rest of one character is still a wait, and a takeover has to be able to end it:
++            // the bridge waits here alongside the terminal, and what it asks for is answered
++            // before the character it interrupts is finished.
++            let byte = loop {
 +                match next_input_event(
 +                    self.get_in_fd(),
 +                    self.get_ioport_fd(),
-+                    -1,
++                    self.get_bridge_fd(),
++                    self.bridge_wants_write(),
 +                    Timeout::Forever,
 +                ) {
-                     InputEventTrigger::Byte(b) => b,
-                     _ => 0,
-                 },
++                    InputEventTrigger::Byte(b) => break b,
++                    InputEventTrigger::BridgeNotified => self.bridge_readable(),
++                    _ => break 0,
++                }
++            };
++            buffer.push(byte);
+         }) {
+             Ok(decoded) => (decoded, false),
+             Err(evt) => {
+@@ -70,6 +86,7 @@
+                 (Default::default(), true)
+             }
+         };
++        kr_bridge::note_partial_character(false);
+         is_err |= matches!(escape_sequence.state, EscapeSequenceParseState::Error);
+         let mut evt = (!is_err).then(|| {
+             match escape_sequence.state {
+@@ -707,7 +724,9 @@
+ 
+ fn decode_utf8_at_least_one(
+     buffer: &mut Vec<u8>,
+-    on_incomplete: impl Fn(&mut Vec<u8>),
++    // The reader's own bridge is served while this waits for the rest of a character, which is
++    // the reader asking something of itself rather than of the terminal.
++    mut on_incomplete: impl FnMut(&mut Vec<u8>),
+ ) -> Result<WString, CharEvent> {
+     let mut decoded_input = WString::new();
+     loop {
 --- a/src/input/input.rs
 +++ b/src/input/input.rs
-@@ -482,9 +482,17 @@
+@@ -21,7 +21,7 @@
+     collections::VecDeque,
+     os::fd::{BorrowedFd, RawFd},
+     sync::atomic::{AtomicUsize, Ordering},
+-    time::Duration,
++    time::{Duration, Instant},
+ };
+ 
+ #[derive(Clone, Debug, PartialEq)]
+@@ -482,9 +482,18 @@
                  return mevt;
              }
  
@@ -71,10 +244,11 @@
                  self.get_in_fd(),
                  self.get_ioport_fd(),
 +                self.get_bridge_fd(),
++                self.bridge_wants_write(),
                  if self.is_blocked_querying() {
                      Timeout::Duration(self.get_input_data().blocking_query_timeout.unwrap())
                  } else {
-@@ -507,6 +515,10 @@
+@@ -507,6 +516,10 @@
                      self.ioport_notified();
                  }
  
@@ -85,21 +259,49 @@
                  InputEventTrigger::Byte(read_byte) => {
                      on_byte_read(self, read_byte);
                  }
-@@ -537,6 +549,13 @@
+@@ -537,11 +550,36 @@
              return Some(evt);
          }
  
+-        check_fd_readable(
+-            unsafe { BorrowedFd::borrow_raw(self.get_in_fd()) },
+-            Duration::from_millis(u64::try_from(wait_time_ms).unwrap()),
+-        )
+-        .then(|| self.readch())
 +        // A short wait for the rest of a sequence is still a wait, and a takeover has to be able
-+        // to end it.
++        // to end it. The person's own configuration decides how short it is, so the bridge waits
++        // here alongside the terminal, and the wait itself is no longer than it was.
 +        self.bridge_before_wait();
 +        if let Some(evt) = self.try_pop() {
 +            return Some(evt);
 +        }
-+
-         check_fd_readable(
-             unsafe { BorrowedFd::borrow_raw(self.get_in_fd()) },
-             Duration::from_millis(u64::try_from(wait_time_ms).unwrap()),
-@@ -554,6 +573,20 @@
++        let deadline = Instant::now() + Duration::from_millis(u64::try_from(wait_time_ms).unwrap());
++        loop {
++            let remaining = deadline.saturating_duration_since(Instant::now());
++            if remaining.is_zero() {
++                return None;
++            }
++            let mut fdset = FdReadableSet::new();
++            fdset.add(self.get_in_fd());
++            fdset.add(self.get_bridge_fd());
++            if self.bridge_wants_write() {
++                fdset.add_writable(self.get_bridge_fd());
++            }
++            if fdset.check_readable(Timeout::Duration(remaining)) <= 0 {
++                return None;
++            }
++            if fdset.test(self.get_in_fd()) {
++                return Some(self.readch());
++            }
++            self.bridge_readable();
++            if let Some(evt) = self.try_pop() {
++                return Some(evt);
++            }
++        }
+     }
+ 
+     /// Return the fd from which to read.
+@@ -554,6 +592,28 @@
          -1
      }
  
@@ -111,6 +313,14 @@
 +        -1
 +    }
 +
++    /// True while the bridge holds an answer it could not finish writing.
++    ///
++    /// The endpoint is then watched for room to write as well as for frames to read, so an answer
++    /// the worker has not yet made room for goes out when it does.
++    fn bridge_wants_write(&self) -> bool {
++        false
++    }
++
 +    /// The bridge's endpoint became readable.
 +    fn bridge_readable(&mut self) {}
 +
@@ -120,7 +330,7 @@
      /// Return the input data. This is to be implemented by the concrete type.
      fn get_input_data(&self) -> &InputData;
      fn get_input_data_mut(&mut self) -> &mut InputData;
-@@ -775,6 +808,9 @@
+@@ -775,6 +835,9 @@
      // Our ioport reported a change, so service main thread requests.
      IOPortNotified,
  
@@ -130,33 +340,38 @@
      // No file descriptor was ready within the query timeout.
      TimeoutElapsed,
  }
-@@ -795,6 +831,7 @@
+@@ -795,6 +858,8 @@
  pub(super) fn next_input_event(
      in_fd: RawFd,
      ioport_fd: RawFd,
 +    bridge_fd: RawFd,
++    bridge_wants_write: bool,
      timeout: Timeout,
  ) -> InputEventTrigger {
      let mut fdset = FdReadableSet::new();
-@@ -805,6 +842,9 @@
+@@ -805,6 +870,13 @@
          // Add the completion ioport (possibly -1 - a no-op).
          fdset.add(ioport_fd);
  
-+        // Add the root-editor bridge's endpoint (possibly -1 - a no-op).
++        // Add the root-editor bridge's endpoint (possibly -1 - a no-op), and watch it for room
++        // to write while it holds an answer that did not fit.
 +        fdset.add(bridge_fd);
++        if bridge_wants_write {
++            fdset.add_writable(bridge_fd);
++        }
 +
          // Get the uvar notifier fd (possibly none).
          let notifier = default_notifier();
          let notifier_fd = notifier.notification_fd();
-@@ -841,6 +881,12 @@
+@@ -841,6 +913,12 @@
          // Check stdin.
          if fdset.test(in_fd) {
              return readb(in_fd).map_or(InputEventTrigger::Eof, InputEventTrigger::Byte);
 +        }
 +
-+        // The bridge is read only when the terminal has nothing: what the person typed is theirs
-+        // and goes first, and anything the worker asks for waits behind it.
-+        if fdset.test(bridge_fd) {
++        // The bridge is served only when the terminal has nothing: what the person typed is
++        // theirs and goes first, and anything the worker asks for waits behind it.
++        if fdset.test(bridge_fd) || fdset.test_writable(bridge_fd) {
 +            return InputEventTrigger::BridgeNotified;
          }
  
@@ -170,7 +385,7 @@
  use crate::{
      event,
      input::{CharEvent, InputData, InputEventQueuer, ReadlineCmd, input_get_bind_mode},
-@@ -21,6 +21,23 @@
+@@ -21,6 +21,27 @@
  
      fn get_ioport_fd(&self) -> RawFd {
          self.debouncers.event_signaller_read_fd()
@@ -184,6 +399,10 @@
 +        // A frame arrived while the reader was waiting for a key, which is one of the two places
 +        // the mailbox is read.
 +        kr_bridge::wait(self);
++    }
++
++    fn bridge_wants_write(&self) -> bool {
++        kr_bridge::wants_write()
 +    }
 +
 +    fn bridge_before_wait(&mut self) {
@@ -345,7 +564,26 @@
          let result = self
              .rls()
              .finished
-@@ -3393,6 +3488,11 @@
+@@ -2723,6 +2818,9 @@
+         let mut accumulated_chars = WString::new();
+ 
+         while accumulated_chars.len() < limit {
++            // Characters this reader has taken from the terminal and not yet put in the buffer are
++            // input it still owes it, so it is not between operations while it holds them.
++            kr_bridge::note_accumulated_characters(!accumulated_chars.is_empty());
+             let evt = self.read_char();
+             let CharEvent::Key(kevt) = &evt else {
+                 event_needing_handling = Some(evt);
+@@ -2747,6 +2845,8 @@
+             }
+         }
+ 
++        kr_bridge::note_accumulated_characters(false);
++
+         if !accumulated_chars.is_empty() {
+             let (elt, _el) = self.active_edit_line();
+             self.insert_string(elt, accumulated_chars);
+@@ -3393,6 +3493,11 @@
                      self.exit_loop_requested = true;
                      check_exit_loop_maybe_warning(Some(self));
                  }

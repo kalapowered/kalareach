@@ -4,7 +4,7 @@
          if self.idx == self.peeked.len() {
              let event = self.event_queue.readch();
              self.peeked.push(event);
-+            kr_bridge::note_peeked(self.peeked.len());
++            kr_bridge::note_peeked(&self.peeked);
          }
          let res = self.peeked[self.idx].clone();
          self.idx += 1;
@@ -12,7 +12,7 @@
              };
              flog!(reader, format!("adding peeked {:?}", newevt));
              self.peeked.push(newevt);
-+            kr_bridge::note_peeked(self.peeked.len());
++            kr_bridge::note_peeked(&self.peeked);
          }
          // Now we have peeked far enough; check the event.
          // If it matches the char, then increment the index.
@@ -20,7 +20,7 @@
          self.event_queue.insert_front(self.peeked.drain(self.idx..));
          self.idx = 0;
          self.subidx = 0;
-+        kr_bridge::note_peeked(0);
++        kr_bridge::note_peeked(&[]);
          std::mem::take(&mut self.peeked)
      }
  
@@ -28,7 +28,7 @@
              "Events left on the queue - missing restart or consume?",
          );
          self.event_queue.insert_front(self.peeked.drain(self.idx..));
-+        kr_bridge::note_peeked(0);
++        kr_bridge::note_peeked(&[]);
      }
  }
  
