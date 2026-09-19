@@ -170,8 +170,14 @@ pub struct SessionAttachResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionDetachParams {
-    /// The attachment to remove.
-    pub attachment_id: AttachmentId,
+    /// The attachment to remove. Null asks the host for the originating attachment.
+    ///
+    /// Section 7's `kr detach` takes no identifier inside its own context, and the host is the
+    /// only place that knows what that context is: the attachment whose input the root editor
+    /// accepted the line under, recorded through the fence at acceptance. A caller that names
+    /// nothing gets that attachment or `AMBIGUOUS_ATTACHMENT`, never a guess and never whichever
+    /// client happens to hold the input lease when the command runs.
+    pub attachment_id: Nullable<AttachmentId>,
 }
 
 /// The result of `session.detach`.

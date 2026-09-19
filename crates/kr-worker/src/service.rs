@@ -962,7 +962,9 @@ impl WorkerService {
                                     &stream_id,
                                     sequence,
                                     "session.detached",
-                                    &kr_protocol::attachment::SessionDetachParams { attachment_id },
+                                    &kr_protocol::attachment::SessionDetachParams {
+                                        attachment_id: Nullable::some(attachment_id),
+                                    },
                                 ) {
                                     let _ = write_frame(
                                         &delivery_writable,
@@ -3035,14 +3037,17 @@ impl WorkerService {
             // attachment of this session is still refused.
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
-                if session
-                    .attachment_capabilities(params.attachment_id)
-                    .is_some()
-                {
+                // A request that names nothing is about the session's own context, so the host
+                // resolves it here, under the same boundary the effect runs on.
+                let attachment_id = match params.attachment_id.0 {
+                    Some(named) => named,
+                    None => session.detach_origin()?,
+                };
+                if session.attachment_capabilities(attachment_id).is_some() {
                     Ok(())
                 } else {
                     Err(WorkerError::UnknownAttachment {
-                        attachment: params.attachment_id.to_string(),
+                        attachment: attachment_id.to_string(),
                     })
                 }
             }
@@ -3825,15 +3830,23 @@ impl WorkerService {
             }
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(params)?;
+                // The same resolution the validation made, on the same locked session: a request
+                // that named nothing is about the attachment the root editor accepted its line
+                // from.
+                let attachment_id = match params.attachment_id.0 {
+                    Some(named) => named,
+                    None => session.detach_origin()?,
+                };
                 // Whose attachment a caller may detach depends on how it reached the host. Every
                 // local caller is the same authenticated operating-system user, and detaching from
                 // another window is something a person does on purpose. A forwarded caller is a
                 // different actor, and an attachment identifier is not permission: it detaches
-                // what its own connection created and nothing else.
+                // what its own connection created and nothing else. The resolved attachment is
+                // what that check is applied to, so naming nothing is not a way around it.
                 if caller.is_remote() {
-                    Self::check_attachment(state, params.attachment_id)?;
+                    Self::check_attachment(state, attachment_id)?;
                 }
-                let outcome = session.detach(params.attachment_id);
+                let outcome = session.detach(attachment_id);
                 // Detaching releases the lease, which moves the input fence, and can produce the
                 // terminator of a paste the attachment had open. Both are published here, *before*
                 // the result is looked at: the lease has already moved whether or not the geometry
@@ -3842,8 +3855,8 @@ impl WorkerService {
                 // attachment that sent them had gone.
                 self.runtime.flush_locked(session);
                 let result = outcome?;
-                state.remove_attachment(params.attachment_id);
-                self.forget_remote_attachment(params.attachment_id);
+                state.remove_attachment(attachment_id);
+                self.forget_remote_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionClose => {

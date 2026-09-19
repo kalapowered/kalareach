@@ -999,6 +999,133 @@ async fn an_accepted_line_names_the_client_that_typed_it_and_an_ambiguous_one_sa
     wired.close().await;
 }
 
+/// KR-REQ-07.84: `session.detach` with no attachment named resolves against the recorded origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_from() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let typist = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    wired
+        .bridge
+        .send_event(BridgeEvent::CommandAccepted(RootCommandAcceptedParams {
+            session_id: wired.session_id,
+            fence_id: Nullable::some(fence.fence_id),
+            prompt_generation: fence.prompt_generation,
+            origin: AcceptedOrigin::Fenced {
+                attachment_id: typist,
+                input_epoch: fence.input_epoch,
+            },
+        }))
+        .await
+        .expect("reports");
+    loop {
+        match wired.next().await {
+            ToBridge::EventResult { result, .. } => match *result {
+                kr_shell_integration::contract::transport::EventOutcome::CommandRecorded(_) => {
+                    break;
+                }
+                _ => continue,
+            },
+            _ => continue,
+        }
+    }
+
+    // A second client takes the keys while the command from that line is still running, which is
+    // exactly the case section 7 refuses to let decide a detach.
+    let later = holder_over(&mut client, &wired).await;
+    assert_ne!(later, typist);
+    assert_eq!(wired.runtime.session().lease().holder.0, Some(later));
+
+    let detached: kr_protocol::attachment::SessionDetachResult = client
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::attachment::SessionDetachParams {
+                attachment_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("detaches")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        detached.attachment_id, typist,
+        "the host resolves the origin the editor accepted the line from, not the lease holder"
+    );
+    assert!(
+        wired
+            .runtime
+            .session()
+            .attachment_capabilities(typist)
+            .is_none()
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.84: a mixed origin is refused rather than guessed at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_that_names_nothing_is_refused_when_the_origin_was_mixed() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let _ = holder;
+    let fence = fenced(&mut wired, 1, 1).await;
+    wired
+        .bridge
+        .send_event(BridgeEvent::CommandAccepted(RootCommandAcceptedParams {
+            session_id: wired.session_id,
+            fence_id: Nullable::some(fence.fence_id),
+            prompt_generation: fence.prompt_generation,
+            origin: AcceptedOrigin::Mixed,
+        }))
+        .await
+        .expect("reports");
+    tokio::time::timeout(SOON, async {
+        loop {
+            if wired
+                .runtime
+                .session()
+                .fence()
+                .expect("a driver")
+                .detach_target()
+                == DetachTarget::Ambiguous(AmbiguityReason::MixedContext)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the mixed context was recorded");
+
+    let refused = client
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::attachment::SessionDetachParams {
+                attachment_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a mixed context cannot name one attachment");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        1,
+        "and nothing was detached"
+    );
+    wired.close().await;
+}
+
 // --------------------------------------------------------------------------------------------
 // KR-REQ-07.32, KR-REQ-07.33, KR-REQ-07.83, KR-REQ-23.38, KR-REQ-23.54: the launch transaction.
 // --------------------------------------------------------------------------------------------

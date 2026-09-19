@@ -13567,9 +13567,15 @@ export interface SessionSummary1 {
  */
 export interface SessionDetachParams {
   /**
-   * One CLI or application attachment, independently of its device.
+   * The attachment to remove. Null asks the host for the originating attachment.
+   *
+   * Section 7's `kr detach` takes no identifier inside its own context, and the host is the
+   * only place that knows what that context is: the attachment whose input the root editor
+   * accepted the line under, recorded through the fence at acceptance. A caller that names
+   * nothing gets that attachment or `AMBIGUOUS_ATTACHMENT`, never a guess and never whichever
+   * client happens to hold the input lease when the command runs.
    */
-  attachment_id: string
+  attachment_id: AttachmentId | null
 }
 /**
  * The result of `session.detach`.

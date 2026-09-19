@@ -273,26 +273,28 @@ async fn run(cli: Cli) -> Result<Completion> {
             let (_, descriptor) = find(&paths, &selector, None)?;
             let mut client = open_worker(&descriptor, build_id()).await?;
             let attachment_id = match arguments.attachment.as_deref() {
-                Some(text) => text
-                    .parse()
-                    .map_err(|_| CliError::Usage(format!("{text} is not an attachment")))?,
-                // Nothing was named, so the session is asked what is attached. One terminal
-                // attachment is unambiguous; more than one is not, and the command says which
-                // rather than guessing.
-                None => sole_terminal_attachment(&mut client, descriptor.session_id).await?,
+                Some(text) => Some(
+                    text.parse()
+                        .map_err(|_| CliError::Usage(format!("{text} is not an attachment")))?,
+                ),
+                // Nothing was named, so the session decides. It is the only party that knows which
+                // attachment the root editor accepted this command's own line from, and it answers
+                // `AMBIGUOUS_ATTACHMENT` rather than guessing when it cannot establish one.
+                None => None,
             };
             let result =
                 kr_cli::attach::detach_attachment(&mut client, &descriptor, attachment_id).await?;
+            let detached = result.attachment_id;
             if cli.json {
                 print_json(&serde_json::json!({
                     "ok": true,
                     "session_id": descriptor.session_id.to_string(),
-                    "detached": attachment_id.to_string(),
+                    "detached": detached.to_string(),
                     "remaining": result.remaining.get(),
                 }));
             } else {
                 println!(
-                    "detached {attachment_id}; {} attachment(s) remain",
+                    "detached {detached}; {} attachment(s) remain",
                     result.remaining
                 );
             }
@@ -851,40 +853,6 @@ fn open_terminal_application(
     Err(CliError::TerminalUnavailable(
         "no terminal application this host can open was found".to_owned(),
     ))
-}
-
-/// Returns the one terminal attachment of a session, or says why there is not one.
-async fn sole_terminal_attachment(
-    client: &mut kr_ipc::client::LocalClient,
-    session_id: SessionId,
-) -> Result<kr_protocol::ids::AttachmentId> {
-    let outcome = client
-        .request(
-            Method::EventsSnapshot,
-            &kr_protocol::recovery::EventsSnapshotParams { session_id },
-        )
-        .await?;
-    let snapshot: kr_protocol::recovery::EventsSnapshotResult = typed(outcome)?;
-    let terminals: Vec<&kr_protocol::attachment::AttachmentSummary> = snapshot
-        .attachments
-        .iter()
-        .filter(|attachment| attachment.mode == kr_protocol::attachment::AttachMode::Terminal)
-        .collect();
-    match terminals.len() {
-        0 => Err(CliError::UnknownSession(format!(
-            "session {session_id} has no terminal attachment to detach"
-        ))),
-        1 => Ok(terminals[0].attachment_id),
-        _ => Err(CliError::Usage(format!(
-            "session {session_id} has {} terminal attachments; name one with --attachment: {}",
-            terminals.len(),
-            terminals
-                .iter()
-                .map(|attachment| attachment.attachment_id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
-    }
 }
 
 /// Resolves a selector that names no live descriptor, through what the daemon retains.

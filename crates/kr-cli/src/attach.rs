@@ -473,7 +473,11 @@ pub fn guard_program() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("kr-attach-guard"))
 }
 
-/// Detaches an attachment of a session, named explicitly.
+/// Detaches an attachment of a session.
+///
+/// `None` asks the session for its own originating attachment, which is what `kr detach` inside a
+/// root shell means. The host answers that from the fence the root editor accepted the line under,
+/// or refuses with `AMBIGUOUS_ATTACHMENT`; this command never picks one itself.
 ///
 /// # Errors
 ///
@@ -481,13 +485,15 @@ pub fn guard_program() -> std::path::PathBuf {
 pub async fn detach_attachment(
     client: &mut LocalClient,
     descriptor: &WorkerDescriptor,
-    attachment_id: AttachmentId,
+    attachment_id: Option<AttachmentId>,
 ) -> Result<kr_protocol::attachment::SessionDetachResult> {
     call(
         client,
         Method::SessionDetach,
         target(descriptor),
-        &SessionDetachParams { attachment_id },
+        &SessionDetachParams {
+            attachment_id: Nullable(attachment_id),
+        },
     )
     .await
 }

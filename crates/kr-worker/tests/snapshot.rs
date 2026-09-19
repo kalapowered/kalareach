@@ -1503,7 +1503,7 @@ async fn succession_draws_the_remaining_client_for_the_size_it_inherits() {
             ActionId::new(kr_ipc::new_uuid()),
             target(&host),
             &kr_protocol::attachment::SessionDetachParams {
-                attachment_id: owner.attachment_id,
+                attachment_id: kr_protocol::scalars::Nullable::some(owner.attachment_id),
             },
         )
         .await

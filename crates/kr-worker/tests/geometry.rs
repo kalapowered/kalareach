@@ -1350,7 +1350,7 @@ async fn the_attachment_methods_answer_with_the_geometry_and_the_epoch_they_prod
             ActionId::new(kr_ipc::new_uuid()),
             wired.target(),
             &SessionDetachParams {
-                attachment_id: owner,
+                attachment_id: kr_protocol::scalars::Nullable::some(owner),
             },
         )
         .await

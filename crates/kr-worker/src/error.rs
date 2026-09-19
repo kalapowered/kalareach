@@ -42,6 +42,12 @@ pub enum WorkerError {
         /// The identifier that was named.
         attachment: String,
     },
+    /// A detach that named no attachment cannot be resolved to one.
+    #[error("{detail}")]
+    AmbiguousDetach {
+        /// Why the originating attachment could not be established.
+        detail: String,
+    },
     /// The caller does not hold the input lease at the epoch it claimed.
     #[error("the input lease has moved on")]
     LeaseLost,
@@ -176,7 +182,9 @@ impl WorkerError {
             Self::Storage { .. } | Self::JournalUnavailable { .. } => ErrorCode::StorageUnavailable,
             Self::Pty { .. } | Self::ResourceUnavailable { .. } => ErrorCode::ResourceUnavailable,
             Self::Dimensions(_) | Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
-            Self::UnknownAttachment { .. } => ErrorCode::AmbiguousAttachment,
+            Self::UnknownAttachment { .. } | Self::AmbiguousDetach { .. } => {
+                ErrorCode::AmbiguousAttachment
+            }
             Self::LeaseLost => ErrorCode::LeaseLost,
             Self::InputIncompatible { .. } => ErrorCode::InputIncompatible,
             Self::PresentationUnsupported { .. } => ErrorCode::UnsupportedCapability,

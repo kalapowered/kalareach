@@ -1346,6 +1346,84 @@ impl Session {
         })
     }
 
+    /// Returns the attachment a `session.detach` that named none is about.
+    ///
+    /// Section 7 gives `kr detach` no identifier inside its own context, and section 23's editor
+    /// fence is what makes that context a fact rather than a guess: the root integration records
+    /// which attachment's input, under which epoch, the accepted line came from, and a command
+    /// running from that line detaches its own terminal. The recorded origin therefore wins, and
+    /// it is never whichever client holds the input lease by the time the command runs.
+    ///
+    /// A managed session whose fence says the origin was mixed or could not be verified is
+    /// refused: there is a real answer and this host cannot name it. A session with no recorded
+    /// origin at all — no managed editor, or nothing accepted yet — falls back to its sole
+    /// terminal attachment, which is the only attachment a detach could mean, and refuses as soon
+    /// as there is more than one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::AmbiguousDetach`] when no single attachment can be named.
+    pub fn detach_origin(&self) -> Result<AttachmentId> {
+        use kr_shell_integration::contract::fence::{AmbiguityReason, DetachTarget};
+
+        if let Some(driver) = self.fence.as_ref() {
+            match driver.detach_target() {
+                DetachTarget::Attachment(attachment_id)
+                    if self.attachments.get(attachment_id).is_some() =>
+                {
+                    return Ok(attachment_id);
+                }
+                // The origin has already left. Nothing is owed to an attachment that has gone, and
+                // guessing a survivor would detach a window nobody asked about.
+                DetachTarget::Attachment(_) => {
+                    return Err(WorkerError::AmbiguousDetach {
+                        detail: "the attachment the root editor accepted this line from has \
+                                 already left, so name the one to detach with --attachment"
+                            .to_owned(),
+                    });
+                }
+                DetachTarget::Ambiguous(AmbiguityReason::MixedContext) => {
+                    return Err(WorkerError::AmbiguousDetach {
+                        detail: "the accepted line's input came from more than one attachment or \
+                                 epoch, so name the one to detach with --attachment"
+                            .to_owned(),
+                    });
+                }
+                DetachTarget::Ambiguous(AmbiguityReason::Unverifiable) => {
+                    return Err(WorkerError::AmbiguousDetach {
+                        detail: "there was no valid fence when this line was accepted, so its \
+                                 originating attachment cannot be established; name one with \
+                                 --attachment"
+                            .to_owned(),
+                    });
+                }
+                // Nothing has been accepted through a fenced context yet, so there is no origin to
+                // prefer and the sole-attachment rule below is the whole answer.
+                DetachTarget::Ambiguous(AmbiguityReason::NoAcceptedCommand) => {}
+            }
+        }
+        let terminals: Vec<AttachmentId> = self
+            .attachments
+            .summaries()
+            .into_iter()
+            .filter(|summary| summary.mode == kr_protocol::attachment::AttachMode::Terminal)
+            .map(|summary| summary.attachment_id)
+            .collect();
+        match terminals.as_slice() {
+            [only] => Ok(*only),
+            [] => Err(WorkerError::AmbiguousDetach {
+                detail: "this session has no terminal attachment to detach".to_owned(),
+            }),
+            many => Err(WorkerError::AmbiguousDetach {
+                detail: format!(
+                    "this session has {} terminal attachments and no recorded origin; name one \
+                     with --attachment",
+                    many.len()
+                ),
+            }),
+        }
+    }
+
     /// Removes an attachment, releasing whatever it held.
     ///
     /// # Errors

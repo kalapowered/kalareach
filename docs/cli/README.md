@@ -366,6 +366,21 @@ link slow enough to lose the terminator fails that attach rather than continuing
 still deliver a late reply. And SSH's own escape character stays SSH's: `~.` closes the connection
 before the attachment sees it, exactly as it does inside any other full-screen application.
 
+## `kr detach`
+
+`kr detach` removes one attachment and leaves the session running. Run inside a managed root shell
+it takes no identifier: the session already knows which terminal the command's own line was typed
+in, because the root integration records the originating attachment and input epoch through the
+editor fence at the moment the line is accepted. That record is what the detach resolves against,
+so the terminal that gets removed is the one the person is sitting at, never whichever client
+happens to hold the input lease by the time the command runs.
+
+When the recorded origin is a line whose input came from more than one attachment or epoch, or
+there was no valid fence to establish it, the command returns `AMBIGUOUS_ATTACHMENT` and names no
+attachment. Pass `--attachment <id>` to say which one. A session with no recorded origin at all —
+a `native_compat` session, or a managed one before its first accepted line — resolves to its sole
+terminal attachment and returns `AMBIGUOUS_ATTACHMENT` when it has more than one.
+
 ## `kr question`
 
 The companion app is the primary place to answer an agent's question. These commands are the same
