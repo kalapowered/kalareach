@@ -109,7 +109,7 @@ test.describe('the first-start assistant', () => {
       .getByTestId('setup-capability-desktop.accessibility')
       .locator('.setup-evidence')
     await expect(hidden).toHaveAttribute('aria-hidden', 'true')
-    await expect(evidence).toContainText('a check that performed the operation')
+    await expect(evidence).toContainText('a check run in this execution context')
     await expect(evidence).toContainText('/usr/sbin/screencapture')
     await expect(evidence).toContainText('the tool is replaced')
     // The disclosure is a transition, so the screenshot waits for it to settle rather than

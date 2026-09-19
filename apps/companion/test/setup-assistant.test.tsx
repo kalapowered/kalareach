@@ -198,7 +198,7 @@ describe('what the machine can do, and how that is known', () => {
     await goTo('capabilities')
     await userEvent.click(screen.getByTestId('setup-evidence-toggle-desktop.screen_capture'))
     const card = screen.getByTestId('setup-capability-desktop.screen_capture')
-    expect(card.textContent).toMatch(/a check that performed the operation/)
+    expect(card.textContent).toMatch(/a check run in this execution context/)
     expect(card.textContent).toMatch(/\/usr\/sbin\/screencapture/)
     expect(card.textContent).toMatch(/desktop_bound/)
     expect(card.textContent).toMatch(/the tool is replaced/)

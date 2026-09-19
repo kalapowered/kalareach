@@ -159,8 +159,8 @@ impl Check {
                 performs: "starts one new hidden instance of the platform's own calculator, and \
                            ends the instance it started",
                 reads: "nothing",
-                writes: "nothing: the application this check starts has no documents to reopen \
-                         and no state of its own to write",
+                writes: "nothing of its own: the application this check starts opens no document \
+                         and this check gives it nothing to do",
                 sends_input: false,
                 changes_user_data: false,
                 needs_isolated_context: false,
@@ -637,9 +637,24 @@ fn read_authorised_file(plan: &Plan) -> Ran {
     };
     let facility = Some(path.display().to_string());
     // A regular file, and nothing else. Opening a pipe or a device would block for as long as
-    // whatever is on the other end feels like, and the bound this check declares is on the
-    // operation rather than on a clock it does not have.
-    match std::fs::metadata(path) {
+    // whatever is on the other end feels like. The look itself is inside the check's own bound,
+    // because asking a filesystem that has stopped answering about a file blocks in the kernel
+    // just as reading it does.
+    let Some(looked) = bounded_look(path, check.effects().bound) else {
+        return Ran {
+            check,
+            facility,
+            outcome: Outcome::NotAttempted {
+                detail: format!(
+                    "{} had not been looked at after {} seconds, so this check stopped waiting \
+                     for it",
+                    path.display(),
+                    check.effects().bound.as_secs()
+                ),
+            },
+        };
+    };
+    match looked {
         Ok(data) if !data.is_file() => {
             return Ran {
                 check,
@@ -677,9 +692,14 @@ fn read_authorised_file(plan: &Plan) -> Ran {
         }
     }
     let outcome = match bounded_read(path, check.effects().bound) {
-        None => Outcome::NotAnswered {
-            waited: check.effects().bound,
-            stopped: false,
+        // Nothing to ask to stop: the read is in the kernel and the check stops waiting for it.
+        None => Outcome::NotAttempted {
+            detail: format!(
+                "{} had not been read after {} seconds, so this check stopped waiting for it; the \
+                 read itself is the filesystem's to finish",
+                path.display(),
+                check.effects().bound.as_secs()
+            ),
         },
         Some(Ok(count)) => Outcome::Performed {
             detail: format!("it read {count} bytes of {}", path.display()),
@@ -713,10 +733,26 @@ fn read_authorised_file(plan: &Plan) -> Ran {
 /// answer is worse than a thread that is still asleep when the process ends.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bounded_read(path: &Path, bound: Duration) -> Option<std::io::Result<usize>> {
+    on_a_thread(path, bound, |path| read_first_block(&path))
+}
+
+/// Looks at a file, or gives up on the clock. The same trade as [`bounded_read`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bounded_look(path: &Path, bound: Duration) -> Option<std::io::Result<std::fs::Metadata>> {
+    on_a_thread(path, bound, |path| std::fs::metadata(path.as_path()))
+}
+
+/// Runs one filesystem question on a thread and waits for it with a clock.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn on_a_thread<T: Send + 'static>(
+    path: &Path,
+    bound: Duration,
+    ask: impl FnOnce(std::path::PathBuf) -> std::io::Result<T> + Send + 'static,
+) -> Option<std::io::Result<T>> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let owned = path.to_path_buf();
     std::thread::spawn(move || {
-        let _ = sender.send(read_first_block(&owned));
+        let _ = sender.send(ask(owned));
     });
     receiver.recv_timeout(bound).ok()
 }

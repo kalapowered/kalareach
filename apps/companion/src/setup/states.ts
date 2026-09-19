@@ -137,7 +137,9 @@ export function stateMeaning(
 
 /** What produced an answer, in words. */
 export const EVIDENCE_LABEL: Readonly<Record<CapabilityRecord['evidence_source'], string>> = {
-  disclosed_probe: 'a check that performed the operation',
+  // Not "a check that performed the operation": a check that ran and did not get far enough is
+  // this evidence too, and its own state and reason say which of the two it was.
+  disclosed_probe: 'a check run in this execution context',
   platform_query: 'a question to the operating system',
   signed_compatibility_record: 'a signed record about this version',
   not_probed: 'nothing has been run'

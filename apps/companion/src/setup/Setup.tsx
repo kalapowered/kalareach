@@ -992,9 +992,15 @@ function ReadyStep({
           <ul className="setup-governs">
             {records.map((record) => {
               const state = displayState(record, { grantWasOffered: false })
+              const about = aboutLine(record)
               return (
                 <li key={recordKey(record)}>
-                  <span>{capabilityLabel(record.capability)}</span>
+                  <span>
+                    {capabilityLabel(record.capability)}
+                    {about ? (
+                      <span className="mono small faint setup-about">{about}</span>
+                    ) : null}
+                  </span>
                   <Badge tone={STATE_TONE[state]}>{STATE_LABEL[state]}</Badge>
                 </li>
               )
