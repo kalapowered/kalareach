@@ -107,31 +107,26 @@ fn make_our_own(temporary: &Path) -> PathBuf {
 /// difference: those are the forms this helper has used, and every directory left behind is in one
 /// of them, so a sweep that knew only the newest form would tidy nothing that is actually there.
 ///
-/// Four things are then established before anything is removed, and each of them answers a way
-/// this could take away something it should not.
+/// Four things are then established before anything is removed, and each answers a way this could
+/// take away something it should not.
 ///
 /// * It is a directory, read without following a symbolic link, and the user who owns it is the
-///   user who owns `ours` - which is a directory this process made, so that user is this process's.
-///   This is also what settles what a shared temporary directory's sticky bit would leave
-///   half-done.
-/// * It was last written to before `ours` was made. A directory that has been touched since this
-///   run began is one something else is using, and this is what keeps a sweep from reaching a run
-///   that took a name back while this one was deciding about it. Everything genuinely left behind
-///   is older than this run.
-/// * `ps` cannot find the number. That question is whether a process exists, not whether this one
-///   may signal it.
-/// * `kill -0` cannot signal the number. That question is the other one, and it is asked because
-///   the first can answer no about a process that is plainly there: a `ps` that does not take
-///   `-p`, one that was ended by a signal, a `/proc` mounted so that it shows fewer processes than
-///   are running. Between them, a process this user is running is invisible to both only if it is
-///   hidden and out of reach at once.
+///   user who owns `ours` - which is a directory this process made, so that user is this
+///   process's. This is also what settles what a shared temporary directory's sticky bit would
+///   leave half-done.
+/// * Nothing holds the number its name ends in. The question is put to the kernel rather than to a
+///   command, because what has to be told apart is "no such process" from "that process is not
+///   yours to signal", and a command reports both as a failure. Only the first removes anything.
+/// * It was last written to before `ours` was made. Everything genuinely left behind is older than
+///   this run; a directory that something else has touched since is something else's business.
+/// * It is still the same directory at the moment of removal as it was when all of that was
+///   established - the same filesystem object, unchanged. A name released by one run and taken
+///   again by another is a different object under the same name, and this is what keeps a sweep
+///   that had decided about the first from reaching the second.
 ///
-/// Both questions must be answered, and answered plainly: only an exit code of one counts, so a
-/// question that could not be asked at all and a question whose asker was ended both leave the
-/// directory where it is. A number since given to another process keeps a directory for as long as
-/// that process lives, which on a machine that has been up for weeks can be a long time; that is
-/// the safe direction to err in, and the directories it holds are the few whose numbers came round
-/// again.
+/// A number since given to another process keeps a directory for as long as that process lives,
+/// which on a machine that has been up for weeks can be a long time; that is the safe direction to
+/// err in, and the directories it holds are the few whose numbers came round again.
 fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
     use std::os::unix::fs::MetadataExt;
 
@@ -153,10 +148,13 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
             continue;
         };
-        let owner = rest.rsplit('-').next().unwrap_or_default();
-        if owner.is_empty() || !owner.bytes().all(|byte| byte.is_ascii_digit()) {
+        let Some(owner) = rest
+            .rsplit('-')
+            .next()
+            .and_then(|end| end.parse::<i32>().ok())
+        else {
             continue;
-        }
+        };
         let Ok(about) = entry.metadata() else {
             continue;
         };
@@ -169,32 +167,35 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         if !nothing_holds(owner) {
             continue;
         }
+        let Ok(still) = entry.metadata() else {
+            continue;
+        };
+        if still.dev() != about.dev()
+            || still.ino() != about.ino()
+            || still.modified().ok() != about.modified().ok()
+        {
+            continue;
+        }
         let _ = std::fs::remove_dir_all(entry.path());
     }
 }
 
-/// Whether both of the questions above answer that no process holds `number`.
+/// Whether no process holds `number`.
 ///
-/// Each is put to a command, and only a plain exit code of one is taken for an answer: that is
-/// `ps` finding nothing and `kill` refusing the number. Anything else - a command that could not
-/// be started, one that was ended by a signal, any other exit - is not an answer, and one
-/// unanswered question is enough to leave the directory alone.
-fn nothing_holds(number: &str) -> bool {
-    let asked = [vec!["-p", number, "-o", "pid="], vec!["-0", number]];
-    for (command, arguments) in ["ps", "kill"].into_iter().zip(asked) {
-        let Ok(answer) = std::process::Command::new(command)
-            .args(arguments)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-        else {
-            return false;
-        };
-        if answer.code() != Some(1) {
-            return false;
-        }
-    }
-    true
+/// `kill(number, 0)` sends nothing and answers with the kernel's own error, which is the only
+/// thing that tells "no such process" apart from "that process is not yours to signal". A command
+/// would report both as a failure, and so would every other way of asking that this one could not
+/// start, so the syscall is what is asked. Anything but "no such process" is read as something
+/// holding the number, which leaves the directory where it is.
+fn nothing_holds(number: i32) -> bool {
+    let Some(pid) = rustix::process::Pid::from_raw(number) else {
+        // Not a number any process can hold, and not one this helper wrote either.
+        return false;
+    };
+    matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
 }
 
 /// The `kr` these tests launch.
