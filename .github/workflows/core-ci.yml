@@ -142,6 +142,78 @@ jobs:
           path: /tmp/kr-test-artifacts
           if-no-files-found: error
 
+  windows:
+    name: windows
+    runs-on: windows-2025
+    env:
+      # The runner has one build cache and no reason to keep incremental artefacts between steps.
+      CARGO_INCREMENTAL: "0"
+      # Section 27 puts every test artefact in one platform-resolved directory. This runner's
+      # temporary directory is where that is on Windows.
+      KR_TEST_ARTIFACTS_DIR: C:\kr-test-artifacts
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # What this runner is, printed before anything asserts on it: a pass or a failure below then
+      # names the Windows build, the console host and the shells it happened on.
+      - name: What this runner is
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          $PSVersionTable.PSVersion.ToString()
+          (Get-Command pwsh).Source
+          (Get-Command git).Source
+          & "$env:ProgramFiles\Git\usr\bin\sh.exe" -c 'echo the POSIX shell the test scripts use is here'
+
+      # Everything the workspace compiles for this target, including the test targets: a test that
+      # only builds on Unix is a Windows failure, and this is where it is caught.
+      - name: Compile the workspace and its tests
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # The four crates whose behaviour is platform-specific here: the terminal and its job object,
+      # the local attach client, the terminal engine and the repository boundary. The rest of the
+      # workspace has no Windows-specific behaviour and its tests are the same ones the Linux job
+      # runs; compiling them above is what this job owes them.
+      #
+      # What this runner cannot do is qualify a console interactively. The pseudo-console tests
+      # open a console of their own and drive it, which works here; what needs a real machine is
+      # the release matrix - Windows Terminal, an IME, a physical keyboard and a GUI logon - and
+      # `docs/host/README.md` has that procedure for the Windows test machine.
+      - name: Test the platform crates
+        run: cargo test --locked -p kr-worker -p kr-cli -p kr-term -p kr-project
+
+      # The repository boundary refuses every operation on this platform and names what it cannot
+      # hold. Run again on its own so a pass or a failure names this system.
+      - name: Repository boundary
+        if: ${{ !cancelled() }}
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          git --version
+          cargo test --locked -p kr-project --test boundary -- --nocapture
+
+      # The other Windows target the product ships on. Nothing is executed for it here; this is
+      # the compile the release baseline asks for.
+      - name: Compile for ARM64
+        run: |
+          rustup target add aarch64-pc-windows-msvc
+          cargo check --locked -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-project --target aarch64-pc-windows-msvc
+
   shell-packages:
     name: shell-packages
     runs-on: ubuntu-24.04

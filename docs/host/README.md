@@ -430,6 +430,91 @@ A sequence the profile does not name is consumed rather than forwarded, and the 
 the input lease has no destination, so it becomes a durable host event in the worker's own journal
 rather than being shown to whoever happens to be watching.
 
+## Windows
+
+The terminal on Windows is a pseudo-console. It is the same session, the same lease and the same
+retained history; what differs is the three things this platform does its own way.
+
+**The console, and where byte preservation begins.** ConPTY renders an application's console-API
+output into VT sequences before the host sees any of it. So the promise this host makes starts at
+ConPTY's output pipe: every byte that arrives there is carried through unchanged, and what an
+application did through the console API rather than by writing bytes is whatever ConPTY made of it.
+A session never claims to have preserved writes it was never handed.
+
+**The job object.** The worker holds the sole owning handle for one job object per session, with
+kill-on-close, and every process it starts joins that job *before* it runs: the shell is created
+suspended, assigned, and only then resumed. Default breakaway stays disabled, so a child cannot
+leave by asking. A vendor sandbox that creates a job of its own nests inside this one; nesting and
+breakaway are separate questions, and disabling the second says nothing about the first. Where the
+job cannot be created or cannot hold what it must, the session says so: either the launch fails by
+name, or a reduced-ownership profile is selected explicitly, which tracks the root shell's start
+identity alone and can never report complete ownership coverage. A GUI resource that has to outlive
+the session is created through the desktop broker, outside the job, and recorded as an external
+resource; closing a session never ends one.
+
+**The interrupt.** There is no foreground process group here and no signal to send one. The
+interrupt is the byte the console turns into a control event for whatever is attached to it,
+written through the console's own input rather than through the session's, so an application that
+has stopped reading cannot hold it.
+
+**win32 input mode.** A ConPTY asks for console key records with `CSI ?9001h` and disables them
+with `CSI ?9001l`. Those requests stop at this boundary and are never broadcast to a client. The
+worker records what its own backend asked for; a Windows local attach client reads the console with
+`ReadConsoleInputW` and sends typed key records, which the worker encodes as
+`CSI Vk;Sc;Uc;Kd;Cs;Rc_` - a final underscore, not an APC string - carrying the virtual key, the
+scan code the console reported, one UTF-16 code unit, the key-down flag, the control-key state and
+the repeat count. Omitted fields mean `0,0,0,0,0,1`. Nothing decodes a record and encodes it again
+with a scan code this host chose. A client that sends no records sends legacy VT input, which is
+accepted without any claim about scan-code fidelity. A console inside the session - `wsl.exe`, an
+`ssh` client, a nested ConPTY - asks for the mode on the same stream and disables it when it ends;
+the requests are counted, so an inner console's disable leaves the outer backend's mode exactly
+where it was.
+
+### Running the Windows tests
+
+Two machines run them and they run different things.
+
+**The GitHub-hosted runner** (`windows-2025`, the `windows` job in `.github/workflows/core-ci.yml`)
+compiles the whole workspace and its tests with `-D warnings`, runs the tests of `kr-worker`,
+`kr-cli`, `kr-term` and `kr-project`, runs the repository boundary again on its own so a result
+names the system it happened on, and compiles for `aarch64-pc-windows-msvc`. The pseudo-console
+tests open a console of their own and drive it, which the runner can do.
+
+What the runner cannot do is the release matrix. It has no interactive logon, no window manager, no
+IME and no physical keyboard, so nothing about Windows Terminal, a real desktop session, IME
+composition at the keyboard or a GUI logout is established there. Those need a machine.
+
+**The Windows test machine.** Prerequisites, all of which the CI runner also has:
+
+| What | Why |
+| --- | --- |
+| Windows 11 or Windows Server 2025, x86-64 or ARM64 | the release baseline |
+| Visual Studio 2022 Build Tools, the C++ tools for the target, Windows 11 SDK 22621 | the MSVC toolchain the product is built with |
+| LLVM, with `clang` on `PATH` | `ring` compiles its ARM64 Windows sources with clang rather than `cl.exe`, so the ARM64 build needs it |
+| rustup with `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` | the two targets the product ships on |
+| PowerShell 7 | the shell the product launches, and the one `crates/kr-worker/tests/windows.rs` qualifies |
+| Git for Windows | its `usr\bin\sh.exe` is the POSIX shell the test scripts run in; `kr_worker::testing` finds it |
+
+The test list, in the order it is worth running:
+
+```
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p kr-worker -p kr-cli -p kr-term -p kr-project
+cargo test -p kr-worker --test windows -- --nocapture
+cargo test -p kr-project --test boundary -- --nocapture
+cargo check -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-project \
+  --target aarch64-pc-windows-msvc
+```
+
+`cargo test -p kr-worker --test windows` is the platform suite: it opens a pseudo-console, starts
+PowerShell 7 inside it, resizes it and reads the new geometry back from the application, drains
+what the application wrote after it has gone, delivers the interrupt, checks that the job holds the
+shell and the processes it started and that terminating it ends the tree, and checks that a process
+started outside the job survives the session's closure.
+
+The two build commands both need the developer environment for the target loaded first, which
+`vcvarsall.bat x64` or `vcvarsall.bat x64_arm64` does.
+
 ## Who may type
 
 A session has one input lease with an epoch. `input.acquire` takes it immediately: the epoch
