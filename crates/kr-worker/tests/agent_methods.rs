@@ -1746,3 +1746,78 @@ fn kr_req_11_27_an_abandoned_answer_leaves_the_resource_answerable() {
     assert_eq!(answered.state, PendingState::Resolved);
     assert_eq!(upstream.submitted().len(), 1);
 }
+
+/// KR-REQ-11.28 and KR-REQ-23.30: a plan is carried only while the invocation's own authority
+/// still holds, and an admission handed to the wrong dispatch route comes back unspent.
+#[test]
+fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("prompt.submit").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+            }],
+        )
+        .expect("the actions are registered");
+    let invoke = PluginActionInvokeParams {
+        target: target(1),
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        action: ActionName::new("prompt.submit").expect("valid"),
+        draft_id: Nullable::null(),
+        parameters: Bytes::from(b"{}".to_vec()),
+    };
+    let plan = kr_protocol::broker::PreparedEffect {
+        action: ActionName::new("prompt.submit").expect("valid"),
+        class: EffectClass::Write,
+        operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+        draft_id: Nullable::null(),
+        argument_hash: arguments_digest(),
+    };
+
+    // An admission whose approval route is asked for it keeps its permit: the mistake is refused
+    // before anything is consumed, and the right route still works.
+    let admitted = broker
+        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(2))
+        .expect("the invocation is admitted");
+    assert!(
+        broker
+            .record_approval(&admitted, TimestampMs::new(3))
+            .is_err(),
+        "a plugin action is not an approval to settle"
+    );
+    assert!(admitted.executable(), "and its permit is still there");
+    broker
+        .validate_effect(&admitted, &plan)
+        .expect("the plan is the invocation's own");
+    broker
+        .record_plugin_action(&admitted, TimestampMs::new(4))
+        .expect("and the right route carries it");
+    assert_eq!(upstream.submitted().len(), 1);
+
+    // The thread selection moves while the component is preparing its plan. The token was spent
+    // to invite that work, so what refuses the plan is the authority as it stands now.
+    let admitted = broker
+        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(5))
+        .expect("the invocation is admitted");
+    broker
+        .advance_binding(instance(), None, TimestampMs::new(6))
+        .expect("the binding advances");
+    let refusal = broker
+        .validate_effect(&admitted, &plan)
+        .expect_err("the invocation's revision is not the one in force");
+    assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::StaleSession);
+    assert!(
+        broker
+            .record_plugin_action(&admitted, TimestampMs::new(7))
+            .is_err(),
+        "and nothing carries a plan this host did not validate"
+    );
+    assert_eq!(upstream.submitted().len(), 1, "nothing more was written");
+}

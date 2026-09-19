@@ -722,7 +722,10 @@ impl Arbitration {
                 holds_claim: false,
                 dispatched: pending.dispatched,
                 transmitter: None,
-                releases_transmitter: false,
+                // A resource that goes back to answerable gives its transmission admission back
+                // with its claim. Leaving the old reservation would make it a resource that says
+                // it is pending and that nobody can answer.
+                releases_transmitter: to == PendingState::Pending,
             });
         }
         (result, transitions)
@@ -946,6 +949,10 @@ mod tests {
             claim(&mut arbitration, resource_id, "device-2", 3).is_err(),
             "a second answer cannot claim a resource that is already claimed"
         );
+        let reserved = arbitration.plan_dispatch(&held).expect("reserved");
+        arbitration.commit(reserved).expect("committed");
+        let marked = arbitration.plan_dispatched(&held).expect("marked");
+        arbitration.commit(marked).expect("committed");
         let resolve = arbitration.plan_resolve(&held).expect("planned");
         arbitration.commit(resolve).expect("committed");
         assert!(
@@ -968,6 +975,10 @@ mod tests {
         let fresh = claim(&mut arbitration, resource_id, "device-1", 3).expect("claimed again");
         assert_ne!(released.claim_id, fresh.claim_id);
         assert!(arbitration.plan_resolve(&released).is_err());
+        let reserved = arbitration.plan_dispatch(&fresh).expect("reserved");
+        arbitration.commit(reserved).expect("committed");
+        let marked = arbitration.plan_dispatched(&fresh).expect("marked");
+        arbitration.commit(marked).expect("committed");
         arbitration
             .plan_resolve(&fresh)
             .expect("the claim in force resolves it");
@@ -1038,7 +1049,11 @@ mod tests {
         arbitration.record(withdrawn, None, None).expect("recorded");
 
         let held = claim(&mut arbitration, dispatched_id, "device-1", 2).expect("claimed");
-        let marker = arbitration.plan_dispatch(&held).expect("planned");
+        let reserved = arbitration.plan_dispatch(&held).expect("reserved");
+        arbitration
+            .commit(reserved)
+            .expect("the reservation is taken");
+        let marker = arbitration.plan_dispatched(&held).expect("planned");
         arbitration.commit(marker).expect("the marker is committed");
 
         let reconciliation = reconcile(

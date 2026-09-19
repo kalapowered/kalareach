@@ -407,6 +407,17 @@ impl MutationAdmission {
         self.action.as_ref()
     }
 
+    /// Asks the transport whether it can carry this operation, as the body now stands.
+    ///
+    /// It is asked once the operation is final, which for an answer is after the core has
+    /// prepared it. Asking earlier would put a different operation to the transport than the one
+    /// it will be given.
+    pub(crate) fn check_transport(&self) -> Result<()> {
+        let held = self.held();
+        let permit = held.as_ref().ok_or(BrokerError::AlreadyTransmitted)?;
+        permit.dispatch.admit(&permit.request)
+    }
+
     /// Returns true when the permit has not been taken.
     #[must_use]
     pub fn executable(&self) -> bool {
@@ -547,7 +558,7 @@ impl Broker {
         let _ = caller;
         let capability_id = CapabilityId::new(capability)
             .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;
-        self.state().admit_mutation_in(
+        let admitted = self.state().admit_mutation_in(
             target,
             Some(capability_id),
             operation,
@@ -556,7 +567,12 @@ impl Broker {
             body,
             None,
             now,
-        )
+        )?;
+        // And whether the transport can carry this operation at all. Asking here is what makes an
+        // upstream with no method for the operation a rejection rather than a marker followed by
+        // a refusal nobody can act on.
+        admitted.check_transport()?;
+        Ok(admitted)
     }
 
     /// Admits `agent.prompt.submit` or `agent.prompt.queue`.
@@ -786,7 +802,16 @@ impl Broker {
             option_id: params.option_id.clone(),
             response: dispatch.response.clone(),
         };
-        Ok(admitted.with_body(body).with_approval(claim, dispatch))
+        let admitted = admitted
+            .with_body(body)
+            .with_approval(claim.clone(), dispatch);
+        // The transport is asked about the answer it will actually be given, which is the frame
+        // the core just prepared. A transport that cannot carry it gives the resource back.
+        if let Err(error) = admitted.check_transport() {
+            let _ = self.release_claim(&claim, now);
+            return Err(error);
+        }
+        Ok(admitted)
     }
 
     /// Applies `agent.approval.respond`.
@@ -890,15 +915,11 @@ impl Broker {
             Some(draft_id) => Some(self.resolve_draft(draft_id)?),
             None => None,
         };
-        // The parameters have to be ones this host can put on the wire. Discovering that they
-        // are not when the frame is built would substitute something else for them after the
-        // digest had already been agreed, so it is decided here.
-        if serde_json::from_slice::<serde_json::Value>(params.parameters.as_slice()).is_err() {
-            return Err(BrokerError::invalid(format!(
-                "{}'s parameters are not an encoding this host can carry to an upstream",
-                params.action
-            )));
-        }
+        // The parameters are read once and written back in the one form this host will transmit.
+        // What is hashed is that form, so the digest covers the bytes that go rather than a
+        // spelling of them: two members of one name, or any other difference the encoder would
+        // resolve later, cannot make the transmitted arguments differ from the hashed ones.
+        let arguments = Self::executable_arguments(params)?;
         let mut state = self.state();
         // The declaration is read *inside* the admission. Reading it before the lock would let
         // `register_actions` replace it in between, so the grant, the effect class and the draft
@@ -909,7 +930,7 @@ impl Broker {
                 detail: format!("{} acts on a draft and this call named none", params.action),
             });
         }
-        let invocation = Self::invocation_for(caller, &registered, params);
+        let invocation = Self::invocation_for(caller, &registered, params, arguments.clone());
         let admitted = state.admit_mutation_in(
             &params.target,
             registered.capability.clone(),
@@ -920,7 +941,7 @@ impl Broker {
                 plugin_id: params.plugin_id.clone(),
                 action: params.action.clone(),
                 draft_id: params.draft_id.as_ref().copied(),
-                parameters: params.parameters.as_slice().to_vec(),
+                parameters: arguments.clone(),
                 operation: None,
                 token: None,
             },
@@ -938,10 +959,12 @@ impl Broker {
             .inspect_err(|_| {
                 state.tokens.retire(&token.token_id);
             })?;
-        Ok(admitted
+        let admitted = admitted
             .with_action_token(spent)
             .with_draft(draft)
-            .with_declaration(registered))
+            .with_declaration(registered);
+        admitted.check_transport()?;
+        Ok(admitted)
     }
 
     /// Applies `plugin.action.invoke`.
@@ -1112,7 +1135,12 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<()> {
         let registered = self.check_action(binding_id, params)?;
-        let invocation = Self::invocation_for(caller, &registered, params);
+        let invocation = Self::invocation_for(
+            caller,
+            &registered,
+            params,
+            Self::executable_arguments(params)?,
+        );
         let mut state = self.state();
         state.admit_mutation_in(
             &params.target,
@@ -1131,10 +1159,34 @@ impl Broker {
         Ok(())
     }
 
+    /// Returns the one encoding of an invocation's arguments this host will transmit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the arguments are not an encoding this host
+    /// can carry to an upstream.
+    fn executable_arguments(params: &PluginActionInvokeParams) -> Result<Vec<u8>> {
+        let arguments: serde_json::Value = serde_json::from_slice(params.parameters.as_slice())
+            .map_err(|error| {
+                BrokerError::invalid(format!(
+                    "{}'s parameters are not an encoding this host can carry to an upstream: \
+                     {error}",
+                    params.action
+                ))
+            })?;
+        serde_json::to_vec(&arguments).map_err(|error| {
+            BrokerError::invalid(format!(
+                "{}'s parameters will not encode: {error}",
+                params.action
+            ))
+        })
+    }
+
     fn invocation_for(
         caller: &Caller,
         registered: &RegisteredAction,
         params: &PluginActionInvokeParams,
+        arguments: Vec<u8>,
     ) -> Invocation {
         Invocation {
             actor_id: caller.actor_id.clone(),
@@ -1148,7 +1200,7 @@ impl Broker {
                 .capability
                 .clone()
                 .map(|capability| (capability, None)),
-            parameters: params.parameters.as_slice().to_vec(),
+            parameters: arguments,
         }
     }
 
@@ -1240,6 +1292,11 @@ impl Broker {
                 ),
             });
         }
+        // And the invocation's own authority, as it stands now. The token was spent to invite the
+        // component to prepare this plan, so it is not proof of anything by the time the plan
+        // arrives: a grant withdrawn, a thread selection advanced or a capability invalidated
+        // while the component was working is a plan this host will not carry.
+        self.recheck_invocation(binding_id, &token, registered.capability.clone())?;
         if registered.operation != effect.operation {
             return Err(BrokerError::invalid(format!(
                 "{} is declared as {} and this plan prepares {}",

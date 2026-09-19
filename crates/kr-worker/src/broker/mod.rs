@@ -1110,10 +1110,13 @@ impl Broker {
     /// transmission admission, and [`BrokerError::LedgerUnavailable`] when the marker cannot be
     /// written.
     pub fn commit_dispatch(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+        let _ = now;
         let mut state = self.state();
         let transition = state.arbitration.plan_dispatched(claim)?;
+        // One durable write. The resource's own state does not change here — it was claimed and
+        // stays claimed — so the marker is the whole of what is written, and a second write
+        // beside it could leave the ledger saying dispatched while memory said reserved.
         state.ledger.mark_dispatched(&transition.resource)?;
-        state.write_transition(&transition, now)?;
         state.arbitration.commit(transition)
     }
 
@@ -1921,6 +1924,38 @@ impl Broker {
 
     // -- the gateway --------------------------------------------------------------------------
 
+    /// Rechecks one invocation's own authority against what this broker holds now.
+    ///
+    /// The token was spent when the component was invited to prepare its plan, so nothing about
+    /// it is proof by the time the plan arrives. This asks again: the binding, its grant, the
+    /// instance's suspension, the revision in force and the capability, all as they stand.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Grant`], [`BrokerError::StaleBinding`],
+    /// [`BrokerError::UnsupportedCapability`] or [`BrokerError::PreconditionFailed`] as the
+    /// present state requires.
+    pub fn recheck_invocation(
+        &self,
+        binding_id: BrokerBindingId,
+        token: &ActionToken,
+        capability: Option<CapabilityId>,
+    ) -> Result<()> {
+        let invocation = Invocation {
+            actor_id: token.actor_id.clone(),
+            grant: token.grant,
+            grant_id: token.grant_id.as_ref().copied(),
+            application_instance_id: token.application_instance_id,
+            binding_revision: token.binding_revision,
+            action: token.action.clone(),
+            draft_id: token.draft_id.as_ref().copied(),
+            capability: capability.map(|capability| (capability, None)),
+            parameters: Vec::new(),
+        };
+        self.state().check_invocation(binding_id, &invocation)?;
+        Ok(())
+    }
+
     /// Pins one connector's qualified tables for one installation.
     ///
     /// A table is qualified at installation, under the publisher's semantic trust grant, and this
@@ -2627,10 +2662,6 @@ impl BrokerState {
             turn_id,
             body,
         };
-        // And whether the transport can carry this operation at all. Asking here is what makes an
-        // upstream with no method for the operation a rejection rather than a marker followed by
-        // a refusal nobody can act on.
-        dispatch.admit(&request)?;
         Ok(crate::broker::methods::MutationAdmission::new(
             request,
             dispatch,

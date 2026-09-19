@@ -3252,8 +3252,11 @@ was working has withdrawn the invitation. The draft is resolved before the admis
 and the snapshot is what the admission binds to; a draft that moved before the plan arrived is
 `DRAFT_CONFLICT`. The arguments a plan is for are the arguments that will execute: the host
 computes their digest itself and compares it with the token's and the plan's, because a hash a
-component supplied says only that the component can write a hash, and an encoding this host cannot
-put on the wire is refused at admission rather than replaced when the frame is built. What
+component supplied says only that the component can write a hash. The arguments are read once at
+admission and written back in the one form this host will transmit, so the digest covers the bytes
+that go; an encoding this host cannot put on the wire is refused there rather than replaced when
+the frame is built. The invocation's own authority is asked again when the plan arrives, because
+the token was spent to invite the work and is not proof by the time the work comes back. What
 transmits is the plan that was validated: the operation it prepares travels in the frame, carried
 in the permit rather than attested by a flag beside it. The draft store itself — whose the draft is
 and what else it holds — is not this host's, and what it supplies here is the snapshot.
