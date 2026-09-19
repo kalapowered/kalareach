@@ -27,7 +27,8 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{EnvironmentVariable, Presentation, SessionCreateParams, ShellMode};
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
-    MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
+    CURRENT_BASENAME, MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
+    PackageShell, PackageStartupEntry, default_package_root,
 };
 use kr_shell_integration::host::startup::{self, Change, HomeLayout};
 use kr_shell_integration::host::terminal::{
@@ -126,33 +127,45 @@ fn target(environment_id: EnvironmentId) -> ActionTarget {
     }
 }
 
-/// Installs a package manifest whose executable is a copy of a real program on the internal disk.
-fn install_package(root: &Path, kind: ShellKind, flags: &[&str]) {
-    let directory = root.join(kind.as_str()).join("identity-1");
+/// Installs a package the way a build does: an identity directory, a record and a current pointer.
+///
+/// The executable is a copy of a real program on the internal disk, because what these tests check
+/// about it is that the host resolves and launches the package's own binary rather than a
+/// substitute.
+fn install_package(root: &Path, kind: ShellKind) {
+    let identity = "identity-1";
+    let directory = root.join(kind.as_str()).join(identity);
     std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
-    std::fs::copy("/bin/cat", directory.join("bin/shell")).expect("copies a program");
-    std::fs::create_dir_all(directory.join("share")).expect("creates the entry directory");
+    let executable = directory.join("bin").join(kind.as_str());
+    std::fs::copy("/bin/cat", &executable).expect("copies a program");
+    std::fs::create_dir_all(directory.join("startup")).expect("creates the entry directory");
     std::fs::write(
-        directory.join("share/entry"),
+        directory.join("startup/entry"),
         b"# the package's own entry\n",
     )
     .expect("writes the entry");
     let manifest = PackageManifest {
-        shell: kind,
-        executable: "bin/shell".to_owned(),
-        upstream_version: "5.9".to_owned(),
-        editor_abi: "zle-5.9".to_owned(),
-        integration_version: "1".to_owned(),
-        interactive_flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
-        patches: Vec::new(),
-        modules: Vec::new(),
-        startup_entry: "share/entry".to_owned(),
+        identity: identity.to_owned(),
+        shell: PackageShell {
+            kind,
+            executable,
+            upstream_version: "5.9".to_owned(),
+            editor_abi: "zle-5.9".to_owned(),
+            integration_version: "1".to_owned(),
+            patches: Vec::new(),
+            modules: Vec::new(),
+        },
+        startup_entry: PackageStartupEntry {
+            file: "startup/entry".to_owned(),
+        },
     };
     std::fs::write(
         directory.join(MANIFEST_BASENAME),
         serde_json::to_string(&manifest).expect("encodes"),
     )
-    .expect("writes the manifest");
+    .expect("writes the record");
+    std::fs::write(root.join(kind.as_str()).join(CURRENT_BASENAME), identity)
+        .expect("names the identity this installation uses");
 }
 
 // --------------------------------------------------------------------------------------------
@@ -183,7 +196,7 @@ async fn a_managed_create_without_a_qualified_package_is_refused_before_anything
     assert_eq!(refused.code, ErrorCode::ShellIntegrationUnsupported);
 
     // A shell KalaReach qualifies, with no package installed for it, is the same refusal by name.
-    install_package(packages.path(), ShellKind::Zsh, &["-l", "-i"]);
+    install_package(packages.path(), ShellKind::Zsh);
     let refused = client
         .mutate(
             Method::SessionCreate,
@@ -240,7 +253,7 @@ async fn a_stock_shell_is_labelled_rather_than_claiming_the_managed_contract() {
 #[test]
 fn a_managed_session_launches_the_package_binary_with_the_flags_it_declares() {
     let packages = tempfile::tempdir().expect("a directory");
-    install_package(packages.path(), ShellKind::Zsh, &["-l", "-i"]);
+    install_package(packages.path(), ShellKind::Zsh);
     let set = PackageSet::discover(packages.path()).expect("reads the package");
     let package = set.select(Some("zsh")).expect("qualified");
     assert_eq!(
@@ -362,8 +375,8 @@ fn the_environment_is_the_creators_snapshot_filtered_and_then_the_contexts_and_t
 fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
     let home = tempfile::tempdir().expect("a directory");
     let packages = tempfile::tempdir().expect("a directory");
-    install_package(packages.path(), ShellKind::Zsh, &["-l", "-i"]);
-    install_package(packages.path(), ShellKind::Bash, &["-l", "-i"]);
+    install_package(packages.path(), ShellKind::Zsh);
+    install_package(packages.path(), ShellKind::Bash);
     let set = PackageSet::discover(packages.path()).expect("reads the packages");
 
     // The user has their own configuration, and a ZDOTDIR that moves where Zsh reads from.
@@ -384,11 +397,11 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
 
     for package in set.packages() {
         let body = startup::entry(
-            package.manifest.shell,
+            package.kind(),
             &package.startup_entry(),
-            package.manifest.shell == ShellKind::Zsh,
+            package.kind() == ShellKind::Zsh,
         );
-        for target in layout.targets(package.manifest.shell) {
+        for target in layout.targets(package.kind()) {
             assert_eq!(
                 startup::install(&target.path, &body).expect("installs"),
                 Change::Added
@@ -426,7 +439,7 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
 
     // Removal deletes the marked entry and leaves everything else exactly as it was.
     for package in set.packages() {
-        for target in layout.targets(package.manifest.shell) {
+        for target in layout.targets(package.kind()) {
             assert_eq!(
                 startup::remove(&target.path).expect("removes"),
                 Change::Removed
@@ -517,19 +530,18 @@ fn the_terminal_is_chosen_in_order_and_a_host_with_none_says_so_once() {
 /// KR-REQ-07.16, KR-REQ-07.85: the packages a build produced, when it produced any.
 #[test]
 fn the_built_packages_are_qualified_where_this_run_has_them() {
-    let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
+    // Whatever this run was told to use, or the installation's own root, which is where
+    // `scripts/build-shells.sh` puts what it builds.
+    let root = std::env::var_os(PACKAGE_ROOT_VARIABLE)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(default_package_root);
+    let set = PackageSet::discover(&root).expect("reads the built packages");
+    if set.packages().is_empty() {
         // The packages are built by their own tooling and are not a prerequisite for this suite.
         // Nothing is asserted about a package this run does not have.
-        eprintln!(
-            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory, so no built package is checked"
-        );
+        eprintln!("skipped: {} holds no package manifest", root.display());
         return;
-    };
-    let set = PackageSet::discover(Path::new(&root)).expect("reads the built packages");
-    assert!(
-        !set.packages().is_empty(),
-        "{PACKAGE_ROOT_VARIABLE} named {root:?} and it holds no package manifest"
-    );
+    }
     for package in set.packages() {
         assert!(
             package.executable().is_file(),

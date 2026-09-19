@@ -186,36 +186,43 @@ A command the caller has already quoted for its target shell is installed exactl
 ## Launching the root shell
 
 Managed mode launches a KalaReach-qualified package: the exact binary its reader patch was built
-into, with the flags that package declares, and the module tree it will load. Nothing is substituted.
-A shell no package qualifies is refused with `SHELL_INTEGRATION_UNSUPPORTED`, by name, before a
-reservation is recorded and before anything is spawned. A command line rather than an executable is
-refused the same way: a non-interactive script request never becomes an interactive shell.
+into and the module tree it will load. Nothing is substituted. A shell no package qualifies is
+refused with `SHELL_INTEGRATION_UNSUPPORTED`, by name, before a reservation is recorded and before
+anything is spawned. A command line rather than an executable is refused the same way: a
+non-interactive script request never becomes an interactive shell.
 
-A package is a directory with a manifest beside its binary:
+A package is what `scripts/build-shells.sh` installed, and this host reads that installation rather
+than a description of its own:
 
 ```
-<root>/<shell>/<identity>/package.json
+<root>/<shell>/current                            the identity this installation uses
+<root>/<shell>/<identity>/kr-shell-identity.json  what the package declares in its handshake
 ```
 
 `<root>` is the installation's own shell directory, or whatever `KR_SHELL_PACKAGES` names, which is
-how a test runs against a package that was just built. Every path in the manifest is relative to the
-manifest's own directory, so a package that was copied elsewhere is still the same package.
+how a test runs against a package that was just built. `docs/shell-integration/packages.md` is where
+the record's own shape is stated; these are the parts a session depends on.
 
 | Field | What it is |
 | --- | --- |
-| `shell` | `zsh`, `bash`, `fish` or `powershell` |
-| `executable` | The shell binary |
-| `upstream_version` | The upstream release it was built from |
-| `editor_abi` | The editor ABI revision the reader patch was built against |
-| `integration_version` | The package's own integration version |
-| `interactive_flags` | The flags an interactive root shell of this package is launched with |
-| `patches` | Every published reader patch, with the upstream revision each applies to |
-| `modules` | The module tree, with each module's search path and ABI |
-| `startup_entry` | The file the guarded startup entry sources |
+| `shell.kind` | `zsh`, `bash`, `fish` or `powershell` |
+| `shell.executable` | The shell binary, as the build installed it |
+| `shell.upstream_version` | The upstream release it was built from |
+| `shell.editor_abi` | The editor ABI revision the reader patch was built against |
+| `shell.integration_version` | The package's own integration version |
+| `shell.patches` | Every published reader patch, with the upstream revision each applies to |
+| `shell.modules` | The module tree, with each module's search path and ABI |
+| `startup_entry.file` | The file the guarded startup entry sources |
 
 A hello is checked against the package's editor ABI and integration version, and the rest of the
 identity it carries — the executable, the upstream revision, the patches and the module tree — is
 recorded whole with the session, which is what its diagnostics report.
+
+The arguments that make one of these an interactive login shell are the host's rather than the
+package's: a record says what a package was built from, not how a session starts it, and the
+arguments belong to the shell family. A package whose recorded executable is no longer where the
+build put it is still read from its own directory, so a package that was copied somewhere else is
+the package that is there.
 
 ## Setup
 

@@ -102,11 +102,11 @@ pub fn report(package: &ShellPackage, layout: &HomeLayout) -> ShellReport {
         package: Some(PackageReport {
             executable: package.executable().display().to_string(),
             flags: package.interactive_flags(),
-            version: package.manifest.upstream_version.clone(),
-            editor_abi: package.manifest.editor_abi.clone(),
-            integration_version: package.manifest.integration_version.clone(),
+            version: package.manifest.shell.upstream_version.clone(),
+            editor_abi: package.manifest.shell.editor_abi.clone(),
+            integration_version: package.manifest.shell.integration_version.clone(),
         }),
-        ..entries_only(package.manifest.shell, layout)
+        ..entries_only(package.kind(), layout)
     }
 }
 
@@ -144,7 +144,7 @@ pub fn install(
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
-    let body = startup::entry(package.manifest.shell, &package.startup_entry(), nsh_bypass);
+    let body = startup::entry(package.kind(), &package.startup_entry(), nsh_bypass);
     let mut reported = report(package, layout);
     for entry in &mut reported.entries {
         let path = std::path::Path::new(&entry.path);

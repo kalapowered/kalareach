@@ -116,34 +116,47 @@ impl Host {
     /// depends on what the machine happens to have installed.
     fn with_shell_package(mut self) -> Self {
         use kr_shell_integration::contract::qualification::ShellKind;
-        use kr_shell_integration::host::package::{MANIFEST_BASENAME, PackageManifest};
+        use kr_shell_integration::host::package::{
+            CURRENT_BASENAME, MANIFEST_BASENAME, PackageManifest, PackageShell, PackageStartupEntry,
+        };
 
+        let identity = "identity-1";
         let root = self.temp.root().join("packages");
-        let directory = root.join(ShellKind::Zsh.as_str()).join("identity-1");
+        let directory = root.join(ShellKind::Zsh.as_str()).join(identity);
         std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
-        std::fs::copy("/bin/cat", directory.join("bin/shell")).expect("copies a program");
-        std::fs::create_dir_all(directory.join("share")).expect("creates the entry directory");
+        let executable = directory.join("bin").join("zsh");
+        std::fs::copy("/bin/cat", &executable).expect("copies a program");
+        std::fs::create_dir_all(directory.join("startup")).expect("creates the entry directory");
         std::fs::write(
-            directory.join("share/entry"),
+            directory.join("startup/entry"),
             b"# the package's own entry\n",
         )
         .expect("writes the entry");
         let manifest = PackageManifest {
-            shell: ShellKind::Zsh,
-            executable: "bin/shell".to_owned(),
-            upstream_version: "5.9".to_owned(),
-            editor_abi: "zle-5.9".to_owned(),
-            integration_version: "1".to_owned(),
-            interactive_flags: vec!["-l".to_owned(), "-i".to_owned()],
-            patches: Vec::new(),
-            modules: Vec::new(),
-            startup_entry: "share/entry".to_owned(),
+            identity: identity.to_owned(),
+            shell: PackageShell {
+                kind: ShellKind::Zsh,
+                executable,
+                upstream_version: "5.9".to_owned(),
+                editor_abi: "zle-5.9".to_owned(),
+                integration_version: "1".to_owned(),
+                patches: Vec::new(),
+                modules: Vec::new(),
+            },
+            startup_entry: PackageStartupEntry {
+                file: "startup/entry".to_owned(),
+            },
         };
         std::fs::write(
             directory.join(MANIFEST_BASENAME),
             serde_json::to_string(&manifest).expect("encodes"),
         )
-        .expect("writes the manifest");
+        .expect("writes the record");
+        std::fs::write(
+            root.join(ShellKind::Zsh.as_str()).join(CURRENT_BASENAME),
+            identity,
+        )
+        .expect("names the identity this installation uses");
 
         // Where the worker this daemon starts looks for its own packages: a directory this test
         // made and left empty. The value is set on the child rather than on this process, whose

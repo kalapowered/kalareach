@@ -7,9 +7,10 @@
 //!
 //! # Where packages live
 //!
-//! A build writes each package under `<root>/<shell>/<identity>/`, with a manifest beside the
-//! binary. `<root>` is the installation's own shell directory, or whatever
-//! [`PACKAGE_ROOT_VARIABLE`] names, which is how a test runs against a package that was just built.
+//! A build writes each package under `<root>/<shell>/<identity>/`, with its identity record beside
+//! the binary and `<root>/<shell>/current` naming the identity the installation uses. `<root>` is
+//! the installation's own shell directory, or whatever [`PACKAGE_ROOT_VARIABLE`] names, which is
+//! how a test runs against a package that was just built.
 
 use std::path::{Path, PathBuf};
 
@@ -22,36 +23,56 @@ use crate::contract::transport::{ModuleEntry, PatchRevision, ShellIdentity};
 /// The variable that names the directory the qualified packages were built into.
 pub const PACKAGE_ROOT_VARIABLE: &str = "KR_SHELL_PACKAGES";
 
-/// The manifest each package carries beside its binary.
-pub const MANIFEST_BASENAME: &str = "package.json";
+/// The identity record each package carries beside its binary.
+pub const MANIFEST_BASENAME: &str = "kr-shell-identity.json";
 
-/// What a package's manifest says it is.
+/// The file beside a shell's packages that names the identity this installation uses.
+pub const CURRENT_BASENAME: &str = "current";
+
+/// What a package's identity record says it is.
 ///
-/// Every path in it is relative to the manifest's own directory, so a package that was copied
-/// somewhere else is still the same package. The identity fields are the ones the handshake
-/// carries, which is what makes a qualification claim checkable rather than asserted.
+/// This is the record `scripts/build-shells.sh` writes and the package declares in its handshake,
+/// read here rather than restated: the identity fields are the ones the handshake carries, which is
+/// what makes a qualification claim checkable rather than asserted. The record says more than this
+/// host reads — the five declared mechanisms and the build's own inputs and compiler — and those
+/// stay in the file for whoever needs them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PackageManifest {
+    /// The identity a build computed from its own inputs, which also names the directory.
+    #[serde(default)]
+    pub identity: String,
+    /// The shell this package is, and what it was built from.
+    pub shell: PackageShell,
+    /// The guarded startup entry this package installs.
+    pub startup_entry: PackageStartupEntry,
+}
+
+/// What a package says about the shell inside it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageShell {
     /// Which managed shell this package is.
-    pub shell: ShellKind,
-    /// The shell binary, relative to the manifest's directory.
-    pub executable: String,
+    pub kind: ShellKind,
+    /// The shell binary, as the build installed it.
+    pub executable: PathBuf,
     /// The upstream shell version it was built from.
     pub upstream_version: String,
     /// The editor ABI revision the reader patch was built against.
     pub editor_abi: String,
     /// The package's own integration version.
     pub integration_version: String,
-    /// The flags this package declares an interactive root shell is launched with.
-    pub interactive_flags: Vec<String>,
     /// Every published reader patch in the package.
+    #[serde(default)]
     pub patches: Vec<PatchRevision>,
-    /// The module tree the shell will load, with each module's search path relative to the
-    /// manifest's directory.
+    /// The module tree the shell will load, with each module's own search path.
+    #[serde(default)]
     pub modules: Vec<ModuleEntry>,
-    /// The guarded startup entry this package installs, relative to the manifest's directory.
-    pub startup_entry: String,
+}
+
+/// Where a package's guarded startup entry lives.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageStartupEntry {
+    /// The file a startup entry sources, relative to the package's own directory.
+    pub file: String,
 }
 
 /// One qualified package, resolved to absolute paths.
@@ -64,22 +85,50 @@ pub struct ShellPackage {
 }
 
 impl ShellPackage {
+    /// Returns which managed shell this package is.
+    #[must_use]
+    pub const fn kind(&self) -> ShellKind {
+        self.manifest.shell.kind
+    }
+
     /// Returns the executable a session launches.
+    ///
+    /// A build records the path it installed, which is absolute. A package that was copied
+    /// somewhere else carries a path that is no longer there, so the copy's own directory answers
+    /// for it: the package is the directory, and the record describes what is in it.
     #[must_use]
     pub fn executable(&self) -> PathBuf {
-        self.directory.join(&self.manifest.executable)
+        let recorded = &self.manifest.shell.executable;
+        if recorded.is_absolute() && recorded.is_file() {
+            return recorded.clone();
+        }
+        match recorded.file_name() {
+            Some(name) if recorded.is_absolute() => self.directory.join("bin").join(name),
+            _ => self.directory.join(recorded),
+        }
     }
 
     /// Returns the guarded startup entry this package installs.
     #[must_use]
     pub fn startup_entry(&self) -> PathBuf {
-        self.directory.join(&self.manifest.startup_entry)
+        self.directory.join(&self.manifest.startup_entry.file)
     }
 
     /// Returns the flags an interactive root shell of this package is launched with.
+    ///
+    /// The host's, not the package's: a package records what it was built from rather than how a
+    /// session starts it, and these are the arguments that make that shell an interactive login
+    /// shell. They belong to the shell rather than to the platform, which is why they are chosen
+    /// by kind.
     #[must_use]
     pub fn interactive_flags(&self) -> Vec<String> {
-        self.manifest.interactive_flags.clone()
+        match self.manifest.shell.kind {
+            ShellKind::Zsh | ShellKind::Bash => {
+                vec!["-l".to_owned(), "-i".to_owned()]
+            }
+            ShellKind::Fish => vec!["--login".to_owned(), "--interactive".to_owned()],
+            ShellKind::PowerShell => vec!["-NoLogo".to_owned(), "-NoExit".to_owned()],
+        }
     }
 
     /// Returns the identity a bridge of this package declares.
@@ -89,14 +138,15 @@ impl ShellPackage {
     #[must_use]
     pub fn identity(&self) -> ShellIdentity {
         ShellIdentity {
-            kind: self.manifest.shell,
+            kind: self.manifest.shell.kind,
             executable: self.executable().display().to_string(),
-            upstream_version: self.manifest.upstream_version.clone(),
-            editor_abi: self.manifest.editor_abi.clone(),
-            integration_version: self.manifest.integration_version.clone(),
-            patches: self.manifest.patches.clone(),
+            upstream_version: self.manifest.shell.upstream_version.clone(),
+            editor_abi: self.manifest.shell.editor_abi.clone(),
+            integration_version: self.manifest.shell.integration_version.clone(),
+            patches: self.manifest.shell.patches.clone(),
             modules: self
                 .manifest
+                .shell
                 .modules
                 .iter()
                 .map(|module| ModuleEntry {
@@ -228,12 +278,12 @@ impl PackageSet {
                         path: candidate.display().to_string(),
                         detail: error.to_string(),
                     })?;
-                if manifest.shell != *kind {
+                if manifest.shell.kind != *kind {
                     return Err(PackageFault::Unreadable {
                         path: candidate.display().to_string(),
                         detail: format!(
-                            "the manifest says {} and it is installed as {}",
-                            manifest.shell,
+                            "the record says {} and it is installed as {}",
+                            manifest.shell.kind,
                             kind.as_str()
                         ),
                     });
@@ -278,7 +328,7 @@ impl PackageSet {
     pub fn get(&self, kind: ShellKind) -> Option<&ShellPackage> {
         self.packages
             .iter()
-            .find(|package| package.manifest.shell == kind)
+            .find(|package| package.manifest.shell.kind == kind)
     }
 
     /// Resolves the package a create request selects.
@@ -347,9 +397,17 @@ impl PackageSet {
 
 /// Returns the manifests a package directory may hold, newest layout first.
 fn manifest_candidates(directory: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![directory.join(MANIFEST_BASENAME)];
-    // A build writes one identity directory per build, so an installation can hold more than one.
-    // They are read in name order, which is stable, and the first complete one is the package.
+    let mut candidates = Vec::new();
+    // What the installation says it is using. A build writes one identity directory per build, so
+    // an installation holds every package it ever built and this file names the one that counts.
+    if let Ok(current) = std::fs::read_to_string(directory.join(CURRENT_BASENAME)) {
+        let current = current.trim();
+        if !current.is_empty() {
+            candidates.push(directory.join(current).join(MANIFEST_BASENAME));
+        }
+    }
+    candidates.push(directory.join(MANIFEST_BASENAME));
+    // Failing both, whichever identity directory holds a record, in name order, which is stable.
     if let Ok(entries) = std::fs::read_dir(directory) {
         let mut nested: Vec<PathBuf> = entries
             .flatten()
@@ -415,23 +473,27 @@ mod tests {
 
     fn manifest(kind: ShellKind) -> PackageManifest {
         PackageManifest {
-            shell: kind,
-            executable: "bin/shell".to_owned(),
-            upstream_version: "5.9".to_owned(),
-            editor_abi: "zle-5.9".to_owned(),
-            integration_version: "1".to_owned(),
-            interactive_flags: vec!["-l".to_owned(), "-i".to_owned()],
-            patches: vec![PatchRevision {
-                name: "reader-mailbox".to_owned(),
-                upstream_revision: "5.9".to_owned(),
-                revision: "1".to_owned(),
-            }],
-            modules: vec![ModuleEntry {
-                name: "kr-bridge".to_owned(),
-                search_path: "lib".to_owned(),
+            identity: "identity-1".to_owned(),
+            shell: PackageShell {
+                kind,
+                executable: PathBuf::from("bin/shell"),
+                upstream_version: "5.9".to_owned(),
                 editor_abi: "zle-5.9".to_owned(),
-            }],
-            startup_entry: "share/entry.sh".to_owned(),
+                integration_version: "1".to_owned(),
+                patches: vec![PatchRevision {
+                    name: "reader-mailbox".to_owned(),
+                    upstream_revision: "5.9".to_owned(),
+                    revision: "1".to_owned(),
+                }],
+                modules: vec![ModuleEntry {
+                    name: "kr-bridge".to_owned(),
+                    search_path: "lib".to_owned(),
+                    editor_abi: "zle-5.9".to_owned(),
+                }],
+            },
+            startup_entry: PackageStartupEntry {
+                file: "share/entry.sh".to_owned(),
+            },
         }
     }
 
@@ -498,7 +560,7 @@ mod tests {
         let package = set
             .select(Some(executable.to_str().expect("utf-8")))
             .expect("qualified");
-        assert_eq!(package.manifest.shell, ShellKind::Zsh);
+        assert_eq!(package.kind(), ShellKind::Zsh);
 
         // A shell no package qualifies, at a path with a space in it, is refused as unqualified
         // rather than as a script.
