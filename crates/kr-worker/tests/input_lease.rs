@@ -1155,8 +1155,7 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
 
     {
         let mut session = runtime.session();
-        // An ordinary byte, which the application echoes, and then four bytes of a delimiter,
-        // which it does not see.
+        // An ordinary byte, which the application echoes.
         session
             .write_input(
                 leaving,
@@ -1167,6 +1166,17 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
                 std::time::Instant::now(),
             )
             .expect("ordinary bytes");
+    }
+    runtime.flush_input();
+    retained_within(&runtime, b"kr-typed.", LIVENESS_DEADLINE).await;
+
+    // Then four bytes of a delimiter, which the application does not see, and the source going,
+    // both while this hold on the session lasts. A held prefix has a deadline of its own, and the
+    // host forwards it when that passes; waiting for anything in between would be waiting to see
+    // which of the two happened first on this machine. What is under test is what the detach finds
+    // and reports, so the detach follows the prefix without letting go.
+    {
+        let mut session = runtime.session();
         let accepted = session
             .write_input(
                 leaving,
@@ -1178,13 +1188,6 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
             )
             .expect("the first four bytes of a delimiter");
         assert_eq!(accepted.held_prefix_bytes, 4);
-    }
-    runtime.flush_input();
-    retained_within(&runtime, b"kr-typed.", LIVENESS_DEADLINE).await;
-
-    // The source goes.
-    {
-        let mut session = runtime.session();
         session.detach(leaving).expect("detaches");
         let interrupted = session.interrupted_input();
         assert_eq!(
