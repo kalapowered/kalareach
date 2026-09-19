@@ -1117,13 +1117,20 @@ durable writing was lost - so a reader is told the record has holes rather than 
 into it. "This session kept nothing" and "this host cannot say what this session kept" are
 different answers and a reader is owed the second one.
 
-**A worker crash closes the session.** The controller records the closure, and the closure record
-carries the terminated process identities, the resources known to survive, and an
-ownership-coverage flag that never claims every application was discovered. The archive then
-fences what the session recorded still owning: each identity is checked against the kernel's own
-answer before anything is stopped, one that has already gone is counted as gone, and one the
-platform declines to describe leaves the coverage incomplete. Nothing is rebuilt from terminal
-history.
+**A worker crash closes the session.** The controller takes recovery ownership, runs section 9's
+two recovery rules over the journal the worker left - a dispatch marker with no authoritative
+outcome becomes `unknown` and is never dispatched again, and an accepted intent with no marker is
+rejected - and then records the closure. The closure record carries the terminated process
+identities, the resources known to survive, and an ownership-coverage flag that never claims every
+application was discovered.
+
+The archive then fences what the worker's own boundary still holds. On a Unix host that boundary
+is the process group the worker led: it is sessionised, so its descendants join its group, and a
+process that left with `setsid` is exactly what the coverage flag exists to be honest about. Every
+member is checked against the kernel's own answer before anything is stopped, because the kernel
+reuses identifiers; one that has already gone is counted as gone, and one the platform declines to
+describe leaves the coverage incomplete. This host's own process group is never touched. Nothing
+is rebuilt from terminal history.
 
 The transfer service's one retention question is answered here. Section 14 gives a submitted
 attachment its session's retention rather than the seven-day unused window, and the archive is
@@ -1146,21 +1153,32 @@ three of them would leave the fourth undone somewhere a person could not see.
 4. **Reconcile** before completion is reported. In-flight cleanup is finished when every subsystem
    says it has nothing outstanding, not when it was asked for.
 
+The generation is written down **before** any subsystem is touched. A generation that was applied
+and not recorded would be a boundary a restart could not see, and a late result from before it
+would then be published; a host that cannot record it does not enter privacy mode at all.
+
 Content-history retention, description inference, sync production and backup production are
-disabled prospectively, together. Retained local output, semantic-history caches and generated
-descriptions are removed, and titles become metadata only.
+disabled prospectively, together. What this host holds itself is removed with them: the retained
+output goes, the spool with it, and the content a settled receipt carries - the intent envelope
+the caller sent and the result the action produced - is taken out of the journal while the
+receipt's own metadata stays. A receipt that has *not* settled keeps its envelope, because
+recovery reads it and a retry of an action this host may already have performed is answered from
+it.
 
 What stays is named rather than quietly retained: the receipt journal's operation metadata, the
-minimal local authority this host holds, live pending questions and approvals, which keep working
-under the grants they already have without their bodies being exported as historical content, and
-user-pinned labels, which are kept locally unless explicitly cleared and excluded from later sync
-while privacy mode is on. A host that claimed a functioning durable control system wrote no state
-at all would be claiming something untrue.
+minimal local authority this host holds, the envelope of an action that has not settled, live
+pending questions and approvals, which keep working under the grants they already have without
+their bodies being exported as historical content, and user-pinned labels, which are kept locally
+unless explicitly cleared and excluded from later sync while privacy mode is on. A host that
+claimed a functioning durable control system wrote no state at all would be claiming something
+untrue.
 
 What has already left the host is shown rather than erased. An uploaded archive or notification is
-listed with a separately authorised deletion action; this host does not silently delete unrelated
-backup collections and does not claim a copy somebody else holds can be recalled. Local deletion
-is logical cleanup of this host's own records rather than a claim of physical secure erase.
+listed with a separately authorised deletion action for the copies this host holds a reference to;
+it does not silently delete unrelated backup collections and does not claim a copy somebody else
+holds can be recalled. Local deletion is logical cleanup of this host's own records rather than a
+claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here
+says the bytes are unrecoverable from the device they were on.
 
 Turning privacy mode off starts retention again from that moment. It reconstructs nothing, and the
 generation does not go back, so a late result from the private interval is still refused.

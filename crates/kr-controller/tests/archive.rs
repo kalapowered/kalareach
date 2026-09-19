@@ -111,7 +111,9 @@ fn a_closed_session_is_served_from_what_it_left_behind() {
     assert_eq!(read.receipts, 1);
     assert!(read.is_complete(), "{:?}", read.incompleteness);
 
-    // And the receipt itself, with no worker anywhere.
+    // And the receipt itself, with no worker anywhere. It was admitted and never dispatched, and
+    // recovery has not run, so what it says is what the worker left: section 9's rules are run
+    // once under recovery ownership, which the next test drives.
     let actor = ActorId::new("test:archive").expect("an actor");
     let receipt = archive
         .receipt(
@@ -127,6 +129,77 @@ fn a_closed_session_is_served_from_what_it_left_behind() {
 }
 
 #[test]
+fn recovery_resolves_what_a_crashed_worker_left_unfinished() {
+    // Section 9's two recovery rules are the worker's, and a worker that crashed never ran them.
+    // The archive runs them once under ownership: a dispatch marker with no authoritative outcome
+    // becomes `unknown` and is never dispatched again, and an accepted intent with no marker is
+    // rejected, because the freshness it was admitted under cannot be revalidated.
+    let (_temp, archive) = host();
+    let session_id = session();
+    let actor = ActorId::new("test:archive").expect("an actor");
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal.accept(&submission(1)).expect("an accepted intent");
+        journal.accept(&submission(2)).expect("a second one");
+        journal
+            .mark_dispatching(
+                actor.clone(),
+                kr_worker::journal::action_id_from([2; 16]),
+                kr_ipc::now_ms(),
+            )
+            .expect("a dispatch marker with no outcome");
+    }
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let recovered = archive.recover_journal(&ownership).expect("recovers");
+    assert_eq!(recovered.left_unknown, 1);
+    assert_eq!(recovered.rejected, 1);
+
+    let dispatched = archive
+        .receipt(
+            session_id,
+            &actor,
+            kr_worker::journal::action_id_from([2; 16]),
+        )
+        .expect("reads the receipt");
+    assert_eq!(
+        dispatched.receipt.state,
+        kr_protocol::receipt::ReceiptState::Unknown,
+        "a marker with no answer is unknown rather than dispatching for ever"
+    );
+    let accepted = archive
+        .receipt(
+            session_id,
+            &actor,
+            kr_worker::journal::action_id_from([1; 16]),
+        )
+        .expect("reads the receipt");
+    assert_eq!(
+        accepted.receipt.state,
+        kr_protocol::receipt::ReceiptState::Rejected
+    );
+}
+
+#[test]
+fn recovery_of_a_session_with_no_journal_creates_none() {
+    let (_temp, archive) = host();
+    let session_id = session();
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let recovered = archive.recover_journal(&ownership).expect("answers");
+    assert_eq!(recovered.left_unknown, 0);
+    assert_eq!(recovered.rejected, 0);
+    assert!(
+        !archive.paths().journal_database(session_id).exists(),
+        "an empty journal is not invented for a session that had none"
+    );
+}
+
+#[test]
 fn a_lost_journal_produces_an_explicit_incomplete_archive_rather_than_an_empty_success() {
     // KR-REQ-24.19. "This session kept nothing" and "this host cannot say what this session kept"
     // are different answers, and the second is the one a reader is owed.
@@ -134,7 +207,13 @@ fn a_lost_journal_produces_an_explicit_incomplete_archive_rather_than_an_empty_s
     let session_id = session();
     let read = archive.archive(session_id).expect("reads the archive");
     assert!(!read.is_complete());
-    assert_eq!(read.incompleteness, vec![Incompleteness::JournalMissing]);
+    assert_eq!(
+        read.incompleteness,
+        vec![
+            Incompleteness::JournalMissing,
+            Incompleteness::ClosureMissing
+        ]
+    );
     assert!(read.summary.is_none());
     assert!(read.closure.is_none());
 }
@@ -337,67 +416,110 @@ fn taking_ownership_creates_no_worker_and_no_store() {
         "no spool was created either"
     );
     let read = archive.archive(session_id).expect("reads the archive");
-    assert_eq!(read.incompleteness, vec![Incompleteness::JournalMissing]);
+    assert_eq!(
+        read.incompleteness,
+        vec![
+            Incompleteness::JournalMissing,
+            Incompleteness::ClosureMissing
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-07.65, 07.66: the closure receipt and what a crash fences
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
-fn a_crash_fences_what_the_session_recorded_and_never_claims_more() {
-    // KR-REQ-07.66. Only identities the session recorded are touched, each is checked against the
-    // kernel's own answer first, and what survives outside that boundary is the user's.
+fn a_crash_fences_the_workers_own_boundary_and_never_claims_more() {
+    // KR-REQ-07.66. What is still running after a worker crash is whatever the worker's own
+    // boundary still holds, and on a Unix host that boundary is the process group it led. Every
+    // member is checked against the kernel's own answer before anything is stopped, and the
+    // coverage never claims that every application was discovered.
     let (_temp, archive) = host();
     let session_id = session();
-    // An identity the kernel never described belongs to a process that had already ended when it
-    // was made, which is what `ended_process_identity` records and what the archive validates.
-    let ended = kr_ipc::identity::ended_process_identity(1);
-    let ownership = archive
-        .take_ownership(session_id, DisplayNumber::new(1), &ended)
-        .expect("ownership");
 
-    // One process this test started itself, which stands in for a job the session owned.
-    let mut child = std::process::Command::new("/bin/sh")
+    // A process group of this test's own making, standing in for the boundary a worker leads.
+    // Job control is what puts a background job in a group of its own on every Unix this host
+    // builds for, and the shell writes the group down rather than leaving this test to look for
+    // it. The parent shell stays in this test's own group and is never touched.
+    let marker = std::env::temp_dir().join(format!("kr-fence-{}", kr_ipc::new_uuid()));
+    let mut leader = std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg("sleep 30")
+        // The inner shell leads the group and then exits, which is the shape a crashed worker
+        // leaves behind: the leader is gone and what it started is still in its group.
+        .arg(format!(
+            "set -m; /bin/sh -c 'sleep 30 & ps -o pgid= -p $$ > {0}' & wait",
+            marker.display()
+        ))
         .spawn()
-        .expect("starts a child");
-    let owned = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
+        .expect("starts a group leader");
+    let mut group = None;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        if let Ok(text) = std::fs::read_to_string(&marker)
+            && let Ok(found) = text.trim().parse::<u32>()
+        {
+            group = Some(found);
+            break;
+        }
+    }
+    let group = group.expect("the group leader recorded its own group");
+    std::fs::remove_file(&marker).ok();
+
+    let ownership = archive
+        .take_ownership(
+            session_id,
+            DisplayNumber::new(1),
+            &kr_ipc::identity::ended_process_identity(group),
+        )
+        .expect("ownership");
     let mut record = closure(session_id, ClosureReason::WorkerCrash);
-    record.terminated = vec![
-        TerminatedProcess {
-            identity: owned.clone(),
-            name: Nullable::some("a job this session owned".to_owned()),
-            forced: false,
-        },
-        TerminatedProcess {
-            identity: ended.clone(),
-            name: Nullable::some("the session's worker".to_owned()),
-            forced: false,
-        },
-    ];
     record.surviving = vec![SurvivingResource {
         kind: "browser".to_owned(),
         detail: "an explicitly brokered window".to_owned(),
     }];
-
     let fenced = archive.fence_owned(&ownership, &record);
     assert_eq!(fenced.session_id, session_id);
-    assert_eq!(fenced.stopped, vec![owned], "the live one was terminated");
-    assert_eq!(fenced.already_gone, 1, "the worker had already ended");
-    assert_eq!(fenced.unaccounted, 0);
+    assert_eq!(
+        fenced.boundary,
+        kr_controller::archive::CleanupBoundary::ProcessGroup(group)
+    );
+    assert!(
+        !fenced.stopped.is_empty(),
+        "what the dead leader left in its group was terminated: {fenced:?}"
+    );
     assert_eq!(fenced.surviving.len(), 1, "what survives is reported");
     assert_eq!(
         fenced.coverage,
         OwnershipCoverage::Incomplete,
-        "a session with a surviving resource never claims complete coverage"
+        "a process group is not a complete boundary and never claims to be"
     );
-    let status = child.wait().expect("the child is collected");
+    // Nothing outside that group was touched: this test's own process is still running.
     assert!(
-        !status.success(),
-        "the child ended because it was terminated rather than on its own"
+        matches!(
+            kr_ipc::identity::process_state(
+                &kr_ipc::identity::current_process_start_identity().expect("an identity")
+            ),
+            kr_ipc::identity::ProcessState::Running
+        ),
+        "the fence stayed inside the session's own boundary"
     );
+    let _ = leader.wait();
+}
+
+#[test]
+fn a_boundary_this_host_cannot_enumerate_leaves_the_coverage_incomplete() {
+    let (_temp, archive) = host();
+    let session_id = session();
+    // A process identifier nothing holds: there is no group to enumerate.
+    let ended = kr_ipc::identity::ended_process_identity(u32::MAX - 7);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let fenced = archive.fence_owned(&ownership, &closure(session_id, ClosureReason::WorkerCrash));
+    assert!(fenced.stopped.is_empty());
+    assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete);
 }
 
 #[test]

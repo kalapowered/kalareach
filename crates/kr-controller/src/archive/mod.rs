@@ -35,6 +35,13 @@ use kr_worker::persistence::fault::RecoveryGap;
 
 use crate::error::{ControllerError, Result};
 
+/// The most bytes one archive history page carries.
+///
+/// A control frame carries [`kr_protocol::limits::MAX_CONTROL_FRAME_LEN`] in all, and a page is a
+/// response with a header, cursors and a gap beside its bytes. Three quarters of the frame leaves
+/// room for every one of those whatever the caller asked for.
+pub const MAX_ARCHIVE_PAGE_BYTES: u64 = (kr_protocol::limits::MAX_CONTROL_FRAME_LEN as u64) * 3 / 4;
+
 /// How long an archive waits for a process the operating system will not describe.
 ///
 /// A query that is denied or fails is not death. Section 24 makes recovery ownership conditional
@@ -135,19 +142,51 @@ impl Archive {
 
     /// Returns true when this session's own retention still covers what was submitted to it.
     ///
-    /// Section 14 gives a submitted attachment its session's retention. A session the archive
-    /// holds a record of keeps what was submitted to it; one this host has no record of at all
-    /// keeps nothing. An archive that could not read its journal answers *yes*, because declining
-    /// to delete is the answer that cannot lose a file.
+    /// Section 14 gives a submitted attachment its session's retention rather than the seven-day
+    /// unused-attachment window, so the question is whether this host still holds a record of the
+    /// session at all. Three answers are *yes* and they are all the same kind of answer:
+    ///
+    /// * a summary or a closure survived, which is a session this host remembers;
+    /// * retained output survived, which is a session whose history is still being kept;
+    /// * something could not be read, because declining to delete is the answer that cannot lose
+    ///   a file and an unreadable record is not evidence that retention has ended.
+    ///
+    /// Only an archive that found nothing at all and could read everything it looked at answers
+    /// no. The one thing that must never happen here is a *false* answer produced by not looking,
+    /// because the sweep reads no as expiry and removes the payload.
     #[must_use]
     pub fn retains_submissions(&self) -> bool {
         self.summary.is_some()
             || self.closure.is_some()
-            || self
-                .incompleteness
-                .iter()
-                .any(|reason| matches!(reason, Incompleteness::JournalUnreadable { .. }))
+            || self.next_cursor > 0
+            || self.incompleteness.iter().any(|reason| {
+                matches!(
+                    reason,
+                    Incompleteness::JournalUnreadable { .. } | Incompleteness::HistoryLost { .. }
+                )
+            })
     }
+}
+
+/// The boundary a crashed session's remaining processes were cleaned by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CleanupBoundary {
+    /// The worker's own process group, which its descendants join.
+    ///
+    /// It is not a complete boundary: a process that calls `setsid` leaves it, which is why a
+    /// host built on it never claims complete coverage.
+    ProcessGroup(u32),
+    /// No boundary this host could enumerate.
+    None,
+}
+
+/// What recovering a crashed session's journal resolved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recovered {
+    /// Dispatch markers with no authoritative outcome, left `unknown` and never dispatched again.
+    pub left_unknown: u64,
+    /// Accepted intents with no marker, rejected because their freshness cannot be revalidated.
+    pub rejected: u64,
 }
 
 /// What fencing a crashed session's owned processes did.
@@ -155,6 +194,8 @@ impl Archive {
 pub struct Fenced {
     /// The session.
     pub session_id: SessionId,
+    /// The boundary this pass was able to enumerate.
+    pub boundary: CleanupBoundary,
     /// The processes this pass terminated. The signal reached each of them.
     pub stopped: Vec<ProcessStartIdentity>,
     /// How many recorded processes had already ended.
@@ -185,6 +226,23 @@ fn stop(identity: &ProcessStartIdentity) -> bool {
         return false;
     };
     rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_ok()
+}
+
+/// Returns this process's own process group, where the platform has one.
+#[cfg(unix)]
+fn own_process_group() -> Option<u32> {
+    Some(
+        rustix::process::getpgrp()
+            .as_raw_nonzero()
+            .get()
+            .unsigned_abs(),
+    )
+}
+
+/// Returns this process's own process group, where the platform has one.
+#[cfg(not(unix))]
+const fn own_process_group() -> Option<u32> {
+    None
 }
 
 /// Terminates one recorded process, and says whether the signal reached it.
@@ -337,54 +395,118 @@ impl ArchiveService {
         fenced
     }
 
-    /// Fences whatever a crashed session still owns, by the identities it recorded.
+    /// Fences whatever a crashed session still owns.
     ///
     /// Section 7: after a worker crash the controller fences its endpoints, uses the cgroup or
     /// Job or the recorded identities for cleanup, and records any incomplete coverage. The
     /// endpoint is fenced by [`Self::take_ownership`]; this is the second half.
     ///
-    /// Only identities this session recorded are touched, and each is checked before it is
-    /// stopped: a process identifier on its own proves nothing, because the kernel reuses them,
-    /// so the recorded start value has to match as well. A process that has already ended is
-    /// counted as gone rather than as stopped, and one the platform declines to describe is
-    /// counted as neither, which is what makes the coverage incomplete.
+    /// **The boundary is what is cleaned, not the closure's list.** A closure record's
+    /// `terminated` list is what a session already stopped; a crashed worker never wrote one, and
+    /// the synthetic record the controller writes names the worker alone. What is still running
+    /// is whatever the worker's own boundary still holds, and on a Unix host that boundary is the
+    /// worker's process group: the worker is sessionised, so it leads a group its descendants
+    /// join, and a process that left that group with `setsid` is exactly what the
+    /// ownership-coverage flag exists to be honest about.
+    ///
+    /// Two guards. Nothing is stopped whose recorded start value does not match what the kernel
+    /// describes now, because the kernel reuses identifiers. And a group that is this daemon's
+    /// own is never touched, which cannot arise from a worker the service manager started and is
+    /// refused rather than relied on.
     #[must_use]
     pub fn fence_owned(&self, ownership: &RecoveryOwnership, closure: &ClosureRecord) -> Fenced {
         let mut fenced = Fenced {
             session_id: ownership.session_id,
+            boundary: CleanupBoundary::None,
             stopped: Vec::new(),
             already_gone: 0,
             unaccounted: 0,
-            surviving: Vec::new(),
+            surviving: closure.surviving.clone(),
             coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
         };
-        for terminated in &closure.terminated {
-            match kr_ipc::identity::process_state(&terminated.identity) {
-                kr_ipc::identity::ProcessState::Ended => fenced.already_gone += 1,
-                kr_ipc::identity::ProcessState::Running => {
-                    if stop(&terminated.identity) {
-                        fenced.stopped.push(terminated.identity.clone());
-                    } else {
+        let Ok(leader) = u32::try_from(ownership.ended.pid.get()) else {
+            return fenced;
+        };
+        if own_process_group() == Some(leader) {
+            // This daemon's own group. Nothing a worker the service manager started can be in it,
+            // and stopping it would stop this host.
+            fenced.unaccounted += 1;
+            return fenced;
+        }
+        match kr_ipc::identity::processes_in_group(leader) {
+            Ok(members) => {
+                fenced.boundary = CleanupBoundary::ProcessGroup(leader);
+                for pid in members {
+                    if pid == leader {
+                        // The worker itself, whose death is what let this run at all.
+                        fenced.already_gone += 1;
+                        continue;
+                    }
+                    let Ok(identity) = kr_ipc::identity::process_start_identity(pid) else {
                         fenced.unaccounted += 1;
+                        continue;
+                    };
+                    match kr_ipc::identity::process_state(&identity) {
+                        kr_ipc::identity::ProcessState::Ended => fenced.already_gone += 1,
+                        kr_ipc::identity::ProcessState::Running => {
+                            if stop(&identity) {
+                                fenced.stopped.push(identity);
+                            } else {
+                                fenced.unaccounted += 1;
+                            }
+                        }
+                        kr_ipc::identity::ProcessState::Unknown { .. } => fenced.unaccounted += 1,
                     }
                 }
-                kr_ipc::identity::ProcessState::Unknown { .. } => fenced.unaccounted += 1,
             }
+            // A platform that will not enumerate the boundary is one this host cannot account
+            // for. It says so rather than reporting a clean sweep of nothing.
+            Err(_) => fenced.unaccounted += 1,
         }
         // Section 7 forbids claiming that every application a worker may have started was
-        // discovered. What survives outside the recorded boundary is the user's.
-        fenced.surviving = closure.surviving.clone();
-        fenced.coverage = if fenced.unaccounted == 0 && !closure.surviving.is_empty() {
-            kr_protocol::session::OwnershipCoverage::Incomplete
-        } else if fenced.unaccounted == 0 {
-            closure.ownership_coverage
-        } else {
-            kr_protocol::session::OwnershipCoverage::Incomplete
-        };
+        // discovered. A process group is not a complete boundary - `setsid` leaves it - so this
+        // never reports complete coverage on its own, and a surviving resource is the user's.
+        fenced.coverage = kr_protocol::session::OwnershipCoverage::Incomplete;
         fenced
     }
 
-    /// Reads what one session left behind.
+    /// Recovers a crashed session's journal, under ownership, without creating one.
+    ///
+    /// Section 9's two recovery rules are the worker's, and a worker that crashed never ran them.
+    /// The archive runs them once instead: a dispatch marker with no authoritative outcome
+    /// becomes `unknown` and is never dispatched again, and an accepted intent with no marker is
+    /// rejected, because the freshness it was admitted under cannot be revalidated after the
+    /// process that issued it has gone. Without this a crashed session would serve `dispatching`
+    /// for ever, which says an effect may be about to happen on a host where nothing is running.
+    ///
+    /// It opens the journal that is there and creates none: a session with no journal has nothing
+    /// to recover, and inventing an empty one would replace an incomplete archive with a
+    /// confident empty one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's refusal when the journal is there and cannot be recovered.
+    pub fn recover_journal(&self, ownership: &RecoveryOwnership) -> Result<Recovered> {
+        let path = self.paths.journal_database(ownership.session_id);
+        if !path.exists() {
+            return Ok(Recovered::default());
+        }
+        let mut journal = Journal::open(&path)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let now = kr_ipc::now_ms();
+        let unknown = journal
+            .resolve_unfinished_dispatches(now)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let rejected = journal
+            .reject_unrevalidated_intents(now)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        Ok(Recovered {
+            left_unknown: unknown as u64,
+            rejected: rejected as u64,
+        })
+    }
+
+    /// Reads what one session left behind.    /// Reads what one session left behind.
     ///
     /// A journal that is missing, or that is there and cannot be read, produces an archive that
     /// says so rather than an error or an empty success. That is section 24's explicit incomplete
@@ -396,6 +518,24 @@ impl ArchiveService {
     /// Returns an error only when a path this host owns cannot be built. Everything about the
     /// stores themselves is reported as incompleteness.
     pub fn archive(&self, session_id: SessionId) -> Result<Archive> {
+        self.archive_beside(session_id, None)
+    }
+
+    /// Reads what one session left behind, beside a closure the caller already holds.
+    ///
+    /// A crashed worker never wrote its own closure, and the record the controller writes for it
+    /// lives in the registry. Passing it in is what stops the archive reporting a closure as
+    /// missing when this host has one: the journal is the authority when it has one, and the
+    /// caller's record is what answers when it has not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a path this host owns cannot be built.
+    pub fn archive_beside(
+        &self,
+        session_id: SessionId,
+        recorded: Option<ClosureRecord>,
+    ) -> Result<Archive> {
         let path = self.paths.journal_database(session_id);
         let mut incompleteness = Vec::new();
         let mut archive = Archive {
@@ -408,8 +548,12 @@ impl ArchiveService {
             retained: Vec::new(),
             incompleteness: Vec::new(),
         };
+        archive.closure = recorded;
         if !path.exists() {
             archive.incompleteness.push(Incompleteness::JournalMissing);
+            if archive.closure.is_none() {
+                archive.incompleteness.push(Incompleteness::ClosureMissing);
+            }
             self.read_history_into(session_id, &mut archive);
             return Ok(archive);
         }
@@ -425,8 +569,14 @@ impl ArchiveService {
                     }),
                 }
                 match journal.read_closure(session_id) {
+                    // The worker's own record is the authority: it knows the root's result, what
+                    // it stopped and how much of that it could account for, and a record written
+                    // from outside knows none of those.
                     Ok(Some(closure)) => archive.closure = Some(closure),
-                    Ok(None) => incompleteness.push(Incompleteness::ClosureMissing),
+                    Ok(None) if archive.closure.is_none() => {
+                        incompleteness.push(Incompleteness::ClosureMissing);
+                    }
+                    Ok(None) => {}
                     Err(error) => incompleteness.push(Incompleteness::JournalUnreadable {
                         detail: error.to_string(),
                     }),
@@ -437,8 +587,13 @@ impl ArchiveService {
                         detail: error.to_string(),
                     }),
                 }
-                for gap in journal.recovery_gaps().unwrap_or_default() {
-                    incompleteness.push(durability_lost(&gap));
+                match journal.recovery_gaps() {
+                    Ok(gaps) => incompleteness.extend(gaps.iter().map(durability_lost)),
+                    // A record of lost durability that cannot itself be read is a store this host
+                    // cannot account for, not a store with no gaps in it.
+                    Err(error) => incompleteness.push(Incompleteness::JournalUnreadable {
+                        detail: error.to_string(),
+                    }),
                 }
             }
             Err(error) => incompleteness.push(Incompleteness::JournalUnreadable {
@@ -481,14 +636,16 @@ impl ArchiveService {
                 }),
             });
         }
-        let history = kr_worker::history::OutputHistory::with_spool(
-            0,
+        let history = kr_worker::history::OutputHistory::read_spool(
             &directory,
             kr_worker::history::SpoolLayout::DEFAULT,
         )
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // The page is bounded by what one control frame carries, because the archive answers over
+        // the same endpoint a live worker's page does and a page that could not be encoded would
+        // be a page nobody receives.
         history
-            .page(from_cursor, max_bytes)
+            .page(from_cursor, max_bytes.min(MAX_ARCHIVE_PAGE_BYTES))
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
@@ -545,16 +702,55 @@ impl ArchiveService {
         Ok(self.archive(session_id)?.retains_submissions())
     }
 
+    /// Returns every session this host still holds a journal or a spool for.
+    ///
+    /// The sweep needs the union of what the registry knows and what is on disk, because a
+    /// session the registry has finished with still keeps what was submitted to it while its
+    /// archive is there. A directory this host cannot read contributes nothing, which errs
+    /// towards the registry's answer rather than towards deleting a payload.
+    #[must_use]
+    pub fn sessions_on_disk(&self) -> Vec<SessionId> {
+        let mut found = std::collections::BTreeSet::new();
+        for (directory, prefix, suffix) in [
+            (self.paths.journals_dir(), "session-", ".sqlite"),
+            (self.paths.spool_dir(), "", ".log"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(rest) = name.strip_prefix(prefix) else {
+                    continue;
+                };
+                let Some(identifier) = rest.strip_suffix(suffix) else {
+                    continue;
+                };
+                if let Ok(uuid) = identifier.parse::<kr_protocol::scalars::Uuid>() {
+                    found.insert(SessionId::new(uuid));
+                }
+            }
+        }
+        found.into_iter().collect()
+    }
+
     fn read_history_into(&self, session_id: SessionId, archive: &mut Archive) {
         let directory = self.paths.session_spool(session_id);
         if !directory.exists() {
             return;
         }
-        let Ok(history) = kr_worker::history::OutputHistory::with_spool(
-            0,
+        let Ok(history) = kr_worker::history::OutputHistory::read_spool(
             &directory,
             kr_worker::history::SpoolLayout::DEFAULT,
         ) else {
+            // A spool that is there and cannot be read is a range this host cannot account for.
+            archive
+                .incompleteness
+                .push(Incompleteness::JournalUnreadable {
+                    detail: "this session's output spool could not be read".to_owned(),
+                });
             return;
         };
         archive.oldest_retained_cursor = history.oldest_retained_cursor();
@@ -589,32 +785,42 @@ impl crate::service::Controller {
     /// Returns the sessions whose archives still keep what was submitted to them.
     ///
     /// Section 14 gives a submitted attachment its session's retention, and this is where that
-    /// question is answered now: the archive holds a closed session's record, so it can say what
-    /// a session keeps after the registry has stopped holding a reservation for it.
+    /// question is answered now. Two authorities know about sessions and the answer is the union
+    /// of them, because the sweep reads a missing session as expiry and removes its payload: the
+    /// registry, which lists every reservation in any launch phase and every worker row, and the
+    /// archive, which holds the journal and the spool of a session the registry has finished
+    /// with. A session either of them knows about keeps what was submitted to it.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the registry cannot be read.
     pub fn archive_retention(&self) -> Result<ArchiveRetention> {
         let archive = self.archive();
-        let sessions = {
+        let mut candidates = std::collections::BTreeSet::new();
+        {
             let registry = self.registry_handle().blocking_lock();
-            let mut sessions: Vec<SessionId> = Vec::new();
             for phase in EVERY_LAUNCH_PHASE {
                 for reservation in registry.reservations_in(*phase)? {
-                    sessions.push(reservation.session_id);
+                    candidates.insert(reservation.session_id);
                 }
             }
             for worker in registry.workers()? {
-                sessions.push(worker.session_id);
+                candidates.insert(worker.session_id);
             }
-            sessions
-        };
+        }
         let mut retention = ArchiveRetention::default();
-        for session_id in sessions {
-            // A session the registry still lists keeps what was submitted to it. One it no longer
-            // lists is asked of the archive, which is what holds a closed session's record, and a
-            // session neither of them knows about keeps nothing.
+        // Every session the registry lists keeps what was submitted to it, whatever its journal
+        // says: the registry is a record of the session, and a record is what retention is about.
+        for session_id in &candidates {
+            retention.insert(*session_id);
+        }
+        // Then the sessions only the archive knows about, which are the ones the registry has
+        // finished with. Asking the archive about each is what makes this the union rather than
+        // the registry's answer with a different name on it.
+        for session_id in archive.sessions_on_disk() {
+            if candidates.contains(&session_id) {
+                continue;
+            }
             if archive.retains_submissions(session_id)? {
                 retention.insert(session_id);
             }

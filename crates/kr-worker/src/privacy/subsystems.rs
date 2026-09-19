@@ -13,25 +13,27 @@ use crate::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
 };
 
-/// Retained session output and the semantic history beside it.
+/// Retained session output, over the session's own history.
 ///
 /// This is the one section 24 names first: privacy mode disables content-history retention
 /// prospectively and removes what is already retained. The spool and the resident window are the
-/// content, and the eviction is logical cleanup of this host's own records.
+/// content, and this is an adapter over them rather than a count of them: fencing stops the
+/// capture, and removing takes the bytes.
+///
+/// Local deletion is logical cleanup. This host removes its own records and does not claim the
+/// bytes are unrecoverable from the device they were on.
 #[derive(Debug)]
-pub struct RetainedHistory {
-    /// Bytes of retained output at the moment privacy mode was enabled.
-    retained_bytes: u64,
-    /// Whether the content-bearing capture is fenced.
+pub struct RetainedHistory<'a> {
+    history: &'a mut crate::history::OutputHistory,
     fenced: bool,
 }
 
-impl RetainedHistory {
-    /// Builds the hook over a session holding this many bytes of retained output.
+impl<'a> RetainedHistory<'a> {
+    /// Builds the hook over one session's retained output.
     #[must_use]
-    pub const fn new(retained_bytes: u64) -> Self {
+    pub fn over(history: &'a mut crate::history::OutputHistory) -> Self {
         Self {
-            retained_bytes,
+            history,
             fenced: false,
         }
     }
@@ -43,7 +45,7 @@ impl RetainedHistory {
     }
 }
 
-impl PrivacySubsystem for RetainedHistory {
+impl PrivacySubsystem for RetainedHistory<'_> {
     fn name(&self) -> &'static str {
         "history"
     }
@@ -51,6 +53,7 @@ impl PrivacySubsystem for RetainedHistory {
     fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
         // The capture stops before the removal, so nothing is written behind the cleanup.
         self.fenced = true;
+        self.history.stop_retaining();
         Fenced {
             queues: 1,
             items: 0,
@@ -64,8 +67,8 @@ impl PrivacySubsystem for RetainedHistory {
     }
 
     fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        let bytes = std::mem::take(&mut self.retained_bytes);
-        Removed { bytes, records: 0 }
+        let (bytes, records) = self.history.discard_retained();
+        Removed { bytes, records }
     }
 
     fn outstanding(&self) -> u64 {
@@ -73,29 +76,46 @@ impl PrivacySubsystem for RetainedHistory {
     }
 }
 
-/// The receipt journal's metadata, which privacy mode keeps.
-#[derive(Debug, Default)]
-pub struct ReceiptMetadata {
-    /// How many live pending questions and approvals this session holds.
+/// The receipt journal: what privacy mode removes from it, and what it keeps.
+///
+/// A receipt is not all metadata. Its identity, state, revision, digests and deadline are, and
+/// section 24 keeps them; the intent envelope the caller sent and the result the action produced
+/// are the caller's own content, and a question's answer text lives in one of them. So this
+/// removes those from receipts that have settled and keeps them for receipts that have not,
+/// because recovery reads a pending envelope and a de-duplicated retry is answered from it.
+#[derive(Debug)]
+pub struct ReceiptMetadata<'a> {
+    journal: Option<&'a mut crate::journal::Journal>,
     pending: u64,
+    failure: Option<String>,
 }
 
-impl ReceiptMetadata {
-    /// Builds the hook over a session with this many live pending questions and approvals.
+impl<'a> ReceiptMetadata<'a> {
+    /// Builds the hook over one session's journal and its live pending questions and approvals.
     #[must_use]
-    pub const fn new(pending: u64) -> Self {
-        Self { pending }
+    pub fn over(journal: Option<&'a mut crate::journal::Journal>, pending: u64) -> Self {
+        Self {
+            journal,
+            pending,
+            failure: None,
+        }
+    }
+
+    /// Returns why the redaction could not finish, when it could not.
+    #[must_use]
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
 }
 
-impl PrivacySubsystem for ReceiptMetadata {
+impl PrivacySubsystem for ReceiptMetadata<'_> {
     fn name(&self) -> &'static str {
         "receipts"
     }
 
     fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
-        // Nothing here is content-bearing. A receipt is operation metadata, which is what section
-        // 20 requires of it and what this host's own store declaration says it holds.
+        // A receipt does not travel anywhere on its own, so there is no queue here to stop. What
+        // has to be taken out of it is taken by the removal below.
         Fenced::default()
     }
 
@@ -107,11 +127,23 @@ impl PrivacySubsystem for ReceiptMetadata {
     }
 
     fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        Removed::default()
+        let Some(journal) = self.journal.as_mut() else {
+            return Removed::default();
+        };
+        match journal.redact_settled_content() {
+            Ok(records) => Removed { bytes: 0, records },
+            Err(error) => {
+                // A store that refused the redaction has not done it, and this says so rather
+                // than reporting a removal that did not happen. Reconciliation carries it.
+                self.failure = Some(error.to_string());
+                Removed::default()
+            }
+        }
     }
 
     fn outstanding(&self) -> u64 {
-        0
+        // A redaction that failed is cleanup this host still owes.
+        u64::from(self.failure.is_some())
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {
@@ -124,6 +156,11 @@ impl PrivacySubsystem for ReceiptMetadata {
             KeptExplicitly {
                 what: "the minimal local authority this host holds",
                 why: "a host that forgot its own authority could not refuse a withdrawn one",
+            },
+            KeptExplicitly {
+                what: "the intent envelope of an action that has not settled",
+                why: "recovery reads it, and a retry of an action this host may already have \
+                      performed is answered from it",
             },
         ];
         if self.pending > 0 {
@@ -486,15 +523,17 @@ impl PrivacySubsystem for Recording {
     }
 }
 
-/// Builds an exported copy, for a host reporting what had already left it.
+/// Builds an exported copy this host holds a reference it can delete through.
+///
+/// `deletable` is a fact about the reference rather than about the copy: it says this host has a
+/// way to ask for that object's removal, not that removal will succeed or that no other copy
+/// exists. A host reporting a copy it cannot reach builds an [`Exported`] with `deletable` false.
 #[must_use]
 pub fn exported(kind: &str, reference: &str, left_at_ms: TimestampMs) -> Exported {
     Exported {
         kind: kind.to_owned(),
         reference: reference.to_owned(),
         left_at_ms,
-        // Every copy this host knows about is one it can offer to delete. What it cannot offer is
-        // a copy somebody else holds, and it does not claim otherwise.
         deletable: true,
     }
 }

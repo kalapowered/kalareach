@@ -159,6 +159,13 @@ pub struct Session {
     history: OutputHistory,
     hub: OutputHub,
     journal: Option<Journal>,
+    /// Privacy mode's durable state: the generation, and whether it is on.
+    ///
+    /// It is read back from the journal when the session opens, because the generation is what
+    /// makes a late result decidable across a restart: work admitted before privacy mode was
+    /// enabled comes back after it, and a host that had forgotten which generation was in force
+    /// could not tell that answer from one it had asked for.
+    privacy: crate::privacy::PrivacyMode,
     /// The durability condition this session publishes.
     ///
     /// It is the journal's own seam when there is a journal, and a seam of this session's own,
@@ -411,6 +418,19 @@ impl Session {
                 health
             }
         };
+        // Privacy mode's own state, read back before anything is served. A session that could
+        // not read it is a session that does not know which generation is in force, and the
+        // conservative reading of that is the one this host has never opened: nothing produced
+        // under an older generation is accepted, because none is in force.
+        let privacy = journal
+            .as_ref()
+            .and_then(|journal| journal.read_privacy().ok().flatten())
+            .map_or_else(crate::privacy::PrivacyMode::new, |(generation, enabled)| {
+                crate::privacy::PrivacyMode::restored(
+                    crate::privacy::PrivacyGeneration::new(generation),
+                    enabled,
+                )
+            });
         Ok(Self {
             attachments: AttachmentTable::new(config.dimensions),
             state: SessionState::Creating,
@@ -422,6 +442,7 @@ impl Session {
             history,
             hub: OutputHub::new(),
             journal,
+            privacy,
             health,
             time,
             closure: None,
@@ -2851,6 +2872,91 @@ impl Session {
                 0
             }
         }
+    }
+
+    /// Returns privacy mode's state.
+    #[must_use]
+    pub const fn privacy(&self) -> crate::privacy::PrivacyMode {
+        self.privacy
+    }
+
+    /// Enables privacy mode for this session.
+    ///
+    /// The order is section 24's and it starts with the durable write: the generation is recorded
+    /// *before* any subsystem is touched, because a generation that was applied and not recorded
+    /// would be a boundary a restart could not see, and a late result from before it would then
+    /// be published. Then the content-bearing capture is fenced, the undispatched work is
+    /// cancelled, and the retained local content is removed.
+    ///
+    /// It does not report completion. In-flight work is reconciled by
+    /// [`Self::reconcile_privacy`], and until that says so this is an enabling rather than a
+    /// finished cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the generation cannot be recorded, and
+    /// then nothing has been fenced or removed: a privacy mode this host cannot write down is one
+    /// it must not claim to be in.
+    pub fn enable_privacy<'a>(
+        &'a mut self,
+        extra: &mut [&'a mut dyn crate::privacy::PrivacySubsystem],
+    ) -> Result<crate::privacy::Enabling> {
+        let now = kr_ipc::now_ms();
+        let mut privacy = self.privacy;
+        let generation = privacy.open_generation(now);
+        let Some(journal) = self.journal.as_mut() else {
+            return Err(WorkerError::JournalUnavailable {
+                detail: "this session has no journal, so a privacy generation cannot be recorded"
+                    .to_owned(),
+            });
+        };
+        journal.record_privacy(generation.get(), true, now)?;
+        self.privacy = privacy;
+
+        // The question ledger is the service's rather than the session's, so the count of live
+        // pending questions and approvals comes from the caller with its own subsystems. What is
+        // reported here is what this session can see, which is none of them.
+        let pending = 0;
+        let mut history = crate::privacy::RetainedHistory::over(&mut self.history);
+        let mut receipts = crate::privacy::ReceiptMetadata::over(self.journal.as_mut(), pending);
+        let mut subsystems: Vec<&mut dyn crate::privacy::PrivacySubsystem> =
+            vec![&mut history, &mut receipts];
+        for subsystem in extra.iter_mut() {
+            subsystems.push(&mut **subsystem);
+        }
+        Ok(privacy.apply(&mut subsystems, now))
+    }
+
+    /// Asks whether privacy mode's cleanup has finished.
+    ///
+    /// The session's own two subsystems have nothing outstanding once `enable_privacy` returns,
+    /// because what they do is local and synchronous. The work that can still be in flight is the
+    /// caller's, which is why the caller's subsystems are what this is given.
+    #[must_use]
+    pub fn reconcile_privacy(
+        extra: &[&dyn crate::privacy::PrivacySubsystem],
+    ) -> crate::privacy::Completion {
+        crate::privacy::PrivacyMode::reconcile(extra)
+    }
+
+    /// Turns privacy mode off, and starts retention again from this moment.
+    ///
+    /// Nothing omitted while it was on is reconstructed, and the generation stays where it is, so
+    /// a late result from the private interval is still refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the change cannot be recorded.
+    pub fn disable_privacy(&mut self) -> Result<crate::privacy::Resumed> {
+        let now = kr_ipc::now_ms();
+        let mut privacy = self.privacy;
+        let resumed = privacy.disable(now);
+        if let Some(journal) = self.journal.as_mut() {
+            journal.record_privacy(resumed.generation.get(), false, now)?;
+        }
+        self.privacy = privacy;
+        self.history.resume_retaining();
+        Ok(resumed)
     }
 
     /// Tries to leave a journal fault, and clears what this session says about it.

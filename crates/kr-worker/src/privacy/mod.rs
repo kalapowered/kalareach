@@ -122,7 +122,10 @@ pub struct Exported {
     pub reference: String,
     /// When it left.
     pub left_at_ms: TimestampMs,
-    /// Whether deleting it is an action this host can offer.
+    /// Whether this host holds a reference it can ask for the copy's removal through.
+    ///
+    /// It says this host has a way to ask, not that asking will succeed and not that no other
+    /// copy exists. A copy somebody else holds is not recallable and is not claimed to be.
     pub deletable: bool,
 }
 
@@ -165,7 +168,7 @@ pub struct Removed {
 /// fenced and did not reconcile would let privacy mode report complete while its own work was
 /// still in flight, and one that cancelled without rejecting a late result would publish the
 /// answer to work it had cancelled.
-pub trait PrivacySubsystem: std::fmt::Debug + Send {
+pub trait PrivacySubsystem: std::fmt::Debug {
     /// The subsystem's stable name, which is what a report names.
     fn name(&self) -> &'static str;
 
@@ -192,19 +195,6 @@ pub trait PrivacySubsystem: std::fmt::Debug + Send {
     /// Returns what has already left this host, which privacy mode does not erase.
     fn exported(&self) -> Vec<Exported> {
         Vec::new()
-    }
-
-    /// Returns whether a result produced under `produced_under` may still be published.
-    ///
-    /// The default is the rule itself, and a subsystem should not need to override it: a result
-    /// from before the current generation is refused. It is on the trait rather than beside it so
-    /// that every subsystem answers the same question the same way.
-    fn accepts_result(
-        &self,
-        produced_under: PrivacyGeneration,
-        current: PrivacyGeneration,
-    ) -> bool {
-        produced_under >= current
     }
 }
 
@@ -261,38 +251,37 @@ impl Completion {
 }
 
 /// Privacy mode for one session.
-#[derive(Debug)]
+///
+/// What it holds is the durable state: the generation and whether privacy mode is on. It does not
+/// own the subsystems, and that is deliberate. A subsystem worth having is an adapter over a live
+/// store - the session's retained output, its journal - which its owner already holds, and one
+/// that reports its own cleanup has to stay reachable after the enabling that started it. So the
+/// caller passes them in, drives them here, and keeps them.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct PrivacyMode {
     generation: PrivacyGeneration,
     enabled: bool,
     enabled_at_ms: Option<TimestampMs>,
-    subsystems: Vec<Box<dyn PrivacySubsystem>>,
 }
 
 impl PrivacyMode {
-    /// Builds privacy mode over the subsystems it reaches.
+    /// Builds privacy mode for a host that has never enabled it.
     #[must_use]
-    pub fn new(subsystems: Vec<Box<dyn PrivacySubsystem>>) -> Self {
+    pub const fn new() -> Self {
         Self {
             generation: PrivacyGeneration::INITIAL,
             enabled: false,
             enabled_at_ms: None,
-            subsystems,
         }
     }
 
     /// Builds privacy mode from a generation a restart read back.
     #[must_use]
-    pub fn restored(
-        generation: PrivacyGeneration,
-        enabled: bool,
-        subsystems: Vec<Box<dyn PrivacySubsystem>>,
-    ) -> Self {
+    pub const fn restored(generation: PrivacyGeneration, enabled: bool) -> Self {
         Self {
             generation,
             enabled,
             enabled_at_ms: None,
-            subsystems,
         }
     }
 
@@ -308,6 +297,12 @@ impl PrivacyMode {
         self.enabled
     }
 
+    /// Returns when privacy mode was enabled in this process, when it was.
+    #[must_use]
+    pub const fn enabled_at_ms(&self) -> Option<TimestampMs> {
+        self.enabled_at_ms
+    }
+
     /// Returns whether a capability is disabled right now.
     #[must_use]
     pub const fn disables(&self, _capability: Disabled) -> bool {
@@ -316,40 +311,50 @@ impl PrivacyMode {
         self.enabled
     }
 
-    /// Enables privacy mode.
+    /// Advances the generation and records that privacy mode is on.
     ///
-    /// The order is the contract and it is the order section 24 states: record the generation,
-    /// fence what is content-bearing *immediately*, cancel what has not been dispatched, then
-    /// remove the retained local content. Fencing first is what stops the queue emptying itself
-    /// while the cancellation walks it.
-    ///
-    /// It does not report completion. In-flight work is reconciled by [`Self::reconcile`], and
-    /// until that says so this is an enabling rather than a finished cleanup.
-    pub fn enable(&mut self, now_ms: TimestampMs) -> Enabling {
+    /// The caller writes this down durably *before* it drives any subsystem. A generation that
+    /// was applied and not recorded would be a boundary a restart could not see, and a late
+    /// result from before it would then be published.
+    pub const fn open_generation(&mut self, now_ms: TimestampMs) -> PrivacyGeneration {
         self.generation = self.generation.next();
         self.enabled = true;
         self.enabled_at_ms = Some(now_ms);
-        let generation = self.generation;
+        self.generation
+    }
 
+    /// Drives every subsystem through the four things privacy mode asks of them.
+    ///
+    /// The order is the contract and it is the order section 24 states: fence what is
+    /// content-bearing *immediately*, cancel what has not been dispatched, then remove the
+    /// retained local content. Fencing first is what stops a queue emptying itself while the
+    /// cancellation walks it.
+    ///
+    /// It does not report completion. In-flight work is reconciled by [`Self::reconcile`], and
+    /// until that says so this is an enabling rather than a finished cleanup.
+    pub fn apply(
+        &self,
+        subsystems: &mut [&mut dyn PrivacySubsystem],
+        now_ms: TimestampMs,
+    ) -> Enabling {
+        let generation = self.generation;
         let mut fenced = Vec::new();
-        for subsystem in &mut self.subsystems {
+        for subsystem in subsystems.iter_mut() {
             fenced.push((subsystem.name(), subsystem.fence(generation)));
         }
         let mut cancelled = Vec::new();
-        for subsystem in &mut self.subsystems {
+        for subsystem in subsystems.iter_mut() {
             cancelled.push((subsystem.name(), subsystem.cancel_undispatched(generation)));
         }
         let mut removed = Vec::new();
-        for subsystem in &mut self.subsystems {
+        for subsystem in subsystems.iter_mut() {
             removed.push((subsystem.name(), subsystem.remove_retained(generation)));
         }
-        let kept = self
-            .subsystems
+        let kept = subsystems
             .iter()
             .flat_map(|subsystem| subsystem.kept())
             .collect();
-        let exported = self
-            .subsystems
+        let exported = subsystems
             .iter()
             .flat_map(|subsystem| subsystem.exported())
             .collect();
@@ -367,9 +372,8 @@ impl PrivacyMode {
 
     /// Asks every subsystem whether its in-flight cleanup has finished.
     #[must_use]
-    pub fn reconcile(&self) -> Completion {
-        let outstanding: Vec<(&'static str, u64)> = self
-            .subsystems
+    pub fn reconcile(subsystems: &[&dyn PrivacySubsystem]) -> Completion {
+        let outstanding: Vec<(&'static str, u64)> = subsystems
             .iter()
             .map(|subsystem| (subsystem.name(), subsystem.outstanding()))
             .filter(|(_, outstanding)| *outstanding > 0)
@@ -383,33 +387,14 @@ impl PrivacyMode {
 
     /// Returns whether a result produced under an earlier generation may be published.
     ///
-    /// Asked of the subsystem that produced it, so a subsystem with a reason of its own is the
-    /// one that answers. None has such a reason today, and the trait's own rule is what they all
-    /// use.
+    /// It is the whole rule and it is here rather than beside each publication, because a rule
+    /// each caller restated would be a rule one of them could restate differently. A result is
+    /// published only when the generation it was produced under is *exactly* the one in force: an
+    /// older one belongs to work privacy mode cancelled, and a newer one belongs to no generation
+    /// this host has opened.
     #[must_use]
-    pub fn accepts_result(&self, subsystem: &str, produced_under: PrivacyGeneration) -> bool {
-        self.subsystems
-            .iter()
-            .find(|candidate| candidate.name() == subsystem)
-            .is_none_or(|candidate| candidate.accepts_result(produced_under, self.generation))
-    }
-
-    /// Returns what this host keeps while privacy mode is on, explicitly.
-    #[must_use]
-    pub fn kept(&self) -> Vec<KeptExplicitly> {
-        self.subsystems
-            .iter()
-            .flat_map(|subsystem| subsystem.kept())
-            .collect()
-    }
-
-    /// Returns what had already left this host, which privacy mode does not erase.
-    #[must_use]
-    pub fn exported(&self) -> Vec<Exported> {
-        self.subsystems
-            .iter()
-            .flat_map(|subsystem| subsystem.exported())
-            .collect()
+    pub const fn accepts_result(&self, produced_under: PrivacyGeneration) -> bool {
+        produced_under.get() == self.generation.get()
     }
 
     /// Turns privacy mode off.
@@ -417,7 +402,7 @@ impl PrivacyMode {
     /// Retention starts again from this moment. It does not reconstruct what was omitted while
     /// privacy mode was on, and nothing here pretends it could: the generation stays where it is,
     /// so a late result from the private interval is still refused.
-    pub fn disable(&mut self, now_ms: TimestampMs) -> Resumed {
+    pub const fn disable(&mut self, now_ms: TimestampMs) -> Resumed {
         self.enabled = false;
         Resumed {
             generation: self.generation,
@@ -439,7 +424,7 @@ pub mod subsystems;
 
 pub use crate::privacy::subsystems::{
     BackupOutbox, DescriptionInference, ReceiptMetadata, RetainedHistory, SyncOutbox,
-    TransferPreviews,
+    TransferPreviews, exported,
 };
 
 #[cfg(test)]
@@ -447,31 +432,35 @@ mod tests {
     use super::*;
     use crate::privacy::subsystems::Recording;
 
-    fn mode() -> PrivacyMode {
-        PrivacyMode::new(vec![
-            Box::new(Recording::new("first")),
-            Box::new(Recording::new("second")),
-        ])
+    fn drive(mode: &PrivacyMode, first: &mut Recording, second: &mut Recording) -> Enabling {
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![first, second];
+        mode.apply(&mut subsystems, TimestampMs::new(1_000))
     }
 
     #[test]
-    fn enabling_records_a_generation_and_advances_it_each_time() {
-        let mut mode = mode();
+    fn opening_a_generation_advances_it_each_time() {
+        let mut mode = PrivacyMode::new();
         assert_eq!(mode.generation(), PrivacyGeneration::INITIAL);
-        let first = mode.enable(TimestampMs::new(1_000));
-        assert_eq!(first.generation, PrivacyGeneration::new(1));
-        let second = mode.enable(TimestampMs::new(2_000));
-        assert_eq!(second.generation, PrivacyGeneration::new(2));
+        assert_eq!(
+            mode.open_generation(TimestampMs::new(1_000)),
+            PrivacyGeneration::new(1)
+        );
+        assert_eq!(
+            mode.open_generation(TimestampMs::new(2_000)),
+            PrivacyGeneration::new(2)
+        );
         assert!(mode.is_enabled());
     }
 
     #[test]
     fn every_subsystem_is_fenced_before_any_is_cancelled() {
-        let mut mode = mode();
-        let enabling = mode.enable(TimestampMs::new(1_000));
-        // Both fences ran, and both ran before either cancellation: the recording subsystem
-        // refuses to cancel anything it has not fenced first, so a cancellation that had run
-        // early would have been counted as such.
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(1_000));
+        let mut first = Recording::new("first");
+        let mut second = Recording::new("second");
+        let enabling = drive(&mode, &mut first, &mut second);
+        // The recording subsystem refuses to cancel anything it has not fenced first, so a
+        // cancellation that had run early would be counted as taking nothing back.
         assert_eq!(enabling.fenced.len(), 2);
         assert!(enabling.fenced.iter().all(|(_, fenced)| fenced.queues > 0));
         assert!(
@@ -484,12 +473,17 @@ mod tests {
 
     #[test]
     fn all_four_capabilities_are_disabled_together() {
-        let mut mode = mode();
+        let mut mode = PrivacyMode::new();
         for capability in Disabled::ALL {
             assert!(!mode.disables(*capability));
         }
-        let enabling = mode.enable(TimestampMs::new(1_000));
-        assert_eq!(enabling.disabled, Disabled::ALL.to_vec());
+        mode.open_generation(TimestampMs::new(1_000));
+        let mut first = Recording::new("first");
+        let mut second = Recording::new("second");
+        assert_eq!(
+            drive(&mode, &mut first, &mut second).disabled,
+            Disabled::ALL.to_vec()
+        );
         for capability in Disabled::ALL {
             assert!(mode.disables(*capability));
         }
@@ -497,40 +491,42 @@ mod tests {
 
     #[test]
     fn completion_is_not_reported_while_any_subsystem_is_still_reconciling() {
-        let mut mode = PrivacyMode::new(vec![
-            Box::new(Recording::new("quiet")),
-            Box::new(Recording::with_in_flight("busy", 3)),
-        ]);
-        mode.enable(TimestampMs::new(1_000));
-        match mode.reconcile() {
-            Completion::Reconciling { outstanding } => {
-                assert_eq!(outstanding, vec![("busy", 3)]);
-            }
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(1_000));
+        let mut quiet = Recording::new("quiet");
+        let mut busy = Recording::with_in_flight("busy", 2);
+        drive(&mode, &mut quiet, &mut busy);
+        match PrivacyMode::reconcile(&[&quiet, &busy]) {
+            Completion::Reconciling { outstanding } => assert_eq!(outstanding, vec![("busy", 2)]),
             Completion::Complete => panic!("cleanup had not finished"),
         }
+        // The subsystem the caller still holds is the one that reports its own cleanup, which is
+        // what makes completion reachable rather than a state nothing can leave.
+        busy.note_reconciled();
+        busy.note_reconciled();
+        assert!(PrivacyMode::reconcile(&[&quiet, &busy]).is_complete());
     }
 
     #[test]
-    fn a_result_from_before_the_generation_is_refused_and_one_from_after_it_is_not() {
-        let mut mode = mode();
-        mode.enable(TimestampMs::new(1_000));
-        assert!(!mode.accepts_result("first", PrivacyGeneration::INITIAL));
-        assert!(mode.accepts_result("first", PrivacyGeneration::new(1)));
-        // A second enabling refuses what the first admitted.
-        mode.enable(TimestampMs::new(2_000));
-        assert!(!mode.accepts_result("first", PrivacyGeneration::new(1)));
+    fn a_result_is_published_only_under_the_generation_in_force() {
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(1_000));
+        assert!(!mode.accepts_result(PrivacyGeneration::INITIAL));
+        assert!(mode.accepts_result(PrivacyGeneration::new(1)));
+        // A generation this host has never opened is not a licence either.
+        assert!(!mode.accepts_result(PrivacyGeneration::new(2)));
+        mode.open_generation(TimestampMs::new(2_000));
+        assert!(!mode.accepts_result(PrivacyGeneration::new(1)));
     }
 
     #[test]
     fn disabling_starts_retention_again_and_reconstructs_nothing() {
-        let mut mode = mode();
-        mode.enable(TimestampMs::new(1_000));
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(1_000));
         let resumed = mode.disable(TimestampMs::new(5_000));
         assert!(!mode.is_enabled());
         assert_eq!(resumed.retention_resumes_at_ms.get(), 5_000);
         assert_eq!(resumed.generation, PrivacyGeneration::new(1));
-        // The generation does not go back, so a late result from the private interval is still
-        // refused after privacy mode is turned off.
-        assert!(!mode.accepts_result("first", PrivacyGeneration::INITIAL));
+        assert!(!mode.accepts_result(PrivacyGeneration::INITIAL));
     }
 }

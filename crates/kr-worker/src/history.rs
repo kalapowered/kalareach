@@ -109,6 +109,11 @@ pub struct OutputHistory {
     /// A new interval starts when [`RESIDENT_MARK_MS`] has passed, which keeps the record to a
     /// handful of entries and keeps what is retained past the deadline to about that long.
     resident_marks: VecDeque<(u64, u64)>,
+    /// Whether output is being retained at all.
+    ///
+    /// Privacy mode disables content-history retention prospectively, which is this: what arrives
+    /// while it is false reaches the live parser and the attachments and is not kept.
+    retaining: bool,
     /// Whether this session was given a spool and then lost it.
     ///
     /// A write failure narrows the retained range to the resident window, and that is a different
@@ -134,10 +139,30 @@ impl OutputHistory {
             resident_start: 0,
             next_cursor: 0,
             spool: None,
+            retaining: true,
             spool_lost: false,
             resident_marks: VecDeque::new(),
             evictions: VecDeque::new(),
         }
+    }
+
+    /// Opens an existing spool for reading, without creating or repairing anything.
+    ///
+    /// The archive reads a session's retained output after the session is gone, and a read is a
+    /// read: it does not create the directory it was asked about, and it does not narrow the
+    /// permissions of one that is already there. Repair belongs to the host that owns the
+    /// session, under recovery ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be read.
+    pub fn read_spool(directory: impl Into<PathBuf>, layout: SpoolLayout) -> Result<Self> {
+        let mut history = Self::in_memory(0);
+        let spool = Spool::read_existing(directory.into(), layout)?;
+        history.next_cursor = spool.next_cursor();
+        history.resident_start = history.next_cursor;
+        history.spool = Some(spool);
+        Ok(history)
     }
 
     /// Builds a history backed by a spool directory.
@@ -191,6 +216,14 @@ impl OutputHistory {
     pub fn append(&mut self, bytes: &[u8]) -> u64 {
         let start = self.next_cursor;
         if bytes.is_empty() {
+            return start;
+        }
+        if !self.retaining {
+            // Privacy mode has disabled retention. The cursor still advances, because it is the
+            // session's own position and a client that asked for what it missed is told the range
+            // is gone rather than served later output under an earlier cursor.
+            self.next_cursor += bytes.len() as u64;
+            self.resident_start = self.next_cursor;
             return start;
         }
         if let Some(spool) = self.spool.as_mut()
@@ -257,6 +290,60 @@ impl OutputHistory {
             .and_then(Spool::oldest_written_at_ms)
             .or_else(|| self.resident_marks.front().map(|(_, last_at)| *last_at))
             .map(TimestampMs::new)
+    }
+
+    /// Stops retaining output.
+    ///
+    /// What is already held stays until [`Self::discard_retained`] takes it; what arrives after
+    /// this is not retained at all. Privacy mode fences before it removes, so the two are
+    /// separate: a capture still running while the removal walked the spool would write behind
+    /// the cleanup.
+    pub fn stop_retaining(&mut self) {
+        self.retaining = false;
+    }
+
+    /// Starts retaining output again, from this moment.
+    ///
+    /// Nothing before it is reconstructed.
+    pub fn resume_retaining(&mut self) {
+        self.retaining = true;
+    }
+
+    /// Returns whether output is being retained.
+    #[must_use]
+    pub const fn is_retaining(&self) -> bool {
+        self.retaining
+    }
+
+    /// Removes every byte of retained output, and returns what went.
+    ///
+    /// The bytes are the resident window and the spool together; the records are the spool
+    /// segments that were deleted. The boundary is published first, as every other eviction
+    /// publishes it, so a session reopened over the emptied directory still says where its output
+    /// had reached rather than starting again at nought.
+    ///
+    /// This is logical cleanup. The files are unlinked and the window is dropped; nothing here
+    /// claims the bytes are unrecoverable from the device they were on.
+    pub fn discard_retained(&mut self) -> (u64, u64) {
+        let resident = self.resident.len() as u64;
+        self.resident.clear();
+        self.resident_marks.clear();
+        self.resident_start = self.next_cursor;
+        let mut bytes = resident;
+        let mut segments = 0;
+        if let Some(spool) = self.spool.as_mut()
+            && spool.record_boundary()
+        {
+            while !spool.segments.is_empty() {
+                let went = spool.drop_oldest();
+                if went == 0 {
+                    break;
+                }
+                bytes += went;
+                segments += 1;
+            }
+        }
+        (bytes, segments)
     }
 
     /// Returns what retention has taken from this session, oldest first.
@@ -539,6 +626,11 @@ impl Spool {
     fn open(directory: PathBuf, layout: SpoolLayout) -> Result<Self> {
         create_owner_only(&directory)
             .map_err(|error| WorkerError::storage("create the output spool", error))?;
+        Self::read_existing(directory, layout)
+    }
+
+    /// Opens a spool that is already there, creating and repairing nothing.
+    fn read_existing(directory: PathBuf, layout: SpoolLayout) -> Result<Self> {
         // A spool that already has segments is this session's own history from before a restart.
         // Starting with an empty index would report it as a gap while the bytes sat on disk.
         let mut segments: Vec<Segment> = Vec::new();
@@ -666,7 +758,10 @@ impl Spool {
         if self.total_bytes <= self.layout.capacity_bytes || self.segments.len() < 2 {
             return 0;
         }
-        self.record_boundary();
+        if !self.record_boundary() {
+            // The boundary could not be published, so nothing that supports it is deleted.
+            return 0;
+        }
         let mut dropped = 0;
         while self.total_bytes > self.layout.capacity_bytes && self.segments.len() > 1 {
             let went = self.drop_oldest();
@@ -710,10 +805,18 @@ impl Spool {
         segment.len
     }
 
-    /// Writes the boundary down before anything that supports it is deleted.
-    fn record_boundary(&mut self) {
-        self.boundary = self.boundary.max(self.next_cursor());
-        write_boundary(&self.directory, self.boundary);
+    /// Publishes the boundary before anything that supports it is deleted.
+    ///
+    /// Returns false when it could not be written, and then nothing is deleted: the retained
+    /// output stays and the bound is breached until the next pass, which is the lesser of the two
+    /// failures. Losing the record of where the output reached is the greater one.
+    fn record_boundary(&mut self) -> bool {
+        let boundary = self.boundary.max(self.next_cursor());
+        if !write_boundary(&self.directory, boundary) {
+            return false;
+        }
+        self.boundary = boundary;
+        true
     }
 
     /// Removes the segments that are entirely past the retention period.
@@ -730,7 +833,10 @@ impl Spool {
         {
             return 0;
         }
-        self.record_boundary();
+        if !self.record_boundary() {
+            // The boundary could not be published, so nothing that supports it is deleted.
+            return 0;
+        }
         let mut dropped = 0;
         while self
             .segments
@@ -751,7 +857,10 @@ impl Spool {
         if bytes == 0 || self.segments.is_empty() {
             return 0;
         }
-        self.record_boundary();
+        if !self.record_boundary() {
+            // The boundary could not be published, so nothing that supports it is deleted.
+            return 0;
+        }
         let mut dropped = 0;
         while dropped < bytes && !self.segments.is_empty() {
             let went = self.drop_oldest();
@@ -818,19 +927,26 @@ fn read_boundary(directory: &Path) -> RecordedBoundary {
     }
 }
 
-/// Writes the boundary down, replacing it in one step.
+/// Writes the boundary down, replacing it in one step, and says whether it is published.
 ///
 /// The temporary file and the rename are what make it one step: a crash during the write leaves
-/// either the previous boundary or the new one, never half of either. A failure costs the gap
-/// after a restart and nothing else, so it is not an error the session is told about; the
-/// retained output is still there, and refusing to serve the session over it would be worse.
-fn write_boundary(directory: &Path, boundary: u64) {
+/// either the previous boundary or the new one, never half of either.
+///
+/// The answer matters. A full disk can refuse this write and still allow the deletions that
+/// follow it, and a spool that deleted its segments over an unpublished boundary would come back
+/// from a restart with no record of where its output had reached. So the answer is returned, and
+/// the caller does not delete what the boundary describes until it is true.
+fn write_boundary(directory: &Path, boundary: u64) -> bool {
     let staging = directory.join("boundary.writing");
-    if std::fs::write(&staging, boundary.to_string()).is_ok()
-        && std::fs::rename(&staging, directory.join(BOUNDARY_FILE)).is_err()
-    {
+    if std::fs::write(&staging, boundary.to_string()).is_err() {
         let _ = std::fs::remove_file(&staging);
+        return false;
     }
+    if std::fs::rename(&staging, directory.join(BOUNDARY_FILE)).is_err() {
+        let _ = std::fs::remove_file(&staging);
+        return false;
+    }
+    true
 }
 
 /// Creates the spool directory so that only this account can read it.

@@ -178,6 +178,15 @@ pub struct ReceiptEvent {
 pub struct Journal {
     connection: Connection,
     pruned_at_ms: u64,
+    /// Whether a stored value this build cannot decode has been found.
+    ///
+    /// It is kept apart from the seam's condition because it is a different fact and it clears
+    /// differently. `PRAGMA quick_check` says the store's *pages* are sound, which is what a full
+    /// disk or a torn write damages; it says nothing about a row whose encoded value this build
+    /// cannot read. Nothing here repairs such a row, so the fault it caused stays for the life of
+    /// this journal, which is what produces an explicit incomplete archive rather than a store
+    /// that calls itself recovered while a reader still cannot read it.
+    semantic_corruption: std::sync::atomic::AtomicBool,
     /// The condition this journal publishes, and what reads it decides.
     ///
     /// Section 24 makes a worker whose durable store has stopped answering refuse new durable
@@ -243,6 +252,7 @@ impl Journal {
         let journal = Self {
             connection,
             pruned_at_ms: 0,
+            semantic_corruption: std::sync::atomic::AtomicBool::new(false),
             health: crate::persistence::fault::JournalHealth::shared(),
             boot: kr_ipc::identity::boot_identity()
                 .ok()
@@ -297,6 +307,7 @@ impl Journal {
                         (1, 2) => self.migrate_1_to_2()?,
                         (2, 3) => self.migrate_2_to_3()?,
                         (3, 4) => self.migrate_3_to_4()?,
+                        (4, 5) => self.migrate_4_to_5()?,
                         _ => {
                             return Err(unavailable_detail_owned(format!(
                                 "no migration is implemented from schema version {} to {}",
@@ -443,6 +454,12 @@ impl Journal {
                      recovered_at_ms INTEGER NOT NULL,
                      durable_through INTEGER NOT NULL,
                      resumed_at      INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS privacy (
+                     id             INTEGER PRIMARY KEY CHECK (id = 1),
+                     generation     INTEGER NOT NULL,
+                     enabled        INTEGER NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
                  );",
             )
             .map_err(|error| faulted(&self.health, error))?;
@@ -488,6 +505,27 @@ impl Journal {
                      resumed_at      INTEGER NOT NULL
                  );
                  UPDATE schema_version SET version = 4;
+                 COMMIT;",
+            )
+            .map_err(|error| {
+                let _ = self.connection.execute_batch("ROLLBACK;");
+                faulted(&self.health, error)
+            })?;
+        Ok(())
+    }
+
+    /// Adds the privacy generation this host records when privacy mode is enabled.
+    fn migrate_4_to_5(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS privacy (
+                     id             INTEGER PRIMARY KEY CHECK (id = 1),
+                     generation     INTEGER NOT NULL,
+                     enabled        INTEGER NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 UPDATE schema_version SET version = 5;
                  COMMIT;",
             )
             .map_err(|error| {
@@ -2347,6 +2385,7 @@ impl Journal {
         Ok(Self {
             connection,
             pruned_at_ms: 0,
+            semantic_corruption: std::sync::atomic::AtomicBool::new(false),
             health: crate::persistence::fault::JournalHealth::shared(),
             boot: None,
         })
@@ -2382,6 +2421,8 @@ impl Journal {
     /// a store whose content cannot be trusted, which is the condition the archive has to be told
     /// about. It is classified as corruption rather than as an ordinary read failure.
     fn corrupt(&self, detail: &'static str) -> WorkerError {
+        self.semantic_corruption
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.health
             .note_fault(crate::persistence::fault::JournalFault {
                 kind: crate::persistence::fault::FaultKind::Corrupt,
@@ -2400,6 +2441,102 @@ impl Journal {
             .try_into()
             .map_err(|_| self.corrupt("a stored identifier is not sixteen bytes"))?;
         Ok(Uuid::from_bytes(raw))
+    }
+
+    /// Writes down the privacy generation and whether privacy mode is on.
+    ///
+    /// It is one row, replaced each time. The generation is what makes a late result decidable
+    /// across a restart: a description or an upload admitted before privacy mode was enabled
+    /// comes back after it, and a host that had forgotten which generation was in force could
+    /// not tell that answer from one it had asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_privacy(
+        &mut self,
+        generation: u64,
+        enabled: bool,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO privacy (id, generation, enabled, recorded_at_ms)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT (id) DO UPDATE SET
+                     generation = excluded.generation,
+                     enabled = excluded.enabled,
+                     recorded_at_ms = excluded.recorded_at_ms",
+                params![
+                    i64::try_from(generation).unwrap_or(i64::MAX),
+                    i64::from(enabled),
+                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(())
+    }
+
+    /// Reads the privacy generation back, and whether privacy mode was on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn read_privacy(&self) -> Result<Option<(u64, bool)>> {
+        let row: Option<(i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT generation, enabled FROM privacy WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(row.map(|(generation, enabled)| (u64::try_from(generation).unwrap_or(0), enabled != 0)))
+    }
+
+    /// Removes the content a settled receipt carries, keeping the metadata.
+    ///
+    /// Section 24 keeps *minimal local authority and receipt metadata* under privacy mode, and a
+    /// receipt's metadata is its identity, its state, its revision, its digests and its deadline.
+    /// What it also carries is the intent envelope the caller sent and the result the action
+    /// produced, and those are the caller's own content: a question's answer text is in one and
+    /// the question is in the other.
+    ///
+    /// Only a receipt in a terminal state is redacted. A receipt still `accepted` or
+    /// `dispatching` needs its envelope, because recovery reads it and a de-duplicated retry is
+    /// answered from it; taking that away would turn privacy mode into a way of losing an action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn redact_settled_content(&mut self) -> Result<u64> {
+        const SETTLED: &str = "state IN ('applied', 'refused', 'rejected', 'unknown', 'failed')";
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
+        let results = transaction
+            .execute(
+                &format!(
+                    "DELETE FROM results WHERE (actor_id, action_id) IN
+                     (SELECT actor_id, action_id FROM receipts WHERE {SETTLED})"
+                ),
+                [],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        let intents = transaction
+            .execute(
+                &format!(
+                    "UPDATE receipts SET intent = NULL WHERE intent IS NOT NULL AND {SETTLED}"
+                ),
+                [],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(results as u64 + intents as u64)
     }
 
     /// Returns the schema version this store records.
@@ -2533,11 +2670,20 @@ impl Journal {
         let Some(fault) = self.health.condition().fault().cloned() else {
             return Ok(None);
         };
-        // A store whose content cannot be read back is not one a successful write speaks for. It
-        // stays faulted until the store itself says its pages are sound, which is what section
-        // 24's explicit incomplete archive is built on: a corrupt journal is reported rather than
-        // recovered from.
-        if fault.kind == crate::persistence::fault::FaultKind::Corrupt && !self.pages_are_sound()? {
+        // A store whose content cannot be read back is not one a successful write speaks for.
+        //
+        // Two different things are called corruption and they clear differently. Damaged pages
+        // are what `PRAGMA quick_check` answers for, and a store whose pages are sound again is a
+        // store this host may write to. A stored *value* this build cannot decode is not repaired
+        // by any check, and nothing here repairs it, so the fault it caused stays: that is
+        // section 24's explicit incomplete archive rather than a store calling itself recovered
+        // while a reader still cannot read it.
+        if fault.kind == crate::persistence::fault::FaultKind::Corrupt
+            && (self
+                .semantic_corruption
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || !self.pages_are_sound()?)
+        {
             return Ok(None);
         }
         let resumed_at = self.allocated_event_sequence()?;

@@ -17,7 +17,7 @@
 //!   it, which is what stops a partial restore being mistaken for a complete one.
 
 /// The schema version this build reads after migration.
-pub const CURRENT: i64 = 4;
+pub const CURRENT: i64 = 5;
 
 /// The oldest schema version this build's ladder can bring forward.
 pub const OLDEST_MIGRATABLE: i64 = 1;
@@ -49,6 +49,11 @@ pub static LADDER: &[Migration] = &[
         from: 3,
         to: 4,
         summary: "the outbox, its consumer cursors, and the intervals durable writing was lost",
+    },
+    Migration {
+        from: 4,
+        to: 5,
+        summary: "the privacy generation and whether privacy mode is on",
     },
 ];
 
@@ -150,9 +155,9 @@ mod tests {
     #[test]
     fn a_store_an_earlier_build_wrote_is_planned_all_the_way_forward() {
         let steps = plan(1).expect("version 1 is migratable");
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].from, 1);
-        assert_eq!(steps[2].to, CURRENT);
+        assert_eq!(steps.len(), (CURRENT - OLDEST_MIGRATABLE) as usize);
+        assert_eq!(steps[0].from, OLDEST_MIGRATABLE);
+        assert_eq!(steps.last().expect("a last step").to, CURRENT);
         assert!(
             plan(CURRENT)
                 .expect("the current version needs nothing")

@@ -866,14 +866,14 @@ fn the_mark_a_gap_starts_from_survives_receipt_collection() {
 }
 
 #[test]
-fn a_store_whose_content_cannot_be_read_stays_faulted_until_its_pages_are_sound() {
+fn a_stored_value_this_build_cannot_read_leaves_the_store_faulted() {
     // Section 24: a lost or corrupt journal produces an explicit incomplete archive rather than
     // an invented success. A write that happens to succeed says nothing about a row this build
-    // could not decode, so it does not clear the condition.
+    // could not decode, and neither does a structural check: nothing here repairs such a row, so
+    // the fault stays rather than being cleared over a reader that still cannot read it.
     let path = journal_path("corrupt-stays-faulted");
     let mut journal = Journal::open(&path).expect("opens");
     journal.accept(&submission(1, 1)).expect("accepts");
-    // A stored value this build cannot read.
     rusqlite::Connection::open(&path)
         .expect("the same database")
         .execute(
@@ -888,19 +888,61 @@ fn a_store_whose_content_cannot_be_read_stays_faulted_until_its_pages_are_sound(
         Some(FaultKind::Corrupt)
     );
 
-    // Recovery asks the store whether its pages are sound. They are: what this build cannot read
-    // is a value rather than a page, so the condition clears and the next read of that row faults
-    // again. What matters is that the *decision* is the store's rather than the write's.
-    let recovered = journal.recover(TimestampMs::new(7_000)).expect("recovers");
-    assert!(recovered.is_some());
-    assert!(journal.outbox_after(0, 64).is_err());
+    // The store's pages are sound - what this build cannot read is a value rather than a page -
+    // and recovery still refuses, because a sound page says nothing about an unreadable value.
+    assert!(
+        journal
+            .recover(TimestampMs::new(7_000))
+            .expect("recovery answers")
+            .is_none(),
+        "a value this build cannot read is not recovered from"
+    );
     assert_eq!(
         journal.health().condition().fault().map(|fault| fault.kind),
-        Some(FaultKind::Corrupt),
-        "the undecodable row faults again the next time it is read"
+        Some(FaultKind::Corrupt)
+    );
+    assert!(journal.recovery_gaps().expect("reads the gaps").is_empty());
+    assert!(
+        !journal.health().posture().admits(WorkClass::RichMutation),
+        "rich work stays fenced while the store holds a value nothing can read"
     );
     drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_boundary_this_host_cannot_publish_stops_the_eviction_it_describes() {
+    // A full disk can refuse the boundary write and still allow the deletions after it. A spool
+    // that deleted its segments over an unpublished boundary would come back from a restart with
+    // no record of where its output had reached, so nothing is deleted until it is published.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-unwritable-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    for _ in 0..4 {
+        history.append(&[b'x'; 8]);
+    }
+    let retained = history.oldest_retained_cursor();
+    // A directory whose boundary cannot be written: a directory of that name is in the way.
+    std::fs::create_dir(directory.join("boundary")).expect("blocks the boundary file");
+    let taken = history.apply_retention(
+        OutputRetention::new(std::time::Duration::from_secs(7 * 24 * 60 * 60), 1 << 30, 0),
+        32,
+        kr_ipc::now_ms(),
+        true,
+    );
+    assert!(
+        taken.is_empty(),
+        "nothing is deleted while the boundary is unpublished"
+    );
+    assert_eq!(history.oldest_retained_cursor(), retained);
+    assert_eq!(
+        history.page(0, 64).expect("a page").bytes.len(),
+        28,
+        "the retained output is still there"
+    );
+    std::fs::remove_dir_all(&directory).ok();
 }
 
 #[test]
@@ -1372,10 +1414,12 @@ struct EarlierHistoryGap {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_journal_fences_rich_work_while_the_terminal_keeps_working() {
-    // KR-ACC-028: fill the journal while local terminal traffic continues; fence rich mutations
-    // and approvals, and never replay a volatile request. All three in one sequence, because the
-    // contract is about what happens to them *together*.
+async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
+    // KR-ACC-028, for the parts this suite can drive: the journal is filled while the input lease
+    // is live, raw input keeps being accepted, a rich mutation is refused before anything is
+    // dispatched, and nothing is left behind for a replay to find. What it does not drive is an
+    // approval, which needs the question ledger, or a native terminal application responding to
+    // the bytes; the fixture's root shell is a `sleep`. Those are named in this task's handoff.
     let host = host().await;
     let mut client = cli(&host).await;
 
@@ -1473,7 +1517,10 @@ async fn a_full_journal_fences_rich_work_while_the_terminal_keeps_working() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_history_page_is_bounded_by_its_cursor_and_its_range() {
+async fn a_history_page_is_bounded_by_the_cursor_and_the_range_it_names() {
+    // KR-REQ-23.48 for `history.page`. The row also covers `events.subscribe`,
+    // `events.snapshot` and `action.read`, and present view authority over the subject; those are
+    // this host's own suites and are named in this task's handoff rather than claimed here.
     let host = host().await;
     let mut client = cli(&host).await;
     {
@@ -1525,7 +1572,7 @@ async fn a_history_page_is_bounded_by_its_cursor_and_its_range() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn the_persistence_contract_covers_network_loss_and_a_daemon_restart_and_not_a_crash() {
+fn the_store_declarations_say_what_survives_a_daemon_restart_and_what_a_crash_ends() {
     // Section 7: *the persistence contract covers network loss and control-daemon restart. A
     // worker crash or host reboot ends the affected live process execution.* The store
     // declarations are where that is decidable: what survives a daemon restart is what the

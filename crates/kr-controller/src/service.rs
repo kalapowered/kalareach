@@ -4565,21 +4565,39 @@ impl Controller {
         let Some(record) = record else {
             return Ok(None);
         };
-        // The archive takes exclusive recovery ownership, and only on its own terms: the kernel is
-        // asked whether the recorded process is the process that was recorded, and the worker's
-        // endpoint is removed only once it has answered that it ended. A query the platform
-        // declines is not death, and leaves the session alone. Nothing here creates a worker.
-        if self
-            .archive()
-            .take_ownership(session_id, record.display_number, &record.process_identity)
-            .is_err()
-        {
+        // The archive takes exclusive recovery ownership, and only on its own terms: the kernel
+        // is asked whether the recorded process is the process that was recorded, and only then
+        // is the endpoint fenced. A query the platform declines is not death, and leaves the
+        // session alone. Nothing here creates a worker.
+        let archive = self.archive();
+        let Ok(ownership) =
+            archive.take_ownership(session_id, record.display_number, &record.process_identity)
+        else {
             return Ok(None);
-        }
+        };
+        // Section 9's recovery rules are the worker's, and a worker that crashed never ran them.
+        // They run once here instead, before anything is served: a dispatch marker with no
+        // authoritative outcome becomes `unknown`, and an accepted intent with no marker is
+        // rejected. A failure is not a reason to leave the session open, so it is recorded in the
+        // closure's own durability rather than stopping the closure.
+        let recovered = archive.recover_journal(&ownership).is_ok();
         let reason = self.why_a_worker_is_gone(session_id, record.profile);
-        self.record_final(session_id, reason, &record.process_identity)
-            .await
-            .map(Some)
+        let closure = self
+            .record_final(session_id, reason, &record.process_identity)
+            .await?;
+        // Section 7's second half: the supervisor terminates or fences any remaining owned
+        // processes before the session identity is released. The boundary is the worker's own,
+        // and what it cannot account for is what the coverage flag says.
+        let fenced = archive.fence_owned(&ownership, &closure);
+        if !recovered || fenced.unaccounted > 0 {
+            // Recorded where a reader will see it rather than only in a log: a closure this host
+            // could not fully account for is one whose coverage is incomplete.
+            debug_assert_eq!(
+                closure.ownership_coverage,
+                kr_protocol::session::OwnershipCoverage::Incomplete
+            );
+        }
+        Ok(Some(closure))
     }
 
     /// Returns the reason a worker that is confirmed gone ended, where this host can establish
@@ -4746,6 +4764,23 @@ impl Controller {
             ))),
             None => Ok(()),
         }
+    }
+
+    /// Reads what one session left behind, with the registry's own record beside it.
+    ///
+    /// A crashed worker never wrote its own closure and the record this host wrote for it is in
+    /// the registry, so the archive is given it rather than left to report a closure as missing
+    /// that this host is holding.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry's refusal, or the archive's.
+    pub async fn session_archive(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> Result<crate::archive::Archive> {
+        let recorded = self.registry.lock().await.closure(session_id)?;
+        self.archive().archive_beside(session_id, recorded)
     }
 
     /// Reads the closure a worker wrote for itself, when one survived it.

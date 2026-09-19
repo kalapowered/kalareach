@@ -280,6 +280,18 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: true,
     },
     StoreDescriptor {
+        name: "privacy",
+        holds: "the privacy generation in force, and whether privacy mode is on",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::ArchiveService,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
         name: "journal_gaps",
         holds: "the intervals durable writing was unavailable, so no reader reads continuity",
         durability: Durability::CrashDurable,
@@ -402,6 +414,7 @@ mod tests {
             "fence_delivery",
             "fence_forgotten",
             "host_time",
+            "privacy",
             "closure",
             "journal_gaps",
         ] {
