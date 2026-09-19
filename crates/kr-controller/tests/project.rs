@@ -1162,13 +1162,17 @@ fn keys_are_this_test_s(
     // it: a daemon given relative directories resolves them against the working directory the
     // kernel reports, and on macOS that has already followed the link at `/var`. So the two names
     // are compared as directories rather than as text.
+    // The suffix is removed rather than split on, because a directory's own name may contain the
+    // text the suffix starts with.
     let said = std::fs::read_to_string(log).unwrap_or_default();
     let named = said
         .lines()
         .find_map(|line| {
             line.strip_prefix("kr-controller: keys in the 0700 fallback directory at ")
         })
-        .and_then(|rest| rest.split(" (").next())
+        .and_then(|rest| {
+            rest.strip_suffix(" (protected only by OS account isolation and disk encryption)")
+        })
         .unwrap_or_else(|| {
             panic!("the daemon's log does not say where its keys went; it says: {said}")
         });
