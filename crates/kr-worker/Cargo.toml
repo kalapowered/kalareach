@@ -50,7 +50,17 @@ libproc.workspace = true
 [target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dependencies]
 sysinfo.workspace = true
 
+[features]
+# The pause the host's own tests use to enter the window between a durable receipt acceptance and
+# the broker's admission of the same mutation. It compiles to nothing without this feature, and no
+# shipped build enables it.
+testing = []
+
 [dev-dependencies]
+# This crate's own tests, with the pause above compiled in. A test cannot otherwise stand inside
+# the interval the dispatch marker divides, because every other seam a test controls is called
+# under the broker's own lock.
+kr-worker = { path = ".", features = ["testing"] }
 kr-cbor.workspace = true
 # The performance measurement stops its clock when a *client* is holding a screen and has drawn
 # it, which is what the section-27 figure means by usable. That is the client library's own work,

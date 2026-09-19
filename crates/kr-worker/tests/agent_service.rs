@@ -698,11 +698,9 @@ fn approval_mutation(
 /// KR-REQ-11.33 and KR-REQ-09: a resource the native path resolved first leaves the rich answer a
 /// rejection with a receipt, not an outcome nobody can establish.
 ///
-/// The window this closes is between the service accepting the mutation and the broker admitting
-/// it. The service used to finish its own checks before the receipt marker and admit afterwards,
-/// so a native resolution in between produced a zero-send refusal recorded as `Unknown`. The
-/// admission now crosses the marker, so the refusal is decided before it: the receipt says the
-/// answer was rejected, and no dispatch marker was written.
+/// Here the resource is already resolved when the mutation is sent. The harder case, where it is
+/// resolved *inside* the interval between the receipt acceptance and the admission, is the test
+/// below this one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_33_a_natively_resolved_resource_leaves_the_rich_answer_a_rejection() {
     let host = host().await;
@@ -744,9 +742,8 @@ async fn kr_req_11_33_a_natively_resolved_resource_leaves_the_rich_answer_a_reje
 
 /// KR-REQ-11.17 and KR-REQ-09: evidence withdrawn before the service admits is a rejection too.
 ///
-/// The same window, entered by the other door the synthesis names: the capability the answer needs
-/// is invalidated rather than the resource being resolved. The refusal is still decided before the
-/// dispatch marker, so it is a rejection with a receipt rather than an unknown outcome.
+/// The other door: the capability the answer needs is invalidated rather than the resource being
+/// resolved. Again the interval version follows below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_17_evidence_withdrawn_before_the_service_admits_is_a_rejection() {
     let host = host().await;
@@ -786,5 +783,198 @@ async fn kr_req_11_17_evidence_withdrawn_before_the_service_admits_is_a_rejectio
             .state,
         kr_protocol::gateway::PendingState::Pending,
         "and the resource is left answerable, with nothing reserved against it"
+    );
+}
+
+/// Reads one receipt's durable state, and every state its event log holds, from a second reader.
+///
+/// The service's own answer is not evidence about what is on disk. This opens the journal file
+/// beside it, which is how a test can say what a restart would read back.
+fn durable(host: &Host, action_id: ActionId) -> (Option<String>, Vec<String>) {
+    let connection = rusqlite::Connection::open(&host.journal_path).expect("the journal opens");
+    let state = connection
+        .query_row(
+            "SELECT state FROM receipts WHERE action_id = ?1",
+            rusqlite::params![action_id.get().as_bytes().as_slice()],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let mut statement = connection
+        .prepare("SELECT state FROM receipt_events WHERE action_id = ?1 ORDER BY revision")
+        .expect("the event log is readable");
+    let events = statement
+        .query_map(
+            rusqlite::params![action_id.get().as_bytes().as_slice()],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("the event log is readable")
+        .map(|row| row.expect("a row"))
+        .collect();
+    (state, events)
+}
+
+/// KR-REQ-11.33, KR-REQ-11.17 and KR-REQ-09: what changes inside the interval between the durable
+/// acceptance and the broker's admission is still a rejection, and still sends nothing.
+///
+/// This is the window the admission was moved across. The service used to finish its own checks
+/// before the receipt marker and admit the mutation afterwards, so a native resolution or an
+/// invalidation arriving in between produced a zero-send refusal recorded as an outcome nobody
+/// could establish. The service pauses here with its receipt committed as `accepted` and no
+/// dispatch marker written, the interference lands, and the refusal is a rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_33_what_changes_inside_the_admission_interval_is_still_a_rejection() {
+    for door in ["the native answer", "the evidence"] {
+        let host = host().await;
+        let upstream = Arc::new(CountingUpstream::default());
+        register(&host, None);
+        let resource_id = offer_approval(&host, Arc::clone(&upstream));
+        let mut client = cli(&host).await;
+        let mutation = approval_mutation(&client, &host, 17, resource_id);
+        let action_id = mutation.action_id;
+
+        let (arrived, release) = host.service.pause_before_admission();
+        let sending = tokio::spawn(async move {
+            let outcome = send(&mut client, mutation).await;
+            (outcome, client)
+        });
+        tokio::task::spawn_blocking(move || arrived.recv().expect("the service reached the pause"))
+            .await
+            .expect("the wait finishes");
+
+        // The receipt is durably accepted and nothing has been marked for dispatch.
+        let (state, events) = durable(&host, action_id);
+        assert_eq!(state.as_deref(), Some("accepted"), "{door}");
+        assert!(
+            !events.iter().any(|event| event == "dispatching"),
+            "{door}: no dispatch marker has been written"
+        );
+
+        let expected = if door == "the native answer" {
+            host.service
+                .broker()
+                .native_answer_through(
+                    kr_protocol::ids::GatewayConnectionId::new(1),
+                    br#"{"id":11,"result":{"option_id":"allow"}}"#,
+                    TimestampMs::new(5),
+                    |_| Ok(()),
+                )
+                .expect("the native answer is carried");
+            ErrorCode::QuestionResolved
+        } else {
+            record_evidence(
+                &host,
+                "agent.approval",
+                CapabilityRevision::new(2),
+                kr_protocol::broker::InstanceCapabilityState::TemporarilyUnavailable,
+            );
+            ErrorCode::UnsupportedCapability
+        };
+        release.send(()).expect("the service is let go");
+
+        let (outcome, client) = sending.await.expect("the mutation is answered");
+        let mut client = client;
+        let Outcome::Error(error) = outcome else {
+            panic!("{door}: this answer cannot go: {outcome:?}");
+        };
+        assert_eq!(error.code, expected, "{door}");
+        assert_eq!(
+            upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{door}: the rich path wrote no frame"
+        );
+        let receipt = receipt(&mut client, action_id).await;
+        assert_eq!(
+            receipt.state,
+            ReceiptState::Rejected,
+            "{door}: a refusal decided before the marker is a rejection"
+        );
+        let (state, events) = durable(&host, action_id);
+        assert_eq!(state.as_deref(), Some("rejected"), "{door}");
+        assert!(
+            !events.iter().any(|event| event == "dispatching"),
+            "{door}: and no dispatch marker was ever written"
+        );
+    }
+}
+
+/// KR-REQ-09 and KR-REQ-11.27: an approval whose dispatch marker the receipt journal refused
+/// leaves its reservation back where it was.
+///
+/// The marker is the receipt's, and the reservation is the broker's. They live in one journal
+/// file, so the failure here is made specific rather than file-wide: a trigger on the receipt
+/// table refuses exactly the `accepted → dispatching` update of an approval, and every broker
+/// table stays writable. The service abandons the admission it took, which gives the resource's
+/// one transmission back — and the proof of that is the answer that goes afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_27_an_approval_whose_marker_was_refused_leaves_the_resource_answerable() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(&host, None);
+    let resource_id = offer_approval(&host, Arc::clone(&upstream));
+
+    // The receipt journal refuses this one transition, and nothing else.
+    let journal = rusqlite::Connection::open(&host.journal_path).expect("the journal opens");
+    journal
+        .execute_batch(
+            "CREATE TRIGGER refuse_approval_dispatch BEFORE UPDATE ON receipts
+             WHEN OLD.state = 'accepted' AND NEW.state = 'dispatching'
+                  AND OLD.method = 'agent.approval.respond'
+             BEGIN SELECT RAISE(ABORT, 'this dispatch marker cannot be written'); END;",
+        )
+        .expect("the trigger is installed");
+
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 18, resource_id);
+    let action_id = mutation.action_id;
+    let outcome = send(&mut client, mutation).await;
+    let Outcome::Error(error) = outcome else {
+        panic!("a marker that could not be written is not an applied answer: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the admission was given up, so nothing carried the answer"
+    );
+
+    let (state, events) = durable(&host, action_id);
+    assert_eq!(state.as_deref(), Some("accepted"));
+    assert!(!events.iter().any(|event| event == "dispatching"));
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(resource_id)
+            .expect("retained")
+            .state,
+        kr_protocol::gateway::PendingState::Pending,
+        "the reservation went back with the admission"
+    );
+    let dispatched: i64 = journal
+        .query_row(
+            "SELECT dispatched FROM broker_pending WHERE resource_id = ?1",
+            rusqlite::params![resource_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the broker's own row is readable and its tables are writable");
+    assert_eq!(dispatched, 0, "and no broker dispatch marker was written");
+
+    // Which the next answer proves: the resource is still answerable, and it settles once.
+    host.service
+        .broker()
+        .native_answer_through(
+            kr_protocol::ids::GatewayConnectionId::new(1),
+            br#"{"id":11,"result":{"option_id":"allow"}}"#,
+            TimestampMs::new(6),
+            |_| Ok(()),
+        )
+        .expect("the resource was left answerable");
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(resource_id)
+            .expect("retained")
+            .state,
+        kr_protocol::gateway::PendingState::Resolved,
+        "and answering it once is what ends it"
     );
 }

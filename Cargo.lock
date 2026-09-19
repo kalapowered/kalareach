@@ -4428,6 +4428,7 @@ dependencies = [
  "kr-shell-integration",
  "kr-term",
  "kr-transport",
+ "kr-worker",
  "libc",
  "libproc",
  "portable-pty",

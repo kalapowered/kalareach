@@ -233,6 +233,16 @@ pub struct WorkerService {
     /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
     broker: Arc<crate::broker::Broker>,
     build_id: kr_protocol::ids::BuildId,
+    /// A pause between a durable receipt acceptance and the broker's admission of the same
+    /// mutation, which this host's own tests arm to stand inside that interval. It is compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    admission_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 impl WorkerService {
@@ -364,8 +374,57 @@ impl WorkerService {
             questions,
             broker,
             build_id: binding.build_id,
+            #[cfg(feature = "testing")]
+            admission_pause: Mutex::new(None),
         })
     }
+
+    /// Stops the next approval immediately before the broker admits it, for this host's own tests.
+    ///
+    /// The receipt has been accepted durably by then and the dispatch marker has not been written,
+    /// which is the interval section 24 divides. Every other seam a test controls inside that
+    /// interval runs under the broker's own lock, so a test that wanted to resolve the resource or
+    /// replace its evidence from one would deadlock rather than race.
+    ///
+    /// Returns the end that says the service has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_admission(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .admission_pause
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_before_admission(&self) {
+        let armed = self
+            .admission_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// The same, without the feature: there is no pause.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this service's own pause"
+    )]
+    const fn wait_before_admission(&self) {}
 
     /// Returns the generation this worker currently accepts.
     #[must_use]
@@ -3559,8 +3618,11 @@ impl WorkerService {
             // before the dispatch marker: section 9 makes a refusal this host can decide a
             // rejection rather than an outcome nobody can establish, and everything the broker
             // decides is decidable without touching the upstream. What comes back is the
-            // admission itself, and it crosses the marker with the mutation, so nothing the
-            // admission checked can move between the check and the transmission.
+            // admission itself, and it crosses the marker with the mutation. What that buys is
+            // not that nothing can change afterwards — the marker and the bytes still follow —
+            // but that everything this host could refuse has been refused on *this* side of the
+            // marker, and that an answer's one transmission is reserved from here, so a change
+            // that lands later cannot turn into a second answer.
             Method::AgentPromptSubmit | Method::AgentPromptQueue => {
                 let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
                 let admitted = self.broker.admit_prompt(
@@ -3592,6 +3654,7 @@ impl WorkerService {
             Method::AgentApprovalRespond => {
                 let params: kr_protocol::agent::AgentApprovalRespondParams =
                     parse(&mutation.params)?;
+                self.wait_before_admission();
                 let admitted = self.broker.admit_approval(
                     &Self::broker_caller(caller),
                     &params,
