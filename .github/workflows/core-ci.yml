@@ -41,6 +41,15 @@ jobs:
           rustc --version
           cargo --version
 
+      # The workspace contains the companion application's backend, which links the system WebView
+      # and the window toolkit. A workspace-wide check needs them present before it can compile.
+      - name: Install the desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
       # The test components are compiled to wasm32-wasip2 and are not committed: Rust embeds build
       # paths in a component's custom sections, so two machines produce different bytes for the same
       # source and a committed artefact could not be checked.
@@ -329,6 +338,10 @@ jobs:
           path: /tmp/kr-test-artifacts
           if-no-files-found: ignore
 
-      # The desktop application itself, compiled the way it is shipped.
+      # The desktop application itself, compiled the way it is shipped: the production bundle, and
+      # the feature that makes the binary serve it from inside itself rather than from a
+      # development server.
       - name: Build the desktop application
-        run: cargo build --locked -p companion-tauri --release
+        run: |
+          pnpm -C apps/companion build
+          cargo build --locked -p companion-tauri --release --features custom-protocol

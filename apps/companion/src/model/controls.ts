@@ -57,7 +57,8 @@ export const MAX_PREDICATE_DEPTH = 4
 export const MAX_PREDICATE_TERMS = 8
 
 /** Evaluates a predicate against what the client knows. */
-export function evaluate(predicate: Predicate, state: ControlState, depth = 0): Truth {
+export function evaluate(predicate: Predicate, state: ControlState, depth = 1): Truth {
+  // The outermost predicate is level one, as the contract counts it.
   if (depth > MAX_PREDICATE_DEPTH) return 'unknown'
   switch (predicate.op) {
     case 'always':
@@ -70,10 +71,12 @@ export function evaluate(predicate: Predicate, state: ControlState, depth = 0): 
       return inner === 'true' ? 'false' : 'true'
     }
     case 'all': {
-      // An empty `all` is vacuously true and an empty `any` vacuously false, which is what the
-      // host's own evaluator answers. A client that disagreed would show or hide a control the
-      // host would then decide differently about.
-      if (predicate.terms.length > MAX_PREDICATE_TERMS) return 'unknown'
+      // A combinator with no terms, or with more than the contract permits, is not a predicate the
+      // package could have published: the shared evaluator rejects both. A client that answered
+      // one would be deciding about a control on a condition nothing validated.
+      if (predicate.terms.length === 0 || predicate.terms.length > MAX_PREDICATE_TERMS) {
+        return 'unknown'
+      }
       let sawUnknown = false
       for (const term of predicate.terms) {
         const value = evaluate(term, state, depth + 1)
@@ -83,7 +86,9 @@ export function evaluate(predicate: Predicate, state: ControlState, depth = 0): 
       return sawUnknown ? 'unknown' : 'true'
     }
     case 'any': {
-      if (predicate.terms.length > MAX_PREDICATE_TERMS) return 'unknown'
+      if (predicate.terms.length === 0 || predicate.terms.length > MAX_PREDICATE_TERMS) {
+        return 'unknown'
+      }
       let sawUnknown = false
       for (const term of predicate.terms) {
         const value = evaluate(term, state, depth + 1)

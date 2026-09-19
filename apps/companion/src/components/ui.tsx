@@ -271,16 +271,28 @@ export function Segmented<T extends string>({
           aria-selected={option.value === value}
           tabIndex={option.value === value ? 0 : -1}
           onKeyDown={(event) => {
-            const step =
+            const wrapped = (position: number) =>
+              (position + options.length) % options.length
+            const target =
               event.key === 'ArrowRight' || event.key === 'ArrowDown'
-                ? 1
+                ? wrapped(index + 1)
                 : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
-                  ? -1
-                  : 0
-            if (step === 0) return
+                  ? wrapped(index - 1)
+                  : event.key === 'Home'
+                    ? 0
+                    : event.key === 'End'
+                      ? options.length - 1
+                      : -1
+            if (target < 0) return
             event.preventDefault()
-            const next = options[(index + step + options.length) % options.length]
-            if (next) onChange(next.value)
+            const next = options[target]
+            if (!next) return
+            onChange(next.value)
+            // Focus follows the selection, or a second arrow press would start from the tab that
+            // is no longer selected and the control could not be traversed.
+            const list = event.currentTarget.parentElement
+            const buttons = list?.querySelectorAll<HTMLButtonElement>('[role="tab"]')
+            buttons?.[target]?.focus()
           }}
           onClick={() => {
             onChange(option.value)
@@ -567,6 +579,10 @@ export function Sheet({
             const height = sheet.offsetHeight || 1
             const offset = Math.max(0, start.offset + (event.clientY - start.pointer))
             const velocity = tracker.current.velocity()
+            // Recorded before either branch: a dismissal that discarded the release velocity would
+            // stop dead where the finger left, which is the one thing a thrown surface must not do.
+            presented.current.offset = offset
+            presented.current.velocity = velocity
             if (Math.abs(offset - start.offset) < DRAG_THRESHOLD && velocity === 0) {
               place(start.offset)
               return

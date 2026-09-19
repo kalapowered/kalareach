@@ -325,15 +325,24 @@ describe('declarative controls', () => {
     ).toBe('false')
   })
 
-  it('answers an empty combinator the way the host does', () => {
-    expect(evaluate({ op: 'all', terms: [] }, emptyControlState())).toBe('true')
-    expect(evaluate({ op: 'any', terms: [] }, emptyControlState())).toBe('false')
+  it('does not decide about a combinator the contract would have rejected', () => {
+    // The shared evaluator refuses an empty combinator and one over the term limit. A client that
+    // answered either would be deciding about a control on a condition nothing validated.
+    expect(evaluate({ op: 'all', terms: [] }, emptyControlState())).toBe('unknown')
+    expect(evaluate({ op: 'any', terms: [] }, emptyControlState())).toBe('unknown')
+    const tooMany = Array.from({ length: 9 }, () => ({ op: 'always' }) as const)
+    expect(evaluate({ op: 'all', terms: tooMany }, emptyControlState())).toBe('unknown')
   })
 
   it('bounds the predicate depth rather than recursing on a deep one', () => {
     let predicate = { op: 'always' } as Parameters<typeof evaluate>[0]
     for (let index = 0; index < 12; index += 1) predicate = { op: 'not', term: predicate }
     expect(evaluate(predicate, emptyControlState())).toBe('unknown')
+
+    // Four levels is what the contract permits, and four levels evaluates.
+    let permitted = { op: 'always' } as Parameters<typeof evaluate>[0]
+    for (let index = 0; index < 3; index += 1) permitted = { op: 'not', term: permitted }
+    expect(evaluate(permitted, emptyControlState())).toBe('false')
   })
 
   it('knows exactly which node kinds it draws', () => {

@@ -95,6 +95,17 @@ export interface ApprovedLink {
   readonly host: string | null
 }
 
+/** A completed, verified attachment, as `upload.finish` published it. */
+export interface AttachmentHandle {
+  readonly transfer_id: string
+  readonly environment_id: string
+  readonly byte_len: string
+  readonly content_digest: string
+  readonly declared_media_type: string
+  readonly original_file_name: string
+  readonly presented_as_image: boolean
+}
+
 /** One image the person explicitly imported. */
 export interface ImportedImage {
   readonly url: string
@@ -212,6 +223,13 @@ export interface HostPort {
 
   draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
   draftUpdate(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * Sends one dropped file to the host and answers with the verified handle.
+   *
+   * The page never holds the bytes. The platform gave the backend a path when the person dropped
+   * the file on the window; this names that path back, and the backend refuses any other.
+   */
+  attachmentUpload(path: string, subject: SessionSubject): Promise<AttachmentHandle>
   draftAddAttachment(params: unknown, subject: SessionSubject): Promise<Settled>
   /** Reads the bytes behind one validated attachment handle. */
   attachmentImage(params: unknown): Promise<{ bytes: number[]; media_type: string }>

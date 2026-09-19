@@ -46,6 +46,11 @@ objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["std", "NSString", "NSError"] }
 objc2-local-authentication = { workspace = true, features = ["std", "LAContext", "LAError", "block2"] }
 
+[features]
+# What `tauri build` turns on, and what a release build must have: the interface comes from the
+# bundle rather than from a development server.
+custom-protocol = ["tauri/custom-protocol"]
+
 [dev-dependencies]
 tempfile.workspace = true
 

@@ -22,6 +22,7 @@ pub struct AppState {
     origin: Mutex<Origin>,
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
+    dropped_files: Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -44,6 +45,7 @@ impl AppState {
             ),
             drafts: Mutex::new(None),
             export_destinations: Mutex::new(Vec::new()),
+            dropped_files: Mutex::new(Vec::new()),
         }
     }
 
@@ -176,6 +178,42 @@ impl AppState {
         }
     }
 
+    /// Remembers a file the platform said was dropped on this window.
+    ///
+    /// The page is told what was dropped so it can show it, and the page passes the path back when
+    /// the person attaches it. Remembering it here is what makes that safe: a path the page names
+    /// on its own was never dropped, and the upload refuses it.
+    pub fn dropped(&self, paths: impl IntoIterator<Item = std::path::PathBuf>) {
+        let mut held = self
+            .dropped_files
+            .lock()
+            .expect("the drop lock is not poisoned");
+        for path in paths {
+            if held.len() >= MAX_PENDING_DROPS {
+                held.remove(0);
+            }
+            held.push(path);
+        }
+    }
+
+    /// Takes back a dropped file, once, for one upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` for any path this window was not given.
+    pub fn take_dropped_file(&self, path: &std::path::Path) -> Result<std::path::PathBuf> {
+        let mut held = self
+            .dropped_files
+            .lock()
+            .expect("the drop lock is not poisoned");
+        match held.iter().position(|each| each == path) {
+            Some(index) => Ok(held.remove(index)),
+            None => Err(CommandError::refused(
+                "a file is attached by dropping it on this window",
+            )),
+        }
+    }
+
     /// Opens, or reuses, this device's draft store.
     ///
     /// A draft belongs to the device, so the store lives under this application's own per-user
@@ -203,6 +241,9 @@ impl AppState {
 
 /// How many save destinations may be waiting for their write at once.
 const MAX_PENDING_EXPORTS: usize = 8;
+
+/// How many dropped files may be waiting to be attached at once.
+const MAX_PENDING_DROPS: usize = 64;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -259,6 +300,27 @@ mod tests {
         assert!(
             state.take_export_destination(&chosen).is_err(),
             "one dialog is one write"
+        );
+    }
+
+    #[test]
+    fn a_path_this_window_was_never_given_is_not_uploadable() {
+        let state = AppState::new();
+        let error = state
+            .take_dropped_file(std::path::Path::new("/Users/someone/.ssh/id_ed25519"))
+            .expect_err("that file was not dropped on this window");
+        assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn a_dropped_file_is_uploadable_once_and_not_twice() {
+        let state = AppState::new();
+        let dropped = std::path::PathBuf::from("/tmp/diagram.png");
+        state.dropped([dropped.clone()]);
+        assert!(state.take_dropped_file(&dropped).is_ok());
+        assert!(
+            state.take_dropped_file(&dropped).is_err(),
+            "one drop is one upload"
         );
     }
 

@@ -68,7 +68,8 @@ import {
   queued,
   reconnectBanner,
   sent,
-  settled
+  settled,
+  stateOfReceipt
 } from '../model/receipts'
 import type { LaunchSurface } from '../model/pending'
 
@@ -223,6 +224,7 @@ export function Conversation({
 
       call
         .then((result) => {
+          const outcome = result.receipt ? stateOfReceipt(result.receipt) : 'sent'
           update((current) => ({
             ...current,
             submissions: current.submissions.map((submission) => {
@@ -231,8 +233,22 @@ export function Conversation({
                 ? sent(submission, result.action_id)
                 : submission
               return result.receipt ? settled(identified, result.receipt) : identified
-            })
+            }),
+            // A refused or rejected submission gives the text back, exactly as a transport failure
+            // does. What the host said no to is still what the person wrote.
+            draft:
+              clears &&
+              (outcome === 'refused' || outcome === 'rejected') &&
+              current.draft.text.length === 0
+                ? edit(current.draft, typed, Date.now())
+                : current.draft
           }))
+          if (outcome === 'refused' || outcome === 'rejected') {
+            say('The host did not take that. It is back in the composer.', 'danger')
+          }
+          if (outcome === 'unknown') {
+            say('The host could not confirm what became of that.', 'danger')
+          }
         })
         .catch((error: unknown) => {
           const code = failureCode(error) ?? 'UNKNOWN'
@@ -256,30 +272,72 @@ export function Conversation({
     [port, sessionId, subject, state.draft.text, update, say]
   )
 
+  /**
+   * A dropped file becomes an attachment in three steps, and they stay three.
+   *
+   * The transfer publishes a verified handle. The insertion binds that handle to the draft. The
+   * submission is a separate act the person performs. Section 12 keeps them apart because a failed
+   * insertion must leave the completed upload and the draft alone, and because only upstream
+   * evidence makes an attachment accepted by an agent.
+   */
   const attach = useCallback(
     (files: readonly DroppedFile[]) => {
       for (const file of files) {
+        const path = file.path
+        if (!path) {
+          setInsertion('That file was not given to this window, so it was not sent.')
+          continue
+        }
         port
-          .draftAddAttachment(
-            {
-              draft_id: state.draft.draftId,
-              original_file_name: file.name,
-              insertion_method: 'typed_submission'
-            },
-            subject
-          )
-          .then((result) => {
-            // Only an applied receipt says the attachment reached the draft.
-            if (result.receipt?.state === 'applied') say(`${file.name} attached.`)
-            else say(`${file.name} sent. Waiting for the host to confirm.`)
+          .attachmentUpload(path, subject)
+          .then((handle) => {
+            // The upload is done and the handle is verified. It is kept whatever the insertion
+            // does next.
+            update((current) => ({
+              ...current,
+              draft: {
+                ...current.draft,
+                attachments: [
+                  ...current.draft.attachments,
+                  {
+                    transferId: handle.transfer_id,
+                    name: handle.original_file_name,
+                    byteLen: Number(handle.byte_len),
+                    mediaType: handle.declared_media_type,
+                    presentedAsImage: handle.presented_as_image,
+                    acceptedUpstream: false
+                  }
+                ]
+              }
+            }))
+            return port
+              .draftAddAttachment(
+                {
+                  draft_id: state.draft.draftId,
+                  transfer_id: handle.transfer_id,
+                  insertion_method: 'typed_submission'
+                },
+                subject
+              )
+              .then((result) => {
+                // Only an applied receipt says the attachment reached the draft. The upload is
+                // done either way, and the handle above is kept.
+                say(
+                  outcomeMessage(`${handle.original_file_name} attached`, result.receipt),
+                  receiptTone(result.receipt)
+                )
+              })
+              .catch((error: unknown) => {
+                const refusal = readInsertionRefusal(failureCode(error) ?? 'UNKNOWN')
+                setInsertion(refusal.fallback)
+              })
           })
           .catch((error: unknown) => {
-            const refusal = readInsertionRefusal(failureCode(error) ?? 'UNKNOWN')
-            setInsertion(refusal.fallback)
+            setInsertion(`${file.name} was not sent: ${failureMessage(error)}`)
           })
       }
     },
-    [port, state.draft.draftId, subject, say]
+    [port, state.draft.draftId, subject, update, say]
   )
 
   useEffect(() => port.onFilesDropped(attach), [port, attach])
@@ -337,11 +395,7 @@ export function Conversation({
           subject
         )
         .then((result) => {
-          say(
-            result.receipt?.state === 'applied'
-              ? `${control.label} done.`
-              : `${control.label} sent. Waiting for the host to confirm.`
-          )
+          say(outcomeMessage(control.label, result.receipt), receiptTone(result.receipt))
         })
         .catch((error: unknown) => {
           say(failureMessage(error), 'danger')
@@ -521,6 +575,36 @@ function readAgentCommands(answer: unknown): readonly AgentCommand[] {
     .filter((command): command is Record<string, unknown> => typeof command === 'object' && command !== null)
     .map((command) => ({ name: text(command.name), summary: text(command.summary) }))
     .filter((command) => command.name.length > 0)
+}
+
+/**
+ * What one action's receipt means, in words.
+ *
+ * Only `applied` is completion. Everything else is named for what it is, because "waiting" for an
+ * outcome the host has already refused is the one thing the receipt contract exists to prevent.
+ */
+export function outcomeMessage(done: string, receipt: { state?: string } | null): string {
+  switch (receipt?.state) {
+    case 'applied':
+      return `${done}.`
+    case 'refused':
+      return 'The host refused that.'
+    case 'rejected':
+      return 'The host rejected that.'
+    case 'unknown':
+      return 'The host could not confirm what became of that.'
+    case undefined:
+      return 'Sent. Waiting for the host to confirm.'
+    default:
+      return 'Sent. Waiting for the host to confirm.'
+  }
+}
+
+/** Whether an outcome reads as a failure. */
+export function receiptTone(receipt: { state?: string } | null): 'success' | 'danger' {
+  return receipt && ['refused', 'rejected', 'unknown'].includes(receipt.state ?? '')
+    ? 'danger'
+    : 'success'
 }
 
 /** Whether the view is at the live end, which is what makes it follow. */
@@ -787,8 +871,10 @@ const NodeView = memo(function NodeView({
  */
 function FormFields({ fields }: { readonly fields: unknown }): ReactNode {
   const entries =
-    typeof fields === 'object' && fields !== null && Array.isArray((fields as { fields?: unknown }).fields)
-      ? ((fields as { fields: unknown[] }).fields as Record<string, unknown>[])
+    typeof fields === 'object' &&
+    fields !== null &&
+    Array.isArray((fields as { parameters?: unknown }).parameters)
+      ? ((fields as { parameters: unknown[] }).parameters as Record<string, unknown>[])
       : []
   if (entries.length === 0) return null
   return (
@@ -796,14 +882,29 @@ function FormFields({ fields }: { readonly fields: unknown }): ReactNode {
       {entries.map((field, index) => {
         const name = text(field.name) || `field-${index}`
         const label = text(field.label) || name
-        const kind = text(field.kind) || text(field.type)
+        // The declaration's kind is a tagged object, and its tag is what a client draws from.
+        const kind =
+          typeof field.kind === 'object' && field.kind !== null
+            ? text((field.kind as { type?: unknown }).type)
+            : ''
         return (
           <label className="form-field" key={name}>
             <span>{label}</span>
             {kind === 'boolean' ? (
               <input type="checkbox" name={name} />
-            ) : kind === 'number' || kind === 'integer' ? (
+            ) : kind === 'integer' ? (
               <input type="number" name={name} />
+            ) : kind === 'choice' ? (
+              <select name={name}>
+                {(Array.isArray((field.kind as { choices?: unknown }).choices)
+                  ? ((field.kind as { choices: Record<string, unknown>[] }).choices)
+                  : []
+                ).map((choice, position) => (
+                  <option key={text(choice.id) || position} value={text(choice.id)}>
+                    {text(choice.label) || text(choice.id)}
+                  </option>
+                ))}
+              </select>
             ) : (
               <input type="text" name={name} />
             )}
@@ -911,9 +1012,8 @@ function LaunchSurfaceView({
                   )
                   .then((result) => {
                     say(
-                      result.receipt?.state === 'applied'
-                        ? `${profile.label} started.`
-                        : `${profile.label} requested. Waiting for the host to confirm.`
+                      outcomeMessage(`${profile.label} started`, result.receipt),
+                      receiptTone(result.receipt)
                     )
                     onLaunched()
                   })

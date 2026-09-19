@@ -54,7 +54,8 @@ export function Sessions(): ReactNode {
 
   const load = useCallback(() => {
     port
-      .sessionList({})
+      // Every environment this connection may see, and only the sessions that are still open.
+      .sessionList({ environment_id: null, include_closed: false })
       .then((result) => {
         setList(result)
         setFailure(null)
@@ -206,7 +207,7 @@ export function Hosts(): ReactNode {
       <Card>
         <div className="card-header">
           <div className="spacer">
-            <h2>studio</h2>
+            <h2>{environments?.environments[0]?.label ?? 'This machine'}</h2>
             <p className="muted small">
               {reachable ? 'Connected' : 'Not in contact'}
               {info ? ` · build ${info.build_id}` : ''}
@@ -227,7 +228,6 @@ export function Hosts(): ReactNode {
               </div>
               <span className="row">
                 <Badge tone="neutral">{environment.live_sessions} live</Badge>
-                <Badge tone="success">Desktop ready</Badge>
               </span>
             </div>
           ))}

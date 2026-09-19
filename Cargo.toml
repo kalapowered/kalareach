@@ -103,6 +103,8 @@ spake2 = "=0.4.0"
 subtle = "=2.6.1"
 sysctl = "=0.6.0"
 sysinfo = "=0.33.1"
+# `custom-protocol` is what makes a built application serve its interface from the bundle instead
+# of from a development server. It is not implied by an optimised profile.
 tauri = { version = "=2.11.5", default-features = false, features = ["common-controls-v6", "wry"] }
 tauri-build = { version = "=2.6.3", default-features = false }
 tauri-plugin-dialog = "=2.7.3"

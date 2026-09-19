@@ -33,7 +33,6 @@ pub const MUTATION_TTL: kr_protocol::scalars::DurationMs =
 
 /// The complete command surface, as a table of names and the methods they perform.
 pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
-    /// The complete command surface.
     // Hosts and environments.
     ("host_info", Some(Method::HostInfo)),
     ("environment_list", Some(Method::EnvironmentList)),
@@ -93,7 +92,6 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
 /// The command handlers, in the form Tauri registers.
 ///
 /// The page can reach exactly these. There is no handler that takes a method name.
-#[must_use]
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         host_info,
@@ -400,6 +398,10 @@ pub async fn attachment_upload(
     path: String,
     session_id: Option<String>,
 ) -> Result<Value> {
+    // Only a file this window was actually given. The platform hands the backend a path when a
+    // person drops something on the window, and that path is spent by one upload. A path the page
+    // names is refused, so this command is not a general file read.
+    let path = state.take_dropped_file(std::path::Path::new(&path))?;
     let environment_id = state.environment_id()?;
     let target = subject.target(environment_id)?;
     let session = state.session()?;
@@ -411,14 +413,8 @@ pub async fn attachment_upload(
                 .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
         ),
     };
-    let handle = crate::transfers::upload(
-        &session,
-        target,
-        environment_id,
-        session_id,
-        std::path::PathBuf::from(path),
-    )
-    .await?;
+    let handle =
+        crate::transfers::upload(&session, target, environment_id, session_id, path).await?;
     encode(&handle)
 }
 

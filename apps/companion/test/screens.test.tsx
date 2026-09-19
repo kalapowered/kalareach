@@ -182,6 +182,50 @@ describe('the semantic view', () => {
     expect(within(screen.getByTestId('launch-surface')).getByRole('button', { name: /Codex/ })).toBeDisabled()
   })
 
+  it('sends a dropped file through the transfer service before it touches the draft', async () => {
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('composer')
+
+    controls.dropFiles([
+      { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
+    ])
+
+    await waitFor(() => {
+      expect(controls.uploaded).toEqual(['/tmp/diagram.png'])
+    })
+    expect(await screen.findByText(/diagram.png attached/)).toBeInTheDocument()
+  })
+
+  it('does not send a file this window was never given', async () => {
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('composer')
+
+    controls.dropFiles([
+      { name: 'id_ed25519', media_type: 'application/octet-stream', byte_len: 400 }
+    ])
+
+    expect(await screen.findByTestId('insertion-refusal')).toHaveTextContent(
+      'was not given to this window'
+    )
+    expect(controls.uploaded).toEqual([])
+  })
+
   it('tells the person the draft is kept when a composer insertion is refused', async () => {
     const { port, controls } = fakeHost()
     render(
@@ -209,7 +253,9 @@ describe('the semantic view', () => {
         <App />
       </AppProvider>
     )
-    controls.dropFiles([{ name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }])
+    controls.dropFiles([
+      { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
+    ])
 
     const refusal = await screen.findByTestId('insertion-refusal')
     expect(refusal.textContent).toMatch(/kept/)

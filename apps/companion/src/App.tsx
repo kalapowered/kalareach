@@ -28,10 +28,12 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
 export function App(): ReactNode {
   const { place, go, toast, dismissToast, port } = useApp()
   const [connected, setConnected] = useState(true)
+  const [reason, setReason] = useState<string | null>(null)
 
   useEffect(() => {
     void port.connectionState().then((state) => {
       setConnected(state.connected)
+      setReason(state.reason)
     })
     return port.subscribe((event) => {
       const body = event.body as { kind?: string; connected?: boolean }
@@ -100,7 +102,7 @@ export function App(): ReactNode {
           <span className="row">
             <span className="connection">
               <span className={`status-dot${connected ? '' : ' offline'}`} />
-              {connected ? 'Connected to studio' : 'Not in contact with studio'}
+              {connected ? 'Connected to this machine' : (reason ?? 'Not in contact')}
             </span>
           </span>
         </header>

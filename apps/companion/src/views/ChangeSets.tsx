@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
+import { outcomeMessage, receiptTone } from './Conversation'
 import type { ChangeSets as ChangeSetList, RetainedArtefacts } from '../model/pending'
 
 /** Change sets and retained artefacts. */
@@ -164,8 +165,14 @@ export function ChangeSets(): ReactNode {
                     onCommit={() => {
                       port
                         .storageObjectDelete({ object_id: artefact.object_id }, {})
-                        .then(() => {
-                          say('Deleted. This removes the record, not the physical bytes.')
+                        .then((result) => {
+                          say(
+                            outcomeMessage(
+                              'Deleted, which removes the record rather than the physical bytes',
+                              result.receipt
+                            ),
+                            receiptTone(result.receipt)
+                          )
                           load()
                         })
                         .catch((error: unknown) => {

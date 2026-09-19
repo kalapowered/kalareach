@@ -50,7 +50,7 @@ function median(samples: readonly number[]): number {
 }
 
 function record(name: string, figure: string, verdict: string): void {
-   
+
   // a run that did not both have to leave one behind.
   console.log(`KR-PERF-008 ${name}: ${figure} (${verdict})`)
 }

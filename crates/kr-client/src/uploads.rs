@@ -273,7 +273,7 @@ impl Upload {
                 original_file_name: self.subject.original_file_name.clone(),
             }))),
             Phase::Sending => {
-                let transfer_id = self.transfer_id.clone().ok_or_else(|| {
+                let transfer_id = self.transfer_id.ok_or_else(|| {
                     ClientError::Host(kr_protocol::error::ProtocolError::new(
                         kr_protocol::error::ErrorCode::InvalidArgument,
                         "the upload is sending chunks without a transfer identity",
@@ -290,7 +290,7 @@ impl Upload {
                 )))
             }
             Phase::Publishing => {
-                let transfer_id = self.transfer_id.clone().ok_or_else(|| {
+                let transfer_id = self.transfer_id.ok_or_else(|| {
                     ClientError::Host(kr_protocol::error::ProtocolError::new(
                         kr_protocol::error::ErrorCode::InvalidArgument,
                         "the upload is publishing without a transfer identity",
@@ -338,7 +338,7 @@ impl Upload {
                     ));
                 }
                 self.layout = result.layout;
-                self.transfer_id = Some(result.transfer_id.clone());
+                self.transfer_id = Some(result.transfer_id);
                 self.adopt_bitmap(&result.received_chunks)?;
                 self.advance();
                 Ok(())

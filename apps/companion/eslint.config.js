@@ -6,6 +6,7 @@ export default tseslint.config(
   {
     ignores: [
       'dist',
+      'dist-harness',
       'src-tauri',
       'playwright-report',
       'test-results',

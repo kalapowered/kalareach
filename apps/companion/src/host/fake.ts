@@ -138,6 +138,8 @@ export interface FakeHostControls {
   readonly openedLinks: string[]
   /** What the interface explicitly imported, in order. */
   readonly importedImages: string[]
+  /** The files the interface sent to the host, in order. */
+  readonly uploaded: string[]
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -155,6 +157,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const savedExports: Written[] = []
   const openedLinks: string[] = []
   const importedImages: string[] = []
+  const uploaded: string[] = []
   const nodes: DocumentNode[] = startingConversation()
   const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
@@ -185,7 +188,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       requireConnection()
       return Promise.resolve(environments())
     },
-    
+
     sessionList: () => {
       requireConnection()
       return Promise.resolve(sessions())
@@ -315,9 +318,26 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       Promise.resolve(settledAs('draft.create', 'applied')),
     draftUpdate: () =>
       Promise.resolve(settledAs('draft.update', 'applied')),
+    attachmentUpload: (path) => {
+      requireConnection()
+      const name = path.split('/').pop() ?? path
+      uploaded.push(path)
+      return Promise.resolve({
+        transfer_id: '99999999-9999-4999-8999-999999999999',
+        environment_id: ENVIRONMENT,
+        byte_len: '10',
+        content_digest: 'a'.repeat(64),
+        declared_media_type: 'image/png',
+        original_file_name: name,
+        presented_as_image: true
+      })
+    },
     draftAddAttachment: (params) => {
       requireConnection()
       const method = (params as { insertion_method?: string }).insertion_method
+      if (!(params as { transfer_id?: string }).transfer_id) {
+        refuse('INVALID_ARGUMENT', 'a draft attachment names the transfer that produced it')
+      }
       if (method === 'verified_composer_insertion') {
         // The specification's own rule: a nonempty or unknown buffer returns DRAFT_CONFLICT, the
         // draft is retained, and the person is offered the terminal workflow instead.
@@ -546,7 +566,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     savedExports,
     openedLinks,
-    importedImages
+    importedImages,
+    uploaded
   }
 
   return { port, controls }

@@ -250,8 +250,7 @@ export function Pairing(): ReactNode {
           </div>
           {presence ? (
             <p className="small success-text" data-testid="presence-mechanism">
-              Verified through {presence}. The host records that verification with the
-              confirmation.
+              Verified through {presence} on this device.
             </p>
           ) : (
             <p className="small faint">

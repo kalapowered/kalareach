@@ -15,7 +15,7 @@ import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, Th
 import { useApp } from '../app/state'
 import { failureMessage, type SessionSubject } from '../host/port'
 import type { LaunchSurface } from '../model/pending'
-import { Conversation } from './Conversation'
+import { Conversation, outcomeMessage, receiptTone } from './Conversation'
 import { RawTerminal } from '../terminal/RawTerminal'
 import { describeApplicationState, sessionDescription } from './Sessions'
 
@@ -203,11 +203,10 @@ export function Session({
             .then((result) => {
               setClosing(false)
               say(
-                result.receipt?.state === 'applied'
-                  ? 'The session is closed. Its history is kept.'
-                  : 'Close requested. Waiting for the host to confirm.'
+                outcomeMessage('The session is closed, and its history is kept', result.receipt),
+                receiptTone(result.receipt)
               )
-              go({ view: 'sessions' })
+              if (result.receipt?.state === 'applied') go({ view: 'sessions' })
             })
             .catch((error: unknown) => {
               setClosing(false)
@@ -390,8 +389,8 @@ function SessionSettings({
                       },
                       subject
                     )
-                    .then(() => {
-                      say('Invitation issued.')
+                    .then((result) => {
+                      say(outcomeMessage('Invitation issued', result.receipt), receiptTone(result.receipt))
                     })
                     .catch((error: unknown) => {
                       say(failureMessage(error), 'danger')

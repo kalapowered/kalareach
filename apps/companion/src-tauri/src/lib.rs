@@ -57,11 +57,49 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 reach_local_host(handle).await;
             });
+            watch_drops(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("the companion window could not be created");
 }
+
+/// Records what the platform drops on this window, and tells the interface about it.
+///
+/// The bytes never reach the page: the platform gives this process a path, the backend remembers
+/// it, and the page is told the name so it can show what was dropped. An upload spends one of
+/// these; a path the page names on its own was never dropped and is refused.
+fn watch_drops(app: &tauri::AppHandle) {
+    use tauri::{Emitter as _, Listener as _, Manager as _};
+
+    let handle = app.clone();
+    // The platform's own event, in the window rather than in the page: the page is told the names
+    // afterwards, and the paths themselves stay here.
+    app.listen_any(PLATFORM_DRAG_DROP_EVENT, move |event| {
+        let Ok(payload) = serde_json::from_str::<DroppedPaths>(event.payload()) else {
+            return;
+        };
+        if payload.paths.is_empty() {
+            return;
+        }
+        let paths: Vec<std::path::PathBuf> =
+            payload.paths.iter().map(std::path::PathBuf::from).collect();
+        handle.state::<AppState>().dropped(paths);
+        let _ = handle.emit(DROPPED_EVENT, payload.paths);
+    });
+}
+
+/// The event the platform publishes when something is dropped on the window.
+const PLATFORM_DRAG_DROP_EVENT: &str = "tauri://drag-drop";
+
+/// What that event carries.
+#[derive(serde::Deserialize)]
+struct DroppedPaths {
+    paths: Vec<String>,
+}
+
+/// The event the backend publishes the paths of dropped files on.
+pub const DROPPED_EVENT: &str = "kr://dropped";
 
 /// Connects to the controller on this machine and starts publishing its events.
 async fn reach_local_host(app: tauri::AppHandle) {

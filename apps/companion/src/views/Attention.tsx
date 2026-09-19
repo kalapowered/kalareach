@@ -12,6 +12,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
+import { outcomeMessage, receiptTone } from './Conversation'
 import type { AttentionEntry, AttentionInbox, AttentionKind } from '../model/pending'
 
 const FILTERS: readonly { readonly value: AttentionKind | 'all'; readonly label: string }[] = [
@@ -84,11 +85,8 @@ export function Attention(): ReactNode {
         // The completion feedback waits for the receipt: the host said what happened, not the
         // network.
         say(
-          settled.receipt?.state === 'applied'
-            ? decision === 'allow'
-              ? 'Allowed.'
-              : 'Denied.'
-            : 'Sent. Waiting for the host to confirm.'
+          outcomeMessage(decision === 'allow' ? 'Allowed' : 'Denied', settled.receipt),
+          receiptTone(settled.receipt)
         )
         load()
       })

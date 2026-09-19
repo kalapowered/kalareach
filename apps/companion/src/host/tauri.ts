@@ -12,10 +12,10 @@
 
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { getCurrentWebview } from '@tauri-apps/api/webview'
 
 import type {
   ApprovedLink,
+  AttachmentHandle,
   ConnectionState,
   DroppedFile,
   HostEvent,
@@ -35,6 +35,9 @@ export const HOST_EVENT = 'kr://event'
 
 /** The event the backend publishes a change of connection state on. */
 export const CONNECTION_EVENT = 'kr://connection'
+
+/** The event the backend publishes the paths of dropped files on. */
+export const DROPPED_EVENT = 'kr://dropped'
 
 /**
  * The refusal for an operation this build has no agreed shape for.
@@ -99,6 +102,8 @@ export function tauriPort(): HostPort {
 
     draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
     draftUpdate: (params, subject) => mutate<Settled>('draft_update', params, subject),
+    attachmentUpload: (path, subject) =>
+      call<AttachmentHandle>('attachment_upload', { path, subject }),
     draftAddAttachment: (params, subject) =>
       mutate<Settled>('draft_add_attachment', params, subject),
     attachmentImage: (params) =>
@@ -189,24 +194,21 @@ export function tauriPort(): HostPort {
     onFilesDropped(listener: (files: readonly DroppedFile[]) => void) {
       let stop: (() => void) | null = null
       let cancelled = false
-      void getCurrentWebview()
-        .onDragDropEvent((event) => {
-          if (event.payload.type !== 'drop') return
-          // The platform hands the native backend paths, never the bytes: the page is told what
-          // was dropped and the backend is what reads it.
-          listener(
-            event.payload.paths.map((path) => ({
-              name: path.split(/[\\/]/).pop() ?? path,
-              media_type: 'application/octet-stream',
-              byte_len: 0,
-              path
-            }))
-          )
-        })
-        .then((unlisten) => {
-          if (cancelled) unlisten()
-          else stop = unlisten
-        })
+      // The backend records the paths first and then publishes them, so a path the page sees here
+      // is one the backend will accept for exactly one upload.
+      void listen<string[]>(DROPPED_EVENT, (event) => {
+        listener(
+          event.payload.map((path) => ({
+            name: path.split(/[\\/]/).pop() ?? path,
+            media_type: 'application/octet-stream',
+            byte_len: 0,
+            path
+          }))
+        )
+      }).then((unlisten) => {
+        if (cancelled) unlisten()
+        else stop = unlisten
+      })
       return () => {
         cancelled = true
         stop?.()

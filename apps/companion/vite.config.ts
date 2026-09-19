@@ -21,7 +21,9 @@ export default defineConfig({
     strictPort: true
   },
   build: {
-    outDir: 'dist',
+    // The harness is built somewhere else entirely, so a test build can never leave its entry in
+    // the directory a desktop build bundles.
+    outDir: harness ? 'dist-harness' : 'dist',
     emptyOutDir: true,
     // The WebView is current on every platform the application ships to, so the output does not
     // carry transforms for engines that are not there.
@@ -29,10 +31,7 @@ export default defineConfig({
     sourcemap: true,
     rollupOptions: {
       input: harness
-        ? {
-            index: resolve(import.meta.dirname, 'index.html'),
-            harness: resolve(import.meta.dirname, 'harness.html')
-          }
+        ? { harness: resolve(import.meta.dirname, 'harness.html') }
         : { index: resolve(import.meta.dirname, 'index.html') }
     }
   },

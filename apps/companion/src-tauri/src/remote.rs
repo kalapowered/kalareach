@@ -15,8 +15,9 @@ use crate::links;
 /// The most one explicitly imported image may weigh.
 ///
 /// Large enough for a screenshot from any current display, small enough that a hostile server
-/// cannot make the application hold an arbitrary buffer. The limit is declared to the server
-/// through a range request and enforced again while reading, because a declared length is a claim.
+/// cannot make the application hold an arbitrary buffer. It is enforced while reading, one byte
+/// past the limit, so a response that exceeds it is refused rather than truncated into half an
+/// image. A declared length is a claim and is not what this rests on.
 pub const MAX_IMPORT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// What an import asked for and what it got.
@@ -104,7 +105,9 @@ impl HttpsFetcher {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(20)))
             .max_redirects(3)
-            // A redirect that leaves https leaves the policy behind with it.
+            // Every request in the chain, not just the first: a redirect to http is refused before
+            // it is made rather than noticed after the bytes have already gone somewhere.
+            .https_only(true)
             .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
             .user_agent("KalaReach")
             .build();
@@ -125,11 +128,13 @@ impl Fetcher for HttpsFetcher {
         let mut response = self.agent.get(url).call().map_err(|error| {
             CommandError::unavailable(format!("the image could not be fetched: {error}"))
         })?;
+        // The agent refuses a request that is not https, so a chain that left it never happened.
+        // This is the second check on the same fact, on the URL the response actually came from.
         if !crate::links::approve(&ureq::ResponseExt::get_uri(&response).to_string())
             .is_ok_and(|approved| approved.scheme == "https")
         {
             return Err(CommandError::refused(
-                "the request was redirected away from https and was not followed",
+                "that response did not come from an https address",
             ));
         }
         let media_type = response
@@ -171,9 +176,7 @@ mod tests {
                 .lock()
                 .expect("the recorder is not poisoned")
                 .push((url.to_owned(), limit));
-            self.answer
-                .clone()
-                .ok_or_else(|| CommandError::not_connected())
+            self.answer.clone().ok_or_else(CommandError::not_connected)
         }
     }
 
