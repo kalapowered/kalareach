@@ -113,6 +113,52 @@ export function RawTerminal({
     setSubstituted(replaced)
   }, [screen, zoom])
 
+  // The wheel is read here rather than through a React handler, because the renderer inside this
+  // element listens for it too. In control mode it must reach the program unchanged, so this
+  // neither cancels it nor stops it; in view mode this is the owner and cancels it.
+  useEffect(() => {
+    const element = host.current
+    if (!element) return
+    const onWheel = (event: WheelEvent) => {
+      const outcome = routeWheel(mode, {
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        zoomGesture: event.ctrlKey
+      })
+      if (outcome.kind === 'application') {
+        setWheelToApplication((count) => count + 1)
+        void port
+          .terminalInput({ session_id: sessionId, wheel: { lines: outcome.lines } })
+          .catch(() => {
+            // A failed forward is a transport failure; the banner above already says so.
+          })
+        return
+      }
+      event.preventDefault()
+      if (outcome.kind === 'zoom') {
+        setZoom((current) => zoomBy(current, outcome.steps))
+        return
+      }
+      void port
+        .attachmentViewport(
+          {
+            attachment_id: attachmentId,
+            session_id: sessionId,
+            viewport: { rows_above: outcome.rows, columns: outcome.columns }
+          },
+          subject
+        )
+        .then(load)
+        .catch(() => {
+          // Nothing to say: the projection stays where it was.
+        })
+    }
+    element.addEventListener('wheel', onWheel, { capture: true, passive: false })
+    return () => {
+      element.removeEventListener('wheel', onWheel, { capture: true })
+    }
+  }, [mode, port, sessionId, attachmentId, subject, load])
+
   const columns = Number(screen?.dimensions.columns ?? '0')
   const rows = Number(screen?.dimensions.rows ?? '0')
 
@@ -163,45 +209,6 @@ export function RawTerminal({
         ref={host}
         data-testid="terminal-surface"
         data-wheel-to-application={wheelToApplication}
-        onWheel={(event) => {
-          const outcome = routeWheel(mode, {
-            deltaX: event.deltaX,
-            deltaY: event.deltaY,
-            zoomGesture: event.ctrlKey
-          })
-          if (outcome.kind === 'application') {
-            // The application's own scroll. The view neither consumes nor cancels it: it goes to
-            // the program as the wheel event it is.
-            setWheelToApplication((count) => count + 1)
-            void port
-              .terminalInput({
-                session_id: sessionId,
-                wheel: { lines: outcome.lines }
-              })
-              .catch(() => {
-                // A failed forward is a transport failure; the banner above already says so.
-              })
-            return
-          }
-          event.preventDefault()
-          if (outcome.kind === 'zoom') {
-            setZoom((current) => zoomBy(current, outcome.steps))
-            return
-          }
-          void port
-            .attachmentViewport(
-              {
-                attachment_id: attachmentId,
-                session_id: sessionId,
-                viewport: { rows_above: outcome.rows, columns: outcome.columns }
-              },
-              subject
-            )
-            .then(load)
-            .catch(() => {
-              // Nothing to say: the projection stays where it was.
-            })
-        }}
       />
 
       <footer className="terminal-footer between">

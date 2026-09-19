@@ -733,11 +733,7 @@ mod tests {
     #[test]
     fn a_resumed_plan_takes_the_transfer_it_is_resuming_and_asks_only_for_what_is_missing() {
         let content = vec![5_u8; CHUNK_LEN + 4];
-        let mut upload = Upload::resuming(
-            subject(),
-            Box::new(Held::new(content)),
-            transfer_id(),
-        );
+        let mut upload = Upload::resuming(subject(), Box::new(Held::new(content)), transfer_id());
         let mut held = ChunkBitmap::empty(2);
         held.insert(0);
         upload

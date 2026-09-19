@@ -200,7 +200,12 @@ export function Pairing(): ReactNode {
               spellCheck={false}
               className="mono"
               onChange={(event) => {
-                setCode(event.target.value)
+                const value = event.target.value
+                setCode(value)
+                // A scanned code arrives as a typed payload. Pasting one into this field is the
+                // same act as scanning it, and it is read the same way: by the backend, which
+                // decides whether it names another service.
+                if (value.trimStart().startsWith('{')) scan(value.trim())
               }}
             />
             <p className="form-hint">
@@ -212,14 +217,13 @@ export function Pairing(): ReactNode {
             <Button
               data-testid="paste-qr"
               onClick={() => {
-                // In the desktop application a scan arrives from the camera or a pasted payload.
-                // Either way it is read by the backend, which is what decides whether it names
-                // another origin.
+                // A scan arrives from the camera or from the clipboard. Either way the backend
+                // reads it, and the backend is what decides whether it names another service.
                 void navigator.clipboard
                   ?.readText()
                   .then(scan)
                   .catch(() => {
-                    setFailure('Nothing readable was on the clipboard.')
+                    setFailure('Nothing readable was on the clipboard. Paste the code below.')
                   })
               }}
             >

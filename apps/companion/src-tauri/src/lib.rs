@@ -30,6 +30,7 @@ pub mod pairing;
 pub mod remote;
 pub mod state;
 pub mod target;
+pub mod transfers;
 pub mod verify;
 
 pub use error::{CommandError, Result};

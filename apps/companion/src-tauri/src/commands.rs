@@ -62,6 +62,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
         "draft_add_attachment",
         Some(Method::AgentDraftAddAttachment),
     ),
+    ("attachment_upload", Some(Method::UploadBegin)),
     ("attachment_upload_status", Some(Method::UploadStatus)),
     ("attachment_image", Some(Method::DownloadBegin)),
     ("attachment_image_chunk", Some(Method::DownloadChunk)),
@@ -114,6 +115,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         draft_create,
         draft_update,
         draft_add_attachment,
+        attachment_upload,
         attachment_upload_status,
         attachment_image,
         attachment_image_chunk,
@@ -385,6 +387,40 @@ mutate_command!(
     /// Cancels a pending action.
     action_cancel, Method::ActionCancel, kr_protocol::receipt::ActionCancelParams
 );
+
+/// Sends one dropped file to the host, and answers with the verified attachment handle.
+///
+/// The page never sees the file. The platform gives this process a path when the person drops
+/// something on the window, the page passes that path back, and the shared client's upload
+/// sequence does the rest: declare the size and digest, send the chunks, publish the handle.
+#[tauri::command]
+pub async fn attachment_upload(
+    state: State<'_, AppState>,
+    subject: Subject,
+    path: String,
+    session_id: Option<String>,
+) -> Result<Value> {
+    let environment_id = state.environment_id()?;
+    let target = subject.target(environment_id)?;
+    let session = state.session()?;
+    let session_id = match session_id {
+        None => None,
+        Some(value) => Some(
+            value
+                .parse()
+                .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
+        ),
+    };
+    let handle = crate::transfers::upload(
+        &session,
+        target,
+        environment_id,
+        session_id,
+        std::path::PathBuf::from(path),
+    )
+    .await?;
+    encode(&handle)
+}
 
 /// Writes one ordered batch of raw terminal input.
 ///

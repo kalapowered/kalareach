@@ -13,7 +13,16 @@
  * this is the surface a person watches most.
  */
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode
+} from 'react'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
@@ -63,6 +72,15 @@ import {
 } from '../model/receipts'
 import type { LaunchSurface } from '../model/pending'
 
+/** How close to the end still counts as being at it. */
+const AT_END_SLACK = 32
+
+/** How close to the top brings more of the document into the window. */
+const NEAR_TOP = 64
+
+/** How much of the document one move brings in. */
+const WINDOW_STEP = Math.floor(WINDOW_SIZE / 2)
+
 /** The composer's own actions, which the specification names. */
 type ComposerAction = 'submit' | 'queue' | 'steer' | 'interrupt'
 
@@ -97,6 +115,7 @@ export function Conversation({
   const [insertion, setInsertion] = useState<string | null>(null)
   const [commands, setCommands] = useState<readonly AgentCommand[]>([])
   const scroller = useRef<HTMLDivElement | null>(null)
+  const anchor = useRef<{ nodeId: string; offsetTop: number } | null>(null)
 
   // One batch per animation frame. Forty events in one tick are one render, and the composer keeps
   // taking keystrokes while they arrive.
@@ -357,28 +376,58 @@ export function Conversation({
   }, [port, sessionId, update, say])
 
   /**
-   * Moves the window and decides whether the view is still following.
+   * Decides whether the view is still following, and brings more of the document into the window
+   * when the reader reaches the top of it.
    *
    * Following is what the scroll position says, not a setting: a person who has scrolled up is
    * reading, and new output must not pull them away from it.
+   *
+   * Moving the window changes how tall the content is, so the height before the move is recorded
+   * and the scroll position is corrected by the difference once the new window is laid out. Without
+   * that the view jumps, and a jump at the top of the content is indistinguishable from the content
+   * being taken away.
    */
   const onScroll = useCallback(() => {
     const element = scroller.current
     if (!element) return
-    const atEnd = element.scrollHeight - element.scrollTop - element.clientHeight < 32
-    const total = state.conversation.nodes.length
-    const fraction =
-      element.scrollHeight <= element.clientHeight
-        ? 0
-        : element.scrollTop / (element.scrollHeight - element.clientHeight)
-    const start = Math.round(fraction * Math.max(0, total - WINDOW_SIZE))
-    update((current) => ({
-      ...current,
-      conversation: atEnd
-        ? setFollowing(current.conversation, true)
-        : setWindowStart(current.conversation, start)
-    }))
-  }, [state.conversation.nodes.length, update])
+    if (atLiveEnd(element)) {
+      update((current) => ({ ...current, conversation: setFollowing(current.conversation, true) }))
+      return
+    }
+    const atTop = element.scrollTop < NEAR_TOP
+    update((current) => {
+      const stopped = setFollowing(current.conversation, false)
+      if (!atTop || stopped.windowStart === 0) {
+        return { ...current, conversation: stopped }
+      }
+      anchor.current = anchorOf(element)
+      return {
+        ...current,
+        conversation: setWindowStart(stopped, Math.max(0, stopped.windowStart - WINDOW_STEP))
+      }
+    })
+  }, [update])
+
+  // The correction for a window that moved: the node the reader was looking at goes back to the
+  // pixel it was on. A sliding window does not change how tall the content is, so a correction
+  // computed from the height would be zero and the reader would be moved without being told.
+  //
+  // Whether the view is at the live end is settled here as well as on scroll. A view that is at
+  // the end is following, and the position can reach the end without a scroll event: laying out a
+  // shorter window, or content that does not fill the viewport, both do it.
+  useLayoutEffect(() => {
+    const element = scroller.current
+    if (!element) return
+    const held = anchor.current
+    if (held) {
+      anchor.current = null
+      const node = element.querySelector<HTMLElement>(`[data-node-id="${cssEscape(held.nodeId)}"]`)
+      if (node) element.scrollTop += node.offsetTop - held.offsetTop
+    }
+    if (atLiveEnd(element)) {
+      update((current) => ({ ...current, conversation: setFollowing(current.conversation, true) }))
+    }
+  }, [state.conversation.windowStart, state.conversation.nodes.length, update])
 
   return (
     <div className="conversation" data-testid="conversation">
@@ -413,6 +462,7 @@ export function Conversation({
         onScroll={onScroll}
         data-testid="conversation-scroll"
         data-following={state.conversation.following ? 'true' : 'false'}
+        data-window-start={state.conversation.windowStart}
       >
         {hidden > 0 ? (
           <div className="history-edge">
@@ -471,6 +521,35 @@ function readAgentCommands(answer: unknown): readonly AgentCommand[] {
     .filter((command): command is Record<string, unknown> => typeof command === 'object' && command !== null)
     .map((command) => ({ name: text(command.name), summary: text(command.summary) }))
     .filter((command) => command.name.length > 0)
+}
+
+/** Whether the view is at the live end, which is what makes it follow. */
+function atLiveEnd(element: HTMLElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight < AT_END_SLACK
+}
+
+/**
+ * The node the reader is looking at, and where it is.
+ *
+ * The first node whose bottom is below the top of the viewport: that is the one a person's eye is
+ * on, and it is the one that must not move.
+ */
+function anchorOf(element: HTMLElement): { nodeId: string; offsetTop: number } | null {
+  const nodes = element.querySelectorAll<HTMLElement>('[data-node-id]')
+  for (const node of nodes) {
+    if (node.offsetTop + node.offsetHeight > element.scrollTop) {
+      const nodeId = node.dataset.nodeId
+      if (nodeId) return { nodeId, offsetTop: node.offsetTop }
+    }
+  }
+  return null
+}
+
+/** A node identifier, as a selector may carry it. */
+function cssEscape(value: string): string {
+  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+    ? CSS.escape(value)
+    : value.replace(/["\\]/g, '\\$&')
 }
 
 /**

@@ -14,6 +14,7 @@ import {
   useRef,
   useState,
   type ButtonHTMLAttributes,
+  type HTMLAttributes,
   type ReactNode
 } from 'react'
 
@@ -197,12 +198,17 @@ export function CommitButton({
 /** A status chip. */
 export function Badge({
   tone = 'neutral',
-  children
+  children,
+  ...rest
 }: {
   readonly tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'accent'
   readonly children: ReactNode
-}): ReactNode {
-  return <span className={`badge ${tone}`}>{children}</span>
+} & Omit<HTMLAttributes<HTMLSpanElement>, 'className'>): ReactNode {
+  return (
+    <span className={`badge ${tone}`} {...rest}>
+      {children}
+    </span>
+  )
 }
 
 /** A card. */

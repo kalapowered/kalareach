@@ -8,10 +8,12 @@ const artefacts = process.env.KR_TEST_ARTIFACTS_DIR ?? '/tmp/kr-test-artifacts'
 export default defineConfig({
   testDir: './e2e',
   outputDir: `${artefacts}/companion-e2e`,
-  fullyParallel: true,
+  // One at a time. Several of these measure layout, a gesture or a scroll position, and workers
+  // competing for the same cores measure the machine rather than the interface.
+  fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: 0,
-  workers: process.env.CI ? 2 : undefined,
+  workers: 1,
   reporter: [['list'], ['html', { outputFolder: `${artefacts}/companion-e2e-report`, open: 'never' }]],
   use: {
     baseURL: 'http://localhost:4188',
