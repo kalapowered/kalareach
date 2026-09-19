@@ -101,12 +101,33 @@ pub async fn connect_local() -> Result<Connection> {
         .environment(environment_id)
         .controller_endpoint()
         .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
-    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, build_id()?).await?;
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, build_id()?)
+        .await
+        .map_err(absent_host)?;
     let session = Session::start(transport.shared())?;
     Ok(Connection {
         session: Arc::new(session),
         environment_id,
     })
+}
+
+/// Names the ordinary case of no host running before it reaches the window.
+///
+/// A socket that is not there, or that nothing is listening on, is not a fault in either build: it
+/// is what this machine looks like before the host is started. The window has to say something,
+/// and "no such file or directory" is the operating system talking about a path the person never
+/// chose. Every other failure keeps its own words, because they describe something that did go
+/// wrong.
+fn absent_host(error: kr_client::error::ClientError) -> CommandError {
+    if let kr_client::error::ClientError::Ipc(kr_ipc::IpcError::Socket { source, .. }) = &error
+        && matches!(
+            source.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    {
+        return CommandError::unavailable("no host on this machine");
+    }
+    CommandError::from(error)
 }
 
 /// One host notification, in the shape the interface reads.

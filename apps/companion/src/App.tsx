@@ -15,6 +15,7 @@ import { Hosts, Sessions } from './views/Sessions'
 import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
+import { failureMessage } from './host/port'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
   { place: { view: 'attention' }, label: 'Attention' },
@@ -31,16 +32,31 @@ export function App(): ReactNode {
   const [reason, setReason] = useState<string | null>(null)
 
   useEffect(() => {
-    void port.connectionState().then((state) => {
-      setConnected(state.connected)
-      setReason(state.reason)
-    })
-    return port.subscribe((event) => {
+    let watching = true
+    // A failure to answer is itself an answer: the window says it is not connected, and says why,
+    // rather than leaving a rejected promise for nobody.
+    port
+      .connectionState()
+      .then((state) => {
+        if (!watching) return
+        setConnected(state.connected)
+        setReason(state.reason)
+      })
+      .catch((failure: unknown) => {
+        if (!watching) return
+        setConnected(false)
+        setReason(failureMessage(failure))
+      })
+    const stop = port.subscribe((event) => {
       const body = event.body as { kind?: string; connected?: boolean }
       if (body.kind === 'connection' && typeof body.connected === 'boolean') {
         setConnected(body.connected)
       }
     })
+    return () => {
+      watching = false
+      stop()
+    }
   }, [port])
 
   // The last input device decides whether anything animates. A keyboard-driven change is instant;
