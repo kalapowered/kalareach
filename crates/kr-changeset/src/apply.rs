@@ -1837,6 +1837,10 @@ fn carry_permissions(
     executable: bool,
 ) -> Result<Option<u32>> {
     use cap_std::fs::PermissionsExt as _;
+
+    // Only the platform that has to ask about a list by name uses it.
+    #[cfg(not(target_os = "macos"))]
+    let _ = temporary;
     let existing = match destination.open_read(leaf, ObjectPolicy::ReadableFile) {
         Ok(file) => {
             // An access-control list is protection this host cannot carry across a replacement,
