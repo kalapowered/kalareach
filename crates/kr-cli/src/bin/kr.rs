@@ -3,7 +3,9 @@
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use kr_cli::cli::{Cli, Command, HostCommand, ShellArguments, ShellCommand};
+use kr_cli::cli::{
+    AccountCommand, AccountTokenCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand,
+};
 use kr_cli::error::{CliError, Result};
 use kr_cli::resolve::{SessionSelector, find, open_controller, open_worker};
 use kr_cli::session::AttachOptions;
@@ -594,6 +596,53 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Ok(Completion::Done)
             }
+        },
+        Command::Account(arguments) => match arguments.command {
+            AccountCommand::Token(token) => match token {
+                AccountTokenCommand::Import(import) => {
+                    // Nothing here reaches the host or the network. It reads the operator's file
+                    // and writes this host's, and what it reports never carries the token.
+                    let imported = kr_cli::account::import(&import.path)?;
+                    if cli.json {
+                        print_json(&serde_json::json!({ "ok": true, "imported": imported }));
+                    } else {
+                        for line in imported.lines() {
+                            println!("{line}");
+                        }
+                    }
+                    Ok(Completion::Done)
+                }
+                AccountTokenCommand::Show => {
+                    let path = kr_cli::account::token_path()?;
+                    let stored = kr_client::services::voice::AccountTokenFile::at(path.clone())
+                        .stored()
+                        .ok();
+                    if cli.json {
+                        print_json(&serde_json::json!({
+                            "ok": true,
+                            "path": path.display().to_string(),
+                            "imported": stored.is_some(),
+                            "origin": stored.as_ref().map(|stored| stored.origin.clone()),
+                            "scopes": stored
+                                .as_ref()
+                                .map(|stored| stored.scopes.clone())
+                                .unwrap_or_default(),
+                        }));
+                    } else {
+                        println!("This host reads its account token from {}.", path.display());
+                        match stored {
+                            // The description is the origin, the scopes and the expiry. The token
+                            // itself is never printed by anything.
+                            Some(stored) => println!("It holds {}.", stored.description()),
+                            None => println!(
+                                "No account token has been imported. Write one with `kr account \
+                                 token import <path>`."
+                            ),
+                        }
+                    }
+                    Ok(Completion::Done)
+                }
+            },
         },
         Command::Shell(arguments) => {
             // Nothing here reaches the host: setup configures this user's own shell, and the

@@ -1071,6 +1071,204 @@ fn local(message: &str) -> ClientError {
     ))
 }
 
+/* -------------------------------------------------------------------------- */
+/* The account token on disk                                                   */
+/* -------------------------------------------------------------------------- */
+
+/// The file under the runtime root that holds this host's account token.
+pub const ACCOUNT_TOKEN_FILE: &str = "account-token.json";
+
+/// Largest account-token file this host will read.
+pub const ACCOUNT_TOKEN_FILE_LIMIT: u64 = 16 * 1024;
+
+/// Returns where the account token lives under a runtime root.
+#[must_use]
+pub fn account_token_path(runtime_root: &std::path::Path) -> std::path::PathBuf {
+    runtime_root.join(ACCOUNT_TOKEN_FILE)
+}
+
+/// The account token as it is stored, read and written.
+///
+/// One definition, used by the command that imports the token and by the host that presents it, so
+/// the two cannot disagree about the shape of the file. The token itself is an
+/// [`AccountToken`], which means no rendering of this structure contains it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAccountToken {
+    /// The managed-service origin the token was issued by and may be presented to.
+    pub origin: String,
+    /// The token.
+    pub access_token: AccountToken,
+    /// The scopes it carries. Managed voice needs [`VOICE_SCOPE`].
+    pub scopes: Vec<String>,
+    /// When it stops being accepted, in UTC milliseconds, or null when the issuer did not say.
+    pub expires_at_ms: Option<u64>,
+}
+
+/// What the file looks like on disk.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TokenDocument {
+    origin: String,
+    access_token: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    expires_at_ms: Option<u64>,
+}
+
+impl StoredAccountToken {
+    /// Reads one from the bytes of a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not this document, when the token could not be a header
+    /// value, or when the origin is not an absolute address. No refusal quotes the token.
+    pub fn read(bytes: &[u8]) -> Result<Self> {
+        let document: TokenDocument = serde_json::from_slice(bytes).map_err(|error| {
+            // Only the position, never the message: a serde message for a string field can quote
+            // what it was reading, and what it was reading may be the token.
+            local(&format!(
+                "that is not an account token document: it stops making sense at line {}, \
+                 column {}",
+                error.line(),
+                error.column()
+            ))
+        })?;
+        if !(document.origin.starts_with("https://") || document.origin.starts_with("http://"))
+            || document.origin.ends_with('/')
+        {
+            return Err(local(
+                "an account token names the origin it belongs to, as an absolute address with no                  trailing slash",
+            ));
+        }
+        Ok(Self {
+            origin: document.origin,
+            access_token: AccountToken::new(document.access_token)?,
+            scopes: document.scopes,
+            expires_at_ms: document.expires_at_ms,
+        })
+    }
+
+    /// The bytes to write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document cannot be written, which would be a fault in this build.
+    pub fn write(&self) -> Result<Vec<u8>> {
+        let document = TokenDocument {
+            origin: self.origin.clone(),
+            access_token: self.access_token.expose().to_owned(),
+            scopes: self.scopes.clone(),
+            expires_at_ms: self.expires_at_ms,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&document)
+            .map_err(|error| local(&format!("the token could not be written: {error}")))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    /// Returns true when this token carries `scope`.
+    #[must_use]
+    pub fn carries(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|held| held == scope)
+    }
+
+    /// What can be said about the token without saying the token.
+    ///
+    /// The origin, the scopes and the expiry, which is everything an operator needs to see that
+    /// the right thing was imported. The value is not here and cannot be derived from what is.
+    #[must_use]
+    pub fn description(&self) -> String {
+        let scopes = if self.scopes.is_empty() {
+            "no scopes".to_owned()
+        } else {
+            self.scopes.join(", ")
+        };
+        match self.expires_at_ms {
+            Some(expires_at_ms) => format!(
+                "an account token for {} carrying {scopes}, until {expires_at_ms} in UTC \
+                 milliseconds",
+                self.origin
+            ),
+            None => format!(
+                "an account token for {} carrying {scopes}, with no stated expiry",
+                self.origin
+            ),
+        }
+    }
+}
+
+/// An account token read from the runtime root each time it is needed.
+///
+/// Read each time rather than held: the operator replaces an expired token by importing a new one,
+/// and a host that read the file once at startup would keep presenting the old one until it was
+/// restarted.
+#[derive(Clone, Debug)]
+pub struct AccountTokenFile {
+    path: std::path::PathBuf,
+}
+
+impl AccountTokenFile {
+    /// Reads the token from this path.
+    #[must_use]
+    pub fn at(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Reads the token from the ordinary place under a runtime root.
+    #[must_use]
+    pub fn under(runtime_root: &std::path::Path) -> Self {
+        Self::at(account_token_path(runtime_root))
+    }
+
+    /// The file this reads.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Reads the stored token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no token has been imported, when the file is not one this host wrote,
+    /// or when it does not parse. No error carries the token.
+    pub fn stored(&self) -> Result<StoredAccountToken> {
+        let bytes = kr_ipc::paths::read_owner_only_file(&self.path, ACCOUNT_TOKEN_FILE_LIMIT)
+            .map_err(|error| {
+                ClientError::Host(ProtocolError::new(
+                    ErrorCode::HostNotConfigured,
+                    format!("the account token could not be read: {error}"),
+                ))
+            })?
+            .ok_or_else(|| {
+                ClientError::Host(ProtocolError::new(
+                    ErrorCode::HostNotConfigured,
+                    format!(
+                        "no account token has been imported. Write one with `kr account token \
+                         import <path>`; it is read from {}.",
+                        self.path.display()
+                    ),
+                ))
+            })?;
+        StoredAccountToken::read(&bytes)
+    }
+}
+
+impl AccountTokenSource for AccountTokenFile {
+    fn token(&self) -> Result<AccountToken> {
+        let stored = self.stored()?;
+        if !stored.carries(VOICE_SCOPE) {
+            return Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the imported account token was not issued with the scope managed voice needs"
+                    .to_owned(),
+            )));
+        }
+        Ok(stored.access_token)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,6 +1408,44 @@ mod tests {
             voice_close_path("a/../b"),
             "/api/voice/sessions/a%2F..%2Fb/close"
         );
+    }
+
+    #[test]
+    fn a_stored_token_describes_itself_without_saying_itself() {
+        let stored = StoredAccountToken::read(
+            br#"{"origin":"https://reach.example","accessToken":"a-secret-value",
+                 "scopes":["voice"],"expiresAtMs":1700000000000}"#,
+        )
+        .expect("a token document");
+        assert!(stored.carries(VOICE_SCOPE));
+        let described = stored.description();
+        assert!(!described.contains("a-secret-value"), "{described}");
+        assert!(described.contains("reach.example"));
+        assert!(!format!("{stored:?}").contains("a-secret-value"));
+    }
+
+    #[test]
+    fn a_document_this_host_cannot_read_is_refused_without_quoting_it() {
+        for bad in [
+            &br#"{"origin":"https://reach.example","accessToken":"a-secret-value"#[..],
+            &br#"{"origin":"reach.example","accessToken":"a-secret-value","scopes":[]}"#[..],
+            &br#"{"origin":"https://reach.example","accessToken":"","scopes":[]}"#[..],
+            &br#"{"origin":"https://reach.example","accessToken":"bad\nvalue","scopes":[]}"#[..],
+        ] {
+            let error = StoredAccountToken::read(bad).expect_err("refused");
+            assert!(!error.to_string().contains("a-secret-value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_token_round_trips_through_the_file_it_is_written_to() {
+        let stored = StoredAccountToken::read(
+            br#"{"origin":"https://reach.example","accessToken":"a-secret-value",
+                 "scopes":["voice"],"expiresAtMs":1}"#,
+        )
+        .expect("a token document");
+        let bytes = stored.write().expect("bytes");
+        assert_eq!(StoredAccountToken::read(&bytes).expect("read back"), stored);
     }
 
     #[test]

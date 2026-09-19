@@ -59,6 +59,43 @@ pub enum Command {
     Host(HostArguments),
     /// Set up the managed shell integration, or report what it is.
     Shell(ShellArguments),
+    /// Manage this host's managed-service account credentials.
+    Account(AccountArguments),
+}
+
+/// `kr account`.
+#[derive(Debug, Args)]
+pub struct AccountArguments {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: AccountCommand,
+}
+
+/// One `kr account` operation.
+#[derive(Debug, Subcommand)]
+pub enum AccountCommand {
+    /// Manage the account token this host presents to managed services.
+    #[command(subcommand)]
+    Token(AccountTokenCommand),
+}
+
+/// One `kr account token` operation.
+#[derive(Debug, Subcommand)]
+pub enum AccountTokenCommand {
+    /// Read an account token from a file and write it where this host reads it.
+    ///
+    /// The token's value is never printed. What is reported is where it was written, the origin it
+    /// belongs to, the scopes it carries and when it stops.
+    Import(AccountTokenImportArguments),
+    /// Report where this host reads its account token, and what the stored one carries.
+    Show,
+}
+
+/// `kr account token import`.
+#[derive(Debug, Args)]
+pub struct AccountTokenImportArguments {
+    /// The file to read the token from.
+    pub path: std::path::PathBuf,
 }
 
 /// `kr host`.

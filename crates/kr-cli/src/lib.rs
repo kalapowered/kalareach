@@ -8,6 +8,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
+//! | [`account`] | The managed-service account token this host presents, and where it is kept |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
 //! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
 //! | [`create`] | The palette a new session starts with |
@@ -22,6 +23,7 @@
 //! | [`report`] | Text for people and the `--json` shapes |
 //! | [`error`] | The failures above, each with its own exit code |
 
+pub mod account;
 pub mod attach;
 pub mod cli;
 pub mod contact;
