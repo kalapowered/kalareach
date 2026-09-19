@@ -93,6 +93,51 @@ fn drain(pty: &Pty, reader: &mut Box<dyn Read + Send>, patience: Duration) -> St
     String::from_utf8_lossy(&seen).into_owned()
 }
 
+/// Waits for the shell to end, draining the console while it does.
+///
+/// A console's output pipe holds what the application has written and this host has not read. An
+/// application that writes more than fits, while this host waits for it to exit before reading, is
+/// an application blocked in a write and a host blocked in a wait: neither moves again. So the
+/// wait reads.
+fn drain_until_it_ends(
+    pty: &Pty,
+    reader: &mut Box<dyn Read + Send>,
+    shell: &mut RootShell,
+) -> (kr_worker::pty::ShellExit, String) {
+    let waiter = pty.output_waiter();
+    let deadline = Instant::now() + PATIENCE;
+    let mut seen = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    while Instant::now() < deadline {
+        match reader.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => {
+                seen.extend_from_slice(&buffer[..read]);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {}
+        }
+        if let Some(exit) = shell.try_wait().expect("the shell's status") {
+            // Whatever it wrote last is still in the console, so the pipe is emptied before the
+            // exit is returned.
+            seen.extend_from_slice(drain(pty, reader, Duration::from_secs(5)).as_bytes());
+            return (exit, String::from_utf8_lossy(&seen).into_owned());
+        }
+        if waiter
+            .as_ref()
+            .map(|waiter| waiter.wait(Duration::from_millis(50)))
+            .is_none()
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    panic!(
+        "the shell was still running after {PATIENCE:?}; it had written {} bytes",
+        seen.len()
+    );
+}
+
 /// Reads the identifier the shell printed as `kr-child=<pid>.`
 fn named_child(seen: &str) -> u32 {
     seen.split("kr-child=")
@@ -135,7 +180,7 @@ fn powershell_seven_is_the_shell_that_runs_inside_the_console(/* KR-REQ-03.03 */
         seen.contains("kr-major=7"),
         "and its major version is 7: {seen:?}"
     );
-    let exit = shell.wait().expect("the shell ends");
+    let (exit, _) = drain_until_it_ends(&pty, &mut reader, &mut shell);
     assert_eq!(exit.code, 0, "and it ended of its own accord");
 }
 
@@ -160,7 +205,7 @@ fn the_console_resizes_and_the_application_reads_the_new_geometry(/* KR-ACC-010 
         second.contains("kr-second=120"),
         "the application reads the new width: {second:?}"
     );
-    shell.wait().expect("the shell ends");
+    drain_until_it_ends(&pty, &mut reader, &mut shell);
 }
 
 #[test]
@@ -170,10 +215,11 @@ fn everything_the_application_wrote_is_still_there_to_read_after_it_has_gone(/* 
     // time, which is exactly the failure a person notices.
     let (pty, mut reader, mut shell) =
         powershell_in_a_console("1..200 | ForEach-Object { Write-Host \"kr-line-$_\" }");
-    let exit = shell.wait().expect("the shell ends");
+    // Drained while it is waited for. A console holds what has been written and not read, and a
+    // host that waited for the exit first would be waiting for an application blocked in a write.
+    let (exit, seen) = drain_until_it_ends(&pty, &mut reader, &mut shell);
     assert_eq!(exit.code, 0);
 
-    let seen = drain(&pty, &mut reader, Duration::from_secs(20));
     assert!(
         seen.contains("kr-line-1\r\n") || seen.contains("kr-line-1\n"),
         "the first line survived the exit"
@@ -210,7 +256,7 @@ fn an_interrupt_reaches_the_application_in_the_console(/* KR-ACC-010 */) {
         .expect("the console takes the interrupt");
 
     let seen = read_until(&pty, &mut reader, "kr-interrupted.");
-    let exit = shell.wait().expect("the shell ends");
+    let (exit, _) = drain_until_it_ends(&pty, &mut reader, &mut shell);
     assert!(
         seen.contains("kr-interrupted."),
         "the application was told about the interrupt: {seen:?}"
