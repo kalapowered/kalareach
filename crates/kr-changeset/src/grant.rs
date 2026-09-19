@@ -60,7 +60,7 @@ const SECRET_DIRECTORIES: &[&str] = &[".aws", ".gnupg", ".ssh"];
 /// would reach that repository's configuration, which holds its remotes and can hold a credential,
 /// and its object database, which holds every version of every file in it. None of that is the
 /// content of the tree this host was asked to capture.
-const ADMINISTRATIVE_DIRECTORY: &str = ".git";
+pub(crate) const ADMINISTRATIVE_DIRECTORY: &str = ".git";
 
 /// What the grant decided about one path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

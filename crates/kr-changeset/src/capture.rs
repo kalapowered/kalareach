@@ -123,6 +123,9 @@ impl<'a> std::ops::Deref for Scope<'a> {
 /// would make a materialisation a different tree, so both are named and left out.
 pub(crate) const REGULAR_MODES: &[&str] = &["100644", "100755"];
 
+/// The most a `.git` file is read for the one line it holds.
+const MAX_GIT_FILE_BYTES: u64 = 4096;
+
 /// What the capture is asked to read.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureRequest<'a> {
@@ -504,11 +507,20 @@ pub fn read_differences(
         }
         let status = parts[4].chars().next().unwrap_or('?');
         let absent = |value: &str| value.bytes().all(|byte| byte == b'0');
+        // The identifier this record carries becomes the base object of a captured path and the
+        // thing a revert reads back, so it is checked here, where it is read, rather than where
+        // it is used.
+        let base_object_id = if absent(parts[2]) {
+            None
+        } else {
+            check_object_id(parts[2])?;
+            Some(parts[2].to_owned())
+        };
         entries.insert(
             path.to_owned(),
             BaseDifference {
                 base_mode: (!absent(parts[0])).then(|| parts[0].to_owned()),
-                base_object_id: (!absent(parts[2])).then(|| parts[2].to_owned()),
+                base_object_id,
                 status,
             },
         );
@@ -650,6 +662,12 @@ fn walk(
         });
         return Ok(());
     };
+    // Another repository nested in this tree keeps its administrative data wherever its own `.git`
+    // says. The name rule catches a `.git` directory; it cannot catch a `.git` **file** that points
+    // at a directory of any other name beside it, and reading that directory would reach that
+    // repository's configuration, which holds its remotes and can hold a credential, and its
+    // object database. So the location is resolved here and refused by name in this directory.
+    let nested = nested_administrative_directory(&directory);
     let entries = directory
         .handle()
         .entries()
@@ -665,6 +683,16 @@ fn walk(
         })?;
         let child = format!("{prefix}/{file_name}");
         let kind = entry.file_type().map_err(ChangeSetError::storage)?;
+        if nested.as_deref() == Some(file_name.as_str()) {
+            // One entry for the whole of it, so the content read records the exclusion with its
+            // reason rather than the path going missing. Nothing beneath it is listed.
+            out.push(kr_project::workspace::StatusEntry {
+                path: child,
+                class,
+                change: ChangeKind::Present,
+            });
+            continue;
+        }
         if *budget == 0 {
             return Err(ChangeSetError::QuotaExceeded {
                 detail: format!(
@@ -1038,6 +1066,34 @@ fn store_base_content(
     let bytes = read_object(profile, repository, object_id)?;
     budget.charge(bytes.len() as u64)?;
     store.put(&bytes).map(Some)
+}
+
+/// Returns the directory a nested repository keeps its own data in, when it names one.
+///
+/// A `.git` file holds one line, `gitdir: <path>`. Only a name inside this same directory is
+/// answered: a path that climbs out or is absolute points somewhere this walk cannot reach
+/// through its handle anyway, and a `.git` directory needs no answer because the name rule
+/// already refuses it.
+fn nested_administrative_directory(directory: &kr_transfer::AuthorisedDirectory) -> Option<String> {
+    use std::io::Read as _;
+
+    let name = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY).ok()?;
+    let mut file = directory
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .ok()?;
+    if file.byte_len() > MAX_GIT_FILE_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    file.handle_mut()
+        .take(MAX_GIT_FILE_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let target = text.trim().strip_prefix("gitdir:")?.trim();
+    if target.is_empty() || target.starts_with('/') || target.contains('/') || target == ".." {
+        return None;
+    }
+    Some(target.to_owned())
 }
 
 /// Returns true when one path is this repository's own administrative data.
@@ -1432,9 +1488,15 @@ fn is_executable(_file: &kr_transfer::AuthorisedFile) -> Option<bool> {
 /// It reaches an argument vector, so it is checked rather than trusted: a name that is not
 /// hexadecimal is not an object identifier, and a leading `-` is an option.
 fn check_object_id(object_id: &str) -> Result<()> {
-    if object_id.is_empty() || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    // A whole identifier, not an abbreviation: forty characters for SHA-1 and sixty-four for
+    // SHA-256. An abbreviation is ambiguous in a repository that grows and means something else
+    // in a repository that is not the one it came from, and a version records exact content
+    // revisions.
+    if !matches!(object_id.len(), 40 | 64)
+        || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err(ChangeSetError::InvalidArgument(
-            "this repository reported something that is not an object identifier".into(),
+            "this repository reported something that is not a whole object identifier".into(),
         ));
     }
     Ok(())
@@ -2258,13 +2320,27 @@ mod tests {
 
     #[test]
     fn an_identifier_that_is_not_one_is_refused_before_it_reaches_an_argument_vector() {
-        for value in ["--upload-pack=sh", "-c", "", "refs/heads/main", "zzzz"] {
+        for value in [
+            "--upload-pack=sh",
+            "-c",
+            "",
+            "refs/heads/main",
+            "zzzz",
+            // An abbreviation is not an identifier either: it means one thing in the repository
+            // it came from today and can mean another there tomorrow.
+            "abcdef0123456789",
+            "0123456789abcdef0123456789abcdef0123456",
+        ] {
             assert!(
                 check_object_id(value).is_err(),
-                "{value} is not an object identifier"
+                "{value} is not a whole object identifier"
             );
         }
-        assert!(check_object_id("abcdef0123456789").is_ok());
+        assert!(check_object_id("0123456789abcdef0123456789abcdef01234567").is_ok());
+        assert!(
+            check_object_id("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                .is_ok()
+        );
     }
 
     #[test]

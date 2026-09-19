@@ -621,7 +621,10 @@ impl Store {
                 "SELECT content_digest, consistency, base_revision, derived_from, record, manifest,
                         captured_at_ms
                    FROM versions WHERE change_set_id = ?1 AND version = ?2",
-                params![uuid_bytes(change_set_id.get()), version.get() as i64],
+                params![
+                    uuid_bytes(change_set_id.get()),
+                    i64::try_from(version.get()).map_err(ChangeSetError::store)?
+                ],
                 |row| {
                     Ok(VersionRow {
                         change_set_id,

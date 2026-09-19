@@ -216,7 +216,7 @@ fn write_path(
 /// A whole number of nanoseconds since the epoch, so the value can be recorded and compared
 /// later. A platform that will not say answers nothing, and the comparison then rests on the
 /// identity and the length alone, which is said where the limit is stated.
-fn written_at(file: &kr_transfer::AuthorisedFile) -> Option<u64> {
+pub(crate) fn written_at(file: &kr_transfer::AuthorisedFile) -> Option<u64> {
     let modified = file.handle().metadata().ok()?.modified().ok()?;
     let system: std::time::SystemTime = modified.into_std();
     let since = system.duration_since(std::time::UNIX_EPOCH).ok()?;

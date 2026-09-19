@@ -265,19 +265,26 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
                 differences
                     .get(&entry.path)
                     .or_else(|| staged.get(&entry.path))
-                    .and_then(|difference| difference.base_object_id.clone())
-                    .or_else(|| {
-                        index
-                            .get(&entry.path)
-                            .filter(|_| {
-                                !differences.contains_key(&entry.path)
-                                    && !staged.contains_key(&entry.path)
-                            })
-                            .map(|held| held.object_id.clone())
-                    }),
+                    .and_then(|difference| difference.base_object_id.clone()),
             ),
             content_digest: Nullable(content_digest),
         };
+        // Four readings of one repository: the revision, the index, the two diffs against the
+        // commit and the status. A tracked path the status reports as changed is a path at least
+        // one diff has to name, and when none does the readings are of different moments rather
+        // than of one source. Guessing a base object from the index would state a content
+        // revision the commit does not hold.
+        if index.contains_key(&entry.path)
+            && !differences.contains_key(&entry.path)
+            && !staged.contains_key(&entry.path)
+        {
+            return Err(ChangeSetError::SourceChanged {
+                detail: "this working tree changed while this host was reading it: its status \
+                         names a change to a tracked path that neither reading against the \
+                         commit holds"
+                    .into(),
+            });
+        }
         if index.contains_key(&entry.path) || differences.contains_key(&entry.path) {
             tracked.push(read);
         } else {
@@ -542,6 +549,8 @@ fn carried_paths(manifest: &Manifest, order: &ApplyOrder<'_>) -> Result<Vec<Requ
 struct Observed {
     worktree_digest: Option<Digest256>,
     index_object_id: Option<String>,
+    index_mode: Option<String>,
+    unmerged: bool,
 }
 
 /// Reads what the destination holds for every affected path.
@@ -571,6 +580,10 @@ fn observe(
             Observed {
                 worktree_digest,
                 index_object_id: index.get(&entry.path).map(|held| held.object_id.clone()),
+                index_mode: index.get(&entry.path).map(|held| held.mode.clone()),
+                // An unresolved merge is never what a request describes: the index holds several
+                // stages for such a path and none of them is the one content an apply is against.
+                unmerged: index.get(&entry.path).is_some_and(|held| held.stage != 0),
             },
         );
     }
@@ -591,8 +604,10 @@ fn conflicts(
         // An absent expectation is an expectation that the index does not hold the path, not a
         // wildcard, and a caller that does not mean to check the index says so rather than
         // leaving a field out.
-        let index_differs =
-            entry.check_index && entry.expected_index_object_id.0 != here.index_object_id;
+        let index_differs = entry.check_index
+            && (entry.expected_index_object_id.0 != here.index_object_id
+                || entry.expected_index_mode.0 != here.index_mode
+                || here.unmerged);
         if worktree_differs || index_differs {
             found.push(PathConflict {
                 path: entry.path.clone(),
@@ -1193,9 +1208,6 @@ fn run_operations(
     order: &ApplyOrder<'_>,
     operations: &[(String, Operation)],
 ) -> Result<RunOutcome> {
-    // The index is read once, immediately before the writes, so an expectation about it is
-    // compared with what is there now rather than with what the preflight saw.
-    let index = read_index(service.project().profile(), repository)?;
     let mut run = RunOutcome {
         progress: Vec::new(),
         changed: Vec::new(),
@@ -1214,11 +1226,11 @@ fn run_operations(
         #[cfg(feature = "fault-injection")]
         let fault = service.fault();
         let installed = install(
+            service.project().profile(),
             repository,
             path,
             operation,
             expected,
-            &index,
             #[cfg(feature = "fault-injection")]
             fault
                 .as_ref()
@@ -1397,11 +1409,11 @@ enum Installed {
 /// other than the validated content is caught rather than recorded as a success.
 #[allow(clippy::too_many_lines)]
 fn install(
+    profile: &RestrictedProfile,
     repository: &OpenedRepository,
     path: &str,
     operation: &Operation,
     expected: Option<&AffectedVersion>,
-    index: &BTreeMap<String, IndexEntry>,
     #[cfg(feature = "fault-injection")] before_rename: Option<&dyn Fn(&str)>,
 ) -> Result<Installed> {
     let name = RelativeName::parse(path)?;
@@ -1424,7 +1436,8 @@ fn install(
         Operation::Refuse(detail) => return Ok(Installed::Unresolved(detail.clone())),
         Operation::Remove => {
             // A removal has nothing to stage. The recheck is the last thing before it.
-            if let Some(conflict) = recheck(&here, &leaf_name, expected, index, path)? {
+            if let Some(conflict) = recheck(profile, repository, &here, &leaf_name, expected, path)?
+            {
                 return Ok(conflict);
             }
             #[cfg(feature = "fault-injection")]
@@ -1479,7 +1492,7 @@ fn install(
         };
         // As late as this platform permits: the last thing before the rename, on the object the
         // parent handle names rather than on a path resolved earlier.
-        if let Some(conflict) = recheck(&here, &leaf_name, expected, index, path)? {
+        if let Some(conflict) = recheck(profile, repository, &here, &leaf_name, expected, path)? {
             return Ok(conflict);
         }
         #[cfg(feature = "fault-injection")]
@@ -1555,6 +1568,7 @@ fn read_destination(
         Ok(mut file) => {
             let identity = file.identity();
             let before = file.byte_len();
+            let written_before = crate::materialise::written_at(&file);
             if before > crate::capture::MAX_CAPTURE_FILE_BYTES {
                 return Err(ChangeSetError::QuotaExceeded {
                     detail: format!(
@@ -1581,8 +1595,15 @@ fn read_destination(
             }
             // The same open handle is asked again: a file that changed while this host was reading
             // it would otherwise give a digest of a stream that no version of the file ever held.
+            // The instant it was last written is asked for too, because a rewrite of the same
+            // length leaves the identity and the length exactly as they were.
             let after = file.revalidate().map_err(ChangeSetError::from)?;
-            if file.identity() != identity || after != before || after != bytes.len() as u64 {
+            let written_after = crate::materialise::written_at(&file);
+            if file.identity() != identity
+                || after != before
+                || after != bytes.len() as u64
+                || written_after != written_before
+            {
                 return Err(ChangeSetError::SourceChanged {
                     detail: "a destination path changed while this host was reading it".into(),
                 });
@@ -1596,10 +1617,11 @@ fn read_destination(
 
 /// Compares the destination with what the request expects, as late as the platform permits.
 fn recheck(
+    profile: &RestrictedProfile,
+    repository: &OpenedRepository,
     directory: &AuthorisedDirectory,
     name: &RelativeName,
     expected: Option<&AffectedVersion>,
-    index: &BTreeMap<String, IndexEntry>,
     path: &str,
 ) -> Result<Option<Installed>> {
     let Some(expected) = expected else {
@@ -1613,6 +1635,13 @@ fn recheck(
         return Ok(Some(Installed::Conflicted(here)));
     }
     if expected.check_index {
+        // Read now, for this path: an index read at the start of the run describes what was there
+        // before every earlier operation, and a request that says what the index holds is asking
+        // about the index at the moment its own path is written.
+        let index = match read_index(profile, repository) {
+            Ok(index) => index,
+            Err(error) => return Ok(Some(Installed::Unresolved(error.to_string()))),
+        };
         let held = index.get(path);
         let object_differs =
             expected.expected_index_object_id.0 != held.map(|entry| entry.object_id.clone());
@@ -2384,6 +2413,8 @@ mod tests {
             Observed {
                 worktree_digest: Some(here),
                 index_object_id: Some("abcdef".to_owned()),
+                index_mode: Some("100644".to_owned()),
+                unmerged: false,
             },
         );
         assert_eq!(conflicts(&affected, &observed).len(), 1);
@@ -2393,6 +2424,30 @@ mod tests {
             Observed {
                 worktree_digest: Some(expected),
                 index_object_id: Some("123456".to_owned()),
+                index_mode: Some("100644".to_owned()),
+                unmerged: false,
+            },
+        );
+        assert_eq!(conflicts(&affected, &observed).len(), 1);
+        // The object agrees and the mode does not.
+        observed.insert(
+            path.clone(),
+            Observed {
+                worktree_digest: Some(expected),
+                index_object_id: Some("abcdef".to_owned()),
+                index_mode: Some("100755".to_owned()),
+                unmerged: false,
+            },
+        );
+        assert_eq!(conflicts(&affected, &observed).len(), 1);
+        // Everything agrees and the path has an unresolved merge.
+        observed.insert(
+            path.clone(),
+            Observed {
+                worktree_digest: Some(expected),
+                index_object_id: Some("abcdef".to_owned()),
+                index_mode: Some("100644".to_owned()),
+                unmerged: true,
             },
         );
         assert_eq!(conflicts(&affected, &observed).len(), 1);
@@ -2402,6 +2457,8 @@ mod tests {
             Observed {
                 worktree_digest: Some(expected),
                 index_object_id: Some("abcdef".to_owned()),
+                index_mode: Some("100644".to_owned()),
+                unmerged: false,
             },
         );
         assert!(conflicts(&affected, &observed).is_empty());

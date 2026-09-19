@@ -910,6 +910,64 @@ fn a_nested_repository_s_own_data_is_never_captured() {
     );
 }
 
+/// KR-REQ-14.33: a nested repository that keeps its data under another name is refused too.
+///
+/// A `.git` **file** points a repository's administrative data at a directory of any name inside
+/// the same tree. The name rule cannot see that one, so the location is resolved and refused.
+#[test]
+fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "renamed-tree");
+    let nested = path.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("a directory");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    git_raw(
+        &nested,
+        [
+            "remote",
+            "add",
+            "origin",
+            "https://user:a-secret-token@example.invalid/x.git",
+        ],
+    );
+    write(&nested, "inner.txt", "inner content\n");
+    // Exactly what a repository made with a separate Git directory looks like from the tree.
+    std::fs::rename(nested.join(".git"), nested.join("repo-data"))
+        .expect("the repository keeps its data under another name");
+    std::fs::write(nested.join(".git"), b"gitdir: repo-data\n").expect("and points at it");
+
+    let workspace = fixture.workspace("renamed-tree");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.contains("vendor/inner/repo-data")),
+        "nothing of the nested repository's own data is captured: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        manifest.path("vendor/inner/inner.txt").is_some(),
+        "and the nested repository's content still is"
+    );
+    assert!(
+        record
+            .exclusions
+            .iter()
+            .any(|entry| entry.path == "vendor/inner/repo-data"),
+        "the exclusion names it: {:?}",
+        record.exclusions
+    );
+}
+
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
 /// because nothing this host can reach holds a working tree still for the whole of a read.
 #[test]
