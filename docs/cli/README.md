@@ -410,9 +410,12 @@ so the terminal that gets removed is the one the person is sitting at, never whi
 happens to hold the input lease by the time the command runs.
 
 Run anywhere else it takes an identifier. The session answers a request that names nothing only
-when the calling process is inside it, which the kernel says: the process is in the session's own
-boundary or descends from its root shell. `kr detach <session>` from an ordinary terminal is a
-caller the session has accepted no line from, so it names the attachment it means.
+when the calling process is the line it has a record of, which the kernel says twice: the process
+is in the session's own boundary or descends from its root shell, and it is in the job the
+terminal has in the foreground, which is the job the root shell made for the line it accepted.
+`kr detach <session>` from an ordinary terminal, from a command the shell was told to run in the
+background, or from one left over from a line that has already finished, names the attachment it
+means. Where a platform does not name a foreground job, every `kr detach` names one.
 
 Everything else returns `AMBIGUOUS_ATTACHMENT` and names no attachment: a line whose input came
 from more than one attachment or epoch, a line accepted without a valid fence, an origin whose

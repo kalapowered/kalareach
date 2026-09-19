@@ -3045,7 +3045,7 @@ impl WorkerService {
                 let attachment_id = match params.attachment_id.0 {
                     Some(named) => named,
                     None => {
-                        Self::bind_source_in(session, state).map_err(|_| {
+                        let source = Self::bind_source_in(session, state).map_err(|_| {
                             WorkerError::AmbiguousDetach {
                                 detail: "this caller is not running inside the session, so \
                                          the line it detaches is not one this session \
@@ -3054,6 +3054,20 @@ impl WorkerService {
                                     .to_owned(),
                             }
                         })?;
+                        // And inside it, the line this session has a record of: the caller is in
+                        // the job the terminal has in the foreground, which is the job the root
+                        // shell made for the line it accepted. A caller the shell was told to run
+                        // in the background, or one left from a line that has since finished, is
+                        // some other line's, and the record is not about it.
+                        let pid = u32::try_from(source.process.pid.get()).unwrap_or(u32::MAX);
+                        if !session.runs_the_accepted_line(pid) {
+                            return Err(WorkerError::AmbiguousDetach {
+                                detail: "this caller is not the line the root shell accepted, \
+                                         so the attachment that line came from is not its own; \
+                                         name the attachment to detach with --attachment"
+                                    .to_owned(),
+                            });
+                        }
                         session.detach_origin()?
                     }
                 };

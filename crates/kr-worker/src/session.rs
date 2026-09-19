@@ -1543,6 +1543,27 @@ impl Session {
         })
     }
 
+    /// Returns whether one process is in the job this terminal has in the foreground.
+    ///
+    /// The foreground job is the one the root shell put the line it accepted into, and the one the
+    /// interrupt key would signal. A `kr detach` the person typed at the prompt is in it. One the
+    /// shell was told to run in the background, or one left over from a line that has already
+    /// finished, is not, and the attachment this session has a record of is not that caller's.
+    ///
+    /// Where the platform does not name a foreground job, nothing is in it, and a detach that
+    /// names no attachment is refused rather than attributed to whoever typed last.
+    #[must_use]
+    pub fn runs_the_accepted_line(&self, pid: u32) -> bool {
+        let Some(group) = self
+            .pty
+            .foreground_group()
+            .and_then(|group| u32::try_from(group).ok())
+        else {
+            return false;
+        };
+        kr_ipc::identity::processes_in_group(group).is_ok_and(|members| members.contains(&pid))
+    }
+
     /// Returns the attachment a `session.detach` that named none is about.
     ///
     /// Section 7 gives `kr detach` no identifier inside its own context, and section 23's editor
