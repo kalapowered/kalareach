@@ -28,7 +28,7 @@ use kr_protocol::session::{EnvironmentVariable, Presentation, SessionCreateParam
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     CURRENT_BASENAME, MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
-    PackageShell, PackageStartupEntry, default_package_root,
+    PackageShell, PackageStartupEntry,
 };
 use kr_shell_integration::host::startup::{self, Change, HomeLayout};
 use kr_shell_integration::host::terminal::{
@@ -532,18 +532,20 @@ fn the_terminal_is_chosen_in_order_and_a_host_with_none_says_so_once() {
 /// KR-REQ-07.16, KR-REQ-07.85: the packages a build produced, when it produced any.
 #[test]
 fn the_built_packages_are_qualified_where_this_run_has_them() {
-    // Whatever this run was told to use, or the installation's own root, which is where
-    // `scripts/build-shells.sh` puts what it builds.
-    let root = std::env::var_os(PACKAGE_ROOT_VARIABLE)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(default_package_root);
-    let set = PackageSet::discover(&root).expect("reads the built packages");
-    if set.packages().is_empty() {
-        // The packages are built by their own tooling and are not a prerequisite for this suite.
-        // Nothing is asserted about a package this run does not have.
-        eprintln!("skipped: {} holds no package manifest", root.display());
+    // What this run was told to use, and nothing else. An ordinary acceptance run says nothing
+    // about a package it was not pointed at, because the machine's own installation is not this
+    // suite's to depend on; a run that names one is a run that expects it to be there.
+    let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
+        eprintln!(
+            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory, so no built package is checked"
+        );
         return;
-    }
+    };
+    let set = PackageSet::discover(Path::new(&root)).expect("reads the built packages");
+    assert!(
+        !set.packages().is_empty(),
+        "{PACKAGE_ROOT_VARIABLE} named {root:?} and it holds no package record"
+    );
     for package in set.packages() {
         assert!(
             package.executable().is_file(),

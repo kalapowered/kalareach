@@ -39,7 +39,6 @@ pub const CURRENT_BASENAME: &str = "current";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageManifest {
     /// The identity a build computed from its own inputs, which also names the directory.
-    #[serde(default)]
     pub identity: String,
     /// The shell this package is, and what it was built from.
     pub shell: PackageShell,
@@ -61,10 +60,12 @@ pub struct PackageShell {
     /// The package's own integration version.
     pub integration_version: String,
     /// Every published reader patch in the package.
-    #[serde(default)]
+    ///
+    /// Stated rather than defaulted, here and for the modules: a record that says nothing about
+    /// its patches is a record this host cannot check, and a package with no modules says so by
+    /// declaring an empty list.
     pub patches: Vec<PatchRevision>,
     /// The module tree the shell will load, with each module's own search path.
-    #[serde(default)]
     pub modules: Vec<ModuleEntry>,
 }
 
@@ -73,6 +74,33 @@ pub struct PackageShell {
 pub struct PackageStartupEntry {
     /// The file a startup entry sources, relative to the package's own directory.
     pub file: String,
+}
+
+/// Whether a root shell reads the user's login startup as well as its interactive startup.
+///
+/// Section 7 states the platform defaults: macOS runs normal login startup, including any path
+/// changes it makes, and Linux does not unless a profile says so. It is a property of the session
+/// being created rather than of the package, which is why a package is asked for its arguments in
+/// one mode rather than asked what its arguments are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartupMode {
+    /// The interactive startup only.
+    #[default]
+    Interactive,
+    /// The login startup as well.
+    Login,
+}
+
+impl StartupMode {
+    /// Returns what this platform does when nothing says otherwise.
+    #[must_use]
+    pub const fn for_host() -> Self {
+        if cfg!(target_vendor = "apple") {
+            Self::Login
+        } else {
+            Self::Interactive
+        }
+    }
 }
 
 /// One qualified package, resolved to absolute paths.
@@ -92,42 +120,83 @@ impl ShellPackage {
     }
 
     /// Returns the executable a session launches.
-    ///
-    /// A build records the path it installed, which is absolute. A package that was copied
-    /// somewhere else carries a path that is no longer there, so the copy's own directory answers
-    /// for it: the package is the directory, and the record describes what is in it.
     #[must_use]
     pub fn executable(&self) -> PathBuf {
-        let recorded = &self.manifest.shell.executable;
-        if recorded.is_absolute() && recorded.is_file() {
-            return recorded.clone();
+        self.own(&self.manifest.shell.executable)
+    }
+
+    /// Returns a path the record names, as this package's own copy of it.
+    ///
+    /// A build records the paths it installed, which are absolute and inside the directory it
+    /// installed them in. A package that was copied somewhere else carries paths that point back
+    /// at the original, and launching that original would be launching a package this one only
+    /// describes. So a recorded path inside this directory is taken as it is, and one outside it
+    /// is taken as its own tail under this directory: the package is the directory it is in.
+    fn own(&self, recorded: &Path) -> PathBuf {
+        if recorded.starts_with(&self.directory) {
+            return recorded.to_path_buf();
         }
-        match recorded.file_name() {
-            Some(name) if recorded.is_absolute() => self.directory.join("bin").join(name),
-            _ => self.directory.join(recorded),
+        if !recorded.is_absolute() {
+            return self.directory.join(recorded);
         }
+        // The last two components of an installed path are the kind of place it sits in and its
+        // own name: `bin/zsh`, `lib/zsh/5.9`. Keeping the tail keeps the layout the build made.
+        let tail: PathBuf = recorded
+            .components()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        self.directory.join(tail)
     }
 
     /// Returns the guarded startup entry this package installs.
     #[must_use]
     pub fn startup_entry(&self) -> PathBuf {
-        self.directory.join(&self.manifest.startup_entry.file)
+        self.own(Path::new(&self.manifest.startup_entry.file))
     }
 
-    /// Returns the flags an interactive root shell of this package is launched with.
+    /// Returns the arguments an interactive root shell of this package is launched with.
     ///
     /// The host's, not the package's: a package records what it was built from rather than how a
-    /// session starts it, and these are the arguments that make that shell an interactive login
-    /// shell. They belong to the shell rather than to the platform, which is why they are chosen
-    /// by kind.
+    /// session starts it. Section 7 states the defaults per platform, and they differ in one thing
+    /// only, which is whether the shell reads the user's login startup as well as the interactive
+    /// one. This host's own platform decides that; a profile that says otherwise is the caller's
+    /// to pass to [`Self::arguments`].
     #[must_use]
     pub fn interactive_flags(&self) -> Vec<String> {
+        self.arguments(StartupMode::for_host())
+    }
+
+    /// Returns the arguments this package's shell is launched with in one startup mode.
+    #[must_use]
+    pub fn arguments(&self, mode: StartupMode) -> Vec<String> {
+        let login = mode == StartupMode::Login;
         match self.manifest.shell.kind {
+            // Section 7: the packaged Zsh with `-l -i` on macOS, the packaged shell with `-i` on
+            // Linux, and a Linux profile may ask for login startup.
             ShellKind::Zsh | ShellKind::Bash => {
-                vec!["-l".to_owned(), "-i".to_owned()]
+                let mut arguments = Vec::new();
+                if login {
+                    arguments.push("-l".to_owned());
+                }
+                arguments.push("-i".to_owned());
+                arguments
             }
-            ShellKind::Fish => vec!["--login".to_owned(), "--interactive".to_owned()],
-            ShellKind::PowerShell => vec!["-NoLogo".to_owned(), "-NoExit".to_owned()],
+            // Fish uses `--interactive` and adds `--login` for a login profile.
+            ShellKind::Fish => {
+                let mut arguments = Vec::new();
+                if login {
+                    arguments.push("--login".to_owned());
+                }
+                arguments.push("--interactive".to_owned());
+                arguments
+            }
+            // PowerShell 7 with `-NoLogo`; its startup integration is the profile's, not an
+            // argument, and it has no login-shell mode to ask for.
+            ShellKind::PowerShell => vec!["-NoLogo".to_owned()],
         }
     }
 
@@ -152,8 +221,7 @@ impl ShellPackage {
                 .map(|module| ModuleEntry {
                     name: module.name.clone(),
                     search_path: self
-                        .directory
-                        .join(&module.search_path)
+                        .own(Path::new(&module.search_path))
                         .display()
                         .to_string(),
                     editor_abi: module.editor_abi.clone(),
@@ -262,7 +330,7 @@ impl PackageSet {
         let mut packages = Vec::new();
         for kind in ShellKind::ALL {
             let directory = root.join(kind.as_str());
-            for candidate in manifest_candidates(&directory) {
+            for candidate in manifest_candidates(&directory)? {
                 let text = match std::fs::read_to_string(&candidate) {
                     Ok(text) => text,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -396,27 +464,63 @@ impl PackageSet {
 }
 
 /// Returns the manifests a package directory may hold, newest layout first.
-fn manifest_candidates(directory: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    // What the installation says it is using. A build writes one identity directory per build, so
-    // an installation holds every package it ever built and this file names the one that counts.
-    if let Ok(current) = std::fs::read_to_string(directory.join(CURRENT_BASENAME)) {
-        let current = current.trim();
-        if !current.is_empty() {
-            candidates.push(directory.join(current).join(MANIFEST_BASENAME));
+fn manifest_candidates(directory: &Path) -> Result<Vec<PathBuf>, PackageFault> {
+    // What the installation says it is using, and the only answer where it says anything. A build
+    // writes one identity directory per build and keeps the ones before it, so an installation
+    // holds every package it ever built; this file names the one that counts. A pointer that names
+    // nothing is a broken installation rather than an invitation to pick an older build.
+    let pointer = directory.join(CURRENT_BASENAME);
+    match std::fs::read_to_string(&pointer) {
+        Ok(current) => {
+            let current = current.trim();
+            if current.is_empty() {
+                return Err(PackageFault::Unreadable {
+                    path: pointer.display().to_string(),
+                    detail: "it names no identity".to_owned(),
+                });
+            }
+            let record = directory.join(current).join(MANIFEST_BASENAME);
+            if !record.is_file() {
+                return Err(PackageFault::Unreadable {
+                    path: pointer.display().to_string(),
+                    detail: format!("it names {current}, which has no identity record"),
+                });
+            }
+            return Ok(vec![record]);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(PackageFault::Unreadable {
+                path: pointer.display().to_string(),
+                detail: error.to_string(),
+            });
         }
     }
-    candidates.push(directory.join(MANIFEST_BASENAME));
-    // Failing both, whichever identity directory holds a record, in name order, which is stable.
-    if let Ok(entries) = std::fs::read_dir(directory) {
-        let mut nested: Vec<PathBuf> = entries
+    // No pointer at all: a record beside the shell's own directory, or one identity directory and
+    // no more. Two of them with nothing to choose between is not a choice this host may make.
+    let direct = directory.join(MANIFEST_BASENAME);
+    if direct.is_file() {
+        return Ok(vec![direct]);
+    }
+    let mut nested: Vec<PathBuf> = match std::fs::read_dir(directory) {
+        Ok(entries) => entries
             .flatten()
             .map(|entry| entry.path().join(MANIFEST_BASENAME))
-            .collect();
-        nested.sort();
-        candidates.extend(nested);
+            .filter(|record| record.is_file())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    nested.sort();
+    if nested.len() > 1 {
+        return Err(PackageFault::Unreadable {
+            path: directory.display().to_string(),
+            detail: format!(
+                "{} identity directories and no {CURRENT_BASENAME} naming one of them",
+                nested.len()
+            ),
+        });
     }
-    candidates
+    Ok(nested)
 }
 
 /// Returns the alternative name a shell's binary is installed under.
@@ -510,6 +614,136 @@ mod tests {
             serde_json::to_string(&manifest(kind)).expect("encodes"),
         )
         .expect("writes the manifest");
+    }
+
+    /// Writes an identity directory and names it in the shell's `current` pointer.
+    fn install_identity(root: &Path, kind: ShellKind, identity: &str) {
+        let directory = root.join(kind.as_str()).join(identity);
+        std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
+        std::fs::write(directory.join("bin/shell"), b"#!/bin/sh\n").expect("writes the binary");
+        let mut record = manifest(kind);
+        record.identity = identity.to_owned();
+        std::fs::write(
+            directory.join(MANIFEST_BASENAME),
+            serde_json::to_string(&record).expect("encodes"),
+        )
+        .expect("writes the record");
+    }
+
+    #[test]
+    fn the_installation_launches_the_identity_its_pointer_names() {
+        // A build keeps every identity it ever produced, so the pointer is the only thing that says
+        // which one this installation uses. Reading the newest, or the first by name, would launch
+        // a package somebody replaced.
+        let root = tempfile::tempdir().expect("a directory");
+        install_identity(root.path(), ShellKind::Zsh, "aaaa-old");
+        install_identity(root.path(), ShellKind::Zsh, "zzzz-new");
+        std::fs::write(root.path().join("zsh/current"), "zzzz-new").expect("names one");
+
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        let package = set.get(ShellKind::Zsh).expect("the one it names");
+        assert_eq!(package.manifest.identity, "zzzz-new");
+        assert!(
+            package
+                .executable()
+                .starts_with(root.path().join("zsh/zzzz-new")),
+            "{}",
+            package.executable().display()
+        );
+
+        // A pointer that names nothing there is a broken installation, not a reason to pick
+        // another build.
+        std::fs::write(root.path().join("zsh/current"), "gone").expect("names a missing one");
+        let fault = PackageSet::discover(root.path()).expect_err("refused");
+        assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+
+        // And two identities with nothing naming one of them is not a choice this host may make.
+        std::fs::remove_file(root.path().join("zsh/current")).expect("removes the pointer");
+        let fault = PackageSet::discover(root.path()).expect_err("refused");
+        assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_that_was_copied_launches_the_copy_rather_than_the_original() {
+        // A record names the paths the build installed. A copy of that package carries them
+        // unchanged, and launching them would launch the package this one only describes.
+        let original = tempfile::tempdir().expect("a directory");
+        install_identity(original.path(), ShellKind::Zsh, "identity-1");
+        std::fs::write(original.path().join("zsh/current"), "identity-1").expect("names one");
+        let installed = original.path().join("zsh/identity-1");
+        let mut record = manifest(ShellKind::Zsh);
+        record.identity = "identity-1".to_owned();
+        record.shell.executable = installed.join("bin/shell");
+        record.shell.modules = vec![ModuleEntry {
+            name: "kr-bridge".to_owned(),
+            search_path: installed.join("lib/zsh").display().to_string(),
+            editor_abi: "zle-5.9".to_owned(),
+        }];
+        std::fs::write(
+            installed.join(MANIFEST_BASENAME),
+            serde_json::to_string(&record).expect("encodes"),
+        )
+        .expect("writes the record");
+
+        // The same package somewhere else, with the original still there.
+        let copy = tempfile::tempdir().expect("a directory");
+        let there = copy.path().join("zsh/identity-1");
+        std::fs::create_dir_all(there.join("bin")).expect("creates the copy");
+        std::fs::copy(installed.join("bin/shell"), there.join("bin/shell")).expect("copies");
+        std::fs::copy(
+            installed.join(MANIFEST_BASENAME),
+            there.join(MANIFEST_BASENAME),
+        )
+        .expect("copies the record");
+        std::fs::write(copy.path().join("zsh/current"), "identity-1").expect("names one");
+
+        let set = PackageSet::discover(copy.path()).expect("reads the copy");
+        let package = set.get(ShellKind::Zsh).expect("the copy");
+        assert_eq!(package.executable(), there.join("bin/shell"));
+        let identity = package.identity();
+        assert_eq!(
+            identity.modules[0].search_path,
+            there.join("lib/zsh").display().to_string(),
+            "the module tree is the copy's too"
+        );
+    }
+
+    #[test]
+    fn a_record_that_says_nothing_about_its_patches_is_refused() {
+        // Defaulting them would let a package that declares nothing look like one that declares an
+        // empty list, and the second is a statement while the first is a silence.
+        let root = tempfile::tempdir().expect("a directory");
+        let directory = root.path().join("zsh/identity-1");
+        std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
+        std::fs::write(directory.join("bin/shell"), b"#!/bin/sh\n").expect("writes the binary");
+        std::fs::write(
+            directory.join(MANIFEST_BASENAME),
+            r#"{"identity":"identity-1","shell":{"kind":"zsh","executable":"bin/shell",
+               "upstream_version":"5.9","editor_abi":"zle-5.9","integration_version":"1"},
+               "startup_entry":{"file":"share/entry.sh"}}"#,
+        )
+        .expect("writes the record");
+        std::fs::write(root.path().join("zsh/current"), "identity-1").expect("names one");
+        let fault = PackageSet::discover(root.path()).expect_err("refused");
+        assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+    }
+
+    #[test]
+    fn the_arguments_are_the_platforms_and_a_login_profile_adds_to_them() {
+        // Section 7: the packaged Zsh with `-l -i` on macOS, the packaged shell with `-i` on
+        // Linux, and a Linux profile may ask for login startup.
+        let root = tempfile::tempdir().expect("a directory");
+        install(root.path(), ShellKind::Zsh, false);
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        let package = set.get(ShellKind::Zsh).expect("the package");
+        assert_eq!(package.arguments(StartupMode::Interactive), vec!["-i"]);
+        assert_eq!(package.arguments(StartupMode::Login), vec!["-l", "-i"]);
+        assert_eq!(
+            package.interactive_flags(),
+            package.arguments(StartupMode::for_host()),
+            "the default is this platform's"
+        );
     }
 
     #[test]

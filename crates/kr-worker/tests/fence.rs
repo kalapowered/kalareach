@@ -201,7 +201,19 @@ async fn unpumped() -> Unpumped {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let config = configuration(&temp, ShellMode::Managed);
+    let mut config = configuration(&temp, ShellMode::Managed);
+    // A shell that echoes what it is sent and ignores an interrupt, because one of these tests
+    // sends the configured native interrupt and still expects the application to be there to
+    // receive what the machine released on the same boundary.
+    config.shell = ShellCommand {
+        program: "/bin/sh".to_owned(),
+        arguments: vec![
+            "-c".to_owned(),
+            "trap '' INT; while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_owned(),
+        ],
+        cwd: "/".to_owned(),
+        environment: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
+    };
     let session_id = config.session_id;
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -1495,13 +1507,13 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
     wired.close().await;
 }
 
-/// A-17 again, on the request that is refused rather than admitted.
+/// A-17 again, on the interrupt's own boundary.
 ///
-/// An interrupt whose epoch has moved is refused, and the refusal is what the caller is told. What
-/// the machine let go of on the way is still the application's: a refusal is an answer about the
-/// interrupt, not about input this session accepted before it.
+/// An interrupt is not held behind a reader transition, and the sweep it performs on the way can
+/// let go of input that was. Those bytes are the application's from that moment: they reach it on
+/// the interrupt's own boundary rather than waiting for whatever happens next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_request_still_delivers_what_it_released() {
+async fn an_interrupt_delivers_what_its_own_sweep_released() {
     let wired = unpumped().await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
@@ -1556,7 +1568,7 @@ async fn a_refused_request_still_delivers_what_it_released() {
     assert!(!contains(&retained(&wired.runtime.session()), b"waited"));
 
     wired.clock.advance(Duration::from_millis(400));
-    let refused = client
+    client
         .mutate(
             Method::InputInterrupt,
             ActionId::new(kr_ipc::new_uuid()),
@@ -1564,16 +1576,13 @@ async fn a_refused_request_still_delivers_what_it_released() {
             &kr_protocol::input::InputInterruptParams {
                 session_id: wired.session_id,
                 attachment_id: holder,
-                // An epoch this lease has moved past, so the machine refuses the interrupt and
-                // nothing is sent to the shell.
-                epoch: kr_protocol::ids::InputLeaseEpoch::new(epoch.saturating_sub(1)),
+                epoch: kr_protocol::ids::InputLeaseEpoch::new(epoch),
                 action: kr_protocol::input::InterruptAction::NativeInterrupt,
             },
         )
         .await
         .expect("reaches the worker")
-        .expect_err("the epoch has moved");
-    assert_eq!(refused.code, ErrorCode::LeaseLost, "{refused}");
+        .expect("the holder interrupts at the epoch it holds");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -1582,7 +1591,7 @@ async fn a_refused_request_still_delivers_what_it_released() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "a refused request kept what the machine released"
+            "the interrupt kept what its own sweep released"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

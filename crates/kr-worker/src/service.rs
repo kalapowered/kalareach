@@ -3494,8 +3494,9 @@ impl WorkerService {
                 }
                 // Every stimulus can sweep the machine's own deadlines, so a request from a client
                 // can be what releases a hold that had already expired. The batches it released go
-                // out on this boundary, whether or not the interrupt itself was admitted: nothing
-                // else is due to run, and bytes the machine has let go of are the application's.
+                // out on this boundary, whether or not the machine admitted the interrupt itself:
+                // nothing else is due to run, and bytes the machine has let go of are the
+                // application's.
                 let interrupted = session.interrupt(params.attachment_id, params.epoch.get());
                 self.runtime.flush_locked(session);
                 interrupted?;
