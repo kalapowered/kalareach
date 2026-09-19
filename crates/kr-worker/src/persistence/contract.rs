@@ -94,7 +94,8 @@ pub enum FlushPolicy {
 /// instrumentation of the store: nothing consults it on the write path, because the store's own
 /// durability settings are what carry a transaction. Section 24 permits safe grouped commits to
 /// share a flush, and what this names is which writes may not be grouped with work nobody is
-/// waiting on.
+/// waiting on. `Grouped` is a permission rather than a description: a write this allows to share
+/// a flush may still be committed on its own, which is what this build does.
 #[must_use]
 pub const fn flush_policy(write: WriteKind) -> FlushPolicy {
     match write {

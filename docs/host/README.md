@@ -999,12 +999,14 @@ again. Only the retained output and the host events an attachment never saw are 
 
 ### What waits for a flush, and what never does
 
-Three commit points wait: the intent before the acknowledgement, the dispatch marker before the
-effect, and the outcome with its receipt revision, its event and its outbox record. Those three
-are the ones something else is waiting on, so they are never grouped. Other durable writes - a
-closure record, the privacy generation, a session summary - are ordinary transactions on the same
-store, and the store's own durability settings are what carry them; they are not a fourth commit
-point and nothing is held for them. Section 24 forbids a per-keystroke, per-output-byte or ordinary prompt and command telemetry
+Three commit points are named by section 24 and never grouped: the intent before the
+acknowledgement, the dispatch marker before the effect, and the outcome with its receipt revision,
+its event and its outbox record. They are not the only writes a caller waits for. Turning privacy
+mode on waits for the generation to be recorded, and a closure waits for its own record, because
+in both cases the answer would otherwise claim something the store had not yet taken. What section
+24 names is which writes may not *share* a flush with work nobody is waiting on; this build
+commits the others in transactions of their own, which is its own choice and not a requirement.
+Section 24 forbids a per-keystroke, per-output-byte or ordinary prompt and command telemetry
 event from waiting for an fsync, and this host goes further with the first two: a keystroke and an
 output byte write no durable row at all. The live parser is in worker memory and the retained
 output is a bounded indexed spool.
