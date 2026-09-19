@@ -5,8 +5,8 @@ use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId, SessionId};
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_worker::broker::{
-    BoundBinary, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress, ManagedProcess,
-    Registration, TransportHandle, listener::BROWSER_HEADERS,
+    BoundBinary, BoundEndpoint, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress,
+    ManagedProcess, PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -40,12 +40,40 @@ fn managed(identity: ProcessStartIdentity) -> ManagedProcess {
 }
 
 fn registration(address: ListenerAddress) -> Registration {
+    registration_for(address, process(41, 900))
+}
+
+fn registration_for(address: ListenerAddress, expected: ProcessStartIdentity) -> Registration {
     Registration::new(
         address,
         LaunchProfileId::new("lp-1").expect("valid"),
         instance(),
-        process(41, 900),
+        expected,
     )
+}
+
+/// A private runtime directory, made owner-only the way the host makes one.
+fn private_directory() -> std::path::PathBuf {
+    let name: String = kr_ipc::new_uuid()
+        .to_string()
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    let directory = std::env::temp_dir().join(format!("kr-l-{name}"));
+    std::fs::create_dir_all(&directory).expect("the directory is created");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is made private");
+    }
+    directory
+}
+
+/// The identity this test process actually has, which is what the kernel will report.
+fn this_process() -> ProcessStartIdentity {
+    kr_ipc::identity::current_process_start_identity().expect("this process is identifiable")
 }
 
 fn hello() -> BridgeHello {
@@ -61,7 +89,13 @@ fn hello() -> BridgeHello {
 #[test]
 fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_carries_a_credential()
  {
-    let directory = std::env::temp_dir().join(format!("kr-listener-{}", kr_ipc::new_uuid()));
+    let name: String = kr_ipc::new_uuid()
+        .to_string()
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    let directory = std::env::temp_dir().join(format!("kr-l-{name}"));
     std::fs::create_dir_all(&directory).expect("the directory is created");
     #[cfg(unix)]
     {
@@ -110,7 +144,11 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
     };
     assert!(
         registration
-            .authenticate(&unauthenticated, true, &managed)
+            .authenticate(
+                &unauthenticated,
+                &PeerIdentity::presented(Some(process(41, 900)), true),
+                &managed
+            )
             .is_err()
     );
 
@@ -136,67 +174,138 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// KR-REQ-11.43: bridge registration authenticates against the launch and process binding and a
-/// private exchange, never an environment-variable session identifier alone.
-#[test]
-fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_together() {
-    let registration = registration(ListenerAddress::PrivateSocket("/run/kr/a.sock".into()));
-    let managed = managed(process(41, 900));
+/// KR-REQ-11.43 and KR-REQ-12.14: registration authenticates against the launch and process
+/// binding and a private exchange, on an endpoint this host actually bound.
+///
+/// The endpoint is real, so the peer's ownership and process identity are the kernel's reading of
+/// the connection rather than anything the connecting side said about itself. That is the whole
+/// difference between deciding who may connect and knowing who did.
+#[tokio::test]
+async fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_together() {
+    let directory = private_directory();
+    let endpoint = BoundEndpoint::bind(&directory).expect("the endpoint binds");
+    let address = endpoint.address().clone();
+    address.require_local().expect("a bound endpoint is local");
 
+    // The launch this host made is this process, because this process is what will connect.
+    let launched = this_process();
+    let registration = registration_for(address.clone(), launched.clone());
+    let managed = managed(launched.clone());
+
+    let connecting = match address.clone() {
+        ListenerAddress::PrivateSocket(path) => tokio::spawn(async move {
+            tokio::net::UnixStream::connect(&path)
+                .await
+                .expect("the bridge connects")
+        }),
+        ListenerAddress::Loopback { address, port } => tokio::spawn(async move {
+            let _ = tokio::net::TcpStream::connect((address, port))
+                .await
+                .expect("the bridge connects");
+            unreachable!("this platform prefers a private socket in these tests")
+        }),
+    };
+    let accepted = endpoint.accept().await.expect("the connection is accepted");
+    assert!(
+        accepted.peer.from_operating_system(),
+        "a private socket names its peer"
+    );
+    assert_eq!(
+        accepted.peer.process().expect("the kernel named it"),
+        &launched,
+        "the identity is read from the kernel and not from the hello"
+    );
+
+    // Both halves, on a connection the kernel vouched for.
     registration
-        .authenticate(&hello(), true, &managed)
+        .authenticate(
+            &BridgeHello {
+                credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
+                process: launched.clone(),
+                environment_session_id: Some("KR_SESSION=abc".to_owned()),
+            },
+            &accepted.peer,
+            &managed,
+        )
         .expect("both halves are there");
 
     // The session identifier from the environment, and nothing else.
-    let session_only = BridgeHello {
-        credential: kr_crypto::secret::SecretVec::new(Vec::new()),
-        process: process(41, 900),
-        environment_session_id: Some("KR_SESSION=abc".to_owned()),
-    };
     assert!(
         registration
-            .authenticate(&session_only, true, &managed)
+            .authenticate(
+                &BridgeHello {
+                    credential: kr_crypto::secret::SecretVec::new(Vec::new()),
+                    process: launched.clone(),
+                    environment_session_id: Some("KR_SESSION=abc".to_owned()),
+                },
+                &accepted.peer,
+                &managed,
+            )
             .is_err(),
         "an environment-variable session identifier is not authentication"
     );
 
-    // The private exchange from a process this host did not launch.
-    let elsewhere = BridgeHello {
-        credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
-        process: process(77, 900),
-        environment_session_id: None,
-    };
+    // A bridge that names somebody else's process is refused by the kernel's reading, not by its
+    // own honesty: the hello below claims the launch and the connection is a different process.
+    let stranger = registration_for(address.clone(), process(77, 900));
+    assert!(
+        stranger
+            .authenticate(
+                &BridgeHello {
+                    credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
+                    process: process(77, 900),
+                    environment_session_id: None,
+                },
+                &accepted.peer,
+                &managed,
+            )
+            .is_err(),
+        "the process the kernel named is the one that is compared"
+    );
+
+    // Another operating-system user is refused before anything else is read.
     assert!(
         registration
-            .authenticate(&elsewhere, true, &managed)
+            .authenticate(
+                &BridgeHello {
+                    credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
+                    process: launched.clone(),
+                    environment_session_id: None,
+                },
+                &PeerIdentity::presented(Some(launched.clone()), false),
+                &managed,
+            )
             .is_err()
     );
 
-    // The right process with a recycled identifier.
-    let recycled = BridgeHello {
-        credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
-        process: process(41, 999),
-        environment_session_id: None,
-    };
-    assert!(
-        registration
-            .authenticate(&recycled, true, &managed)
-            .is_err()
-    );
-
-    // Another operating-system user.
-    assert!(
-        registration
-            .authenticate(&hello(), false, &managed)
-            .is_err()
-    );
+    // And where the kernel does name the peer, an identity it did not name is not admitted: the
+    // loopback path exists for a platform that has no private socket, not as a way past this one.
+    if cfg!(unix) {
+        assert!(
+            registration
+                .authenticate(
+                    &BridgeHello {
+                        credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
+                        process: launched.clone(),
+                        environment_session_id: None,
+                    },
+                    &PeerIdentity::presented(Some(launched), true),
+                    &managed,
+                )
+                .is_err()
+        );
+    }
 
     // The registration file is the small file section 11 prefers: where to connect and which
     // launch, and nothing that speaks to the listener.
     let file = registration.to_file();
-    assert!(file.contains("endpoint=/run/kr/a.sock"));
-    assert!(file.contains("pid=41"));
+    assert!(file.contains(&address.for_diagnostics()));
     assert!(file.lines().count() >= 5);
+    assert!(!file.to_ascii_lowercase().contains("credential"));
+
+    drop(connecting.await.expect("the connecting task finishes"));
+    drop(endpoint);
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// KR-REQ-12.15: an executable upgrade affects new launches; an existing binding keeps the binary

@@ -21,9 +21,11 @@
 //! | --- | --- |
 //! | [`arbitration`] | Pending resources, one resolution each, and what a reconnect does |
 //! | [`capability`] | The per-installation capability map and the probes behind it |
+//! | [`endpoint`] | The bound local socket, and who the kernel says connected to it |
 //! | [`error`] | The broker's refusals, each mapped to a stable protocol code |
 //! | [`gateway`] | The core-declarative forwarding path, the closed rich table and reverse calls |
 //! | [`ledger`] | The durable records, in the worker's own journal file |
+//! | [`link`] | The worker-owned transport that reads, forwards, answers and executes |
 //! | [`methods`] | The agent-state reads, the five agent mutations and the plugin action call |
 //! | [`listener`] | The private local endpoint, bridge registration and the pinned binary |
 //! | [`process`] | Launched processes, their credentials and their immutable source frames |
@@ -41,9 +43,11 @@
 
 pub mod arbitration;
 pub mod capability;
+pub mod endpoint;
 pub mod error;
 pub mod gateway;
 pub mod ledger;
+pub mod link;
 pub mod listener;
 pub mod methods;
 pub mod process;
@@ -75,12 +79,14 @@ pub use crate::broker::arbitration::{
     Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
+pub use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 pub use crate::broker::error::{BrokerError, Result};
 pub use crate::broker::gateway::{
     Connection, ConnectionOrigin, Forwarded, Gateway, PreparedResponse, ReverseRequest,
     RichInvocation,
 };
 pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
+pub use crate::broker::link::{Carried, Framing, Link, LinkDispatch, Writer, writers};
 pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
@@ -333,6 +339,23 @@ struct BrokerState {
     capabilities: CapabilityOwner,
     volatile: VolatileState,
     next_connection: u64,
+    /// The declarative tables this host pinned at installation, by instance and package.
+    ///
+    /// Section 11: "Tables are pinned and qualified against the installed protocol version under
+    /// the connector publisher's semantic trust grant." A table presented at connection time is
+    /// compared with this, so a package cannot open a connection with a table nobody installed.
+    pinned_tables: BTreeMap<(ApplicationInstanceId, PluginId), PinnedTable>,
+}
+
+/// The identity of one declarative table, as the installation pinned it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedTable {
+    /// The publisher whose semantic trust grant qualifies the table.
+    pub publisher_id: PublisherId,
+    /// The digest of the exact table bytes.
+    pub digest: Digest256,
+    /// The version of the table itself.
+    pub table_version: kr_protocol::ids::MethodTableVersion,
 }
 
 /// The trusted broker.
@@ -392,6 +415,7 @@ impl Broker {
                 capabilities: CapabilityOwner::new(),
                 volatile,
                 next_connection,
+                pinned_tables: BTreeMap::new(),
             }),
         })
     }
@@ -1777,6 +1801,40 @@ impl Broker {
 
     // -- the gateway --------------------------------------------------------------------------
 
+    /// Pins one connector's declarative table for one installation.
+    ///
+    /// A table is qualified at installation, under the publisher's semantic trust grant, and this
+    /// is what that qualification leaves behind. A connection that presents anything else is
+    /// refused: the core interprets frames with this table, so a table nobody installed would be
+    /// a package choosing how its own bytes are read.
+    pub fn pin_table(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        table: &kr_protocol::gateway::DeclarativeTable,
+    ) {
+        self.state().pinned_tables.insert(
+            (application_instance_id, table.plugin_id.clone()),
+            PinnedTable {
+                publisher_id: table.publisher_id.clone(),
+                digest: table.digest,
+                table_version: table.table_version,
+            },
+        );
+    }
+
+    /// Returns what this host pinned for one installation's package.
+    #[must_use]
+    pub fn pinned_table(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        plugin_id: &PluginId,
+    ) -> Option<PinnedTable> {
+        self.state()
+            .pinned_tables
+            .get(&(application_instance_id, plugin_id.clone()))
+            .cloned()
+    }
+
     /// Opens a native connection for a terminal this worker launched and authenticated.
     ///
     /// # Errors
@@ -1812,6 +1870,7 @@ impl Broker {
                 "this connection does not present the launch binding and the private exchange of                  a terminal this worker started",
             ));
         }
+        state.check_pinned_table(application_instance_id, &table)?;
         state.gateway.open_native(
             connection,
             application_instance_id,
@@ -1837,7 +1896,9 @@ impl Broker {
         rich: kr_protocol::gateway::RichMethodTable,
         installed_protocol_version: &str,
     ) -> Result<()> {
-        self.state().gateway.open(
+        let mut state = self.state();
+        state.check_pinned_table(application_instance_id, &table)?;
+        state.gateway.open(
             connection,
             application_instance_id,
             origin,
@@ -1845,6 +1906,37 @@ impl Broker {
             rich,
             installed_protocol_version,
         )
+    }
+
+    /// Returns one gateway connection as the broker holds it.
+    #[must_use]
+    pub fn connection(&self, connection: GatewayConnectionId) -> Option<Connection> {
+        self.state().gateway.connection(connection).cloned()
+    }
+
+    /// Records the upstream answering or withdrawing a request of its own.
+    ///
+    /// This is the acknowledgement half, kept separate from the native writer's own answer. A
+    /// frame that resolves nothing is not an error the connection ends over: an upstream may
+    /// answer something this host never recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the frame carries no correlation identifier.
+    pub fn upstream_response(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+        now: TimestampMs,
+    ) -> Result<Option<PendingResource>> {
+        let mut state = self.state();
+        let request = state.gateway.correlate_response(connection, frame)?;
+        if state.arbitration.by_request(&request).is_none() {
+            return Ok(None);
+        }
+        let transition = state.arbitration.plan_upstream_resolved(&request)?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition).map(Some)
     }
 
     /// Closes one gateway connection.
@@ -2307,6 +2399,43 @@ impl BrokerState {
             self.arbitration.commit(transition)?;
         }
         Ok(reconciliation)
+    }
+
+    /// Checks one presented table against what the installation pinned.
+    fn check_pinned_table(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        table: &kr_protocol::gateway::DeclarativeTable,
+    ) -> Result<()> {
+        let pinned = self
+            .pinned_tables
+            .get(&(application_instance_id, table.plugin_id.clone()))
+            .ok_or_else(|| {
+                BrokerError::denied(format!(
+                    "no declarative table of {} is pinned for {application_instance_id}, and the \
+                     core interprets frames only with a table this host installed",
+                    table.plugin_id
+                ))
+            })?;
+        if pinned.publisher_id != table.publisher_id {
+            return Err(BrokerError::denied(format!(
+                "this table names publisher {} and {} was pinned",
+                table.publisher_id, pinned.publisher_id
+            )));
+        }
+        if pinned.digest != table.digest {
+            return Err(BrokerError::denied(format!(
+                "this table is not the one pinned for {} at {application_instance_id}",
+                table.plugin_id
+            )));
+        }
+        if pinned.table_version != table.table_version {
+            return Err(BrokerError::denied(format!(
+                "this table is version {} and {} was pinned",
+                table.table_version, pinned.table_version
+            )));
+        }
+        Ok(())
     }
 
     /// Returns one pending resource, or says this broker does not hold it.

@@ -123,12 +123,14 @@ fn table() -> DeclarativeTable {
         request_id_field: "id".to_owned(),
         response_id_field: "id".to_owned(),
         method_field: "method".to_owned(),
+        params_field: "params".to_owned(),
         result_field: "result".to_owned(),
         error_field: "error".to_owned(),
         entries: vec![DeclarativeEntry {
             method: method("session/request_permission"),
             class: NativeMethodClass::Mutation,
             expects_response: true,
+            reverse: Nullable::null(),
         }],
     }
 }
@@ -241,6 +243,7 @@ fn agent_broker() -> Broker {
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
+    broker.pin_table(instance(), &table());
     broker
         .open_native_connection(
             GatewayConnectionId::new(1),

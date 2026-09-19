@@ -19,7 +19,7 @@ use kr_protocol::ids::{
     MethodTableVersion, PluginId, PublisherId, SessionId, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::Durability;
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, ConnectionOrigin, Credential, ManagedProcess,
@@ -110,6 +110,7 @@ fn table() -> DeclarativeTable {
         request_id_field: "id".to_owned(),
         response_id_field: "id".to_owned(),
         method_field: "method".to_owned(),
+        params_field: "params".to_owned(),
         result_field: "result".to_owned(),
         error_field: "error".to_owned(),
         entries: vec![
@@ -117,16 +118,19 @@ fn table() -> DeclarativeTable {
                 method: method("fs/write_text_file"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: method("session/request_permission"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: method("session/update"),
                 class: NativeMethodClass::Observation,
                 expects_response: false,
+                reverse: Nullable::null(),
             },
         ],
     }
@@ -187,6 +191,7 @@ fn gateway(path: Option<&std::path::Path>) -> Broker {
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
+    broker.pin_table(instance(2), &table());
     broker
         .open_native_connection(
             GatewayConnectionId::new(1),
@@ -471,6 +476,7 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
             Some(managed(instance(3))),
         )
         .expect("the instance is registered");
+    broker.pin_table(instance(3), &table());
     broker
         .open_native_connection(
             GatewayConnectionId::new(2),
@@ -553,6 +559,7 @@ fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_list
             "1",
         )
         .expect("a rich client connects");
+    broker.pin_table(instance(3), &table());
     broker
         .open_connection(
             GatewayConnectionId::new(3),
@@ -1128,6 +1135,7 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
             Some(managed(instance(3))),
         )
         .expect("the instance is registered");
+    broker.pin_table(instance(3), &table());
     broker
         .open_native_connection(
             GatewayConnectionId::new(2),
@@ -1407,6 +1415,7 @@ fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_i
     // A second upstream records its first request while the recovery is running. It has not said
     // what it holds either, so it joins what this recovery owes and finishing the first one does
     // not lift the fence.
+    broker.pin_table(instance(2), &table());
     broker
         .open_native_connection(
             GatewayConnectionId::new(2),

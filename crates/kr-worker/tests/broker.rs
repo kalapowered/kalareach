@@ -195,6 +195,7 @@ fn declarative_table() -> DeclarativeTable {
         request_id_field: "id".to_owned(),
         response_id_field: "id".to_owned(),
         method_field: "method".to_owned(),
+        params_field: "params".to_owned(),
         result_field: "result".to_owned(),
         error_field: "error".to_owned(),
         entries: vec![
@@ -202,11 +203,13 @@ fn declarative_table() -> DeclarativeTable {
                 method: permission_method(),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: UpstreamMethod::new("session/update").expect("valid"),
                 class: NativeMethodClass::Observation,
                 expects_response: false,
+                reverse: Nullable::null(),
             },
         ],
     }
@@ -248,6 +251,7 @@ fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker 
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
+    broker.pin_table(instance(2), &declarative_table());
     broker
         .open_native_connection(
             GatewayConnectionId::new(1),
@@ -526,6 +530,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
                 TimestampMs::new(1),
             )
             .expect("the binding is recorded");
+        broker.pin_table(instance(2), &declarative_table());
         broker
             .open_native_connection(
                 GatewayConnectionId::new(1),
@@ -540,6 +545,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
 
         // Binding: a request of another application is not this binding's to interpret. The
         // frame is not a thing a caller names at all: the broker recorded it with the request.
+        broker.pin_table(instance(3), &declarative_table());
         broker
             .open_native_connection(
                 GatewayConnectionId::new(2),
@@ -1368,6 +1374,7 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
             )
             .expect("the binding is recorded");
 
+        broker.pin_table(instance(2), &declarative_table());
         broker
             .open_native_connection(
                 GatewayConnectionId::new(1),

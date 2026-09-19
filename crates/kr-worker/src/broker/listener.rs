@@ -27,6 +27,7 @@ use kr_protocol::broker::BinaryIdentity;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId};
 
+use crate::broker::endpoint::PeerIdentity;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::process::ManagedProcess;
 
@@ -108,9 +109,17 @@ impl ListenerAddress {
             // The directory decides who may connect, so it is checked before an address that
             // depends on it is handed out.
             crate::broker::process::check_private_directory(runtime_directory)?;
-            let address = Self::PrivateSocket(
-                runtime_directory.join(format!("agent-{}.sock", kr_ipc::new_uuid())),
-            );
+            // The name is short on purpose. A socket path has a small fixed bound on every Unix,
+            // and a runtime directory a person chose can already be most of it, so the part this
+            // host adds stays out of the way: enough of a fresh identifier not to collide, and no
+            // more.
+            let name: String = kr_ipc::new_uuid()
+                .to_string()
+                .chars()
+                .filter(char::is_ascii_hexdigit)
+                .take(12)
+                .collect();
+            let address = Self::PrivateSocket(runtime_directory.join(format!("a-{name}.sock")));
             debug_assert!(address.is_local());
             Ok(address)
         } else {
@@ -234,27 +243,47 @@ impl Registration {
     /// process is the one this host launched, and the credential is the one this host generated
     /// for that launch. An environment session identifier is not one of the three.
     ///
+    /// The first two come from [`PeerIdentity`], which only a bound endpoint produces. That is the
+    /// difference between deciding and knowing: a bridge that names somebody else's process is
+    /// refused because the kernel named its own, not because it was asked to be honest. Where the
+    /// platform has no private socket the kernel names no peer, and there the credential is the
+    /// whole authentication and the identity the bridge presents is compared with the launch; that
+    /// case is the one [`PeerIdentity::from_operating_system`] reports.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] naming which of the three failed.
     pub fn authenticate(
         &self,
         hello: &BridgeHello,
-        peer_is_owner: bool,
+        peer: &PeerIdentity,
         process: &ManagedProcess,
     ) -> Result<()> {
-        if !peer_is_owner {
+        if !peer.is_owner() {
             return Err(BrokerError::denied(
                 "this connection is not the operating-system user who owns the session",
             ));
         }
-        if !hello.process.matches(&self.expected_process) {
+        // Where the kernel can name the peer, an identity it did not name is not one this host
+        // admits. Otherwise the presented identity that loopback needs would become a way past
+        // the check on a platform that never needed it.
+        if cfg!(unix) && !peer.from_operating_system() {
+            return Err(BrokerError::denied(
+                "this platform names the process on a private socket, and this connection was \
+                 admitted without one",
+            ));
+        }
+        // On a private socket this is the kernel's reading of the connecting process. On loopback
+        // the kernel names none, so the identity the bridge presents is what is compared, and the
+        // credential below is what makes the comparison worth anything.
+        let connecting = peer.process().unwrap_or(&hello.process);
+        if !connecting.matches(&self.expected_process) {
             return Err(BrokerError::denied(format!(
                 "this connection is process {} and the launch was process {}",
-                hello.process.pid, self.expected_process.pid
+                connecting.pid, self.expected_process.pid
             )));
         }
-        if !process.authenticates(hello.credential.expose(), &hello.process) {
+        if !process.authenticates(hello.credential.expose(), connecting) {
             return Err(BrokerError::denied(
                 "this connection did not present the private exchange of the launch it claims",
             ));
@@ -361,6 +390,12 @@ mod tests {
         )
     }
 
+    /// The peer a bound endpoint would report, built here so the unit tests can state which
+    /// process the kernel named. The endpoint that actually reads one is the integration suite's.
+    fn kernel_peer(process: ProcessStartIdentity) -> PeerIdentity {
+        PeerIdentity::from_kernel(process, true)
+    }
+
     fn registration() -> Registration {
         Registration::new(
             ListenerAddress::PrivateSocket("/run/kr/agent-1.sock".into()),
@@ -396,7 +431,7 @@ mod tests {
         let registration = registration();
         let managed = managed(process(41, 900));
         registration
-            .authenticate(&hello(), true, &managed)
+            .authenticate(&hello(), &kernel_peer(process(41, 900)), &managed)
             .expect("the launch binding and the private exchange are both there");
 
         // The session identifier, and nothing else.
@@ -406,7 +441,9 @@ mod tests {
             environment_session_id: None,
         };
         assert!(
-            registration.authenticate(&bare, true, &managed).is_err(),
+            registration
+                .authenticate(&bare, &kernel_peer(process(41, 900)), &managed)
+                .is_err(),
             "an environment-variable session identifier is not authentication"
         );
 
@@ -418,14 +455,18 @@ mod tests {
         };
         assert!(
             registration
-                .authenticate(&elsewhere, true, &managed)
+                .authenticate(&elsewhere, &kernel_peer(process(42, 900)), &managed)
                 .is_err()
         );
 
         // The right process from the wrong user.
         assert!(
             registration
-                .authenticate(&hello(), false, &managed)
+                .authenticate(
+                    &hello(),
+                    &PeerIdentity::presented(Some(process(41, 900)), false),
+                    &managed
+                )
                 .is_err()
         );
 
@@ -437,7 +478,7 @@ mod tests {
         };
         assert!(
             registration
-                .authenticate(&recycled, true, &managed)
+                .authenticate(&recycled, &kernel_peer(process(41, 901)), &managed)
                 .is_err()
         );
     }

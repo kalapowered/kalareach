@@ -443,6 +443,15 @@ export type ConnectReply =
       refused: ProtocolError
     }
 /**
+ * What an upstream reverse request asks the host to do.
+ *
+ * Section 12: KalaReach executes these "in the agent's host environment with its existing user
+ * identity, not accidentally in the phone or another desktop client's filesystem". The type
+ * exists so that the execution site is part of the contract rather than an implementation
+ * accident.
+ */
+export type ReverseOperation = 'filesystem_read' | 'filesystem_write' | 'terminal'
+/**
  * An upstream method name, as a connector's declarative or rich table names it.
  */
 export type UpstreamMethod = string
@@ -7177,6 +7186,14 @@ export interface DeclarativeTable {
    */
   method_field: string
   /**
+   * The member a request carries its parameters in.
+   *
+   * Core code encodes a rich mutation into this member. Without it the core would know where to
+   * read an identifier and a method and would still have nowhere to put what the operation
+   * actually asks for.
+   */
+  params_field: string
+  /**
    * A plugin identifier from its manifest.
    */
   plugin_id: string
@@ -7223,6 +7240,15 @@ export interface DeclarativeEntry {
    * The upstream method this entry classifies.
    */
   method: string
+  /**
+   * What this method asks the host to perform, when it asks for anything.
+   *
+   * Section 12 has the upstream ask this host for filesystem and terminal operations, and they
+   * run in the agent's own host environment. Which of its methods ask for that is a fact about
+   * the protocol, so the qualified table states it rather than leaving the core to guess from a
+   * method name.
+   */
+  reverse: ReverseOperation | null
 }
 /**
  * What a decoder offered, and every check the broker made before believing it.

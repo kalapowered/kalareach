@@ -186,6 +186,13 @@ pub struct DeclarativeEntry {
     ///
     /// A reverse request creates a pending resource; a notification does not.
     pub expects_response: bool,
+    /// What this method asks the host to perform, when it asks for anything.
+    ///
+    /// Section 12 has the upstream ask this host for filesystem and terminal operations, and they
+    /// run in the agent's own host environment. Which of its methods ask for that is a fact about
+    /// the protocol, so the qualified table states it rather than leaving the core to guess from a
+    /// method name.
+    pub reverse: Nullable<ReverseOperation>,
 }
 
 /// A connector's qualified declarative table.
@@ -214,6 +221,12 @@ pub struct DeclarativeTable {
     pub response_id_field: String,
     /// The member of a frame that carries its method name.
     pub method_field: String,
+    /// The member a request carries its parameters in.
+    ///
+    /// Core code encodes a rich mutation into this member. Without it the core would know where to
+    /// read an identifier and a method and would still have nowhere to put what the operation
+    /// actually asks for.
+    pub params_field: String,
     /// The member a successful response carries its result in.
     pub result_field: String,
     /// The member a failed response carries its error in.
@@ -233,10 +246,20 @@ impl DeclarativeTable {
             "request_id_field" => &self.request_id_field,
             "response_id_field" => &self.response_id_field,
             "method_field" => &self.method_field,
+            "params_field" => &self.params_field,
             "result_field" => &self.result_field,
             "error_field" => &self.error_field,
             _ => "",
         }
+    }
+
+    /// Returns what one method asks this host to perform, when it asks for anything.
+    #[must_use]
+    pub fn reverse_of(&self, method: &UpstreamMethod) -> Option<ReverseOperation> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.method == method)
+            .and_then(|entry| entry.reverse.as_ref().copied())
     }
 
     /// Classifies one upstream method.
@@ -287,6 +310,7 @@ impl DeclarativeTable {
             ("request_id_field", &self.request_id_field),
             ("response_id_field", &self.response_id_field),
             ("method_field", &self.method_field),
+            ("params_field", &self.params_field),
             ("result_field", &self.result_field),
             ("error_field", &self.error_field),
             ("upstream_protocol_version", &self.upstream_protocol_version),
@@ -301,10 +325,14 @@ impl DeclarativeTable {
         // every bare identifier into a successful answer.
         for (first, second) in [
             ("response_id_field", "method_field"),
+            ("response_id_field", "params_field"),
             ("response_id_field", "result_field"),
             ("response_id_field", "error_field"),
+            ("method_field", "params_field"),
             ("method_field", "result_field"),
             ("method_field", "error_field"),
+            ("params_field", "result_field"),
+            ("params_field", "error_field"),
             ("result_field", "error_field"),
         ] {
             if self.member(first) == self.member(second) {
@@ -960,6 +988,7 @@ mod tests {
             request_id_field: "id".to_owned(),
             response_id_field: "id".to_owned(),
             method_field: "method".to_owned(),
+            params_field: "params".to_owned(),
             result_field: "result".to_owned(),
             error_field: "error".to_owned(),
             entries: vec![
@@ -967,11 +996,13 @@ mod tests {
                     method: method("session/request_permission"),
                     class: NativeMethodClass::Mutation,
                     expects_response: true,
+                    reverse: Nullable::null(),
                 },
                 DeclarativeEntry {
                     method: method("session/update"),
                     class: NativeMethodClass::Observation,
                     expects_response: false,
+                    reverse: Nullable::null(),
                 },
             ],
         }

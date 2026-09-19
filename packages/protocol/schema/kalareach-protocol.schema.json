@@ -6198,12 +6198,24 @@
         "method": {
           "$ref": "#/$defs/UpstreamMethod",
           "description": "The upstream method this entry classifies."
+        },
+        "reverse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReverseOperation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this method asks the host to perform, when it asks for anything.\n\nSection 12 has the upstream ask this host for filesystem and terminal operations, and they\nrun in the agent's own host environment. Which of its methods ask for that is a fact about\nthe protocol, so the qualified table states it rather than leaving the core to guess from a\nmethod name."
         }
       },
       "required": [
         "method",
         "class",
-        "expects_response"
+        "expects_response",
+        "reverse"
       ],
       "type": "object"
     },
@@ -6232,6 +6244,10 @@
         },
         "method_field": {
           "description": "The member of a frame that carries its method name.",
+          "type": "string"
+        },
+        "params_field": {
+          "description": "The member a request carries its parameters in.\n\nCore code encodes a rich mutation into this member. Without it the core would know where to\nread an identifier and a method and would still have nowhere to put what the operation\nactually asks for.",
           "type": "string"
         },
         "plugin_id": {
@@ -6273,6 +6289,7 @@
         "request_id_field",
         "response_id_field",
         "method_field",
+        "params_field",
         "result_field",
         "error_field",
         "entries"
@@ -21637,6 +21654,26 @@
         {
           "const": "outcome_unknown",
           "description": "Dispatch may have occurred. Never retry this action identifier; show the unknown result and\nrequire a new identifier for an explicit later user request.",
+          "type": "string"
+        }
+      ]
+    },
+    "ReverseOperation": {
+      "description": "What an upstream reverse request asks the host to do.\n\nSection 12: KalaReach executes these \"in the agent's host environment with its existing user\nidentity, not accidentally in the phone or another desktop client's filesystem\". The type\nexists so that the execution site is part of the contract rather than an implementation\naccident.",
+      "oneOf": [
+        {
+          "const": "filesystem_read",
+          "description": "Read a file.",
+          "type": "string"
+        },
+        {
+          "const": "filesystem_write",
+          "description": "Write a file.",
+          "type": "string"
+        },
+        {
+          "const": "terminal",
+          "description": "Run something in the session's terminal environment.",
           "type": "string"
         }
       ]

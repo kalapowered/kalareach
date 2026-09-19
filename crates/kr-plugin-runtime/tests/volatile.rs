@@ -15,7 +15,7 @@ use kr_protocol::gateway::{
     PendingState, check_transition,
 };
 use kr_protocol::ids::{MethodTableVersion, PluginId, PublisherId, UpstreamMethod};
-use kr_protocol::scalars::{Digest256, TimestampMs, U64};
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64};
 use kr_protocol::session::Durability;
 
 fn method(name: &str) -> UpstreamMethod {
@@ -46,6 +46,7 @@ fn table() -> DeclarativeTable {
         request_id_field: "id".to_owned(),
         response_id_field: "id".to_owned(),
         method_field: "method".to_owned(),
+        params_field: "params".to_owned(),
         result_field: "result".to_owned(),
         error_field: "error".to_owned(),
         entries: vec![
@@ -53,11 +54,13 @@ fn table() -> DeclarativeTable {
                 method: method("fs/write_text_file"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: method("session/update"),
                 class: NativeMethodClass::Observation,
                 expects_response: false,
+                reverse: Nullable::null(),
             },
         ],
     }

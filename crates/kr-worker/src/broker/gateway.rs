@@ -710,7 +710,7 @@ mod tests {
     use kr_protocol::identity::ProcessStartSource;
     use kr_protocol::ids::{MethodTableVersion, PluginId, PublisherId};
     use kr_protocol::rights::ActionRight;
-    use kr_protocol::scalars::{Digest256, Uuid};
+    use kr_protocol::scalars::{Digest256, Nullable, Uuid};
 
     fn instance() -> ApplicationInstanceId {
         ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
@@ -731,6 +731,7 @@ mod tests {
             request_id_field: "id".to_owned(),
             response_id_field: "id".to_owned(),
             method_field: "method".to_owned(),
+            params_field: "params".to_owned(),
             result_field: "result".to_owned(),
             error_field: "error".to_owned(),
             entries: vec![
@@ -738,16 +739,19 @@ mod tests {
                     method: method("fs/write_text_file"),
                     class: NativeMethodClass::Mutation,
                     expects_response: true,
+                    reverse: Nullable::null(),
                 },
                 DeclarativeEntry {
                     method: method("session/request_permission"),
                     class: NativeMethodClass::Mutation,
                     expects_response: true,
+                    reverse: Nullable::null(),
                 },
                 DeclarativeEntry {
                     method: method("session/update"),
                     class: NativeMethodClass::Observation,
                     expects_response: false,
+                    reverse: Nullable::null(),
                 },
             ],
         }
