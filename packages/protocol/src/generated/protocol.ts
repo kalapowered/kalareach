@@ -4310,6 +4310,7 @@ export interface SessionCreateParams {
    * KalaReach variables out of it, and execution-context values take precedence over it.
    */
   environment_snapshot: EnvironmentVariable[]
+  launch_profile: LaunchProfile
   /**
    * The palette this session starts with. Null takes the profile default.
    *
@@ -4351,6 +4352,48 @@ export interface EnvironmentVariable {
    * The value.
    */
   value: string
+}
+/**
+ * How this session starts its root shell and what may be launched inside it.
+ */
+export interface LaunchProfile {
+  /**
+   * The opt-in command integrations this session applies to interactive invocations.
+   */
+  command_integrations: CommandIntegration[]
+  /**
+   * Whether a host-authorised `shell.launch` may install a command in this session's editor.
+   *
+   * A profile that says no keeps everything else a managed session has — the fence, the
+   * empty-prompt end-of-file gesture, the attributed acceptance — and refuses the one operation
+   * that puts text a person did not type into their editor.
+   */
+  fenced_launch: boolean
+  /**
+   * Which startup files the root shell reads.
+   */
+  startup: 'host_default' | 'interactive' | 'login'
+}
+/**
+ * One agent's opt-in command integration.
+ *
+ * Section 12: where an agent needs integration flags, an explicitly enabled integration adds them
+ * to interactive invocations inside a managed root shell. The command name and the argument
+ * vector the person typed are preserved; the flags are added and nothing is removed or reordered.
+ */
+export interface CommandIntegration {
+  /**
+   * The command name this integration applies to, as typed.
+   */
+  command: string
+  /**
+   * Whether the user has enabled it. A disabled integration changes nothing.
+   */
+  enabled: boolean
+  /**
+   * The flags the agent needs, added to an interactive invocation.
+   */
+  flags: string[]
 }
 /**
  * The default foreground and background a client's bounded probe established.
@@ -13444,6 +13487,7 @@ export interface SessionCreateParams1 {
    * KalaReach variables out of it, and execution-context values take precedence over it.
    */
   environment_snapshot: EnvironmentVariable[]
+  launch_profile: LaunchProfile
   /**
    * The palette this session starts with. Null takes the profile default.
    *
@@ -13712,7 +13756,40 @@ export interface SessionReadResult {
    * The endpoint a local client can attach to, while the session is running.
    */
   endpoint: string | null
+  /**
+   * How this session starts its root shell and what may be launched inside it.
+   *
+   * Null for a session that has already closed, whose profile decides nothing any more.
+   */
+  launch_profile: LaunchProfile1 | null
   session: SessionSummary3
+}
+/**
+ * How a session starts its root shell and what may be launched inside it.
+ *
+ * Section 23 lists the launch profile among `shell.launch`'s preconditions, beside the terminal
+ * input right, the current input lease, a qualified root editor, an empty prompt behind a fence
+ * and the working-directory revision. It is the one of those six that is a decision about the
+ * session rather than a fact about the reader, which is why it is fixed when the session is
+ * created and read back wherever the session is described.
+ */
+export interface LaunchProfile1 {
+  /**
+   * The opt-in command integrations this session applies to interactive invocations.
+   */
+  command_integrations: CommandIntegration[]
+  /**
+   * Whether a host-authorised `shell.launch` may install a command in this session's editor.
+   *
+   * A profile that says no keeps everything else a managed session has — the fence, the
+   * empty-prompt end-of-file gesture, the attributed acceptance — and refuses the one operation
+   * that puts text a person did not type into their editor.
+   */
+  fenced_launch: boolean
+  /**
+   * Which startup files the root shell reads.
+   */
+  startup: 'host_default' | 'interactive' | 'login'
 }
 /**
  * What a client knows about one session.

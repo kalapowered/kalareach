@@ -114,6 +114,7 @@ fn create(
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         environment_snapshot: Vec::new(),
         palette: Nullable::null(),
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
 
@@ -675,6 +676,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     })
     .expect("opens the session");
     session.launch().expect("launches the shell");

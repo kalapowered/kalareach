@@ -43,6 +43,7 @@ fn configuration(host: &kr_ipc::testing::TempHost, script: &str) -> SessionConfi
         spool_directory: Some(host.environment().session_spool(session_id)),
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
 
@@ -1698,6 +1699,7 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
         worker_profile: WorkerProfile::HeadlessUser,
         environment_snapshot: Vec::<EnvironmentVariable>::new(),
         palette: Nullable(palette),
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
 
     for (request, expected) in [

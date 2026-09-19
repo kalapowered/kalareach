@@ -115,6 +115,7 @@ fn create_params(environment_id: EnvironmentId) -> SessionCreateParams {
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         environment_snapshot: Vec::new(),
         palette: Nullable::null(),
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
 

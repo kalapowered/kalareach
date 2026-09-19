@@ -181,6 +181,96 @@ impl fmt::Display for ShellMode {
     }
 }
 
+/// Whether a root shell reads the user's login startup as well as its interactive startup.
+///
+/// Section 7 states the platform defaults: macOS runs normal login startup, including any path
+/// changes it makes, and Linux does not unless a profile asks for it. That is a property of the
+/// session being created rather than of the shell package, so it travels with the create request.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellStartup {
+    /// Whatever the host platform does when nothing asks otherwise.
+    #[default]
+    HostDefault,
+    /// The interactive startup only.
+    Interactive,
+    /// The login startup as well.
+    Login,
+}
+
+impl ShellStartup {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostDefault => "host_default",
+            Self::Interactive => "interactive",
+            Self::Login => "login",
+        }
+    }
+}
+
+/// One agent's opt-in command integration.
+///
+/// Section 12: where an agent needs integration flags, an explicitly enabled integration adds them
+/// to interactive invocations inside a managed root shell. The command name and the argument
+/// vector the person typed are preserved; the flags are added and nothing is removed or reordered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommandIntegration {
+    /// The command name this integration applies to, as typed.
+    pub command: String,
+    /// The flags the agent needs, added to an interactive invocation.
+    pub flags: Vec<String>,
+    /// Whether the user has enabled it. A disabled integration changes nothing.
+    pub enabled: bool,
+}
+
+/// How a session starts its root shell and what may be launched inside it.
+///
+/// Section 23 lists the launch profile among `shell.launch`'s preconditions, beside the terminal
+/// input right, the current input lease, a qualified root editor, an empty prompt behind a fence
+/// and the working-directory revision. It is the one of those six that is a decision about the
+/// session rather than a fact about the reader, which is why it is fixed when the session is
+/// created and read back wherever the session is described.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchProfile {
+    /// Which startup files the root shell reads.
+    pub startup: ShellStartup,
+    /// Whether a host-authorised `shell.launch` may install a command in this session's editor.
+    ///
+    /// A profile that says no keeps everything else a managed session has — the fence, the
+    /// empty-prompt end-of-file gesture, the attributed acceptance — and refuses the one operation
+    /// that puts text a person did not type into their editor.
+    pub fenced_launch: bool,
+    /// The opt-in command integrations this session applies to interactive invocations.
+    pub command_integrations: Vec<CommandIntegration>,
+}
+
+impl Default for LaunchProfile {
+    fn default() -> Self {
+        Self {
+            startup: ShellStartup::HostDefault,
+            fenced_launch: true,
+            command_integrations: Vec::new(),
+        }
+    }
+}
+
 /// How a new session is presented locally.
 ///
 /// The three are mutually exclusive. `attach` is the default when standard input and output are
@@ -673,6 +763,8 @@ pub struct SessionCreateParams {
     /// afterwards only an authorised explicit change moves it. The provenance is recorded either
     /// way, so a palette query can say where the session's colours came from.
     pub palette: Nullable<PaletteRequest>,
+    /// How this session starts its root shell and what may be launched inside it.
+    pub launch_profile: LaunchProfile,
 }
 
 impl SessionCreateParams {
@@ -742,6 +834,10 @@ pub struct SessionReadResult {
     pub session: SessionSummary,
     /// The endpoint a local client can attach to, while the session is running.
     pub endpoint: Nullable<String>,
+    /// How this session starts its root shell and what may be launched inside it.
+    ///
+    /// Null for a session that has already closed, whose profile decides nothing any more.
+    pub launch_profile: Nullable<LaunchProfile>,
 }
 
 /// Parameters of `session.close`.
@@ -839,6 +935,7 @@ mod tests {
             worker_profile: crate::identity::WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::<EnvironmentVariable>::new(),
             palette,
+            launch_profile: LaunchProfile::default(),
         };
         let probed = Nullable::some(PaletteRequest::Probe(ProbedPalette {
             foreground: crate::projection::Rgb {

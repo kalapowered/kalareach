@@ -38,6 +38,14 @@ The presentation flags are mutually exclusive:
 
 Without a terminal and without a flag the command stops and asks for one, rather than choosing.
 
+Two flags decide the session's launch profile, which is fixed when the session is created and read
+back by `kr status`:
+
+| Flag | What happens |
+| --- | --- |
+| `--startup <host-default\|interactive\|login>` | Which startup files the root shell reads. The host default is login startup on macOS and the interactive startup alone elsewhere |
+| `--no-fenced-launch` | Refuse `shell.launch` in this session. The fence, the empty-prompt Ctrl-D and the attributed acceptance all stay; what goes is installing a command the person did not type |
+
 Where the session runs is a separate choice, and these two are mutually exclusive as well:
 
 | Flag | What happens |

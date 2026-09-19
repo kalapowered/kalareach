@@ -135,6 +135,7 @@ async fn worker() -> Worker {
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
@@ -915,6 +916,7 @@ async fn a_mutation_whose_admission_lapses_before_its_transaction_is_refused_ins
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
         })
         .expect("encodes"),
     };
@@ -1445,6 +1447,7 @@ async fn a_retry_reaches_its_retained_answer_after_its_window_stops_admitting_an
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
         })
         .expect("encodes"),
     };
@@ -1499,6 +1502,7 @@ async fn a_retained_action_is_disclosed_under_current_authority_and_not_under_wi
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
         })
         .expect("encodes"),
     };
@@ -1620,6 +1624,7 @@ async fn a_create_that_queues_past_its_lifetime_is_refused_without_starting_anyt
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
         })
         .expect("encodes"),
     };
@@ -1773,6 +1778,7 @@ async fn hosted_worker() -> Hosted {
                     worker_profile: WorkerProfile::HeadlessUser,
                     environment_snapshot: Vec::new(),
                     palette: Nullable::null(),
+                    launch_profile: kr_protocol::session::LaunchProfile::default(),
                 })
                 .expect("encodes"),
             };
@@ -1855,6 +1861,7 @@ async fn hosted_worker() -> Hosted {
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");

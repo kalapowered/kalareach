@@ -208,6 +208,7 @@ fn create_params(host: &Host) -> SessionCreateParams {
             name: "PATH".to_owned(),
             value: "/usr/bin:/bin".to_owned(),
         }],
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
 

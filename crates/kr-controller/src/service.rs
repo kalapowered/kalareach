@@ -4045,7 +4045,8 @@ impl Controller {
             let summary = self
                 .read_from_worker_within(&worker, Some(DEMAND_PATIENCE.min(left)))
                 .await
-                .ok();
+                .ok()
+                .map(|read| read.session);
             let Some(summary) = summary else {
                 // A worker that did not answer has not said its work ended, so what it last said
                 // stands. A worker whose process the kernel says is gone is different: it is not
@@ -4338,7 +4339,7 @@ impl Controller {
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
             match self.read_from_worker(&worker).await {
-                Ok(summary) => sessions.push(summary),
+                Ok(read) => sessions.push(read.session),
                 Err(_) => {
                     let _ = self.reconcile(worker.descriptor.session_id).await;
                 }
@@ -4374,10 +4375,11 @@ impl Controller {
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         if let Some(worker) = worker {
             match self.read_from_worker(&worker).await {
-                Ok(summary) => {
+                Ok(read) => {
                     return encode(&SessionReadResult {
-                        session: summary,
+                        session: read.session,
                         endpoint: Nullable::some(worker.endpoint.as_text()),
+                        launch_profile: read.launch_profile,
                     });
                 }
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
@@ -4404,6 +4406,7 @@ impl Controller {
                 encode(&SessionReadResult {
                     session: self.closed_session(&closure, display).await,
                     endpoint: Nullable::null(),
+                    launch_profile: Nullable::null(),
                 })
             }
             None => Err(ControllerError::UnknownSession {
@@ -4666,7 +4669,7 @@ impl Controller {
             .get(reservation.session_id)
             .cloned()
             .ok_or_else(|| ControllerError::supervision("the worker is not in the directory"))?;
-        let summary = self.read_from_worker(&worker).await?;
+        let summary = self.read_from_worker(&worker).await?.session;
         // A new session can be the work that justifies keeping this host awake, and the setting
         // decides whether it does. That is looked at beside this answer rather than before it:
         // what the host does about its own sleep policy is no reason to hold a caller's receipt.
@@ -4785,7 +4788,7 @@ impl Controller {
             .get(reservation.session_id)
             .cloned();
         if let Some(worker) = worker {
-            let summary = self.read_from_worker(&worker).await?;
+            let summary = self.read_from_worker(&worker).await?.session;
             return encode(&SessionCreateResult {
                 session: summary,
                 endpoint: Nullable::some(worker.endpoint.as_text()),
@@ -5500,7 +5503,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionSummary> {
+    async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionReadResult> {
         self.read_from_worker_within(worker, None).await
     }
 
@@ -5519,7 +5522,7 @@ impl Controller {
         &self,
         worker: &KnownWorker,
         patience: Option<std::time::Duration>,
-    ) -> Result<SessionSummary> {
+    ) -> Result<SessionReadResult> {
         let deadline = patience.map(|patience| tokio::time::Instant::now() + patience);
         let mut held = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, self.worker_client(worker))
@@ -5564,7 +5567,7 @@ impl Controller {
                 let read: SessionReadResult = value
                     .to_typed()
                     .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-                Ok(read.session)
+                Ok(read)
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }
@@ -6045,7 +6048,7 @@ mod a_create_that_launches_nothing {
     use kr_protocol::ids::{ActionId, ActionWindowId, BuildId, ConnectionId, RequestId};
     use kr_protocol::method::{Method, MethodVersion};
     use kr_protocol::scalars::{DurationMs, Nullable};
-    use kr_protocol::session::{Presentation, SessionCreateParams, ShellMode};
+    use kr_protocol::session::{LaunchProfile, Presentation, SessionCreateParams, ShellMode};
     use kr_transport::clock::ContinuousClock as _;
     use kr_transport::window::{AcceptedDeadline, DeadlineBound};
 
@@ -6087,6 +6090,7 @@ mod a_create_that_launches_nothing {
             worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
             palette: Nullable::null(),
+            launch_profile: LaunchProfile::default(),
         }
     }
 

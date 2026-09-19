@@ -79,6 +79,7 @@ fn configuration(host: &kr_ipc::testing::TempHost, mode: ShellMode) -> SessionCo
         spool_directory: Some(host.environment().session_spool(session_id)),
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
 
@@ -355,10 +356,24 @@ async fn wired() -> Wired {
 }
 
 async fn wired_with(mode: ShellMode, register: bool) -> Wired {
+    wired_profiled(
+        mode,
+        register,
+        kr_protocol::session::LaunchProfile::default(),
+    )
+    .await
+}
+
+async fn wired_profiled(
+    mode: ShellMode,
+    register: bool,
+    launch_profile: kr_protocol::session::LaunchProfile,
+) -> Wired {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let config = configuration(&temp, mode);
+    let mut config = configuration(&temp, mode);
+    config.launch_profile = launch_profile;
     let session_id = config.session_id;
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -995,6 +1010,52 @@ async fn an_accepted_line_names_the_client_that_typed_it_and_an_ambiguous_one_sa
     assert_eq!(
         DetachTarget::Ambiguous(AmbiguityReason::MixedContext).code(),
         Some(ErrorCode::AmbiguousAttachment)
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-23.38: the session's launch profile is one of the launch's preconditions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_profile_that_refuses_a_fenced_launch_installs_nothing() {
+    let mut wired = wired_profiled(
+        ShellMode::Managed,
+        true,
+        kr_protocol::session::LaunchProfile {
+            fenced_launch: false,
+            ..kr_protocol::session::LaunchProfile::default()
+        },
+    )
+    .await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+
+    let refused = client
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &ShellLaunchParams {
+                session_id: wired.session_id,
+                command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                expected_prompt_generation: fence.prompt_generation,
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("this session's profile admits no fenced launch");
+    assert_eq!(refused.code, ErrorCode::ShellIntegrationUnsupported);
+    assert!(
+        refused.message.contains("launch profile"),
+        "the refusal names the precondition that failed: {}",
+        refused.message
+    );
+    assert!(
+        !contains(&retained(&wired.runtime.session()), b"ls"),
+        "and nothing was written into the terminal"
     );
     wired.close().await;
 }

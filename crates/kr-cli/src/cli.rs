@@ -330,6 +330,46 @@ pub struct NewArguments {
     /// invisible session cannot probe because it has no terminal.
     #[arg(long)]
     pub palette: Option<String>,
+    /// Which startup files the root shell reads: `host-default`, `interactive` or `login`.
+    ///
+    /// The host default is login startup on macOS and the interactive startup alone elsewhere,
+    /// which is what section 7 states.
+    #[arg(long, default_value = "host-default")]
+    pub startup: String,
+    /// Refuse `shell.launch` in this session.
+    ///
+    /// Everything else a managed session has stays: the editor fence, the empty-prompt end-of-file
+    /// gesture and the attributed acceptance. What goes is the one operation that puts text the
+    /// person did not type into their editor.
+    #[arg(long)]
+    pub no_fenced_launch: bool,
+}
+
+impl NewArguments {
+    /// Returns the launch profile this invocation asks for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a usage failure when `--startup` names none of the three.
+    pub fn launch_profile(&self) -> Result<kr_protocol::session::LaunchProfile, crate::CliError> {
+        let startup = match self.startup.as_str() {
+            "host-default" | "host_default" => kr_protocol::session::ShellStartup::HostDefault,
+            "interactive" => kr_protocol::session::ShellStartup::Interactive,
+            "login" => kr_protocol::session::ShellStartup::Login,
+            other => {
+                return Err(crate::CliError::Usage(format!(
+                    "{other} is not a startup selection; use host-default, interactive or login"
+                )));
+            }
+        };
+        Ok(kr_protocol::session::LaunchProfile {
+            startup,
+            fenced_launch: !self.no_fenced_launch,
+            // Command integrations are configured for the environment rather than per invocation,
+            // and a session inherits what that configuration enables.
+            command_integrations: Vec::new(),
+        })
+    }
 }
 
 /// `kr attach`.

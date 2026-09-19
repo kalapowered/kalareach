@@ -453,6 +453,7 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
                 value: String::new(),
             },
         ],
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
 

@@ -162,6 +162,7 @@ async fn host_with(
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes,
         resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
     // The palette is chosen at creation, before anything has been produced. That is the only
@@ -2185,6 +2186,7 @@ async fn a_queue_too_small_for_any_screen_is_refused_when_it_is_asked_for() {
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");

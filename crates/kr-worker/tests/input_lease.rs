@@ -60,6 +60,7 @@ fn configuration(host: &kr_ipc::testing::TempHost, script: &str) -> SessionConfi
         spool_directory: Some(host.environment().session_spool(session_id)),
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
 

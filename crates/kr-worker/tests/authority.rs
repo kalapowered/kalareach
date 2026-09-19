@@ -79,6 +79,7 @@ async fn host_producing(generation: u64, script: &str) -> Host {
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");

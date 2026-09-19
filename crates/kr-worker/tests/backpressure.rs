@@ -91,6 +91,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: SEND_QUEUE_BYTES,
         resident_bytes: 4 * 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");

@@ -37,7 +37,7 @@ use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
 use kr_shell_integration::host::HostError;
 use kr_shell_integration::host::endpoint::HostEndpoint;
 use kr_shell_integration::host::package::{
-    PackageFault, PackageSet, ShellPackage, default_package_root,
+    PackageFault, PackageSet, ShellPackage, StartupMode, default_package_root,
 };
 use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
@@ -492,17 +492,19 @@ fn session_config(
         environment_id: specification.environment_id,
         display_number,
         shell: ShellCommand {
-            // A package declares the flags its interactive root shell is launched with, because
-            // they belong to that build rather than to the platform.
+            // A package declares the mechanisms its interactive root shell is launched with; which
+            // startup files that shell reads is the session's own decision, so the profile decides
+            // it and the package answers for that mode.
             arguments: package.map_or_else(
                 || interactive_arguments(&shell_path, create.presentation),
-                ShellPackage::interactive_flags,
+                |package| package.arguments(startup_mode(&create.launch_profile)),
             ),
             program: shell_path,
             cwd,
             environment: environment_pairs,
         },
         shell_mode: create.shell_mode,
+        launch_profile: create.launch_profile.clone(),
         worker_profile: create.worker_profile,
         desktop,
         dimensions,
@@ -510,6 +512,19 @@ fn session_config(
         spool_directory: Some(environment.session_spool(specification.session_id)),
         send_queue_bytes: DEFAULT_SEND_QUEUE_BYTES,
         resident_bytes: DEFAULT_RESIDENT_BYTES,
+    }
+}
+
+/// Returns the startup a session's profile asks a packaged shell for.
+///
+/// Section 7's defaults are the platform's: login startup on macOS, interactive only elsewhere. A
+/// profile that names one overrides that, which is how a Linux session asks for login startup and
+/// a macOS session asks not to have it.
+const fn startup_mode(profile: &kr_protocol::session::LaunchProfile) -> StartupMode {
+    match profile.startup {
+        kr_protocol::session::ShellStartup::HostDefault => StartupMode::for_host(),
+        kr_protocol::session::ShellStartup::Interactive => StartupMode::Interactive,
+        kr_protocol::session::ShellStartup::Login => StartupMode::Login,
     }
 }
 
@@ -588,3 +603,32 @@ fn detach_from_the_launcher() {
 /// the way the daemon starts it, which is where that decision belongs.
 #[cfg(not(unix))]
 const fn detach_from_the_launcher() {}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::session::{LaunchProfile, ShellStartup};
+
+    use super::{StartupMode, startup_mode};
+
+    /// KR-REQ-23.38: the profile decides which startup files the root shell reads.
+    #[test]
+    fn a_profile_that_names_a_startup_overrides_this_platforms_default() {
+        let profile = |startup| LaunchProfile {
+            startup,
+            ..LaunchProfile::default()
+        };
+        assert_eq!(
+            startup_mode(&profile(ShellStartup::HostDefault)),
+            StartupMode::for_host(),
+            "nothing asked, so section 7's platform default stands"
+        );
+        assert_eq!(
+            startup_mode(&profile(ShellStartup::Interactive)),
+            StartupMode::Interactive
+        );
+        assert_eq!(
+            startup_mode(&profile(ShellStartup::Login)),
+            StartupMode::Login
+        );
+    }
+}

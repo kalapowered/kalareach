@@ -3122,6 +3122,13 @@ impl WorkerService {
                                 .to_owned(),
                     });
                 }
+                if !session.config().launch_profile.fenced_launch {
+                    return Err(WorkerError::ShellIntegrationUnsupported {
+                        detail: "this session's launch profile does not admit a fenced launch, so \
+                                 no command is installed in its editor"
+                            .to_owned(),
+                    });
+                }
                 Ok(())
             }
             Method::AttachmentViewport => {
@@ -3534,6 +3541,7 @@ impl WorkerService {
         encode(&SessionReadResult {
             session: session.summary(),
             endpoint: Nullable(running.then(|| self.endpoint.as_text())),
+            launch_profile: Nullable(running.then(|| session.config().launch_profile.clone())),
         })
     }
 

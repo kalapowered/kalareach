@@ -67,6 +67,8 @@ pub struct SessionConfig {
     pub shell: ShellCommand,
     /// How the shell is integrated.
     pub shell_mode: ShellMode,
+    /// How this session starts its root shell and what may be launched inside it.
+    pub launch_profile: kr_protocol::session::LaunchProfile,
     /// How long the execution context lasts.
     pub worker_profile: WorkerProfile,
     /// The login session a desktop-bound worker is tied to.

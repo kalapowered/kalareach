@@ -153,6 +153,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Presentation::Terminal | Presentation::Invisible => None,
             };
+            let launch_profile = arguments.launch_profile()?;
             let params = SessionCreateParams {
                 environment_id: environment.environment_id,
                 presentation,
@@ -169,6 +170,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 // Chosen here, before anything connects, because a probe of this terminal is part
                 // of choosing it and a session's palette is fixed at creation.
                 palette: Nullable(palette),
+                launch_profile,
             };
             let outcome = client
                 .mutate(
