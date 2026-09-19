@@ -241,7 +241,8 @@ export const ACTION_RIGHTS: readonly ActionRight[] = [
   'session.close',
   'session.share',
   'automation.manage',
-  'host.manage'
+  'host.manage',
+  'voice.use'
 ]
 
 /**
