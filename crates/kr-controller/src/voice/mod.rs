@@ -226,6 +226,7 @@ impl VoiceModule {
                     &self
                         .coordinator
                         .grant(&params, authority_revision, now_ms)
+                        .await
                         .map_err(voice_error)?,
                 )
             }

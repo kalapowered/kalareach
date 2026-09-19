@@ -183,7 +183,7 @@ impl Coordinator {
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
-    pub fn grant(
+    pub async fn grant(
         &self,
         params: &VoiceGrantParams,
         authority_revision: kr_protocol::ids::AuthorityRevision,
@@ -216,11 +216,22 @@ impl Coordinator {
         let replaced = self
             .authority
             .standing_voice_grant(params.device_id, now_ms)?;
+        let mut ending: Vec<String> = Vec::new();
         if let Some(replaced) = replaced.as_ref() {
             self.authority.revoke(replaced.grant_id, now_ms)?;
             let mut state = self.state.lock().expect("the coordinator's state");
             for ended in state.sessions.stop_under(replaced.grant_id) {
                 state.ledger.forget_session(ended.voice_session_id);
+                if let Some(call_id) = ended.call_id {
+                    ending.push(call_id);
+                }
+            }
+        }
+        // Outside the lock, and after the authority is already gone: a call whose grant this
+        // change withdrew is finalised rather than left metering until its own deadline.
+        if let Some(provider) = self.provider.clone() {
+            for call_id in &ending {
+                self.close_unbound(&provider, call_id).await;
             }
         }
         let written = self.authority.issue(&planned.plan)?;
@@ -301,6 +312,22 @@ impl Coordinator {
             },
         )?;
 
+        let session_ids = match &planned.plan.session_selector {
+            kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.clone(),
+            // A grant over every session reaches every session, and each request is decided again
+            // against both grants. A grant over none reaches none, which is nothing to start.
+            kr_protocol::grant::SessionSelector::Any => self.sessions_of(&device_grant),
+            kr_protocol::grant::SessionSelector::None => CanonicalSet::from_iter([]),
+        };
+        if session_ids.is_empty() {
+            // Checked before the provider is asked, so a call is never created for a voice session
+            // that could reach nothing.
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideDeviceGrant,
+                "this device's grant covers no session, so a voice session would reach none",
+            ));
+        }
+
         let request = kr_client::services::voice::VoiceSessionRequest {
             offer_sdp: params.offer_sdp.clone(),
             host_id: self.environment_id.to_string(),
@@ -347,7 +374,13 @@ impl Coordinator {
             // The service answered with the call an earlier attempt already produced. Issuing a
             // second grant for it would leave two pieces of authority over one call, and stopping
             // either would leave the other standing. The caller is told to use the call it has.
-            self.close_unbound(&provider, &session.call_id).await;
+            //
+            // The call is closed only when nothing holds it. A call a live voice session is
+            // running under is that session's, and closing it here would end a call this host has
+            // just told the caller to go on using.
+            if !self.holds_call(&session.call_id) {
+                self.close_unbound(&provider, &session.call_id).await;
+            }
             return Ok(VoiceStartResult {
                 outcome: VoiceStartOutcome::Unavailable {
                     reason: "session_in_progress".to_owned(),
@@ -378,27 +411,6 @@ impl Coordinator {
                 return Err(error);
             }
         };
-        let session_ids = if planned.plan.session_ids.is_empty() {
-            // An empty list is not "every session there will ever be": it is the sessions the
-            // device's own grant covers, which is what the voice grant narrows. A grant that
-            // covers every session gives a voice session that reaches every session, and both are
-            // decided again on each request.
-            self.sessions_of(&device_grant)
-        } else {
-            planned.plan.session_ids.clone()
-        };
-        if session_ids.is_empty()
-            && !matches!(
-                device_grant.session_selector,
-                kr_protocol::grant::SessionSelector::Any
-            )
-        {
-            self.close_unbound(&provider, &session.call_id).await;
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideDeviceGrant,
-                "this device's grant covers no session, so a voice session would reach none",
-            ));
-        }
         let mut state = self.state.lock().expect("the coordinator's state");
         state.sessions.start(NewVoiceSession {
             voice_session_id,
@@ -437,6 +449,20 @@ impl Coordinator {
                 }),
             },
         })
+    }
+
+    /// Whether a live voice session is running under one broker call.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    fn holds_call(&self, call_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("the coordinator's state")
+            .sessions
+            .iter()
+            .any(|record| record.call_id.as_deref() == Some(call_id))
     }
 
     /// Ends a call this host could not bind to a voice session.

@@ -40,8 +40,12 @@ pub struct VoiceGrantPlan {
     pub recipient_device_id: DeviceId,
     /// The environment it covers.
     pub environment_id: EnvironmentId,
-    /// The sessions it covers, or every session the parent covers when empty.
-    pub session_ids: CanonicalSet<SessionId>,
+    /// The sessions it covers, exactly as the grant will select them.
+    ///
+    /// Resolved during planning rather than at the store: an empty request means the sessions the
+    /// device's own grant covers, which is what a voice grant narrows, and flattening that to
+    /// "every session" would widen it.
+    pub session_selector: SessionSelector,
     /// The voice actions it permits.
     pub actions: CanonicalSet<VoiceAction>,
     /// The rights those actions need, beside [`ActionRight::VoiceUse`].
@@ -67,13 +71,7 @@ impl VoiceGrantPlan {
             environment_selector: EnvironmentSelector::These {
                 environment_ids: [self.environment_id].into_iter().collect(),
             },
-            session_selector: if self.session_ids.is_empty() {
-                SessionSelector::Any
-            } else {
-                SessionSelector::These {
-                    session_ids: self.session_ids.iter().copied().collect(),
-                }
-            },
+            session_selector: self.session_selector.clone(),
             actions: self.rights.clone(),
             history: self.history.clone(),
             expiry: self.expiry,
@@ -163,13 +161,20 @@ pub fn plan_voice_grant(
         plan_expiry = device_grant.expiry;
     }
 
+    // An empty request takes the device's own selector, which is what the voice grant narrows.
+    let session_selector = if session_ids.is_empty() {
+        device_grant.session_selector.clone()
+    } else {
+        SessionSelector::These { session_ids }
+    };
+
     Ok(PlannedVoiceGrant {
         plan: VoiceGrantPlan {
             parent_grant_id,
             issuer_device_id,
             recipient_device_id: device_grant.recipient_device_id,
             environment_id,
-            session_ids,
+            session_selector,
             rights: VoiceAction::rights_for(&permitted),
             actions: permitted,
             // Never wider than the device's own history scope: the selection intersects the

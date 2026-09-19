@@ -268,6 +268,7 @@ impl Host {
                 self.revision(),
                 2,
             )
+            .await
             .expect("a standing voice grant")
             .grant_id
     }

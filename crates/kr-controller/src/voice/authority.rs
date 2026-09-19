@@ -125,7 +125,12 @@ impl VoiceAuthority for GrantAuthority {
             .grants()
             .issue(&GrantRecord {
                 grant: grant.clone(),
-                session_id: plan.session_ids.iter().copied().next(),
+                session_id: match &plan.session_selector {
+                    kr_protocol::grant::SessionSelector::These { session_ids } => {
+                        session_ids.iter().copied().next()
+                    }
+                    _ => None,
+                },
                 issued_at_ms: now_ms,
                 activated_at_ms: Some(now_ms),
                 revoked_at_ms: None,

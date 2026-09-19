@@ -614,6 +614,7 @@ async fn started(fixture: &Fixture, actions: Option<&[VoiceAction]>) -> VoiceSes
     fixture
         .coordinator
         .grant(&grant_params(actions), AuthorityRevision::new(1), 10_000)
+        .await
         .expect("a standing voice grant");
     let result = fixture
         .coordinator
@@ -644,12 +645,13 @@ fn refusal(outcome: &VoiceDelegationOutcome) -> (VoiceRefusal, String) {
 
 /// KR-REQ-15.21: the default voice grant permits section 15 ¶13's four actions, the change states
 /// which actions it permits, and broadening beyond the device's own grant narrows instead.
-#[test]
-fn the_default_voice_grant_permits_four_things_and_names_them() {
+#[tokio::test]
+async fn the_default_voice_grant_permits_four_things_and_names_them() {
     let fixture = fixture();
     let result = fixture
         .coordinator
         .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
         .expect("a standing voice grant");
 
     let names: Vec<&str> = result
@@ -676,6 +678,7 @@ fn the_default_voice_grant_permits_four_things_and_names_them() {
             AuthorityRevision::new(1),
             10_000,
         )
+        .await
         .expect("a narrowed voice grant");
     assert!(
         broadened
@@ -725,6 +728,7 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
     );
     coordinator
         .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
         .expect("a standing voice grant");
     let result = coordinator
         .start(
@@ -750,6 +754,7 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
     fixture
         .coordinator
         .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
         .expect("a standing voice grant");
     let result = fixture
         .coordinator
@@ -805,10 +810,70 @@ async fn a_replayed_answer_does_not_become_a_second_grant() {
         1,
         "the call this device already holds is the only one"
     );
+    assert!(
+        fixture.broker.closed().is_empty(),
+        "the call a live voice session is running under is not closed by a repeated start"
+    );
+}
+
+/// KR-REQ-15.01: a replayed answer for a call nothing holds is closed rather than left metering.
+#[tokio::test]
+async fn a_replayed_answer_for_a_call_nothing_holds_is_closed() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    fixture
+        .coordinator
+        .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 10_050)
+        .await
+        .expect("the call stops");
+    *fixture.broker.answer.lock().expect("the answer") = Answer::Replayed;
+
+    let result = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &start_params(),
+            AuthorityRevision::new(1),
+            10_100,
+        )
+        .await
+        .expect("an answer");
+    assert!(matches!(
+        result.outcome,
+        VoiceStartOutcome::Unavailable { .. }
+    ));
+    assert_eq!(
+        fixture.broker.closed(),
+        vec!["call-managed".to_owned(), "call-managed".to_owned()],
+        "the stop closed it once and the unbound replay closed it again"
+    );
+}
+
+/// KR-REQ-15.14: replacing a standing voice grant finalises the calls it withdrew.
+#[tokio::test]
+async fn replacing_a_standing_grant_closes_the_calls_it_withdrew() {
+    let fixture = fixture();
+    started(&fixture, None).await;
+    assert_eq!(fixture.coordinator.live_sessions(), 1);
+
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Navigate])),
+            AuthorityRevision::new(1),
+            10_200,
+        )
+        .await
+        .expect("a narrower standing voice grant");
+    assert_eq!(
+        fixture.coordinator.live_sessions(),
+        0,
+        "the calls under the grant this one replaces have ended"
+    );
     assert_eq!(
         fixture.broker.closed(),
         vec!["call-managed".to_owned()],
-        "the call the host could not bind is closed rather than left running"
+        "and the broker was told to finalise them"
     );
 }
 
@@ -820,6 +885,7 @@ async fn a_replaced_standing_grant_is_withdrawn_with_the_calls_under_it() {
     let first = fixture
         .coordinator
         .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
         .expect("a standing voice grant")
         .grant_id;
     let second = fixture
@@ -829,6 +895,7 @@ async fn a_replaced_standing_grant_is_withdrawn_with_the_calls_under_it() {
             AuthorityRevision::new(1),
             10_100,
         )
+        .await
         .expect("a narrower standing voice grant")
         .grant_id;
     assert_ne!(first, second);
@@ -846,6 +913,7 @@ async fn exhausted_capacity_reports_what_still_works() {
     fixture
         .coordinator
         .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
         .expect("a standing voice grant");
     let result = fixture
         .coordinator
