@@ -2789,6 +2789,35 @@
       ],
       "type": "object"
     },
+    "CaptureCount": {
+      "additionalProperties": false,
+      "description": "One class's counts in a captured tree or a diff read.",
+      "properties": {
+        "binary": {
+          "$ref": "#/$defs/U64",
+          "description": "How many of those hold content this host classified as binary."
+        },
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Their total size in bytes."
+        },
+        "class": {
+          "$ref": "#/$defs/PathClass",
+          "description": "The class."
+        },
+        "total": {
+          "$ref": "#/$defs/U64",
+          "description": "How many paths belong to it."
+        }
+      },
+      "required": [
+        "class",
+        "total",
+        "binary",
+        "byte_len"
+      ],
+      "type": "object"
+    },
     "CapturePolicy": {
       "additionalProperties": false,
       "description": "The whole policy one capture ran under.",
@@ -2849,8 +2878,8 @@
           "description": "What change the working tree held for it when it was captured."
         },
         "class": {
-          "$ref": "#/$defs/InclusionClass",
-          "description": "Which class of the working tree it belongs to."
+          "$ref": "#/$defs/PathClass",
+          "description": "Which part of the working tree it came from."
         },
         "content": {
           "$ref": "#/$defs/ContentClass",
@@ -3335,9 +3364,9 @@
           "description": "The digest that identifies this version exactly.\n\nTaken over the repository and workspace identity, the base revision, every captured path\nwith its content digest and mode, the exclusions and the capture policy. Two versions with\nthe same digest are the same captured work; a version whose digest differs is different\nwork, whatever else it shares."
         },
         "counts": {
-          "description": "One row per class, with exact counts.",
+          "description": "One row per class, with exact counts over the whole captured tree.",
           "items": {
-            "$ref": "#/$defs/PreviewCount"
+            "$ref": "#/$defs/CaptureCount"
           },
           "type": "array"
         },
@@ -5471,8 +5500,15 @@
           "type": "array"
         },
         "outcome": {
-          "$ref": "#/$defs/ApplyOutcomeClass",
-          "description": "Which of the five classes it came to."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplyOutcomeClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which of the five classes it came to.\n\nAbsent when nothing ran: a preflight that found the destination as the request expects has\nnot applied anything, and the five classes describe an apply that did. A preflight that\nfound a conflict is `DRAFT_CONFLICT` rather than a result, which is what section 14 asks\nfor, so this is absent exactly when the destination was as expected and nothing was\nwritten."
         },
         "progress": {
           "description": "Every path's progress, recorded before and after its write.",
@@ -5564,8 +5600,8 @@
           "description": "What change is held for it."
         },
         "class": {
-          "$ref": "#/$defs/InclusionClass",
-          "description": "Which class of the working tree it belongs to."
+          "$ref": "#/$defs/PathClass",
+          "description": "Which part of the working tree it came from."
         },
         "content": {
           "$ref": "#/$defs/ContentClass",
@@ -5665,7 +5701,7 @@
         "counts": {
           "description": "One row per class, with exact counts.",
           "items": {
-            "$ref": "#/$defs/PreviewCount"
+            "$ref": "#/$defs/CaptureCount"
           },
           "type": "array"
         },
@@ -7679,6 +7715,11 @@
         {
           "const": "unsupported",
           "description": "It is not file content: a symbolic link, a device, a socket, a submodule's own tree.",
+          "type": "string"
+        },
+        {
+          "const": "deleted",
+          "description": "The working tree has deleted it, so the captured tree does not hold it either.\n\nA deletion is carried by the path's absence. This says the absence is the user's own edit\nrather than something the capture could not read.",
           "type": "string"
         },
         {
@@ -12963,6 +13004,36 @@
     "ParamsValue": {
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
       "tsType": "unknown"
+    },
+    "PathClass": {
+      "description": "Which part of the working tree one captured path came from.\n\nThe project service's [`crate::project::InclusionClass`] names the four classes a *policy*\ndecides about. A captured tree also holds the ordinary tracked files that no policy decision\ntouches, so this has a member for them: a count of \"the tracked files\" is what tells a reader\nhow much of the tree is the base's own content.",
+      "oneOf": [
+        {
+          "const": "tracked",
+          "description": "A tracked file with no uncommitted change: the base's own content.",
+          "type": "string"
+        },
+        {
+          "const": "dirty_file",
+          "description": "A tracked file with an uncommitted change.",
+          "type": "string"
+        },
+        {
+          "const": "untracked_file",
+          "description": "A file Git neither tracks nor ignores.",
+          "type": "string"
+        },
+        {
+          "const": "generated_artefact",
+          "description": "A file an ignore rule covers, which is what a build usually produces.",
+          "type": "string"
+        },
+        {
+          "const": "submodule",
+          "description": "A submodule working tree.",
+          "type": "string"
+        }
+      ]
     },
     "PathConflict": {
       "additionalProperties": false,
@@ -24162,6 +24233,9 @@
     },
     "capability_record": {
       "$ref": "#/$defs/CapabilityRecord"
+    },
+    "capture_count": {
+      "$ref": "#/$defs/CaptureCount"
     },
     "change_manifest": {
       "$ref": "#/$defs/ChangeManifest"

@@ -4010,6 +4010,7 @@ dependencies = [
 name = "kr-changeset"
 version = "0.1.0"
 dependencies = [
+ "cap-std",
  "kr-cbor",
  "kr-ipc",
  "kr-project",

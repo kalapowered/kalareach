@@ -37,7 +37,7 @@ use crate::attention::{
 };
 use crate::authority::MethodEntry;
 use crate::changeset::{
-    ChangeSetVersionRecord, ChangeSetVersionSummary, ChangesetCaptureParams,
+    CaptureCount, ChangeSetVersionRecord, ChangeSetVersionSummary, ChangesetCaptureParams,
     ChangesetCaptureResult, ChangesetMaterializeParams, ChangesetMaterializeResult,
     ChangesetReadParams, ChangesetReadResult, DiffApplyParams, DiffApplyResult, DiffEntry,
     DiffReadParams, DiffReadResult, EvidenceReference, MaterialisationRecord,
@@ -442,6 +442,7 @@ pub fn protocol_schema() -> Value {
         // Immutable change sets: the captured version, its materialisations and the results
         // recorded against them, and the diff read, apply and revert contract. Appended for the
         // same reason: these are independent root messages that no earlier one refers to.
+        "capture_count" => CaptureCount,
         "change_set_version_record" => ChangeSetVersionRecord,
         "change_set_version_summary" => ChangeSetVersionSummary,
         "changeset_capture_params" => ChangesetCaptureParams,

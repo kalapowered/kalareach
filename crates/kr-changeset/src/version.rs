@@ -12,11 +12,12 @@
 //! anybody but the actor that produced it.
 
 use kr_protocol::changeset::{
-    CapturedPath, ContentOrigin, Exclusion, ExclusionReason, SourceConsistency, TreeSummary,
+    CaptureCount, CapturedPath, ContentOrigin, Exclusion, ExclusionReason, PathClass,
+    SourceConsistency, TreeSummary,
 };
 use kr_protocol::ids::{EnvironmentId, ProjectRepositoryId, WorkspaceId};
 use kr_protocol::project::{
-    ChangeKind, ContentClass, FilesystemIdentity, InclusionClass, InclusionPolicy, PreviewCount,
+    ChangeKind, ContentClass, FilesystemIdentity, InclusionClass, InclusionPolicy,
 };
 use kr_protocol::scalars::{Digest256, U64};
 use sha2::{Digest as _, Sha256};
@@ -33,8 +34,9 @@ const DOMAIN: &[u8] = b"kalareach.changeset.version.v1";
 ///
 /// This never travels on the wire: a captured tree can hold far more paths than one control frame
 /// carries, so what a caller receives is the identity, the exact counts and the changes, and this
-/// is what a materialisation is written from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// is what a materialisation is written from. It is stored beside the version's own row as
+/// canonical bytes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
     /// Every path of the captured tree, sorted by path.
     pub paths: Vec<CapturedPath>,
@@ -69,7 +71,7 @@ impl Manifest {
             deleted_paths: U64::new(
                 self.exclusions
                     .iter()
-                    .filter(|exclusion| exclusion.reason == ExclusionReason::Unsupported)
+                    .filter(|exclusion| exclusion.reason == ExclusionReason::Deleted)
                     .count() as u64,
             ),
         };
@@ -91,29 +93,24 @@ impl Manifest {
 
     /// Returns one row per class, with exact counts over the captured tree.
     #[must_use]
-    pub fn counts(&self) -> Vec<PreviewCount> {
-        InclusionClass::EVERY
+    pub fn counts(&self) -> Vec<CaptureCount> {
+        PathClass::EVERY
             .iter()
             .map(|class| {
-                let matching = self.paths.iter().filter(|entry| {
-                    if *class == InclusionClass::BinaryFile {
-                        entry.content == ContentClass::Binary
-                    } else {
-                        entry.class == *class
-                    }
-                });
                 let mut total = 0_u64;
+                let mut binary = 0_u64;
                 let mut bytes = 0_u64;
-                for entry in matching {
+                for entry in self.paths.iter().filter(|entry| entry.class == *class) {
                     total += 1;
+                    if entry.content == ContentClass::Binary {
+                        binary += 1;
+                    }
                     bytes = bytes.saturating_add(entry.byte_len.get());
                 }
-                PreviewCount {
+                CaptureCount {
                     class: *class,
                     total: U64::new(total),
-                    // Every path in a manifest is one the capture included; a path the policy left
-                    // out is an exclusion rather than an entry with a flag.
-                    included: U64::new(total),
+                    binary: U64::new(binary),
                     byte_len: U64::new(bytes),
                 }
             })
@@ -123,14 +120,26 @@ impl Manifest {
     /// Returns the paths whose content differs from the base revision.
     ///
     /// These are the included dirty, untracked and binary changes: what a reviewer looks at and
-    /// what an apply carries. A path read from a Git object that the base already held is not one
-    /// of them.
+    /// what an apply carries. An ordinary tracked file the base already held is not one of them,
+    /// whichever side this host read its content from.
     #[must_use]
     pub fn changes(&self) -> Vec<&CapturedPath> {
         self.paths
             .iter()
-            .filter(|entry| entry.origin == ContentOrigin::WorkingTree)
+            .filter(|entry| entry.class.is_change())
             .collect()
+    }
+
+    /// Returns true when every captured path's content came from an immutable Git object.
+    ///
+    /// This is what an atomic snapshot **is** here: the object identifiers came from one index
+    /// listing, which is one instant, and a Git object never changes once it exists. A capture
+    /// that read one byte from the live working tree is not one.
+    #[must_use]
+    pub fn wholly_from_git_objects(&self) -> bool {
+        self.paths
+            .iter()
+            .all(|entry| entry.origin == ContentOrigin::GitObject)
     }
 
     /// Refuses a manifest whose total exceeds what this host copies.
@@ -323,7 +332,7 @@ mod tests {
             executable: false,
             content: ContentClass::Text,
             origin,
-            class: InclusionClass::DirtyFile,
+            class: PathClass::DirtyFile,
             change: ChangeKind::Present,
             base_object_id: Nullable(None),
         }
@@ -363,7 +372,11 @@ mod tests {
         let mut manifest = Manifest {
             paths: vec![
                 path("src/main.rs", b"fn main() {}", ContentOrigin::WorkingTree),
-                path("README.md", b"a repository", ContentOrigin::GitObject),
+                {
+                    let mut tracked = path("README.md", b"a repository", ContentOrigin::GitObject);
+                    tracked.class = PathClass::Tracked;
+                    tracked
+                },
             ],
             exclusions: vec![Exclusion {
                 path: ".env".to_owned(),

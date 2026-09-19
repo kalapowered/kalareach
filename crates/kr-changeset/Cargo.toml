@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+cap-std.workspace = true
 kr-cbor.workspace = true
 kr-ipc.workspace = true
 kr-project = { workspace = true }
@@ -22,6 +23,13 @@ uuid.workspace = true
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+
+[features]
+# The seam a test uses to stop an apply exactly where a crash would stop it, so the journal can be
+# read afterwards. On by default so a plain `cargo test` reaches it; a binary that ships this crate
+# turns default features off, and nothing in the service ever sets it.
+default = ["fault-injection"]
+fault-injection = []
 
 [lints]
 workspace = true

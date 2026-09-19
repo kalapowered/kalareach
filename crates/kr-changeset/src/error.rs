@@ -67,8 +67,17 @@ pub enum ChangeSetError {
         /// Which limit, and what it is.
         detail: Diagnostic,
     },
-    /// A request field is malformed, or the request asks for something this host does not do.
+    /// A request field is malformed.
     InvalidArgument(Diagnostic),
+    /// A faithful interpretation of the request needs something this host does not do.
+    ///
+    /// Section 14: when faithful interpretation requires an ungranted helper, expose the
+    /// limitation instead of executing it under a read-only grant. This is that limitation
+    /// reaching the caller.
+    Unsupported {
+        /// What this host does not do, and what it established before saying so.
+        detail: Diagnostic,
+    },
     /// The project service refused, and its own code and sentence are carried through.
     ///
     /// Reading a repository, resolving a workspace and every Git invocation belong to the project
@@ -97,6 +106,7 @@ impl ChangeSetError {
             Self::WrongState { .. } => "WrongState",
             Self::QuotaExceeded { .. } => "QuotaExceeded",
             Self::InvalidArgument(_) => "InvalidArgument",
+            Self::Unsupported { .. } => "Unsupported",
             Self::Project { .. } => "Project",
         }
     }
@@ -118,6 +128,7 @@ impl ChangeSetError {
             | Self::WrongState { detail }
             | Self::QuotaExceeded { detail }
             | Self::InvalidArgument(detail)
+            | Self::Unsupported { detail }
             | Self::Project { detail, .. } => detail.as_str().to_owned(),
         }
     }
@@ -152,6 +163,7 @@ impl ChangeSetError {
             Self::WrongState { .. } => ErrorCode::ResourceUnavailable,
             Self::QuotaExceeded { .. } => ErrorCode::QuotaExceeded,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            Self::Unsupported { .. } => ErrorCode::UnsupportedCapability,
             Self::Project { code, .. } => *code,
         }
     }
@@ -247,6 +259,9 @@ mod tests {
                 detail: HOSTILE.into(),
             },
             ChangeSetError::InvalidArgument(HOSTILE.into()),
+            ChangeSetError::Unsupported {
+                detail: HOSTILE.into(),
+            },
             ChangeSetError::Project {
                 code: ErrorCode::RepositoryUntrusted,
                 detail: HOSTILE.into(),

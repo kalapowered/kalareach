@@ -36,9 +36,7 @@ use crate::ids::{
     ActionId, ActorId, ChangeSetId, ChangeSetVersion, EnvironmentId, MaterialisationId,
     ProjectRepositoryId, SessionId, WorkflowRunId, WorkspaceId,
 };
-use crate::project::{
-    ChangeKind, ContentClass, FilesystemIdentity, InclusionClass, InclusionPolicy, PreviewCount,
-};
+use crate::project::{ChangeKind, ContentClass, FilesystemIdentity, InclusionPolicy};
 use crate::scalars::{Digest256, Nullable, TimestampMs, U64};
 
 /// How many entries a change-set record lists before it says how many more there are.
@@ -123,6 +121,75 @@ impl SourceConsistency {
     }
 }
 
+/// Which part of the working tree one captured path came from.
+///
+/// The project service's [`crate::project::InclusionClass`] names the four classes a *policy*
+/// decides about. A captured tree also holds the ordinary tracked files that no policy decision
+/// touches, so this has a member for them: a count of "the tracked files" is what tells a reader
+/// how much of the tree is the base's own content.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PathClass {
+    /// A tracked file with no uncommitted change: the base's own content.
+    Tracked,
+    /// A tracked file with an uncommitted change.
+    DirtyFile,
+    /// A file Git neither tracks nor ignores.
+    UntrackedFile,
+    /// A file an ignore rule covers, which is what a build usually produces.
+    GeneratedArtefact,
+    /// A submodule working tree.
+    Submodule,
+}
+
+impl PathClass {
+    /// Every class, in the order a record lists them.
+    pub const EVERY: &'static [Self] = &[
+        Self::Tracked,
+        Self::DirtyFile,
+        Self::UntrackedFile,
+        Self::GeneratedArtefact,
+        Self::Submodule,
+    ];
+
+    /// Returns the wire name of this class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tracked => "tracked",
+            Self::DirtyFile => "dirty_file",
+            Self::UntrackedFile => "untracked_file",
+            Self::GeneratedArtefact => "generated_artefact",
+            Self::Submodule => "submodule",
+        }
+    }
+
+    /// Returns true when a path of this class is a change against the base revision.
+    ///
+    /// Everything but an ordinary tracked file is. This is what decides which paths a record
+    /// lists as changes and which an apply carries.
+    #[must_use]
+    pub const fn is_change(self) -> bool {
+        !matches!(self, Self::Tracked)
+    }
+}
+
+/// One class's counts in a captured tree or a diff read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureCount {
+    /// The class.
+    pub class: PathClass,
+    /// How many paths belong to it.
+    pub total: U64,
+    /// How many of those hold content this host classified as binary.
+    pub binary: U64,
+    /// Their total size in bytes.
+    pub byte_len: U64,
+}
+
 /// Where one captured path's content came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -153,8 +220,8 @@ pub struct CapturedPath {
     pub content: ContentClass,
     /// Where it was read from.
     pub origin: ContentOrigin,
-    /// Which class of the working tree it belongs to.
-    pub class: InclusionClass,
+    /// Which part of the working tree it came from.
+    pub class: PathClass,
     /// What change the working tree held for it when it was captured.
     pub change: ChangeKind,
     /// The Git object the base revision holds for this path, when it has one.
@@ -173,6 +240,11 @@ pub enum ExclusionReason {
     SecretRule,
     /// It is not file content: a symbolic link, a device, a socket, a submodule's own tree.
     Unsupported,
+    /// The working tree has deleted it, so the captured tree does not hold it either.
+    ///
+    /// A deletion is carried by the path's absence. This says the absence is the user's own edit
+    /// rather than something the capture could not read.
+    Deleted,
     /// This host could not read it.
     Unreadable,
 }
@@ -186,6 +258,7 @@ impl ExclusionReason {
             Self::Grant => "grant",
             Self::SecretRule => "secret_rule",
             Self::Unsupported => "unsupported",
+            Self::Deleted => "deleted",
             Self::Unreadable => "unreadable",
         }
     }
@@ -334,8 +407,8 @@ pub struct ChangeSetVersionRecord {
     pub provenance: Provenance,
     /// What the captured tree holds.
     pub summary: TreeSummary,
-    /// One row per class, with exact counts.
-    pub counts: Vec<PreviewCount>,
+    /// One row per class, with exact counts over the whole captured tree.
+    pub counts: Vec<CaptureCount>,
     /// The paths whose content differs from the base, bounded by [`MAX_CHANGESET_ENTRIES`].
     pub changes: Vec<CapturedPath>,
     /// How many changed paths the list above left out.
@@ -861,8 +934,8 @@ pub struct DiffReadParams {
 pub struct DiffEntry {
     /// The path, relative to the repository's top level.
     pub path: String,
-    /// Which class of the working tree it belongs to.
-    pub class: InclusionClass,
+    /// Which part of the working tree it came from.
+    pub class: PathClass,
     /// What change is held for it.
     pub change: ChangeKind,
     /// What its content is.
@@ -910,7 +983,7 @@ pub struct DiffReadResult {
     /// How many entries the two lists left out. The counts still cover them.
     pub omitted_entries: U64,
     /// One row per class, with exact counts.
-    pub counts: Vec<PreviewCount>,
+    pub counts: Vec<CaptureCount>,
     /// What this read cannot promise, in the host's own words.
     pub limitations: Vec<String>,
     /// When it was taken.
@@ -956,7 +1029,13 @@ pub struct DiffApplyResult {
     /// The action it was performed under.
     pub action_id: ActionId,
     /// Which of the five classes it came to.
-    pub outcome: ApplyOutcomeClass,
+    ///
+    /// Absent when nothing ran: a preflight that found the destination as the request expects has
+    /// not applied anything, and the five classes describe an apply that did. A preflight that
+    /// found a conflict is `DRAFT_CONFLICT` rather than a result, which is what section 14 asks
+    /// for, so this is absent exactly when the destination was as expected and nothing was
+    /// written.
+    pub outcome: Nullable<ApplyOutcomeClass>,
     /// Where it was applied.
     pub destination: DestinationClass,
     /// The version the request carried.
@@ -1058,6 +1137,38 @@ mod tests {
         assert_eq!(PathProgressState::Planned.as_str(), "planned");
         assert_ne!(PathProgressState::Planned, PathProgressState::Skipped);
         assert_ne!(PathProgressState::Planned, PathProgressState::Unresolved);
+    }
+
+    #[test]
+    fn every_path_class_has_a_name_and_only_the_tracked_one_is_not_a_change() {
+        assert_eq!(PathClass::EVERY.len(), 5);
+        let names: Vec<&str> = PathClass::EVERY
+            .iter()
+            .map(|class| class.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "tracked",
+                "dirty_file",
+                "untracked_file",
+                "generated_artefact",
+                "submodule"
+            ]
+        );
+        assert!(!PathClass::Tracked.is_change());
+        for class in &PathClass::EVERY[1..] {
+            assert!(class.is_change(), "{} is a change", class.as_str());
+        }
+    }
+
+    #[test]
+    fn a_deletion_has_a_reason_of_its_own_rather_than_reading_as_something_unreadable() {
+        // A path the user deleted and a path this host could not read are two different facts
+        // about a captured tree, and a reader has to be able to tell them apart.
+        assert_eq!(ExclusionReason::Deleted.as_str(), "deleted");
+        assert_ne!(ExclusionReason::Deleted, ExclusionReason::Unreadable);
+        assert_ne!(ExclusionReason::Deleted, ExclusionReason::Unsupported);
     }
 
     #[test]

@@ -370,6 +370,19 @@ export type ActionId = string
  */
 export type WorkspaceId = string
 /**
+ * What one apply or revert came to.
+ *
+ * Five classes and no sixth. A crash after one file reaches
+ * [`Self::InterruptedApply`] rather than [`Self::Applied`], because this host records
+ * [`Self::Applied`] only once every path it planned has been confirmed in the destination.
+ */
+export type ApplyOutcomeClass =
+  | 'preflight_conflict'
+  | 'applied'
+  | 'conflict_after_partial_writes'
+  | 'interrupted_apply'
+  | 'uncertain_outcome'
+/**
  * One upload or download transfer.
  */
 export type TransferId = string
@@ -1222,6 +1235,7 @@ export interface KalaReachProtocol {
   backup_generation_publication?: BackupGenerationPublication
   backup_writer_record?: BackupWriterRecord
   capability_record?: CapabilityRecord
+  capture_count?: CaptureCount
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
   change_set_version_record?: ChangeSetVersionRecord
@@ -3590,6 +3604,27 @@ export interface CapabilitySubject {
   terminal: string | null
 }
 /**
+ * One class's counts in a captured tree or a diff read.
+ */
+export interface CaptureCount {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  binary: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * The class.
+   */
+  class: 'tracked' | 'dirty_file' | 'untracked_file' | 'generated_artefact' | 'submodule'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total: string
+}
+/**
  * The exact set of changes one installation made, and how to undo them.
  */
 export interface ChangeManifest1 {
@@ -3666,9 +3701,9 @@ export interface ChangeSetVersionRecord {
    */
   content_digest: string
   /**
-   * One row per class, with exact counts.
+   * One row per class, with exact counts over the whole captured tree.
    */
-  counts: PreviewCount[]
+  counts: CaptureCount[]
   /**
    * The environment that owns it.
    */
@@ -3731,9 +3766,9 @@ export interface CapturedPath {
    */
   change: 'present' | 'deleted' | 'unmerged'
   /**
-   * Which class of the working tree it belongs to.
+   * Which part of the working tree it came from.
    */
-  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  class: 'tracked' | 'dirty_file' | 'untracked_file' | 'generated_artefact' | 'submodule'
   /**
    * What the content is, by Git's own test.
    */
@@ -3760,27 +3795,6 @@ export interface CapturedPath {
   path: string
 }
 /**
- * One class's counts in a preview.
- */
-export interface PreviewCount {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  byte_len: string
-  /**
-   * The class.
-   */
-  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  included: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  total: string
-}
-/**
  * One path a capture left out, and why.
  */
 export interface Exclusion {
@@ -3795,7 +3809,7 @@ export interface Exclusion {
   /**
    * Why it is not in the captured tree.
    */
-  reason: 'policy' | 'grant' | 'secret_rule' | 'unsupported' | 'unreadable'
+  reason: 'policy' | 'grant' | 'secret_rule' | 'unsupported' | 'deleted' | 'unreadable'
 }
 /**
  * The policy it was captured under.
@@ -4172,9 +4186,9 @@ export interface ChangeSetVersionRecord1 {
    */
   content_digest: string
   /**
-   * One row per class, with exact counts.
+   * One row per class, with exact counts over the whole captured tree.
    */
-  counts: PreviewCount[]
+  counts: CaptureCount[]
   /**
    * The environment that owns it.
    */
@@ -4605,9 +4619,9 @@ export interface ChangeSetVersionRecord2 {
    */
   content_digest: string
   /**
-   * One row per class, with exact counts.
+   * One row per class, with exact counts over the whole captured tree.
    */
-  counts: PreviewCount[]
+  counts: CaptureCount[]
   /**
    * The environment that owns it.
    */
@@ -6280,13 +6294,14 @@ export interface DiffApplyResult {
   limitations: string[]
   /**
    * Which of the five classes it came to.
+   *
+   * Absent when nothing ran: a preflight that found the destination as the request expects has
+   * not applied anything, and the five classes describe an apply that did. A preflight that
+   * found a conflict is `DRAFT_CONFLICT` rather than a result, which is what section 14 asks
+   * for, so this is absent exactly when the destination was as expected and nothing was
+   * written.
    */
-  outcome:
-    | 'preflight_conflict'
-    | 'applied'
-    | 'conflict_after_partial_writes'
-    | 'interrupted_apply'
-    | 'uncertain_outcome'
+  outcome: ApplyOutcomeClass | null
   /**
    * Every path's progress, recorded before and after its write.
    */
@@ -6448,9 +6463,9 @@ export interface DiffEntry {
    */
   change: 'present' | 'deleted' | 'unmerged'
   /**
-   * Which class of the working tree it belongs to.
+   * Which part of the working tree it came from.
    */
-  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  class: 'tracked' | 'dirty_file' | 'untracked_file' | 'generated_artefact' | 'submodule'
   /**
    * What its content is.
    */
@@ -6501,7 +6516,7 @@ export interface DiffReadResult {
   /**
    * One row per class, with exact counts.
    */
-  counts: PreviewCount[]
+  counts: CaptureCount[]
   /**
    * The environment that owns the subject.
    */
@@ -8619,6 +8634,27 @@ export interface InclusionPreview {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   unknown_content: string
+}
+/**
+ * One class's counts in a preview.
+ */
+export interface PreviewCount {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * The class.
+   */
+  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  included: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total: string
 }
 /**
  * One path an inclusion preview names.
