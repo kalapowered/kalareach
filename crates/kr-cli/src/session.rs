@@ -538,10 +538,7 @@ enum Outstanding {
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
     /// Where this terminal's window is now looking, after a scroll-back key.
-    ///
-    /// It carries how many whole screens this terminal had been given when it went out, because a
-    /// screen that arrived since is a newer answer to the same question.
-    Scrollback(u64),
+    Scrollback,
 }
 
 /// Runs the attachment's input, output and connection in one loop.
@@ -575,6 +572,8 @@ async fn drive(
     let mut owns_geometry = attached.owns_geometry;
     let mut resized = resized;
 
+    // Whether a bracketed paste is open, so that nothing inside one is read as a key.
+    let mut paste = PasteWatch::default();
     let mut sequence = 0_u64;
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
@@ -589,16 +588,12 @@ async fn drive(
     // the position the window has left, because the session answers them in the order they arrive
     // and the later one is the one it keeps.
     let mut requested: Option<Option<ViewportPosition>> = None;
-    // How many whole screens this terminal has been given. An answer about a request that was in
-    // flight while a newer screen arrived says nothing about where the window is now.
-    let mut screens = 0_u64;
     // Movement the person has asked for and the session has not answered yet, the step it was
     // measured with, and the size that report carried.
     let mut queued = 0_i64;
     let mut step = 1_u64;
     let mut dimensions_now = attached.dimensions;
-    // Whether a bracketed paste is open, so that nothing inside one is read as a key.
-    let mut paste = PasteWatch::default();
+
     // The output cursor of the last whole screen this terminal was given, which is how it tells a
     // screen the session had something new to say from one it asked for itself.
     let mut drawn_at: Option<u64> = None;
@@ -606,6 +601,10 @@ async fn drive(
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
     // was typed in.
+    // What the person typed while the terminal was being asked goes to the application like
+    // everything else, and past the paste watch like everything else: a delimiter among it is a
+    // delimiter, and what follows it is pasted text rather than one of this terminal's own keys.
+    paste.observe(&typed_during_the_probe);
     if !typed_during_the_probe.is_empty()
         && let Some(epoch) = epoch
     {
@@ -653,13 +652,6 @@ async fn drive(
                         // itself. The renderer is shared with the client library, so this terminal
                         // and the companion application put a canonical cell in the same place.
                         if crate::render::is_projection_event(notification.event_type.as_str()) {
-                            // A reset replaces the screen, so an answer about a request sent
-                            // before it describes a window that has since been drawn again.
-                            if notification.event_type.as_str()
-                                == kr_protocol::projection::PROJECTION_RESET_EVENT
-                            {
-                                screens = screens.saturating_add(1);
-                            }
                             let Some(event) =
                                 crate::render::decode(
                                     notification.event_type.as_str(),
@@ -743,7 +735,7 @@ async fn drive(
                                 {
                                     return AttachOutcome::Disconnected;
                                 }
-                                outstanding.insert(request_id, Outstanding::Scrollback(screens));
+                                outstanding.insert(request_id, Outstanding::Scrollback);
                             }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
@@ -834,9 +826,13 @@ async fn drive(
                                             ),
                                             position: Nullable(
                                                 requested.unwrap_or_else(|| {
-                                                    parked.map(|row| {
-                                                        ViewportPosition::Row(U64::new(row))
-                                                    })
+                                                    display
+                                                        .window_above_the_live_page()
+                                                        .flatten()
+                                                        .or(parked)
+                                                        .map(|row| {
+                                                            ViewportPosition::Row(U64::new(row))
+                                                        })
                                                 }),
                                             ),
                                         };
@@ -925,15 +921,11 @@ async fn drive(
                             // session has given up becomes the oldest one it still holds, and a
                             // row inside the live page becomes the live screen. The pages that
                             // cover it arrive as ordinary output.
-                            (Outstanding::Scrollback(asked_after), outcome) => {
+                            (Outstanding::Scrollback, outcome) => {
                                 if let kr_protocol::envelope::Outcome::Ok(value) = outcome
                                     && let Ok(result) = value.to_typed::<
                                         kr_protocol::attachment::AttachmentViewportResult,
                                     >()
-                                    // A whole screen arrived while this was in flight, and a
-                                    // screen says where the window is. An answer about a request
-                                    // older than that says where it was.
-                                    && screens == asked_after
                                 {
                                     parked = landed(result.position.0);
                                 }
@@ -966,7 +958,7 @@ async fn drive(
                                     {
                                         return AttachOutcome::Disconnected;
                                     }
-                                    outstanding.insert(request_id, Outstanding::Scrollback(screens));
+                                    outstanding.insert(request_id, Outstanding::Scrollback);
                                     requested = Some(position);
                                 }
                             }
@@ -1028,7 +1020,13 @@ async fn drive(
                         attachment_id,
                         dimensions,
                         position: Nullable(requested.unwrap_or_else(|| {
-                            parked.map(|row| ViewportPosition::Row(U64::new(row)))
+                            // The window this terminal is drawing, not the last thing an answer
+                            // said about it: a screen is newer than an answer that crossed it.
+                            display
+                                .window_above_the_live_page()
+                                .flatten()
+                                .or(parked)
+                                .map(|row| ViewportPosition::Row(U64::new(row)))
                         })),
                     };
                     (
@@ -1091,7 +1089,7 @@ async fn drive(
                     queued = queued.saturating_add(steps);
                     if !outstanding
                         .values()
-                        .any(|what| matches!(what, Outstanding::Scrollback(_)))
+                        .any(|what| matches!(what, Outstanding::Scrollback))
                     {
                         // A movement the window cannot make is spent rather than kept: a window on
                         // the live screen asked to go forward has nowhere to go, and holding that
@@ -1117,7 +1115,7 @@ async fn drive(
                         {
                             return AttachOutcome::Disconnected;
                         }
-                        outstanding.insert(request_id, Outstanding::Scrollback(screens));
+                        outstanding.insert(request_id, Outstanding::Scrollback);
                         requested = Some(position);
                         }
                     }
@@ -1130,7 +1128,14 @@ async fn drive(
                 // input outside the visible grid has no application effect. Whole reads again, for
                 // the same reason the keys are, and with the same limit: a report a read boundary
                 // cut in half, or one among other bytes, is forwarded like every other byte.
-                if !pasting && parked.is_some() && is_pointer_report(&bytes) {
+                // The screen decides this and not what an answer last said: what a click would
+                // address is what this terminal is drawing, and a screen is the session's own
+                // account of that.
+                let above_the_live_page = display
+                    .window_above_the_live_page()
+                    .flatten()
+                    .is_some();
+                if !pasting && above_the_live_page && is_pointer_report(&bytes) {
                     continue;
                 }
                 if bytes.is_empty() {
