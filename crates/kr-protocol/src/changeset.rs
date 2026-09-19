@@ -7,9 +7,11 @@
 //! * **A version is immutable and exactly identified.** [`ChangeSetVersionRecord`] carries the
 //!   repository and workspace identity, the base revision, the selected paths' content hashes,
 //!   the included dirty, untracked and binary changes, the exclusions, the capture policy and the
-//!   provenance. Its [`ChangeSetVersionRecord::content_digest`] is taken over all of that, so two
-//!   versions are the same version only when every one of those is the same. New edits produce a
-//!   new version; nothing mutates the subject of an earlier test or review.
+//!   provenance. New edits produce a new version; nothing mutates the subject of an earlier test
+//!   or review. What [`ChangeSetVersionRecord::content_digest`] commits to is stated exactly on
+//!   that field, and the **provenance is deliberately outside it**: two agents who captured the
+//!   same work under the same policy captured the same work, and a digest that said otherwise
+//!   would make a test result unusable by anybody but the actor that produced it.
 //! * **A capture says how consistent its source was.** [`SourceConsistency`] has three members and
 //!   no default, and a capture that read a live working tree file by file is never described as a
 //!   point-in-time snapshot. A workflow that needs the stronger class asks for it with
@@ -376,10 +378,17 @@ pub struct ChangeSetVersionRecord {
     pub version: ChangeSetVersion,
     /// The digest that identifies this version exactly.
     ///
-    /// Taken over the repository and workspace identity, the base revision, every captured path
-    /// with its content digest and mode, the exclusions and the capture policy. Two versions with
-    /// the same digest are the same captured work; a version whose digest differs is different
-    /// work, whatever else it shares.
+    /// It commits to exactly this list and nothing else: the environment, the repository and the
+    /// workspace this version was captured from, both filesystem identities, the base revision,
+    /// the consistency class, the inclusion policy's five choices, the grant's sorted prefixes and
+    /// the quiescence declaration, every captured path with its content digest, length, executable
+    /// bit, class, change kind and origin, and every exclusion with its reason. Two versions with
+    /// the same digest are the same captured work.
+    ///
+    /// What it does **not** commit to: the provenance, the label, the capture instant, the free
+    /// text of an exclusion's detail, and the Git object identifier a path's base side holds. The
+    /// first three are about who took this reading rather than what it is; the last two follow
+    /// from what is committed to, or are this host's own words about it.
     pub content_digest: Digest256,
     /// The label the caller gave the change set.
     pub label: String,

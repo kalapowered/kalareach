@@ -54,6 +54,14 @@ const SECRET_SUFFIXES: &[&str] = &[".jks", ".key", ".keystore", ".p12", ".pem", 
 /// than a list of the names people give keys.
 const SECRET_DIRECTORIES: &[&str] = &[".aws", ".gnupg", ".ssh"];
 
+/// The directory name whose contents are a repository's own administrative data.
+///
+/// Git reports an untracked nested repository as one directory, and a walk that descended into it
+/// would reach that repository's configuration, which holds its remotes and can hold a credential,
+/// and its object database, which holds every version of every file in it. None of that is the
+/// content of the tree this host was asked to capture.
+const ADMINISTRATIVE_DIRECTORY: &str = ".git";
+
 /// What the grant decided about one path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrantDecision {
@@ -61,6 +69,15 @@ pub enum GrantDecision {
     Permitted,
     /// It is not captured, for this reason.
     Refused(ExclusionReason),
+}
+
+/// Returns true when one path is a repository's own administrative data.
+///
+/// The match is on any component, so `nested/.git/config` is covered as surely as `.git/config`.
+#[must_use]
+pub fn is_administrative(path: &str) -> bool {
+    path.split('/')
+        .any(|component| component == ADMINISTRATIVE_DIRECTORY)
 }
 
 /// Returns true when a secret rule covers one path.
@@ -107,6 +124,9 @@ pub fn under(path: &str, prefix: &str) -> bool {
 /// cannot select its way past them; then the caller's exclusions; then its selection.
 #[must_use]
 pub fn decide(grant: &FileGrant, path: &str) -> GrantDecision {
+    if is_administrative(path) {
+        return GrantDecision::Refused(ExclusionReason::Unsupported);
+    }
     if is_secret(path) {
         return GrantDecision::Refused(ExclusionReason::SecretRule);
     }
@@ -174,6 +194,36 @@ mod tests {
                 "{path} is refused whatever the grant selects"
             );
         }
+    }
+
+    #[test]
+    fn a_repository_s_own_administrative_data_is_never_content() {
+        // Git reports an untracked nested repository as one directory. Descending into it would
+        // reach its configuration, which holds its remotes and can hold a credential, and its
+        // object database, which holds every version of every file in it.
+        let everything = FileGrant {
+            included_paths: vec![String::new()],
+            excluded_paths: Vec::new(),
+            secret_rules_applied: true,
+        };
+        for path in [
+            ".git/config",
+            ".git",
+            "nested/.git/config",
+            "nested/.git/objects/ab/cdef",
+            "vendor/thing/.git/HEAD",
+        ] {
+            assert!(is_administrative(path), "{path} is administrative data");
+            assert_eq!(
+                decide(&everything, path),
+                GrantDecision::Refused(ExclusionReason::Unsupported),
+                "{path} is refused whatever the grant selects"
+            );
+        }
+        // A path that merely starts with the same letters is content.
+        assert!(!is_administrative(".gitignore"));
+        assert!(!is_administrative("src/.gitattributes"));
+        assert_eq!(decide(&everything, ".gitignore"), GrantDecision::Permitted);
     }
 
     #[test]

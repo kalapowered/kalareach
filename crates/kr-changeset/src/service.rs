@@ -23,16 +23,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_project::identity::object_identity;
 use kr_project::store::RetainedRow;
-use kr_project::{OpenedRepository, ProjectService, RepositoryIdentity};
+use kr_project::{OpenedRepository, ProjectService};
 use kr_protocol::changeset::{
     ChangeSetVersionRecord, ChangeSetVersionSummary, EvidenceKind, EvidenceReference, Exclusion,
-    MAX_CHANGESET_ENTRIES, Provenance, VersionRef,
+    MAX_CHANGESET_ENTRIES, Provenance, SourceConsistency, VersionRef,
 };
 use kr_protocol::ids::{
     ChangeSetId, ChangeSetVersion, EnvironmentId, ProjectRepositoryId, WorkspaceId,
 };
 use kr_protocol::project::{
-    FilesystemIdentity, RetainedKind, WorkspaceReadParams, WorkspaceSummary,
+    FilesystemIdentity, IsolationMechanism, RetainedKind, WorkspaceReadParams, WorkspaceSummary,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_transfer::{AuthorisedDirectory, RelativeName};
@@ -76,8 +76,13 @@ pub struct ResolvedWorkspace {
     pub project_repository_id: ProjectRepositoryId,
     /// The path its working tree is at.
     pub path: PathBuf,
-    /// The two objects a record named.
-    pub identity: RepositoryIdentity,
+    /// The object the workspace's own working tree is.
+    pub work_tree: kr_transfer::ObjectIdentity,
+    /// The Git directory the record names, for a workspace that shares the project's repository.
+    ///
+    /// Absent for an independent clone, which is its own repository: requiring the project's Git
+    /// directory there would refuse a workspace this host created itself.
+    pub git_dir: Option<kr_transfer::ObjectIdentity>,
 }
 
 /// What one capture is asked for.
@@ -229,13 +234,16 @@ impl ChangeSetService {
                     .into(),
             });
         };
+        // An independent clone is its own repository, so its Git directory is not the project's
+        // and requiring it to be would refuse a workspace this host itself created. A shared tree
+        // and a linked worktree do share the project's Git directory, and there the identity is
+        // checked as well as the tree's.
+        let shares_repository = summary.isolation.0 != Some(IsolationMechanism::IndependentClone);
         Ok(ResolvedWorkspace {
             project_repository_id: summary.project_repository_id,
             path: PathBuf::from(&summary.display_path),
-            identity: RepositoryIdentity {
-                git_dir: object_identity(project.filesystem_identity),
-                work_tree: object_identity(tree),
-            },
+            work_tree: object_identity(tree),
+            git_dir: shares_repository.then(|| object_identity(project.filesystem_identity)),
             summary,
         })
     }
@@ -247,12 +255,52 @@ impl ChangeSetService {
     /// Returns whatever the project service returns, including `SOURCE_CHANGED` when the objects
     /// at the recorded path are not the ones the record named.
     pub fn open_repository(&self, resolved: &ResolvedWorkspace) -> Result<OpenedRepository> {
-        Ok(OpenedRepository::open_recorded(
-            self.project.profile(),
-            self.environment_id,
-            &resolved.path,
-            resolved.identity,
-        )?)
+        let opened =
+            OpenedRepository::open(self.project.profile(), self.environment_id, &resolved.path)?;
+        let found = opened.identity();
+        if found.work_tree != resolved.work_tree {
+            return Err(kr_project::ProjectError::IdentityChanged {
+                detail: format!(
+                    "this record names the working tree {}, and {} is the working tree {}; a \
+                     linked worktree is its own object and a record of one never covers another",
+                    resolved.work_tree,
+                    kr_project::git::redact(&resolved.path.display().to_string()),
+                    found.work_tree
+                )
+                .into(),
+            }
+            .into());
+        }
+        if let Some(git_dir) = resolved.git_dir
+            && found.git_dir != git_dir
+        {
+            return Err(kr_project::ProjectError::IdentityChanged {
+                detail: format!(
+                    "this workspace is a working copy of the repository {git_dir}, and the tree \
+                     at its recorded path belongs to the repository {}; a recorded identity is \
+                     the object rather than the path",
+                    found.git_dir
+                )
+                .into(),
+            }
+            .into());
+        }
+        Ok(opened)
+    }
+
+    /// Returns true when nothing this host knows of holds one workspace.
+    ///
+    /// The project service records every session and every automation run bound to a workspace,
+    /// and this is the one mechanism behind a quiesced capture that is not a declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the project service returns for the read.
+    pub fn nothing_holds(&self, workspace_id: WorkspaceId) -> Result<bool> {
+        let read = self
+            .project
+            .workspace_read(&WorkspaceReadParams { workspace_id })?;
+        Ok(read.workspace.bound_sessions.is_empty() && read.workspace.bound_runs.is_empty())
     }
 
     // ----- capture ------------------------------------------------------------------------------
@@ -266,14 +314,17 @@ impl ChangeSetService {
     pub fn capture(&self, order: &CaptureOrder<'_>) -> Result<(ChangeSetVersionRecord, bool)> {
         let resolved = self.resolve(order.workspace_id)?;
         let repository = self.open_repository(&resolved)?;
+        let workspace_id = order.workspace_id;
+        let quiet = || self.nothing_holds(workspace_id);
         let captured = capture(
             self.project.profile(),
             &repository,
             &self.objects,
             &order.request,
+            &quiet,
         )?;
         let now = kr_ipc::now_ms();
-        let (change_set_id, version, label) = {
+        let (change_set_id, label) = {
             let store = self.locked()?;
             match order.change_set_id {
                 Some(existing) => {
@@ -289,10 +340,7 @@ impl ChangeSetService {
                                 .into(),
                         ));
                     }
-                    let next = store
-                        .latest_version(existing)?
-                        .map_or(1, |latest| latest.get() + 1);
-                    (existing, ChangeSetVersion::new(next), row.label)
+                    (existing, row.label)
                 }
                 None => {
                     let fresh = ChangeSetId::new(kr_ipc::new_uuid());
@@ -304,12 +352,18 @@ impl ChangeSetService {
                         label: order.label.to_owned(),
                         created_at_ms: now,
                     })?;
-                    (fresh, ChangeSetVersion::new(1), order.label.to_owned())
+                    (fresh, order.label.to_owned())
                 }
             }
         };
-        let repository_identity = kr_project::identity::wire_identity(resolved.identity.git_dir);
-        let worktree_identity = kr_project::identity::wire_identity(resolved.identity.work_tree);
+        // Both identities come from the repository this capture actually read, which for an
+        // independent clone is the clone's own Git directory rather than the project's.
+        let opened = repository.identity();
+        let repository_identity = kr_project::identity::wire_identity(opened.git_dir);
+        let worktree_identity = kr_project::identity::wire_identity(opened.work_tree);
+        // The number is taken from a counter that only goes up, so a number a deleted version
+        // used is never handed out again and two captures never choose the same one.
+        let version = self.locked()?.reserve_version(change_set_id)?;
         let policy = kr_protocol::changeset::CapturePolicy {
             inclusion: *order.request.policy,
             grant: crate::grant::recorded(order.request.grant),
@@ -595,17 +649,13 @@ impl ChangeSetService {
         from: &ChangeSetVersionRecord,
         manifest: &Manifest,
         provenance: Provenance,
+        consistency: SourceConsistency,
         consistency_detail: String,
     ) -> Result<ChangeSetVersionRecord> {
         let now = kr_ipc::now_ms();
-        let version = {
-            let store = self.locked()?;
-            ChangeSetVersion::new(
-                store
-                    .latest_version(from.change_set_id)?
-                    .map_or(1, |latest| latest.get() + 1),
-            )
-        };
+        // From the same counter a capture takes its number from, so a derived version never
+        // collides with one and never reuses a number a deleted version used.
+        let version = self.locked()?.reserve_version(from.change_set_id)?;
         let mut included = from.policy.grant.included_paths.clone();
         included.sort();
         let mut excluded = from.policy.grant.excluded_paths.clone();
@@ -618,7 +668,7 @@ impl ChangeSetService {
                 repository_identity: from.repository_identity,
                 worktree_identity: from.worktree_identity,
                 base_revision: &from.base_revision,
-                consistency: from.consistency,
+                consistency,
                 policy: &from.policy.inclusion,
                 included_paths: &included,
                 excluded_paths: &excluded,
@@ -640,7 +690,7 @@ impl ChangeSetService {
             worktree_identity: from.worktree_identity,
             base_revision: from.base_revision.clone(),
             base_reference: from.base_reference.clone(),
-            consistency: from.consistency,
+            consistency,
             consistency_detail,
             policy: from.policy.clone(),
             provenance,
@@ -678,7 +728,7 @@ impl ChangeSetService {
                 change_set_id: from.change_set_id,
                 version,
                 content_digest: digest,
-                consistency: from.consistency,
+                consistency,
                 base_revision: from.base_revision.clone(),
                 derived_from: Some(from.version),
                 record: encode_stored(&record)?,
@@ -694,8 +744,12 @@ impl ChangeSetService {
 /// One thing that still holds a version, so a deletion has to account for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holder {
-    /// What kind of thing it is.
-    pub kind: EvidenceKind,
+    /// True when it is a pin the project service holds against the workspace.
+    ///
+    /// A pin lives in the project service's own store rather than this one, which is why it is
+    /// distinguished: it is checked before the transaction that removes a version rather than
+    /// inside it.
+    pub pinned: bool,
     /// What it is, in this host's own words.
     pub detail: String,
 }
@@ -713,81 +767,66 @@ impl ChangeSetService {
     /// Returns everything that still holds one version.
     ///
     /// Section 14: retention and pinning account for every materialisation and evidence reference
-    /// before deletion. This is that account, and [`Self::delete_version`] refuses while it is not
-    /// empty.
+    /// before deletion. This is that account for a caller that wants to show it. What acts on it
+    /// is [`Self::delete_version`], which counts again inside the transaction that removes the
+    /// version, so nothing recorded in between is lost.
     ///
     /// # Errors
     ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the journal cannot be read.
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the journal cannot be read, and whatever
+    /// the project service returns when its own pins cannot be read. A pin this host could not
+    /// read is never treated as no pin.
     pub fn holders(
         &self,
         change_set_id: ChangeSetId,
         version: ChangeSetVersion,
     ) -> Result<Vec<Holder>> {
         let mut held = Vec::new();
-        for record in crate::materialise::outstanding(
-            self,
-            VersionRef {
-                change_set_id,
-                version,
-            },
-        )? {
+        for pin in self.pins(change_set_id)? {
             held.push(Holder {
-                kind: EvidenceKind::Materialisation,
-                detail: format!(
-                    "materialisation {} at {} has not been released",
-                    record.materialisation_id,
-                    kr_project::git::redact(&record.directory_path)
-                ),
+                pinned: true,
+                detail: pin,
             });
         }
-        for reference in self.evidence(change_set_id, version)? {
-            // A materialisation's own evidence row is the materialisation, which is counted above
-            // from the materialisations themselves; counting it twice would report one thing as
-            // two.
-            if reference.kind == EvidenceKind::Materialisation {
-                continue;
-            }
+        for detail in self.locked()?.held_by_anything(change_set_id, version)? {
             held.push(Holder {
-                kind: reference.kind,
-                detail: reference.detail,
+                pinned: false,
+                detail,
             });
-        }
-        // A later version derived from this one names it in its own provenance, and a version
-        // whose parent is gone cannot say where it came from.
-        for summary in self.versions(change_set_id)? {
-            if summary.derived_from.0.is_some_and(|parent| {
-                parent.change_set_id == change_set_id && parent.version == version
-            }) {
-                held.push(Holder {
-                    kind: EvidenceKind::AppliedChange,
-                    detail: format!(
-                        "version {} of this change set is derived from this one",
-                        summary.version.get()
-                    ),
-                });
-            }
-        }
-        // A pin recorded against the workspace through the project service holds it too.
-        if let Ok(row) = self.locked()?.change_set(change_set_id)
-            && let Some(row) = row
-            && let Ok(retained) = self.project.retained(row.workspace_id)
-        {
-            for item in retained {
-                if item.kind == RetainedKind::PinnedChangeSet
-                    && item.change_set_id == Some(change_set_id)
-                {
-                    held.push(Holder {
-                        kind: EvidenceKind::ReviewAcknowledgement,
-                        detail: item.detail,
-                    });
-                }
-            }
         }
         Ok(held)
     }
 
+    /// Returns every pin the project service holds against this change set.
+    ///
+    /// A failure to read them is a failure, never an empty list: treating a store this host could
+    /// not reach as one holding nothing is how a pinned version gets deleted.
+    fn pins(&self, change_set_id: ChangeSetId) -> Result<Vec<String>> {
+        let row = self.locked()?.change_set(change_set_id)?.ok_or_else(|| {
+            ChangeSetError::UnknownVersion {
+                detail: format!("no change set {change_set_id}").into(),
+            }
+        })?;
+        Ok(self
+            .project
+            .retained(row.workspace_id)?
+            .into_iter()
+            .filter(|item| {
+                item.kind == RetainedKind::PinnedChangeSet
+                    && item.change_set_id == Some(change_set_id)
+            })
+            .map(|item| item.detail)
+            .collect())
+    }
+
     /// Deletes one version, once nothing holds it.
+    ///
+    /// The pin the project service holds is checked first, because it lives in another store; then
+    /// the change-set store counts what it holds and removes the version **in one transaction**,
+    /// so a materialisation, a result, an apply or a piece of evidence recorded in between is
+    /// counted rather than lost. What is left, and is written down rather than hidden: a pin
+    /// recorded in the project service between this host's reading of it and that transaction is
+    /// not covered, because the two stores do not share one.
     ///
     /// # Errors
     ///
@@ -797,19 +836,18 @@ impl ChangeSetService {
         change_set_id: ChangeSetId,
         version: ChangeSetVersion,
     ) -> Result<()> {
-        let held = self.holders(change_set_id, version)?;
-        if !held.is_empty() {
-            let named: Vec<String> = held.iter().map(|holder| holder.detail.clone()).collect();
+        let pinned = self.pins(change_set_id)?;
+        if !pinned.is_empty() {
             return Err(ChangeSetError::WrongState {
                 detail: format!(
-                    "this version is still held by {} thing(s), so it is not deleted: {}",
-                    held.len(),
-                    named.join("; ")
+                    "this version is pinned against its workspace, so it is not deleted: {}",
+                    pinned.join("; ")
                 )
                 .into(),
             });
         }
-        self.locked()?.delete_version(change_set_id, version)
+        self.locked()?
+            .delete_version_if_unheld(change_set_id, version)
     }
 }
 

@@ -293,7 +293,11 @@ fn a_version_is_not_deleted_while_anything_still_names_it() {
         .holders(version.change_set_id, version.version)
         .expect("the holders are read");
     assert_eq!(held.len(), 1);
-    assert_eq!(held[0].kind, EvidenceKind::Materialisation);
+    assert!(
+        held[0].detail.contains("materialisation"),
+        "the holder is the materialisation: {}",
+        held[0].detail
+    );
     let refusal = fixture
         .service()
         .delete_version(version.change_set_id, version.version)
@@ -323,7 +327,11 @@ fn a_version_is_not_deleted_while_anything_still_names_it() {
         .holders(version.change_set_id, version.version)
         .expect("the holders are read");
     assert_eq!(held.len(), 1);
-    assert_eq!(held[0].kind, EvidenceKind::ReviewAcknowledgement);
+    assert!(
+        held[0].detail.contains("evidence reference"),
+        "the holder is the acknowledgement: {}",
+        held[0].detail
+    );
     assert!(
         fixture
             .service()
@@ -403,5 +411,267 @@ fn a_pin_against_the_workspace_holds_the_version() {
     assert!(
         !held.is_empty(),
         "a pinned version is one a deletion has to account for"
+    );
+}
+
+/// KR-REQ-14.33: a run that writes a secret into its own copy does not get it stored in a derived
+/// version, because the grant and the secret rules apply to the re-read as they do to a capture.
+#[test]
+fn a_secret_a_run_left_behind_is_not_stored_in_a_derived_version() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "secretive");
+    let workspace = fixture.workspace("secretive");
+    let record = fixture.capture(workspace, &include_everything());
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the test copy",
+    )
+    .expect("the version is materialised");
+    let directory = Path::new(&made.directory_path);
+    std::fs::write(directory.join(".env"), b"API_TOKEN=a-secret-a-run-wrote\n")
+        .expect("the run writes a secret");
+    std::fs::write(directory.join("README.md"), b"and changes a file\n")
+        .expect("the run changes a file");
+
+    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
+        .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::DerivedVersion);
+    let Nullable(Some(tested)) = result.tested_version else {
+        panic!("a derived result names its version");
+    };
+    let manifest = fixture
+        .service()
+        .manifest(tested.change_set_id, tested.version)
+        .expect("its manifest");
+    assert!(
+        manifest.path(".env").is_none(),
+        "a secret rule covers it in a derived version too"
+    );
+    assert!(
+        !fixture
+            .service()
+            .objects()
+            .holds(kr_changeset::objects::digest_of(
+                b"API_TOKEN=a-secret-a-run-wrote\n"
+            ))
+            .expect("the store answers"),
+        "the secret's bytes never reached the content store"
+    );
+    // The change the run did make is recorded, and it is a change of the derived version.
+    let changed = manifest.path("README.md").expect("it is there");
+    assert_eq!(
+        fixture
+            .service()
+            .objects()
+            .get(changed.content_digest)
+            .expect("its content"),
+        b"and changes a file\n"
+    );
+    assert!(changed.class.is_change());
+}
+
+/// KR-REQ-14.34: something this host cannot represent in a version makes the tested source
+/// indeterminate rather than quietly missing from a derived one.
+#[test]
+fn a_link_a_run_added_makes_the_tested_source_indeterminate() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "linked");
+    let workspace = fixture.workspace("linked");
+    let record = fixture.capture(workspace, &include_everything());
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the test copy",
+    )
+    .expect("the version is materialised");
+    std::os::unix::fs::symlink(
+        "README.md",
+        Path::new(&made.directory_path).join("shortcut.md"),
+    )
+    .expect("the run adds a link");
+
+    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
+        .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+    assert_eq!(result.tested_version, Nullable(None));
+    assert!(
+        result.attestation.contains("cannot be established"),
+        "the attestation says so: {}",
+        result.attestation
+    );
+}
+
+/// KR-REQ-14.31, 14.32 and 14.34: a derived version's own metadata describes the derived version,
+/// not the one it came from.
+#[test]
+fn a_derived_version_describes_itself_rather_than_its_parent() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "describes");
+    let workspace = fixture.workspace("describes");
+    // The parent is an atomic snapshot of the base commit, which is the strongest class there is.
+    let record = fixture
+        .capture_with(
+            workspace,
+            &kr_protocol::project::InclusionPolicy::base_only(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            Some(kr_protocol::changeset::SourceConsistency::AtomicSnapshot),
+        )
+        .expect("the snapshot is taken");
+    assert_eq!(
+        record.consistency,
+        kr_protocol::changeset::SourceConsistency::AtomicSnapshot
+    );
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the test copy",
+    )
+    .expect("the version is materialised");
+    let directory = Path::new(&made.directory_path);
+    std::fs::write(directory.join("README.md"), b"the run changed it\n")
+        .expect("the run changes a file");
+    std::fs::remove_file(directory.join("src/lib.rs")).expect("the run removes a file");
+    std::fs::write(directory.join("added.txt"), b"and adds one\n").expect("the run adds a file");
+
+    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
+        .expect("the result is recorded");
+    let Nullable(Some(tested)) = result.tested_version else {
+        panic!("a derived result names its version");
+    };
+    let derived = fixture
+        .service()
+        .record(tested.change_set_id, Some(tested.version))
+        .expect("the derived version is readable");
+    // Its class is the one its own reading was, not the one its parent claimed.
+    assert_eq!(
+        derived.consistency,
+        kr_protocol::changeset::SourceConsistency::PerFileCapture,
+        "a version's consistency is a fact about how it was read"
+    );
+    assert!(
+        derived.consistency_detail.contains("one file at a time"),
+        "the detail says what was done: {}",
+        derived.consistency_detail
+    );
+    // The change the run made is a change of the derived version.
+    let changed = derived
+        .changes
+        .iter()
+        .find(|entry| entry.path == "README.md")
+        .expect("the changed file is named as a change");
+    assert!(changed.class.is_change());
+    // The addition is one too.
+    assert!(
+        derived
+            .changes
+            .iter()
+            .any(|entry| entry.path == "added.txt"),
+        "the added file is a change: {:?}",
+        derived
+            .changes
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    // And the removal is named rather than silently absent.
+    assert!(
+        derived
+            .exclusions
+            .iter()
+            .any(|entry| entry.path == "src/lib.rs"
+                && entry.reason == kr_protocol::changeset::ExclusionReason::Deleted),
+        "the removed file is named: {:?}",
+        derived.exclusions
+    );
+}
+
+/// KR-REQ-14.36: a result that attests nothing still holds the version it ran against, so that
+/// version is not deleted while the record of an indeterminate run names it.
+#[test]
+fn an_indeterminate_result_still_holds_the_version_it_ran_against() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "indeterminate");
+    let workspace = fixture.workspace("indeterminate");
+    let record = fixture.capture(workspace, &include_everything());
+    let version = reference(&record);
+    let made = materialise::materialise(
+        fixture.service(),
+        version,
+        MaterialisationPurpose::Test,
+        "the test copy",
+    )
+    .expect("the version is materialised");
+    std::fs::remove_dir_all(&made.directory_path).expect("the run removes its copy");
+    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
+        .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+    // The materialisation is released, so it no longer holds the version; the result still does.
+    materialise::release(fixture.service(), made.materialisation_id)
+        .expect("the release records itself");
+    let held = fixture
+        .service()
+        .holders(version.change_set_id, version.version)
+        .expect("the holders are read");
+    assert!(
+        !held.is_empty(),
+        "the record of a run against this version is something a deletion accounts for"
+    );
+    assert!(
+        fixture
+            .service()
+            .delete_version(version.change_set_id, version.version)
+            .is_err(),
+        "it is not deleted while that record names it"
+    );
+}
+
+/// KR-REQ-14.36: a release that finds something other than the object this host made removes
+/// nothing and says so, rather than recording a release it did not perform.
+#[test]
+fn a_release_that_finds_another_directory_removes_nothing() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "substituted");
+    let workspace = fixture.workspace("substituted");
+    let record = fixture.capture(workspace, &include_everything());
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the test copy",
+    )
+    .expect("the version is materialised");
+    let directory = Path::new(&made.directory_path);
+    // Somebody puts a different directory at the name, with somebody else's file in it.
+    let elsewhere = fixture.work().join("somebody-elses");
+    std::fs::create_dir_all(&elsewhere).expect("a directory made elsewhere");
+    std::fs::write(elsewhere.join("keep.txt"), b"somebody else's file\n").expect("their file");
+    std::fs::remove_dir_all(directory).expect("the materialisation is taken away");
+    std::fs::rename(&elsewhere, directory).expect("the substitute is moved in");
+
+    let failure = materialise::release(fixture.service(), made.materialisation_id)
+        .expect_err("a substitute is not released");
+    assert!(
+        failure
+            .to_string()
+            .contains("not the object this host made"),
+        "the refusal says why: {failure}"
+    );
+    assert_eq!(
+        std::fs::read(directory.join("keep.txt")).expect("their file is still there"),
+        b"somebody else's file\n",
+        "nothing of theirs was removed"
+    );
+    // And the materialisation still holds its version, because nothing established it is gone.
+    assert!(
+        !fixture
+            .service()
+            .holders(record.change_set_id, record.version)
+            .expect("the holders are read")
+            .is_empty()
     );
 }

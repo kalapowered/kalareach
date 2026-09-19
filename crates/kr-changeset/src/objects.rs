@@ -79,9 +79,11 @@ impl ObjectStore {
             .root
             .create_subdirectory(&RelativeName::parse(fan_out)?)?;
         let final_name = RelativeName::parse(leaf)?;
-        // A blob whose name is already taken is a blob whose content is already there, because the
-        // name is the digest of the content.
-        if shelf.occupied(&final_name)? {
+        // A name that is already taken is a blob whose content should already be there, because
+        // the name is the digest of the content. Should is not is: a damaged file, a directory or
+        // a link at that name would make this write report success and throw the valid bytes
+        // away, and every later read of it would fail. So what is there is read back first.
+        if shelf.occupied(&final_name)? && self.holds_exactly(digest)? {
             return Ok(digest);
         }
         // The temporary's name carries this process's own identity and a counter, so two captures
@@ -103,6 +105,16 @@ impl ObjectStore {
                 })?;
             handle.sync_all().map_err(ChangeSetError::storage)?;
         }
+        // What is at the name is either the content (a concurrent capture got there first, and a
+        // publication is a link from a complete temporary, so a name that exists holds whole
+        // content) or damage. Damage is replaced: the name **is** the digest of the content, so a
+        // file at it that hashes to something else is not content anything can be referring to,
+        // and leaving it would make every version that names this digest undeliverable. This is
+        // the one removal in this module, inside this service's own directory, of a name whose
+        // meaning this host has just read.
+        if shelf.occupied(&final_name)? {
+            shelf.remove(&final_name)?;
+        }
         // A link refuses an occupied name on every platform, so a concurrent capture that got
         // there first keeps its blob and this one removes its own temporary.
         let published = shelf.link_into(&temporary, &shelf, &final_name);
@@ -112,9 +124,27 @@ impl ObjectStore {
                 shelf.sync()?;
                 Ok(digest)
             }
-            // The name is taken, which for a content-addressed store means the content is there.
-            Err(_) if shelf.occupied(&final_name)? => Ok(digest),
-            Err(error) => Err(error.into()),
+            // A concurrent capture got there first. What it wrote is read back before this one
+            // reports success, for the same reason the first check does.
+            Err(_) if self.holds_exactly(digest)? => Ok(digest),
+            Err(error) => Err(ChangeSetError::StorageUnavailable {
+                detail: format!(
+                    "the object {hex} could not be published and what is at its name is not its \
+                     content: {error}"
+                )
+                .into(),
+            }),
+        }
+    }
+
+    /// Returns true when the store holds exactly the content one digest names.
+    ///
+    /// Reads the blob back and hashes it, which is what tells a blob that is there from a name
+    /// that is taken.
+    fn holds_exactly(&self, digest: Digest256) -> Result<bool> {
+        match self.get(digest) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
         }
     }
 
@@ -210,6 +240,33 @@ mod tests {
         let absent = digest_of(b"never written");
         assert!(!store.holds(absent).expect("the store answers"));
         assert!(store.get(absent).is_err(), "reading it is refused");
+    }
+
+    #[test]
+    fn a_damaged_blob_is_replaced_rather_than_accepted_as_deduplication() {
+        // A name that is taken is not evidence that the content is there. A write that found a
+        // damaged file at the digest's name and threw the valid bytes away would leave a version
+        // naming content the store cannot deliver.
+        let temporary = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let (store, _) = store(&temporary);
+        let digest = store.put(b"the captured content").expect("a write");
+        let hex = hex_of(digest);
+        let (fan_out, leaf) = hex.split_at(2);
+        let path = temporary
+            .path()
+            .join(OBJECTS_DIRECTORY)
+            .join(fan_out)
+            .join(leaf);
+        std::fs::write(&path, b"something else entirely").expect("the fixture damages the blob");
+        let again = store
+            .put(b"the captured content")
+            .expect("the write succeeds");
+        assert_eq!(again, digest);
+        assert_eq!(
+            store.get(digest).expect("the content is deliverable"),
+            b"the captured content",
+            "the valid bytes replaced the damaged ones"
+        );
     }
 
     #[test]

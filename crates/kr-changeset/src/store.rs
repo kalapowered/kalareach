@@ -25,7 +25,7 @@ use kr_protocol::ids::{
     WorkspaceId,
 };
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use crate::error::{ChangeSetError, Result};
 
@@ -106,6 +106,10 @@ pub struct MaterialisationRow {
 pub struct ResultRow {
     /// The materialisation it ran against.
     pub materialisation_id: MaterialisationId,
+    /// The change set whose version was materialised.
+    pub input_change_set_id: ChangeSetId,
+    /// The version that was materialised.
+    pub input_version: ChangeSetVersion,
     /// What was actually tested.
     pub tested_source: TestedSource,
     /// The version it attests, when it attests one.
@@ -245,6 +249,10 @@ impl Store {
                      project_repository_id BLOB NOT NULL,
                      workspace_id          BLOB NOT NULL,
                      label                 TEXT NOT NULL,
+                     -- The next version number this change set hands out. It only ever goes up,
+                     -- so a number a deleted version used is never handed out again and two
+                     -- captures of one change set never choose the same one.
+                     next_version          INTEGER NOT NULL DEFAULT 1,
                      created_at_ms         INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS versions (
@@ -371,8 +379,8 @@ impl Store {
             .execute(
                 "INSERT INTO change_sets
                    (change_set_id, environment_id, project_repository_id, workspace_id, label,
-                    created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    next_version, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
                 params![
                     uuid_bytes(row.change_set_id.get()),
                     uuid_bytes(row.environment_id.get()),
@@ -479,6 +487,51 @@ impl Store {
         Ok(highest.map(|value| ChangeSetVersion::new(value as u64)))
     }
 
+    /// Takes the next version number one change set hands out, and moves it on.
+    ///
+    /// Durable and monotonic: the number is written before the version that uses it exists, so a
+    /// capture that then fails leaves a gap rather than a number a later capture reuses, and two
+    /// captures of one change set never choose the same one. A version reference therefore names
+    /// one piece of work for as long as the change set exists, which is what an immutable
+    /// identified version means.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::UnknownVersion`] when there is no such change set, and
+    /// [`ChangeSetError::StoreUnavailable`] when the write fails or the counter would overflow.
+    pub fn reserve_version(&mut self, change_set_id: ChangeSetId) -> Result<ChangeSetVersion> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(ChangeSetError::store)?;
+        let current: i64 = transaction
+            .query_row(
+                "SELECT next_version FROM change_sets WHERE change_set_id = ?1",
+                params![uuid_bytes(change_set_id.get())],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ChangeSetError::store)?
+            .ok_or_else(|| ChangeSetError::UnknownVersion {
+                detail: format!("no change set {change_set_id}").into(),
+            })?;
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| ChangeSetError::StoreUnavailable {
+                detail: "this change set has handed out every version number there is".into(),
+            })?;
+        transaction
+            .execute(
+                "UPDATE change_sets SET next_version = ?2 WHERE change_set_id = ?1",
+                params![uuid_bytes(change_set_id.get()), next],
+            )
+            .map_err(ChangeSetError::store)?;
+        transaction.commit().map_err(ChangeSetError::store)?;
+        Ok(ChangeSetVersion::new(
+            u64::try_from(current).map_err(ChangeSetError::store)?,
+        ))
+    }
+
     /// Returns one version.
     ///
     /// # Errors
@@ -500,7 +553,8 @@ impl Store {
                         change_set_id,
                         version,
                         content_digest: digest_column(row, 0)?,
-                        consistency: consistency_of(&row.get::<_, String>(1)?),
+                        consistency: consistency_of(&row.get::<_, String>(1)?)
+                            .ok_or_else(|| unknown(1, "a consistency class"))?,
                         base_revision: row.get(2)?,
                         derived_from: row
                             .get::<_, Option<i64>>(3)?
@@ -535,7 +589,8 @@ impl Store {
                     change_set_id,
                     version: ChangeSetVersion::new(row.get::<_, i64>(0)? as u64),
                     content_digest: digest_column(row, 1)?,
-                    consistency: consistency_of(&row.get::<_, String>(2)?),
+                    consistency: consistency_of(&row.get::<_, String>(2)?)
+                        .ok_or_else(|| unknown(2, "a consistency class"))?,
                     base_revision: row.get(3)?,
                     derived_from: row
                         .get::<_, Option<i64>>(4)?
@@ -551,15 +606,89 @@ impl Store {
         Ok(rows)
     }
 
-    /// Removes one version, its object references and its evidence, in one transaction.
+    /// Returns everything inside this store that names one version.
     ///
-    /// Nothing here decides whether the removal is permitted; the service does, from what still
-    /// names the version.
+    /// Every count runs inside the caller's own transaction, so nothing can be recorded between
+    /// the counting and a removal that depends on it.
+    fn held_by(
+        transaction: &Transaction<'_>,
+        change_set_id: ChangeSetId,
+        version: ChangeSetVersion,
+    ) -> Result<Vec<String>> {
+        let set = uuid_bytes(change_set_id.get());
+        let number = version.get() as i64;
+        let mut held = Vec::new();
+        for (statement, what) in [
+            (
+                "SELECT COUNT(*) FROM materialisations
+                  WHERE change_set_id = ?1 AND version = ?2 AND released_at_ms IS NULL",
+                "materialisation(s) that have not been released",
+            ),
+            (
+                "SELECT COUNT(*) FROM evidence WHERE change_set_id = ?1 AND version = ?2
+                   AND kind <> 'materialisation'",
+                "evidence reference(s)",
+            ),
+            (
+                "SELECT COUNT(*) FROM versions WHERE change_set_id = ?1 AND derived_from = ?2",
+                "later version(s) derived from this one",
+            ),
+            (
+                "SELECT COUNT(*) FROM results r
+                   JOIN materialisations m ON m.materialisation_id = r.materialisation_id
+                  WHERE (m.change_set_id = ?1 AND m.version = ?2)
+                     OR (r.tested_change_set_id = ?1 AND r.tested_version = ?2)",
+                "recorded result(s)",
+            ),
+            (
+                "SELECT COUNT(*) FROM applies
+                  WHERE (change_set_id = ?1 AND version = ?2)
+                     OR (before_change_set_id = ?1 AND before_version = ?2)
+                     OR (after_change_set_id = ?1 AND after_version = ?2)",
+                "apply record(s) that name it",
+            ),
+        ] {
+            let count: i64 = transaction
+                .query_row(statement, params![set, number], |row| row.get(0))
+                .map_err(ChangeSetError::store)?;
+            if count > 0 {
+                held.push(format!("{count} {what}"));
+            }
+        }
+        Ok(held)
+    }
+
+    /// Returns everything inside this store that names one version, for a caller that shows it.
     ///
     /// # Errors
     ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn delete_version(
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn held_by_anything(
+        &mut self,
+        change_set_id: ChangeSetId,
+        version: ChangeSetVersion,
+    ) -> Result<Vec<String>> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(ChangeSetError::store)?;
+        let held = Self::held_by(&transaction, change_set_id, version)?;
+        transaction.commit().map_err(ChangeSetError::store)?;
+        Ok(held)
+    }
+
+    /// Removes one version, once nothing inside this store names it.
+    ///
+    /// The counting and the removal are **one transaction**, so nothing can record a
+    /// materialisation, a result, an apply or a piece of evidence between them. What this cannot
+    /// cover is the project service's own pin, which lives in another store; the service checks
+    /// that first and the reference says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::WrongState`] naming everything that still holds it, and
+    /// [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn delete_version_if_unheld(
         &mut self,
         change_set_id: ChangeSetId,
         version: ChangeSetVersion,
@@ -568,6 +697,16 @@ impl Store {
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        let held = Self::held_by(&transaction, change_set_id, version)?;
+        if !held.is_empty() {
+            return Err(ChangeSetError::WrongState {
+                detail: format!(
+                    "this version is still held, so it is not deleted: {}",
+                    held.join("; ")
+                )
+                .into(),
+            });
+        }
         let key = params![uuid_bytes(change_set_id.get()), version.get() as i64];
         for statement in [
             "DELETE FROM version_objects WHERE change_set_id = ?1 AND version = ?2",
@@ -652,7 +791,8 @@ impl Store {
                         materialisation_id,
                         change_set_id: ChangeSetId::new(uuid_column(row, 0)?),
                         version: ChangeSetVersion::new(row.get::<_, i64>(1)? as u64),
-                        purpose: purpose_of(&row.get::<_, String>(2)?),
+                        purpose: purpose_of(&row.get::<_, String>(2)?)
+                            .ok_or_else(|| unknown(2, "a materialisation purpose"))?,
                         record: row.get(3)?,
                         directory_name: row.get(4)?,
                         identity: kr_transfer::ObjectIdentity {
@@ -704,7 +844,8 @@ impl Store {
                         materialisation_id: MaterialisationId::new(uuid_column(row, 0)?),
                         change_set_id,
                         version,
-                        purpose: purpose_of(&row.get::<_, String>(1)?),
+                        purpose: purpose_of(&row.get::<_, String>(1)?)
+                            .ok_or_else(|| unknown(1, "a materialisation purpose"))?,
                         record: row.get(2)?,
                         directory_name: row.get(3)?,
                         identity: kr_transfer::ObjectIdentity {
@@ -776,10 +917,17 @@ impl Store {
                 ],
             )
             .map_err(ChangeSetError::store)?;
-        // A result that attests a version is evidence about that version. One that attests nothing
-        // is still accounted for, against the version that was materialised, because the record of
-        // an indeterminate run is exactly what a person has to see before that version goes.
-        if let Some((set, version)) = row.tested_version {
+        // A result is evidence about the version it ran against and about the version it
+        // attests, which are the same version only when the materialisation was unmodified.
+        // Both are written here, in the same transaction as the result itself: an indeterminate
+        // result is exactly what a person has to see before the version it ran against goes.
+        let mut named = vec![(row.input_change_set_id, row.input_version)];
+        if let Some((set, version)) = row.tested_version
+            && (set, version) != (row.input_change_set_id, row.input_version)
+        {
+            named.push((set, version));
+        }
+        for (set, version) in named {
             transaction
                 .execute(
                     "INSERT OR REPLACE INTO evidence
@@ -830,14 +978,11 @@ impl Store {
                     let number: Option<i64> = row.get(3)?;
                     Ok(ResultRow {
                         materialisation_id: MaterialisationId::new(uuid_column(row, 0)?),
-                        tested_source: tested_of(&row.get::<_, String>(1)?),
-                        tested_version: match (set, number) {
-                            (Some(set), Some(number)) => Some((
-                                ChangeSetId::new(uuid_of(&set)),
-                                ChangeSetVersion::new(number as u64),
-                            )),
-                            _ => None,
-                        },
+                        input_change_set_id: change_set_id,
+                        input_version: version,
+                        tested_source: tested_of(&row.get::<_, String>(1)?)
+                            .ok_or_else(|| unknown(1, "a tested-source class"))?,
+                        tested_version: pair(set, number)?,
                         record: row.get(4)?,
                         recorded_at_ms: TimestampMs::new(row.get::<_, i64>(5)? as u64),
                     })
@@ -899,7 +1044,8 @@ impl Store {
                     Ok(EvidenceRow {
                         change_set_id,
                         version,
-                        kind: evidence_of(&row.get::<_, String>(0)?),
+                        kind: evidence_of(&row.get::<_, String>(0)?)
+                            .ok_or_else(|| unknown(0, "an evidence kind"))?,
                         // The rule applies where a column is read as well as where it is written,
                         // because a store an earlier build wrote holds what that build composed.
                         detail: kr_project::git::redact(&row.get::<_, String>(1)?),
@@ -1010,7 +1156,8 @@ impl Store {
                 let after: Option<Vec<u8>> = row.get(3)?;
                 Ok(ProgressRow {
                     path: row.get(0)?,
-                    state: progress_of(&row.get::<_, String>(1)?),
+                    state: progress_of(&row.get::<_, String>(1)?)
+                        .ok_or_else(|| unknown(1, "a path progress state"))?,
                     before_digest: before.as_deref().and_then(digest_of_slice),
                     after_digest: after.as_deref().and_then(digest_of_slice),
                     detail: kr_project::git::redact(&row.get::<_, String>(4)?),
@@ -1138,11 +1285,16 @@ fn apply_row_offset(
         version: ChangeSetVersion::new(row.get::<_, i64>(offset + 1)? as u64),
         workspace_id: workspace
             .as_deref()
-            .map(|bytes| WorkspaceId::new(uuid_of(bytes))),
-        destination: destination_of(&row.get::<_, String>(offset + 3)?),
-        outcome: outcome.as_deref().map(outcome_of),
-        before_version: pair(before_set, before_version),
-        after_version: pair(after_set, after_version),
+            .map(|bytes| uuid_of(bytes, offset + 2).map(WorkspaceId::new))
+            .transpose()?,
+        destination: destination_of(&row.get::<_, String>(offset + 3)?)
+            .ok_or_else(|| unknown(offset + 3, "a destination class"))?,
+        outcome: outcome
+            .as_deref()
+            .map(|text| outcome_of(text).ok_or_else(|| unknown(offset + 4, "an outcome class")))
+            .transpose()?,
+        before_version: pair(before_set, before_version)?,
+        after_version: pair(after_set, after_version)?,
         staged_name: row.get(offset + 9)?,
         detail: kr_project::git::redact(&row.get::<_, String>(offset + 10)?),
         started_at_ms: TimestampMs::new(row.get::<_, i64>(offset + 11)? as u64),
@@ -1152,35 +1304,80 @@ fn apply_row_offset(
     })
 }
 
-fn pair(set: Option<Vec<u8>>, version: Option<i64>) -> Option<(ChangeSetId, ChangeSetVersion)> {
-    match (set, version) {
+fn pair(
+    set: Option<Vec<u8>>,
+    version: Option<i64>,
+) -> rusqlite::Result<Option<(ChangeSetId, ChangeSetVersion)>> {
+    Ok(match (set, version) {
         (Some(set), Some(version)) => Some((
-            ChangeSetId::new(uuid_of(&set)),
+            ChangeSetId::new(uuid_of(&set, 0)?),
             ChangeSetVersion::new(version as u64),
         )),
         _ => None,
-    }
+    })
 }
 
 fn uuid_bytes(value: Uuid) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
 
-fn uuid_of(bytes: &[u8]) -> Uuid {
-    let mut raw = [0_u8; 16];
-    let take = bytes.len().min(16);
-    raw[..take].copy_from_slice(&bytes[..take]);
-    Uuid::from_bytes(raw)
+/// Refuses a stored value this build cannot read.
+///
+/// One unreadable row is one row a reader is refused. The store still opens and every other row
+/// still reads: what this prevents is a damaged or later-written value becoming a plausible
+/// identifier, digest or class for something the store does not actually say.
+fn unreadable(index: usize, kind: rusqlite::types::Type, what: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        kind,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            what.to_owned(),
+        )),
+    )
+}
+
+/// Refuses a stored name this build does not write.
+fn unknown(index: usize, what: &str) -> rusqlite::Error {
+    unreadable(
+        index,
+        rusqlite::types::Type::Text,
+        &format!("{what} this store holds is not one this build writes"),
+    )
+}
+
+/// Decodes one stored identifier, refusing anything that is not one.
+///
+/// Padding a short value or truncating a long one would turn a damaged row into a plausible
+/// identifier for something else, and a reader would then be told about a version that is not the
+/// one the row is about.
+fn uuid_of(bytes: &[u8], index: usize) -> rusqlite::Result<Uuid> {
+    <[u8; 16]>::try_from(bytes)
+        .map(Uuid::from_bytes)
+        .map_err(|_| {
+            unreadable(
+                index,
+                rusqlite::types::Type::Blob,
+                "an identifier this store holds is not sixteen bytes",
+            )
+        })
 }
 
 fn uuid_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
     let bytes: Vec<u8> = row.get(index)?;
-    Ok(uuid_of(&bytes))
+    uuid_of(&bytes, index)
 }
 
+/// Decodes one stored digest, refusing anything that is not one.
 fn digest_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Digest256> {
     let bytes: Vec<u8> = row.get(index)?;
-    Ok(digest_of_slice(&bytes).unwrap_or_else(|| Digest256::from_bytes([0; 32])))
+    digest_of_slice(&bytes).ok_or_else(|| {
+        unreadable(
+            index,
+            rusqlite::types::Type::Blob,
+            "a digest this store holds is not thirty-two bytes",
+        )
+    })
 }
 
 fn digest_of_slice(bytes: &[u8]) -> Option<Digest256> {
@@ -1189,7 +1386,7 @@ fn digest_of_slice(bytes: &[u8]) -> Option<Digest256> {
 
 /// Declares the two directions of one stored vocabulary, so a name and its member cannot drift.
 macro_rules! vocabulary {
-    ($to:ident, $from:ident, $type:ty, $fallback:expr, $($member:ident => $name:literal),+ $(,)?) => {
+    ($to:ident, $from:ident, $type:ty, $($member:ident => $name:literal),+ $(,)?) => {
         /// Returns the stored name of one member.
         #[must_use]
         pub const fn $to(value: $type) -> &'static str {
@@ -1198,15 +1395,17 @@ macro_rules! vocabulary {
             }
         }
 
-        /// Returns the member one stored name stands for.
+        /// Returns the member one stored name stands for, or nothing when this build does not
+        /// know it.
         ///
-        /// A name this build does not know falls back rather than refusing the whole read, so one
-        /// unreadable row never makes a store unopenable.
+        /// A name this build does not write is a row this build cannot read, and a plausible enum
+        /// member in its place would tell a reader something the store does not say. The row is
+        /// refused; the store still opens and every other row still reads.
         #[must_use]
-        pub fn $from(text: &str) -> $type {
+        pub fn $from(text: &str) -> Option<$type> {
             match text {
-                $($name => <$type>::$member,)+
-                _ => $fallback,
+                $($name => Some(<$type>::$member),)+
+                _ => None,
             }
         }
     };
@@ -1216,7 +1415,6 @@ vocabulary!(
     consistency_text,
     consistency_of,
     SourceConsistency,
-    SourceConsistency::PerFileCapture,
     AtomicSnapshot => "atomic_snapshot",
     QuiescedCapture => "quiesced_capture",
     PerFileCapture => "per_file_capture",
@@ -1226,7 +1424,6 @@ vocabulary!(
     purpose_text,
     purpose_of,
     MaterialisationPurpose,
-    MaterialisationPurpose::Inspection,
     Test => "test",
     Review => "review",
     Inspection => "inspection",
@@ -1236,7 +1433,6 @@ vocabulary!(
     tested_text,
     tested_of,
     TestedSource,
-    TestedSource::Indeterminate,
     UnmodifiedVersion => "unmodified_version",
     DerivedVersion => "derived_version",
     Indeterminate => "indeterminate",
@@ -1246,7 +1442,6 @@ vocabulary!(
     evidence_text,
     evidence_of,
     EvidenceKind,
-    EvidenceKind::AppliedChange,
     ReviewAcknowledgement => "review_acknowledgement",
     TestResult => "test_result",
     Materialisation => "materialisation",
@@ -1257,7 +1452,6 @@ vocabulary!(
     destination_text,
     destination_of,
     DestinationClass,
-    DestinationClass::Proposal,
     Proposal => "proposal",
     VersionedReference => "versioned_reference",
     SharedExisting => "shared_existing",
@@ -1267,7 +1461,6 @@ vocabulary!(
     outcome_text,
     outcome_of,
     ApplyOutcomeClass,
-    ApplyOutcomeClass::UncertainOutcome,
     PreflightConflict => "preflight_conflict",
     Applied => "applied",
     ConflictAfterPartialWrites => "conflict_after_partial_writes",
@@ -1279,7 +1472,6 @@ vocabulary!(
     progress_text,
     progress_of,
     PathProgressState,
-    PathProgressState::Unresolved,
     Planned => "planned",
     Written => "written",
     Conflicted => "conflicted",
@@ -1508,27 +1700,19 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_name_this_build_does_not_know_falls_back_rather_than_refusing_the_read() {
-        // One unreadable row must not make a store unopenable, which is what a daemon that never
-        // starts comes to.
-        assert_eq!(
-            consistency_of("something a later build wrote"),
-            SourceConsistency::PerFileCapture
-        );
-        assert_eq!(
-            outcome_of("something a later build wrote"),
-            ApplyOutcomeClass::UncertainOutcome
-        );
-        assert_eq!(
-            progress_of("something a later build wrote"),
-            PathProgressState::Unresolved
-        );
+    fn a_stored_name_this_build_does_not_know_refuses_the_row_rather_than_standing_in_for_one() {
+        // A plausible enum member in place of a name this build does not write would tell a reader
+        // something the store does not say. The row is refused; the store still opens.
+        assert_eq!(consistency_of("something a later build wrote"), None);
+        assert_eq!(outcome_of("something a later build wrote"), None);
+        assert_eq!(progress_of("something a later build wrote"), None);
+        assert_eq!(evidence_of("something a later build wrote"), None);
         // And every name this build writes round-trips.
         for class in SourceConsistency::EVERY {
-            assert_eq!(consistency_of(consistency_text(*class)), *class);
+            assert_eq!(consistency_of(consistency_text(*class)), Some(*class));
         }
         for class in ApplyOutcomeClass::EVERY {
-            assert_eq!(outcome_of(outcome_text(*class)), *class);
+            assert_eq!(outcome_of(outcome_text(*class)), Some(*class));
         }
     }
 }

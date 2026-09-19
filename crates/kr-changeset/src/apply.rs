@@ -48,7 +48,7 @@ use kr_protocol::changeset::{
     AffectedVersion, ApplyOutcomeClass, CapturePolicy, CapturedPath, ChangeSetVersionRecord,
     ContentOrigin, DestinationClass, DiffApplyResult, DiffEntry, DiffReadResult, ExpectedReference,
     FileGrant, MAX_CHANGESET_ENTRIES, PathClass, PathConflict, PathProgress, PathProgressState,
-    Provenance, RecoveryObjects, ReferenceOutcome, VersionRef,
+    Provenance, RecoveryObjects, ReferenceOutcome, SourceConsistency, VersionRef,
 };
 use kr_protocol::ids::{ActionId, WorkspaceId};
 use kr_protocol::project::{ChangeKind, ContentClass, InclusionChoice, InclusionPolicy};
@@ -177,7 +177,7 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
         ));
     };
     let index = read_index(profile, &repository)?;
-    let status = read_status(profile, &repository)?;
+    let status = read_status(profile, &repository, &FileGrant::default())?;
     let mut tracked = Vec::new();
     let mut untracked = Vec::new();
     for entry in &status {
@@ -224,8 +224,8 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
         environment_id: service.environment_id(),
         project_repository_id: resolved.project_repository_id,
         workspace_id,
-        repository_identity: kr_project::identity::wire_identity(resolved.identity.git_dir),
-        worktree_identity: kr_project::identity::wire_identity(resolved.identity.work_tree),
+        repository_identity: kr_project::identity::wire_identity(repository.identity().git_dir),
+        worktree_identity: kr_project::identity::wire_identity(repository.identity().work_tree),
         base_revision: head_revision.clone(),
         base_reference: Nullable(reference.clone()),
         head_revision,
@@ -551,8 +551,10 @@ fn proposal(
         &before,
         &proposed,
         provenance,
+        SourceConsistency::PerFileCapture,
         "this version is a proposal: it is what the destination would hold if this change were \
-         applied, recorded rather than written"
+         applied, recorded rather than written. Its content is what this host read from the \
+         destination one file at a time, with this change's own content put over it"
             .to_owned(),
     )?;
     let now = kr_ipc::now_ms();

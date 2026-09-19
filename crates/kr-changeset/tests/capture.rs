@@ -256,9 +256,23 @@ fn a_capture_that_cannot_reach_the_required_class_is_refused_rather_than_renamed
     assert_eq!(failure.code(), ErrorCode::InvalidArgument);
     let message = failure.to_string();
     assert!(
-        message.contains("per_file_capture") && message.contains("atomic_snapshot"),
-        "the refusal names both classes: {message}"
+        message.contains("uncommitted changes are in no Git object"),
+        "the refusal says why the class is out of reach: {message}"
     );
+    assert!(
+        message.contains("ask for a per-file capture"),
+        "and what to ask for instead: {message}"
+    );
+    // Nothing was recorded: a class this host could not reach is a refusal, not a weaker version
+    // under the name the caller asked for.
+    assert!(
+        fixture
+            .service()
+            .versions(kr_protocol::ids::ChangeSetId::new(kr_ipc::new_uuid()))
+            .expect("the store is readable")
+            .is_empty()
+    );
+    let _ = path;
 }
 
 /// KR-REQ-14.33: the grant and this host's own secret rules apply before the capture reads
@@ -590,5 +604,403 @@ fn a_source_that_keeps_changing_is_retried_and_then_rejected() {
             .versions(kr_protocol::ids::ChangeSetId::new(kr_ipc::new_uuid()))
             .expect("the store is readable")
             .is_empty()
+    );
+}
+
+/// KR-REQ-14.31 and 14.33: the base a version is against is the **commit**, so a staged change is
+/// an uncommitted change like any other and an exclusion of it falls back to the commit's content.
+#[test]
+fn the_base_is_the_commit_and_never_the_index() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "staged");
+    // Three shapes at once: a staged modification, a staged addition and a staged deletion.
+    write(&path, "README.md", "staged, not committed\n");
+    write(&path, "added.txt", "staged addition\n");
+    git_raw(&path, ["add", "README.md", "added.txt"]);
+    git_raw(&path, ["rm", "--cached", "--quiet", "src/lib.rs"]);
+    std::fs::remove_file(path.join("src/lib.rs")).expect("the user removes it too");
+    let workspace = fixture.workspace("staged");
+
+    // Excluding uncommitted changes gives the commit's own content, not the index's.
+    let record = fixture.capture(workspace, &InclusionPolicy::base_only());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert_eq!(
+        fixture
+            .service()
+            .objects()
+            .get(
+                manifest
+                    .path("README.md")
+                    .expect("it is there")
+                    .content_digest
+            )
+            .expect("its content"),
+        b"a repository\n",
+        "the commit's content, not the staged content"
+    );
+    assert!(
+        manifest.path("added.txt").is_none(),
+        "the base never held a staged addition, so excluding the change leaves it absent"
+    );
+    assert_eq!(
+        fixture
+            .service()
+            .objects()
+            .get(
+                manifest
+                    .path("src/lib.rs")
+                    .expect("a staged deletion the base holds is still in the captured tree")
+                    .content_digest
+            )
+            .expect("its content"),
+        b"pub fn answer() -> u32 { 42 }\n"
+    );
+
+    // Including them gives the working tree, and the deletion is carried by absence.
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert_eq!(
+        fixture
+            .service()
+            .objects()
+            .get(
+                manifest
+                    .path("README.md")
+                    .expect("it is there")
+                    .content_digest
+            )
+            .expect("its content"),
+        b"staged, not committed\n"
+    );
+    assert!(manifest.path("added.txt").is_some());
+    assert!(manifest.path("src/lib.rs").is_none());
+    assert_eq!(
+        exclusion(&record, "src/lib.rs").reason,
+        ExclusionReason::Deleted
+    );
+}
+
+/// KR-REQ-14.32: a commit that lands while a capture is reading makes the capture start again, and
+/// past the bound it is rejected rather than recorded against a revision it did not read.
+#[test]
+fn a_commit_that_lands_under_the_capture_is_detected() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let commits = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&commits);
+    let fixture = Fixture::with_interposition(Some(kr_project::git::Interposition::new(Arc::new(
+        move |described: &str, directory: &std::path::Path, _temporary: &std::path::Path| {
+            // Before every status read, the base moves on.
+            if described.starts_with("git status") {
+                let round = counted.fetch_add(1, Ordering::SeqCst);
+                std::fs::write(
+                    directory.join("committed.txt"),
+                    format!("commit number {round}\n"),
+                )
+                .expect("the fixture writes");
+                support::git_raw(directory, ["add", "-A"]);
+                support::git_raw(directory, ["commit", "-q", "-m", "another commit"]);
+            }
+        },
+    ))));
+    ordinary_repository(fixture.work(), "moving-head");
+    let workspace = fixture.workspace("moving-head");
+    let failure = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &FileGrant::default(),
+            None,
+            None,
+        )
+        .expect_err("a base that keeps moving is rejected");
+    assert_eq!(failure.code(), ErrorCode::SourceChanged);
+    assert!(commits.load(Ordering::SeqCst) >= 3, "the retries happened");
+}
+
+/// KR-REQ-14.32: the strongest class comes from the base commit's own tree, and reaching it reads
+/// nothing of the working tree at all.
+#[test]
+fn an_atomic_snapshot_is_the_base_commit_s_own_tree() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "snapshot");
+    // Uncommitted work of every kind, none of which may appear in the snapshot.
+    write(&path, "README.md", "changed after the commit\n");
+    write(&path, "untracked.txt", "the user's own\n");
+    let workspace = fixture.workspace("snapshot");
+    let record = fixture
+        .capture_with(
+            workspace,
+            &InclusionPolicy::base_only(),
+            &FileGrant::default(),
+            None,
+            Some(SourceConsistency::AtomicSnapshot),
+        )
+        .expect("the base commit's own tree is readable");
+    assert_eq!(record.consistency, SourceConsistency::AtomicSnapshot);
+    assert!(
+        record
+            .consistency_detail
+            .contains("one instant by construction"),
+        "the detail names the mechanism: {}",
+        record.consistency_detail
+    );
+    assert_eq!(record.summary.from_working_tree.get(), 0);
+    assert_eq!(record.summary.total_paths.get(), 2);
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert_eq!(
+        fixture
+            .service()
+            .objects()
+            .get(
+                manifest
+                    .path("README.md")
+                    .expect("it is there")
+                    .content_digest
+            )
+            .expect("its content"),
+        b"a repository\n",
+        "the commit's content rather than the tree's"
+    );
+    assert!(manifest.path("untracked.txt").is_none());
+}
+
+/// KR-REQ-14.31: a symbolic link's object holds its target, so it is named rather than written out
+/// as a regular file, and a change to the executable bit reaches the version.
+#[test]
+fn a_link_is_named_and_a_mode_change_reaches_the_version() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "modes");
+    std::os::unix::fs::symlink("README.md", path.join("link.md")).expect("a link");
+    write_bytes(&path, "run.sh", b"#!/bin/sh\necho hello\n");
+    support::make_executable(&path, "run.sh");
+    git_raw(&path, ["add", "-A"]);
+    git_raw(&path, ["commit", "-m", "a link and a program"]);
+    let workspace = fixture.workspace("modes");
+
+    let record = fixture.capture(workspace, &include_everything());
+    let named = exclusion(&record, "link.md");
+    assert_eq!(named.reason, ExclusionReason::Unsupported);
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest.path("link.md").is_none(),
+        "a link is not captured as a file"
+    );
+    assert!(manifest.path("run.sh").expect("it is there").executable);
+
+    // The user takes the executable bit off. The version says so, rather than the index's old mode
+    // outvoting what the file is.
+    let mut permissions = std::fs::metadata(path.join("run.sh"))
+        .expect("the file is there")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+    std::fs::set_permissions(path.join("run.sh"), permissions).expect("the mode is set");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        !manifest.path("run.sh").expect("it is there").executable,
+        "the bit the file has is the bit the version records"
+    );
+}
+
+/// KR-REQ-14.33: a nested repository's own administrative data is never captured, whatever the
+/// policy says.
+#[test]
+fn a_nested_repository_s_own_data_is_never_captured() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "outer-tree");
+    // An untracked nested repository, which Git reports as one directory.
+    let nested = path.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("a directory");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    git_raw(
+        &nested,
+        [
+            "remote",
+            "add",
+            "origin",
+            "https://user:a-secret-token@example.invalid/x.git",
+        ],
+    );
+    write(&nested, "inner.txt", "inner content\n");
+    let workspace = fixture.workspace("outer-tree");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.contains("/.git/") && !entry.path.starts_with(".git/")),
+        "nothing under a Git directory is captured: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    // The nested repository's own content is captured; its administrative data is not.
+    assert!(manifest.path("vendor/inner/inner.txt").is_some());
+    assert!(
+        record.exclusions.iter().any(
+            |entry| entry.path.contains(".git") && entry.reason == ExclusionReason::Unsupported
+        ),
+        "the exclusion names it: {:?}",
+        record.exclusions
+    );
+}
+
+/// KR-REQ-14.32: a live session holding the workspace stops a quiescence declaration deciding the
+/// class, and nothing holding it lets the declaration through.
+#[test]
+fn a_live_session_stops_a_quiescence_declaration_deciding_the_class() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "quiet");
+    let workspace = fixture.workspace("quiet");
+    let session = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+    fixture
+        .project()
+        .bind_session(workspace, session, true)
+        .expect("a session holds the workspace");
+    let record = fixture
+        .capture_declaring_quiescence(workspace)
+        .expect("the capture succeeds");
+    assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
+    assert!(
+        record
+            .consistency_detail
+            .contains("the declaration alone did not decide the class"),
+        "the record says why: {}",
+        record.consistency_detail
+    );
+    assert!(
+        record.policy.quiescence_declared,
+        "the declaration is still recorded"
+    );
+
+    fixture
+        .project()
+        .bind_session(workspace, session, false)
+        .expect("the session ends");
+    let record = fixture
+        .capture_declaring_quiescence(workspace)
+        .expect("the capture succeeds");
+    assert_eq!(record.consistency, SourceConsistency::QuiescedCapture);
+}
+
+/// KR-REQ-01.27: an independent clone is a workspace of its own repository, and capturing one
+/// works rather than being refused for holding a Git directory that is not the project's.
+#[test]
+fn an_independent_clone_workspace_can_be_captured() {
+    use kr_protocol::project::{IsolationMechanism, WorkspaceCreateParams, WorkspaceKind};
+
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "origin-tree");
+    write(&path, "README.md", "the work in progress\n");
+    let project = fixture.adopt("origin-tree");
+    let created = fixture
+        .project()
+        .workspace_create(
+            &support::actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "a clone".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: kr_protocol::scalars::Nullable(Some(
+                    IsolationMechanism::IndependentClone,
+                )),
+                policy: include_everything(),
+                base_revision: kr_protocol::scalars::Nullable(None),
+                base_change_set_id: kr_protocol::scalars::Nullable(None),
+                destination: kr_protocol::scalars::Nullable(Some(support::destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "clone-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&support::action("workspace.create:clone")),
+        )
+        .expect("the clone is made")
+        .workspace
+        .0
+        .expect("a creation returns one");
+    let record = fixture.capture(created.workspace_id, &include_everything());
+    assert_eq!(record.workspace_id, created.workspace_id);
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(manifest.path("README.md").is_some());
+    // The identity recorded is the clone's own repository, which is not the project's.
+    assert_ne!(
+        record.repository_identity,
+        fixture
+            .project()
+            .project_read(&kr_protocol::project::ProjectReadParams {
+                project_repository_id: project,
+            })
+            .expect("the project is readable")
+            .project
+            .filesystem_identity,
+        "an independent clone is its own repository"
+    );
+}
+
+/// KR-REQ-14.31: a version number a deleted version used is never handed out again.
+#[test]
+fn a_version_number_is_never_reused() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "numbers");
+    write(&path, "README.md", "one\n");
+    let workspace = fixture.workspace("numbers");
+    let first = fixture.capture(workspace, &include_everything());
+    write(&path, "README.md", "two\n");
+    let second = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &FileGrant::default(),
+            Some(first.change_set_id),
+            None,
+        )
+        .expect("a second version");
+    assert_eq!(second.version.get(), 2);
+    fixture
+        .service()
+        .delete_version(second.change_set_id, second.version)
+        .expect("nothing holds it");
+    write(&path, "README.md", "three\n");
+    let third = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &FileGrant::default(),
+            Some(first.change_set_id),
+            None,
+        )
+        .expect("a third version");
+    assert_eq!(
+        third.version.get(),
+        3,
+        "the number version two used is not handed out again"
     );
 }

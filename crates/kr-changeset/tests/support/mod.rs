@@ -166,6 +166,33 @@ impl Fixture {
             .expect("the capture succeeds")
     }
 
+    /// Captures one version with a quiescence declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the capture returns.
+    pub fn capture_declaring_quiescence(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> kr_changeset::Result<ChangeSetVersionRecord> {
+        let policy = include_everything();
+        let grant = FileGrant::default();
+        let order = CaptureOrder {
+            workspace_id,
+            change_set_id: None,
+            label: "the work",
+            request: CaptureRequest {
+                policy: &policy,
+                grant: &grant,
+                quiescence_declared: true,
+                required_consistency: None,
+            },
+            pin: false,
+            provenance: provenance(),
+        };
+        self.changesets.capture(&order).map(|(record, _)| record)
+    }
+
     /// Captures one version, with every knob the tests turn.
     ///
     /// # Errors
