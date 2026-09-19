@@ -1,13 +1,16 @@
 //! The desktop execution context and the host sleep setting, over the network path.
 //!
-//! Requirement rows closed here for the paired-device ingress: KR-REQ-03.26 (there is no
-//! GUI-control method for a device to call, `automation.manage` is about workflow definitions, and
-//! the capability records reach a device with their platform distinctions intact) and KR-REQ-03.27
-//! (the setting is off until an owner turns it on, nothing a device can call turns it on, and
-//! active inhibition and its reason are in host information over the network). KR-REQ-23.25 in
-//! part, for `environment.capabilities` as the fourth of the host-and-environment reads.
+//! What these demonstrate, for the paired-device ingress. KR-REQ-03.26: the registry has no
+//! GUI-control method for a device to call, `automation.manage` covers workflow definitions, and
+//! the capability records reach a device unchanged, the display server they are about included.
+//! Which display server that is depends on the machine, so this shows the distinction travelling
+//! rather than any particular one being told apart. KR-REQ-03.27, in part: a fresh host reports
+//! the setting off and holds nothing, a stored choice reaches a device with the reason nothing is
+//! held under it, and no method the registry admits a device to writes anything in the
+//! host-and-environment group. KR-REQ-23.25, in part, for `environment.capabilities`.
 //!
-//! No worker is started here. Every one of these is a read the daemon answers itself.
+//! No worker is started here, so no session has work outstanding and nothing here observes an
+//! assertion actually held. Every one of these is a read the daemon answers itself.
 
 mod net_support;
 
