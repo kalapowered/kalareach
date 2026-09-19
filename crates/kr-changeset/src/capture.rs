@@ -1165,8 +1165,20 @@ fn nested_repositories(
         let Ok(held) = tree.probe(&name) else {
             continue;
         };
-        if held != kr_transfer::authority::ObjectKind::Directory
-            && !keeps_its_data_in_this_repository(tree, &name, directory, administrative)
+        // Where that repository's data is, as a name this host walked to rather than one it read.
+        let data = if held == kr_transfer::authority::ObjectKind::Directory {
+            name.as_str().to_owned()
+        } else {
+            let Some(inside) = submodule_data(tree, &name, directory, administrative) else {
+                return Err(unplaceable(directory));
+            };
+            inside
+        };
+        // A repository can keep its per-worktree data in one place and its configuration, its
+        // references and its objects in another, and say so in a file called `commondir`. This
+        // host does not chase that second place either.
+        if let Ok(common) = RelativeName::parse(&format!("{data}/commondir"))
+            && tree.probe(&common).is_ok()
         {
             return Err(unplaceable(directory));
         }
@@ -1175,43 +1187,35 @@ fn nested_repositories(
     Ok(found)
 }
 
-/// Returns true when a nested repository's `.git` file names a place **inside this repository's
-/// own administrative directory**.
+/// Returns where a nested repository keeps its data when that is **inside this repository's own
+/// administrative directory**, and nothing when it is anywhere else.
 ///
-/// That is what an ordinary submodule is: its tree is in this working tree and its data is under
-/// this repository's own `.git`, which is already the first thing a capture refuses. Nothing else
-/// is answered here. The target is joined to the directory its file is in and reduced once, and it
-/// has to **spell** its way into this repository's own data; a name that reaches there by any
-/// other route spells something else and is not accepted.
-fn keeps_its_data_in_this_repository(
+/// Inside it is what an ordinary submodule is: its tree is in this working tree and its data is
+/// under this repository's own `.git`, which is already the first thing a capture refuses. Two
+/// things have to hold, and spelling is only the first. The target is joined to the directory its
+/// file is in and reduced once, and it has to spell its way into this repository's own data. Then
+/// that name is **walked through the working tree's own handle**, which follows nothing, and has
+/// to reach a real directory: a link at the end of the spelling, or on the way to it, or a name
+/// with nothing at it, is a place this host has not established and does not accept.
+fn submodule_data(
     tree: &kr_transfer::AuthorisedDirectory,
     name: &RelativeName,
     directory: &str,
     administrative: Option<&str>,
-) -> bool {
+) -> Option<String> {
     use std::io::Read as _;
 
-    let Some(administrative) = administrative else {
-        return false;
-    };
-    let Ok(mut file) = tree.open_read(name, ObjectPolicy::ReadableFile) else {
-        return false;
-    };
+    let administrative = administrative?;
+    let mut file = tree.open_read(name, ObjectPolicy::ReadableFile).ok()?;
     if file.byte_len() > MAX_GIT_FILE_BYTES {
-        return false;
+        return None;
     }
     let mut text = String::new();
-    if file
-        .handle_mut()
+    file.handle_mut()
         .take(MAX_GIT_FILE_BYTES)
         .read_to_string(&mut text)
-        .is_err()
-    {
-        return false;
-    }
-    let Some(target) = text.trim().strip_prefix("gitdir:").map(str::trim) else {
-        return false;
-    };
+        .ok()?;
+    let target = text.trim().strip_prefix("gitdir:").map(str::trim)?;
     let root = tree.display_path();
     let inside = lexical(std::path::Path::new(root));
     let mut parts = if std::path::Path::new(target).is_absolute() {
@@ -1223,9 +1227,23 @@ fn keeps_its_data_in_this_repository(
     };
     parts.extend(components(std::path::Path::new(target)));
     let resolved = lexical_parts(parts);
-    let mut wanted = inside;
+    let mut wanted = inside.clone();
     wanted.extend(components(std::path::Path::new(administrative)));
-    resolved.len() > wanted.len() && resolved[..wanted.len()] == wanted[..]
+    if resolved.len() <= wanted.len() || resolved[..wanted.len()] != wanted[..] {
+        return None;
+    }
+    // Spelled inside, and then walked to. A component of that spelling could be a link, and then
+    // the data would be somewhere else entirely while the name looked right.
+    let relative: Vec<String> = resolved[inside.len()..]
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    let candidate = relative.join("/");
+    let walked = RelativeName::parse(&candidate).ok()?;
+    match tree.probe(&walked) {
+        Ok(kr_transfer::authority::ObjectKind::Directory) => Some(candidate),
+        _ => None,
+    }
 }
 
 /// Reduces one path to its components without touching the filesystem.

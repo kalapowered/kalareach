@@ -1010,6 +1010,69 @@ fn a_nested_repository_that_keeps_its_data_elsewhere_refuses_the_capture() {
     );
 }
 
+/// KR-REQ-14.33: a submodule whose data is not really under this repository refuses the capture.
+///
+/// The spelling of a `gitdir:` target is the first thing checked and not the last: a component of
+/// it can be a link, and the data would then be somewhere else entirely while the name looked
+/// right. The same goes for a `commondir`, which puts a repository's configuration, references and
+/// objects somewhere other than its per-worktree data.
+#[test]
+fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
+    for shape in ["link", "commondir"] {
+        let fixture = Fixture::create();
+        let path = ordinary_repository(fixture.work(), &format!("{shape}-tree"));
+        let nested = path.join("vendor/inner");
+        std::fs::create_dir_all(&nested).expect("a directory");
+        git_raw(&nested, ["init", "--initial-branch=main"]);
+        git_raw(
+            &nested,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://user:a-secret-token@example.invalid/x.git",
+            ],
+        );
+        write(&nested, "inner.txt", "inner content\n");
+
+        // The data moves beside the nested tree, and the outer repository's own `.git` is made to
+        // point at it the way a submodule's data would be reached.
+        std::fs::rename(nested.join(".git"), path.join("vendor/repo-data"))
+            .expect("the data moves");
+        std::fs::create_dir_all(path.join(".git/modules")).expect("the modules directory");
+        if shape == "link" {
+            std::os::unix::fs::symlink("../../vendor/repo-data", path.join(".git/modules/inner"))
+                .expect("a link to it");
+        } else {
+            std::fs::create_dir_all(path.join(".git/modules/inner")).expect("a real directory");
+            std::fs::write(
+                path.join(".git/modules/inner/commondir"),
+                b"../../../vendor/repo-data\n",
+            )
+            .expect("and it names its common directory");
+        }
+        std::fs::write(nested.join(".git"), b"gitdir: ../../.git/modules/inner\n")
+            .expect("the submodule's own file");
+
+        let workspace = fixture.workspace(&format!("{shape}-tree"));
+        let failure = fixture
+            .capture_with(
+                workspace,
+                &include_everything(),
+                &kr_protocol::changeset::FileGrant::default(),
+                None,
+                None,
+            )
+            .expect_err("a spelling this host cannot walk to is not captured around");
+        assert!(
+            failure
+                .to_string()
+                .contains("somewhere other than beside its tree"),
+            "the refusal says why for {shape}: {failure}"
+        );
+    }
+}
+
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
 /// because nothing this host can reach holds a working tree still for the whole of a read.
 #[test]
