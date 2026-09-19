@@ -320,9 +320,10 @@ async fn a_devices_attachment_is_what_it_asked_for_intersected_with_its_grant() 
 ///
 /// A grant that carries nothing at all asks for everything and receives nothing. The attachment
 /// still exists, because section 8 separates observing a session from owning its size and holding
-/// its input: what it cannot do is act.
+/// its input. What this shows it cannot do is take the input lease, which is the one operation the
+/// suite exercises; the others are refused by the same check against the same empty set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_whose_grant_carries_nothing_receives_an_attachment_that_can_do_nothing() {
+async fn a_device_whose_grant_carries_nothing_is_granted_no_capability_and_takes_no_lease() {
     let wired = wired("sleep 120").await;
     let mut daemon = wired.daemon().await;
 

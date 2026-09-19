@@ -275,22 +275,55 @@ mod attachment_capability_tests {
         assert!(granted.is_empty());
     }
 
+    /// The table itself, written out rather than derived, so a swapped pair is a failure.
+    ///
+    /// Section 8 gives observation to `session.view`, section 10 gives typing to `terminal.input`
+    /// because it exposes the shell user's account, and section 23's attachment row gives claims
+    /// and resizing to `terminal.geometry`. Reading the expected right out of the function under
+    /// test would let the input and geometry rows be exchanged without a failure.
+    const TABLE: [(AttachmentCapability, ActionRight); 4] = [
+        (
+            AttachmentCapability::ObserveTerminal,
+            ActionRight::SessionView,
+        ),
+        (
+            AttachmentCapability::ObserveSemantic,
+            ActionRight::SessionView,
+        ),
+        (AttachmentCapability::Input, ActionRight::TerminalInput),
+        (
+            AttachmentCapability::Geometry,
+            ActionRight::TerminalGeometry,
+        ),
+    ];
+
     /// Each capability is decided by exactly one right, and the table covers the whole enumeration.
     #[test]
     fn one_right_decides_each_capability() {
-        for capability in AttachmentCapability::ALL {
-            let only = rights(&[attachment_capability_right(*capability)]);
-            let asked: CanonicalSet<AttachmentCapability> = [*capability].into_iter().collect();
+        let listed: Vec<AttachmentCapability> =
+            TABLE.iter().map(|(capability, _)| *capability).collect();
+        assert_eq!(
+            listed,
+            AttachmentCapability::ALL.to_vec(),
+            "the table covers every capability, in the enumeration's own order"
+        );
+        for (capability, right) in TABLE {
             assert_eq!(
-                permitted_attachment_capabilities(&asked, &only),
-                asked,
+                attachment_capability_right(capability),
+                right,
                 "{} is carried by {}",
                 capability.as_str(),
-                attachment_capability_right(*capability).as_str()
+                right.as_str()
+            );
+            let asked: CanonicalSet<AttachmentCapability> = [capability].into_iter().collect();
+            assert_eq!(
+                permitted_attachment_capabilities(&asked, &rights(&[right])),
+                asked,
+                "and that right on its own carries it"
             );
             // And every other right on its own carries none of it.
             for other in ActionRight::ALL {
-                if *other == attachment_capability_right(*capability) {
+                if *other == right {
                     continue;
                 }
                 assert!(

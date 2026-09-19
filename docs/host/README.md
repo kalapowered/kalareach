@@ -728,6 +728,31 @@ adopting, `workspace.manage` for creating and removing a working copy. The four 
 right of their own, so a grant that covers the environment reads the whole repository and workspace
 surface.
 
+Two limits of that, stated rather than implied:
+
+* **A destination is a path the request names.** A creation carries the absolute parent directory
+  it wants, and this host resolves it once with its own filesystem authority. The grant is
+  therefore the whole of the restriction on where a device may create a repository or a working
+  copy: `project.create` reaches any directory this host can open. What the resolution does
+  establish is that the directory it opened is the one the effect writes into, by the identity it
+  recorded, so nothing is substituted underneath it.
+* **`action.read` does not answer for an action this host performed itself.** A receipt lives in
+  the journal of the session an action was performed on, and a create or a repository mutation is
+  performed on no session. What such an action produced is kept where the service that performed it
+  keeps it, which is not a receipt in the shape that method answers with, so the request is refused
+  and the refusal says how to recover the result: submit the action again under the same
+  identifier. That is the recovery section 9 puts first, and it works — the service answers the
+  repeat from its own record without performing anything twice.
+
+The admission a project mutation carries is asked about twice. Once where the daemon accepts it,
+under the registry lock, and once inside the service's own blocking work, immediately after it has
+failed to find a retained record and immediately before it acts. The second is what covers the
+waiting in between: a blocking task to be scheduled and a store to be opened, with a clone or a
+materialisation behind them. It reads the registration and the clock from memory, so there is
+nothing left to wait for between the answer and the effect. A retry never reaches it, because the
+retained record answered it first: section 9 keeps a receipt readable after the freshness that
+admitted it is gone.
+
 ## What the host owes the transport
 
 Two contracts `docs/transport/README.md` names, and where they are kept:

@@ -1298,6 +1298,51 @@ impl Controller {
         }
     }
 
+    /// Refuses a mutation whose registration or accepted deadline has lapsed.
+    ///
+    /// These are the two answers a caller can have without waiting for anything: whether the
+    /// connection is still registered at or above the revision this mutation was admitted under,
+    /// and whether the deadline it was accepted with has passed. Both are read from memory, so
+    /// this can be asked again from inside work that has already begun — a blocking task, a
+    /// service's own call — where taking the registry's asynchronous lock is not possible.
+    ///
+    /// What it establishes is what the registration establishes.
+    /// [`Self::revoke_authority`] takes every connection out of that table before anything can
+    /// observe the revision it installed, and a revocation that withdraws one device leaves the
+    /// rest registered at the revision it advanced to, so a registration still standing at or
+    /// above the revision this mutation carries is one no revocation has taken. The order is the
+    /// contract's: authority first, then freshness, so a caller that may act on a spent deadline
+    /// cannot read past a withdrawal with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] for a registration that has been withdrawn
+    /// and [`ControllerError::WindowExpired`] for a deadline that has passed.
+    pub(crate) fn check_registration(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        let admitted = self.admitted_table();
+        let registered = admitted
+            .get(&admission.connection_id)
+            .is_some_and(|connection| connection.admitted_revision >= admission.admitted_revision);
+        drop(admitted);
+        if !registered {
+            return Err(ControllerError::PermissionDenied {
+                detail: crate::authority::AdmissionLapse::Deregistered.to_string(),
+            });
+        }
+        if admission
+            .deadline
+            .is_some_and(|deadline| self.clock.now() >= deadline)
+        {
+            return Err(ControllerError::WindowExpired {
+                detail: crate::authority::AdmissionLapse::Expired.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the authority revision a connection was admitted under.
     fn admitted_revision(&self, connection_id: ConnectionId) -> Result<AuthorityRevision> {
         let admitted = self.admitted_table();
@@ -2222,7 +2267,22 @@ impl Controller {
             self.check_admission(&registry, &carried)
                 .map_err(|error| error.to_protocol_error())?;
         }
-        self.project.write(actor_id, mutation, method).await
+        // And again where the service is about to act. Between the answer above and the effect
+        // there is a blocking task to be scheduled and the service's own store to be opened, and a
+        // clone or a materialisation takes long enough that a grant can run out or a revocation
+        // can complete inside one. The service asks this immediately after it has failed to find a
+        // retained record for the action and immediately before it performs it, so a retry still
+        // gets its own result while a first admission does not begin under authority that has
+        // gone.
+        let controller = Arc::clone(self);
+        let admission = move || {
+            controller
+                .check_registration(&carried)
+                .map_err(|error| error.to_protocol_error())
+        };
+        self.project
+            .write(actor_id, mutation, method, admission)
+            .await
     }
 
     async fn read_method(self: &Arc<Self>, actor_id: &ActorId, request: &Request) -> ControlFrame {
@@ -5449,6 +5509,76 @@ mod a_create_that_launches_nothing {
                 .join("kr-worker-relative"),
             "the relative name is resolved where the daemon was started, not where the worker runs"
         );
+    }
+
+    /// The check a service makes again from inside work that has already begun.
+    ///
+    /// A project mutation reaches its service through a blocking task, and a clone or a
+    /// materialisation takes long enough that authority can go while it waits. The service asks
+    /// again immediately before it acts, and it asks without waiting for anything, so the answer
+    /// is still true when the effect starts. What it establishes is what the registration
+    /// establishes: a revocation takes the registration before its revision can be observed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registration_withdrawn_while_an_effect_waited_refuses_it() {
+        let (_temp, controller, _asked) = daemon().await;
+        let (connection_id, _actor_id) = admitted(&controller).await;
+        let admitted_revision = controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered");
+        let live = crate::authority::AdmittedMutation {
+            connection_id,
+            admitted_revision,
+            deadline: Some(
+                controller
+                    .clock
+                    .now()
+                    .checked_add(Duration::from_secs(60))
+                    .expect("a deadline"),
+            ),
+        };
+        controller
+            .check_registration(&live)
+            .expect("a live admission stands");
+
+        // A deadline that has passed refuses a first admission, and says so as freshness rather
+        // than as authority: the two are answered differently by the caller.
+        let spent = crate::authority::AdmittedMutation {
+            deadline: Some(controller.clock.now()),
+            ..live
+        };
+        assert!(matches!(
+            controller.check_registration(&spent),
+            Err(ControllerError::WindowExpired { .. })
+        ));
+
+        // A revocation takes the registration, and the check then refuses whatever was waiting.
+        controller
+            .revoke_authority()
+            .await
+            .expect("the revocation completes");
+        assert!(matches!(
+            controller.check_registration(&live),
+            Err(ControllerError::PermissionDenied { .. })
+        ));
+
+        // And a connection registered under a revision this one predates is refused too: the
+        // registration that stands is not the one this admission was made against.
+        let (later, _actor_id) = admitted(&controller).await;
+        let ahead = crate::authority::AdmittedMutation {
+            connection_id: later,
+            admitted_revision: kr_protocol::ids::AuthorityRevision::new(
+                controller
+                    .admitted_revision(later)
+                    .expect("the connection is registered")
+                    .get()
+                    + 1,
+            ),
+            ..live
+        };
+        assert!(matches!(
+            controller.check_registration(&ahead),
+            Err(ControllerError::PermissionDenied { .. })
+        ));
     }
 }
 

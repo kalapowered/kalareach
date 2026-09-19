@@ -621,6 +621,12 @@ impl RemoteConnection {
 
     /// Serves one mutation.
     async fn mutate(&self, mutation: &MutationRequest) -> ControlFrame {
+        // Section 9 measures a requested lifetime from *receipt* time, so it is read here, before
+        // the first thing that can wait. Everything between this and the envelope check can take
+        // time — the registry's lock, a retained lookup, a worker's answer about a receipt — and
+        // deriving the deadline from a reading taken after those waits would hand a request its
+        // whole lifetime back after it had already spent part of it.
+        let received_at = self.controller.clock.now();
         let entry = match self.admit(mutation.method.as_str(), mutation.method_version) {
             Ok(entry) => entry,
             Err(error) => return failure(mutation.request_id, error),
@@ -706,7 +712,7 @@ impl RemoteConnection {
             }
             Err(RouteRefusal::Conflict(error)) => return failure(mutation.request_id, error),
         }
-        let accepted = match self.check_envelope(mutation, entry) {
+        let accepted = match self.check_envelope(mutation, entry, received_at) {
             Ok(accepted) => accepted,
             Err(error) => return failure(mutation.request_id, error),
         };
@@ -1260,15 +1266,37 @@ impl RemoteConnection {
             .devices
             .action_route(&self.device.principal(), params.action_id)
             .map_err(|error| error.to_protocol_error())?;
-        // The same answer the worker gives for a receipt it does not hold: an action nobody
-        // recorded is not an action this device can be told about, and neither is one whose
-        // receipt this host itself owns, which is the daemon's own journal to answer from.
-        let session_id = routed.and_then(|routed| routed.session_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::InvalidArgument,
-                format!("no receipt for action {}", params.action_id),
-            )
-        })?;
+        // A receipt lives in the journal of the session the action was performed on, and the
+        // route says which. Two routes cannot be answered here, and they are answered differently
+        // because they mean different things.
+        let session_id = match routed {
+            Some(routed) => match routed.session_id {
+                Some(session_id) => session_id,
+                // This host performed the action itself: a create, or a repository or workspace
+                // mutation. It records what those produced where the service that performed them
+                // keeps it, and it holds no receipt in the shape this method answers with, so
+                // there is nothing here to read. Submitting the action again under the same
+                // identity is how its result is recovered, and that is what the sentence says
+                // rather than leaving a caller to guess that a recorded action is missing.
+                None => {
+                    return Err(ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "action {} was performed by this host rather than by a session, and                              this host keeps no receipt for one; submit the action again under                              the same identifier to be given its result",
+                            params.action_id
+                        ),
+                    ));
+                }
+            },
+            // Nothing recorded it. An action nobody recorded is not an action this device can be
+            // told about.
+            None => {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("no receipt for action {}", params.action_id),
+                ));
+            }
+        };
         self.check_grant(Some(session_id), entry, false)?;
         self.proxy_for(session_id)
             .await
@@ -1399,6 +1427,7 @@ impl RemoteConnection {
         &self,
         mutation: &MutationRequest,
         entry: &'static MethodEntry,
+        received_at: kr_transport::clock::ContinuousInstant,
     ) -> std::result::Result<AcceptedDeadline, ProtocolError> {
         mutation
             .target
@@ -1491,10 +1520,11 @@ impl RemoteConnection {
             ));
         }
         self.windows
-            .accept(
+            .accept_at(
                 &mutation.action_window_id,
                 self.connection_id,
                 self.controller.boot_epoch,
+                received_at,
                 mutation.requested_ttl_ms,
                 self.authority.grant_deadline,
             )
@@ -1552,11 +1582,17 @@ impl RemoteConnection {
                         format!("this device's grant does not carry {}", right.as_str()),
                     ));
                 }
-                // Current read authority over the subject. For a session subject that is
-                // `session.view` at the session's scope, which is what the grant can answer; the
-                // subject's own state is the worker's to answer inside its barrier.
+                // Current read authority over the subject, which is the subject the request
+                // names. For a session that is `session.view` at the session's scope, which is
+                // what the grant can answer; the session's own state is the worker's to answer
+                // inside its barrier. A request that names no session has a subject of another
+                // kind — a repository, a working copy, this host itself — and demanding
+                // `session.view` for one of those would ask for authority over something the
+                // answer is not about. What still decides such a request is everything else this
+                // check makes: the grant's expiry, its environment selector, the rights the method
+                // requires outright, and its history scope.
                 RequiredAuthority::PresentViewAuthority
-                    if !grant.permits(ActionRight::SessionView) =>
+                    if session_id.is_some() && !grant.permits(ActionRight::SessionView) =>
                 {
                     return Err(ProtocolError::new(
                         ErrorCode::PermissionDenied,

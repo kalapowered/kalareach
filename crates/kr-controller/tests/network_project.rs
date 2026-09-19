@@ -796,3 +796,139 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
     raw.close();
     host.stop().await;
 }
+
+/// KR-REQ-23.42: a device recovers its own project result under the authority the subject needs.
+///
+/// Section 23 has present view authority over the subject decide whether a retained result goes
+/// back. The subject of a repository mutation is a repository, not a session, so a grant that
+/// carries `project.create` and nothing else performs the action and is given its own result back
+/// on a repeat. Demanding `session.view` for that would ask for authority over something the
+/// answer is not about, and it would leave a device that lost its reply unable to recover it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_without_session_view_still_recovers_its_own_project_result() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::ProjectCreate]),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+
+    let params = ProjectInitParams {
+        destination: destination(&host, "alone"),
+        label: "alone".to_owned(),
+        initial_branch: Nullable::some("main".to_owned()),
+    };
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+    let first: ProjectInitResult = typed(
+        &raw.mutate(Method::ProjectInit, action_id, target.clone(), &params)
+            .await
+            .expect("project.init succeeds under project.create alone"),
+    );
+    let again: ProjectInitResult = typed(
+        &raw.mutate(Method::ProjectInit, action_id, target.clone(), &params)
+            .await
+            .expect("the repeat is answered rather than refused"),
+    );
+    assert_eq!(
+        first.project.project_repository_id,
+        again.project.project_repository_id
+    );
+
+    // And a reused identifier carrying another request is still refused, rather than being lost
+    // behind a refusal about authority.
+    let conflicting = raw
+        .mutate(
+            Method::ProjectInit,
+            action_id,
+            target,
+            &ProjectInitParams {
+                destination: destination(&host, "second"),
+                label: "second".to_owned(),
+                initial_branch: Nullable::some("main".to_owned()),
+            },
+        )
+        .await
+        .expect_err("a reused identifier carrying another request is refused");
+    assert_eq!(conflicting.code, ErrorCode::IdConflict);
+
+    raw.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42: what `action.read` says about an action this host performed itself.
+///
+/// A receipt lives in the journal of the session an action was performed on, and a repository
+/// mutation is performed on no session. This host keeps what such an action produced where the
+/// service that performed it keeps it, which is not a receipt in the shape this method answers
+/// with, so the request is refused and the refusal says how the result is actually recovered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn action_read_says_how_to_recover_a_result_this_host_holds_itself() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+    let session = net_support::connect(&host, &device, &record).await;
+
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let _: ProjectInitResult = typed(
+        &raw.mutate(
+            Method::ProjectInit,
+            action_id,
+            ActionTarget::environment(host.environment_id),
+            &ProjectInitParams {
+                destination: destination(&host, "recorded"),
+                label: "recorded".to_owned(),
+                initial_branch: Nullable::some("main".to_owned()),
+            },
+        )
+        .await
+        .expect("project.init succeeds"),
+    );
+
+    let refused = session
+        .read::<_, kr_protocol::receipt::ActionReadResult>(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams { action_id },
+        )
+        .await
+        .expect_err("this host keeps no receipt for an action it performed itself");
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument);
+    assert!(
+        refused.to_string().contains("submit the action again"),
+        "the refusal says how the result is recovered: {refused}"
+    );
+
+    // An action nothing recorded reads differently, because it means something different.
+    let unknown = session
+        .read::<_, kr_protocol::receipt::ActionReadResult>(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id: ActionId::new(kr_ipc::new_uuid()),
+            },
+        )
+        .await
+        .expect_err("nothing recorded it");
+    assert!(
+        unknown.to_string().contains("no receipt for action"),
+        "an action nobody recorded says so: {unknown}"
+    );
+
+    session.close();
+    raw.close();
+    host.stop().await;
+}

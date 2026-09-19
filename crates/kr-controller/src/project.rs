@@ -198,20 +198,6 @@ impl ProjectModule {
         frame(request.request_id, self.read(request).await)
     }
 
-    /// Serves one project mutation and returns the frame it answers with.
-    #[must_use]
-    pub async fn write_frame(
-        &self,
-        actor_id: &ActorId,
-        mutation: &MutationRequest,
-        method: Method,
-    ) -> ControlFrame {
-        frame(
-            mutation.request_id,
-            self.write(actor_id, mutation, method).await,
-        )
-    }
-
     /// Serves one project read.
     ///
     /// # Errors
@@ -251,12 +237,16 @@ impl ProjectModule {
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
-    pub async fn write(
+    pub async fn write<A>(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> Answer<ParamsValue> {
+        admission: A,
+    ) -> Answer<ParamsValue>
+    where
+        A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
+    {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let service = Arc::clone(&self.service);
@@ -279,6 +269,14 @@ impl ProjectModule {
                     }
                 };
             }
+            // Nothing retained, so this is a first admission and it is about to act. The
+            // admission is asked about here rather than before the blocking task started: the
+            // task had to be scheduled and this store had to be opened, both of which wait, and a
+            // first admission may not begin under a deadline that has passed or a registration
+            // that has been withdrawn. A retry never reaches this, because the record above
+            // answered it: section 9 keeps a receipt readable after the freshness that admitted it
+            // is gone.
+            admission()?;
             // The action this mutation is performed under. Each of these methods commits it beside
             // the state it changes, which is what makes a second copy of one action find the claim
             // rather than starting a second clone.
