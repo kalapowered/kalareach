@@ -656,7 +656,7 @@ fn runnable(path: &std::path::Path) -> bool {
 ///
 /// The digest is for noticing a change rather than for proving one: a capability record is
 /// evidence about what is feasible, never authority, and nothing here signs it.
-fn facility_identity(tool: &str) -> Option<String> {
+pub fn facility_identity(tool: &str) -> Option<String> {
     use std::io::Read as _;
 
     let mut file = std::fs::File::open(tool).ok()?;
