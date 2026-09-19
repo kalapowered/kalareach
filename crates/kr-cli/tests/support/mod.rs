@@ -35,9 +35,9 @@ pub fn command_binaries() -> &'static Path {
     static COPIED: OnceLock<PathBuf> = OnceLock::new();
     COPIED.get_or_init(|| {
         let temporary = std::env::temp_dir();
-        let root = temporary.join(format!("{PREFIX}{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("a directory for the command binaries");
-        // After this run's own directory exists, because it is what says who "ours" is.
+        let root = make_our_own(&temporary);
+        // After this run's own directory exists, because a directory this run certainly made is
+        // what says which user "ours" means below.
         remove_what_earlier_runs_left(&temporary, &root);
         for source in [
             Path::new(env!("CARGO_BIN_EXE_kr")),
@@ -62,6 +62,37 @@ pub fn command_binaries() -> &'static Path {
     })
 }
 
+/// Makes this run's own directory under `temporary` and returns it.
+///
+/// It is created rather than opened, so what comes back is a directory this process made and
+/// therefore owns. A name that is already taken is not reused: nothing here can establish who owns
+/// a directory that was already there, and the sweep below decides what it may remove by comparing
+/// against the owner of this one. The name it falls back to still ends in this process's number,
+/// which is the only part of it that anything reads.
+///
+/// # Panics
+///
+/// Panics when no directory can be made, which is not something these tests can go on without.
+fn make_our_own(temporary: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let mut taken = 0;
+    loop {
+        let root = if taken == 0 {
+            temporary.join(format!("{PREFIX}{pid}"))
+        } else {
+            temporary.join(format!("{PREFIX}{taken}-{pid}"))
+        };
+        match std::fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => taken += 1,
+            Err(error) => panic!(
+                "a directory for the command binaries at {}: {error}",
+                root.display()
+            ),
+        }
+    }
+}
+
 /// Removes the directories that earlier runs of these suites left in `temporary`, given `ours`,
 /// the one this run made.
 ///
@@ -72,13 +103,15 @@ pub fn command_binaries() -> &'static Path {
 /// directory those runs left behind, so a run that swept only its own form would tidy nothing that
 /// is actually there.
 ///
-/// The three conditions are what make a removal safe rather than merely likely. The owner decides
-/// what `kill -0` means: for a process of one's own user it answers yes while the process lives
-/// and no once it is gone, where for somebody else's it can also answer no because the question
-/// was not ours to ask. A question that could not be put at all - `kill` missing, a process table
-/// that cannot be read - is not an answer either, and leaves the directory alone. Confining the
-/// sweep to one user's own directories also settles what a shared temporary directory's sticky bit
-/// would otherwise leave half-done.
+/// The three conditions together are what make a removal safe rather than merely likely. Given a
+/// directory this user owns, a `kill -0` that answers no settles it either way: either nothing
+/// holds that number, or something does and it is not ours to signal, and a process that is not
+/// ours is not the process of ours that made this directory. What must not be read as an answer is
+/// anything that is not one - `kill` that could not be started at all, or a `kill` that was itself
+/// ended by a signal rather than by exiting - so only a plain exit code of one, which is what both
+/// of this project's platforms report for a number they cannot signal, removes anything. Confining
+/// the sweep to this user's own directories also settles what a shared temporary directory's
+/// sticky bit would otherwise leave half-done.
 ///
 /// Whether the owner is running is asked of the operating system rather than assumed from an age:
 /// a suite of these can take minutes, and a directory whose owner is still launching binaries out
@@ -120,7 +153,10 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         else {
             continue;
         };
-        if !answer.success() {
+        // `Some(1)` and nothing else. A question that was never asked and a question whose asker
+        // was killed both arrive here looking like a failure, and neither says anything about the
+        // process this directory is named after.
+        if answer.code() == Some(1) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
