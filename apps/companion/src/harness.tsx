@@ -11,9 +11,11 @@ import './theme-init'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 
-import { App } from './App'
 import { AppProvider } from './app/state'
 import { fakeHost, type FakeHostControls } from './host/fake'
+// The same shell choice the shipped entry makes, with `?surface=` so a browser test can ask for
+// the phone's one without pretending to be a phone.
+import { Shell, surfaceOf } from './mobile/entry'
 import './styles/tokens.css'
 import './styles/base.css'
 import './styles/components.css'
@@ -35,7 +37,7 @@ window.krTestHost = controls
 createRoot(root).render(
   <StrictMode>
     <AppProvider port={port}>
-      <App />
+      <Shell surface={surfaceOf(window.location.search)} />
     </AppProvider>
   </StrictMode>
 )

@@ -13,6 +13,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
+    "test:mobile": "vitest run test/mobile",
     "e2e": "node scripts/e2e.mjs",
     "tauri": "tauri"
   },

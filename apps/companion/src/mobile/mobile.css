@@ -1,0 +1,623 @@
+/*
+ * The phone's layout, in the same Newsprint tokens the desktop window uses.
+ *
+ * Nothing here defines a colour. Every value is a token from `styles/tokens.css`, so the phone and
+ * the desktop are one design with two layouts rather than two designs, and light, dark, high
+ * contrast and reduced transparency reach the phone without a second implementation.
+ *
+ * Three rules govern the layout. Spacing is in rem, so a larger system text size scales the layout
+ * with the text instead of overflowing it. Every control is at least `--target` in both
+ * dimensions, which is 44 on iOS and 48 on Android. And every edge that can be under a notch, a
+ * home indicator or a rounded corner is padded by the platform's own safe-area inset.
+ */
+
+:root[data-surface='ios'] {
+  --target: 44px;
+}
+
+:root[data-surface='android'] {
+  --target: 48px;
+}
+
+:root[data-surface='ios'],
+:root[data-surface='android'] {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  /* How much of the screen the software keyboard is covering, measured, not guessed. */
+  --keyboard: 0px;
+}
+
+.m-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  block-size: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  overflow: hidden;
+}
+
+/* ---- Chrome ---------------------------------------------------------------------------------- */
+
+/*
+ * The bars are a translucent layer the content passes under, not an opaque strip that eats it.
+ * Where the platform asks for less transparency they become solid, which is the same rule the
+ * desktop window follows.
+ */
+.m-topbar,
+.m-tabbar {
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(20px) saturate(180%);
+  position: relative;
+  z-index: 2;
+}
+
+.m-topbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: calc(var(--safe-top) + var(--gap-2)) calc(var(--safe-right) + var(--gap-4)) var(--gap-2)
+    calc(var(--safe-left) + var(--gap-4));
+  border-block-end: 1px solid var(--line);
+}
+
+.m-topbar h1 {
+  margin: 0;
+  /* Large type reads too loose at its default tracking, so it is tightened as it grows. */
+  font-size: 1.3125rem;
+  line-height: 1.15;
+  letter-spacing: -0.014em;
+  font-weight: 620;
+  text-align: center;
+}
+
+.m-topbar-side {
+  display: flex;
+  align-items: center;
+  min-inline-size: var(--target);
+}
+
+.m-topbar-side:last-child {
+  justify-content: flex-end;
+}
+
+.m-connection {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.m-main {
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  padding-inline: calc(var(--safe-left) + var(--gap-4)) calc(var(--safe-right) + var(--gap-4));
+  padding-block: var(--gap-4) var(--gap-5);
+  scroll-padding-block-end: var(--gap-6);
+}
+
+.m-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ---- The tab bar ----------------------------------------------------------------------------- */
+
+.m-tabbar {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  border-block-start: 1px solid var(--line);
+  padding-block-end: var(--safe-bottom);
+  padding-inline: calc(var(--safe-left)) calc(var(--safe-right));
+}
+
+.m-tab {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 2px;
+  min-block-size: var(--target);
+  min-inline-size: var(--target);
+  padding: var(--gap-2) var(--gap-1);
+  border: 0;
+  background: none;
+  color: var(--faint);
+  font: inherit;
+  font-size: 0.6875rem;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  /* Navigation is used dozens of times a day, so it does not animate. Only the colour settles. */
+  transition: color var(--press) var(--ease-out);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-tab[aria-current='page'] {
+  color: var(--text);
+  font-weight: 620;
+}
+
+.m-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+  border-radius: 8px;
+}
+
+.m-tab-glyph {
+  position: relative;
+  display: grid;
+  place-items: center;
+  inline-size: 26px;
+  block-size: 26px;
+}
+
+.m-tab-badge {
+  position: absolute;
+  inset-block-start: -2px;
+  inset-inline-start: 14px;
+  min-inline-size: 17px;
+  block-size: 17px;
+  padding-inline: 4px;
+  border-radius: 9px;
+  background: var(--danger);
+  color: var(--primary-text);
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 17px;
+  text-align: center;
+}
+
+:root[data-theme='dark'] .m-tab-badge {
+  color: var(--bg);
+}
+
+/* ---- Rows and cards -------------------------------------------------------------------------- */
+
+.m-list {
+  display: grid;
+  gap: var(--gap-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.m-row {
+  display: grid;
+  gap: var(--gap-1);
+  inline-size: 100%;
+  min-block-size: var(--target);
+  padding: var(--gap-3) var(--gap-4);
+  border: 1px solid var(--line);
+  border-inline-start-width: 3px;
+  border-radius: 12px;
+  background: var(--raised);
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  /* Pressing has to be felt at once, so the feedback is on the press and it is short. */
+  transition:
+    transform var(--press) var(--ease-out),
+    background-color var(--press) var(--ease-out);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-row:active {
+  transform: scale(0.985);
+  background: var(--subtle);
+}
+
+.m-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.m-row[data-tone='warning'] {
+  border-inline-start-color: var(--warning);
+}
+.m-row[data-tone='danger'] {
+  border-inline-start-color: var(--danger);
+}
+.m-row[data-tone='success'] {
+  border-inline-start-color: var(--success);
+}
+.m-row[data-tone='muted'] {
+  border-inline-start-color: var(--control-line);
+}
+
+.m-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--gap-2);
+}
+
+.m-row-kind {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.m-row[data-tone='warning'] .m-row-kind {
+  color: var(--warning);
+}
+.m-row[data-tone='danger'] .m-row-kind {
+  color: var(--danger);
+}
+.m-row[data-tone='success'] .m-row-kind {
+  color: var(--success);
+}
+.m-row[data-tone='muted'] .m-row-kind {
+  color: var(--faint);
+}
+
+.m-row-title {
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.m-row-where,
+.m-row-detail {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.m-row-detail {
+  color: var(--faint);
+}
+
+.m-empty {
+  padding: var(--gap-6) var(--gap-4);
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  color: var(--faint);
+  text-align: center;
+}
+
+.m-section-title {
+  margin: var(--gap-5) 0 var(--gap-2);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.m-section-title:first-child {
+  margin-block-start: 0;
+}
+
+/* ---- Filters --------------------------------------------------------------------------------- */
+
+.m-filters {
+  display: flex;
+  gap: var(--gap-2);
+  margin-block-end: var(--gap-4);
+  padding-block-end: var(--gap-1);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.m-filters::-webkit-scrollbar {
+  display: none;
+}
+
+.m-filter {
+  flex: 0 0 auto;
+  min-block-size: var(--target);
+  min-inline-size: var(--target);
+  padding: var(--gap-2) var(--gap-4);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition:
+    transform var(--press) var(--ease-out),
+    background-color var(--press) var(--ease-out),
+    color var(--press) var(--ease-out);
+}
+
+.m-filter:active {
+  transform: scale(0.97);
+}
+
+.m-filter[aria-pressed='true'] {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-text);
+}
+
+.m-filter:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- The session surfaces -------------------------------------------------------------------- */
+
+.m-session {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  block-size: 100%;
+  gap: var(--gap-3);
+}
+
+.m-pane {
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  min-block-size: 0;
+}
+
+/* Streamed output never animates: text that fades in is text a person cannot read as it arrives. */
+.m-stream * {
+  transition: none !important;
+  animation: none !important;
+}
+
+.m-node {
+  padding-block: var(--gap-2);
+  border-block-end: 1px solid var(--line);
+  font-size: 0.9375rem;
+  line-height: 1.55;
+}
+
+.m-node:last-child {
+  border-block-end: 0;
+}
+
+.m-node-role {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.m-terminal {
+  position: relative;
+  overflow: hidden;
+  min-block-size: 12rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  /* The view owns the gesture, so the browser's own panning and zooming are off inside it. */
+  touch-action: none;
+}
+
+.m-terminal-grid {
+  margin: 0;
+  padding: var(--gap-2);
+  font-family: var(--font-mono);
+  font-size: calc(0.8125rem * var(--zoom, 1));
+  line-height: 1.35;
+  white-space: pre;
+  transform: translate3d(calc(var(--pan-x, 0) * 1px), calc(var(--pan-y, 0) * 1px), 0);
+}
+
+.m-terminal-hud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+  padding-block-start: var(--gap-2);
+  font-size: 0.75rem;
+  color: var(--faint);
+}
+
+/* ---- The composer and the accessory row ------------------------------------------------------ */
+
+.m-composer {
+  display: grid;
+  gap: var(--gap-2);
+  padding-block-end: calc(var(--safe-bottom) + var(--keyboard));
+}
+
+.m-composer textarea {
+  inline-size: 100%;
+  min-block-size: calc(var(--target) * 1.4);
+  padding: var(--gap-3);
+  border: 1px solid var(--control-line);
+  border-radius: 10px;
+  background: var(--raised);
+  color: var(--text);
+  font: inherit;
+  font-size: 1rem; /* Anything smaller makes iOS zoom the page when the field takes focus. */
+  line-height: 1.45;
+  resize: none;
+}
+
+.m-composer textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.m-composer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+  align-items: center;
+}
+
+.m-accessory {
+  display: flex;
+  gap: var(--gap-1);
+  padding-block: var(--gap-1);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.m-accessory::-webkit-scrollbar {
+  display: none;
+}
+
+.m-key {
+  flex: 0 0 auto;
+  min-inline-size: var(--target);
+  min-block-size: var(--target);
+  padding-inline: var(--gap-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  cursor: pointer;
+  /* A key is pressed over and over, so it gives feedback and nothing else. */
+  transition:
+    transform var(--press) var(--ease-out),
+    background-color var(--press) var(--ease-out);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-key:active {
+  transform: scale(0.94);
+  background: var(--subtle);
+}
+
+.m-key:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.m-key[data-latch='once'] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.m-key[data-latch='locked'] {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-text);
+}
+
+.m-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+}
+
+.m-attachment {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  min-block-size: var(--target);
+  padding: var(--gap-1) var(--gap-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 0.8125rem;
+}
+
+/* ---- Usage ----------------------------------------------------------------------------------- */
+
+.m-usage {
+  display: grid;
+  gap: var(--gap-1);
+  padding-block: var(--gap-2);
+}
+
+.m-meter {
+  block-size: 6px;
+  border-radius: 3px;
+  background: var(--subtle);
+  overflow: hidden;
+}
+
+.m-meter > span {
+  display: block;
+  block-size: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+
+/* ---- Landscape and larger screens ------------------------------------------------------------ */
+
+@media (min-width: 40rem) {
+  .m-main {
+    padding-inline: calc(var(--safe-left) + var(--gap-5)) calc(var(--safe-right) + var(--gap-5));
+  }
+
+  .m-list {
+    grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+  }
+}
+
+@media (orientation: landscape) and (max-height: 30rem) {
+  /* A short landscape screen has no room for a label under every tab. */
+  .m-tab {
+    grid-auto-flow: column;
+    gap: var(--gap-2);
+    align-items: center;
+  }
+
+  .m-topbar {
+    padding-block: var(--gap-1);
+  }
+}
+
+/* ---- Reduced motion -------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .m-row,
+  .m-filter,
+  .m-key,
+  .m-tab {
+    transition-property: background-color, color;
+  }
+
+  .m-row:active,
+  .m-filter:active,
+  .m-key:active {
+    transform: none;
+  }
+
+  .m-terminal-grid {
+    transition: none;
+  }
+}
+
+/* ---- Reduced transparency and high contrast -------------------------------------------------- */
+
+@media (prefers-reduced-transparency: reduce) {
+  .m-topbar,
+  .m-tabbar {
+    background: var(--bg);
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .m-topbar,
+  .m-tabbar {
+    background: var(--bg);
+    backdrop-filter: none;
+  }
+
+  .m-row,
+  .m-filter,
+  .m-key {
+    border-color: var(--control-line);
+  }
+}
+
+/* A sentence that qualifies what a control will do, under the control it qualifies. */
+.m-hint {
+  margin: var(--gap-2) 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--faint);
+}

@@ -11,9 +11,11 @@ import './theme-init'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 
-import { App } from './App'
 import { AppProvider } from './app/state'
 import { tauriPort } from './host/tauri'
+// The phone's shell. `Shell` picks it from the platform, so the desktop window renders exactly
+// what it rendered before and iOS and Android render the mobile surfaces.
+import { Shell, surfaceOf } from './mobile/entry'
 import './styles/tokens.css'
 import './styles/base.css'
 import './styles/components.css'
@@ -25,7 +27,7 @@ if (!root) throw new Error('The application has no root element.')
 createRoot(root).render(
   <StrictMode>
     <AppProvider port={tauriPort()}>
-      <App />
+      <Shell surface={surfaceOf()} />
     </AppProvider>
   </StrictMode>
 )
