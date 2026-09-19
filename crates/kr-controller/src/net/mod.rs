@@ -1137,7 +1137,7 @@ impl Controller {
     pub(crate) async fn close_remote_session(
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
-        actor: &kr_protocol::actor::ActorEnvelope,
+        vouched: proxy::Vouched<'_>,
         accepted: AcceptedDeadline,
         observer: &dispatch::ExpiryObserver,
         answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
@@ -1148,7 +1148,7 @@ impl Controller {
         let settled = self
             .close_through(
                 mutation,
-                actor,
+                vouched,
                 accepted,
                 observer,
                 &mut link,
@@ -1167,7 +1167,7 @@ impl Controller {
     async fn close_through(
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
-        actor: &kr_protocol::actor::ActorEnvelope,
+        vouched: proxy::Vouched<'_>,
         accepted: AcceptedDeadline,
         observer: &dispatch::ExpiryObserver,
         link: &mut Option<Arc<WorkerProxy>>,
@@ -1230,7 +1230,7 @@ impl Controller {
             )
             .await?;
         *link = Some(Arc::clone(&proxy));
-        let answered = proxy.forward_mutation(mutation, actor, deadline).await?;
+        let answered = proxy.forward_mutation(mutation, vouched, deadline).await?;
         // Whether this came from the worker's journal rather than from a close it performed now.
         // The connection that asked decides whether it may be told a retained result; the close
         // itself happened either way, which is what section 7 asks of a stop.

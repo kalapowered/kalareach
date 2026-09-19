@@ -26,11 +26,26 @@ use kr_protocol::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalClientKind,
 };
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Nullable, U64};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use tokio::sync::{Mutex, oneshot};
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
+
+/// What the host vouches for about one forwarded mutation.
+///
+/// The worker can establish neither half for itself: it did not authenticate the caller, and it
+/// holds no grants. The two travel together because they are one statement — this is the actor,
+/// and these are the rights of the grant this request was checked against — and a caller acting
+/// under no grant carries an empty set rather than a missing one.
+#[derive(Clone, Copy, Debug)]
+pub struct Vouched<'a> {
+    /// The actor the host verified, with the ingress it arrived on.
+    pub actor: &'a ActorEnvelope,
+    /// The rights of the grant the host checked this request against.
+    pub grant_rights: &'a CanonicalSet<ActionRight>,
+}
 use crate::service::Controller;
 
 /// How long a proxied call waits for the worker before the caller is told the outcome is unknown.
@@ -290,7 +305,7 @@ impl WorkerProxy {
     pub async fn forward_mutation(
         &self,
         mutation: &MutationRequest,
-        actor: &ActorEnvelope,
+        vouched: Vouched<'_>,
         accepted_deadline_boot_ms: U64,
     ) -> Result<Forwarded> {
         let request_id = self.next_request_id();
@@ -300,7 +315,8 @@ impl WorkerProxy {
         forwarded.request_id = request_id;
         let frame = ControlFrame::Forwarded(Box::new(ForwardedMutation {
             mutation: forwarded,
-            actor: actor.clone(),
+            actor: vouched.actor.clone(),
+            grant_rights: vouched.grant_rights.clone(),
             accepted_deadline_boot_ms,
         }));
         self.call(request_id, &frame).await

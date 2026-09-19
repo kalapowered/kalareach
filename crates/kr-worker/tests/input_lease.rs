@@ -753,6 +753,9 @@ async fn a_forwarded_caller_claiming_a_network_ingress_is_refused_the_lease() {
         .forward(
             &mutation,
             &claiming_a_device,
+            &[kr_protocol::rights::ActionRight::TerminalInput]
+                .into_iter()
+                .collect(),
             kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 5_000),
         )
         .await

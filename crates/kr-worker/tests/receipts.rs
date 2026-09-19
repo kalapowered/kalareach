@@ -1110,6 +1110,9 @@ async fn the_host_authorises_against_current_state_and_a_relayed_envelope_grants
             DEFAULT_MUTATION_TTL.get(),
             ParamsValue::empty(),
         ),
+        grant_rights: [kr_protocol::rights::ActionRight::SessionClose]
+            .into_iter()
+            .collect(),
         actor: kr_protocol::actor::ActorEnvelope {
             actor_id: actor("device:somebody-elses-phone"),
             ingress: kr_protocol::actor::ActorIngress::PairedDevice,
@@ -2779,6 +2782,8 @@ async fn a_forwarded_retry_is_answered_after_its_deadline_and_never_first_admitt
         ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
             mutation,
             actor: actor_envelope(actor("local:501")),
+            // A local caller acts under no grant, so there are no rights to narrow it by.
+            grant_rights: kr_protocol::scalars::CanonicalSet::new(),
             accepted_deadline_boot_ms: U64::new(deadline),
         }))
     };

@@ -3571,7 +3571,15 @@ impl Controller {
             let client = held.as_mut().expect("the connection is open");
             match tokio::time::timeout_at(
                 budget,
-                client.forward(mutation, actor, accepted_deadline_boot_ms),
+                client.forward(
+                    mutation,
+                    actor,
+                    // A local caller acts under the operating-system identity the listener
+                    // authenticated rather than under a grant, so there are no rights to narrow
+                    // what it asked for.
+                    &CanonicalSet::new(),
+                    accepted_deadline_boot_ms,
+                ),
             )
             .await
             {

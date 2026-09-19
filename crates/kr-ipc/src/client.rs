@@ -400,9 +400,9 @@ impl LocalClient {
     /// Passes a mutation the host admitted to the component that owns its subject.
     ///
     /// The mutation travels unchanged, because it is what the payload digest covers and what the
-    /// caller will retry with. Only the actor the host verified and the deadline it accepted travel
-    /// beside it, and the deadline is on the machine's own continuous clock so both processes read
-    /// the same instant.
+    /// caller will retry with. What travels beside it is the actor the host verified, the rights of
+    /// the grant it was checked against, and the deadline it accepted; the deadline is on the
+    /// machine's own continuous clock so both processes read the same instant.
     ///
     /// # Errors
     ///
@@ -411,6 +411,7 @@ impl LocalClient {
         &mut self,
         mutation: &MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
+        grant_rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
         accepted_deadline_boot_ms: kr_protocol::scalars::U64,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         let request_id = mutation.request_id;
@@ -419,6 +420,7 @@ impl LocalClient {
                 kr_protocol::local::ForwardedMutation {
                     mutation: mutation.clone(),
                     actor: actor.clone(),
+                    grant_rights: grant_rights.clone(),
                     accepted_deadline_boot_ms,
                 },
             )))

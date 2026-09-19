@@ -57,7 +57,7 @@ use kr_transport::listener::{AuthorisedSession, ControlSender};
 use kr_transport::window::AcceptedDeadline;
 
 use super::devices::DeviceRecord;
-use super::proxy::{RELAY_QUEUED_BYTES, RelayBudget, Relayed, WorkerProxy};
+use super::proxy::{RELAY_QUEUED_BYTES, RelayBudget, Relayed, Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::service::Controller;
 
@@ -780,6 +780,7 @@ impl RemoteConnection {
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let envelope = self.envelope(validated);
+                let grant_rights = self.device.grant.actions.clone();
                 let request_id = mutation.request_id;
                 // The answer comes back before the link that carried the close is released,
                 // because releasing it is what tells the worker the acceptance was delivered.
@@ -790,7 +791,15 @@ impl RemoteConnection {
                 tokio::spawn(async move {
                     controller
                         .close_remote_session(
-                            &mutation, &envelope, accepted, &observer, answer, delivered,
+                            &mutation,
+                            Vouched {
+                                actor: &envelope,
+                                grant_rights: &grant_rights,
+                            },
+                            accepted,
+                            &observer,
+                            answer,
+                            delivered,
                         )
                         .await;
                 });
@@ -990,10 +999,22 @@ impl RemoteConnection {
         // cancellation here must not be what decides whether the outcome is recorded.
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
-        let effect =
-            tokio::spawn(
-                async move { proxy.forward_mutation(&mutation, &envelope, deadline).await },
-            );
+        // The grant's rights travel with the mutation. The worker admits an attachment and holds
+        // no grants: section 8's intersection of requested capabilities with the actor's rights is
+        // made where the attachment is admitted, out of what the host checked this request against.
+        let grant_rights = self.device.grant.actions.clone();
+        let effect = tokio::spawn(async move {
+            proxy
+                .forward_mutation(
+                    &mutation,
+                    Vouched {
+                        actor: &envelope,
+                        grant_rights: &grant_rights,
+                    },
+                    deadline,
+                )
+                .await
+        });
         match effect.await {
             Ok(Ok(answered)) => {
                 if answered.retained
@@ -1605,23 +1626,25 @@ impl RemoteConnection {
 /// Returns whether one request claims or adds a geometry claim.
 ///
 /// The condition on `terminal.geometry` is "when the request claims or adds a geometry claim", so
-/// the request is what decides it. `session.attach` and `attachment.configure` both carry the flag
-/// and the requested capability, and either one is a claim.
+/// the request is what decides it: `claim_geometry` is the field that registers one, and
+/// `session.attach` and `attachment.configure` both carry it.
+///
+/// A *requested capability* is not a claim. Section 8 makes an attachment's granted capabilities
+/// the requested ones intersected with the actor's rights, so asking for `geometry` in a grant
+/// that does not carry `terminal.geometry` yields an attachment without it rather than a refusal,
+/// and the summary the caller is given says which it got. Refusing here instead would mean a
+/// client that asks for everything it can use gets nothing, which is the opposite of what an
+/// intersection is for. What it may still never do is register the claim: `claim_geometry` needs
+/// the right here, and every later operation is checked against the capability the attachment was
+/// actually granted.
 fn claims_geometry(mutation: &MutationRequest) -> bool {
     let kr_cbor::CanonicalValue::Map(map) = mutation.params.as_value() else {
         return false;
     };
-    let claim = matches!(
+    matches!(
         map.get("claim_geometry"),
         Some(kr_cbor::CanonicalValue::Bool(true))
-    );
-    let requested = match map.get("requested") {
-        Some(kr_cbor::CanonicalValue::Array(items)) => items
-            .iter()
-            .any(|item| matches!(item, kr_cbor::CanonicalValue::Text(text) if text == "geometry")),
-        _ => false,
-    };
-    claim || requested
+    )
 }
 
 /// Returns the session a request names, from the encoded parameters.
@@ -1740,5 +1763,71 @@ const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> 
             "this action window has expired; the host has already replaced it, so submit a new \
              request rather than replaying this one"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+    use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+    use kr_protocol::ids::{
+        ActionId, ActionWindowId, EnvironmentId, RequestId, SessionEpoch, SessionId,
+    };
+    use kr_protocol::method::{Method, MethodVersion};
+    use kr_protocol::scalars::{Nullable, Uuid};
+
+    fn attach(claim_geometry: bool, requested: &[AttachmentCapability]) -> MutationRequest {
+        let session_id = SessionId::new(Uuid::from_bytes([3; 16]));
+        MutationRequest {
+            request_id: RequestId::new(1),
+            method: Method::SessionAttach.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(Uuid::from_bytes([4; 16])),
+            target: ActionTarget {
+                environment_id: EnvironmentId::new(Uuid::from_bytes([5; 16])),
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            params: ParamsValue::from_typed(&SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry,
+                dimensions: Nullable::null(),
+                terminal_profile_id: Nullable::null(),
+                requested: requested.iter().copied().collect(),
+            })
+            .expect("encodes"),
+            grant_id: Nullable::null(),
+            expected: ParamsValue::from_typed(&std::collections::BTreeMap::<String, u64>::new())
+                .expect("encodes"),
+            action_window_id: ActionWindowId::new("window").expect("a window identifier"),
+            requested_ttl_ms: kr_protocol::limits::DEFAULT_MUTATION_TTL,
+        }
+    }
+
+    /// KR-REQ-08.68: registering a claim is what needs the geometry right, and asking is not
+    /// registering.
+    #[test]
+    fn a_requested_capability_is_not_a_geometry_claim() {
+        assert!(
+            super::claims_geometry(&attach(true, &[])),
+            "the flag that registers a claim is a claim"
+        );
+        assert!(
+            !super::claims_geometry(&attach(false, &[AttachmentCapability::Geometry])),
+            "asking for the capability is a request the host intersects, not a claim"
+        );
+        assert!(
+            !super::claims_geometry(&attach(
+                false,
+                &[
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Input
+                ]
+            )),
+            "and an ordinary observing attachment claims nothing"
+        );
     }
 }

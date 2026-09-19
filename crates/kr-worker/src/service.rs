@@ -2025,7 +2025,7 @@ impl WorkerService {
         self.mutation(
             state,
             &forwarded.mutation,
-            &Caller::forwarded(&forwarded.actor),
+            &Caller::forwarded(&forwarded.actor, &forwarded.grant_rights),
             Freshness::Vouched(deadline),
             proxied,
         )
@@ -2079,7 +2079,11 @@ impl WorkerService {
         self.request(
             state,
             &forwarded.request,
-            &Caller::forwarded(&forwarded.actor)
+            // A forwarded read carries no rights, because nothing a read decides is decided from
+            // them: an attachment's capabilities are fixed where the attachment is admitted, which
+            // is a mutation, and every later operation is checked against what that admission
+            // granted rather than against the grant again.
+            &Caller::forwarded(&forwarded.actor, &CanonicalSet::new())
                 .until(forwarded.authority_deadline_boot_ms.0.map(U64::get)),
         )
     }
@@ -3389,10 +3393,26 @@ impl WorkerService {
             Method::SessionAttach => {
                 let params: SessionAttachParams = parse(params)?;
                 let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
-                // A local owner attachment receives what it asked for: peer credentials already
-                // proved the caller is this user, and the worker's own authority covers its
-                // session.
-                let granted = params.requested.clone();
+                // Section 8: what an attachment is granted is what it asked for intersected with
+                // the actor's rights. A caller acting under a grant is narrowed to the rights the
+                // host checked its request against, capability by capability, so an attachment
+                // never records authority its grant never carried and the summary it is given says
+                // what it actually holds.
+                //
+                // Exactly one caller is not narrowed: the local owner, on this worker's own socket
+                // and holding no grant. Its peer credentials already proved it is this user and
+                // the worker's own authority covers its session. Everything else is narrowed,
+                // including a caller that reached the host some other way and named no grant,
+                // which under this rule receives nothing rather than everything.
+                let granted =
+                    if caller.ingress == ActorIngress::LocalIpc && !caller.grant_id.is_present() {
+                        params.requested.clone()
+                    } else {
+                        kr_protocol::rights::permitted_attachment_capabilities(
+                            &params.requested,
+                            &caller.grant_rights,
+                        )
+                    };
                 // And it is drawn the whole screen, because it holds no grant to be narrowed by.
                 // A forwarded caller is drawn the live screen alone: section 10's live-screen
                 // exception never reaches the buffer that is not showing, and this build serves a
@@ -3720,6 +3740,14 @@ pub struct Caller {
     /// written to the application afterwards, because the queue it waits in is not the check that
     /// admitted it. Absent for a caller whose authority does not expire.
     pub authority_deadline_boot_ms: Option<u64>,
+    /// The rights the grant this caller's *mutation* was checked against carries.
+    ///
+    /// Section 8's intersection of requested attachment capabilities with the actor's rights is
+    /// made from this, because the worker holds no grants of its own and an attachment is admitted
+    /// here. Empty for a caller whose authority is not a grant, and empty on a read: an
+    /// attachment's capabilities are fixed where it is admitted, and every later operation is
+    /// checked against what that admission granted rather than against the grant a second time.
+    pub grant_rights: CanonicalSet<kr_protocol::rights::ActionRight>,
 }
 
 impl Caller {
@@ -3733,12 +3761,16 @@ impl Caller {
             device_id: Nullable::null(),
             validated_revision: None,
             authority_deadline_boot_ms: None,
+            grant_rights: CanonicalSet::new(),
         }
     }
 
-    /// Returns the caller the control daemon vouched for.
+    /// Returns the caller the control daemon vouched for, under the rights it checked.
     #[must_use]
-    pub fn forwarded(actor: &ActorEnvelope) -> Self {
+    pub fn forwarded(
+        actor: &ActorEnvelope,
+        grant_rights: &CanonicalSet<kr_protocol::rights::ActionRight>,
+    ) -> Self {
         Self {
             actor_id: actor.actor_id.clone(),
             ingress: actor.ingress,
@@ -3746,6 +3778,7 @@ impl Caller {
             device_id: actor.device_id,
             validated_revision: actor.grant_revision.as_ref().copied(),
             authority_deadline_boot_ms: None,
+            grant_rights: grant_rights.clone(),
         }
     }
 

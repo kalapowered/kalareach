@@ -126,7 +126,8 @@ pub struct LocalHelloAck {
 /// worker a different action from the one the caller asked for.
 ///
 /// What travels beside it is what the worker cannot establish for itself: which principal the host
-/// verified, and the deadline the host accepted. The worker performs the action under both.
+/// verified, the rights the grant it was checked against carries, and the deadline the host
+/// accepted. The worker performs the action under all three.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedMutation {
@@ -134,6 +135,16 @@ pub struct ForwardedMutation {
     pub mutation: MutationRequest,
     /// The actor the host verified, with the ingress it arrived on.
     pub actor: crate::actor::ActorEnvelope,
+    /// The rights the grant named in the envelope carries, as the host resolved them.
+    ///
+    /// Section 8 makes an attachment's granted capabilities the requested ones intersected with
+    /// the actor's rights, and the worker is where an attachment is admitted. It holds no grants,
+    /// so the rights travel with the mutation that needs them rather than being asked for again.
+    ///
+    /// Empty when the envelope names no grant, which is what a locally authenticated caller's
+    /// operating-system identity is. The worker narrows nothing for such a caller: there is no
+    /// grant to narrow by, and its peer credentials already proved it is this user.
+    pub grant_rights: CanonicalSet<crate::rights::ActionRight>,
     /// The deadline the host derived at first admission, on the machine's own continuous clock.
     ///
     /// Milliseconds since this boot, from the clock the operating system keeps for the whole

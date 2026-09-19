@@ -312,6 +312,31 @@ export type PalettePreset = 'light' | 'dark'
  */
 export type ControllerConnectionRole = 'authority' | 'proxy'
 /**
+ * One permitted action in a grant.
+ */
+export type ActionRight =
+  | 'session.view'
+  | 'terminal.input'
+  | 'terminal.geometry'
+  | 'terminal.geometry.transfer'
+  | 'terminal.palette'
+  | 'agent.prompt'
+  | 'agent.cancel'
+  | 'agent.approval.respond'
+  | 'question.respond'
+  | 'files.read'
+  | 'files.upload'
+  | 'files.apply_diff'
+  | 'project.create'
+  | 'workspace.manage'
+  | 'changeset.create'
+  | 'session.create'
+  | 'session.rename'
+  | 'session.close'
+  | 'session.share'
+  | 'automation.manage'
+  | 'host.manage'
+/**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
@@ -375,31 +400,6 @@ export type ApplicationState = 'shell_ready' | 'agent_busy' | 'awaiting_input' |
  * The event streams a session publishes.
  */
 export type EventStream = 'session_state' | 'output' | 'attachments' | 'input_lease' | 'receipts'
-/**
- * One permitted action in a grant.
- */
-export type ActionRight =
-  | 'session.view'
-  | 'terminal.input'
-  | 'terminal.geometry'
-  | 'terminal.geometry.transfer'
-  | 'terminal.palette'
-  | 'agent.prompt'
-  | 'agent.cancel'
-  | 'agent.approval.respond'
-  | 'question.respond'
-  | 'files.read'
-  | 'files.upload'
-  | 'files.apply_diff'
-  | 'project.create'
-  | 'workspace.manage'
-  | 'changeset.create'
-  | 'session.create'
-  | 'session.rename'
-  | 'session.close'
-  | 'session.share'
-  | 'automation.manage'
-  | 'host.manage'
 /**
  * An upstream approval request identifier. Opaque to KalaReach.
  */
@@ -4106,7 +4106,8 @@ export interface GenerationAccepted {
  * worker a different action from the one the caller asked for.
  *
  * What travels beside it is what the worker cannot establish for itself: which principal the host
- * verified, and the deadline the host accepted. The worker performs the action under both.
+ * verified, the rights the grant it was checked against carries, and the deadline the host
+ * accepted. The worker performs the action under all three.
  */
 export interface ForwardedMutation {
   /**
@@ -4114,6 +4115,18 @@ export interface ForwardedMutation {
    */
   accepted_deadline_boot_ms: string
   actor: ActorEnvelope1
+  /**
+   * The rights the grant named in the envelope carries, as the host resolved them.
+   *
+   * Section 8 makes an attachment's granted capabilities the requested ones intersected with
+   * the actor's rights, and the worker is where an attachment is admitted. It holds no grants,
+   * so the rights travel with the mutation that needs them rather than being asked for again.
+   *
+   * Empty when the envelope names no grant, which is what a locally authenticated caller's
+   * operating-system identity is. The worker narrows nothing for such a caller: there is no
+   * grant to narrow by, and its peer credentials already proved it is this user.
+   */
+  grant_rights: ActionRight[]
   mutation: MutationRequest1
 }
 /**

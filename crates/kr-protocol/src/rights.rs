@@ -133,3 +133,173 @@ impl FromStr for ActionRight {
         Self::from_wire(value).ok_or(UnknownActionRight)
     }
 }
+
+/// The right a grant must carry for one attachment capability.
+///
+/// Section 8 says an attachment's granted capabilities are the requested ones intersected with the
+/// actor's rights, and section 10 says what the rights are. This is that intersection's table, and
+/// it lives beside the vocabulary so a right added there has to be decided for the capabilities
+/// too rather than defaulting into one.
+///
+/// A request is not a grant: an attachment identifier is never permission on its own, and asking
+/// for a capability the grant does not carry gets an attachment without it rather than a refusal.
+#[must_use]
+pub const fn attachment_capability_right(
+    capability: crate::attachment::AttachmentCapability,
+) -> ActionRight {
+    use crate::attachment::AttachmentCapability;
+    match capability {
+        // Observing a session, in either mode, is what `session.view` is: section 23's attachment
+        // row is "view for observation", and the mode is a presentation choice rather than a
+        // second authority.
+        AttachmentCapability::ObserveTerminal | AttachmentCapability::ObserveSemantic => {
+            ActionRight::SessionView
+        }
+        // Holding the input lease and writing input. Section 10 says this effectively exposes the
+        // shell user's account, which is why it is never implied by observation.
+        AttachmentCapability::Input => ActionRight::TerminalInput,
+        // Registering a geometry claim and resizing while owner.
+        AttachmentCapability::Geometry => ActionRight::TerminalGeometry,
+    }
+}
+
+/// Narrows requested attachment capabilities to the ones a set of rights permits.
+///
+/// This is the host's side of section 8's intersection. It is applied where an attachment is
+/// admitted, against the rights of the grant the host has already checked the request against; a
+/// caller whose authority is not a grant has none to be narrowed by and keeps what it asked for.
+#[must_use]
+pub fn permitted_attachment_capabilities(
+    requested: &crate::scalars::CanonicalSet<crate::attachment::AttachmentCapability>,
+    rights: &crate::scalars::CanonicalSet<ActionRight>,
+) -> crate::scalars::CanonicalSet<crate::attachment::AttachmentCapability> {
+    requested
+        .iter()
+        .copied()
+        .filter(|capability| rights.contains(&attachment_capability_right(*capability)))
+        .collect()
+}
+
+#[cfg(test)]
+mod attachment_capability_tests {
+    use super::{ActionRight, attachment_capability_right, permitted_attachment_capabilities};
+    use crate::attachment::AttachmentCapability;
+    use crate::scalars::CanonicalSet;
+
+    /// The four default session roles of section 25, as the rights they compile to.
+    ///
+    /// A role is a way of choosing rights and nothing else: the host decides from the rights, so
+    /// these are here as the four grants a person actually issues rather than as a type.
+    const VIEWER: &[ActionRight] = &[ActionRight::SessionView];
+    const REVIEWER: &[ActionRight] = &[ActionRight::SessionView, ActionRight::FilesRead];
+    const CONTROLLER: &[ActionRight] = &[
+        ActionRight::SessionView,
+        ActionRight::FilesRead,
+        ActionRight::TerminalInput,
+        ActionRight::TerminalGeometry,
+        ActionRight::AgentPrompt,
+        ActionRight::AgentCancel,
+        ActionRight::AgentApprovalRespond,
+        ActionRight::QuestionRespond,
+    ];
+    const OWNER: &[ActionRight] = &[
+        ActionRight::SessionView,
+        ActionRight::FilesRead,
+        ActionRight::TerminalInput,
+        ActionRight::TerminalGeometry,
+        ActionRight::TerminalGeometryTransfer,
+        ActionRight::TerminalPalette,
+        ActionRight::AgentPrompt,
+        ActionRight::AgentCancel,
+        ActionRight::AgentApprovalRespond,
+        ActionRight::QuestionRespond,
+        ActionRight::SessionRename,
+        ActionRight::SessionClose,
+        ActionRight::SessionShare,
+    ];
+
+    fn rights(of: &[ActionRight]) -> CanonicalSet<ActionRight> {
+        of.iter().copied().collect()
+    }
+
+    fn everything() -> CanonicalSet<AttachmentCapability> {
+        AttachmentCapability::ALL.iter().copied().collect()
+    }
+
+    /// KR-REQ-08.68 and KR-REQ-23.35: every capability against the four roles a person issues.
+    #[test]
+    fn each_role_receives_the_capabilities_its_rights_carry_and_no_others() {
+        for (role, name, expected) in [
+            (
+                VIEWER,
+                "viewer",
+                vec![
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::ObserveSemantic,
+                ],
+            ),
+            (
+                REVIEWER,
+                "reviewer",
+                vec![
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::ObserveSemantic,
+                ],
+            ),
+            (CONTROLLER, "controller", AttachmentCapability::ALL.to_vec()),
+            (OWNER, "owner", AttachmentCapability::ALL.to_vec()),
+        ] {
+            let granted = permitted_attachment_capabilities(&everything(), &rights(role));
+            let expected: CanonicalSet<AttachmentCapability> = expected.into_iter().collect();
+            assert_eq!(
+                granted, expected,
+                "a {name} grant asking for everything receives what its rights carry"
+            );
+        }
+    }
+
+    /// A request is not a grant, and it is not a floor either: what is asked for bounds the answer.
+    #[test]
+    fn nothing_is_granted_that_was_not_asked_for() {
+        let asked: CanonicalSet<AttachmentCapability> = [AttachmentCapability::ObserveSemantic]
+            .into_iter()
+            .collect();
+        let granted = permitted_attachment_capabilities(&asked, &rights(OWNER));
+        assert_eq!(granted, asked, "an owner grant adds nothing to the request");
+    }
+
+    /// Capabilities describe feasibility, never authority: an empty grant grants none of them.
+    #[test]
+    fn a_grant_that_carries_nothing_receives_no_capability() {
+        let granted = permitted_attachment_capabilities(&everything(), &CanonicalSet::new());
+        assert!(granted.is_empty());
+    }
+
+    /// Each capability is decided by exactly one right, and the table covers the whole enumeration.
+    #[test]
+    fn one_right_decides_each_capability() {
+        for capability in AttachmentCapability::ALL {
+            let only = rights(&[attachment_capability_right(*capability)]);
+            let asked: CanonicalSet<AttachmentCapability> = [*capability].into_iter().collect();
+            assert_eq!(
+                permitted_attachment_capabilities(&asked, &only),
+                asked,
+                "{} is carried by {}",
+                capability.as_str(),
+                attachment_capability_right(*capability).as_str()
+            );
+            // And every other right on its own carries none of it.
+            for other in ActionRight::ALL {
+                if *other == attachment_capability_right(*capability) {
+                    continue;
+                }
+                assert!(
+                    permitted_attachment_capabilities(&asked, &rights(&[*other])).is_empty(),
+                    "{} does not carry {}",
+                    other.as_str(),
+                    capability.as_str()
+                );
+            }
+        }
+    }
+}

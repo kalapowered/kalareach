@@ -6108,7 +6108,7 @@
     },
     "ForwardedMutation": {
       "additionalProperties": false,
-      "description": "A mutation the host admitted for a caller, passed to the component that owns its subject.\n\nThe control daemon owns admission: it authenticates the caller, stamps the freshness window,\nchecks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding\ncarries the caller's mutation to the worker **unchanged**, because the mutation is what the\npayload digest covers and what the caller will retry with: rewriting any of it would give the\nworker a different action from the one the caller asked for.\n\nWhat travels beside it is what the worker cannot establish for itself: which principal the host\nverified, and the deadline the host accepted. The worker performs the action under both.",
+      "description": "A mutation the host admitted for a caller, passed to the component that owns its subject.\n\nThe control daemon owns admission: it authenticates the caller, stamps the freshness window,\nchecks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding\ncarries the caller's mutation to the worker **unchanged**, because the mutation is what the\npayload digest covers and what the caller will retry with: rewriting any of it would give the\nworker a different action from the one the caller asked for.\n\nWhat travels beside it is what the worker cannot establish for itself: which principal the host\nverified, the rights the grant it was checked against carries, and the deadline the host\naccepted. The worker performs the action under all three.",
       "properties": {
         "accepted_deadline_boot_ms": {
           "$ref": "#/$defs/U64",
@@ -6118,6 +6118,14 @@
           "$ref": "#/$defs/ActorEnvelope",
           "description": "The actor the host verified, with the ingress it arrived on."
         },
+        "grant_rights": {
+          "description": "The rights the grant named in the envelope carries, as the host resolved them.\n\nSection 8 makes an attachment's granted capabilities the requested ones intersected with\nthe actor's rights, and the worker is where an attachment is admitted. It holds no grants,\nso the rights travel with the mutation that needs them rather than being asked for again.\n\nEmpty when the envelope names no grant, which is what a locally authenticated caller's\noperating-system identity is. The worker narrows nothing for such a caller: there is no\ngrant to narrow by, and its peer credentials already proved it is this user.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "mutation": {
           "$ref": "#/$defs/MutationRequest",
           "description": "The caller's mutation, exactly as it arrived at the host."
@@ -6126,6 +6134,7 @@
       "required": [
         "mutation",
         "actor",
+        "grant_rights",
         "accepted_deadline_boot_ms"
       ],
       "type": "object"
