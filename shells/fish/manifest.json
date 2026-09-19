@@ -1,0 +1,96 @@
+{
+  "shell": "fish",
+  "integration_version": "1",
+  "editor_abi": "fish-reader-4.9",
+  "mailbox_mechanism": "reader_event_bridge",
+  "pre_eof_mechanism": "named_reader_binding",
+  "build_system": "cmake",
+  "upstream": {
+    "version": "4.9.3",
+    "revision": "fish-4.9.3",
+    "archive": "fish-4.9.3.tar.xz",
+    "url": "https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz",
+    "sha256": "20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c",
+    "directory": "fish-4.9.3"
+  },
+  "configure": [
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DWITH_MESSAGE_LOCALIZATION=ON"
+  ],
+  "cflags": [
+    "-O2",
+    "-std=gnu17"
+  ],
+  "environment": {
+    "FISH_BUILD_DOCS": "0",
+    "CARGO_NET_GIT_FETCH_WITH_CLI": "true"
+  },
+  "binary": "bin/fish",
+  "module_directory": "share/fish",
+  "source_directory": "src",
+  "modules": [],
+  "patches": [
+    {
+      "name": "fish-reader-event-bridge",
+      "file": "patches/0001-fish-reader-event-bridge.patch",
+      "revision": "1",
+      "purpose": "A private mailbox the reader waits on alongside the terminal and reads at every key-sequence boundary; immediate line acceptance through the editor's own execute; non-destructive cancellation of a pending key wait through the reader's own interruption path; reader enter, leave and idle events; and the atomic snapshot of the invoking key sequence, the terminal's typeahead and the events queued ahead of it."
+    },
+    {
+      "name": "fish-reader-state",
+      "file": "patches/0002-fish-reader-state.patch",
+      "revision": "1",
+      "purpose": "The reader states the detach condition and the cancellation report are evaluated against, where fish keeps no flag of its own: an input function waiting for the target character it takes as an argument, `get-key` waiting for the literal key it reports, the events a sequence has peeked and not resolved, and where the next character came from."
+    },
+    {
+      "name": "fish-bridge-activation",
+      "file": "patches/0003-fish-bridge-activation.patch",
+      "revision": "1",
+      "purpose": "The bridge core is compiled into the shell, the named `kr-eof-decide` binding joins the reader's own command table, the bridge loads before the user's configuration and before the first primary reader, and the `kr-bridge` builtin the guarded startup entry activates the user-facing hooks through."
+    }
+  ],
+  "sources": [
+    {
+      "file": "src/kr_bridge.h",
+      "install": "src/kr_bridge.h"
+    },
+    {
+      "file": "src/kr_bridge.c",
+      "install": "src/kr_bridge.c"
+    },
+    {
+      "file": "src/kr_bridge_cbor.h",
+      "install": "src/kr_bridge_cbor.h"
+    },
+    {
+      "file": "src/kr_bridge_cbor.c",
+      "install": "src/kr_bridge_cbor.c"
+    },
+    {
+      "file": "src/kr_bridge_crypto.h",
+      "install": "src/kr_bridge_crypto.h"
+    },
+    {
+      "file": "src/kr_bridge_crypto.c",
+      "install": "src/kr_bridge_crypto.c"
+    },
+    {
+      "file": "src/kr_bridge_fish.rs",
+      "install": "src/reader/kr_bridge.rs"
+    },
+    {
+      "file": "src/kr_builtin_bridge.rs",
+      "install": "src/builtins/kr_bridge.rs"
+    }
+  ],
+  "startup": {
+    "file": "startup/kr-fish.fish",
+    "target": "$__fish_config_dir/conf.d/kr-kalareach.fish",
+    "marker": "# >>> kalareach shell integration >>>",
+    "end_marker": "# <<< kalareach shell integration <<<"
+  },
+  "upstream_tests": {
+    "command": "fish_run_tests",
+    "reason": ""
+  }
+}

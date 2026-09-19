@@ -1,0 +1,82 @@
+--- a/build.rs
++++ b/build.rs
+@@ -46,10 +46,38 @@
+     target.set_verbose(true);
+     detect_cfgs(&mut target);
+ 
++    build_kr_bridge();
++
+     #[cfg(all(target_env = "gnu", target_feature = "crt-static"))]
+     compile_error!(
+         "Statically linking against glibc has unavoidable crashes and is unsupported. Use dynamic linking or link statically against musl."
+     );
++}
++
++/// Compiles the KalaReach root-editor bridge's shell-independent core into the shell.
++///
++/// The reader's own half of the bridge is Rust, beside the reader it belongs to; the frames, the
++/// endpoint and every decision the contract states are the same C in every package, so they are
++/// the same source here as well.
++fn build_kr_bridge() {
++    let sources = [
++        "src/kr_bridge.c",
++        "src/kr_bridge_cbor.c",
++        "src/kr_bridge_crypto.c",
++    ];
++    fish_build_helper::rebuild_if_paths_changed(sources);
++    fish_build_helper::rebuild_if_paths_changed([
++        "src/kr_bridge.h",
++        "src/kr_bridge_cbor.h",
++        "src/kr_bridge_crypto.h",
++        "src/kr_bridge_identity.h",
++    ]);
++    cc::Build::new()
++        .files(sources)
++        .include("src")
++        // The same warning set the other packages compile this core with.
++        .extra_warnings(false)
++        .compile("kr_bridge");
+ }
+ 
+ /// Check target system support for certain functionality dynamically when the build is invoked,
+--- a/src/bin/fish.rs
++++ b/src/bin/fish.rs
+@@ -480,6 +480,13 @@
+     let parser = &mut Parser::new(env, CancelBehavior::Clear);
+     parser.set_syncs_uvars(!opts.no_config);
+ 
++    // The root-editor bridge loads here: before the user's startup files, and before the first
++    // primary reader. A shell that inherited no bootstrap values has nothing to attempt and this
++    // does nothing at all, which is what keeps every child of a managed root shell inert.
++    if !opts.no_exec {
++        fish::reader::kr_bridge::activate();
++    }
++
+     if !opts.no_exec && !opts.no_config {
+         read_init(parser, config_paths.as_ref().unwrap());
+     }
+--- a/src/builtins/mod.rs
++++ b/src/builtins/mod.rs
+@@ -29,6 +29,7 @@
+ pub mod r#gettext;
+ pub mod history;
+ pub mod jobs;
++pub mod kr_bridge;
+ pub mod math;
+ pub mod path;
+ pub mod printf;
+--- a/src/builtins/shared/misc.rs
++++ b/src/builtins/shared/misc.rs
+@@ -274,6 +274,12 @@
+         func: jobs::jobs,
+     },
+     BuiltinData {
++        // The KalaReach root-editor bridge's one-shot activation, which the guarded startup entry
++        // under conf.d runs once the person's own configuration has been read.
++        name: L!("kr-bridge"),
++        func: kr_bridge::kr_bridge,
++    },
++    BuiltinData {
+         name: L!("math"),
+         func: math::math,
+     },

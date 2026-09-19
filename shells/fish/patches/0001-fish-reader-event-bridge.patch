@@ -1,0 +1,336 @@
+--- a/src/input/binding.rs
++++ b/src/input/binding.rs
+@@ -5,7 +5,7 @@
+     global_safety::RelaxedAtomicBool,
+     key::{self, Key, Modifiers, canonicalize_raw_escapes, ctrl},
+     prelude::*,
+-    reader::{Reader, reader_reset_interrupted},
++    reader::{Reader, kr_bridge, reader_reset_interrupted},
+     threads::assert_is_main_thread,
+ };
+ use fish_common::{FilenameRef, Named, assert_sorted_by_name, escape, get_by_sorted_name};
+@@ -267,6 +267,7 @@
+     ("kill-whole-line", KillWholeLine),
+     ("kill-word", KillWordEmacs),
+     ("kill-word-vi", KillWordVi),
++    ("kr-eof-decide", KrEofDecide),
+     ("nextd-or-forward-word", NextdOrForwardWordEmacs),
+     ("or", FuncOr),
+     ("pager-toggle-search", PagerToggleSearch),
+@@ -856,6 +857,9 @@
+                     );
+                     self.push_front(evt);
+                     self.binding_execute_matching_or_generic();
++                    // One complete key sequence has been resolved and its binding has not run:
++                    // the reader is between operations, which is where its mailbox is read.
++                    kr_bridge::boundary(self);
+                 }
+                 CharEvent::Implicit(_) | CharEvent::QueryResult(_) => {
+                     return evt;
+@@ -915,6 +919,8 @@
+ 
+     /// Perform the action of the specified binding.
+     fn binding_execute(&mut self, m: &Binding, key_events: Vec<CharEvent>) {
++        // The sequence that invoked this operation, which is what the fence proof carries.
++        kr_bridge::record_invoking_keys(&key_events);
+         let has_command = m
+             .commands
+             .iter()
+--- a/src/input/decode.rs
++++ b/src/input/decode.rs
+@@ -58,7 +58,14 @@
+         };
+         let (decoded_buffer, mut is_err) = match decode_utf8_at_least_one(&mut buffer, |buffer| {
+             buffer.push(
+-                match next_input_event(self.get_in_fd(), self.get_ioport_fd(), Timeout::Forever) {
++                // The bridge is left out here: the rest of one character is not a boundary, and
++                // a frame that arrived mid-sequence waits for the one that follows it.
++                match next_input_event(
++                    self.get_in_fd(),
++                    self.get_ioport_fd(),
++                    -1,
++                    Timeout::Forever,
++                ) {
+                     InputEventTrigger::Byte(b) => b,
+                     _ => 0,
+                 },
+--- a/src/input/input.rs
++++ b/src/input/input.rs
+@@ -482,9 +482,17 @@
+                 return mevt;
+             }
+ 
++            // The bridge's mailbox is read before the reader blocks, so a reader with nothing
++            // left to read says so and answers what is waiting for it.
++            self.bridge_before_wait();
++            if let Some(mevt) = self.try_pop() {
++                return mevt;
++            }
++
+             match next_input_event(
+                 self.get_in_fd(),
+                 self.get_ioport_fd(),
++                self.get_bridge_fd(),
+                 if self.is_blocked_querying() {
+                     Timeout::Duration(self.get_input_data().blocking_query_timeout.unwrap())
+                 } else {
+@@ -507,6 +515,10 @@
+                     self.ioport_notified();
+                 }
+ 
++                InputEventTrigger::BridgeNotified => {
++                    self.bridge_readable();
++                }
++
+                 InputEventTrigger::Byte(read_byte) => {
+                     on_byte_read(self, read_byte);
+                 }
+@@ -537,6 +549,13 @@
+             return Some(evt);
+         }
+ 
++        // A short wait for the rest of a sequence is still a wait, and a takeover has to be able
++        // to end it.
++        self.bridge_before_wait();
++        if let Some(evt) = self.try_pop() {
++            return Some(evt);
++        }
++
+         check_fd_readable(
+             unsafe { BorrowedFd::borrow_raw(self.get_in_fd()) },
+             Duration::from_millis(u64::try_from(wait_time_ms).unwrap()),
+@@ -554,6 +573,20 @@
+         -1
+     }
+ 
++    /// Return the fd of the root-editor bridge's endpoint, or -1 if none.
++    ///
++    /// The bridge waits alongside the terminal rather than being polled, so a request that arrives
++    /// while the reader is blocked is answered then rather than at the person's next keystroke.
++    fn get_bridge_fd(&self) -> RawFd {
++        -1
++    }
++
++    /// The bridge's endpoint became readable.
++    fn bridge_readable(&mut self) {}
++
++    /// The reader is about to wait for input.
++    fn bridge_before_wait(&mut self) {}
++
+     /// Return the input data. This is to be implemented by the concrete type.
+     fn get_input_data(&self) -> &InputData;
+     fn get_input_data_mut(&mut self) -> &mut InputData;
+@@ -775,6 +808,9 @@
+     // Our ioport reported a change, so service main thread requests.
+     IOPortNotified,
+ 
++    // The root-editor bridge's endpoint became readable.
++    BridgeNotified,
++
+     // No file descriptor was ready within the query timeout.
+     TimeoutElapsed,
+ }
+@@ -795,6 +831,7 @@
+ pub(super) fn next_input_event(
+     in_fd: RawFd,
+     ioport_fd: RawFd,
++    bridge_fd: RawFd,
+     timeout: Timeout,
+ ) -> InputEventTrigger {
+     let mut fdset = FdReadableSet::new();
+@@ -805,6 +842,9 @@
+         // Add the completion ioport (possibly -1 - a no-op).
+         fdset.add(ioport_fd);
+ 
++        // Add the root-editor bridge's endpoint (possibly -1 - a no-op).
++        fdset.add(bridge_fd);
++
+         // Get the uvar notifier fd (possibly none).
+         let notifier = default_notifier();
+         let notifier_fd = notifier.notification_fd();
+@@ -841,6 +881,12 @@
+         // Check stdin.
+         if fdset.test(in_fd) {
+             return readb(in_fd).map_or(InputEventTrigger::Eof, InputEventTrigger::Byte);
++        }
++
++        // The bridge is read only when the terminal has nothing: what the person typed is theirs
++        // and goes first, and anything the worker asks for waits behind it.
++        if fdset.test(bridge_fd) {
++            return InputEventTrigger::BridgeNotified;
+         }
+ 
+         // Check for iothread completions only if there is no data to be read from the stdin.
+--- a/src/reader/input.rs
++++ b/src/reader/input.rs
+@@ -1,5 +1,5 @@
+ //! Reader implementation of InputEventQueuer.
+-use super::{Reader, reader_reading_interrupted, reader_schedule_prompt_repaint};
++use super::{Reader, kr_bridge, reader_reading_interrupted, reader_schedule_prompt_repaint};
+ use crate::{
+     event,
+     input::{CharEvent, InputData, InputEventQueuer, ReadlineCmd, input_get_bind_mode},
+@@ -21,6 +21,23 @@
+ 
+     fn get_ioport_fd(&self) -> RawFd {
+         self.debouncers.event_signaller_read_fd()
++    }
++
++    fn get_bridge_fd(&self) -> RawFd {
++        kr_bridge::bridge_fd()
++    }
++
++    fn bridge_readable(&mut self) {
++        // A frame arrived while the reader was waiting for a key, which is one of the two places
++        // the mailbox is read.
++        kr_bridge::wait(self);
++    }
++
++    fn bridge_before_wait(&mut self) {
++        // Nothing left to read: the worker is told so, and whatever is already in the mailbox is
++        // answered before the reader blocks on it.
++        kr_bridge::before_wait(self);
++        kr_bridge::wait(self);
+     }
+ 
+     fn prepare_to_select(&mut self) {
+--- a/src/reader/mod.rs
++++ b/src/reader/mod.rs
+@@ -1,6 +1,7 @@
+ mod history_search;
+ 
+ mod input;
++pub mod kr_bridge;
+ pub mod iothreads;
+ #[allow(clippy::module_inception)]
+ mod reader;
+--- a/src/reader/reader.rs
++++ b/src/reader/reader.rs
+@@ -20,6 +20,7 @@
+ use super::{
+     history_search::{ReaderHistorySearch, SearchMode, smartcase_flags},
+     iothreads::{self, Debouncers},
++    kr_bridge,
+     word_motion::{MoveWordDir, MoveWordStateMachine, MoveWordStyle},
+ };
+ use crate::{
+@@ -123,7 +124,7 @@
+     join_strings, string_prefixes_string, string_prefixes_string_case_insensitive,
+     string_prefixes_string_maybe_case_insensitive,
+ };
+-use fish_widestring::{ELLIPSIS_CHAR, UTF8_BOM_WCHAR, bytes2wcstring};
++use fish_widestring::{ELLIPSIS_CHAR, UTF8_BOM_WCHAR, bytes2wcstring, wcs2bytes};
+ use libc::{
+     _POSIX_VDISABLE, SIGINT, STDIN_FILENO, STDOUT_FILENO, VMIN, VQUIT, VSUSP, VTIME, c_char,
+ };
+@@ -795,6 +796,59 @@
+     }
+ }
+ 
++/// What the KalaReach root-editor bridge reads and changes, and nothing else.
++///
++/// The bridge lives beside the reader rather than inside it, so the state it needs is named here
++/// once instead of being reached for from another module.
++impl ReaderData {
++    /// True for the reader the interactive loop runs, which is the primary prompt.
++    ///
++    /// The only other reader fish starts is the one the `read` builtin pushes, and it carries no
++    /// prompt event of its own.
++    pub(super) fn kr_is_primary(&self) -> bool {
++        self.conf.event == L!("fish_prompt")
++    }
++
++    /// The descriptor this reader reads from.
++    pub(super) fn kr_input_fd(&self) -> RawFd {
++        self.conf.inputfd
++    }
++
++    /// The command line, which is the buffer the detach condition and a launch are judged against.
++    pub(super) fn kr_command_line(&self) -> &wstr {
++        self.command_line.text()
++    }
++
++    /// True while a search is running, whether in the history or in the pager's search field.
++    pub(super) fn kr_search_active(&self) -> bool {
++        self.history_search.active()
++            || self.active_edit_line_tag() == EditableLineTag::SearchField
++    }
++
++    /// Puts a launch's command in the empty buffer, with the cursor at its end.
++    pub(super) fn kr_set_command_line(&mut self, text: &wstr) {
++        self.set_buffer_maintaining_pager(text, text.len());
++        self.clear_pager();
++    }
++
++    /// Takes a launch's command back out.
++    pub(super) fn kr_clear_command_line(&mut self) {
++        self.clear(EditableLineTag::Commandline);
++        self.update_buff_pos(EditableLineTag::Commandline, None);
++    }
++
++    /// Prints one line above the prompt and draws the prompt again below it.
++    pub(super) fn kr_print_above_prompt(&mut self, line: &wstr) {
++        let mut text = WString::from_str("\r\n");
++        text.push_utfstr(line);
++        text.push('\n');
++        let _ = write_loop(&STDOUT_FILENO, &wcs2bytes(&text));
++        self.screen
++            .reset_abandoning_line(Some(termsize_last().width()));
++        self.force_exec_prompt_and_repaint = true;
++    }
++}
++
+ /// Read commands from \c fd until encountering EOF.
+ /// The fd is not closed.
+ pub fn reader_read(parser: &mut Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
+@@ -2606,6 +2660,10 @@
+         }
+         self.exec_prompt(true, false);
+ 
++        // The prompt is drawn and the reader is about to read: this is where it starts, which is
++        // not the same moment as the prompt being printed.
++        kr_bridge::editor_enter(self);
++
+         // Start out as initially dirty.
+         self.force_exec_prompt_and_repaint = true;
+ 
+@@ -2622,6 +2680,9 @@
+             if self.handle_char_event(None).is_break() || self.rls().finished {
+                 break;
+             }
++            // One pass of the read loop is over, so anything that was waiting behind what it did
++            // is read here rather than at the person's next keystroke.
++            kr_bridge::pass_end(self);
+         }
+ 
+         // Disable tty protocols now that we're going to execute a command.
+@@ -2678,6 +2739,17 @@
+             }
+             Outputter::stdoutput().borrow_mut().reset_text_face();
+         }
++        // The accepted line is reported from inside the fence, before the leave that invalidates
++        // it; every other way out of the reader is a leave on its own.
++        let leave_reason = if self.rls().finished {
++            kr_bridge::KR_LEAVE_COMMAND_ACCEPTED
++        } else if self.exit_loop_requested || reader_received_exit_signal() {
++            kr_bridge::KR_LEAVE_ROOT_EXIT
++        } else {
++            kr_bridge::KR_LEAVE_CANCELLATION
++        };
++        kr_bridge::editor_leave(self, leave_reason);
++
+         let result = self
+             .rls()
+             .finished
+@@ -3393,6 +3465,11 @@
+                     self.exit_loop_requested = true;
+                     check_exit_loop_maybe_warning(Some(self));
+                 }
++            }
++            rl::KrEofDecide => {
++                // The end-of-file decision, taken with the actual reader context. Outside the
++                // detach condition the previous function or script block runs.
++                kr_bridge::eof_decide(self);
+             }
+             rl::Execute => {
+                 if !self.handle_execute() {

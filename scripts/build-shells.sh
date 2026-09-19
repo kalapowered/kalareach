@@ -26,6 +26,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 build_zsh=0
 build_bash=0
+build_fish=0
 force=0
 run_upstream_tests=1
 require_upstream_tests=0
@@ -44,9 +45,9 @@ prefix="${KR_SHELL_PREFIX:-$default_prefix}"
 
 usage() {
     cat >&2 <<'USAGE'
-usage: build-shells.sh [--zsh] [--bash] [--all] [options]
+usage: build-shells.sh [--zsh] [--bash] [--fish] [--all] [options]
 
-  --zsh, --bash, --all   which packages to build
+  --zsh, --bash, --fish, --all   which packages to build
   --force                rebuild even when the identity is already installed
   --no-upstream-tests    skip the shell's own test suite
   --require-upstream-tests  fail the build unless the shell's own test suite passes
@@ -62,7 +63,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --zsh) build_zsh=1 ;;
         --bash) build_bash=1 ;;
-        --all) build_zsh=1; build_bash=1 ;;
+        --fish) build_fish=1 ;;
+        --all) build_zsh=1; build_bash=1; build_fish=1 ;;
         --force) force=1 ;;
         --no-upstream-tests) run_upstream_tests=0 ;;
         --require-upstream-tests) require_upstream_tests=1 ;;
@@ -76,12 +78,17 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-if [ "$build_zsh" -eq 0 ] && [ "$build_bash" -eq 0 ]; then
+if [ "$build_zsh" -eq 0 ] && [ "$build_bash" -eq 0 ] && [ "$build_fish" -eq 0 ]; then
     echo "build-shells: name at least one package" >&2
     usage
 fi
 
-for tool in curl make patch tar python3; do
+needed="curl make patch tar python3"
+if [ "$build_fish" -eq 1 ]; then
+    # The fish package is a Rust shell built through CMake, so it needs both.
+    needed="$needed cmake cargo rustc"
+fi
+for tool in $needed; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "build-shells: $tool is needed and is not installed" >&2
         exit 1
@@ -119,6 +126,9 @@ def put(name, value):
     print("%s=%s" % (name, shlex.quote(str(value))))
 
 put("m_shell", manifest["shell"])
+put("m_build_system", manifest.get("build_system", "autotools"))
+put("m_environment", " ".join("%s=%s" % item
+                              for item in sorted(manifest.get("environment", {}).items())))
 put("m_integration_version", manifest["integration_version"])
 put("m_editor_abi", manifest["editor_abi"])
 put("m_mailbox", manifest["mailbox_mechanism"])
@@ -291,6 +301,7 @@ build_package() {
     local package="$root/shells/$shell_name"
     local cache="$prefix/sources"
     local m_shell m_integration_version m_editor_abi m_mailbox m_pre_eof
+    local m_build_system m_environment
     local m_upstream_version m_archive m_url m_sha256 m_directory m_revision
     local m_binary m_module_directory m_source_directory m_test_command m_test_reason
     local m_configure m_cflags m_patches m_patch_names m_patch_revisions m_sources
@@ -328,6 +339,14 @@ cc=${CC:-cc} $toolchain
 cppflags=${CPPFLAGS:-}
 ldflags=${LDFLAGS:-}
 "
+    if [ "$m_build_system" = "cmake" ]; then
+        # A shell whose own source is Rust is the compiler that produced it as much as the C one,
+        # so a different toolchain is a different package here too.
+        inputs="$inputs
+rustc=$(rustc --version 2>/dev/null)
+env=$m_environment
+"
+    fi
     local patch_file
     for patch_file in $m_patches; do
         inputs="$inputs
@@ -403,6 +422,18 @@ startup=$(digest "$package/$m_startup") $m_startup"
         "$package" "$executable" "$module_directory"
 
     echo "build-shells: configuring $shell_name $m_upstream_version"
+    if [ "$m_build_system" = "cmake" ]; then
+        (
+            # shellcheck disable=SC2086
+            env $m_environment CFLAGS="$m_cflags" \
+                cmake -S "$source_tree" -B "$source_tree/build" \
+                    -DCMAKE_INSTALL_PREFIX="$destination" $m_configure
+        ) > "$work/configure.log" 2>&1 || {
+            tail -40 "$work/configure.log" >&2
+            echo "build-shells: configuring $shell_name failed" >&2
+            exit 1
+        }
+    else
     (
         cd "$source_tree"
         # A release from 2022 writes some of its configure probes in pre-C99 style, and a compiler
@@ -417,23 +448,40 @@ startup=$(digest "$package/$m_startup") $m_startup"
         echo "build-shells: configuring $shell_name failed" >&2
         exit 1
     }
+    fi
 
     echo "build-shells: compiling $shell_name"
+    if [ "$m_build_system" = "cmake" ]; then
+        # shellcheck disable=SC2086
+        env $m_environment CFLAGS="$m_cflags" \
+            cmake --build "$source_tree/build" -j"$jobs" > "$work/make.log" 2>&1 || {
+            tail -40 "$work/make.log" >&2
+            echo "build-shells: compiling $shell_name failed" >&2
+            exit 1
+        }
+    else
     make -C "$source_tree" -j"$jobs" > "$work/make.log" 2>&1 || {
         tail -40 "$work/make.log" >&2
         echo "build-shells: compiling $shell_name failed" >&2
         exit 1
     }
+    fi
 
     local tests_result="skipped"
     local summary=
+    local -a test_argv
+    if [ "$m_build_system" = "cmake" ]; then
+        test_argv=(env $m_environment cmake --build "$source_tree/build" --target "$m_test_command")
+    else
+        test_argv=(make -C "$source_tree" "$m_test_command")
+    fi
     if [ "$run_upstream_tests" -eq 1 ] && [ -n "$m_test_command" ]; then
         echo "build-shells: running the $shell_name test suite"
         # The suite runs in its own process group so a stall can be ended without reaching any
         # other build on this machine.
         set -m
         (
-            make -C "$source_tree" "$m_test_command" > "$work/tests.log" 2>&1
+            "${test_argv[@]}" > "$work/tests.log" 2>&1
             echo "$?" > "$work/tests.status"
         ) &
         local runner=$!
@@ -488,11 +536,20 @@ startup=$(digest "$package/$m_startup") $m_startup"
 
     rm -rf "$destination"
     mkdir -p "$destination"
+    if [ "$m_build_system" = "cmake" ]; then
+        # shellcheck disable=SC2086
+        env $m_environment cmake --install "$source_tree/build" > "$work/install.log" 2>&1 || {
+            tail -40 "$work/install.log" >&2
+            echo "build-shells: installing $shell_name failed" >&2
+            exit 1
+        }
+    else
     make -C "$source_tree" install > "$work/install.log" 2>&1 || {
         tail -40 "$work/install.log" >&2
         echo "build-shells: installing $shell_name failed" >&2
         exit 1
     }
+    fi
 
     if [ ! -x "$executable" ]; then
         echo "build-shells: $executable was not installed" >&2
@@ -519,4 +576,7 @@ if [ "$build_zsh" -eq 1 ]; then
 fi
 if [ "$build_bash" -eq 1 ]; then
     build_package bash
+fi
+if [ "$build_fish" -eq 1 ]; then
+    build_package fish
 fi
