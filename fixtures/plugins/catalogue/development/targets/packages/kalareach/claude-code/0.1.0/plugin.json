@@ -1,0 +1,74 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "claude-code",
+  "version": "0.1.0",
+  "display_name": "Claude Code",
+  "description": "Recognises Claude Code and names the session after it. Terminal integration only.",
+  "sdk_range": ">=0.1.0, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "4f8c69e538b5e4b7b220305822f1f6f6ad212416"
+  },
+  "match_rules": [
+    {
+      "id": "claude-code-executable",
+      "executable": {
+        "file_stem": "claude",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "8215fbfe3ea2883bb619bfa4f6468980ecd02b2e9504609d497e8432b1df27df",
+      "size_bytes": "1341"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "a47a31fffda0c988d39ef3fa05cbeeccfc033beee115c04edd86f5616d902abb",
+      "size_bytes": "462"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise Claude Code from its executable name"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Name the session after Claude Code and describe it"
+    }
+  ],
+  "actions": [],
+  "attachments": null,
+  "native_bridge": null
+}

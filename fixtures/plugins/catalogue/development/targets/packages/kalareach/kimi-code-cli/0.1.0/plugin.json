@@ -1,0 +1,74 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "kimi-code-cli",
+  "version": "0.1.0",
+  "display_name": "Kimi Code CLI",
+  "description": "Recognises Kimi Code CLI and names the session after it. Terminal integration only.",
+  "sdk_range": ">=0.1.0, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "4f8c69e538b5e4b7b220305822f1f6f6ad212416"
+  },
+  "match_rules": [
+    {
+      "id": "kimi-code-cli-executable",
+      "executable": {
+        "file_stem": "kimi",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "acb194fcc130e3669c1cfd4b054dcd21ce5569b2b097c2bc2c7a60b8b2ce4799",
+      "size_bytes": "1347"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "52ac809d7c03f49477d931392f600790d88831f926b9abb158a7cf958f1292a9",
+      "size_bytes": "464"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise Kimi Code CLI from its executable name"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Name the session after Kimi Code CLI and describe it"
+    }
+  ],
+  "actions": [],
+  "attachments": null,
+  "native_bridge": null
+}

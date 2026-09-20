@@ -1,0 +1,74 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "qoder-cli",
+  "version": "0.1.0",
+  "display_name": "Qoder CLI",
+  "description": "Recognises Qoder CLI and names the session after it. Terminal integration only.",
+  "sdk_range": ">=0.1.0, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "4f8c69e538b5e4b7b220305822f1f6f6ad212416"
+  },
+  "match_rules": [
+    {
+      "id": "qoder-cli-executable",
+      "executable": {
+        "file_stem": "qoder",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "60a9169f7aa4d3ab78bf05de81bcd4b67f135b5ceb20a613fd35cba94835df56",
+      "size_bytes": "1332"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "a87408274d566f513f05f5b721e19f0b05cb701c41d2fc116661cb80e329d6ee",
+      "size_bytes": "460"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise Qoder CLI from its executable name"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Name the session after Qoder CLI and describe it"
+    }
+  ],
+  "actions": [],
+  "attachments": null,
+  "native_bridge": null
+}

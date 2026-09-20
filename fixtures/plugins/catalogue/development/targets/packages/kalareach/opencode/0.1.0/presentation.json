@@ -1,0 +1,21 @@
+{
+  "manifest_version": 1,
+  "base_revision": "1",
+  "nodes": [
+    {
+      "id": "overview",
+      "revision": "1",
+      "body": {
+        "kind": "markdown",
+        "source": "OpenCode runs in the terminal. KalaReach recognises it, names the session after it, and carries its terminal through the ordinary session path."
+      }
+    }
+  ],
+  "voice": {
+    "status_nodes": [],
+    "choice_controls": [],
+    "detail_nodes": [
+      "overview"
+    ]
+  }
+}
