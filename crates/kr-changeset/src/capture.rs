@@ -1204,8 +1204,10 @@ fn nested_repositories<'a>(
     // in the set too, so a directory that is that object reaches the same refusal whatever it is
     // called here.
     let mut refused: BTreeSet<(u64, u64)> = BTreeSet::new();
-    // What this host has looked inside, which is not the same question as what it excludes.
-    let mut inspected: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // What this host has looked inside, which is not the same question as what it excludes. The
+    // mount is part of the answer: one directory reached on two mounts is two sets of children,
+    // and a scan that took the second for the first would not see what is mounted inside it.
+    let mut inspected: BTreeSet<((u64, u64), Option<kr_transfer::MountId>)> = BTreeSet::new();
     // **Every administrative directory Git itself reports for this working tree** (D-087a), each
     // entered by what it is rather than by what it is called. There can be two: the common one,
     // which holds the configuration, the references and the objects, and this worktree's own,
@@ -1431,7 +1433,7 @@ fn administrative_directories(
 fn administrative_descendants(
     directory: &AuthorisedDirectory,
     into: &mut BTreeSet<(u64, u64)>,
-    inspected: &mut BTreeSet<(u64, u64)>,
+    inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
     budget: &mut usize,
     depth: usize,
 ) -> Result<()> {
@@ -1530,7 +1532,10 @@ fn administrative_descendants(
         // the exclusion set because it is a nested repository's tree and still hold a link this
         // host has not seen. What stops the descent running away is having **inspected** it.
         into.insert(identity_of(&held));
-        if inspected.insert(identity_of(&held)) {
+        // Excluded by what it **is**; looked inside by what it is *and where it was reached*. The
+        // same directory on another mount holds different children, and one of them can be a mount
+        // this host has not seen.
+        if inspected.insert((identity_of(&held), held.mount())) {
             administrative_descendants(&held, into, inspected, budget, depth + 1)?;
         }
     }
