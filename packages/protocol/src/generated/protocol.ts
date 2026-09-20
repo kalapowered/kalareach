@@ -21936,6 +21936,10 @@ export interface WorkflowDefinition {
    */
   enabled: boolean
   /**
+   * Whether explicit recurrence is allowed under the reviewed definition (default: false).
+   */
+  explicit_recurrence?: boolean
+  /**
    * One host-issued authority object.
    */
   grant_reference: string
@@ -22137,6 +22141,10 @@ export interface WorkflowDefinition1 {
    * Whether this workflow is enabled to process triggers.
    */
   enabled: boolean
+  /**
+   * Whether explicit recurrence is allowed under the reviewed definition (default: false).
+   */
+  explicit_recurrence?: boolean
   /**
    * One host-issued authority object.
    */

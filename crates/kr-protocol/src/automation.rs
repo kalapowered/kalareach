@@ -228,6 +228,9 @@ pub struct WorkflowDefinition {
     pub grant_reference: GrantId,
     /// Whether this workflow is enabled to process triggers.
     pub enabled: bool,
+    /// Whether explicit recurrence is allowed under the reviewed definition (default: false).
+    #[serde(default)]
+    pub explicit_recurrence: bool,
 }
 
 /// Reference to a causal parent node and run.

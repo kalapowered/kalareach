@@ -133,6 +133,41 @@ pub enum AutomationError {
         run_id: WorkflowRunId,
     },
 
+    /// Stale causal generation attempted to consume a rearmed budget.
+    #[error(
+        "stale causal generation {found_generation} rejected against budget generation {expected_generation} for root {root}"
+    )]
+    StaleCausalGeneration {
+        /// The causal root ID.
+        root: CausalRootId,
+        /// The current budget generation.
+        expected_generation: u64,
+        /// The found generation on the descendant.
+        found_generation: u64,
+    },
+
+    /// The parent run was not found in host storage.
+    #[error("parent run {0} not found in durable host store")]
+    ParentRunNotFound(WorkflowRunId),
+
+    /// The parent node was not found in the parent run.
+    #[error("parent node {node_id} not found in run {run_id}")]
+    ParentNodeNotFound {
+        /// Run ID.
+        run_id: WorkflowRunId,
+        /// Node ID.
+        node_id: String,
+    },
+
+    /// A workflow definition revision is already installed and immutable.
+    #[error("workflow {workflow_id} revision {revision} is already installed and immutable")]
+    AlreadyInstalled {
+        /// Workflow ID.
+        workflow_id: WorkflowId,
+        /// Revision.
+        revision: u64,
+    },
+
     /// SQLite storage error.
     #[error("storage error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
@@ -232,6 +267,27 @@ impl From<AutomationError> for ProtocolError {
             AutomationError::RunTimeout { run_id } => Self::new(
                 ErrorCode::ResourceUnavailable,
                 format!("run deadline exceeded for run {run_id}"),
+            ),
+            AutomationError::StaleCausalGeneration { root, .. } => Self::new(
+                ErrorCode::CausalLimit,
+                format!("stale causal generation rejected for root {root}"),
+            ),
+            AutomationError::ParentRunNotFound(id) => Self::new(
+                ErrorCode::InvalidArgument,
+                format!("parent run {id} not found in host storage"),
+            ),
+            AutomationError::ParentNodeNotFound { run_id, node_id } => Self::new(
+                ErrorCode::InvalidArgument,
+                format!("parent node {node_id} not found in run {run_id}"),
+            ),
+            AutomationError::AlreadyInstalled {
+                workflow_id,
+                revision,
+            } => Self::new(
+                ErrorCode::DraftConflict,
+                format!(
+                    "workflow {workflow_id} revision {revision} is already installed and immutable"
+                ),
             ),
             AutomationError::DatabaseError(err) => Self::new(
                 ErrorCode::StorageUnavailable,

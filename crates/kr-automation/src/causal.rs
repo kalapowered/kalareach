@@ -15,6 +15,8 @@ use kr_protocol::scalars::U64;
 pub struct CausalContext {
     /// Host-verified causal root identifier.
     pub root_id: CausalRootId,
+    /// Causal budget generation.
+    pub generation: u64,
     /// Current depth from the causal root (starts at 1 for root run).
     pub depth: u64,
     /// Direct causal parent, if this run was triggered by another workflow node.
@@ -29,6 +31,7 @@ impl CausalContext {
     pub fn new_root(workflow_id: WorkflowId) -> Self {
         Self {
             root_id: CausalRootId::new(crate::new_uuid()),
+            generation: 0,
             depth: 1,
             parent: None,
             ancestors: vec![workflow_id],
@@ -40,6 +43,7 @@ impl CausalContext {
     pub fn from_existing_root(root_id: CausalRootId, workflow_id: WorkflowId) -> Self {
         Self {
             root_id,
+            generation: 0,
             depth: 1,
             parent: None,
             ancestors: vec![workflow_id],
@@ -60,6 +64,7 @@ impl CausalContext {
         }
         Self {
             root_id: self.root_id,
+            generation: self.generation,
             depth: self.depth.saturating_add(1),
             parent: Some(CausalParentRef {
                 causal_root_id: self.root_id,

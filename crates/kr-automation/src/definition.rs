@@ -33,14 +33,18 @@ pub const REGISTERED_ACTION_KINDS: &[&str] = &[
     "capture_changeset",
 ];
 
-/// Validates a workflow definition according to section 25 requirements.
+/// Validates that a workflow definition is syntactically, structurally, and semantically valid.
 ///
-/// 1. Acyclicity: graph formed by nodes and edges must be a Directed Acyclic Graph (DAG).
-/// 2. Registered action kinds: every node must reference a known action kind.
-/// 3. No arbitrary template evaluation: node parameters must not contain template markers
-///    such as `{{`, `}}`, `${`, `$(`, `<%`, or `eval(`.
-/// 4. Shell command requirements: any `shell_command` node requires a declared execution
-///    environment and an explicit broad shell grant (`terminal.input`).
+/// 1. Identifier and structure check: non-empty name, at least one node, valid node/edge IDs.
+/// 2. Graph validity: acyclic DAG check (via DFS/Tarjan cycle detection).
+/// 3. No arbitrary template evaluation: action parameters must parse as valid JSON and no string
+///    value (even if unicode-escaped in raw JSON) may contain template markers such as `{{`, `}}`,
+///    `${`, `$(`, `<%`, `%>`, `eval(`, `exec(`, or backticks.
+/// 4. Typed action parameter validation: ensures parameters conform to the typed schema of the
+///    action kind.
+/// 5. Shell command requirements: any `shell_command` node requires a declared execution
+///    environment and an explicit broad shell grant (`terminal.input`) matching the definition's
+///    `grant_reference` whose environment selector admits the declared environment.
 pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant>) -> Result<()> {
     // Basic identifier and field checks
     if definition.name.trim().is_empty() {
@@ -56,7 +60,7 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant
 
     // Build node map and check node uniqueness
     let mut node_ids = HashSet::new();
-    let mut has_shell_node = false;
+    let mut shell_nodes = Vec::new();
 
     for node in &definition.nodes {
         if node.node_id.trim().is_empty() {
@@ -79,13 +83,14 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant
             )));
         }
 
-        // Template syntax check
-        check_no_template_syntax(&node.node_id, &node.action_params)?;
+        // Parse and validate typed action parameters, rejecting any template syntax (decoded)
+        validate_typed_action_params(&node.node_id, &node.action_kind, &node.action_params)?;
 
-        // Shell command checks
+        // Collect shell command nodes for grant verification
         if node.action_kind == "shell_command" {
-            has_shell_node = true;
-            if !node.declared_environment.is_present() {
+            if let Some(env_id) = node.declared_environment.0 {
+                shell_nodes.push((&node.node_id, env_id));
+            } else {
                 return Err(AutomationError::ShellGrantRequired {
                     detail: format!(
                         "node {} has shell_command action but no declared_environment",
@@ -96,10 +101,18 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant
         }
     }
 
-    // Shell grant verification if a shell node is present
-    if has_shell_node {
+    // Shell grant verification if shell nodes are present
+    if !shell_nodes.is_empty() {
         match grant {
             Some(g) => {
+                if g.grant_id != definition.grant_reference {
+                    return Err(AutomationError::ShellGrantRequired {
+                        detail: format!(
+                            "grant ID {} does not match definition grant_reference {}",
+                            g.grant_id, definition.grant_reference
+                        ),
+                    });
+                }
                 if !g.actions.contains(&ActionRight::TerminalInput) {
                     return Err(AutomationError::ShellGrantRequired {
                         detail: format!(
@@ -107,6 +120,16 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant
                             definition.grant_reference
                         ),
                     });
+                }
+                for (node_id, env_id) in shell_nodes {
+                    if !g.environment_selector.admits(env_id) {
+                        return Err(AutomationError::ShellGrantRequired {
+                            detail: format!(
+                                "node {} declared environment {} is not admitted by grant environment selector",
+                                node_id, env_id
+                            ),
+                        });
+                    }
                 }
             }
             None => {
@@ -124,17 +147,172 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant
     Ok(())
 }
 
-/// Checks that a string contains no arbitrary template code or script interpolation.
-fn check_no_template_syntax(node_id: &str, params: &str) -> Result<()> {
+/// Validates typed action parameters and inspects decoded string values for template syntax.
+fn validate_typed_action_params(node_id: &str, action_kind: &str, params_json: &str) -> Result<()> {
+    let parsed: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
+        AutomationError::InvalidArgument(format!(
+            "node {} action_params is not valid JSON: {}",
+            node_id, e
+        ))
+    })?;
+
+    // Recursively check decoded strings for forbidden template patterns
+    check_no_template_values(node_id, &parsed)?;
+
+    // Validate typed action schema
+    match action_kind {
+        "shell_command" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} shell_command params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            let cmd = obj.get("command").and_then(|v| v.as_str());
+            if cmd.is_none() || cmd.unwrap().trim().is_empty() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} shell_command requires non-empty string 'command'",
+                    node_id
+                )));
+            }
+        }
+        "run_tests" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} run_tests params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            if obj.get("suite").and_then(|v| v.as_str()).is_none() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} run_tests requires string 'suite'",
+                    node_id
+                )));
+            }
+        }
+        "request_review" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} request_review params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            if obj.get("reviewer_id").and_then(|v| v.as_str()).is_none() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} request_review requires string 'reviewer_id'",
+                    node_id
+                )));
+            }
+        }
+        "create_session" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} create_session params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            if obj.get("title").and_then(|v| v.as_str()).is_none() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} create_session requires string 'title'",
+                    node_id
+                )));
+            }
+        }
+        "attention_notice" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} attention_notice params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            if obj.get("summary").and_then(|v| v.as_str()).is_none() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} attention_notice requires string 'summary'",
+                    node_id
+                )));
+            }
+        }
+        "materialize_changeset" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} materialize_changeset params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            if obj.get("changeset_id").and_then(|v| v.as_str()).is_none() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} materialize_changeset requires string 'changeset_id'",
+                    node_id
+                )));
+            }
+        }
+        "apply_diff" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} apply_diff params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            if obj.get("diff").and_then(|v| v.as_str()).is_none() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} apply_diff requires string 'diff'",
+                    node_id
+                )));
+            }
+        }
+        "capture_changeset" => {
+            let obj = parsed.as_object().ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {} capture_changeset params must be a JSON object",
+                    node_id
+                ))
+            })?;
+            if obj.get("workspace_id").and_then(|v| v.as_str()).is_none() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {} capture_changeset requires string 'workspace_id'",
+                    node_id
+                )));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Recursively checks that no JSON value contains arbitrary template code or script interpolation.
+fn check_no_template_values(node_id: &str, val: &serde_json::Value) -> Result<()> {
     const FORBIDDEN_PATTERNS: &[&str] =
         &["{{", "}}", "${", "$(", "<%", "%>", "eval(", "exec(", "`"];
 
-    for pattern in FORBIDDEN_PATTERNS {
-        if params.contains(pattern) {
-            return Err(AutomationError::TemplateCodeRejected {
-                node_id: node_id.to_owned(),
-            });
+    match val {
+        serde_json::Value::String(s) => {
+            for pattern in FORBIDDEN_PATTERNS {
+                if s.contains(pattern) {
+                    return Err(AutomationError::TemplateCodeRejected {
+                        node_id: node_id.to_owned(),
+                    });
+                }
+            }
         }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                check_no_template_values(node_id, item)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                for pattern in FORBIDDEN_PATTERNS {
+                    if key.contains(pattern) {
+                        return Err(AutomationError::TemplateCodeRejected {
+                            node_id: node_id.to_owned(),
+                        });
+                    }
+                }
+                check_no_template_values(node_id, item)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -245,6 +423,7 @@ pub fn create_workflow_definition(
         edges,
         deadlines: WorkflowDeadlines::default(),
         grant_reference,
+        explicit_recurrence: false,
         enabled: true,
     }
 }

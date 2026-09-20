@@ -29120,6 +29120,11 @@
           "description": "Whether this workflow is enabled to process triggers.",
           "type": "boolean"
         },
+        "explicit_recurrence": {
+          "default": false,
+          "description": "Whether explicit recurrence is allowed under the reviewed definition (default: false).",
+          "type": "boolean"
+        },
         "grant_reference": {
           "$ref": "#/$defs/GrantId",
           "description": "Explicit grant reference required to run this workflow."

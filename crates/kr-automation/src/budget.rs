@@ -38,6 +38,8 @@ pub struct CausalBudget {
     pub total_runs: u64,
     /// Maximum allowed runs.
     pub max_runs: u64,
+    /// Causal budget generation, incremented on rearm to reject late descendants.
+    pub generation: u64,
     /// Total action nodes executed.
     pub total_actions: u64,
     /// Maximum allowed actions.
@@ -66,6 +68,7 @@ impl CausalBudget {
     pub fn new(causal_root_id: CausalRootId, started_at_ms: u64) -> Self {
         Self {
             causal_root_id,
+            generation: 0,
             depth: 1,
             max_depth: DEFAULT_CAUSAL_DEPTH_LIMIT,
             total_runs: 0,
@@ -81,6 +84,18 @@ impl CausalBudget {
             attention_emitted: false,
             rearmed_at_ms: None,
         }
+    }
+
+    /// Checks that the caller's generation is current and not from a pre-rearm generation.
+    pub fn check_generation(&self, descendant_generation: u64) -> Result<()> {
+        if descendant_generation < self.generation {
+            return Err(AutomationError::StaleCausalGeneration {
+                root: self.causal_root_id,
+                expected_generation: self.generation,
+                found_generation: descendant_generation,
+            });
+        }
+        Ok(())
     }
 
     /// Checks whether another run at `requested_depth` can be admitted, and reserves it.
@@ -101,7 +116,7 @@ impl CausalBudget {
 
         // Check depth limit
         if requested_depth > self.max_depth {
-            let _ = self.exhaust("depth limit exceeded", now_ms);
+            let _event = self.exhaust("depth limit exceeded", now_ms);
             return Err(AutomationError::CausalLimitExhausted {
                 root: self.causal_root_id,
                 reason: format!("depth {} exceeds limit {}", requested_depth, self.max_depth),
@@ -110,7 +125,7 @@ impl CausalBudget {
 
         // Check total runs limit
         if self.total_runs.saturating_add(1) > self.max_runs {
-            let _ = self.exhaust("total runs limit exceeded", now_ms);
+            let _event = self.exhaust("total runs limit exceeded", now_ms);
             return Err(AutomationError::CausalLimitExhausted {
                 root: self.causal_root_id,
                 reason: format!(
@@ -124,7 +139,7 @@ impl CausalBudget {
         // Check lifetime limit
         let elapsed = now_ms.saturating_sub(self.started_at_ms);
         if elapsed > self.max_lifetime_ms {
-            let _ = self.exhaust("elapsed lifetime exceeded", now_ms);
+            let _event = self.exhaust("elapsed lifetime exceeded", now_ms);
             return Err(AutomationError::CausalLimitExhausted {
                 root: self.causal_root_id,
                 reason: format!(
@@ -146,6 +161,19 @@ impl CausalBudget {
             return Err(AutomationError::CausalLimitExhausted {
                 root: self.causal_root_id,
                 reason: "causal chain is already paused or exhausted".to_owned(),
+            });
+        }
+
+        // Check lifetime limit
+        let elapsed = now_ms.saturating_sub(self.started_at_ms);
+        if elapsed > self.max_lifetime_ms {
+            let _event = self.exhaust("elapsed lifetime exceeded", now_ms);
+            return Err(AutomationError::CausalLimitExhausted {
+                root: self.causal_root_id,
+                reason: format!(
+                    "elapsed lifetime {}ms exceeds limit {}ms",
+                    elapsed, self.max_lifetime_ms
+                ),
             });
         }
 
@@ -174,6 +202,19 @@ impl CausalBudget {
             });
         }
 
+        // Check lifetime limit
+        let elapsed = now_ms.saturating_sub(self.started_at_ms);
+        if elapsed > self.max_lifetime_ms {
+            let _event = self.exhaust("elapsed lifetime exceeded", now_ms);
+            return Err(AutomationError::CausalLimitExhausted {
+                root: self.causal_root_id,
+                reason: format!(
+                    "elapsed lifetime {}ms exceeds limit {}ms",
+                    elapsed, self.max_lifetime_ms
+                ),
+            });
+        }
+
         if self.created_sessions.saturating_add(1) > self.max_sessions {
             let _event = self.exhaust("created sessions limit exceeded", now_ms);
             return Err(AutomationError::CausalLimitExhausted {
@@ -192,6 +233,9 @@ impl CausalBudget {
 
     /// Atomically marks the budget exhausted and paused, returning an attention event if not yet emitted.
     pub fn exhaust(&mut self, reason: &str, now_ms: u64) -> Option<SourceEvent> {
+        if self.exhausted && self.attention_emitted {
+            return None;
+        }
         self.paused = true;
         self.exhausted = true;
 
@@ -220,8 +264,14 @@ impl CausalBudget {
 
     /// Rearms the budget under an explicit authorized administrative request.
     ///
-    /// Replayed or late events cannot call this; only an explicit API call with management rights.
+    /// Clears exhaustion, establishes a fresh budget generation, and resets resource counters
+    /// so that late descendants from the previous generation are rejected while fresh runs can proceed.
     pub fn rearm(&mut self, now_ms: u64) {
+        self.generation = self.generation.saturating_add(1);
+        self.total_runs = 0;
+        self.total_actions = 0;
+        self.created_sessions = 0;
+        self.depth = 0;
         self.paused = false;
         self.exhausted = false;
         self.attention_emitted = false;

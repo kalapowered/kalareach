@@ -57,6 +57,14 @@ pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {
     kr_protocol::scalars::Uuid::from_bytes(uuid::Uuid::new_v4().into_bytes())
 }
 
+/// Returns the current system clock time in milliseconds since the Unix epoch.
+pub fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 pub(crate) fn parse_uuid(s: &str) -> std::result::Result<kr_protocol::scalars::Uuid, uuid::Error> {
     uuid::Uuid::parse_str(s).map(|u| kr_protocol::scalars::Uuid::from_bytes(u.into_bytes()))
 }

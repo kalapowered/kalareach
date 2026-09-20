@@ -211,29 +211,55 @@ impl WorkflowEngine {
                 }
 
                 if can_run {
-                    // Check causal action reservation
-                    let mut budget = self
-                        .store
-                        .get_or_create_budget(causal_ctx.root_id, now_ms)?;
-                    if let Err(err) = budget.reserve_action(now_ms) {
-                        self.store.save_budget(&budget)?;
-                        node_statuses.insert(node.node_id.clone(), NodeStatus::Paused);
+                    let dispatch_time_ms = crate::current_time_ms().max(now_ms);
+
+                    // Check session reservation if creating a session
+                    if node.action_kind == "create_session" {
+                        if let Err(err) = self.store.reserve_budget_session(
+                            causal_ctx.root_id,
+                            causal_ctx.generation,
+                            dispatch_time_ms,
+                        ) {
+                            node_statuses.insert(node.node_id.clone(), NodeStatus::Failed);
+                            self.store.update_node_receipt(
+                                run_id,
+                                &node.node_id,
+                                NodeStatus::Failed,
+                                None,
+                                Some(&err.to_string()),
+                                Some(dispatch_time_ms),
+                            )?;
+                            self.store.update_run_status(
+                                run_id,
+                                WorkflowRunStatus::Failed,
+                                Some(dispatch_time_ms),
+                            )?;
+                            return Err(err);
+                        }
+                    }
+
+                    // Check atomic causal action reservation
+                    if let Err(err) = self.store.reserve_budget_action(
+                        causal_ctx.root_id,
+                        causal_ctx.generation,
+                        dispatch_time_ms,
+                    ) {
+                        node_statuses.insert(node.node_id.clone(), NodeStatus::Failed);
                         self.store.update_node_receipt(
                             run_id,
                             &node.node_id,
-                            NodeStatus::Paused,
+                            NodeStatus::Failed,
                             None,
                             Some(&err.to_string()),
-                            Some(now_ms),
+                            Some(dispatch_time_ms),
                         )?;
                         self.store.update_run_status(
                             run_id,
-                            WorkflowRunStatus::Paused,
-                            Some(now_ms),
+                            WorkflowRunStatus::Failed,
+                            Some(dispatch_time_ms),
                         )?;
-                        return Ok(WorkflowRunStatus::Paused);
+                        return Err(err);
                     }
-                    self.store.save_budget(&budget)?;
 
                     // Mark running
                     node_statuses.insert(node.node_id.clone(), NodeStatus::Running);
@@ -247,7 +273,7 @@ impl WorkflowEngine {
                     )?;
 
                     let action_id = node_actions[&node.node_id];
-                    let outcome_res = self.runner.execute(node, action_id, now_ms).await;
+                    let outcome_res = self.runner.execute(node, action_id, dispatch_time_ms).await;
 
                     match outcome_res {
                         Ok(ActionOutcome::Success { output }) => {
