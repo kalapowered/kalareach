@@ -28,7 +28,27 @@ jobs:
   rust:
     name: rust
     runs-on: ubuntu-24.04
+    env:
+      # This workspace's test build is large: a debug build of every crate's test targets, and then
+      # an optimised build for the two timed measurements, in one directory. Debug information is
+      # the greater part of that and nothing this job does reads it - a panic still names its file
+      # and its line - so the profiles this job builds in carry none.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # The runner has one build cache and no reason to keep incremental artefacts between steps.
+      CARGO_INCREMENTAL: "0"
     steps:
+      # Even without debug information that build wants more room than a hosted runner leaves free,
+      # and the runner arrives with toolchains this project never uses. Removing them and the
+      # container images is where the rest of the room comes from. This reading and the one the
+      # last step takes are the margin the run had.
+      - name: Free the disk the build needs
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -65,7 +85,10 @@ jobs:
             ~/.cargo/git/db
             target
             fixtures/plugins/components/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'fixtures/plugins/components/Cargo.lock') }}
+          # The key names how the artefacts were built as well as what they were built from. A
+          # cache from a run that kept debug information would otherwise be restored into this
+          # directory, and the build would leave both sets of artefacts in it.
+          key: cargo-${{ runner.os }}-nodebuginfo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'fixtures/plugins/components/Cargo.lock') }}
 
       - name: Build the test components
         run: bash scripts/build-plugin-fixtures.sh
@@ -148,6 +171,12 @@ jobs:
           name: performance-evidence
           path: /tmp/kr-test-artifacts
           if-no-files-found: error
+
+      # What the disk had left once the build and every check above it were done, beside the
+      # reading the first step took.
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        run: df -h /
 
   windows:
     name: windows
