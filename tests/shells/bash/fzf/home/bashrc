@@ -8,6 +8,9 @@ set -o ignoreeof
 KR_TEST_USER_CONFIGURATION=1
 
 PATH="$KR_STACK_FZF:$PATH"
+# One candidate, so what the widget puts in the line is the one it was given.
+export FZF_CTRL_T_COMMAND='printf "kr-fzf-choice\n"'
+export FZF_DEFAULT_OPTS="--no-mouse --height=10"
 source "$KR_STACK_FZF_SHELL/shell/completion.bash"
 source "$KR_STACK_FZF_SHELL/shell/key-bindings.bash"
 printf '%s\n' stack >> "$KR_TEST_ORDER"

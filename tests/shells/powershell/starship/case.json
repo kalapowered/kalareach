@@ -4,7 +4,7 @@
   "stack": "starship",
   "title": "starship on the qualified PSReadLine, which replaces the prompt function",
   "supported": true,
-  "notes": "The gesture on this editor is a chord the worker configures rather than the line discipline's own character, and this editor reaches its own reader-thread queue only when the reader steps: a fence published between one step and the next is not the one the gesture that follows it is decided against, so this session cannot put the gesture and the fence in a known order. The Windows leg of this package, where the chord and the named-pipe endpoint are the mechanism, is qualified on Windows.",
+  "notes": "The Windows leg of this package, where the endpoint is a named pipe and the gesture is the configured chord rather than the terminal's own end-of-file character, is qualified on Windows. What is driven here is the gesture this editor reads on a Unix terminal.",
   "requires": [
     "starship"
   ],
@@ -21,7 +21,8 @@
     "profile_once",
     "plugin_active",
     "plugin_buffer",
-    "user_bindings"
+    "user_bindings",
+    "gesture_detaches"
   ],
   "plugin": {
     "probe": "\"kr-plugin=$(if ($env:STARSHIP_SESSION_KEY) {'on'} else {'off'})\"",

@@ -1,8 +1,10 @@
 # The instant prompt block goes at the very top, which is where this theme's own instructions put
 # it: it draws a prompt from a cache of the last run before the rest of this file has run at all.
 if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
-  print -r -- instant-prompt >> "$KR_TEST_ORDER"
   source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+  # Recorded after the cache has run and only when it drew: the cache has several reasons to
+  # return without drawing anything, and a marker written before it would count those as a draw.
+  (( $+__p9k_instant_prompt_active )) && print -r -- instant-prompt >> "$KR_TEST_ORDER"
 fi
 
 print -r -- user-top >> "$KR_TEST_ORDER"

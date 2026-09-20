@@ -1112,6 +1112,7 @@ fn the_states_that_need_a_command_first(
         driven.push(DetachExclusion::ViMotion);
         session.type_bytes(shellpkg::CTRL_C);
         std::thread::sleep(Duration::from_millis(150));
+
         session.clear_line();
         assert!(
             session.run(emacs_mode, "kr-vi-off"),
@@ -1314,6 +1315,9 @@ fn plugin_writes_the_buffer(
     case: &QualificationCase,
     session: &mut Session,
 ) -> kr_protocol::root::RootEditorEnterParams {
+    if case.stack == "fzf" {
+        return the_widget_puts_its_own_choice_in_the_line(case, session);
+    }
     // The line the customisation remembers prints something its own text does not contain, so a
     // run of it is the buffer having held the whole line rather than the editor having drawn one.
     const REMEMBERED: &str = "echo kr-sugg''estion-ran";
@@ -1528,6 +1532,56 @@ fn a_launch_past_its_reader_budget_installs_nothing(
 /// The lease epoch the harness's own fences are published under.
 fn enter_epoch() -> kr_protocol::ids::InputLeaseEpoch {
     shellpkg::epoch(4)
+}
+
+/// The customisation's own widget runs a program inside the reader and puts its choice in the line.
+///
+/// Two keys are sent and neither is a character: the chord the widget is bound to, and the return
+/// that chooses. What is in the reader's buffer afterwards is the widget's, and the reader reports
+/// it as a line rather than as an empty prompt — which is what section 7 says a prompt hook cannot
+/// tell apart.
+fn the_widget_puts_its_own_choice_in_the_line(
+    case: &QualificationCase,
+    session: &mut Session,
+) -> kr_protocol::root::RootEditorEnterParams {
+    const CHORD: &[u8] = &[0x14];
+    const CHOICE: &str = "kr-fzf-choice";
+
+    let (entered, _fence) = session.fenced_after_a_command(24);
+    settle(session, Duration::from_millis(200), REPLY);
+    let empty = session.fence_exchange(&entered, shellpkg::fence_id(25));
+    assert!(
+        empty.editor.buffer_empty,
+        "{}: the prompt the widget is about was not empty",
+        case.id
+    );
+
+    let before = session.written();
+    session.type_bytes(CHORD);
+    assert!(
+        session.wait_for_output_after(before, CHOICE, REPLY),
+        "{}: the widget drew nothing to choose from; the terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    session.type_bytes(b"\r");
+    settle(session, Duration::from_millis(400), REPLY);
+
+    let held = session.fence_exchange(&entered, shellpkg::fence_id(26));
+    assert!(
+        !held.editor.buffer_empty,
+        "{}: the widget's own choice did not reach the reader's buffer; the terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    assert!(
+        held.editor.buffer_revision.get() > empty.editor.buffer_revision.get(),
+        "{}: the reader reported no edit between the empty prompt and the widget's choice",
+        case.id
+    );
+    session.clear_line();
+    settle(session, Duration::from_millis(200), REPLY);
+    entered
 }
 
 /// A second start over the same home, which is the only one a cached early prompt exists for.
@@ -1851,13 +1905,15 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
 
 /// KR-REQ-07.88: no unqualified binary is hot-swapped into a session that is already running.
 ///
-/// The installation is what a new session resolves its package from. A session that is already
-/// running holds the one it started with: it launched that executable, its handshake declared that
-/// identity, and nothing about a newer installation reaches it. This installs a second identity
-/// under a root of this test's own while a session is live, and checks both halves.
+/// The installation is what a new session resolves its package from, and the product's own
+/// resolver is what reads it. This makes two complete installations of the same package under a
+/// root of this test's own, each with its own binary and its own startup entry, starts a session
+/// from the first, and then points the installation at the second while that session is running.
+/// The resolver a new session would use answers the second; the session that is running still
+/// declares, and is still running, the first.
 #[test]
 fn a_live_session_keeps_the_package_it_started_with() {
-    let Some(first) = Package::found(ShellKind::Zsh) else {
+    let Some(installed) = Package::found(ShellKind::Zsh) else {
         return;
     };
     let Some(index) = installed_stacks() else {
@@ -1873,75 +1929,610 @@ fn a_live_session_keeps_the_package_it_started_with() {
         .tempdir()
         .expect("an installation root on the internal disk");
     let shell = root.path().join("zsh");
-    let before = install_identity(&shell, &first, "aaaaaaaaaaaaaaaa");
+    let before = copy_installation(&shell, &installed, "aaaaaaaaaaaaaaaa", "before");
+    let after = copy_installation(&shell, &installed, "bbbbbbbbbbbbbbbb", "after");
+    assert_ne!(
+        before.executable, after.executable,
+        "the two installations share a binary, so neither could be told from the other"
+    );
     std::fs::write(shell.join("current"), "aaaaaaaaaaaaaaaa").expect("the pointer");
-    assert_eq!(current_identity(&shell), "aaaaaaaaaaaaaaaa");
+    assert_eq!(resolved_executable(root.path()), before.executable);
 
     let setup = CaseSetup::prepare(&case, &before, &index);
     let mut session = Session::start_for(&before, &case, &setup);
-    let enter = session.first_prompt();
+    session.first_prompt();
     settle(&mut session, Duration::from_millis(300), REPLY);
+    // Which installation this session is running is read from that installation's own startup
+    // entry rather than from what the handshake declares: a build records where it installed
+    // itself, so a copy of a package declares the path it was built for whichever copy is
+    // running. What the person gets is the startup the running installation holds.
+    assert!(
+        session.run("echo kr-live=$KR_TEST_LIVE", "kr-live=before"),
+        "the session did not start the installation it was given; the terminal showed:\n{}",
+        session.terminal_output()
+    );
 
     // A newer package is installed while that session is running.
-    let after = install_identity(&shell, &first, "bbbbbbbbbbbbbbbb");
     std::fs::write(shell.join("current"), "bbbbbbbbbbbbbbbb").expect("the pointer");
     assert_eq!(
-        current_identity(&shell),
-        "bbbbbbbbbbbbbbbb",
-        "a new session would still resolve the old installation"
+        resolved_executable(root.path()),
+        after.executable,
+        "a new session would still resolve the installation that was replaced"
     );
-    assert_ne!(before.identity, after.identity);
 
-    // The live session is untouched: it still declares what it started with, and it still answers.
-    assert_eq!(
-        session.hello.shell.executable,
-        before.executable.display().to_string(),
-        "a live session is running another binary than the one it started"
-    );
-    let acknowledgement = session.fence_exchange(&enter, shellpkg::fence_id(30));
-    assert_eq!(acknowledgement.prompt_generation, enter.prompt_generation);
+    // The live session is untouched: it is still running the installation it started, and its
+    // reader still answers.
     assert!(
-        session.run("echo kr-still-here", "kr-still-here"),
-        "the live session stopped answering when another package was installed"
+        session.run("echo kr-live=$KR_TEST_LIVE", "kr-live=before"),
+        "the live session took up the installation that replaced it; the terminal showed:\n{}",
+        session.terminal_output()
     );
+    assert!(
+        !session.terminal_output().contains("kr-live=after"),
+        "the live session reported the installation that replaced it"
+    );
+    let (enter, fence) = session.fenced_after_a_command(30);
+    assert_eq!(fence.prompt_generation, enter.prompt_generation);
     assert!(session.alive());
 }
 
-/// Writes one identity of the installed package into a root of this test's own.
+/// What the product's own resolver would launch for a new session at this installation.
+fn resolved_executable(root: &std::path::Path) -> std::path::PathBuf {
+    kr_shell_integration::host::package::PackageSet::discover(root)
+        .expect("the installation reads")
+        .get(ShellKind::Zsh)
+        .expect("the installation holds a Zsh package")
+        .executable()
+}
+
+/// Copies a whole installed package into a root of this test's own, under a new identity.
 ///
-/// The record names the real executable, so the session this starts is the real packaged shell.
-/// What differs between the two identities is the installation the pointer names, which is what a
-/// new session resolves and a running one does not.
-fn install_identity(shell: &std::path::Path, from: &Package, identity: &str) -> Package {
+/// The copy is complete, so the session it starts is a real packaged shell of its own rather than
+/// a record pointing at somebody else's installation. The record's identity and its recorded paths
+/// move with it, which is what the product's resolver checks before it will launch anything, and
+/// the startup entry says which of the two this session is running.
+fn copy_installation(
+    shell: &std::path::Path,
+    from: &Package,
+    identity: &str,
+    marker: &str,
+) -> Package {
+    let source = from
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the package directory")
+        .to_path_buf();
     let directory = shell.join(identity);
-    std::fs::create_dir_all(directory.join("startup")).expect("an installation directory");
-    let mut record = from.record.clone();
+    copy_tree(&source, &directory);
+
+    let record_path = directory.join("kr-shell-identity.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).expect("the record"))
+            .expect("the record decodes");
+    let moved = |value: &serde_json::Value| -> serde_json::Value {
+        serde_json::Value::String(value.as_str().unwrap_or_default().replace(
+            &source.display().to_string(),
+            &directory.display().to_string(),
+        ))
+    };
     record["identity"] = serde_json::Value::String(identity.to_owned());
+    record["shell"]["executable"] = moved(&record["shell"]["executable"]);
+    if let Some(modules) = record["shell"]["modules"].as_array().cloned() {
+        record["shell"]["modules"] = serde_json::Value::Array(
+            modules
+                .into_iter()
+                .map(|mut module| {
+                    if let Some(path) = module.get("search_path").cloned() {
+                        module["search_path"] = moved(&path);
+                    }
+                    module
+                })
+                .collect(),
+        );
+    }
     std::fs::write(
-        directory.join("kr-shell-identity.json"),
+        &record_path,
         serde_json::to_string_pretty(&record).expect("the record encodes"),
     )
     .expect("the identity record");
+
     let entry = from
         .startup_entry
         .file_name()
         .expect("the startup entry has a name");
-    std::fs::copy(&from.startup_entry, directory.join("startup").join(entry))
+    let startup = directory.join("startup").join(entry);
+    let body = std::fs::read_to_string(&startup).expect("the startup entry");
+    std::fs::write(&startup, format!("export KR_TEST_LIVE={marker}\n{body}"))
         .expect("the startup entry");
+
     Package {
         kind: from.kind,
         identity: identity.to_owned(),
-        executable: from.executable.clone(),
-        startup_entry: directory.join("startup").join(entry),
-        module_directory: from.module_directory.clone(),
+        executable: std::path::PathBuf::from(
+            record["shell"]["executable"]
+                .as_str()
+                .expect("the record names an executable"),
+        ),
+        startup_entry: startup,
+        module_directory: directory.join("modules"),
         record,
     }
 }
 
-/// What a new session would resolve from an installation.
-fn current_identity(shell: &std::path::Path) -> String {
-    std::fs::read_to_string(shell.join("current"))
-        .expect("the installation names a current identity")
-        .trim()
-        .to_owned()
+/// Copies a directory tree, keeping what is executable executable.
+fn copy_tree(from: &std::path::Path, into: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(into).expect("a directory");
+    for entry in std::fs::read_dir(from).expect("the package directory is readable") {
+        let entry = entry.expect("a directory entry");
+        let source = entry.path();
+        let destination = into.join(entry.file_name());
+        let kind = entry.file_type().expect("a file type");
+        if kind.is_dir() {
+            copy_tree(&source, &destination);
+        } else if kind.is_file() {
+            std::fs::copy(&source, &destination).expect("a file");
+            let mode = entry.metadata().expect("a mode").permissions().mode();
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))
+                .expect("the mode");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The worker's own race rules, on a clock this suite moves.
+//
+// The cases above drive a real reader in a real terminal. These drive the other half: the machine
+// the worker runs, which decides what a hold releases, in what order, and what a caller is told.
+// `FenceMachine::apply` takes the moment as an argument, so a deadline is reached by naming it
+// rather than by waiting for it, and a rule that depends on 250 ms passing is checked without a
+// test that is slower than the rule it is about.
+// ---------------------------------------------------------------------------------------------
+
+use kr_protocol::root::{
+    CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, KeyQueueSnapshot,
+    PendingReaderInput, PromptGeneration, QueueDrainReport, ReaderContext, ReaderRevision,
+    RootEditorEnterParams, ShellLaunchParams,
+};
+use kr_shell_integration::contract::events::ReaderIdle;
+use kr_shell_integration::contract::fence::{
+    ActionShape, ContinuousMs, EditorEntered, FenceMachine, InputArrived, InputRef,
+    LaunchRequested, LeaseView, ReaderIdled, Stimulus,
+};
+
+fn race_session() -> kr_protocol::ids::SessionId {
+    kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([0x63; 16]))
+}
+
+fn race_process() -> kr_protocol::identity::ProcessStartIdentity {
+    kr_protocol::identity::ProcessStartIdentity::new(
+        4242,
+        kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+        99,
+    )
+}
+
+fn empty_reader(revision: u64) -> EditorState {
+    EditorState {
+        buffer_revision: EditorBufferRevision::new(revision),
+        buffer_empty: true,
+        keymap: EditorKeymap::Emacs,
+        pending: PendingReaderInput::NONE,
+    }
+}
+
+fn at(milliseconds: u64) -> ContinuousMs {
+    ContinuousMs::new(milliseconds)
+}
+
+fn entered(prompt: u64, revision: u64, candidate: u8) -> Stimulus {
+    Stimulus::EditorEntered(EditorEntered {
+        params: RootEditorEnterParams {
+            session_id: race_session(),
+            root_process: race_process(),
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(revision),
+            reader_context: ReaderContext::Primary,
+            editor: empty_reader(1),
+            cwd_revision: CwdRevision::new(2),
+        },
+        candidate_fence: shellpkg::fence_id(candidate),
+    })
+}
+
+fn arrived(label: &str, bytes: u64) -> Stimulus {
+    Stimulus::InputArrived(InputArrived {
+        input: InputRef::new(label),
+        attachment_id: shellpkg::attachment_id(1),
+        epoch: shellpkg::epoch(1),
+        bytes: kr_protocol::scalars::U64::new(bytes),
+    })
+}
+
+fn acknowledged(candidate: u8, prompt: u64, revision: u64, queues: QueueDrainReport) -> Stimulus {
+    Stimulus::FenceAcknowledged(kr_protocol::root::FenceAcknowledgement {
+        fence_id: shellpkg::fence_id(candidate),
+        reader_context: ReaderContext::Primary,
+        prompt_generation: PromptGeneration::new(prompt),
+        reader_revision: ReaderRevision::new(revision),
+        queues,
+        snapshot: KeyQueueSnapshot::drained(),
+        editor: empty_reader(1),
+        cwd_revision: CwdRevision::new(2),
+    })
+}
+
+fn idled(prompt: u64, revision: u64, candidate: u8) -> Stimulus {
+    Stimulus::ReaderIdled(ReaderIdled {
+        idle: ReaderIdle {
+            session_id: race_session(),
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(revision),
+            reader_context: ReaderContext::Primary,
+            snapshot: KeyQueueSnapshot::drained(),
+            editor: empty_reader(1),
+            cwd_revision: CwdRevision::new(2),
+        },
+        candidate_fence: shellpkg::fence_id(candidate),
+    })
+}
+
+/// A machine at a published fence, with the moment that fence was published.
+fn fenced_machine() -> (FenceMachine, ContinuousMs) {
+    let mut machine = FenceMachine::new(
+        race_session(),
+        LeaseView::held(shellpkg::epoch(1), shellpkg::attachment_id(1)),
+    );
+    machine.apply(at(0), &entered(1, 1, 1));
+    let published = machine.apply(at(20), &acknowledged(1, 1, 1, QueueDrainReport::CLEAR));
+    assert!(
+        published
+            .shapes()
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::PublishFence { .. })),
+        "an acknowledged exchange with clear queues did not publish: {:?}",
+        published.shapes()
+    );
+    (machine, at(20))
+}
+
+/// KR-REQ-07.79, KR-REQ-07.83: the 250 ms release, in the order the input arrived, with one
+/// `EDITOR_BUSY` attachment event and no refusal of the input itself.
+#[test]
+fn the_hold_releases_what_it_held_in_order_with_one_editor_busy_and_no_refusal() {
+    let mut machine = FenceMachine::new(
+        race_session(),
+        LeaseView::held(shellpkg::epoch(1), shellpkg::attachment_id(1)),
+    );
+    let opened = machine.apply(at(0), &entered(1, 1, 1));
+    assert!(
+        opened
+            .shapes()
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::AskFence { .. })),
+        "entry started no exchange: {:?}",
+        opened.shapes()
+    );
+
+    for (index, label) in ["first", "second", "third"].iter().enumerate() {
+        let held = machine.apply(at(10 + 10 * index as u64), &arrived(label, 4));
+        assert!(
+            held.shapes()
+                .iter()
+                .any(|shape| matches!(shape, ActionShape::Hold { .. })),
+            "{label} was not held while the exchange was open: {:?}",
+            held.shapes()
+        );
+    }
+    assert_eq!(
+        machine.held(),
+        vec![
+            InputRef::new("first"),
+            InputRef::new("second"),
+            InputRef::new("third")
+        ],
+        "the hold is not in arrival order"
+    );
+    assert_eq!(
+        machine.deadline(),
+        Some(at(250)),
+        "the hold's deadline is not the 250 ms section 7 gives it"
+    );
+
+    let expired = machine.apply(at(250), &Stimulus::HoldExpired);
+    let shapes = expired.shapes();
+    let release = shapes
+        .iter()
+        .position(|shape| matches!(shape, ActionShape::Release { .. }))
+        .unwrap_or_else(|| panic!("the hold released nothing: {shapes:?}"));
+    let busy = shapes
+        .iter()
+        .position(|shape| matches!(shape, ActionShape::EmitEditorBusy { .. }))
+        .unwrap_or_else(|| panic!("nothing told the attachment why: {shapes:?}"));
+    assert!(
+        release < busy,
+        "the event that explains the release came before it: {shapes:?}"
+    );
+    assert!(
+        shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::WithholdFence { .. })),
+        "the bridge was not told that no fence was published: {shapes:?}"
+    );
+    assert!(
+        !shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::RefuseInput { .. })),
+        "the release refused the input it was releasing: {shapes:?}"
+    );
+    assert!(
+        !shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::Discard { .. })),
+        "the release discarded input rather than delivering it: {shapes:?}"
+    );
+    match expired
+        .actions
+        .iter()
+        .find(|action| matches!(action.shape(), ActionShape::Release { .. }))
+    {
+        Some(kr_shell_integration::contract::fence::Action::Release(batches)) => assert_eq!(
+            batches,
+            &vec![
+                InputRef::new("first"),
+                InputRef::new("second"),
+                InputRef::new("third")
+            ],
+            "the held input was released out of its original order"
+        ),
+        other => panic!("the release is {other:?}"),
+    }
+    assert!(machine.held().is_empty(), "the hold still holds something");
+}
+
+/// KR-REQ-07.79: a retried fence waits for mixed queues to drain rather than discarding them.
+#[test]
+fn a_retried_fence_waits_for_the_mixed_queues_rather_than_discarding_them() {
+    let mut machine = FenceMachine::new(
+        race_session(),
+        LeaseView::held(shellpkg::epoch(1), shellpkg::attachment_id(1)),
+    );
+    machine.apply(at(0), &entered(1, 1, 1));
+    machine.apply(at(10), &arrived("typed", 3));
+    machine.apply(at(250), &Stimulus::HoldExpired);
+
+    // The retry happens at the reader's own next idle report, which is one of the points section 7
+    // names.
+    let retried = machine.apply(at(300), &idled(1, 1, 2));
+    assert!(
+        retried
+            .shapes()
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::AskFence { .. })),
+        "an idle reader did not retry the exchange: {:?}",
+        retried.shapes()
+    );
+
+    // The queues the release left mixed are still holding something, so nothing is published and
+    // nothing is thrown away.
+    let mixed = machine.apply(
+        at(310),
+        &acknowledged(
+            2,
+            1,
+            1,
+            QueueDrainReport {
+                tty_typeahead_drained: false,
+                macro_input_drained: true,
+                partial_key_drained: true,
+            },
+        ),
+    );
+    let shapes = mixed.shapes();
+    assert!(
+        shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::WithholdFence { .. })),
+        "a fence was published over queues that had not drained: {shapes:?}"
+    );
+    assert!(
+        !shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::PublishFence { .. })),
+        "a fence was published over queues that had not drained: {shapes:?}"
+    );
+    assert!(
+        !shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::Discard { .. })),
+        "the retry discarded the mixed queues instead of waiting: {shapes:?}"
+    );
+
+    // They drain, and the next retry publishes.
+    machine.apply(at(320), &idled(1, 1, 3));
+    let published = machine.apply(at(330), &acknowledged(3, 1, 1, QueueDrainReport::CLEAR));
+    assert!(
+        published
+            .shapes()
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::PublishFence { .. })),
+        "drained queues still published nothing: {:?}",
+        published.shapes()
+    );
+}
+
+/// KR-REQ-07.83: a launch that reaches its reservation timeout installs no command.
+#[test]
+fn a_launch_that_reaches_its_reservation_timeout_installs_no_command() {
+    let (mut machine, published) = fenced_machine();
+    let transaction = kr_shell_integration::contract::requests::LaunchTransactionId::new(
+        kr_protocol::scalars::Uuid::from_bytes([0x17; 16]),
+    );
+    let fence = machine.fence().expect("a published fence").clone();
+    let requested = machine.apply(
+        at(published.get() + 5),
+        &Stimulus::LaunchRequested(LaunchRequested {
+            params: ShellLaunchParams {
+                session_id: race_session(),
+                command: kr_protocol::root::LaunchCommand::Arguments(vec![
+                    "printf".to_owned(),
+                    "kr-must-not-install".to_owned(),
+                ]),
+                expected_prompt_generation: fence.prompt_generation,
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+            requester: shellpkg::attachment_id(1),
+            transaction,
+        }),
+    );
+    assert!(
+        requested
+            .shapes()
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::SendLaunch { .. })),
+        "the launch never reached the reader's mailbox: {:?}",
+        requested.shapes()
+    );
+    let deadline = machine.deadline().expect("a reservation has a deadline");
+
+    // Input that arrives while the reservation stands is held, and the reservation's own timeout
+    // is what releases it.
+    machine.apply(at(deadline.get() - 10), &arrived("during", 2));
+    let expired = machine.apply(deadline, &Stimulus::HoldExpired);
+    let shapes = expired.shapes();
+    assert!(
+        shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::Release { .. })),
+        "the reservation's timeout released nothing: {shapes:?}"
+    );
+    assert!(
+        shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::RevokeLaunch { .. })),
+        "the bridge was not told the transaction was over: {shapes:?}"
+    );
+    assert!(
+        !shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::InstallLaunch { .. })),
+        "a command was installed at the reservation's timeout: {shapes:?}"
+    );
+
+    // The reader answers that it installed nothing, and that is what the caller is told, with the
+    // code section 7 names.
+    let answered = machine.apply(
+        at(deadline.get() + 30),
+        &Stimulus::LaunchDecided(
+            kr_shell_integration::contract::requests::LaunchDecision::Rejected(
+                kr_shell_integration::contract::requests::LaunchRejection {
+                    transaction,
+                    fence_id: fence.fence_id,
+                    reason:
+                        kr_shell_integration::contract::requests::LaunchRejectionReason::Timeout,
+                    prompt_generation: fence.prompt_generation,
+                    buffer_revision: EditorBufferRevision::new(1),
+                },
+            ),
+        ),
+    );
+    let shapes = answered.shapes();
+    assert!(
+        !shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::InstallLaunch { .. })),
+        "a refused launch installed a command: {shapes:?}"
+    );
+    match answered
+        .actions
+        .iter()
+        .find(|action| matches!(action.shape(), ActionShape::RejectLaunch { .. }))
+    {
+        Some(kr_shell_integration::contract::fence::Action::RejectLaunch { code, .. }) => {
+            assert_eq!(
+                *code,
+                kr_protocol::error::ErrorCode::EditorBusy,
+                "the caller was refused with another code"
+            );
+        }
+        other => panic!("the caller was answered with {other:?}"),
+    }
+}
+
+/// What this qualification cannot reach, recorded rather than left out.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Unreachable {
+    description: String,
+    unreachable: Vec<UnreachableBehaviour>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreachableBehaviour {
+    id: String,
+    what: String,
+    why_here: String,
+    owner: String,
+    next_step: String,
+}
+
+/// KR-REQ-07.83, KR-REQ-07.79: the behaviours section 7 names that this suite cannot provoke are
+/// named here with the reason and whose they are.
+///
+/// Both are conditions of the host rather than of a package: one needs a worker holding its own
+/// session while a desktop reading is taken, the other needs a control daemon deciding whether the
+/// machine may sleep. This suite drives a package against a bridge endpoint, so neither exists in
+/// it. A qualification that simply left them out would read as though it had covered them.
+#[test]
+fn what_this_qualification_cannot_reach_is_recorded_with_its_reason_and_its_owner() {
+    let path = corpus_root().join("unreachable.json");
+    let body = std::fs::read_to_string(&path).expect("the record is committed beside the corpus");
+    let record: Unreachable = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("{} does not decode: {error}", path.display()));
+    assert!(record.description.split_whitespace().count() >= 10);
+    assert!(
+        record.unreachable.len() >= 2,
+        "the record names {} behaviours",
+        record.unreachable.len()
+    );
+    for behaviour in &record.unreachable {
+        assert!(!behaviour.id.is_empty());
+        for (field, text) in [
+            ("what", &behaviour.what),
+            ("why_here", &behaviour.why_here),
+            ("next_step", &behaviour.next_step),
+        ] {
+            assert!(
+                text.split_whitespace().count() >= 12,
+                "{}'s {field} does not say enough to act on",
+                behaviour.id
+            );
+        }
+        assert!(
+            [
+                "kr-worker",
+                "kr-controller",
+                "kr-shell-integration",
+                "packaging"
+            ]
+            .contains(&behaviour.owner.as_str()),
+            "{} belongs to {}, which is not a component of this build",
+            behaviour.id,
+            behaviour.owner
+        );
+    }
+    let ids: Vec<&str> = record
+        .unreachable
+        .iter()
+        .map(|behaviour| behaviour.id.as_str())
+        .collect();
+    for named in [
+        "desktop-probe-outlasts-the-launch-hold",
+        "the-sleep-demand-scan-cannot-see-an-outstanding-launch",
+    ] {
+        assert!(ids.contains(&named), "{named} is not recorded");
+    }
 }

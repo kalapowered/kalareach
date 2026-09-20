@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use kr_protocol::ids::SessionId;
+use kr_protocol::root::{FENCE_EXCHANGE_TIMEOUT, FenceCause, RootEditorFenceParams};
 use kr_protocol::scalars::Uuid;
 use kr_shell_integration::contract::qualification::{DetachExclusion, ShellKind};
 use kr_shell_integration::contract::transport::{
@@ -831,15 +832,71 @@ impl Session {
             "the shell did not answer before a fence was asked for:\n{}",
             self.terminal_output()
         );
-        let published = self.fenced_prompt(index);
+        let published = self.fenced_latest(index);
         // An editor that reaches its own queue only when the reader steps has not taken the
-        // publication yet. The step a person gives it by typing is given here, before the gesture
-        // this fence is about.
+        // publication frame yet, and a gesture sent before it does is decided against the fence
+        // that was there before. A request sent after the publication is the barrier: the reader
+        // reads its mailbox in order, so an answer to that request is the publication having been
+        // read. Waiting for the answer is what puts the two in a known order, rather than a sleep.
         if dialect(self.package_kind).answers_at_the_next_step {
-            self.nudge();
-            std::thread::sleep(Duration::from_millis(200));
+            let barrier = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
+                session_id: self.session_id,
+                fence_id: published.1.fence_id,
+                prompt_generation: published.0.prompt_generation,
+                reader_revision: published.0.reader_revision,
+                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                cause: FenceCause::Retry,
+            }));
+            let _ = self.answer(barrier);
         }
         published
+    }
+
+    /// The primary reader that is running now, rather than the first one still in the queue.
+    ///
+    /// A reader that leaves and comes back reports both, and an editor that redraws its prompt can
+    /// report several in a row. A fence names one reader, so it has to name the one the gesture
+    /// after it will be read by: the newest entry this session has been told about.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no primary reader reports itself at all.
+    pub fn latest_prompt(&mut self) -> RootEditorEnterParams {
+        let mut newest = self.next_prompt();
+        self.pump(Duration::from_millis(200));
+        while let Some(position) = self.events.iter().position(|(_, event)| {
+            matches!(
+                event,
+                BridgeEvent::EditorEnter(params)
+                    if params.reader_context == kr_protocol::root::ReaderContext::Primary
+            )
+        }) {
+            self.events.drain(..position);
+            let (_, event) = self.events.pop_front().expect("the entry is there");
+            newest = as_enter(&event).clone();
+        }
+        self.last_entry = Some(newest.clone());
+        newest
+    }
+
+    /// Takes the reader that is running now to a fenced empty prompt.
+    ///
+    /// # Panics
+    ///
+    /// Panics when that reader reports a queue still holding input at an empty prompt.
+    pub fn fenced_latest(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
+        let enter = self.latest_prompt();
+        let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
+        let acknowledgement = self.fence_exchange(&enter, fence.fence_id);
+        assert!(
+            acknowledgement.queues.tty_typeahead_drained
+                && acknowledgement.queues.macro_input_drained
+                && acknowledgement.queues.partial_key_drained,
+            "an idle reader reported a queue still holding input: {:?}",
+            acknowledgement.queues
+        );
+        self.publish(&fence);
+        (enter, fence)
     }
 
     /// Puts the reader back where a drive left it, before anything is asked of it.
@@ -848,8 +905,16 @@ impl Session {
     /// pending sequence. The keys here are the ones every one of these editors answers with
     /// "stop what you are doing and keep the line", followed by clearing the line itself.
     pub fn recover(&mut self) {
-        for keys in [CTRL_G, CTRL_C, CTRL_U] {
-            self.type_bytes(keys);
+        // An editor whose own queue the reader steps to reach is left out of the interrupt: that
+        // key ends its read altogether there, and the reader that comes back is a different one
+        // from the one a fence would have been about.
+        let keys: &[&[u8]] = if dialect(self.package_kind).answers_at_the_next_step {
+            &[CTRL_G, CTRL_U]
+        } else {
+            &[CTRL_G, CTRL_C, CTRL_U]
+        };
+        for bytes in keys.iter().copied() {
+            self.type_bytes(bytes);
             std::thread::sleep(Duration::from_millis(80));
         }
         std::thread::sleep(Duration::from_millis(120));

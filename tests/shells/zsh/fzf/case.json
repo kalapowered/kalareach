@@ -18,6 +18,7 @@
     "identity",
     "profile_order",
     "plugin_active",
+    "plugin_writes_buffer",
     "plugin_buffer",
     "user_bindings",
     "gesture_detaches",

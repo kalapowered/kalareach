@@ -425,6 +425,14 @@ startup=$(digest "$package/$m_startup") $m_startup"
         return 0
     fi
 
+    # A patch to a file a release also ships a generated form of — a configure script beside its
+    # configure.ac, a parser beside its grammar — leaves the source newer than the product, and
+    # the release's own makefile then tries to regenerate it with tools a person building a shell
+    # is not asked to have. Every file in the tree is given one moment here, so nothing is newer
+    # than anything else and the generated forms the release ships are the ones that are used.
+    # The patches correct both halves, so the two agree.
+    find "$source_tree" -exec touch {} +
+
     write_identity_header "$source_tree/$m_source_directory/kr_bridge_identity.h" \
         "$package" "$executable" "$module_directory"
 

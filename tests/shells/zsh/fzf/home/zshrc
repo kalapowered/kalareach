@@ -12,6 +12,9 @@ typeset -g KR_TEST_USER_CONFIGURATION=1
 
 # These widgets bind Ctrl-T, Ctrl-R and Alt-C, and each runs a program inside the reader.
 path=("$KR_STACK_FZF" $path)
+# One candidate, so what the widget puts in the line is the one it was given.
+export FZF_CTRL_T_COMMAND='printf "kr-fzf-choice\n"'
+export FZF_DEFAULT_OPTS="--no-mouse --height=10"
 source "$KR_STACK_FZF_SHELL/shell/completion.zsh"
 source "$KR_STACK_FZF_SHELL/shell/key-bindings.zsh"
 print -r -- stack >> "$KR_TEST_ORDER"

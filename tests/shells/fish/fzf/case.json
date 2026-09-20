@@ -4,7 +4,7 @@
   "stack": "fzf",
   "title": "fzf's key bindings on the packaged fish, which claim keys in every bind mode",
   "supported": true,
-  "notes": "A takeover while this reader waits for the rest of a key sequence is not driven on this shell in this corpus. The sequence this session binds to reach that wait shares its bind modes with these widgets, and the fence asked inside it named a reader that had moved. What ends such a wait is driven through the package suite instead, and driving it here is unfinished.",
+  "notes": "Two things are recorded rather than driven on this shell here. A takeover while the reader waits for the rest of a key sequence: the reader this corpus leaves in that wait has moved by the time the fence behind the cancellation is asked, so what is measured is a different reader. And its numeric argument, which its vi bindings accumulate: the keys that reach it here ended the reader rather than leaving it holding a count. The package suite drives both.",
   "requires": [
     "fzf",
     "fzf-shell"
@@ -20,6 +20,7 @@
     "identity",
     "profile_order",
     "plugin_active",
+    "plugin_writes_buffer",
     "plugin_buffer",
     "user_bindings",
     "gesture_detaches",

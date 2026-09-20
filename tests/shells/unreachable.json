@@ -1,0 +1,19 @@
+{
+  "description": "Behaviours section 7 names that this qualification cannot reach, each with the reason and whose they are. A qualification that left these out would read as though it had covered them.",
+  "unreachable": [
+    {
+      "id": "desktop-probe-outlasts-the-launch-hold",
+      "what": "A desktop-bound session whose desktop probe runs while the session is held takes longer than the 250 ms a launch hold is given, so the held input reaches the terminal late and a reader's answer or a detach waits behind the probe.",
+      "why_here": "The probe, the supervision loop and the session lock are the worker's, in crates/kr-worker/src/runtime.rs and crates/kr-worker/src/desktop/. This suite drives a package against a bridge endpoint and starts no worker, so there is no session lock here to hold.",
+      "owner": "kr-worker",
+      "next_step": "Split the watch into one call that says what reading is wanted and one that folds a reading in, take the reading off the session lock, and assert that a desktop-bound session with a fence hold armed and a probe slower than the hold still delivers the held input at its own deadline."
+    },
+    {
+      "id": "the-sleep-demand-scan-cannot-see-an-outstanding-launch",
+      "what": "A managed session waiting for a reader's launch answer reports no demand, so a host with sleep inhibition enabled can suspend while a shell.launch is in flight and the action window can expire across the sleep.",
+      "why_here": "The scan is the control daemon's, in crates/kr-controller/src/service.rs, and the count it would read is a field on the session summary in kr-protocol. Neither is this crate, and this suite runs no daemon.",
+      "owner": "kr-controller",
+      "next_step": "Report how many launch confirmations a session is still waiting on, count it into the demand scan, and assert the demand before the revocation, after it, after the reader's answer and after a bridge loss."
+    }
+  ]
+}
