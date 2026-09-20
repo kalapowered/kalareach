@@ -1954,3 +1954,82 @@ fn a_restart_owes_the_ciphertext_of_cancelled_work_that_never_left_this_host() {
     let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
+
+#[test]
+fn a_late_acknowledgement_does_not_bring_back_a_cleanup_that_is_finished() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let admitted = service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        service
+            .note_dispatched(admitted.sequence)
+            .expect("the upload is in flight");
+        service
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                objects[0].object_id(),
+                TimestampMs::new(6_000),
+            )
+            .expect("the member arrives first");
+
+        // The whole privacy sequence, staged ciphertext and all.
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(6_500));
+        {
+            let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut service];
+            mode.apply(&mut subsystems, TimestampMs::new(6_500));
+        }
+
+        // The transfer that had already left finishes afterwards. What the service has is written
+        // down; where the ciphertext is does not change, because it is nowhere here.
+        let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+        assert!(
+            service
+                .note_object_uploaded(
+                    archive_id(),
+                    BackupGeneration::new(1),
+                    manifest_id,
+                    TimestampMs::new(7_000),
+                )
+                .expect("the manifest is acknowledged")
+        );
+        for row in service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+        {
+            assert_eq!(row.state, ObjectState::Removed);
+            assert!(!row.staged_path.exists());
+        }
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+    }
+
+    // A restart does not raise a removal this host has already done.
+    let service = BackupService::open(&state).expect("the service opens again");
+    service
+        .reconcile(TimestampMs::new(8_000))
+        .expect("reconciliation");
+    assert!(
+        service.obligations().expect("a read").is_empty(),
+        "the cleanup is finished and stays finished"
+    );
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+}

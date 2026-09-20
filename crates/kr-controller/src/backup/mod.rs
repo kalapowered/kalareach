@@ -339,20 +339,25 @@ impl BackupService {
     /// complete over content that had not gone. So a failure becomes a durable obligation, and
     /// [`PrivacySubsystem::outstanding`] counts it: a restart comes back owing what it owed, and
     /// only the retry's own success clears it.
-    fn owe(&self, store: &mut BackupStore, what: String) {
-        if store.record_obligation(&what, kr_ipc::now_ms()).is_err() {
-            // A store that will not record the obligation cannot be asked what it owes either, so
-            // the failure is kept where `outstanding` will still see it: a store that cannot be
-            // read answers "one thing outstanding" rather than "nothing".
-            let _ = store.record_obligation(FAILED_TO_RECORD, kr_ipc::now_ms());
-            let mut unpersisted = self
-                .unpersisted_obligations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !unpersisted.contains(&what) {
-                unpersisted.push(what);
-            }
+    /// Returns whether the obligation reached the disk. An in-memory one lasts as long as this
+    /// process and no longer, so a caller about to write over the only other durable record of the
+    /// same work has to know which it got.
+    fn owe(&self, store: &mut BackupStore, what: String) -> bool {
+        if store.record_obligation(&what, kr_ipc::now_ms()).is_ok() {
+            return true;
         }
+        // A store that will not record the obligation cannot be asked what it owes either, so the
+        // failure is kept where `outstanding` will still see it: a store that cannot be read
+        // answers "one thing outstanding" rather than "nothing".
+        let _ = store.record_obligation(FAILED_TO_RECORD, kr_ipc::now_ms());
+        let mut unpersisted = self
+            .unpersisted_obligations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !unpersisted.contains(&what) {
+            unpersisted.push(what);
+        }
+        false
     }
 
     /// Records that one privacy step did what it was asked, clearing what it owed.
@@ -768,13 +773,17 @@ impl BackupService {
                 // with nothing else to say so. Recording it first is what makes it durable: the
                 // outbox entry this loop is about to clear was the only other thing counting the
                 // cleanup, and an obligation written afterwards is one a stop in between loses.
-                if record.state == GenerationState::Cancelled
+                let owed = record.state == GenerationState::Cancelled
                     && store
                         .objects(record.archive_id, record.backup_generation)?
                         .iter()
-                        .any(|object| object.state != ObjectState::Removed)
-                {
-                    self.owe(&mut store, REMOVE_STEP.to_owned());
+                        .any(|object| object.state != ObjectState::Removed);
+                if owed && !self.owe(&mut store, REMOVE_STEP.to_owned()) {
+                    // The obligation got no further than this process. The outbox entry is then
+                    // the only durable thing left counting this cleanup, so it stays: settling
+                    // over it would leave a store that says nothing is outstanding and a disk that
+                    // still holds the ciphertext. The next reconciliation tries again.
+                    continue;
                 }
                 if entries.is_empty() {
                     continue;
@@ -1124,6 +1133,10 @@ impl PrivacySubsystem for BackupService {
             let mut unlinked = 0u64;
             for object in &objects {
                 if object.state == ObjectState::Removed {
+                    // Already gone, and counted as gone. A pass that left it out of the tally
+                    // would never see a generation as wholly removed, so a second pass over
+                    // anything this one part-finished could never finish it either.
+                    unlinked += 1;
                     continue;
                 }
                 match std::fs::remove_file(&object.staged_path) {

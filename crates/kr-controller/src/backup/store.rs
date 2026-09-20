@@ -510,16 +510,33 @@ impl BackupStore {
                 "that object is not one this host staged",
             ));
         };
+        // What the service has is written down whatever else is true of the object. Where its
+        // ciphertext is, is a separate fact, and an acknowledgement does not put a file back: an
+        // object privacy mode has already removed stays removed, and saying it was staged here
+        // again would be a record that named a file this host does not hold.
         transaction
             .execute(
-                "UPDATE objects SET state = ?4, uploaded_bytes = ?5
+                "UPDATE objects SET uploaded_bytes = ?4
                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3",
                 params![
                     archive_id.get().as_bytes().as_slice(),
                     i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
                     object_id.get().as_bytes().as_slice(),
-                    ObjectState::Uploaded.as_str(),
                     uploaded_len,
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction
+            .execute(
+                "UPDATE objects SET state = ?4
+                 WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3
+                   AND state <> ?5",
+                params![
+                    archive_id.get().as_bytes().as_slice(),
+                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                    object_id.get().as_bytes().as_slice(),
+                    ObjectState::Uploaded.as_str(),
+                    ObjectState::Removed.as_str(),
                 ],
             )
             .map_err(ControllerError::registry)?;
