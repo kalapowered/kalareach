@@ -306,7 +306,19 @@ impl Coordinator {
                 parent_grant_id: Some(standing.grant_id),
                 issuer_device_id: self.host_device_id,
                 environment_id: self.environment_id,
-                session_ids: params.session_ids.clone(),
+                // An empty request takes the standing voice grant's own sessions, not the wider
+                // set the device's ordinary grant covers: the child narrows both, and the standing
+                // grant is the narrower of the two by construction.
+                session_ids: if params.session_ids.is_empty() {
+                    match &standing.session_selector {
+                        kr_protocol::grant::SessionSelector::These { session_ids } => {
+                            session_ids.clone()
+                        }
+                        _ => CanonicalSet::from_iter([]),
+                    }
+                } else {
+                    params.session_ids.clone()
+                },
                 expiry: call_expiry(closes_at_ms),
                 authority_revision,
             },
@@ -314,9 +326,16 @@ impl Coordinator {
 
         let session_ids = match &planned.plan.session_selector {
             kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.clone(),
-            // A grant over every session reaches every session, and each request is decided again
-            // against both grants. A grant over none reaches none, which is nothing to start.
-            kr_protocol::grant::SessionSelector::Any => self.sessions_of(&device_grant),
+            // A voice session names what it reaches. A grant over every session cannot be turned
+            // into that list here, and answering with an empty one would be a call that reaches
+            // nothing, so the caller is asked to name them.
+            kr_protocol::grant::SessionSelector::Any => {
+                return Err(VoiceError::refused(
+                    VoiceRefusal::SessionOutsideVoiceSession,
+                    "name the sessions this voice session may reach; a voice grant over every \
+                     session is not one a call can be bound to",
+                ));
+            }
             kr_protocol::grant::SessionSelector::None => CanonicalSet::from_iter([]),
         };
         if session_ids.is_empty() {
