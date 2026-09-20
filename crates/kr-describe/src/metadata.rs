@@ -131,13 +131,11 @@ fn normalise(text: &str, limit: usize) -> String {
     for character in text.chars() {
         // A control character is removed rather than replaced: replacing it with a space would let
         // a caller pad a title with invisible bytes, and escaping it would put its name in the
-        // title. Every C0 and C1 code, the line and paragraph separators and the directional
-        // overrides go, which is what stops a right-to-left override reordering what is shown.
-        if character.is_control()
-            || matches!(character, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}')
-            || ('\u{202a}'..='\u{202e}').contains(&character)
-            || ('\u{2066}'..='\u{2069}').contains(&character)
-        {
+        // title. Every C0 and C1 code, the line and paragraph separators and the whole of
+        // Unicode's Bidi_Control set go, which is what stops a right-to-left override reordering
+        // what is shown. `char::is_control` does not cover the format characters, so they are
+        // named: U+061C is one Rust would otherwise let through.
+        if character.is_control() || is_bidi_control(character) || is_line_separator(character) {
             continue;
         }
         if character.is_whitespace() {
@@ -159,6 +157,27 @@ fn normalise(text: &str, limit: usize) -> String {
         codepoints += 1;
     }
     out
+}
+
+/// Returns whether a character is one of Unicode's bidirectional controls.
+///
+/// The set is `Bidi_Control`: the two marks, the four embedding and override codes, the pop, the
+/// Arabic letter mark and the four isolate codes. Ordinary letters in any script, and the zero-width
+/// joiner and non-joiner that scripts need to render correctly, are not in it and are kept.
+const fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Returns whether a character is a line or paragraph separator.
+const fn is_line_separator(character: char) -> bool {
+    matches!(character, '\u{2028}' | '\u{2029}')
 }
 
 /// A session's state, as the host and its adapters record it.

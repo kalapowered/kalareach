@@ -6,9 +6,15 @@
 //! not run a model to label a host session at all.
 //!
 //! The rule is expressed as a placement rather than as a check somebody remembers to make: an
-//! environment answers where its inference may run, and [`ModelMapping`] is the only thing that
-//! holds a mapped model. A second mapping in one environment is not refused by a guard; there is
-//! nowhere to put one.
+//! environment answers where its inference may run, and [`ModelMapping`] holds one record per
+//! environment.
+//!
+//! [`ModelMapping`] is bookkeeping, and saying so matters. It holds no process, no weights and no
+//! runtime handle, so it unloads nothing by itself: what it records is *which* profile an
+//! environment has mapped, which is what decides whether a result is late. The weights belong to
+//! [`crate::service::DescriptionService`], which owns exactly one mapping and one runtime and
+//! calls `unload` on the runtime **before** it maps another. Two `ModelMapping` values would be
+//! two records of one fact, which is why nothing but the service builds one.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +22,7 @@ use kr_protocol::ids::{ActorId, EnvironmentId};
 use kr_protocol::scalars::TimestampMs;
 
 use crate::error::{DescribeError, Result};
+use crate::profile::catalogue::MetGates;
 use crate::profile::{ModelProfile, ProfileRevision};
 
 /// What kind of execution environment this is.
@@ -209,12 +216,15 @@ pub struct Remapped {
     pub mapped: MappedModel,
 }
 
-/// The mapping of environments to the one model each has.
+/// The record of which model each environment has mapped.
 ///
 /// Section 22's "one shared inference process and model mapping per execution environment" is this
-/// map: one entry per environment, replaced rather than added to. Mapping a second profile unloads
-/// the first before the second exists, so there is no moment when two sets of weights are resident
-/// and no way for a session to ask for one of its own.
+/// map: one entry per environment, replaced rather than added to, and no session key anywhere, so
+/// there is nowhere for a per-session model to be recorded.
+///
+/// It is a record, not an owner. Replacing an entry returns the entry it replaced so its owner can
+/// release the weights, and [`crate::service::DescriptionService::ensure_mapped`] is the caller
+/// that does: it unloads its runtime first and maps second.
 #[derive(Debug, Default)]
 pub struct ModelMapping {
     mapped: BTreeMap<EnvironmentId, MappedModel>,
@@ -240,17 +250,25 @@ impl ModelMapping {
         self.mapped.len()
     }
 
-    /// Maps a profile in an environment, unloading whatever was there first.
+    /// Records a profile as this environment's mapping, returning whatever it replaced.
+    ///
+    /// Three things are checked here because this is the boundary a profile crosses to become the
+    /// thing a host runs: the environment may run a model at all, the profile lists this target,
+    /// and every gate the profile declares has been met on this host. The last is what stops a
+    /// caller that obtained a candidate profile some other way from running it without the
+    /// platform, resource and quality gates section 22 requires.
     ///
     /// # Errors
     ///
-    /// Returns [`DescribeError::PlacementRefused`] when the environment runs no model, and
-    /// [`DescribeError::IncompatibleTarget`] when the profile does not list this target.
+    /// Returns [`DescribeError::PlacementRefused`] when the environment runs no model,
+    /// [`DescribeError::IncompatibleTarget`] when the profile does not list this target, and
+    /// [`DescribeError::GatesOutstanding`] when a candidate's gates have not been met.
     pub fn map(
         &mut self,
         environment: &ExecutionEnvironment,
         choice: Option<&DataAccessChoice>,
         profile: &ModelProfile,
+        met: &MetGates,
         target: &str,
         now_ms: TimestampMs,
     ) -> Result<Remapped> {
@@ -269,9 +287,21 @@ impl ModelMapping {
                 target: target.to_owned(),
             });
         }
-        // Unload first. Section 22 states the order, and the order is what keeps the process
-        // ceiling a ceiling: two sets of weights resident at once would exceed it for as long as
-        // the changeover took, which is exactly when a host is least able to afford it.
+        let outstanding = met.outstanding(profile);
+        if !outstanding.is_empty() {
+            return Err(DescribeError::GatesOutstanding {
+                profile: profile.profile_id().to_owned(),
+                gates: outstanding
+                    .iter()
+                    .map(|gate| gate.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        // The previous record comes out before the new one goes in, and it is returned so its
+        // owner releases the weights before it loads more. Section 22 states that order, and the
+        // order is what keeps the process ceiling a ceiling: two sets of weights resident at once
+        // would exceed it for as long as the changeover took.
         let unloaded = self.mapped.remove(environment.id());
         if let Some(previous) = unloaded.clone() {
             self.unloaded.push(previous);

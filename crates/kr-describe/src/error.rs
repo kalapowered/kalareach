@@ -22,6 +22,15 @@ pub enum DescribeError {
         reason: &'static str,
     },
 
+    /// A candidate profile's declared gates have not been met on this host.
+    #[error("profile {profile} needs these gates met first: {gates}")]
+    GatesOutstanding {
+        /// The profile asked for.
+        profile: String,
+        /// The gates that are outstanding.
+        gates: String,
+    },
+
     /// The profile was not qualified on this target.
     #[error("profile {profile} was not qualified on {target}")]
     IncompatibleTarget {

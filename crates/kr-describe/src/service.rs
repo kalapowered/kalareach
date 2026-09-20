@@ -749,6 +749,7 @@ impl DescriptionService {
             &self.environment,
             self.choice.as_ref(),
             profile,
+            &self.met,
             &self.target,
             now.wall_ms(),
         )?;

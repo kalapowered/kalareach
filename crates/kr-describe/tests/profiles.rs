@@ -7,6 +7,7 @@
 
 mod support;
 
+use kr_crypto::keys::AuthorisationKeyPair;
 use kr_describe::budget::{Budgets, GIB, ResidentCost};
 use kr_describe::environment::{
     DataAccessChoice, EnvironmentKind, ExecutionEnvironment, MachineGroup, ModelMapping, Placement,
@@ -17,6 +18,7 @@ use kr_describe::metadata::{
     LabelSource, LifecycleFacts, RepositoryFacts, SessionFacts, SessionLabel, VerifiedStatus,
     deterministic_title,
 };
+use kr_describe::profile::catalogue::builtin_trust;
 use kr_describe::profile::catalogue::{Catalogue, MetGates, NotSelected, Selection};
 use kr_describe::profile::{
     Admission, DownloadLedger, DownloadPolicy, Gate, ModelProfile, ProfileDocument, ProfileTrust,
@@ -25,6 +27,18 @@ use kr_describe::profile::{
 use kr_protocol::scalars::TimestampMs;
 
 use support::{MAC, built_in, default_profile, environment_id, native};
+
+/// Signs a profile document with a test key, which is the only way to get a [`ModelProfile`].
+fn sign(document: &str, keys: &AuthorisationKeyPair) -> SignedProfile {
+    let document = ProfileDocument::new(document.as_bytes().to_vec());
+    let transcript = document.transcript().expect("a transcript");
+    let signature = kr_crypto::sign::sign(keys, &transcript).expect("a signature");
+    SignedProfile {
+        document,
+        key: *keys.public(),
+        signature,
+    }
+}
 
 /// KR-REQ-22.02: a title and a status are available with no model, no network and no store.
 #[test]
@@ -128,10 +142,24 @@ fn a_logical_group_grants_no_transcript_access_and_no_shared_mapping() {
     let profile = default_profile();
     let mut mapping = ModelMapping::new();
     mapping
-        .map(&first, None, &profile, MAC, TimestampMs::new(1))
+        .map(
+            &first,
+            None,
+            &profile,
+            &MetGates::default(),
+            MAC,
+            TimestampMs::new(1),
+        )
         .expect("the first environment maps");
     mapping
-        .map(&second, None, &profile, MAC, TimestampMs::new(2))
+        .map(
+            &second,
+            None,
+            &profile,
+            &MetGates::default(),
+            MAC,
+            TimestampMs::new(2),
+        )
         .expect("the second environment maps");
     assert_eq!(mapping.mapped_environments(), 2);
     assert!(mapping.accepts_result(first.id(), profile.profile_id(), profile.revision()));
@@ -242,8 +270,9 @@ fn pressure_a_timeout_and_bad_output_never_select_a_larger_model() {
 #[test]
 fn every_shipped_profile_carries_the_identities_and_offloads_no_layer() {
     for profile in built_in().profiles() {
-        assert!(!profile.model().model_revision.is_empty());
-        assert!(!profile.model().source_revision.is_empty());
+        assert!(!profile.model().revision.is_empty());
+        assert!(profile.conversion().converter_revision.is_none());
+        assert!(profile.tokenizer().embedded_in_asset);
         assert!(!profile.conversion().revision.is_empty());
         assert_eq!(profile.runtime().binding, "llama-cpp-2");
         assert_eq!(profile.runtime().binding_version, "0.1.156");
@@ -271,21 +300,14 @@ fn every_shipped_profile_carries_the_identities_and_offloads_no_layer() {
     }
 }
 
-/// KR-REQ-22.08: a profile from outside the binary is used only when its signature verifies.
+/// KR-REQ-22.08: a profile is used only when a key this host accepts signed the exact document.
 #[test]
-fn a_profile_from_outside_the_binary_needs_a_signature_this_host_accepts() {
+fn a_profile_is_used_only_when_a_key_this_host_accepts_signed_it() {
     let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair");
     let other = kr_crypto::keys::AuthorisationKeyPair::generate().expect("another keypair");
-    let document = ProfileDocument::new(catalogue::DEFAULT_PROFILE_DOCUMENT.as_bytes().to_vec());
-    let transcript = document.transcript().expect("a transcript");
-    let signature = kr_crypto::sign::sign(&keys, &transcript).expect("a signature");
     let trust = ProfileTrust::new(vec![*keys.public()]);
+    let signed = sign(catalogue::DEFAULT_PROFILE_DOCUMENT, &keys);
 
-    let signed = SignedProfile {
-        document: document.clone(),
-        key: *keys.public(),
-        signature,
-    };
     let verified = trust.verify(&signed).expect("a signed profile verifies");
     assert_eq!(verified.profile_id(), "minicpm5-2b-q4-k-m");
 
@@ -297,19 +319,29 @@ fn a_profile_from_outside_the_binary_needs_a_signature_this_host_accepts() {
     ));
 
     // One byte of the document changed, with the same signature.
-    let mut bytes = catalogue::DEFAULT_PROFILE_DOCUMENT.as_bytes().to_vec();
-    let position = bytes
-        .windows(2)
-        .position(|pair| pair == b"20")
-        .expect("the document names a revision");
-    bytes[position] = b'3';
     let tampered = SignedProfile {
-        document: ProfileDocument::new(bytes),
-        key: signed.key,
-        signature,
+        document: ProfileDocument::new(
+            catalogue::DEFAULT_PROFILE_DOCUMENT
+                .replace(
+                    "\"parameters_billions\": 2.0",
+                    "\"parameters_billions\": 3.0",
+                )
+                .into_bytes(),
+        ),
+        ..signed.clone()
     };
     assert!(matches!(
         trust.verify(&tampered),
+        Err(DescribeError::ProfileSignatureInvalid)
+    ));
+
+    // A signature made over a different document, presented for this one.
+    let swapped = SignedProfile {
+        signature: sign(catalogue::CANDIDATE_PROFILE_DOCUMENT, &keys).signature,
+        ..signed.clone()
+    };
+    assert!(matches!(
+        trust.verify(&swapped),
         Err(DescribeError::ProfileSignatureInvalid)
     ));
 
@@ -319,32 +351,63 @@ fn a_profile_from_outside_the_binary_needs_a_signature_this_host_accepts() {
         ProfileTrust::default().verify(&signed),
         Err(DescribeError::ProfileUntrustedKey)
     ));
+
+    // And the profiles this build ships verify against this build's own anchor.
+    let builtin = builtin_trust().expect("this build has an anchor");
+    assert_eq!(builtin.len(), 1);
+    assert!(built_in().profiles().len() == 2);
 }
 
-/// KR-REQ-22.08: a profile that states something this product will not run is refused.
+/// KR-REQ-22.08: a signed document that states something this product will not run is refused.
+///
+/// Every case goes through the signature, because that is the only door: a document is checked
+/// after its signature verifies, so a profile refused here is one a correctly signed document
+/// could have carried.
 #[test]
-fn a_profile_that_offloads_a_layer_or_carries_a_component_is_refused() {
+fn a_signed_profile_that_states_the_wrong_thing_is_still_refused() {
+    let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair");
+    let trust = ProfileTrust::new(vec![*keys.public()]);
     let refuse = |find: &str, replace: &str| {
         let document = catalogue::DEFAULT_PROFILE_DOCUMENT.replace(find, replace);
-        ModelProfile::parse(document.as_bytes())
+        assert_ne!(
+            document,
+            catalogue::DEFAULT_PROFILE_DOCUMENT,
+            "the case changed nothing"
+        );
+        trust.verify(&sign(&document, &keys))
     };
-    assert!(matches!(
-        refuse("\"gpu_layers\": 0", "\"gpu_layers\": 32"),
-        Err(DescribeError::ProfileRefused { .. })
-    ));
-    assert!(matches!(
-        refuse("\"tools\": false", "\"tools\": true"),
-        Err(DescribeError::ProfileRefused { .. })
-    ));
-    assert!(matches!(
-        refuse("\"vision\": false", "\"vision\": true"),
-        Err(DescribeError::ProfileRefused { .. })
-    ));
-    assert!(matches!(
-        refuse("\"mode\": \"disabled\"", "\"mode\": \"thinking\""),
-        Err(DescribeError::ProfileRefused { .. })
-    ));
-    // A field this build does not know is a profile it cannot claim to understand.
+    for (find, replace) in [
+        ("\"gpu_layers\": 0", "\"gpu_layers\": 32"),
+        ("\"tools\": false", "\"tools\": true"),
+        ("\"vision\": false", "\"vision\": true"),
+        ("\"mode\": \"disabled\"", "\"mode\": \"thinking\""),
+        ("\"temperature\": 0.0", "\"temperature\": -1.0"),
+        ("\"top_p\": 1.0", "\"top_p\": 4.0"),
+        ("\"top_k\": 1", "\"top_k\": 0"),
+        ("\"context_tokens\": 4096", "\"context_tokens\": 0"),
+        ("\"max_output_tokens\": 128", "\"max_output_tokens\": 8192"),
+        ("\"cpu_threads\": 4", "\"cpu_threads\": 0"),
+        (
+            "\"revision\": \"12a3808a956f869c767195e9266b59c4d21d92e2\"",
+            "\"revision\": \"\"",
+        ),
+        ("\"role\": \"weights\"", "\"role\": \"tokenizer\""),
+        (
+            "\"tokenizer_sha256\": \"3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81\"",
+            "\"tokenizer_sha256\": \"NOTAHASH\"",
+        ),
+        ("\"gate\": \"default\"", "\"gate\": \"candidate\""),
+    ] {
+        assert!(
+            matches!(
+                refuse(find, replace),
+                Err(DescribeError::ProfileRefused { .. })
+            ),
+            "{find} -> {replace} was not refused"
+        );
+    }
+
+    // A field this build does not know is a document it cannot claim to understand.
     assert!(matches!(
         refuse(
             "\"gate\": \"default\"",
@@ -352,12 +415,36 @@ fn a_profile_that_offloads_a_layer_or_carries_a_component_is_refused() {
         ),
         Err(DescribeError::ProfileMalformed { .. })
     ));
+
+    // A candidate that declares fewer than all three gates is refused too.
+    let fewer = catalogue::CANDIDATE_PROFILE_DOCUMENT.replace(
+        "\"platform\",\n    \"resource\",\n    \"quality\"",
+        "\"platform\"",
+    );
+    assert!(matches!(
+        trust.verify(&sign(&fewer, &keys)),
+        Err(DescribeError::ProfileRefused { .. })
+    ));
 }
 
-/// KR-REQ-22.08: two profiles never share a tokenizer or a chat template.
+/// KR-REQ-22.08: each model names its own tokenizer and chat template rather than borrowing one.
 #[test]
-fn two_models_never_share_a_tokenizer_or_a_chat_template() {
+fn each_model_names_its_own_tokenizer_and_chat_template() {
     let catalogue = built_in();
+    for profile in catalogue.profiles() {
+        assert_eq!(
+            profile.tokenizer().source_repository,
+            profile.model().repository,
+            "a profile's tokenizer comes from its own model"
+        );
+        assert_eq!(
+            profile.tokenizer().source_revision,
+            profile.model().revision
+        );
+        // The digests are provenance; what inference reads is embedded in the asset, and the asset
+        // digest is what pins it.
+        assert!(profile.tokenizer().embedded_in_asset);
+    }
     let default = catalogue.default_profile();
     let candidate = catalogue
         .profile("smollm3-3b-q4-k-m")
@@ -366,20 +453,6 @@ fn two_models_never_share_a_tokenizer_or_a_chat_template() {
         default.tokenizer().tokenizer_sha256,
         candidate.tokenizer().tokenizer_sha256
     );
-    assert_ne!(
-        default.tokenizer().chat_template_sha256,
-        candidate.tokenizer().chat_template_sha256
-    );
-
-    let shared = catalogue::CANDIDATE_PROFILE_DOCUMENT.replace(
-        &candidate.tokenizer().tokenizer_sha256,
-        &default.tokenizer().tokenizer_sha256,
-    );
-    let sharing = ModelProfile::parse(shared.as_bytes()).expect("it still parses");
-    assert!(matches!(
-        Catalogue::new(vec![default.clone(), sharing]),
-        Err(DescribeError::CatalogueRefused { .. })
-    ));
 }
 
 /// KR-REQ-22.09: one download per selected profile, under a disclosed policy, and never both.
@@ -399,13 +472,29 @@ fn one_download_per_selected_profile_and_never_the_other_one() {
         ledger.admit(selected, selected).expect("the first fetch"),
         Admission::Download(_)
     ));
+    // Nothing is held while the fetch is running, so a second request does not start another and
+    // does not claim the assets are there.
+    assert!(ledger.is_running(selected.profile_id(), selected.revision()));
+    assert!(!ledger.holds(selected.profile_id(), selected.revision()));
     assert_eq!(
         ledger
             .admit(selected, selected)
             .expect("the second request"),
+        Admission::AlreadyRunning
+    );
+    assert_eq!(ledger.downloads(), 0);
+
+    ledger.note_verified(selected);
+    assert!(ledger.holds(selected.profile_id(), selected.revision()));
+    assert_eq!(
+        ledger
+            .admit(selected, selected)
+            .expect("a request afterwards"),
         Admission::AlreadyHeld
     );
     assert_eq!(ledger.downloads(), 1);
+
+    // A profile this environment did not select is refused outright.
     assert!(matches!(
         ledger.admit(selected, candidate),
         Err(DescribeError::DownloadNotSelected { .. })
@@ -413,7 +502,30 @@ fn one_download_per_selected_profile_and_never_the_other_one() {
     assert_eq!(ledger.downloads(), 1);
 }
 
-/// KR-REQ-22.09: an asset that is not the recorded one is refused by size and by digest.
+/// KR-REQ-22.09: a cancelled or failed fetch leaves nothing held, so the next request fetches.
+#[test]
+fn a_cancelled_or_failed_fetch_leaves_nothing_held() {
+    let catalogue = built_in();
+    let selected = catalogue.default_profile();
+    let mut ledger = DownloadLedger::new();
+    ledger.admit(selected, selected).expect("a fetch");
+    ledger.note_failed(selected);
+    assert!(!ledger.holds(selected.profile_id(), selected.revision()));
+    assert!(!ledger.is_running(selected.profile_id(), selected.revision()));
+    assert_eq!(ledger.downloads(), 0);
+    assert!(matches!(
+        ledger.admit(selected, selected).expect("the next fetch"),
+        Admission::Download(_)
+    ));
+
+    // A verified fetch that is later found wrong is released the same way.
+    ledger.note_verified(selected);
+    assert!(ledger.holds(selected.profile_id(), selected.revision()));
+    ledger.note_failed(selected);
+    assert!(!ledger.holds(selected.profile_id(), selected.revision()));
+}
+
+/// KR-REQ-22.09: an asset that is not the recorded file is refused by size and by digest.
 #[test]
 fn an_asset_that_is_not_the_recorded_file_is_refused() {
     let directory = tempfile::tempdir().expect("a temporary directory");
@@ -425,23 +537,44 @@ fn an_asset_that_is_not_the_recorded_file_is_refused() {
         asset.verify_file(&path),
         Err(DescribeError::AssetSizeMismatch { .. })
     ));
-
-    // A file of the right size and the wrong contents is refused by the digest.
-    let document = catalogue::DEFAULT_PROFILE_DOCUMENT
-        .replace(&asset.bytes.to_string(), "28")
-        .replace(
-            &format!("\"weights_bytes\": {}", asset.bytes),
-            "\"weights_bytes\": 28",
-        );
-    let small = ModelProfile::parse(document.as_bytes()).expect("a profile with a small asset");
-    assert!(matches!(
-        small.assets()[0].verify_file(&path),
-        Err(DescribeError::AssetDigestMismatch { .. })
-    ));
-
     assert!(matches!(
         asset.verify_file(&directory.path().join("absent.gguf")),
         Err(DescribeError::AssetUnreadable { .. })
+    ));
+
+    // A file larger than one digest block, so the streaming path is the one under test. The
+    // profile is rewritten to describe this file exactly, and then one byte of it is changed.
+    let body = vec![0x5a_u8; (1 << 20) + 4096];
+    let digest = {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&body);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair");
+    let trust = ProfileTrust::new(vec![*keys.public()]);
+    let document = catalogue::DEFAULT_PROFILE_DOCUMENT
+        .replace(&asset.sha256, &digest)
+        .replace(&asset.bytes.to_string(), &body.len().to_string());
+    let rewritten = trust
+        .verify(&sign(&document, &keys))
+        .expect("a profile over the file this test wrote");
+    let big = directory.path().join(&rewritten.assets()[0].file_name);
+    std::fs::write(&big, &body).expect("a large file");
+    rewritten.assets()[0]
+        .verify_file(&big)
+        .expect("a file that matches across several blocks verifies");
+
+    let mut changed = body.clone();
+    changed[(1 << 20) + 1] = 0x5b;
+    std::fs::write(&big, &changed).expect("a changed file");
+    assert!(matches!(
+        rewritten.assets()[0].verify_file(&big),
+        Err(DescribeError::AssetDigestMismatch { .. })
     ));
 }
 
@@ -457,10 +590,24 @@ fn a_replaced_model_is_unloaded_before_another_is_mapped() {
     let environment = native(1);
     let mut mapping = ModelMapping::new();
     mapping
-        .map(&environment, None, &first, MAC, TimestampMs::new(1))
+        .map(
+            &environment,
+            None,
+            &first,
+            &MetGates::all(),
+            MAC,
+            TimestampMs::new(1),
+        )
         .expect("the first mapping");
     let remapped = mapping
-        .map(&environment, None, &second, MAC, TimestampMs::new(2))
+        .map(
+            &environment,
+            None,
+            &second,
+            &MetGates::all(),
+            MAC,
+            TimestampMs::new(2),
+        )
         .expect("the second mapping");
     assert_eq!(
         remapped.unloaded.map(|mapped| mapped.profile_id),
@@ -510,5 +657,65 @@ fn an_owner_may_tighten_the_ceiling_and_never_loosen_it() {
             .with_owner_ceiling(16 * GIB)
             .process_memory_ceiling_bytes,
         4 * GIB
+    );
+}
+
+/// KR-REQ-22.06: the default is chosen whatever order the catalogue was built from.
+#[test]
+fn the_default_is_chosen_whatever_order_the_catalogue_was_built_from() {
+    let catalogue = built_in();
+    let default = catalogue.default_profile().clone();
+    let candidate = catalogue
+        .profile("smollm3-3b-q4-k-m")
+        .expect("the candidate")
+        .clone();
+    let reversed = Catalogue::new(vec![candidate, default]).expect("a catalogue either way");
+    assert_eq!(
+        reversed.default_profile().profile_id(),
+        "minicpm5-2b-q4-k-m"
+    );
+    assert_eq!(
+        reversed
+            .select(MAC, &MetGates::all())
+            .profile()
+            .map(ModelProfile::profile_id),
+        Some("minicpm5-2b-q4-k-m"),
+        "every gate met still selects the default"
+    );
+}
+
+/// KR-REQ-22.07: a candidate cannot be mapped without the gates it declares, however it was
+/// obtained.
+#[test]
+fn a_candidate_cannot_be_mapped_without_the_gates_it_declares() {
+    let catalogue = built_in();
+    let candidate = catalogue
+        .profile("smollm3-3b-q4-k-m")
+        .expect("the candidate");
+    let environment = native(1);
+    let mut mapping = ModelMapping::new();
+    assert!(matches!(
+        mapping.map(
+            &environment,
+            None,
+            candidate,
+            &MetGates::default(),
+            MAC,
+            TimestampMs::new(1)
+        ),
+        Err(DescribeError::GatesOutstanding { .. })
+    ));
+    assert_eq!(mapping.mapped_environments(), 0);
+    assert!(
+        mapping
+            .map(
+                &environment,
+                None,
+                candidate,
+                &MetGates::all(),
+                MAC,
+                TimestampMs::new(2)
+            )
+            .is_ok()
     );
 }

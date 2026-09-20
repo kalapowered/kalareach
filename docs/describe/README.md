@@ -33,8 +33,10 @@ One shared inference process and one mapped model per execution environment. Nev
 - **The default profile** is `openbmb/MiniCPM5-2B`, quantised to Q4\_K\_M, about 1.5 GiB on disk and
   about 2 GiB resident.
 - **`HuggingFaceTB/SmolLM3-3B`** ships as a *candidate*, behind platform, resource and quality
-  gates. It is not a fallback: memory pressure, a timeout and bad output never cause a switch to a
-  larger model. The fallback is always deterministic metadata.
+  gates - all three, and a candidate profile that declared fewer is refused. It is not a fallback:
+  memory pressure, a timeout and bad output never cause a switch to a larger model. The fallback is
+  always deterministic metadata. The gates are checked again where a profile is mapped, so a
+  candidate obtained some other way still cannot run without them.
 - **WSL** reaches a native-host broker only after somebody explicitly chooses to let local data
   cross. Without that choice a distribution runs no model, and shows deterministic titles.
 - **Mobile** never runs a model to label a host session.
@@ -44,18 +46,34 @@ One shared inference process and one mapped model per execution environment. Nev
 ### The profile
 
 A model profile is not configuration. It is the statement a qualification was made against, and it
-records the exact model and source revisions, the conversion the assets came from, the runtime, the
-verified size and SHA-256 of every asset, the tokenizer and chat-template digests, the sampler
-values, that reasoning is off, that there is no tools or vision component, zero GPU layers and the
-targets it was qualified on.
+records the source model's repository and commit, the repository and commit the converted asset was
+published at, the runtime, the verified size and SHA-256 of every asset, the tokenizer and
+chat-template digests, the sampler values, that reasoning is off, that there is no tools or vision
+component, zero GPU layers and the targets it declares as compatible.
 
-Two profiles never share a tokenizer or chat template; a catalogue that tried would be refused.
+Two things the profile is careful not to claim. The `converter_revision` is empty for both shipped
+profiles, because neither publisher states which tool produced their GGUF; what binds the asset is
+its digest, not a converter this product cannot see. And the tokenizer and chat-template digests are
+the *source* files' - what inference reads is the copy embedded in the asset, which the asset digest
+pins.
 
-Assets are downloaded once, for the selected profile only, under a policy that states the exact
-byte count before anything is fetched. Every file is verified against the recorded size and digest
-before it is loaded, and a mismatch stops the load rather than producing a warning. Replacing a
-mapped model unloads the old one first, and a result that comes back from the old profile revision
-is refused rather than shown.
+There is one way to get a profile: a document plus a detached signature from a key the host
+accepts. The profiles shipped here are compiled in beside their signatures and the public half of
+the key that made them, and they are verified before use like any other. Against a document from
+outside the binary that is worth what a signature is normally worth. Against the built-in documents
+it is worth less, and it is honest to say so: the anchor ships beside them, so replacing one means
+rebuilding, and a rebuild can carry a new anchor. What it buys is one code path instead of two.
+
+The profile-signing key is per build: it is generated, used, and not kept. Changing a shipped
+profile means generating a key, signing both documents again and committing the anchor with them,
+in one change.
+
+Assets are downloaded once, for the selected profile only, under a policy that states the exact byte
+count before anything is fetched. A fetch is *admitted*; only a fetch whose files have been verified
+against the recorded size and digest is *held*, so a download that was cancelled or produced the
+wrong bytes leaves nothing behind and the next request fetches again. Replacing a mapped model
+unloads the old one first, and a result that comes back from the old profile revision is refused
+rather than shown.
 
 ## The budgets
 
@@ -89,6 +107,11 @@ state is `resource_paused`, the reason is named, and the deterministic titles ar
 - When pressure clears, the host resumes on the next evaluation. Nothing is restarted: the queue
   keeps its positions, the sessions keep their titles, and no worker is touched.
 - A host that cannot read a memory signal refuses to load rather than assuming the reserve holds.
+
+Inference asks for zero GPU layers, and that is what makes it CPU-only: no layer is offloaded to
+any backend. On Apple silicon the pinned binding compiles the Metal backend in whether or not it is
+wanted, because its manifest enables that feature for the target rather than behind an option, so
+the guarantee is the zero layers rather than the absence of the backend from the binary.
 
 Inference runs at the background scheduling class each platform offers — `SCHED_BATCH` on Linux,
 the lowest ordinary thread priority elsewhere — and the report says which mechanism was applied. No

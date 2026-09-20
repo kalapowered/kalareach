@@ -4,13 +4,13 @@
   "gate": "default",
   "model": {
     "repository": "openbmb/MiniCPM5-2B",
-    "model_revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
-    "source_revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
+    "revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
     "parameters_billions": 2.0
   },
   "conversion": {
     "repository": "openbmb/MiniCPM5-2B-GGUF",
     "revision": "2079a22f3beaa4e306449978533478fe0522f4b3",
+    "converter_revision": null,
     "quantisation": "Q4_K_M",
     "format": "gguf"
   },
@@ -33,7 +33,8 @@
     "source_revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
     "tokenizer_sha256": "3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81",
     "tokenizer_config_sha256": "e9b1064649e771d7a8e15637c68b2d2749724877ba3648bd74a4ece31c26303b",
-    "chat_template_sha256": "cc945752db555d60949b16989df4ccfeb52a313d6b4b5c5229dd786e2e9fcf1c"
+    "chat_template_sha256": "cc945752db555d60949b16989df4ccfeb52a313d6b4b5c5229dd786e2e9fcf1c",
+    "embedded_in_asset": true
   },
   "sampler": {
     "temperature": 0.0,
