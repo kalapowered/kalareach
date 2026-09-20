@@ -3659,6 +3659,7 @@ export interface ProtocolVersion {
  * The helper's answer, once it has reached what the invoker asked for.
  */
 export interface BridgeHelloAck {
+  action_window: ActionWindow1
   boot_identity: BootIdentity
   /**
    * The connection identity that host assigned the helper.
@@ -3681,6 +3682,31 @@ export interface BridgeHelloAck {
    * Which host process the helper reached.
    */
   role: 'controller' | 'worker' | 'rendezvous'
+}
+/**
+ * The first action window of this connection, issued by the destination.
+ */
+export interface ActionWindow1 {
+  /**
+   * The window identity a mutation names.
+   */
+  action_window_id: string
+  /**
+   * The host boot the window is bound to. A restart invalidates new admission through it.
+   */
+  boot_epoch: string
+  /**
+   * The connection the window is bound to.
+   */
+  connection_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`].
+   */
+  valid_for_ms: string
 }
 /**
  * The boot the destination is running.
@@ -3772,7 +3798,7 @@ export interface ProtocolVersion2 {
  * The first frame the host sends back.
  */
 export interface LocalHelloAck {
-  action_window: ActionWindow1
+  action_window: ActionWindow2
   boot_identity: BootIdentity1
   /**
    * The capabilities both sides will use.
@@ -3802,7 +3828,7 @@ export interface LocalHelloAck {
  * without being asked. A client schedules its own expectations from the duration and never
  * computes an expiry the host will honour.
  */
-export interface ActionWindow1 {
+export interface ActionWindow2 {
   /**
    * The window identity a mutation names.
    */
@@ -6282,7 +6308,7 @@ export interface SecretReference {
  * What the host returns once both proofs verify.
  */
 export interface ConnectAccepted {
-  action_window: ActionWindow2
+  action_window: ActionWindow3
   host_proof: ConnectProof
 }
 /**
@@ -6296,7 +6322,7 @@ export interface ConnectAccepted {
  * its own suspend-aware continuous clock. `issued_at_ms` is the host's stamp, for display and
  * diagnosis only.
  */
-export interface ActionWindow2 {
+export interface ActionWindow3 {
   /**
    * The window identity a mutation names.
    */

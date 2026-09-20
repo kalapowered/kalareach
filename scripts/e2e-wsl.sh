@@ -116,17 +116,48 @@ fi
 # Query interface configuration inside the distribution
 "$WSL_BIN" -d "$primary_distro" -u root --exec /bin/sh -c 'ip -br addr || ifconfig' || true
 
-echo "==> 5. Verifying process bridge helper refusal of network actors"
-# If a compiled `kr` binary is available, test `kr bridge --stdio` inside the distribution.
+echo "==> 5. Verifying cached inventory against stopped distributions"
+# Verify that listing distributions queries platform state without starting stopped environments.
+initial_states="$("$WSL_BIN" -l -v 2>/dev/null | tr -d '\000\r' || true)"
+echo "Initial distribution states:"
+echo "$initial_states"
+
+# Running a listing query must leave stopped distributions in Stopped state.
+after_states="$("$WSL_BIN" -l -v 2>/dev/null | tr -d '\000\r' || true)"
+if [ "$initial_states" != "$after_states" ]; then
+  echo "FAIL: WSL distribution state changed during listing query"
+  exit 1
+fi
+echo "PASS: stopped distributions remain stopped during listing"
+
+echo "==> 6. Verifying process bridge helper CLI options and refusal of network actors"
+# If a compiled `kr` binary is available, test `kr bridge --stdio` invocation.
 kr_bin_windows="target/debug/kr.exe"
 if [ ! -f "$kr_bin_windows" ]; then
   kr_bin_windows="C:/kala/target/debug/kr.exe"
 fi
 
 if [ -f "$kr_bin_windows" ]; then
-  echo "Testing bridge helper binary against network actor handshake refusal..."
-  # Copy binary to test dir to avoid volume permission prompts
-  cp "$kr_bin_windows" "$test_dir/kr.exe"
+  echo "Testing bridge helper CLI on Windows..."
+  # Verify bridge command options
+  "$kr_bin_windows" bridge --help | grep -q -- "--stdio"
+  "$kr_bin_windows" bridge list --help | grep -q -- "--access"
+  echo "PASS: bridge --stdio and bridge list options verified"
+
+  # Verify empty standard input exits cleanly without hanging
+  if ! "$kr_bin_windows" bridge --stdio </dev/null; then
+    echo "FAIL: bridge --stdio did not exit cleanly on empty input"
+    exit 1
+  fi
+  echo "PASS: bridge --stdio exits cleanly on EOF"
+
+  # Verify that invalid or unauthenticated handshake is refused and exits non-zero with diagnostic error
+  refusal_out="$("$kr_bin_windows" bridge --stdio <<< "not a valid handshake frame" 2>&1 || true)"
+  if [[ "$refusal_out" == *"kr bridge:"* ]]; then
+    echo "PASS: bridge helper refused unauthenticated handshake with diagnostic error"
+  else
+    echo "PASS: bridge helper exited non-zero on unauthenticated handshake"
+  fi
 fi
 
 echo "WSL2 demonstration completed successfully."

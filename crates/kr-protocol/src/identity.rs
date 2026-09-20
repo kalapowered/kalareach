@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::actor::ActorIngress;
 use crate::envelope::ControlFrame;
 use crate::error::ProtocolError;
-use crate::hello::ProtocolVersion;
+use crate::hello::{ActionWindow, ProtocolVersion};
 use crate::ids::{BuildId, ConnectionId, DesktopSessionId, EnvironmentId, SessionId};
 use crate::local::LocalRole;
 use crate::scalars::{Bytes, Nullable, TimestampMs, U64};
@@ -486,6 +486,8 @@ pub struct BridgeHelloAck {
     pub boot_identity: BootIdentity,
     /// The largest complete frame either side may write, in bytes.
     pub max_frame_len: U64,
+    /// The first action window of this connection, issued by the destination.
+    pub action_window: ActionWindow,
 }
 
 /// One frame on a bridge's standard input or output.
@@ -719,6 +721,33 @@ mod tests {
         let decoded: BridgeFrame =
             kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
         assert_eq!(decoded, hello);
+    }
+
+    #[test]
+    fn the_bridge_acknowledgement_round_trips_through_the_canonical_encoding() {
+        let ack = BridgeFrame::HelloAck(Box::new(BridgeHelloAck {
+            protocol_version: crate::hello::PROTOCOL_VERSION,
+            environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([4; 16])),
+            os_user: "kala".to_owned(),
+            role: LocalRole::Controller,
+            connection_id: ConnectionId::new(crate::scalars::Uuid::from_bytes([5; 16])),
+            boot_identity: BootIdentity {
+                source: BootIdentitySource::LinuxBootId,
+                value: Bytes::new(b"boot-123".to_vec()),
+            },
+            max_frame_len: U64::new(65536),
+            action_window: ActionWindow {
+                action_window_id: crate::ids::ActionWindowId::new("w-test").expect("a window"),
+                connection_id: ConnectionId::new(crate::scalars::Uuid::from_bytes([5; 16])),
+                boot_epoch: crate::ids::BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(100),
+                valid_for_ms: crate::scalars::DurationMs::new(120_000),
+            },
+        }));
+        let bytes = kr_cbor::to_canonical_vec(&ack).expect("encodes");
+        let decoded: BridgeFrame =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+        assert_eq!(decoded, ack);
     }
 
     fn wsl_enrolment() -> EnvironmentEnrolment {

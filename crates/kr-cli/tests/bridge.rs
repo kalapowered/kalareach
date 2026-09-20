@@ -15,12 +15,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use kr_protocol::actor::ActorIngress;
-use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
+use kr_protocol::envelope::{
+    ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{FrameCodec, StreamKind};
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ProtocolVersion, ReceiveLimits};
 use kr_protocol::identity::{BridgeFrame, BridgeHello, BridgeTarget};
-use kr_protocol::ids::{BuildId, EnvironmentId, RequestId};
+use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, RequestId};
 use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64, Uuid};
@@ -202,17 +204,32 @@ async fn stub_controller(
             return;
         }
         while let Ok(frame) = reader.read_message::<ControlFrame>().await {
-            if let ControlFrame::Request(request) = frame {
-                let response = ControlFrame::Response(Response {
-                    request_id: request.request_id,
-                    outcome: match answer.clone() {
-                        Ok(value) => Outcome::Ok(value),
-                        Err(error) => Outcome::Error(error),
-                    },
-                });
-                if writer.write_message(&response).await.is_err() {
-                    return;
+            match frame {
+                ControlFrame::Request(request) => {
+                    let response = ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: match answer.clone() {
+                            Ok(value) => Outcome::Ok(value),
+                            Err(error) => Outcome::Error(error),
+                        },
+                    });
+                    if writer.write_message(&response).await.is_err() {
+                        return;
+                    }
                 }
+                ControlFrame::Mutation(mutation) => {
+                    let response = ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: match answer.clone() {
+                            Ok(value) => Outcome::Ok(value),
+                            Err(error) => Outcome::Error(error),
+                        },
+                    });
+                    if writer.write_message(&response).await.is_err() {
+                        return;
+                    }
+                }
+                _ => {}
             }
         }
     })
@@ -402,4 +419,83 @@ fn the_command_asks_for_stdio_by_the_name_the_specification_uses() {
         .expect("the command runs");
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--stdio"), "{help}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locally_authenticated_invocation_carries_a_mutation_quoting_the_bridged_action_window() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let environment = tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let served = ParamsValue::from_typed(&kr_protocol::hostinfo::EnvironmentListResult {
+        environments: Vec::new(),
+    })
+    .expect("the answer encodes");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(served.clone())).await;
+
+    let mut helper = Helper::start(&tree);
+    helper.write(&hello(ActorIngress::LocalIpc));
+    let window_id = match helper.read() {
+        BridgeFrame::HelloAck(acknowledgement) => {
+            assert_eq!(acknowledgement.environment_id, tree.environment_id());
+            assert_eq!(acknowledgement.role, LocalRole::Controller);
+            acknowledgement.action_window.action_window_id
+        }
+        other => panic!("expected an acknowledgement, got {other:?}"),
+    };
+
+    helper.write(&BridgeFrame::Control(Box::new(ControlFrame::Mutation(
+        Box::new(MutationRequest {
+            request_id: RequestId::new(42),
+            method: Method::EnvironmentEnrol.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(tree.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: window_id,
+            requested_ttl_ms: DurationMs::new(10_000),
+            params: ParamsValue::empty(),
+        }),
+    ))));
+    match helper.read() {
+        BridgeFrame::Control(carried) => match *carried {
+            ControlFrame::Response(response) => {
+                assert_eq!(response.request_id, RequestId::new(42));
+                assert_eq!(response.outcome, Outcome::Ok(served));
+            }
+            other => panic!("expected a response, got {other:?}"),
+        },
+        other => panic!("expected a carried frame, got {other:?}"),
+    }
+    let (code, _) = helper.finish();
+    assert_eq!(code, Some(0));
+    stub.abort();
+}
+
+#[test]
+fn a_helper_exits_without_hanging_when_input_remains_open_after_refusal() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let mut helper = Helper::start(&tree);
+    // Write a refusal-triggering frame (network ingress).
+    helper.write(&hello(ActorIngress::PairedDevice));
+    match helper.read() {
+        BridgeFrame::Refused(error) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    // Note: helper.input is NOT dropped yet. The helper process must terminate without
+    // hanging even though the input pipe remains open.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut child = helper.child;
+    let waiter = std::thread::spawn(move || {
+        let status = child.wait().expect("child finishes");
+        let _ = tx.send(status);
+    });
+    // Wait at most 2 seconds; a hung helper would block until test timeout.
+    let status = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the helper exited promptly without waiting for stdin to close");
+    assert!(!status.success());
+    let _ = waiter.join();
 }

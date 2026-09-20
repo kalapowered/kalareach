@@ -131,17 +131,26 @@ pub async fn serve(
     let reading = std::thread::spawn(move || read_frames(input, &to_relay, &wake));
 
     let outcome = relay(&mut incoming, &mut woken, output, environment).await;
-    // The reading thread holds the input stream, so it is joined before this function returns. Both
-    // receivers go first: a thread that is part way through handing a frame over waits on one of
-    // them, and a join before they are dropped would wait for it for ever.
+    // The reading thread holds the input stream. Drop both receivers first: a thread that is
+    // handing a frame over waits on one of them, and dropping them unblocks it.
     drop(incoming);
     drop(woken);
-    let stream = match reading.join() {
-        Ok(Ok(()) | Err(PipeError::Closed)) => Ok(()),
-        Ok(Err(error)) => Err(transport(&error)),
-        Err(_) => Err(CliError::Other(
-            "the bridge's reading thread stopped unexpectedly".to_owned(),
-        )),
+    // If the reading thread has already finished (or finishes promptly on EOF), collect its status.
+    // If standard input remains open, do not wait indefinitely: dropped receivers mean nothing more
+    // will be relayed, and an indefinite join would leave this helper stuck in a blocking read.
+    if !reading.is_finished() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let stream = if reading.is_finished() {
+        match reading.join() {
+            Ok(Ok(()) | Err(PipeError::Closed)) => Ok(()),
+            Ok(Err(error)) => Err(transport(&error)),
+            Err(_) => Err(CliError::Other(
+                "the bridge's reading thread stopped unexpectedly".to_owned(),
+            )),
+        }
+    } else {
+        Ok(())
     };
     match (outcome, stream) {
         (Err(error), _) => Err(error),
@@ -225,6 +234,7 @@ async fn relay(
             connection_id: acknowledgement.connection_id,
             boot_identity: acknowledgement.boot_identity.clone(),
             max_frame_len: U64::new(pipe::max_frame_len() as u64),
+            action_window: acknowledgement.action_window,
         })),
     )
     .map_err(|error| transport(&error))?;

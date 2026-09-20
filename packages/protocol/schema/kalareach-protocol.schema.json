@@ -2546,6 +2546,10 @@
       "additionalProperties": false,
       "description": "The helper's answer, once it has reached what the invoker asked for.",
       "properties": {
+        "action_window": {
+          "$ref": "#/$defs/ActionWindow",
+          "description": "The first action window of this connection, issued by the destination."
+        },
         "boot_identity": {
           "$ref": "#/$defs/BootIdentity",
           "description": "The boot the destination is running."
@@ -2582,7 +2586,8 @@
         "role",
         "connection_id",
         "boot_identity",
-        "max_frame_len"
+        "max_frame_len",
+        "action_window"
       ],
       "type": "object"
     },
