@@ -151,7 +151,7 @@ mod tests {
         ExternalDestination, Idempotency,
     };
     use crate::journal::{
-        DeliveryRecord, DeliveryState, EventKey, OUTBOX_CONSUMER, TakenEvent, Transition,
+        DeliveryRecord, DeliveryState, EventKey, EventSource, TakenEvent, Transition,
     };
     use kr_protocol::ids::NotificationId;
     use kr_protocol::scalars::{TimestampMs, Uuid};
@@ -161,10 +161,14 @@ mod tests {
         Uuid::from_bytes([byte; 16])
     }
 
+    fn consumer() -> String {
+        EventSource::WorkerOutbox.consumer("session-1")
+    }
+
     fn journal_with_work() -> DeliveryJournal {
         let mut journal = DeliveryJournal::in_memory().expect("a journal");
         journal
-            .register_consumer(OUTBOX_CONSUMER, 1)
+            .register_consumer(&consumer(), 1)
             .expect("registration");
         journal
             .configure_destination(&DestinationRecord {
@@ -185,12 +189,13 @@ mod tests {
         for byte in 1..=3u8 {
             journal
                 .take_events(
-                    OUTBOX_CONSUMER,
+                    &consumer(),
                     &[TakenEvent {
                         key: EventKey::outbox(&uuid(byte)),
                         source_cursor: u64::from(byte),
                         session_id: None,
                         recorded_at_ms: TimestampMs::new(1_000),
+                        notice: Vec::new(),
                     }],
                     u64::from(byte),
                 )

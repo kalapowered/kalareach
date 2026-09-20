@@ -18,7 +18,7 @@
 use std::fmt;
 
 use kr_protocol::ids::{GrantId, InstallationId, PushSenderRecordId};
-use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
+use kr_protocol::scalars::{NotificationPreviewKey, StoredEnvelopeKey, TimestampMs};
 
 use crate::error::{DeliveryError, Result};
 
@@ -184,6 +184,12 @@ impl PreviewKeys {
     /// The bound is the caller's: it is the furthest expiry among the notifications already sealed
     /// to the key being replaced. A rotation with nothing outstanding keeps nothing, which is the
     /// ordinary case and the one that leaves the least behind.
+    ///
+    /// Section 16 keeps **a** previous key, singular, so a second rotation while the first
+    /// replacement still has notifications outstanding keeps the key being replaced now and drops
+    /// the older one. The deadline is the later of the two, because the older key's outstanding
+    /// notifications are the ones that would otherwise be unopenable, and the newer key is the one
+    /// a device has just stopped using. Dropping the older key is what makes *bounded* mean one.
     #[must_use]
     pub fn rotated(
         &self,
@@ -191,10 +197,19 @@ impl PreviewKeys {
         revision: u64,
         outstanding_until_ms: Option<TimestampMs>,
     ) -> Self {
+        let carried = self
+            .previous
+            .as_ref()
+            .map(|previous| previous.retired_until_ms);
+        let retired_until_ms = match (outstanding_until_ms, carried) {
+            (Some(now), Some(before)) => Some(TimestampMs::new(now.get().max(before.get()))),
+            (Some(now), None) => Some(now),
+            (None, _) => None,
+        };
         Self {
             current,
             revision,
-            previous: outstanding_until_ms.map(|retired_until_ms| RetiredPreviewKey {
+            previous: retired_until_ms.map(|retired_until_ms| RetiredPreviewKey {
                 key: self.current,
                 revision: self.revision,
                 retired_until_ms,
@@ -237,6 +252,14 @@ pub struct PushDestination {
     /// the generic alert remains. It is not a field a producer may override, and the producer asks
     /// this rather than deciding for itself.
     pub previews_enabled: bool,
+    /// The device's stored-envelope key, which an encrypted object is sealed to.
+    ///
+    /// Section 16 moves the excess detail of a preview that does not fit into a referenced
+    /// encrypted object, and an encrypted object for a device is a mailbox object: it is sealed to
+    /// the stored-envelope key, never to the preview key, because the preview key is for preview
+    /// envelopes only. A destination with no stored-envelope key has nowhere to move the excess
+    /// to, so an oversized notification for it is refused rather than trimmed.
+    pub mailbox_key: Option<StoredEnvelopeKey>,
 }
 
 /// How a destination lets a sender name a delivery so that a repeat is not a second message.
@@ -417,6 +440,29 @@ mod tests {
         assert_eq!(
             rotated.previous, None,
             "the key is dropped, not just hidden"
+        );
+    }
+
+    #[test]
+    fn a_second_rotation_keeps_one_previous_key_and_the_later_deadline() {
+        let first = PreviewKeys::only(key(1), 1);
+        let second = first.rotated(key(2), 2, Some(TimestampMs::new(5_000)));
+        let third = second.rotated(key(3), 3, Some(TimestampMs::new(3_000)));
+        let previous = third.previous.as_ref().expect("one previous key");
+        assert_eq!(
+            previous.key,
+            key(2),
+            "the key being replaced now is the one kept"
+        );
+        assert_eq!(
+            previous.retired_until_ms.get(),
+            5_000,
+            "the later of the two deadlines, because the older key's notifications outlast it"
+        );
+        assert_eq!(
+            third.retained_previous(5_000),
+            None,
+            "and it is still bounded"
         );
     }
 

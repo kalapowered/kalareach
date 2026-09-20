@@ -23,19 +23,30 @@
 //! below 3,500 bytes; move excess details to a referenced encrypted object instead of relying on
 //! an approximate expansion ratio.*
 //!
-//! So there are two checks and they are on different things. [`check_preview_bound`] is on the
-//! canonical bytes of the body **before** anything is done to it. [`check_payload_bound`] is on
-//! the request body a host will actually send, base64 and all, which is the only figure a provider
-//! sees. Neither multiplies the other by a ratio, which is the sentence's own instruction.
+//! So there are two checks and they are on different things.
 //!
-//! With these two numbers the **outer** bound is the one that bites first. A body near the
-//! 1,800-byte inner bound pads to a three-kibibyte bucket, and three kibibytes of ciphertext in
-//! base64 is already past 3,500 bytes on its own. So a producer that only checked the inner bound
-//! would build requests a gateway refuses, which is exactly what section 16 means by *rather than
-//! relying on an approximate expansion ratio*: the expansion is not a ratio, it is a bucket, and a
-//! bucket is a step.
+//! [`check_preview_bound`] is on the canonical encoding of the **complete envelope plaintext**
+//! before it is padded: the preview text and every piece of inner metadata that is sealed with it,
+//! which is what *preview text plus inner metadata* names. Checking only the body would leave the
+//! envelope's own identifiers, timestamps and type outside a bound that is about what is inside
+//! the seal.
 //!
-//! The remedy is section 16's own: the excess moves to a referenced encrypted object.
+//! [`check_payload_bound`] is on the **provider payload**, which is the document the gateway sends
+//! to FCM and not the request the host sends to the gateway. Those differ: the gateway adds the
+//! registration token, the platform block, the generic alert text and the preview re-encoded as a
+//! JSON string inside `data`. [`provider_payload_bytes`] builds both platform documents the way
+//! `workers/api/src/push/fcm.ts` builds them and measures the larger. The host does not hold the
+//! registration token - the gateway binds it - so the token is reserved at
+//! [`kr_protocol::push::MAX_REGISTRATION_TOKEN_LEN`], the largest the protocol admits. That makes
+//! this check strictly stronger than the gateway's: a payload that fits here fits there, whatever
+//! token the destination turns out to have.
+//!
+//! Neither multiplies the other by a ratio, which is the sentence's own instruction. The expansion
+//! is not a ratio anyway: it is a padding bucket, and a bucket is a step.
+//!
+//! In practice the outer bound is the one that bites. A kibibyte bucket leaves room for the
+//! reserved token; a two-kibibyte bucket does not, on either platform. The remedy is section 16's
+//! own: the excess moves to a referenced encrypted object.
 //! [`PreviewBody::referring_to`] is that move, and the producer applies it when either bound
 //! refuses the first attempt.
 //!
@@ -54,12 +65,13 @@ use kr_crypto::keys::{NotificationPreviewKeyPair, key_id};
 use kr_protocol::ids::{EnvelopeId, EnvironmentId, NotificationId, SessionId};
 use kr_protocol::mailbox::{
     EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MailboxPayloadType, SEAL_OVERHEAD_BYTES,
-    SMALL_MAILBOX_PLAINTEXT_BYTES, mailbox_granularity, mailbox_size_bucket,
+    SMALL_MAILBOX_PLAINTEXT_BYTES, granularity_for_bucket, mailbox_granularity,
+    mailbox_size_bucket, notification_granularity,
 };
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::push::{
-    MAX_PREVIEW_PLAINTEXT_BYTES, MAX_PROVIDER_PAYLOAD_BYTES, PushAlert, PushDeliveryRequest,
-    provider_payload_within_policy,
+    MAX_PREVIEW_PLAINTEXT_BYTES, MAX_PROVIDER_PAYLOAD_BYTES, MAX_REGISTRATION_TOKEN_LEN, PushAlert,
+    PushDeliveryRequest, provider_payload_within_policy,
 };
 use kr_protocol::scalars::{Bytes, NotificationPreviewKey, Nullable, TimestampMs, U64};
 
@@ -124,12 +136,16 @@ impl PreviewBody {
 
 /// Checks section 16's 1,800-byte bound on the preview text plus its inner metadata.
 ///
+/// The argument is the complete envelope plaintext, canonically encoded and not yet padded. That
+/// is what is inside the seal, so that is what the bound is about: the body's own text and
+/// identifiers **and** the envelope's version, identifiers, key identifiers, type and timestamps.
+///
 /// # Errors
 ///
-/// Returns [`DeliveryError::PreviewTooLarge`] when the canonical body is over the bound, and
+/// Returns [`DeliveryError::PreviewTooLarge`] when the canonical plaintext is over the bound, and
 /// [`DeliveryError::Encoding`] when it cannot be encoded.
-pub fn check_preview_bound(body: &PreviewBody) -> Result<Vec<u8>> {
-    let encoded = body.canonical_bytes()?;
+pub fn check_preview_bound(plaintext: &EnvelopePlaintext) -> Result<Vec<u8>> {
+    let encoded = kr_cbor::to_canonical_vec(plaintext)?;
     let actual = encoded.len() as u64;
     if actual > MAX_PREVIEW_PLAINTEXT_BYTES {
         return Err(DeliveryError::PreviewTooLarge {
@@ -188,7 +204,7 @@ pub fn unpad(padded: &[u8]) -> Result<&[u8]> {
 pub struct SealedPreview {
     /// The envelope, ready to travel inside a delivery request.
     pub envelope: kr_protocol::mailbox::SealedEnvelope,
-    /// The canonical body's length before padding and encryption, in bytes.
+    /// The complete plaintext's length before padding and encryption, in bytes.
     pub plaintext_bytes: u64,
     /// The revision of the recipient key it was sealed to.
     pub recipient_revision: u64,
@@ -221,8 +237,7 @@ pub fn seal_preview(
     created_at_ms: TimestampMs,
     expires_at_ms: TimestampMs,
 ) -> Result<SealedPreview> {
-    let payload = check_preview_bound(body)?;
-    let plaintext_bytes = payload.len() as u64;
+    let payload = body.canonical_bytes()?;
     // Both identifiers are built under the notification-preview purpose. A key identifier covers
     // the purpose as well as the key, so an identifier built here can never name the same key
     // registered as a stored-envelope key, and a reader that expects one will not accept the
@@ -242,7 +257,8 @@ pub fn seal_preview(
         thread_id: Nullable::null(),
         payload: Bytes::new(payload),
     };
-    let encoded = kr_cbor::to_canonical_vec(&plaintext)?;
+    let encoded = check_preview_bound(&plaintext)?;
+    let plaintext_bytes = encoded.len() as u64;
     let (padded, bucket) = pad_to_bucket(&encoded)?;
     let (nonce, ciphertext) =
         kr_crypto::sealed::seal_notification_preview(sender, &target.recipient, &padded)?;
@@ -265,40 +281,179 @@ pub fn seal_preview(
     })
 }
 
-/// Opens a preview this host sealed, which is what a test and a local reader do.
+/// Opens a preview, checking the untrusted routing record against what the seal authenticated.
+///
+/// It is the same three-part check `kr_crypto::envelope::open_envelope` makes, for the key pair
+/// that function does not take: the ciphertext authenticates under the two keys the caller
+/// supplies, the key identifiers inside the sealed plaintext name those two keys under the
+/// notification-preview purpose, and the routing record a service could have altered matches the
+/// authenticated fields. The declared bucket is checked against the padded length, and an envelope
+/// whose own expiry has passed is refused rather than opened.
 ///
 /// # Errors
 ///
-/// Returns [`DeliveryError::Crypto`] when the ciphertext does not authenticate under the two keys
-/// supplied, and [`DeliveryError::JournalUnreadable`] when what it opens is not a padded preview.
+/// Returns [`DeliveryError::Crypto`] when the ciphertext does not authenticate,
+/// [`DeliveryError::JournalUnreadable`] when the routing record disagrees with what was sealed or
+/// the payload is not a preview, and [`DeliveryError::Expiry`] when the envelope has expired.
 pub fn open_preview(
     recipient: &NotificationPreviewKeyPair,
     sender: &NotificationPreviewKey,
     envelope: &kr_protocol::mailbox::SealedEnvelope,
+    now_ms: u64,
 ) -> Result<PreviewBody> {
+    if now_ms >= envelope.routing.expires_at_ms.get() {
+        return Err(DeliveryError::Expiry("this preview envelope has expired"));
+    }
+    if envelope.routing.payload_type != MailboxPayloadType::NotificationPreview {
+        return Err(DeliveryError::JournalUnreadable(
+            "a routing record that does not declare a notification preview",
+        ));
+    }
+    let bucket = envelope.routing.size_bucket_bytes.get();
+    if granularity_for_bucket(bucket) != Some(notification_granularity())
+        || envelope.ciphertext.as_slice().len() as u64 != sealed_length(bucket)
+    {
+        return Err(DeliveryError::JournalUnreadable(
+            "a preview's declared size bucket is not one the notification rule produces",
+        ));
+    }
     let opened = kr_crypto::sealed::open_notification_preview(
         recipient,
         sender,
         &envelope.nonce,
         envelope.ciphertext.as_slice(),
     )?;
+    let padded = opened.expose();
+    if padded.len() as u64 != bucket {
+        return Err(DeliveryError::JournalUnreadable(
+            "a preview's declared size bucket is not the length that was sealed",
+        ));
+    }
+    let unpadded = unpad(padded)?;
+    if mailbox_size_bucket(unpadded.len() as u64) != bucket {
+        return Err(DeliveryError::JournalUnreadable(
+            "a preview's declared size bucket is not the one its plaintext rounds to",
+        ));
+    }
     let plaintext: EnvelopePlaintext =
-        kr_cbor::from_canonical_slice(unpad(opened.expose())?, &kr_cbor::Limits::DEFAULT)
+        kr_cbor::from_canonical_slice(unpadded, &kr_cbor::Limits::DEFAULT)
             .map_err(|error| DeliveryError::Encoding(error.to_string()))?;
     if plaintext.payload_type != MailboxPayloadType::NotificationPreview {
         return Err(DeliveryError::JournalUnreadable(
             "a sealed preview does not carry a notification preview",
         ));
     }
+    if plaintext.sender_key_id != key_id(KeyPurpose::NotificationPreview, sender.as_bytes())
+        || plaintext.recipient_key_id
+            != key_id(
+                KeyPurpose::NotificationPreview,
+                recipient.public().as_bytes(),
+            )
+    {
+        return Err(DeliveryError::JournalUnreadable(
+            "a preview's authenticated key identifiers do not name the keys that opened it",
+        ));
+    }
+    if plaintext.envelope_id != envelope.routing.envelope_id
+        || plaintext.expires_at_ms != envelope.routing.expires_at_ms
+        || plaintext.sender_key_id != envelope.routing.sender_key_id
+        || plaintext.recipient_key_id != envelope.routing.recipient_key_id
+    {
+        return Err(DeliveryError::JournalUnreadable(
+            "a preview's routing record does not match what was sealed",
+        ));
+    }
     kr_cbor::from_canonical_slice(plaintext.payload.as_slice(), &kr_cbor::Limits::DEFAULT)
         .map_err(|error| DeliveryError::Encoding(error.to_string()))
 }
 
-/// The length of the request body a host will send, in bytes.
+/// How many bytes are reserved for the registration token the gateway will add.
 ///
-/// It is the complete JSON document, with the sealed preview base64url inside it, which is what
-/// section 16 means by *after encryption and base64*. No expansion ratio is applied to anything:
-/// the built body is measured.
+/// The host does not hold the token: the gateway binds it to the installation, and section 16
+/// keeps it there. So the measurement reserves the largest token the protocol admits. The check is
+/// therefore strictly stronger than the gateway's, and a payload that passes here passes there
+/// whatever token the destination turns out to have.
+pub const RESERVED_TOKEN_BYTES: usize = MAX_REGISTRATION_TOKEN_LEN;
+
+/// The longest time-to-live a notification's own expiry can produce, in seconds.
+const MAX_EXPIRY_AHEAD_SECONDS: u64 = 24 * 60 * 60;
+
+/// The length of the provider payload this notification will become, in bytes.
+///
+/// This is the figure section 16 names: *measure the complete provider payload after encryption
+/// and base64*. The complete provider payload is what the gateway sends to the provider, not what
+/// the host sends to the gateway, so this builds the same two documents
+/// `workers/api/src/push/fcm.ts` builds - the Android message and the Apple message - and returns
+/// the larger. The preview goes inside `data` as a JSON string, exactly as the gateway puts it
+/// there, so its second round of quoting is measured rather than assumed.
+///
+/// Three figures the host cannot know are taken at their largest, which is the direction that
+/// refuses rather than admits: the registration token, the time-to-live decimal, and the Apple
+/// sound field the gateway includes only for an attention message.
+///
+/// # Errors
+///
+/// Returns [`DeliveryError::Encoding`] when the request cannot be serialised.
+pub fn provider_payload_bytes(request: &PushDeliveryRequest) -> Result<u64> {
+    let encode = |value: &serde_json::Value| -> Result<u64> {
+        serde_json::to_vec(value)
+            .map(|bytes| bytes.len() as u64)
+            .map_err(|error| DeliveryError::Encoding(error.to_string()))
+    };
+    let token = "t".repeat(RESERVED_TOKEN_BYTES);
+    let alert = request.hints.alert.generic_text();
+    let notification_id = request.notification_id.to_string();
+    let collapse_id = request.collapse_id.to_string();
+    let expires = request.expires_at_ms.get();
+    let mut data = serde_json::Map::new();
+    data.insert("notification_id".to_owned(), notification_id.into());
+    data.insert("expires_at_ms".to_owned(), expires.to_string().into());
+    if let Some(preview) = request.preview.as_ref() {
+        let encoded = serde_json::to_string(preview)
+            .map_err(|error| DeliveryError::Encoding(error.to_string()))?;
+        data.insert("preview".to_owned(), encoded.into());
+    }
+    let ttl = format!("{MAX_EXPIRY_AHEAD_SECONDS}s");
+    let android = serde_json::json!({
+        "message": {
+            "token": token,
+            "data": serde_json::Value::Object(data.clone()),
+            "android": {
+                "priority": request.hints.urgency.fcm_priority(),
+                "collapse_key": collapse_id,
+                "ttl": ttl,
+                "notification": { "body": alert, "tag": collapse_id },
+            },
+        }
+    });
+    let apple = serde_json::json!({
+        "message": {
+            "token": token,
+            "data": serde_json::Value::Object(data),
+            "apns": {
+                "headers": {
+                    "apns-priority": request.hints.urgency.apns_priority(),
+                    "apns-expiration": (expires / 1000).to_string(),
+                    "apns-collapse-id": collapse_id,
+                    "apns-push-type": "alert",
+                },
+                "payload": {
+                    "aps": {
+                        "alert": { "body": alert },
+                        "mutable-content": 1,
+                        "sound": "default",
+                    }
+                },
+            },
+        }
+    });
+    Ok(encode(&android)?.max(encode(&apple)?))
+}
+
+/// The length of the request body a host will send to the gateway, in bytes.
+///
+/// It is not the figure section 16's bound is about - [`provider_payload_bytes`] is - but it is
+/// what this host actually writes to a socket, so it is what the journal records.
 ///
 /// # Errors
 ///
@@ -324,7 +479,7 @@ pub fn encode_request(request: &PushDeliveryRequest) -> Result<Vec<u8>> {
 /// caller's remedy is to move the excess into a referenced encrypted object and build again; it is
 /// not to trim the text and hope.
 pub fn check_payload_bound(request: &PushDeliveryRequest) -> Result<u64> {
-    let measured = measure_payload(request)?;
+    let measured = provider_payload_bytes(request)?;
     if provider_payload_within_policy(measured) {
         Ok(measured)
     } else {
@@ -414,29 +569,81 @@ mod tests {
         }
     }
 
+    fn sealed(
+        host: &NotificationPreviewKeyPair,
+        device: &NotificationPreviewKeyPair,
+        body: &PreviewBody,
+        expires: TimestampMs,
+    ) -> Result<SealedPreview> {
+        seal_preview(
+            host,
+            &PreviewTarget {
+                recipient: *device.public(),
+                revision: 1,
+            },
+            envelope_id(),
+            body,
+            TimestampMs::new(1_700_000_000_000),
+            expires,
+        )
+    }
+
+    const EXPIRES: u64 = 1_700_000_100_000;
+
     #[test]
     fn a_preview_opens_for_the_key_it_was_sealed_to_and_no_other() {
         let host = NotificationPreviewKeyPair::generate().expect("a keypair");
         let device = NotificationPreviewKeyPair::generate().expect("a keypair");
         let other = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let sealed = seal_preview(
+        let preview = sealed(
             &host,
-            &PreviewTarget {
-                recipient: *device.public(),
-                revision: 3,
-            },
-            envelope_id(),
+            &device,
             &body("an approval is waiting"),
-            TimestampMs::new(1_000),
-            TimestampMs::new(2_000),
+            TimestampMs::new(EXPIRES),
         )
         .expect("a sealed preview");
-        let opened = open_preview(&device, host.public(), &sealed.envelope).expect("the body");
+        let opened = open_preview(&device, host.public(), &preview.envelope, 1_700_000_000_000)
+            .expect("the body");
         assert_eq!(opened.summary, "an approval is waiting");
         assert!(
-            open_preview(&other, host.public(), &sealed.envelope).is_err(),
+            open_preview(&other, host.public(), &preview.envelope, 1_700_000_000_000).is_err(),
             "a preview opens for its own recipient key only"
         );
+    }
+
+    #[test]
+    fn an_altered_routing_record_does_not_yield_a_body() {
+        let host = NotificationPreviewKeyPair::generate().expect("a keypair");
+        let device = NotificationPreviewKeyPair::generate().expect("a keypair");
+        let preview = sealed(&host, &device, &body("x"), TimestampMs::new(EXPIRES))
+            .expect("a sealed preview");
+
+        let mut moved = preview.envelope.clone();
+        moved.routing.envelope_id = EnvelopeId::new(Uuid::from_bytes([9; 16]));
+        assert!(
+            open_preview(&device, host.public(), &moved, 1_700_000_000_000).is_err(),
+            "the untrusted routing record is checked against what was sealed"
+        );
+
+        let mut relabelled = preview.envelope.clone();
+        relabelled.routing.size_bucket_bytes = U64::new(4 * 1024);
+        assert!(open_preview(&device, host.public(), &relabelled, 1_700_000_000_000).is_err());
+
+        let mut restamped = preview.envelope.clone();
+        restamped.routing.expires_at_ms = TimestampMs::new(EXPIRES + 1_000);
+        assert!(open_preview(&device, host.public(), &restamped, 1_700_000_000_000).is_err());
+    }
+
+    #[test]
+    fn an_expired_preview_envelope_is_refused_rather_than_opened() {
+        let host = NotificationPreviewKeyPair::generate().expect("a keypair");
+        let device = NotificationPreviewKeyPair::generate().expect("a keypair");
+        let preview = sealed(&host, &device, &body("x"), TimestampMs::new(EXPIRES))
+            .expect("a sealed preview");
+        assert!(matches!(
+            open_preview(&device, host.public(), &preview.envelope, EXPIRES),
+            Err(DeliveryError::Expiry(_))
+        ));
     }
 
     #[test]
@@ -454,28 +661,18 @@ mod tests {
     fn a_sealed_preview_names_the_notification_preview_purpose_on_both_sides() {
         let host = NotificationPreviewKeyPair::generate().expect("a keypair");
         let device = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let sealed = seal_preview(
-            &host,
-            &PreviewTarget {
-                recipient: *device.public(),
-                revision: 1,
-            },
-            envelope_id(),
-            &body("x"),
-            TimestampMs::new(1_000),
-            TimestampMs::new(2_000),
-        )
-        .expect("a sealed preview");
+        let preview =
+            sealed(&host, &device, &body("x"), TimestampMs::new(EXPIRES)).expect("a preview");
         assert_eq!(
-            sealed.envelope.routing.recipient_key_id,
+            preview.envelope.routing.recipient_key_id,
             key_id(KeyPurpose::NotificationPreview, device.public().as_bytes())
         );
         assert_eq!(
-            sealed.envelope.routing.sender_key_id,
+            preview.envelope.routing.sender_key_id,
             key_id(KeyPurpose::NotificationPreview, host.public().as_bytes())
         );
         assert_eq!(
-            sealed.envelope.routing.payload_type,
+            preview.envelope.routing.payload_type,
             MailboxPayloadType::NotificationPreview
         );
     }
@@ -508,7 +705,7 @@ mod tests {
         let (nonce, ciphertext) =
             kr_crypto::sealed::seal_stored_envelope(&host, device.public(), &padded)
                 .expect("a ciphertext");
-        let sealed = kr_protocol::mailbox::SealedEnvelope {
+        let envelope = kr_protocol::mailbox::SealedEnvelope {
             routing: EnvelopeRouting {
                 envelope_id: plaintext.envelope_id,
                 recipient_key_id: plaintext.recipient_key_id,
@@ -521,9 +718,14 @@ mod tests {
             nonce,
             ciphertext: Bytes::new(ciphertext),
         };
-        let opened =
-            kr_crypto::envelope::open_envelope(&device, host.public(), &sealed, 1_500, |_| Ok(()))
-                .expect("libsodium unpads what this module padded");
+        let opened = kr_crypto::envelope::open_envelope(
+            &device,
+            host.public(),
+            &envelope,
+            1_500,
+            |_| Ok(()),
+        )
+        .expect("libsodium unpads what this module padded");
         assert_eq!(opened.payload.as_slice(), b"a reference");
         assert_eq!(unpad(&padded).expect("the plaintext"), encoded.as_slice());
     }
@@ -532,46 +734,46 @@ mod tests {
     fn a_sealed_preview_is_shaped_the_way_the_gateway_checks_for() {
         let host = NotificationPreviewKeyPair::generate().expect("a keypair");
         let device = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let expires = TimestampMs::new(1_700_000_100_000);
-        let sealed = seal_preview(
-            &host,
-            &PreviewTarget {
-                recipient: *device.public(),
-                revision: 1,
-            },
-            envelope_id(),
-            &body("an approval is waiting"),
-            TimestampMs::new(1_700_000_000_000),
-            expires,
-        )
-        .expect("a sealed preview");
-        let request = request_with(sealed.envelope.clone(), expires);
+        let expires = TimestampMs::new(EXPIRES);
+        let preview = sealed(&host, &device, &body("an approval is waiting"), expires)
+            .expect("a sealed preview");
+        let request = request_with(preview.envelope.clone(), expires);
         assert!(
             request.preview_is_well_formed(),
             "the bucket, the expiry and the ciphertext length are what a gateway checks"
         );
         assert_eq!(
-            sealed.envelope.ciphertext.as_slice().len() as u64,
-            sealed_length(sealed.envelope.routing.size_bucket_bytes.get())
+            preview.envelope.ciphertext.as_slice().len() as u64,
+            sealed_length(preview.envelope.routing.size_bucket_bytes.get())
         );
     }
 
     #[test]
-    fn a_preview_body_over_eighteen_hundred_bytes_is_refused_before_anything_is_sealed() {
+    fn the_inner_bound_covers_the_envelope_metadata_and_not_only_the_body() {
+        // A body under 1,800 bytes whose complete plaintext is over it. Checking the body alone
+        // would have admitted this, and what is sealed is the plaintext.
         let host = NotificationPreviewKeyPair::generate().expect("a keypair");
         let device = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let error = seal_preview(
-            &host,
-            &PreviewTarget {
-                recipient: *device.public(),
-                revision: 1,
-            },
-            envelope_id(),
-            &body(&"x".repeat(2_000)),
-            TimestampMs::new(1_000),
-            TimestampMs::new(2_000),
-        )
-        .expect_err("the bound is checked before the seal");
+        let mut summary = 1_600;
+        let (body_at, plaintext_len) = loop {
+            let candidate = body(&"x".repeat(summary));
+            let body_len = candidate.canonical_bytes().expect("bytes").len() as u64;
+            let plaintext = plaintext_of(&host, &device, &candidate);
+            let plaintext_len = kr_cbor::to_canonical_vec(&plaintext).expect("bytes").len() as u64;
+            if body_len <= MAX_PREVIEW_PLAINTEXT_BYTES
+                && plaintext_len > MAX_PREVIEW_PLAINTEXT_BYTES
+            {
+                break (candidate, plaintext_len);
+            }
+            summary += 1;
+            assert!(summary < 2_000, "such a body exists well before here");
+        };
+        assert!(
+            body_at.canonical_bytes().expect("bytes").len() as u64 <= MAX_PREVIEW_PLAINTEXT_BYTES
+        );
+        assert!(plaintext_len > MAX_PREVIEW_PLAINTEXT_BYTES);
+        let error = sealed(&host, &device, &body_at, TimestampMs::new(EXPIRES))
+            .expect_err("the complete plaintext is over the bound");
         assert!(matches!(
             error,
             DeliveryError::PreviewTooLarge {
@@ -581,136 +783,75 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_payload_bound_is_measured_on_the_built_body_and_not_estimated() {
-        let host = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let device = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let expires = TimestampMs::new(1_700_000_100_000);
-        let sealed = seal_preview(
-            &host,
-            &PreviewTarget {
-                recipient: *device.public(),
-                revision: 1,
-            },
-            envelope_id(),
-            &body("an approval is waiting"),
-            TimestampMs::new(1_700_000_000_000),
-            expires,
-        )
-        .expect("a sealed preview");
-        let request = request_with(sealed.envelope, expires);
-        let measured = check_payload_bound(&request).expect("a small preview fits");
-        assert!(measured < MAX_PROVIDER_PAYLOAD_BYTES);
-        assert_eq!(
-            measured,
-            encode_request(&request).expect("the body").len() as u64,
-            "the figure is the body's own length, not an expansion ratio"
-        );
-    }
-
-    #[test]
-    fn a_preview_at_the_inner_bound_is_refused_by_the_measured_payload_bound() {
-        // The two bounds are independent, and this is the case that shows why measuring matters:
-        // a body inside the 1,800-byte inner bound pads to a three-kibibyte bucket, and that
-        // bucket in base64 is already past 3,500 bytes. An expansion ratio applied to the inner
-        // bound would have admitted it.
-        let host = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let device = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let expires = TimestampMs::new(1_700_000_100_000);
-        let target = PreviewTarget {
-            recipient: *device.public(),
-            revision: 1,
-        };
-        let at_bound = largest_body_inside_the_preview_bound();
-        assert!(
-            check_preview_bound(&at_bound).is_ok(),
-            "this body is inside the inner bound"
-        );
-        let sealed = seal_preview(
-            &host,
-            &target,
-            envelope_id(),
-            &at_bound,
-            TimestampMs::new(1_700_000_000_000),
-            expires,
-        )
-        .expect("a sealed preview");
-        let error = check_payload_bound(&request_with(sealed.envelope, expires))
-            .expect_err("the built payload is over the bound");
-        assert!(matches!(
-            error,
-            DeliveryError::PayloadTooLarge {
-                limit: MAX_PROVIDER_PAYLOAD_BYTES,
-                ..
-            }
-        ));
-
-        // Section 16's remedy, and it works: the detail moves to a referenced encrypted object and
-        // what is left fits.
-        let referring = at_bound.referring_to(envelope_id());
-        let sealed = seal_preview(
-            &host,
-            &target,
-            envelope_id(),
-            &referring,
-            TimestampMs::new(1_700_000_000_000),
-            expires,
-        )
-        .expect("a sealed preview");
-        let measured = check_payload_bound(&request_with(sealed.envelope, expires))
-            .expect("the reference fits where the detail did not");
-        assert!(measured < MAX_PROVIDER_PAYLOAD_BYTES);
-    }
-
-    /// The largest body this test can build without crossing the 1,800-byte inner bound.
-    fn largest_body_inside_the_preview_bound() -> PreviewBody {
-        let mut summary = 1_000;
-        loop {
-            let candidate = body(&"x".repeat(summary + 1));
-            if candidate.canonical_bytes().expect("bytes").len() as u64
-                > MAX_PREVIEW_PLAINTEXT_BYTES
-            {
-                return body(&"x".repeat(summary));
-            }
-            summary += 1;
+    /// The envelope plaintext `seal_preview` would build for one body, for a test that needs to
+    /// measure it before sealing.
+    fn plaintext_of(
+        host: &NotificationPreviewKeyPair,
+        device: &NotificationPreviewKeyPair,
+        body: &PreviewBody,
+    ) -> EnvelopePlaintext {
+        EnvelopePlaintext {
+            version: EnvelopeVersion::V1,
+            envelope_id: envelope_id(),
+            sender_key_id: key_id(KeyPurpose::NotificationPreview, host.public().as_bytes()),
+            recipient_key_id: key_id(KeyPurpose::NotificationPreview, device.public().as_bytes()),
+            payload_type: MailboxPayloadType::NotificationPreview,
+            created_at_ms: TimestampMs::new(1_700_000_000_000),
+            expires_at_ms: TimestampMs::new(EXPIRES),
+            grant_id: Nullable::null(),
+            environment_id: body.environment_id,
+            session_id: body.session_id,
+            session_epoch: Nullable::null(),
+            thread_id: Nullable::null(),
+            payload: Bytes::new(body.canonical_bytes().expect("bytes")),
         }
     }
 
     #[test]
-    fn a_preview_padded_past_its_bucket_is_refused_by_the_payload_bound() {
-        // A preview whose plaintext needed a three-kibibyte bucket, which is what a producer that
-        // ignored the inner bound would build. The outer check refuses it on the measured body.
+    fn the_payload_bound_is_measured_on_the_provider_document_the_gateway_builds() {
         let host = NotificationPreviewKeyPair::generate().expect("a keypair");
         let device = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let expires = TimestampMs::new(1_700_000_100_000);
-        let oversized = vec![0u8; 2_500];
-        let (padded, bucket) = pad_to_bucket(&oversized).expect("a padded plaintext");
-        assert_eq!(bucket, 3 * 1024);
-        let (nonce, ciphertext) =
-            kr_crypto::sealed::seal_notification_preview(&host, device.public(), &padded)
-                .expect("a ciphertext");
-        let envelope = kr_protocol::mailbox::SealedEnvelope {
-            routing: EnvelopeRouting {
-                envelope_id: envelope_id(),
-                recipient_key_id: key_id(
-                    KeyPurpose::NotificationPreview,
-                    device.public().as_bytes(),
-                ),
-                sender_key_id: key_id(KeyPurpose::NotificationPreview, host.public().as_bytes()),
-                expires_at_ms: expires,
-                payload_type: MailboxPayloadType::NotificationPreview,
-                thread_id: Nullable::null(),
-                size_bucket_bytes: U64::new(bucket),
-            },
-            nonce,
-            ciphertext: Bytes::new(ciphertext),
-        };
-        let request = request_with(envelope, expires);
+        let expires = TimestampMs::new(EXPIRES);
+        let preview = sealed(&host, &device, &body("an approval is waiting"), expires)
+            .expect("a sealed preview");
+        let request = request_with(preview.envelope, expires);
+        let measured = check_payload_bound(&request).expect("a small preview fits");
+        assert!(measured < MAX_PROVIDER_PAYLOAD_BYTES);
+        assert_eq!(
+            measured,
+            provider_payload_bytes(&request).expect("the provider document"),
+        );
+        assert!(
+            measured > measure_payload(&request).expect("the request body"),
+            "the provider document is the larger of the two, because the gateway adds to it"
+        );
+        assert!(
+            measured > RESERVED_TOKEN_BYTES as u64,
+            "the reserved registration token is inside the figure"
+        );
+    }
+
+    #[test]
+    fn a_two_kibibyte_preview_is_refused_by_the_measured_payload_bound() {
+        // A preview whose plaintext needs a two-kibibyte bucket does not fit a provider payload
+        // once the token, the platform block and the second round of JSON quoting are counted.
+        // An expansion ratio applied to the inner bound would have admitted it.
+        let host = NotificationPreviewKeyPair::generate().expect("a keypair");
+        let device = NotificationPreviewKeyPair::generate().expect("a keypair");
+        let expires = TimestampMs::new(EXPIRES);
+        let big = body(&"x".repeat(1_200));
+        let preview = sealed(&host, &device, &big, expires).expect("a sealed preview");
+        assert_eq!(
+            preview.envelope.routing.size_bucket_bytes.get(),
+            2 * 1024,
+            "this body needs the two-kibibyte bucket"
+        );
+        let request = request_with(preview.envelope, expires);
         assert!(
             request.preview_is_well_formed(),
             "the shape is fine; it is the size that is not"
         );
-        let error = check_payload_bound(&request).expect_err("the built payload is too large");
+        let error = check_payload_bound(&request).expect_err("the provider payload is too large");
         assert!(matches!(
             error,
             DeliveryError::PayloadTooLarge {
@@ -718,6 +859,37 @@ mod tests {
                 ..
             }
         ));
+
+        // Section 16's remedy, and it works: the detail moves elsewhere and a reference fits.
+        let referring = big.referring_to(EnvelopeId::new(Uuid::from_bytes([8; 16])));
+        let preview = sealed(&host, &device, &referring, expires).expect("a sealed preview");
+        let measured = check_payload_bound(&request_with(preview.envelope, expires))
+            .expect("the reference fits where the detail did not");
+        assert!(measured < MAX_PROVIDER_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn a_notification_with_no_preview_fits_whatever_the_alert() {
+        let expires = TimestampMs::new(EXPIRES);
+        for alert in PushAlert::ALL {
+            let request = PushDeliveryRequest {
+                collapse_id: kr_protocol::ids::CollapseId::new(Uuid::from_bytes([3; 16])),
+                expires_at_ms: expires,
+                hints: kr_protocol::push::PushPlatformHints {
+                    alert,
+                    urgency: kr_protocol::push::PushUrgency::Deferred,
+                },
+                notification_id: fresh_notification_id(),
+                preview: Nullable::null(),
+                sender_record_id: kr_protocol::ids::PushSenderRecordId::new(Uuid::from_bytes(
+                    [4; 16],
+                )),
+            };
+            assert!(
+                check_payload_bound(&request).is_ok(),
+                "a generic alert always fits: {alert}"
+            );
+        }
     }
 
     #[test]

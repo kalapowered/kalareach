@@ -41,8 +41,7 @@ use crate::destination::{DeliveryRule, Destination, DestinationId, DestinationRe
 use crate::error::{DeliveryError, Result};
 use crate::external::{self, ContentLine, ExternalMessage};
 use crate::journal::{
-    ATTENTION_CONSUMER, DeliveryJournal, DeliveryRecord, DeliveryState, EventKey, EventSource,
-    OUTBOX_CONSUMER, TakenEvent,
+    DeliveryJournal, DeliveryRecord, DeliveryState, EventKey, EventSource, TakenEvent,
 };
 use crate::preview::{self, PreviewBody, PreviewTarget};
 use crate::push::{self, MAX_EXPIRY_AHEAD_MS};
@@ -55,7 +54,7 @@ use crate::push::{self, MAX_EXPIRY_AHEAD_MS};
 pub const DEFAULT_NOTIFICATION_LIFETIME_MS: u64 = 4 * 60 * 60 * 1000;
 
 /// One thing the host recorded that a destination may want to know about.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Notice {
     /// The underlying event, which this journal must already have taken.
     pub event: EventKey,
@@ -112,14 +111,42 @@ impl Notice {
     }
 
     /// The event record this notice's source is taken under.
-    #[must_use]
-    pub fn taken(&self, source_cursor: u64) -> TakenEvent {
-        TakenEvent {
+    ///
+    /// The notice travels into the event row, so a host that takes the event and stops before
+    /// producing comes back to something it can still produce from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::Encoding`] when the notice cannot be represented in KR-CBOR-1.
+    pub fn taken(&self, source_cursor: u64) -> Result<TakenEvent> {
+        Ok(TakenEvent {
             key: self.event.clone(),
             source_cursor,
             session_id: self.session_id,
             recorded_at_ms: self.observed_at_ms,
-        }
+            notice: kr_cbor::to_canonical_vec(self)?,
+        })
+    }
+}
+
+/// One underlying event that is worth recording and warrants no notification.
+///
+/// The worker outbox carries every state transition, and most of them are nobody's notification.
+/// Taking them is still what makes this journal a registered consumer with a claim on collection,
+/// and the empty notice is what says the event needs nothing produced from it.
+#[must_use]
+pub fn observed(
+    key: EventKey,
+    source_cursor: u64,
+    session_id: Option<SessionId>,
+    recorded_at_ms: TimestampMs,
+) -> TakenEvent {
+    TakenEvent {
+        key,
+        source_cursor,
+        session_id,
+        recorded_at_ms,
+        notice: Vec::new(),
     }
 }
 
@@ -182,14 +209,22 @@ pub struct Produced {
 pub struct Producer {
     journal: DeliveryJournal,
     preview_key: kr_crypto::keys::NotificationPreviewKeyPair,
+    mailbox_key: kr_crypto::keys::StoredEnvelopeKeyPair,
     collapse_secret: [u8; 32],
 }
+
+/// How many unproduced events one recovery pass finishes.
+pub const MAX_PENDING_PER_PASS: usize = 256;
+
+/// How many outbox records one pass takes from a worker's journal.
+pub const MAX_OUTBOX_PAGE: u64 = 256;
 
 impl Producer {
     /// Builds a producer over one delivery journal.
     ///
-    /// Both consumers are registered here, before anything is read, because a consumer that has
-    /// not registered has no claim on what collection removes.
+    /// The two keys are this host's own: the notification-preview keypair a preview is sealed
+    /// from, and the stored-envelope keypair an encrypted object is sealed from when a preview's
+    /// excess detail has to move into one.
     ///
     /// # Errors
     ///
@@ -197,16 +232,120 @@ impl Producer {
     pub fn new(
         mut journal: DeliveryJournal,
         preview_key: kr_crypto::keys::NotificationPreviewKeyPair,
-        now_ms: u64,
+        mailbox_key: kr_crypto::keys::StoredEnvelopeKeyPair,
     ) -> Result<Self> {
-        journal.register_consumer(ATTENTION_CONSUMER, now_ms)?;
-        journal.register_consumer(OUTBOX_CONSUMER, now_ms)?;
         let collapse_secret = journal.collapse_secret()?;
         Ok(Self {
             journal,
             preview_key,
+            mailbox_key,
             collapse_secret,
         })
+    }
+
+    /// Takes every announcement one attention store is offering, and settles them afterwards.
+    ///
+    /// The order is T-037's rule 5 and T-040's residual 5 together: take, record durably with the
+    /// cursor, then settle. A host that dies before the settlement is offered the same
+    /// announcements again and the event keys absorb them; one that dies before the local
+    /// transaction has settled nothing, so nothing is lost either way.
+    ///
+    /// `scope` names the store, because a cursor is a position in one store and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::Source`] when the attention store cannot be read or settled, and
+    /// [`DeliveryError::JournalUnavailable`] when this journal cannot be written.
+    pub fn take_from_attention(
+        &mut self,
+        attention: &mut kr_attention::Attention,
+        scope: &str,
+        now_ms: u64,
+    ) -> Result<Vec<Notice>> {
+        let consumer = EventSource::Attention.consumer(scope);
+        self.journal.register_consumer(&consumer, now_ms)?;
+        let announcements = attention
+            .take_announcements()
+            .map_err(|error| DeliveryError::Source(error.to_string()))?;
+        if announcements.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut notices = Vec::with_capacity(announcements.len());
+        let mut events = Vec::with_capacity(announcements.len());
+        let mut settled = Vec::with_capacity(announcements.len());
+        let mut cursor = self
+            .journal
+            .consumer_cursor(&consumer)?
+            .map_or(0, |held| held.cursor);
+        for announcement in &announcements {
+            let notice = Notice::from_announcement(announcement, now_ms);
+            events.push(notice.taken(announcement.number)?);
+            settled.push((announcement.key.clone(), announcement.number));
+            cursor = cursor.max(announcement.number);
+            notices.push(notice);
+        }
+        self.journal.take_events(&consumer, &events, cursor)?;
+        attention
+            .settle_announcements(&settled)
+            .map_err(|error| DeliveryError::Source(error.to_string()))?;
+        Ok(notices)
+    }
+
+    /// Takes one page of a worker's outbox, and tells the worker afterwards.
+    ///
+    /// Registration comes first and is repeated on every pass, because a consumer that has not
+    /// registered has no claim on what collection removes. The acknowledgement comes after the
+    /// local transaction, for the same reason the attention settlement does.
+    ///
+    /// Every record is taken, and only the ones a caller turns into a [`Notice`] produce anything.
+    /// That is what makes this journal a registered consumer of the whole stream rather than of
+    /// the part it happens to notify about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::Source`] when the worker's journal cannot be read or told, and
+    /// [`DeliveryError::JournalUnavailable`] when this journal cannot be written.
+    pub fn take_from_outbox(
+        &mut self,
+        worker: &mut kr_worker::journal::Journal,
+        scope: &str,
+        session_id: Option<SessionId>,
+        now_ms: u64,
+    ) -> Result<Vec<(EventKey, kr_worker::persistence::outbox::OutboxRecord)>> {
+        let consumer = EventSource::WorkerOutbox.consumer(scope);
+        self.journal.register_consumer(&consumer, now_ms)?;
+        let cursor = self
+            .journal
+            .consumer_cursor(&consumer)?
+            .map_or(0, |held| held.cursor);
+        worker
+            .note_outbox_consumed(&consumer, cursor, 0)
+            .map_err(|error| DeliveryError::Source(error.to_string()))?;
+        let page = worker
+            .outbox_after(cursor, MAX_OUTBOX_PAGE)
+            .map_err(|error| DeliveryError::Source(error.to_string()))?;
+        if page.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::with_capacity(page.len());
+        let mut taken = Vec::with_capacity(page.len());
+        let mut highest = cursor;
+        for record in page {
+            let key = EventKey::outbox(&record.event.event_id);
+            events.push(observed(
+                key.clone(),
+                record.cursor,
+                session_id,
+                record.event.recorded_at_ms,
+            ));
+            highest = highest.max(record.cursor);
+            taken.push((key, record));
+        }
+        let applied = self.journal.take_events(&consumer, &events, highest)?;
+        worker
+            .note_outbox_consumed(&consumer, highest, applied as u64)
+            .map_err(|error| DeliveryError::Source(error.to_string()))?;
+        Ok(taken)
     }
 
     /// The journal, for reads a caller needs.
@@ -238,10 +377,14 @@ impl Producer {
     pub fn take(
         &mut self,
         source: EventSource,
+        scope: &str,
         events: &[TakenEvent],
         cursor: u64,
+        now_ms: u64,
     ) -> Result<usize> {
-        self.journal.take_events(source.consumer(), events, cursor)
+        let consumer = source.consumer(scope);
+        self.journal.register_consumer(&consumer, now_ms)?;
+        self.journal.take_events(&consumer, events, cursor)
     }
 
     /// Produces notifications for one notice, one per destination that wants it.
@@ -267,34 +410,98 @@ impl Producer {
         push::check_expiry(now_ms, notice.expires_at_ms)?;
         let generation = self.journal.generation()?;
         let mut produced = Produced::default();
+        let mut records = Vec::new();
+        let mut spent = Vec::new();
         for destination in destinations {
             if !destination.enabled {
                 continue;
             }
             let outcome = match &destination.destination {
-                Destination::Push(_) => self.produce_push(notice, destination, generation, now_ms),
-                Destination::External(_) => {
-                    self.produce_external(notice, destination, authority, lines, generation, now_ms)
-                }
+                Destination::Push(_) => self.build_push(notice, destination, generation, now_ms),
+                Destination::External(_) => self
+                    .build_external(notice, destination, authority, lines, generation, now_ms)
+                    .map(|record| (record, None)),
             };
             match outcome {
-                Ok(true) => produced.admitted += 1,
-                Ok(false) => produced.collapsed += 1,
+                Ok((record, budget)) => {
+                    if record.state == DeliveryState::Collapsed {
+                        produced.collapsed += 1;
+                    } else {
+                        produced.admitted += 1;
+                    }
+                    records.push(record);
+                    if let Some(budget) = budget {
+                        spent.push((destination.id.clone(), budget));
+                    }
+                }
                 Err(error) => produced
                     .refused
                     .push((destination.id.clone(), error.to_string())),
             }
         }
+        // One transaction: every notification this event produced, what they spent, and the
+        // event's own completion. A crash before it leaves the event unproduced, so the recovery
+        // pass produces from it again and nothing has been charged for a notification nobody
+        // admitted.
+        if !self.journal.produce(&notice.event, &records, &spent)? {
+            return Ok(Produced {
+                events_taken: 0,
+                admitted: 0,
+                collapsed: 0,
+                refused: Vec::new(),
+            });
+        }
         Ok(produced)
     }
 
-    fn produce_push(
+    /// Finishes every event this journal took and produced nothing from.
+    ///
+    /// A restart runs it before it reads a new page: the source's cursor has already moved past
+    /// those events, so nothing else will offer them again. `notice_of` decodes the notice the
+    /// caller committed with the event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the journal cannot be read or written.
+    pub fn finish_pending(
+        &mut self,
+        destinations: &[DestinationRecord],
+        authority: &dyn RecipientAuthority,
+        now_ms: u64,
+    ) -> Result<Produced> {
+        let mut total = Produced::default();
+        for pending in self.journal.pending_events(MAX_PENDING_PER_PASS)? {
+            if pending.notice.is_empty() {
+                // An event worth recording and nobody's notification. Marking it produced is what
+                // takes it out of the recovery pass.
+                self.journal.produce(&pending.key, &[], &[])?;
+                continue;
+            }
+            let Ok(notice) =
+                kr_cbor::from_canonical_slice::<Notice>(&pending.notice, &kr_cbor::Limits::DEFAULT)
+            else {
+                // A notice this build cannot read is left where it is rather than dropped: the
+                // event stays unproduced and says so, which is a state a person can look at.
+                total
+                    .refused
+                    .push((DestinationId::new("-")?, pending.key.stored()));
+                continue;
+            };
+            let produced = self.produce(&notice, destinations, authority, &[], now_ms)?;
+            total.admitted += produced.admitted;
+            total.collapsed += produced.collapsed;
+            total.refused.extend(produced.refused);
+        }
+        Ok(total)
+    }
+
+    fn build_push(
         &mut self,
         notice: &Notice,
         destination: &DestinationRecord,
         generation: u64,
         now_ms: u64,
-    ) -> Result<bool> {
+    ) -> Result<(DeliveryRecord, Option<crate::journal::StoredBudget>)> {
         let push = destination
             .as_push()
             .ok_or_else(|| DeliveryError::NoDestination(destination.id.to_string()))?
@@ -309,33 +516,33 @@ impl Producer {
             .budget(&destination.id)?
             .map_or_else(|| Budget::fresh(now_ms), |stored| Budget::restored(&stored));
         let decision = budget.admit(now_ms, preview::fresh_notification_id);
-        self.journal
-            .record_budget(&destination.id, &budget.stored())?;
 
         let (identifier, suppression) = match decision {
             Admission::Send => (notification_id, None),
             Admission::Collapse { suppression } => {
                 // Nothing is sent, and the request is still retained: section 16's *the host
                 // retains every request and reports suppression locally* is this row.
-                self.journal.admit(&DeliveryRecord {
-                    notification_id,
-                    event: notice.event.clone(),
-                    destination_id: destination.id.clone(),
-                    state: DeliveryState::Collapsed,
-                    privacy_generation: generation,
-                    content: None,
-                    payload_bytes: 0,
-                    expires_at_ms: notice.expires_at_ms,
-                    admitted_at_ms: TimestampMs::new(now_ms),
-                    attempts: 0,
-                    suppression: Some(suppression),
-                    detail: Some(
-                        "the destination is over this host's own rate policy, so this collapsed \
-                         into an attention update"
-                            .to_owned(),
-                    ),
-                })?;
-                return Ok(false);
+                return Ok((
+                    DeliveryRecord {
+                        notification_id,
+                        event: notice.event.clone(),
+                        destination_id: destination.id.clone(),
+                        state: DeliveryState::Collapsed,
+                        privacy_generation: generation,
+                        content: None,
+                        payload_bytes: 0,
+                        expires_at_ms: notice.expires_at_ms,
+                        admitted_at_ms: TimestampMs::new(now_ms),
+                        attempts: 0,
+                        suppression: Some(suppression),
+                        detail: Some(
+                            "the destination is over this host's own rate policy, so this \
+                             collapsed into an attention update"
+                                .to_owned(),
+                        ),
+                    },
+                    Some(budget.stored()),
+                ));
             }
             Admission::OpenUpdate {
                 update,
@@ -349,24 +556,27 @@ impl Producer {
         } else {
             notice.alert
         };
-        let request = self.build_request(notice, &push, identifier, alert, now_ms)?;
+        let request =
+            self.build_request(notice, &push, &destination.id, identifier, alert, now_ms)?;
         let content = preview::encode_request(&request)?;
-        let payload_bytes = content.len() as u64;
-        self.journal.admit(&DeliveryRecord {
-            notification_id: identifier,
-            event: notice.event.clone(),
-            destination_id: destination.id.clone(),
-            state: DeliveryState::Admitted,
-            privacy_generation: generation,
-            content: Some(content),
-            payload_bytes,
-            expires_at_ms: notice.expires_at_ms,
-            admitted_at_ms: TimestampMs::new(now_ms),
-            attempts: 0,
-            suppression,
-            detail: None,
-        })?;
-        Ok(true)
+        let payload_bytes = preview::provider_payload_bytes(&request)?;
+        Ok((
+            DeliveryRecord {
+                notification_id: identifier,
+                event: notice.event.clone(),
+                destination_id: destination.id.clone(),
+                state: DeliveryState::Admitted,
+                privacy_generation: generation,
+                content: Some(content),
+                payload_bytes,
+                expires_at_ms: notice.expires_at_ms,
+                admitted_at_ms: TimestampMs::new(now_ms),
+                attempts: 0,
+                suppression,
+                detail: None,
+            },
+            Some(budget.stored()),
+        ))
     }
 
     /// Builds the request, moving the excess into a referenced encrypted object if it does not fit.
@@ -377,6 +587,7 @@ impl Producer {
         &mut self,
         notice: &Notice,
         push: &crate::destination::PushDestination,
+        destination_id: &DestinationId,
         notification_id: NotificationId,
         alert: PushAlert,
         now_ms: u64,
@@ -439,19 +650,46 @@ impl Producer {
             Err(DeliveryError::PreviewTooLarge { .. } | DeliveryError::PayloadTooLarge { .. }) => {
                 // The detail stays on this host, encrypted, and the preview carries a reference to
                 // it. It is not trimmed, and no ratio is applied to guess what would have fitted.
+                //
+                // The object is a mailbox object, sealed to the destination's stored-envelope key
+                // through the ordinary envelope path, because section 16 keeps the preview key for
+                // preview envelopes only. A destination that has registered no stored-envelope key
+                // has nowhere for the excess to go, so the notification is refused rather than sent
+                // with the detail cut out of it.
+                let recipient = push.mailbox_key.ok_or(DeliveryError::NoPreviewKey(
+                    "this destination has no stored-envelope key, so the excess detail of a \
+                     preview has no encrypted object to move into",
+                ))?;
                 let detail_id = EnvelopeId::new(Uuid::from_bytes(*uuid::Uuid::new_v4().as_bytes()));
-                let detail = preview::seal_preview(
-                    &self.preview_key,
-                    &target,
-                    detail_id,
-                    &body,
-                    TimestampMs::new(now_ms),
-                    notice.expires_at_ms,
+                let detail = kr_crypto::envelope::seal_envelope(
+                    &self.mailbox_key,
+                    &recipient,
+                    &kr_protocol::mailbox::EnvelopePlaintext {
+                        version: kr_protocol::mailbox::EnvelopeVersion::V1,
+                        envelope_id: detail_id,
+                        sender_key_id: kr_crypto::keys::key_id(
+                            kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+                            self.mailbox_key.public().as_bytes(),
+                        ),
+                        recipient_key_id: kr_crypto::keys::key_id(
+                            kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+                            recipient.as_bytes(),
+                        ),
+                        payload_type: kr_protocol::mailbox::MailboxPayloadType::StateReference,
+                        created_at_ms: TimestampMs::new(now_ms),
+                        expires_at_ms: notice.expires_at_ms,
+                        grant_id: Nullable::null(),
+                        environment_id: body.environment_id,
+                        session_id: body.session_id,
+                        session_epoch: Nullable::null(),
+                        thread_id: Nullable::null(),
+                        payload: kr_protocol::scalars::Bytes::new(body.canonical_bytes()?),
+                    },
                 )?;
                 self.journal.keep_object(
                     detail_id,
-                    &DestinationId::new(push.installation_id.to_string())?,
-                    &kr_cbor::to_canonical_vec(&detail.envelope)?,
+                    destination_id,
+                    &kr_cbor::to_canonical_vec(&detail)?,
                     notice.expires_at_ms,
                 )?;
                 let sealed = preview::seal_preview(
@@ -470,7 +708,7 @@ impl Producer {
         }
     }
 
-    fn produce_external(
+    fn build_external(
         &mut self,
         notice: &Notice,
         destination: &DestinationRecord,
@@ -478,7 +716,7 @@ impl Producer {
         lines: &[ContentLine],
         generation: u64,
         now_ms: u64,
-    ) -> Result<bool> {
+    ) -> Result<DeliveryRecord> {
         let external_destination = destination
             .as_external()
             .ok_or_else(|| DeliveryError::NoDestination(destination.id.to_string()))?;
@@ -501,7 +739,7 @@ impl Producer {
         let content = serde_json::to_vec(&message_json(&message))
             .map_err(|error| DeliveryError::Encoding(error.to_string()))?;
         let payload_bytes = content.len() as u64;
-        self.journal.admit(&DeliveryRecord {
+        Ok(DeliveryRecord {
             notification_id,
             event: notice.event.clone(),
             destination_id: destination.id.clone(),
@@ -514,8 +752,7 @@ impl Producer {
             attempts: 0,
             suppression: None,
             detail: None,
-        })?;
-        Ok(true)
+        })
     }
 
     /// Returns whether a result produced under `generation` may be published.
@@ -646,9 +883,42 @@ mod tests {
         Producer::new(
             DeliveryJournal::in_memory().expect("a journal"),
             NotificationPreviewKeyPair::generate().expect("a keypair"),
-            1_000,
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
         )
         .expect("a producer")
+    }
+
+    /// The scope every test in this module consumes under: one store, one cursor.
+    const SCOPE: &str = "session-1";
+
+    /// A push destination, with the two device keypairs a test needs to open what it built.
+    fn push_destination_with_keys(
+        id: &str,
+        previews_enabled: bool,
+        mailbox_key: Option<kr_crypto::keys::StoredEnvelopeKeyPair>,
+    ) -> (
+        DestinationRecord,
+        NotificationPreviewKeyPair,
+        Option<kr_crypto::keys::StoredEnvelopeKeyPair>,
+    ) {
+        let device = NotificationPreviewKeyPair::generate().expect("a keypair");
+        let record = DestinationRecord {
+            id: DestinationId::new(id).expect("an identifier"),
+            destination: Destination::Push(Box::new(PushDestination {
+                installation_id: InstallationId::new(Uuid::from_bytes([2; 16])),
+                sender_record_id: PushSenderRecordId::new(Uuid::from_bytes([3; 16])),
+                preview_keys: PreviewKeys::only(*device.public(), 1),
+                previews_enabled,
+                mailbox_key: mailbox_key.as_ref().map(|pair| *pair.public()),
+            })),
+            rule: Some(DeliveryRule {
+                name: "anything that wants a person".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        };
+        (record, device, mailbox_key)
     }
 
     fn push_destination(id: &str, previews_enabled: bool) -> DestinationRecord {
@@ -660,6 +930,11 @@ mod tests {
                 sender_record_id: PushSenderRecordId::new(Uuid::from_bytes([3; 16])),
                 preview_keys: PreviewKeys::only(*device.public(), 1),
                 previews_enabled,
+                mailbox_key: Some(
+                    *kr_crypto::keys::StoredEnvelopeKeyPair::generate()
+                        .expect("a keypair")
+                        .public(),
+                ),
             })),
             rule: Some(DeliveryRule {
                 name: "anything that wants a person".to_owned(),
@@ -705,8 +980,9 @@ mod tests {
     }
 
     fn take_the_event(producer: &mut Producer, notice: &Notice) {
+        let taken = notice.taken(7).expect("an event record");
         producer
-            .take(EventSource::Attention, &[notice.taken(7)], 7)
+            .take(EventSource::Attention, SCOPE, &[taken], 7, 1_000)
             .expect("a page");
     }
 
@@ -895,8 +1171,9 @@ mod tests {
             let mut notice = notice(1_000);
             notice.event =
                 EventKey::announcement(Some(session(1)), "attention.pending_approval/x", number);
+            let taken = notice.taken(number).expect("an event record");
             producer
-                .take(EventSource::Attention, &[notice.taken(number)], number)
+                .take(EventSource::Attention, SCOPE, &[taken], number, 1_000)
                 .expect("a page");
             producer
                 .produce(
@@ -960,6 +1237,192 @@ mod tests {
             ),
             Err(DeliveryError::Fenced)
         ));
+    }
+
+    #[test]
+    fn a_host_that_stopped_before_producing_finishes_the_event_on_the_next_pass() {
+        // The cursor has already moved past the event, so nothing upstream will offer it again.
+        // The notice committed with it is what makes the second transaction recoverable.
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        let destination = push_destination("phone", true);
+        let notice = notice(1_000);
+        {
+            let mut producer = Producer::new(
+                DeliveryJournal::open(&path).expect("a journal"),
+                NotificationPreviewKeyPair::generate().expect("a keypair"),
+                kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            )
+            .expect("a producer");
+            producer
+                .journal_mut()
+                .configure_destination(&destination)
+                .expect("a destination");
+            take_the_event(&mut producer, &notice);
+            // and then this host stops.
+        }
+        let mut producer = Producer::new(
+            DeliveryJournal::open(&path).expect("a journal"),
+            NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        )
+        .expect("a producer");
+        assert_eq!(
+            producer.journal().pending_events(10).expect("a read").len(),
+            1,
+            "the event is waiting, with the notice it was taken with"
+        );
+        let finished = producer
+            .finish_pending(
+                std::slice::from_ref(&destination),
+                &Everything(BTreeSet::new()),
+                2_000,
+            )
+            .expect("a recovery pass");
+        assert_eq!(finished.admitted, 1);
+        assert_eq!(producer.journal().deliveries().expect("a read").len(), 1);
+        assert!(
+            producer
+                .journal()
+                .pending_events(10)
+                .expect("a read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_event_that_warrants_no_notification_is_still_taken_and_still_finished() {
+        let mut producer = producer();
+        let key = EventKey::outbox(&Uuid::from_bytes([4; 16]));
+        producer
+            .take(
+                EventSource::WorkerOutbox,
+                SCOPE,
+                &[observed(key.clone(), 3, None, TimestampMs::new(900))],
+                3,
+                1_000,
+            )
+            .expect("a page");
+        assert_eq!(
+            producer.journal().pending_events(10).expect("a read").len(),
+            1
+        );
+        producer
+            .finish_pending(&[], &Everything(BTreeSet::new()), 1_000)
+            .expect("a recovery pass");
+        assert!(
+            producer
+                .journal()
+                .pending_events(10)
+                .expect("a read")
+                .is_empty(),
+            "an event nobody notifies about is still an event this journal has taken"
+        );
+        assert!(producer.journal().deliveries().expect("a read").is_empty());
+    }
+
+    #[test]
+    fn a_preview_that_does_not_fit_moves_its_detail_into_an_encrypted_object() {
+        let host_mailbox = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair");
+        let host_mailbox_public = *host_mailbox.public();
+        let mut producer = Producer::new(
+            DeliveryJournal::in_memory().expect("a journal"),
+            NotificationPreviewKeyPair::generate().expect("a keypair"),
+            host_mailbox,
+        )
+        .expect("a producer");
+        let device_mailbox = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair");
+        let (destination, device_preview, device_mailbox) =
+            push_destination_with_keys("phone", true, Some(device_mailbox));
+        let device_mailbox = device_mailbox.expect("the device's mailbox keypair");
+        producer
+            .journal_mut()
+            .configure_destination(&destination)
+            .expect("a destination");
+        let mut notice = notice(1_000);
+        // Long enough that the built provider payload is over the bound.
+        notice.summary = "x".repeat(1_400);
+        take_the_event(&mut producer, &notice);
+        let produced = producer
+            .produce(
+                &notice,
+                std::slice::from_ref(&destination),
+                &Everything(BTreeSet::new()),
+                &[],
+                1_000,
+            )
+            .expect("a notification");
+        assert_eq!(
+            produced.admitted, 1,
+            "the remedy is applied rather than the notification refused"
+        );
+        let record = producer.journal().deliveries().expect("a read").remove(0);
+        let request: PushDeliveryRequest =
+            serde_json::from_slice(record.content.as_ref().expect("a body")).expect("a request");
+        assert!(request.preview_is_well_formed());
+        let body = crate::preview::open_preview(
+            &device_preview,
+            producer.preview_public(),
+            request.preview.as_ref().expect("a preview"),
+            1_500,
+        )
+        .expect("the preview opens");
+        assert_eq!(body.summary, "", "the text moved out of the preview");
+        let detail_id = *body.detail_object.as_ref().expect("a reference");
+
+        // The detail is a mailbox object on this host, sealed to the device's stored-envelope key
+        // and not to its preview key, and it opens to the whole body.
+        let sealed: kr_protocol::mailbox::SealedEnvelope = kr_cbor::from_canonical_slice(
+            &producer
+                .journal()
+                .object(detail_id)
+                .expect("a read")
+                .expect("the object"),
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("a sealed envelope");
+        let opened = kr_crypto::envelope::open_envelope(
+            &device_mailbox,
+            &host_mailbox_public,
+            &sealed,
+            1_500,
+            |_| Ok(()),
+        )
+        .expect("the encrypted object opens");
+        let detail: PreviewBody =
+            kr_cbor::from_canonical_slice(opened.payload.as_slice(), &kr_cbor::Limits::DEFAULT)
+                .expect("the whole body");
+        assert_eq!(detail.summary.len(), 1_400, "nothing was trimmed");
+        assert!(record.payload_bytes < kr_protocol::push::MAX_PROVIDER_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn a_destination_with_no_encrypted_object_refuses_an_oversized_notification() {
+        let mut producer = producer();
+        let (destination, _, _) = push_destination_with_keys("phone", true, None);
+        producer
+            .journal_mut()
+            .configure_destination(&destination)
+            .expect("a destination");
+        let mut notice = notice(1_000);
+        notice.summary = "x".repeat(1_400);
+        take_the_event(&mut producer, &notice);
+        let produced = producer
+            .produce(
+                &notice,
+                std::slice::from_ref(&destination),
+                &Everything(BTreeSet::new()),
+                &[],
+                1_000,
+            )
+            .expect("a decision");
+        assert_eq!(produced.admitted, 0);
+        assert_eq!(produced.refused.len(), 1);
+        assert!(
+            produced.refused[0].1.contains("encrypted object"),
+            "the refusal says what is missing rather than trimming the text"
+        );
+        assert!(producer.journal().deliveries().expect("a read").is_empty());
     }
 
     #[test]

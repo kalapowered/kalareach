@@ -63,6 +63,13 @@ pub enum DeliveryError {
     /// A value could not be represented in KR-CBOR-1.
     #[error("a delivery record could not be encoded: {0}")]
     Encoding(String),
+    /// A source this producer consumes could not be read or acknowledged.
+    ///
+    /// The attention store and a worker's journal are other crates' stores. A failure in one of
+    /// them stops this pass rather than being absorbed: an announcement that was taken and not
+    /// settled is offered again, and that is the behaviour the sources are built for.
+    #[error("a delivery source could not be read: {0}")]
+    Source(String),
     /// Privacy mode is fencing this environment's content-bearing outboxes.
     ///
     /// Section 24 fences them *at once*, so a send offered after the fence is refused rather than

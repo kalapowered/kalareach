@@ -20,18 +20,28 @@
 //! that went backwards would then reorder them, and this ordering is not the kind that may depend
 //! on a clock.
 //!
+//! The event row carries the **notice** it was taken with, and a flag saying whether anything has
+//! been produced from it yet. That is what makes the second transaction recoverable rather than
+//! lost: a host that stops between the two comes back, finds the event unproduced, and produces
+//! from the notice it committed. Without the notice the cursor would have moved past an event
+//! nothing could rebuild.
+//!
 //! # One transaction per state transition
 //!
 //! [`DeliveryJournal::record_attempt`] writes the notification's new state, the attempt row that
-//! produced it, the outbox row that follows from it and the destination's spent budget in one
-//! immediate transaction. Splitting them would let a crash leave an attempt with no state, a state
-//! with no outbox row, or a spent allowance that nothing was sent under.
+//! produced it and the outbox row that follows from it in one immediate transaction, and
+//! [`DeliveryJournal::produce`] writes every notification an event produced, its outbox rows, the
+//! destination's spent allowance and the event's own completion in another. Splitting either would
+//! let a crash leave an attempt with no state, a state with no outbox row, or an allowance spent
+//! on a notification nothing admitted.
 //!
 //! # What is never written here
 //!
-//! A delivery credential's secret. The gateway returns it once, the host presents it as a bearer
-//! token, and this journal keeps its digest and nothing else: a secret in this file would be a
-//! secret in every backup of it and in everything that reads a destination.
+//! A delivery credential. The gateway returns one once, the host presents it as a bearer token,
+//! and it stays in memory behind [`crate::push::SenderCredentials`]. What this journal holds is
+//! the destination's `sender_record_id`, which names the authorisation and proves nothing: a
+//! secret in this file would be a secret in every backup of it and in everything that reads a
+//! destination.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -51,20 +61,40 @@ use crate::error::{DeliveryError, Result};
 /// The schema this build writes and reads.
 const SCHEMA_VERSION: i64 = 1;
 
+/// Every table a working journal has.
+///
+/// A store that has lost one of them is refused rather than recreated: an empty outbox and an
+/// empty privacy row say the opposite of what is true about a host that had work queued or a fence
+/// up.
+const REQUIRED_TABLES: [&str; 9] = [
+    "delivery_schema",
+    "delivery_consumers",
+    "delivery_events",
+    "delivery_destinations",
+    "delivery_notifications",
+    "delivery_attempts",
+    "delivery_outbox",
+    "delivery_objects",
+    "delivery_privacy",
+];
+
 /// How long a write waits for another connection to this file before it gives up.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The consumer name the attention announcements are taken under.
+/// The consumer prefix attention announcements are taken under.
 pub const ATTENTION_CONSUMER: &str = "kr-delivery/attention";
 
-/// The consumer name the worker outbox is taken under.
+/// The consumer prefix a worker outbox is taken under.
 ///
 /// It is what [`kr_worker::journal::Journal::note_outbox_consumed`] is registered with, because a
 /// consumer that has not registered has no claim on what collection removes.
 pub const OUTBOX_CONSUMER: &str = "kr-delivery/outbox";
 
 /// Which retained source one taken event came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum EventSource {
     /// An attention announcement, taken through `Attention::take_announcements`.
     Attention,
@@ -85,13 +115,20 @@ impl EventSource {
         }
     }
 
-    /// The consumer this source is taken under.
+    /// The consumer one store of this source is taken under.
+    ///
+    /// The scope is the store, not the source. Each session has its own journal and its own
+    /// attention store, and a cursor is a position in one of them: a cursor of 100 in one worker's
+    /// outbox says nothing about another worker's, whose records may start at one. One consumer
+    /// name for every store of a kind would hand a new session's records to a cursor that had
+    /// already passed them.
     #[must_use]
-    pub const fn consumer(self) -> &'static str {
-        match self {
+    pub fn consumer(self, scope: &str) -> String {
+        let prefix = match self {
             Self::Attention => ATTENTION_CONSUMER,
             Self::WorkerOutbox => OUTBOX_CONSUMER,
-        }
+        };
+        format!("{prefix}/{scope}")
     }
 
     /// Reads a stored name back.
@@ -109,7 +146,9 @@ impl EventSource {
 /// again if this host dies before it acknowledges the page. For the worker outbox that is the
 /// event's immutable identifier. For attention it is the session, the item key and the
 /// announcement's own never-reused number, which is exactly what T-037 says a consumer keys by.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct EventKey {
     source: EventSource,
     identity: String,
@@ -167,6 +206,23 @@ pub struct TakenEvent {
     ///
     /// It is the source's figure, kept so that a person can see when the thing happened. Nothing
     /// in this store decides an ordering from it.
+    pub recorded_at_ms: TimestampMs,
+    /// What this journal has to know to produce from the event, encoded by its caller.
+    ///
+    /// It is committed with the cursor, so a host that stops before producing comes back to a
+    /// notice it can still produce from. Without it the cursor would have moved past an event this
+    /// journal could no longer rebuild, and the source would not offer it again.
+    pub notice: Vec<u8>,
+}
+
+/// One event this journal took and has not produced anything from yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingEvent {
+    /// The event.
+    pub key: EventKey,
+    /// The notice it was taken with.
+    pub notice: Vec<u8>,
+    /// When the host recorded the underlying event, in UTC milliseconds.
     pub recorded_at_ms: TimestampMs,
 }
 
@@ -450,39 +506,88 @@ impl DeliveryJournal {
              PRAGMA synchronous=FULL;
              PRAGMA foreign_keys=ON;",
         )?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS delivery_schema (version INTEGER NOT NULL);",
-        )?;
         let recorded: Option<i64> = connection
             .query_row("SELECT version FROM delivery_schema LIMIT 1", [], |row| {
                 row.get(0)
             })
-            .optional()?;
+            .optional()
+            .unwrap_or(None);
         match recorded {
-            Some(version) if version == SCHEMA_VERSION => {}
-            Some(_) => {
-                return Err(DeliveryError::JournalUnreadable(
-                    "the delivery journal was written by another schema version",
-                ));
+            // A store this build wrote. It is checked rather than repaired: `CREATE TABLE IF NOT
+            // EXISTS` over a store that has lost a table would answer every read from an empty one,
+            // and an empty outbox and an empty privacy row say the opposite of what is true.
+            Some(version) if version == SCHEMA_VERSION => {
+                let journal = Self { connection };
+                journal.check_schema()?;
+                Ok(journal)
             }
+            Some(_) => Err(DeliveryError::JournalUnreadable(
+                "the delivery journal was written by another schema version",
+            )),
+            // A store with no version. It is created whole, in one transaction, so a store that
+            // exists is a store with every table and the singleton rows in it.
             None => {
-                connection.execute(
+                let transaction = connection
+                    .unchecked_transaction()
+                    .map_err(DeliveryError::from)?;
+                transaction.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS delivery_schema (version INTEGER NOT NULL);",
+                )?;
+                let present: Option<i64> = transaction
+                    .query_row("SELECT version FROM delivery_schema LIMIT 1", [], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                if present.is_some() {
+                    return Err(DeliveryError::JournalUnreadable(
+                        "the delivery journal gained a schema version while it was being created",
+                    ));
+                }
+                transaction.execute_batch(SCHEMA)?;
+                transaction.execute(
+                    "INSERT INTO delivery_privacy (id, generation, fenced) VALUES (0, 0, 0)",
+                    [],
+                )?;
+                transaction.execute(
                     "INSERT INTO delivery_schema (version) VALUES (?1)",
                     params![SCHEMA_VERSION],
                 )?;
+                transaction.commit()?;
+                let journal = Self { connection };
+                journal.check_schema()?;
+                Ok(journal)
             }
         }
-        connection.execute_batch(SCHEMA)?;
-        let journal = Self { connection };
-        journal.ensure_privacy_row()?;
-        Ok(journal)
     }
 
-    fn ensure_privacy_row(&self) -> Result<()> {
-        self.connection.execute(
-            "INSERT OR IGNORE INTO delivery_privacy (id, generation, fenced) VALUES (0, 0, 0)",
-            [],
-        )?;
+    /// Refuses a store that is missing a table or a singleton row this build depends on.
+    fn check_schema(&self) -> Result<()> {
+        for table in REQUIRED_TABLES {
+            let found: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if found.is_none() {
+                return Err(DeliveryError::JournalUnreadable(
+                    "the delivery journal is missing a table this build depends on",
+                ));
+            }
+        }
+        let privacy: Option<i64> = self
+            .connection
+            .query_row("SELECT 1 FROM delivery_privacy WHERE id = 0", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if privacy.is_none() {
+            return Err(DeliveryError::JournalUnreadable(
+                "the delivery journal has no privacy row, so it cannot say whether it is fenced",
+            ));
+        }
         Ok(())
     }
 
@@ -569,9 +674,10 @@ impl DeliveryJournal {
         for event in events {
             let changed = transaction.execute(
                 "INSERT INTO delivery_events
-                     (event_key, source, source_cursor, session_id, recorded_at_ms, taken_seq)
+                     (event_key, source, source_cursor, session_id, recorded_at_ms, taken_seq,
+                      notice, produced)
                  VALUES (?1, ?2, ?3, ?4, ?5,
-                         (SELECT COALESCE(MAX(taken_seq), 0) + 1 FROM delivery_events))
+                         (SELECT COALESCE(MAX(taken_seq), 0) + 1 FROM delivery_events), ?6, 0)
                  ON CONFLICT (event_key) DO NOTHING",
                 params![
                     event.key.stored(),
@@ -579,6 +685,7 @@ impl DeliveryJournal {
                     as_i64(event.source_cursor),
                     event.session_id.map(|id| id.to_string()),
                     as_i64(event.recorded_at_ms.get()),
+                    event.notice.as_slice(),
                 ],
             )?;
             taken += usize::from(changed > 0);
@@ -618,7 +725,7 @@ impl DeliveryJournal {
     /// [`DeliveryError::JournalUnreadable`] when a stored source is not one this build writes.
     pub fn events(&self) -> Result<Vec<TakenEvent>> {
         let mut statement = self.connection.prepare(
-            "SELECT event_key, source, source_cursor, session_id, recorded_at_ms
+            "SELECT event_key, source, source_cursor, session_id, recorded_at_ms, notice
                FROM delivery_events ORDER BY taken_seq",
         )?;
         let rows = statement.query_map([], |row| {
@@ -628,11 +735,12 @@ impl DeliveryJournal {
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
             ))
         })?;
         let mut events = Vec::new();
         for row in rows {
-            let (stored, source, cursor, session, recorded) = row?;
+            let (stored, source, cursor, session, recorded, notice) = row?;
             let source =
                 EventSource::from_stored(&source).ok_or(DeliveryError::JournalUnreadable(
                     "a stored event source is not one this build writes",
@@ -648,6 +756,7 @@ impl DeliveryJournal {
                 source_cursor: as_u64(cursor),
                 session_id: session.as_deref().and_then(|id| id.parse().ok()),
                 recorded_at_ms: TimestampMs::new(as_u64(recorded)),
+                notice: notice.unwrap_or_default(),
             });
         }
         Ok(events)
@@ -670,6 +779,7 @@ impl DeliveryJournal {
             previous_revision,
             previous_until,
             previews_enabled,
+            mailbox_key,
             endpoint,
             idempotency_field,
         ) = match &record.destination {
@@ -691,6 +801,7 @@ impl DeliveryJournal {
                     .as_ref()
                     .map(|previous| as_i64(previous.retired_until_ms.get())),
                 i64::from(push.previews_enabled),
+                push.mailbox_key.map(|key| key.as_bytes().to_vec()),
                 None,
                 None,
             ),
@@ -703,6 +814,7 @@ impl DeliveryJournal {
                 None,
                 None,
                 0,
+                None,
                 Some(external.endpoint.clone()),
                 match &external.idempotency {
                     Idempotency::Supported { field } => Some(field.clone()),
@@ -715,8 +827,8 @@ impl DeliveryJournal {
                  (destination_id, kind, enabled, configured_at_ms, rule_name, grant_id,
                   installation_id, sender_record_id, preview_key, preview_revision,
                   previous_preview_key, previous_preview_revision, previous_preview_until_ms,
-                  previews_enabled, endpoint, idempotency_field)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                  previews_enabled, mailbox_key, endpoint, idempotency_field)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT (destination_id) DO UPDATE SET
                  kind = excluded.kind,
                  enabled = excluded.enabled,
@@ -730,6 +842,7 @@ impl DeliveryJournal {
                  previous_preview_revision = excluded.previous_preview_revision,
                  previous_preview_until_ms = excluded.previous_preview_until_ms,
                  previews_enabled = excluded.previews_enabled,
+                 mailbox_key = excluded.mailbox_key,
                  endpoint = excluded.endpoint,
                  idempotency_field = excluded.idempotency_field",
             params![
@@ -750,6 +863,7 @@ impl DeliveryJournal {
                 previous_revision,
                 previous_until,
                 previews_enabled,
+                mailbox_key,
                 endpoint,
                 idempotency_field,
             ],
@@ -819,56 +933,127 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (reason, into, count, next) = suppression_columns(record.suppression.as_ref());
-        let written = transaction.execute(
-            "INSERT INTO delivery_notifications
-                 (notification_id, event_key, destination_id, state, privacy_generation,
-                  content, payload_bytes, expires_at_ms, admitted_at_ms, attempts,
-                  suppression_reason, suppression_into, suppression_count,
-                  suppression_next_ms, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?13, ?14, ?10)",
-            params![
-                record.notification_id.to_string(),
-                record.event.stored(),
-                record.destination_id.as_str(),
-                record.state.as_str(),
-                as_i64(record.privacy_generation),
-                record.content.as_deref(),
-                as_i64(record.payload_bytes),
-                as_i64(record.expires_at_ms.get()),
-                as_i64(record.admitted_at_ms.get()),
-                record.detail.as_deref(),
-                reason,
-                into,
-                count,
-                next,
-            ],
-        );
-        match written {
-            Ok(_) => {}
-            Err(error) if is_foreign_key_violation(&error) => {
-                // Two references, and the message says which is missing rather than making the
-                // caller guess: the event that was never taken, or the destination nobody wrote.
-                return Err(if transaction_has_event(&transaction, &record.event)? {
-                    DeliveryError::NoDestination(record.destination_id.to_string())
-                } else {
-                    DeliveryError::NoUnderlyingEvent(record.event.stored())
-                });
-            }
-            Err(error) => return Err(error.into()),
-        }
-        if !record.state.is_settled() {
-            transaction.execute(
-                "INSERT INTO delivery_outbox (notification_id, due_at_ms, attempt)
-                 VALUES (?1, ?2, 0)",
-                params![
-                    record.notification_id.to_string(),
-                    as_i64(record.admitted_at_ms.get())
-                ],
-            )?;
-        }
+        admit_in(&transaction, record)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Writes every notification one event produced, its allowance and the event's completion.
+    ///
+    /// One transaction, because they are one fact: this event has been produced from, these are
+    /// the notifications it produced, and this is what they spent. A crash before the commit
+    /// leaves the event unproduced and the allowance unspent, so the recovery pass produces from
+    /// it again and nothing is charged for a notification nobody admitted.
+    ///
+    /// It is idempotent by the event's own `produced` flag: an event this journal has already
+    /// produced from writes nothing and returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::Fenced`] when privacy mode has stopped this environment's outbox,
+    /// [`DeliveryError::LateResult`] when a record names a generation that is not in force,
+    /// [`DeliveryError::NoUnderlyingEvent`] when the event has not been taken, and
+    /// [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn produce(
+        &mut self,
+        event: &EventKey,
+        records: &[DeliveryRecord],
+        spent: &[(DestinationId, StoredBudget)],
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let taken: Option<i64> = transaction
+            .query_row(
+                "SELECT produced FROM delivery_events WHERE event_key = ?1",
+                params![event.stored()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match taken {
+            None => return Err(DeliveryError::NoUnderlyingEvent(event.stored())),
+            Some(produced) if produced != 0 => return Ok(false),
+            Some(_) => {}
+        }
+        for record in records {
+            admit_in(&transaction, record)?;
+        }
+        for (destination, budget) in spent {
+            record_budget_in(&transaction, destination, budget)?;
+        }
+        transaction.execute(
+            "UPDATE delivery_events SET produced = 1 WHERE event_key = ?1",
+            params![event.stored()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Returns the events this journal took and has produced nothing from, oldest first.
+    ///
+    /// A restart finishes these before it reads a new page: the cursor has already moved past
+    /// them, so nothing else will offer them again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn pending_events(&self, limit: usize) -> Result<Vec<PendingEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_key, source, notice, recorded_at_ms FROM delivery_events
+              WHERE produced = 0 ORDER BY taken_seq LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let (stored, source, notice, recorded) = row?;
+            let source =
+                EventSource::from_stored(&source).ok_or(DeliveryError::JournalUnreadable(
+                    "a stored event source is not one this build writes",
+                ))?;
+            let identity = stored
+                .split_once(':')
+                .map(|(_, identity)| identity.to_owned())
+                .ok_or(DeliveryError::JournalUnreadable(
+                    "a stored event key is not one this build writes",
+                ))?;
+            pending.push(PendingEvent {
+                key: EventKey { source, identity },
+                notice: notice.unwrap_or_default(),
+                recorded_at_ms: TimestampMs::new(as_u64(recorded)),
+            });
+        }
+        Ok(pending)
+    }
+
+    /// Drops a retired preview key whose outstanding notifications have all expired.
+    ///
+    /// Section 16 keeps a bounded previous preview key *only until outstanding notification
+    /// expiry*, and a bound nothing enforces is not a bound. This is the enforcement, and a
+    /// producer runs it on its own cadence.
+    ///
+    /// Returns how many destinations stopped holding one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn forget_expired_preview_keys(&mut self, now_ms: u64) -> Result<u64> {
+        let changed = self.connection.execute(
+            "UPDATE delivery_destinations
+                SET previous_preview_key = NULL,
+                    previous_preview_revision = NULL,
+                    previous_preview_until_ms = NULL
+              WHERE previous_preview_until_ms IS NOT NULL
+                AND previous_preview_until_ms <= ?1",
+            params![as_i64(now_ms)],
+        )?;
+        Ok(changed as u64)
     }
 
     /// Records one state transition, its attempt row and its outbox row together.
@@ -948,7 +1133,8 @@ impl DeliveryJournal {
     ///
     /// A fenced outbox returns nothing: privacy mode stops the queue reaching anything outside
     /// this host at once, and that is expressed by the read rather than by every caller
-    /// remembering to ask.
+    /// remembering to ask. Nor does a record admitted under an earlier generation, which is
+    /// content privacy mode has already walked past.
     ///
     /// # Errors
     ///
@@ -957,25 +1143,30 @@ impl DeliveryJournal {
         if self.is_fenced()? {
             return Ok(Vec::new());
         }
+        let generation = self.generation()?;
         let mut statement = self.connection.prepare(
             "SELECT n.notification_id, n.destination_id, n.attempts, n.expires_at_ms,
                     n.privacy_generation, n.content
                FROM delivery_outbox o JOIN delivery_notifications n
                  ON n.notification_id = o.notification_id
               WHERE o.due_at_ms <= ?1 AND n.content IS NOT NULL
+                AND n.privacy_generation = ?3
               ORDER BY o.due_at_ms, n.admitted_at_ms
               LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![as_i64(now_ms), limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-            ))
-        })?;
+        let rows = statement.query_map(
+            params![as_i64(now_ms), limit as i64, as_i64(generation)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )?;
         let mut due = Vec::new();
         for row in rows {
             let (identifier, destination, attempts, expires, generation, content) = row?;
@@ -1382,26 +1573,8 @@ impl DeliveryJournal {
         budget: &StoredBudget,
     ) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO delivery_budget
-                 (destination_id, burst_scaled, sustained_scaled, refilled_at_ms,
-                  collapse_into, collapse_opened_at_ms, collapse_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (destination_id) DO UPDATE SET
-                 burst_scaled = excluded.burst_scaled,
-                 sustained_scaled = excluded.sustained_scaled,
-                 refilled_at_ms = excluded.refilled_at_ms,
-                 collapse_into = excluded.collapse_into,
-                 collapse_opened_at_ms = excluded.collapse_opened_at_ms,
-                 collapse_count = excluded.collapse_count",
-            params![
-                destination_id.as_str(),
-                as_i64(budget.burst_scaled),
-                as_i64(budget.sustained_scaled),
-                as_i64(budget.refilled_at_ms),
-                budget.collapse_into.as_deref(),
-                budget.collapse_opened_at_ms.map(as_i64),
-                as_i64(budget.collapse_count),
-            ],
+            BUDGET_UPSERT,
+            rusqlite::params_from_iter(budget_params(destination_id, budget).iter()),
         )?;
         Ok(())
     }
@@ -1481,7 +1654,7 @@ pub struct StoredBudget {
 const DESTINATION_COLUMNS: &str = "SELECT destination_id, kind, enabled, configured_at_ms, \
      rule_name, grant_id, installation_id, sender_record_id, preview_key, preview_revision, \
      previous_preview_key, previous_preview_revision, previous_preview_until_ms, \
-     previews_enabled, endpoint, idempotency_field FROM delivery_destinations";
+     previews_enabled, mailbox_key, endpoint, idempotency_field FROM delivery_destinations";
 
 const NOTIFICATION_COLUMNS: &str = "SELECT notification_id, event_key, destination_id, state, \
      privacy_generation, content, payload_bytes, expires_at_ms, admitted_at_ms, attempts, \
@@ -1503,6 +1676,7 @@ type DestinationRow = (
     Option<i64>,
     Option<i64>,
     i64,
+    Option<Vec<u8>>,
     Option<String>,
     Option<String>,
 );
@@ -1525,6 +1699,7 @@ fn decode_destination(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Destin
         row.get(13)?,
         row.get(14)?,
         row.get(15)?,
+        row.get(16)?,
     );
     Ok(build_destination(columns))
 }
@@ -1545,6 +1720,7 @@ fn build_destination(columns: DestinationRow) -> Result<DestinationRecord> {
         previous_revision,
         previous_until,
         previews_enabled,
+        mailbox_key,
         endpoint,
         idempotency_field,
     ) = columns;
@@ -1586,6 +1762,13 @@ fn build_destination(columns: DestinationRow) -> Result<DestinationRecord> {
                 previous,
             },
             previews_enabled: previews_enabled != 0,
+            mailbox_key: mailbox_key
+                .map(|bytes| {
+                    <[u8; 32]>::try_from(bytes.as_slice())
+                        .map(kr_protocol::scalars::StoredEnvelopeKey::from_bytes)
+                        .map_err(|_| unreadable("a stored mailbox key is not 32 bytes"))
+                })
+                .transpose()?,
         }))
     } else {
         Destination::External(ExternalDestination {
@@ -1688,6 +1871,119 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
     })())
 }
 
+/// Writes one admitted record and its outbox row inside a transaction the caller owns.
+///
+/// The fence and the generation are read **here**, inside that transaction, rather than by the
+/// caller beforehand. A caller-side check has a window: privacy mode can fence between the check
+/// and the insert, and what lands afterwards is content the cleanup has already walked past.
+fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) -> Result<()> {
+    let (generation, fenced): (i64, i64) = transaction.query_row(
+        "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if fenced != 0 {
+        return Err(DeliveryError::Fenced);
+    }
+    if record.privacy_generation != as_u64(generation) {
+        return Err(DeliveryError::LateResult {
+            produced_under: record.privacy_generation,
+            in_force: as_u64(generation),
+        });
+    }
+    let (reason, into, count, next) = suppression_columns(record.suppression.as_ref());
+    let written = transaction.execute(
+        "INSERT INTO delivery_notifications
+             (notification_id, event_key, destination_id, state, privacy_generation,
+              content, payload_bytes, expires_at_ms, admitted_at_ms, attempts,
+              suppression_reason, suppression_into, suppression_count,
+              suppression_next_ms, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?13, ?14, ?10)",
+        params![
+            record.notification_id.to_string(),
+            record.event.stored(),
+            record.destination_id.as_str(),
+            record.state.as_str(),
+            as_i64(record.privacy_generation),
+            record.content.as_deref(),
+            as_i64(record.payload_bytes),
+            as_i64(record.expires_at_ms.get()),
+            as_i64(record.admitted_at_ms.get()),
+            record.detail.as_deref(),
+            reason,
+            into,
+            count,
+            next,
+        ],
+    );
+    match written {
+        Ok(_) => {}
+        Err(error) if is_foreign_key_violation(&error) => {
+            // Two references, and the message says which is missing rather than making the caller
+            // guess: the event that was never taken, or the destination nobody wrote.
+            return Err(if transaction_has_event(transaction, &record.event)? {
+                DeliveryError::NoDestination(record.destination_id.to_string())
+            } else {
+                DeliveryError::NoUnderlyingEvent(record.event.stored())
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if !record.state.is_settled() {
+        transaction.execute(
+            "INSERT INTO delivery_outbox (notification_id, due_at_ms, attempt)
+             VALUES (?1, ?2, 0)",
+            params![
+                record.notification_id.to_string(),
+                as_i64(record.admitted_at_ms.get())
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Writes one destination's spent allowance inside a transaction the caller owns.
+fn record_budget_in(
+    transaction: &rusqlite::Transaction<'_>,
+    destination_id: &DestinationId,
+    budget: &StoredBudget,
+) -> Result<()> {
+    transaction.execute(
+        BUDGET_UPSERT,
+        rusqlite::params_from_iter(budget_params(destination_id, budget).iter()),
+    )?;
+    Ok(())
+}
+
+/// The statement one destination's allowance is written with.
+const BUDGET_UPSERT: &str = "INSERT INTO delivery_budget \
+     (destination_id, burst_scaled, sustained_scaled, refilled_at_ms, \
+      collapse_into, collapse_opened_at_ms, collapse_count) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+     ON CONFLICT (destination_id) DO UPDATE SET \
+         burst_scaled = excluded.burst_scaled, \
+         sustained_scaled = excluded.sustained_scaled, \
+         refilled_at_ms = excluded.refilled_at_ms, \
+         collapse_into = excluded.collapse_into, \
+         collapse_opened_at_ms = excluded.collapse_opened_at_ms, \
+         collapse_count = excluded.collapse_count";
+
+/// The values that statement takes.
+fn budget_params(
+    destination_id: &DestinationId,
+    budget: &StoredBudget,
+) -> [Box<dyn rusqlite::ToSql>; 7] {
+    [
+        Box::new(destination_id.as_str().to_owned()),
+        Box::new(as_i64(budget.burst_scaled)),
+        Box::new(as_i64(budget.sustained_scaled)),
+        Box::new(as_i64(budget.refilled_at_ms)),
+        Box::new(budget.collapse_into.clone()),
+        Box::new(budget.collapse_opened_at_ms.map(as_i64)),
+        Box::new(as_i64(budget.collapse_count)),
+    ]
+}
+
 /// The four columns one suppression record is stored across.
 fn suppression_columns(
     suppression: Option<&PushSuppression>,
@@ -1781,7 +2077,9 @@ const SCHEMA: &str = "
         source_cursor INTEGER NOT NULL,
         session_id TEXT,
         recorded_at_ms INTEGER NOT NULL,
-        taken_seq INTEGER NOT NULL
+        taken_seq INTEGER NOT NULL,
+        notice BLOB,
+        produced INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS delivery_destinations (
         destination_id TEXT PRIMARY KEY,
@@ -1798,6 +2096,7 @@ const SCHEMA: &str = "
         previous_preview_revision INTEGER,
         previous_preview_until_ms INTEGER,
         previews_enabled INTEGER NOT NULL,
+        mailbox_key BLOB,
         endpoint TEXT,
         idempotency_field TEXT
     );
@@ -1863,12 +2162,14 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS delivery_outbox_due ON delivery_outbox (due_at_ms);
     CREATE INDEX IF NOT EXISTS delivery_notifications_state
         ON delivery_notifications (state);
+    CREATE INDEX IF NOT EXISTS delivery_events_unproduced
+        ON delivery_events (produced, taken_seq);
 ";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::destination::{Destination, ExternalDestination};
+    use crate::destination::{Destination, ExternalDestination, PreviewKeys, PushDestination};
 
     fn uuid(byte: u8) -> kr_protocol::scalars::Uuid {
         kr_protocol::scalars::Uuid::from_bytes([byte; 16])
@@ -1884,7 +2185,12 @@ mod tests {
             source_cursor: cursor,
             session_id: None,
             recorded_at_ms: TimestampMs::new(1_000),
+            notice: b"a notice".to_vec(),
         }
+    }
+
+    fn consumer() -> String {
+        EventSource::WorkerOutbox.consumer("session-1")
     }
 
     fn destination(id: &str) -> DestinationRecord {
@@ -1926,7 +2232,7 @@ mod tests {
     fn journal() -> DeliveryJournal {
         let mut journal = DeliveryJournal::in_memory().expect("a journal");
         journal
-            .register_consumer(OUTBOX_CONSUMER, 1)
+            .register_consumer(&consumer(), 1)
             .expect("registration");
         journal
             .configure_destination(&destination("hook"))
@@ -1950,7 +2256,7 @@ mod tests {
     fn taking_the_event_is_what_lets_a_notification_be_produced_from_it() {
         let mut journal = journal();
         journal
-            .take_events(OUTBOX_CONSUMER, &[taken(1, 7)], 7)
+            .take_events(&consumer(), &[taken(1, 7)], 7)
             .expect("a page");
         journal
             .admit(&delivery(9, event(1), "hook"))
@@ -1967,7 +2273,7 @@ mod tests {
     fn a_consumer_that_has_not_registered_cannot_take_a_page() {
         let mut journal = DeliveryJournal::in_memory().expect("a journal");
         let error = journal
-            .take_events(OUTBOX_CONSUMER, &[taken(1, 7)], 7)
+            .take_events(&consumer(), &[taken(1, 7)], 7)
             .expect_err("registration comes first");
         assert!(matches!(error, DeliveryError::NotAuthorised(_)));
     }
@@ -1977,19 +2283,19 @@ mod tests {
         let mut journal = journal();
         assert_eq!(
             journal
-                .take_events(OUTBOX_CONSUMER, &[taken(1, 5), taken(2, 6)], 6)
+                .take_events(&consumer(), &[taken(1, 5), taken(2, 6)], 6)
                 .expect("a page"),
             2
         );
         assert_eq!(
             journal
-                .take_events(OUTBOX_CONSUMER, &[taken(1, 5), taken(2, 6), taken(3, 7)], 7)
+                .take_events(&consumer(), &[taken(1, 5), taken(2, 6), taken(3, 7)], 7)
                 .expect("a page"),
             1,
             "the de-duplication record absorbs what was already taken"
         );
         let cursor = journal
-            .consumer_cursor(OUTBOX_CONSUMER)
+            .consumer_cursor(&consumer())
             .expect("a read")
             .expect("a registered consumer");
         assert_eq!(cursor.cursor, 7);
@@ -2000,14 +2306,14 @@ mod tests {
     fn a_cursor_never_goes_backwards() {
         let mut journal = journal();
         journal
-            .take_events(OUTBOX_CONSUMER, &[taken(1, 9)], 9)
+            .take_events(&consumer(), &[taken(1, 9)], 9)
             .expect("a page");
         journal
-            .take_events(OUTBOX_CONSUMER, &[taken(2, 3)], 3)
+            .take_events(&consumer(), &[taken(2, 3)], 3)
             .expect("a page");
         assert_eq!(
             journal
-                .consumer_cursor(OUTBOX_CONSUMER)
+                .consumer_cursor(&consumer())
                 .expect("a read")
                 .expect("a consumer")
                 .cursor,
@@ -2019,7 +2325,7 @@ mod tests {
     fn a_transition_writes_the_state_the_attempt_and_the_outbox_row_together() {
         let mut journal = journal();
         journal
-            .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
+            .take_events(&consumer(), &[taken(1, 1)], 1)
             .expect("a page");
         journal
             .admit(&delivery(9, event(1), "hook"))
@@ -2058,7 +2364,7 @@ mod tests {
     fn a_settled_transition_takes_the_delivery_out_of_the_outbox_and_keeps_the_record() {
         let mut journal = journal();
         journal
-            .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
+            .take_events(&consumer(), &[taken(1, 1)], 1)
             .expect("a page");
         journal
             .admit(&delivery(9, event(1), "hook"))
@@ -2093,7 +2399,7 @@ mod tests {
             .configure_destination(&destination("second"))
             .expect("a destination");
         journal
-            .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
+            .take_events(&consumer(), &[taken(1, 1)], 1)
             .expect("a page");
         journal
             .admit(&delivery(9, event(1), "hook"))
@@ -2115,13 +2421,13 @@ mod tests {
         let secret = {
             let mut journal = DeliveryJournal::open(&path).expect("a journal");
             journal
-                .register_consumer(OUTBOX_CONSUMER, 1)
+                .register_consumer(&consumer(), 1)
                 .expect("registration");
             journal
                 .configure_destination(&destination("hook"))
                 .expect("a destination");
             journal
-                .take_events(OUTBOX_CONSUMER, &[taken(1, 4)], 4)
+                .take_events(&consumer(), &[taken(1, 4)], 4)
                 .expect("a page");
             journal
                 .admit(&delivery(9, event(1), "hook"))
@@ -2144,7 +2450,7 @@ mod tests {
         let mut reopened = DeliveryJournal::open(&path).expect("a journal");
         assert_eq!(
             reopened
-                .consumer_cursor(OUTBOX_CONSUMER)
+                .consumer_cursor(&consumer())
                 .expect("a read")
                 .expect("a consumer")
                 .cursor,
@@ -2167,10 +2473,283 @@ mod tests {
     }
 
     #[test]
+    fn an_event_carries_the_notice_it_was_taken_with_until_something_is_produced_from_it() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 7)], 7)
+            .expect("a page");
+        let pending = journal.pending_events(10).expect("a read");
+        assert_eq!(pending.len(), 1, "the event is waiting to be produced from");
+        assert_eq!(pending[0].notice, b"a notice");
+        journal
+            .produce(&event(1), &[delivery(9, event(1), "hook")], &[])
+            .expect("produced");
+        assert!(
+            journal.pending_events(10).expect("a read").is_empty(),
+            "an event that has been produced from is no longer pending"
+        );
+    }
+
+    #[test]
+    fn producing_from_one_event_twice_writes_nothing_the_second_time() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 7)], 7)
+            .expect("a page");
+        assert!(
+            journal
+                .produce(&event(1), &[delivery(9, event(1), "hook")], &[])
+                .expect("produced")
+        );
+        assert!(
+            !journal
+                .produce(&event(1), &[delivery(8, event(1), "hook")], &[])
+                .expect("a second pass"),
+            "the event's own flag is what makes producing idempotent"
+        );
+        assert_eq!(journal.deliveries().expect("a read").len(), 1);
+    }
+
+    #[test]
+    fn producing_writes_the_notifications_and_what_they_spent_together() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 7)], 7)
+            .expect("a page");
+        let spent = StoredBudget {
+            burst_scaled: 11,
+            sustained_scaled: 22,
+            refilled_at_ms: 1_000,
+            collapse_into: None,
+            collapse_opened_at_ms: None,
+            collapse_count: 0,
+        };
+        journal
+            .produce(
+                &event(1),
+                &[delivery(9, event(1), "hook")],
+                &[(DestinationId::new("hook").expect("an identifier"), spent)],
+            )
+            .expect("produced");
+        assert_eq!(
+            journal
+                .budget(&DestinationId::new("hook").expect("an identifier"))
+                .expect("a read")
+                .expect("an allowance")
+                .burst_scaled,
+            11
+        );
+    }
+
+    #[test]
+    fn a_refused_notification_leaves_the_allowance_unspent_and_the_event_unproduced() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 7)], 7)
+            .expect("a page");
+        let mut unknown = delivery(9, event(1), "nowhere");
+        unknown.destination_id = DestinationId::new("nowhere").expect("an identifier");
+        let spent = StoredBudget {
+            burst_scaled: 11,
+            sustained_scaled: 22,
+            refilled_at_ms: 1_000,
+            collapse_into: None,
+            collapse_opened_at_ms: None,
+            collapse_count: 0,
+        };
+        assert!(
+            journal
+                .produce(
+                    &event(1),
+                    &[unknown],
+                    &[(DestinationId::new("hook").expect("an identifier"), spent)]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            journal
+                .budget(&DestinationId::new("hook").expect("an identifier"))
+                .expect("a read"),
+            None,
+            "nothing was charged for a notification nobody admitted"
+        );
+        assert_eq!(
+            journal.pending_events(10).expect("a read").len(),
+            1,
+            "the event is still waiting, so the recovery pass produces from it"
+        );
+    }
+
+    #[test]
+    fn nothing_is_admitted_while_the_outbox_is_fenced() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 7)], 7)
+            .expect("a page");
+        journal.fence(1).expect("a fence");
+        let mut record = delivery(9, event(1), "hook");
+        record.privacy_generation = 1;
+        assert!(
+            matches!(journal.admit(&record), Err(DeliveryError::Fenced)),
+            "the fence is read inside the admission transaction, not before it"
+        );
+    }
+
+    #[test]
+    fn a_record_from_an_earlier_generation_is_neither_admitted_nor_dispatched() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 7), taken(2, 8)], 8)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        // Privacy mode opens a generation and is then turned off again.
+        journal.fence(1).expect("a fence");
+        journal.lift_fence(1).expect("the fence lifts");
+        assert!(
+            journal.due(u64::MAX, 10).expect("a read").is_empty(),
+            "content admitted before the boundary is not offered after it"
+        );
+        assert!(
+            matches!(
+                journal.admit(&delivery(8, event(2), "hook")),
+                Err(DeliveryError::LateResult {
+                    produced_under: 0,
+                    in_force: 1
+                })
+            ),
+            "a producer that still holds the old generation is refused"
+        );
+    }
+
+    #[test]
+    fn two_stores_of_one_source_keep_separate_cursors() {
+        let mut journal = journal();
+        let first = EventSource::WorkerOutbox.consumer("session-1");
+        let second = EventSource::WorkerOutbox.consumer("session-2");
+        journal.register_consumer(&first, 1).expect("registration");
+        journal.register_consumer(&second, 1).expect("registration");
+        journal
+            .take_events(&first, &[taken(1, 100)], 100)
+            .expect("a page");
+        assert_eq!(
+            journal
+                .consumer_cursor(&second)
+                .expect("a read")
+                .expect("a consumer")
+                .cursor,
+            0,
+            "one worker's position is not another worker's"
+        );
+    }
+
+    #[test]
+    fn a_retired_preview_key_is_dropped_once_its_notifications_have_expired() {
+        let mut journal = journal();
+        let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+        let replaced = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+        let id = DestinationId::new("phone").expect("an identifier");
+        journal
+            .configure_destination(&DestinationRecord {
+                id: id.clone(),
+                destination: Destination::Push(Box::new(PushDestination {
+                    installation_id: InstallationId::new(uuid(5)),
+                    sender_record_id: PushSenderRecordId::new(uuid(6)),
+                    preview_keys: PreviewKeys::only(*replaced.public(), 1).rotated(
+                        *device.public(),
+                        2,
+                        Some(TimestampMs::new(9_000)),
+                    ),
+                    previews_enabled: true,
+                    mailbox_key: None,
+                })),
+                rule: Some(DeliveryRule {
+                    name: "anything".to_owned(),
+                    grant_id: None,
+                }),
+                enabled: true,
+                configured_at_ms: TimestampMs::new(1),
+            })
+            .expect("a destination");
+        assert_eq!(
+            journal.forget_expired_preview_keys(8_999).expect("a pass"),
+            0
+        );
+        assert!(
+            journal
+                .destination(&id)
+                .expect("a read")
+                .expect("a record")
+                .as_push()
+                .expect("a push destination")
+                .preview_keys
+                .previous
+                .is_some()
+        );
+        assert_eq!(
+            journal.forget_expired_preview_keys(9_000).expect("a pass"),
+            1
+        );
+        assert!(
+            journal
+                .destination(&id)
+                .expect("a read")
+                .expect("a record")
+                .as_push()
+                .expect("a push destination")
+                .preview_keys
+                .previous
+                .is_none(),
+            "the bound is enforced rather than trusted"
+        );
+    }
+
+    #[test]
+    fn a_store_that_has_lost_a_table_is_refused_rather_than_recreated() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        {
+            let mut journal = DeliveryJournal::open(&path).expect("a journal");
+            journal
+                .register_consumer(&consumer(), 1)
+                .expect("registration");
+        }
+        let connection = rusqlite::Connection::open(&path).expect("a connection");
+        connection
+            .execute_batch("DROP TABLE delivery_outbox;")
+            .expect("a table goes missing");
+        drop(connection);
+        assert!(
+            matches!(
+                DeliveryJournal::open(&path),
+                Err(DeliveryError::JournalUnreadable(_))
+            ),
+            "an empty outbox says the opposite of what is true"
+        );
+    }
+
+    #[test]
+    fn a_store_that_has_lost_its_privacy_row_is_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        drop(DeliveryJournal::open(&path).expect("a journal"));
+        let connection = rusqlite::Connection::open(&path).expect("a connection");
+        connection
+            .execute_batch("DELETE FROM delivery_privacy;")
+            .expect("the row goes missing");
+        drop(connection);
+        assert!(matches!(
+            DeliveryJournal::open(&path),
+            Err(DeliveryError::JournalUnreadable(_))
+        ));
+    }
+
+    #[test]
     fn a_fenced_outbox_offers_nothing_and_says_what_it_was_holding() {
         let mut journal = journal();
         journal
-            .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
+            .take_events(&consumer(), &[taken(1, 1)], 1)
             .expect("a page");
         journal
             .admit(&delivery(9, event(1), "hook"))
