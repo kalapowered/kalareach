@@ -106,7 +106,8 @@ configuration file this host reads.
 | unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
-operating-system lock on `.config.lock` beside the document, reads, validates, checks that the
+operating-system lock on `.config.lock` in the environment's state directory, reads, validates,
+checks that the
 document is still what it was and still says what it said, writes, puts the change where the things
 it restricts read it, and releases the lock. The lock lives in the open file handle, so a process
 that ends without releasing it releases it anyway and nothing has to guess from a timestamp whether

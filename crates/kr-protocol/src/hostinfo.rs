@@ -341,6 +341,17 @@ impl EffectiveConfiguration {
                 .iter()
                 .map(|path| redaction::redact(path))
                 .collect(),
+            // A reference is three names a person wrote, so all three go through the boundary. The
+            // store keeps the names it was given; only the exported copy changes.
+            secrets: self
+                .secrets
+                .iter()
+                .map(|reference| configuration::SecretReference {
+                    name: redaction::redact(&reference.name),
+                    store: redaction::redact(&reference.store),
+                    item: redaction::redact(&reference.item),
+                })
+                .collect(),
             ..self
         }
     }
@@ -1946,8 +1957,10 @@ pub mod configuration {
     /// configuration document and in the pairing record, and until they are there this host says
     /// so out loud.
     ///
-    /// The list is the whole of what this build reads from its own environment outside
-    /// [`ALLOWLIST`]. A name that is in neither table changes nothing here.
+    /// The list names what this build reads that decides something: a location, the login this
+    /// host describes, or a network selection. It is not an inventory of every variable a process
+    /// in this tree ever looks at, and it does not claim to be one. A name that is in neither this
+    /// table nor [`ALLOWLIST`] takes no part in the precedence.
     pub const UNGOVERNED: [UngovernedVariable; 22] = [
         UngovernedVariable {
             variable: "TMPDIR",
@@ -2181,6 +2194,27 @@ pub mod redaction {
         redact_opaque_runs(&userinfo)
     }
 
+    /// Returns a desktop context with every free-text field taken through [`redact`].
+    ///
+    /// The context travels beside the capability records, to a paired device, into `kr doctor`'s
+    /// output and into a support bundle. Three of its fields are strings the platform or the
+    /// account supplied rather than values this build chose: the operating-system user name, the
+    /// platform's own session identifier and the compositor's name. The context this host keeps
+    /// for its own comparisons is untouched.
+    #[must_use]
+    pub fn desktop_context(
+        context: crate::desktop::DesktopContext,
+    ) -> crate::desktop::DesktopContext {
+        crate::desktop::DesktopContext {
+            os_user: redact(&context.os_user),
+            platform_session: crate::scalars::Nullable(
+                context.platform_session.0.as_deref().map(redact),
+            ),
+            compositor: crate::scalars::Nullable(context.compositor.0.as_deref().map(redact)),
+            ..context
+        }
+    }
+
     /// Returns capability evidence with every free-text field taken through [`redact`].
     ///
     /// The one place capability records cross a boundary in a redacted form. A record's sentence
@@ -2253,10 +2287,16 @@ pub mod redaction {
             let value_end = text[value_start..]
                 .find(char::is_whitespace)
                 .map_or(text.len(), |offset| value_start + offset);
+            // A scheme written with a capital is the HTTP scheme wherever it appears, so its value
+            // goes whatever the value looks like. A scheme written in lower case may be the
+            // ordinary English word instead, so there the value has to look like a credential.
+            let written_as_a_scheme = text[found..after]
+                .chars()
+                .any(|character| character.is_ascii_uppercase());
             if own_word
                 && spacing > 0
                 && value_end > value_start
-                && carries_a_value(&text[value_start..value_end])
+                && (written_as_a_scheme || carries_a_value(&text[value_start..value_end]))
             {
                 out.push_str(&text[at..value_start]);
                 out.push_str(MARKER);
@@ -2270,17 +2310,17 @@ pub mod redaction {
         out
     }
 
-    /// Whether what follows a scheme word could be the credential rather than the next word.
+    /// Whether what follows an all-lower-case scheme word could be a credential.
     ///
-    /// Three of the four scheme words are also ordinary English, and matching them without regard
-    /// to case makes "the package digest is ..." look like a credential called `is`. A generated
-    /// credential is either long or carries something other than lower-case letters, and a word in
-    /// a sentence is neither, so this keeps the rule useful without it eating prose.
+    /// Every scheme word is also ordinary English, so "the package digest is 9f86…" would read as
+    /// a credential called `is` and "basic configuration is invalid" would lose the word a person
+    /// needs. A generated credential carries something other than lower-case letters; a word in a
+    /// sentence does not. This test applies only where the scheme was written in lower case: a
+    /// capital says the writer meant the scheme, and there the value goes whatever it looks like.
     fn carries_a_value(value: &str) -> bool {
-        value.chars().count() >= 8
-            || !value
-                .chars()
-                .all(|character| character.is_ascii_lowercase())
+        !value
+            .chars()
+            .all(|character| character.is_ascii_lowercase())
     }
 
     /// Returns true when `name` is a name whose value is a credential.
@@ -2419,6 +2459,26 @@ pub mod redaction {
     /// that already had quotes arrives once something has printed it inside another string, which
     /// is what a rejected value looks like in a parser's own error message; read as unquoted it
     /// would stop at the space and leave the second word where it was.
+    ///
+    /// That escaped form ends at the *last* escaped quote on its line rather than the first,
+    /// because one more layer of escaping puts an escaped quote inside the value and there is no
+    /// way to tell the two apart at this layer. Taking the longer span redacts more of a line that
+    /// already holds a credential, which is the side to be wrong on.
+    /// Whether another escaped quote follows `from` before the line ends.
+    fn another_escaped_quote(text: &[char], from: usize, quote: char) -> bool {
+        let mut at = from;
+        while at + 1 < text.len() {
+            if text[at] == '\n' || text[at] == '\r' {
+                return false;
+            }
+            if text[at] == '\\' && text[at + 1] == quote {
+                return true;
+            }
+            at += 1;
+        }
+        false
+    }
+
     fn value_span(text: &[char], mut start: usize, whole_line: bool) -> (usize, usize) {
         while start < text.len() && (text[start] == ' ' || text[start] == '\t') {
             start += 1;
@@ -2437,17 +2497,13 @@ pub mod redaction {
             let character = text[end];
             if let Some(quote) = quote {
                 if escaped {
-                    if character == '\\' {
-                        match text.get(end + 1) {
-                            Some(&next) if next == quote => break,
-                            Some(_) => {
-                                end = (end + 2).min(text.len());
-                                continue;
-                            }
-                            None => break,
-                        }
-                    }
                     if character == '\n' || character == '\r' {
+                        break;
+                    }
+                    if character == '\\'
+                        && text.get(end + 1) == Some(&quote)
+                        && !another_escaped_quote(text, end + 2, quote)
+                    {
                         break;
                     }
                     end += 1;
@@ -2676,11 +2732,59 @@ mod tests {
             let redacted = redaction::redact(text);
             assert!(!redacted.contains("hunter2"), "{text} -> {redacted}");
         }
+        // A scheme written with a capital takes its value whatever the value looks like, because a
+        // short lower-case secret is still a secret.
+        for text in ["Bearer secret", "BEARER secret", "Basic opensesame"] {
+            let redacted = redaction::redact(text);
+            assert!(!redacted.contains("secret"), "{text} -> {redacted}");
+            assert!(!redacted.contains("opensesame"), "{text} -> {redacted}");
+        }
         // The scheme has to be its own word: a name that merely ends in one is not a scheme, and
-        // a scheme with nothing after it has no value to take.
-        for kept in ["subscriber hunter2", "Bearer", "Bearer "] {
+        // a scheme with nothing after it has no value to take. A scheme word written in lower
+        // case in the middle of a sentence is the English word, and the sentence survives.
+        for kept in [
+            "subscriber hunter2",
+            "Bearer",
+            "Bearer ",
+            "digest mismatch",
+            "basic configuration is invalid",
+            "the package digest is 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ] {
             assert_eq!(redaction::redact(kept), kept, "{kept} names no credential");
         }
+    }
+
+    /// KR-REQ-26.44: one more layer of escaping does not leave half a value behind.
+    #[test]
+    fn a_value_escaped_more_than_once_is_taken_whole() {
+        let text = r#"invalid type: string "password=\"two \\\" secret words\"", expected u64"#;
+        let redacted = redaction::redact(text);
+        for gone in ["secret", "words"] {
+            assert!(!redacted.contains(gone), "{text} -> {redacted}");
+        }
+        assert!(
+            redacted.contains("expected u64"),
+            "and the diagnostic survives: {redacted}"
+        );
+    }
+
+    /// KR-REQ-26.44: a secure-store reference is three names, and all three cross the boundary.
+    #[test]
+    fn a_secret_reference_crosses_the_boundary_with_everything_else() {
+        let mut configuration = EffectiveConfiguration::unread();
+        configuration.secrets.push(configuration::SecretReference {
+            name: "relay".to_owned(),
+            store: "login_keychain".to_owned(),
+            item: "password=A1b2C3d4E5f6G7h8I9j0".to_owned(),
+        });
+        let result = HostDoctorResult::new(Vec::new(), configuration);
+        let reference = result.configuration.secrets.first().expect("the reference");
+        assert!(
+            !reference.item.contains("A1b2C3d4E5f6"),
+            "{}",
+            reference.item
+        );
+        assert_eq!(reference.name, "relay", "and the name it is known by stays");
     }
 
     /// KR-REQ-26.44: a public word excuses a key, and only a name that says nothing else.

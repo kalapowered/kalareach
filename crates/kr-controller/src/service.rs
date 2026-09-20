@@ -304,9 +304,9 @@ pub struct Controller {
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the
     /// session number admission enforces is in the registry, not in the document. This is what
-    /// keeps the two the same fact. Every revision is accepted through one path, in order, and a
-    /// revision below this one applies nothing, so a document restored from a backup underneath a
-    /// running host cannot put an old ceiling back.
+    /// keeps the two the same fact. Every revision is accepted through one path, and holding this
+    /// across the read and the effects is what puts them in order: two acceptances cannot
+    /// interleave, so the one that finishes last is the one that read the document on disk.
     accepted_configuration: Mutex<u64>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
@@ -412,8 +412,19 @@ struct SessionDemand {
 /// The desktop this host has, and how old the reading is.
 #[derive(Debug)]
 struct DesktopReading {
-    /// The context, as last read.
+    /// The desktop this machine actually has, labelled with the execution context the
+    /// configuration resolves to.
+    ///
+    /// What a desktop-bound create is checked against, because whether a desktop is there is a
+    /// fact about the machine rather than a preference.
     context: DesktopContext,
+    /// The same reading taken in the resolved execution context, which is what the capability
+    /// evidence is about.
+    ///
+    /// A headless context takes no login session, so it has no desktop session, no display server
+    /// and no graphical access. Evidence that said `headless_user` while carrying a desktop's
+    /// identity would describe a worker this host never creates.
+    evidence: DesktopContext,
     /// The revision the capability records of this context are evidence for.
     ///
     /// It advances whenever the evidence changes: a new login, a tool installed or replaced, a
@@ -567,7 +578,7 @@ impl Controller {
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
-        let initial_desktop = resolved_desktop(&paths, &boot);
+        let (initial_desktop, initial_evidence) = resolved_desktop(&paths, &boot);
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -610,6 +621,7 @@ impl Controller {
             presentations: Mutex::new(std::collections::HashMap::new()),
             desktop: Mutex::new(DesktopReading {
                 context: initial_desktop,
+                evidence: initial_evidence,
                 revision: recorded_revision.unwrap_or_else(|| CapabilityRevision::new(0)),
                 durable_revision: recorded_revision.is_some(),
                 records: Vec::new(),
@@ -3991,10 +4003,19 @@ impl Controller {
     async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
         let mut reading = self.desktop.lock().await;
         if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
-            reading.context = resolved_desktop(&self.paths, &self.boot_identity);
+            let (context, evidence) = resolved_desktop(&self.paths, &self.boot_identity);
+            reading.context = context;
+            reading.evidence = evidence;
             reading.read_at = std::time::Instant::now();
         }
         (reading.context.clone(), reading.revision)
+    }
+
+    /// Returns the context this host's capability evidence is about, and its revision.
+    async fn desktop_evidence(&self) -> (DesktopContext, CapabilityRevision) {
+        let _ = self.desktop().await;
+        let reading = self.desktop.lock().await;
+        (reading.evidence.clone(), reading.revision)
     }
 
     /// Builds the capability report for this host's desktop, at its current revision.
@@ -4015,7 +4036,7 @@ impl Controller {
     /// evidence was described by: one revision would then describe two different answers, and an
     /// action that had bound to the first would find its binding current.
     async fn capability_report(&self) -> Result<kr_protocol::desktop::DesktopCapabilityReport> {
-        let (context, revision) = self.desktop().await;
+        let (context, revision) = self.desktop_evidence().await;
         let mut report =
             crate::desktop::capabilities(self.paths.environment_id(), context, revision);
         // The comparison and the revision it decides are one hold of this lock. Two reports
@@ -4321,6 +4342,7 @@ impl Controller {
         // repeats what that binary printed; the evidence this host keeps for its own comparisons
         // is untouched, because a redacted path is no longer a path it can compare.
         desktop.records = kr_protocol::hostinfo::redaction::capability_records(desktop.records);
+        desktop.desktop = kr_protocol::hostinfo::redaction::desktop_context(desktop.desktop);
         encode(&EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             // The same answer `host.info` gives: what this host creates a session in when the
@@ -4455,7 +4477,9 @@ impl Controller {
     /// The one ordered path, and the whole of the ordering is this lock: it is taken *before* the
     /// document is read, so an edit applying its own effects and a reader accepting what it found
     /// cannot interleave, and whichever of them runs last is the one that read the document that
-    /// is actually on disk. A revision already accepted has nothing left to put anywhere.
+    /// is actually on disk. The effects are applied on every acceptance rather than only when the
+    /// revision number moved, because a document edited by hand can change what it says without
+    /// changing what it calls itself.
     ///
     /// # Errors
     ///
@@ -4464,9 +4488,6 @@ impl Controller {
         let mut accepted = self.accepted_configuration.lock().await;
         let resolver = self.configuration();
         let revision = resolver.revision();
-        if revision == *accepted {
-            return Ok(revision);
-        }
         self.apply_effects(&resolver).await?;
         *accepted = revision;
         Ok(revision)
@@ -4474,14 +4495,18 @@ impl Controller {
 
     /// Puts one reading of the document's ceilings where the things they restrict read them.
     ///
-    /// Only what the document actually names. A document that says nothing about the session
-    /// number, and one this build cannot read, leaves the number admission already enforces
-    /// exactly as it is: a restriction the owner accepted must not be lifted because a later build
-    /// could not read the file it was in.
+    /// A document this host can read decides the number admission enforces, whether it names one
+    /// or leaves it to the product default: both are things the document says. A document that is
+    /// absent, and one this build cannot read, says nothing, and then the number admission already
+    /// enforces stays exactly as it is: a restriction the owner accepted must not be lifted
+    /// because a later build could not read the file it was in.
     async fn apply_effects(&self, resolver: &kr_worker::config::Resolver) -> Result<()> {
-        if let Some(limit) = crate::config::configured_session_limit(resolver, self.hard_limits()) {
-            self.registry.lock().await.set_session_limit(limit)?;
+        if resolver.status().state != kr_protocol::hostinfo::configuration::DocumentState::Loaded {
+            return Ok(());
         }
+        let limit =
+            crate::config::ceilings::session_limit(&resolver.ceilings(), self.hard_limits()).value;
+        self.registry.lock().await.set_session_limit(limit)?;
         Ok(())
     }
 
@@ -6434,25 +6459,33 @@ const fn forwarded_to_worker(method: Method) -> bool {
 /// record that is there and cannot be read says nothing at all, and `None` is that: this host then
 /// serves revision zero, which claims nothing, rather than starting again from one and handing out
 /// a revision it may already have used.
-/// Reads the desktop this host has, in the execution context its configuration resolves to.
+/// Reads the desktop this host has, and the evidence its resolved execution context has.
 ///
-/// The platform reading comes first, because what the platform offers is what decides the default
-/// this configuration may then override. When the resolved context is not the one the reading was
-/// taken in, the reading is taken again in that context instead of having its label changed: a
-/// headless context has no desktop session, no display server and no graphical access, and
-/// evidence that said `headless_user` while still carrying a desktop's identity would describe a
-/// worker nobody can create here.
-fn resolved_desktop(paths: &EnvironmentPaths, boot: &BootIdentity) -> DesktopContext {
-    let physical = crate::desktop::current(boot.clone());
+/// Two readings, because they answer two different questions. The first is what this machine has:
+/// a desktop-bound create is refused when there is no desktop, and that is a fact about the
+/// machine whatever the configuration prefers. The second is what a session created here would
+/// actually get, which is the reading taken in the resolved context rather than the machine's
+/// reading with a different label on it: a headless context takes no login session, so it has no
+/// desktop session, no display server and no graphical access.
+///
+/// The platform reading comes first either way, because what the platform offers decides the
+/// default the configuration may then override.
+fn resolved_desktop(
+    paths: &EnvironmentPaths,
+    boot: &BootIdentity,
+) -> (DesktopContext, DesktopContext) {
+    let mut physical = crate::desktop::current(boot.clone());
     let platform = crate::desktop::default_profile(&physical);
     let resolved = crate::config::open(paths)
         .worker_profile(None, platform)
         .value;
-    if resolved == physical.worker_profile {
-        physical
+    let evidence = if resolved == physical.worker_profile {
+        physical.clone()
     } else {
         kr_worker::desktop::context(resolved, boot.clone())
-    }
+    };
+    physical.worker_profile = resolved;
+    (physical, evidence)
 }
 
 fn capability_revision(paths: &EnvironmentPaths) -> Option<CapabilityRevision> {
