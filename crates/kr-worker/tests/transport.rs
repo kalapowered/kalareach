@@ -1846,6 +1846,126 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
     served.drained.abort();
 }
 
+/// KR-REQ-11.27 and KR-REQ-12.11: a claim is given back when the upstream resolves underneath it.
+///
+/// A rich answer claims the resource before it dispatches. The upstream can withdraw its own
+/// request in that window, and one of the two has to lose: what must not happen is a resource
+/// that ends resolved with a claim still on it, or a claim released against a resource the claim
+/// never held. Whichever wins, the chain the outbox holds ends terminal and the claim does not
+/// outlive it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_27_a_claim_is_given_back_when_the_upstream_resolves_underneath_it() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let owner = Arc::clone(&served.owner);
+    let mut client = tokio::io::BufReader::new(served.client);
+    let answered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream_reader = acknowledge(served.upstream, Arc::clone(&answered));
+
+    owner
+        .from_upstream(
+            br#"{"id":95,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut client).await;
+    let resource_id = broker
+        .pending_resources()
+        .into_iter()
+        .find(|resource| resource.state == PendingState::Pending)
+        .expect("the request is recorded")
+        .resource_id;
+    broker
+        .interpret(
+            binding(),
+            resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the interpretation is verified");
+    let dispatch = owner.dispatch().expect("the link carries operations");
+    broker.bind_connection_dispatch(GatewayConnectionId::new(1), dispatch);
+
+    // A rich answer and the upstream's own withdrawal, at once.
+    let claiming = {
+        let broker = Arc::clone(&broker);
+        tokio::spawn(async move {
+            broker
+                .agent_approval_respond(
+                    &kr_worker::broker::Caller {
+                        actor_id: ActorId::new("device-1").expect("valid"),
+                        grant_id: None,
+                    },
+                    &kr_protocol::agent::AgentApprovalRespondParams {
+                        target: target(),
+                        resource_id,
+                        option_id: "allow".to_owned(),
+                    },
+                    TimestampMs::new(4),
+                )
+                .await
+        })
+    };
+    let withdrawing = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            owner
+                .from_upstream(
+                    br#"{"id":95,"result":{"outcome":"deny"}}"#,
+                    TimestampMs::new(5),
+                )
+                .await
+        })
+    };
+    let rich = claiming.await.expect("the rich task finished");
+    let upstream = withdrawing.await.expect("the upstream task finished");
+    assert!(
+        rich.is_ok() || upstream.is_ok(),
+        "one of the two settled it"
+    );
+
+    let settled = settled_within(&broker, resource_id, std::time::Duration::from_secs(20))
+        .await
+        .expect("the resource reaches a state nothing follows");
+    assert!(settled.is_terminal());
+    let held = broker.pending(resource_id).expect("it is still readable");
+    assert!(
+        held.state.is_terminal(),
+        "a resource nothing can answer any more is not one a claim still holds: {:?}",
+        held.state
+    );
+
+    // The chain says the same: a claim that was taken was given back or carried into the
+    // settlement, and the last event about the resource is the terminal one.
+    let recorded = broker.transitions_after(0).expect("the outbox reads");
+    let chain: Vec<&kr_worker::broker::TransitionEvent> = recorded
+        .iter()
+        .filter(|event| event.resource_id == resource_id)
+        .collect();
+    assert!(
+        chain
+            .last()
+            .expect("the resource has events")
+            .state
+            .is_terminal(),
+        "the chain ends where the resource did: {chain:?}"
+    );
+    if let Some(position) = chain
+        .iter()
+        .position(|event| event.cause == kr_worker::broker::TransitionCause::RichClaim)
+    {
+        assert!(
+            position + 1 < chain.len(),
+            "a claim is never the last thing that happened to a resource"
+        );
+    }
+
+    upstream_reader.abort();
+    served.drained.abort();
+}
+
 /// KR-REQ-12.11: a second gateway joins the observers of the first rather than replacing them.
 ///
 /// The registry is the broker's, so binding another endpoint against the same broker adds its
