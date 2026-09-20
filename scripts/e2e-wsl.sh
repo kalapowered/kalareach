@@ -42,7 +42,8 @@ fi
 
 artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
 mkdir -p "$artifacts"
-run_dir="$(mktemp -d "${TMPDIR:-/tmp}/kr-wsl.XXXXXX")"
+run_dir="$artifacts/wsl-$(date -u '+%Y%m%dT%H%M%SZ')"
+mkdir -p "$run_dir"
 helper_path="${KR_WSL_HELPER:-/usr/local/bin/kr}"
 linux_user="${KR_WSL_USER:-root}"
 second_name="${KR_WSL_SECOND:-kr-acc-011}"
@@ -102,7 +103,7 @@ cleanup() {
     fi
     wsl.exe --shutdown >/dev/null 2>&1 || true
   fi
-  rm -rf "${run_dir:?}"
+  echo "evidence kept under $run_dir"
   exit "$status"
 }
 trap cleanup EXIT
@@ -264,7 +265,7 @@ for distribution in "$first" "$second"; do
   fi
   # A session of the distribution's own: its worker is a Linux process with Linux paths, and
   # nothing on the Windows side takes part in it.
-  session="$(inside "$distribution" "'$helper_path' --json new --command /bin/sh" | compact)"
+  session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)"
   case "$session" in
     *'"session_id":"'*) : ;;
     *) fail "$distribution could not create a session of its own: $session" ;;
@@ -277,7 +278,10 @@ for distribution in "$first" "$second"; do
   worker_pid="$(inside "$distribution" 'pgrep -n kr-worker || true')"
   [[ "$worker_pid" =~ ^[0-9]+$ ]] ||
     fail "$distribution runs no worker for the session it created"
-  inside "$distribution" "'$helper_path' close --all" >/dev/null 2>&1 || true
+  created="$(printf '%s' "$session" | grep -o '"session_id":"[0-9a-f-]*"' | head -n 1 | cut -d'"' -f4)"
+  [ -n "$created" ] || fail "$distribution did not name the session it created"
+  inside "$distribution" "'$helper_path' close $created" >/dev/null ||
+    fail "$distribution could not close the session it created"
 done
 pass "Linux paths, binaries and process identifiers stay local to each distribution"
 
@@ -342,8 +346,8 @@ pass "each distribution answered the bridge with its own environment identity"
 for pair in "$first:$first_id" "$second:$second_id"; do
   distribution="${pair%%:*}"
   recorded="${pair##*:}"
-  reported="$(inside "$distribution" "'$helper_path' --json doctor" |
-    tr ',' '\n' | grep -o '"environment_id":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+  reported="$(inside "$distribution" "'$helper_path' --json doctor" | compact |
+    grep -o '"environment_id":"[0-9a-f-]*"' | head -n 1 | cut -d'"' -f4 || true)"
   if [ -n "$reported" ] && [ "$reported" != "$recorded" ]; then
     fail "$distribution reports environment $reported and the enrolment recorded $recorded"
   fi
@@ -383,30 +387,40 @@ sleep 2
 "$kr_exe" --json bridge list >"$run_dir/list-while-stopped.json" 2>&1 ||
   fail "the listing failed: $(cat "$run_dir/list-while-stopped.json")"
 listing="$(compact <"$run_dir/list-while-stopped.json")"
-# The row for the stopped distribution, as one string: its identity, the status that was last
-# observed, and the fact that this came from the cache rather than from asking the platform.
-case "$listing" in
-  *"\"environment_id\":\"$second_id\""*) : ;;
-  *) fail "the stopped distribution is missing from the listing: $listing" ;;
-esac
-case "$listing" in
+# The row for the stopped distribution alone: everything after its identity up to the end of that
+# row. Another row's source or status cannot satisfy these.
+row="${listing#*\"environment_id\":\""$second_id"\"}"
+[ "$row" != "$listing" ] ||
+  fail "the stopped distribution is missing from the listing: $listing"
+row="${row%%\},\{\"enrolment\"*}"
+case "$row" in
   *'"observation":"cache"'*) : ;;
-  *) fail "the listing did not report its rows as cached: $listing" ;;
+  *) fail "the stopped distribution's row is not from the cache: $row" ;;
 esac
-case "$listing" in
-  *'"status":"running","observation":"refresh"'*)
-    fail "the listing reported a live observation: $listing"
-    ;;
-  *) : ;;
+case "$row" in
+  *'"status":"environment_stopped"'* | *'"status":"stale"'*) : ;;
+  *) fail "the stopped distribution's row does not say it is stopped or stale: $row" ;;
+esac
+case "$row" in
+  *'"last_observed_at_ms":'*) : ;;
+  *) fail "the stopped distribution's row carries no observation time: $row" ;;
 esac
 [ "$(state_of "$second")" = "Stopped" ] ||
   fail "the listing started $second, which a listing must never do"
 pass "the listing reported the stopped distribution from the cache and started nothing"
 
-refresh_and_check second "$second_id" --start
+# Starting the distribution again is one step; the daemon inside it is another, because stopping a
+# distribution ends every process in it. The refresh below starts the distribution, and the bridge
+# is checked once that distribution is serving again.
+"$kr_exe" --json bridge refresh second --start >"$run_dir/refresh-start.json" 2>&1 ||
+  fail "the refresh that was told to start failed: $(cat "$run_dir/refresh-start.json")"
 [ "$(state_of "$second")" = "Running" ] ||
   fail "the refresh that was told to start did not start $second"
-pass "a refresh that was told to start the distribution started it and reached it"
+pass "a refresh that was told to start the distribution started it"
+
+start_daemon_inside "$second"
+refresh_and_check second "$second_id"
+pass "the bridge reaches the distribution that was started again"
 
 # ---------------------------------------------------------------------------------------------
 step "6. NAT and mirrored networking"

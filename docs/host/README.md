@@ -938,11 +938,14 @@ this host from the network is refused before an argument vector is built, and th
 the same handshake again on its own side. A remote client reaches the distribution through the
 distribution's own paired endpoint, which it has.
 
-The ingress the request originally arrived on travels in the opening frame, so what the
-destination records is where the request entered rather than the local IPC hop the helper made
-there. There is no arrangement of hops that turns a network device into a local owner, and a
-request that has already crossed one bridge is refused a second rather than chained: a federated
-proxy is not part of this version.
+The ingress the request originally arrived on travels in the opening frame, and the helper reads it
+to decide whether this bridge may carry the request at all. A remote origin is refused there, on
+the destination's own side, so no arrangement of hops turns a network device into a local owner.
+
+A request crosses at most one bridge. A handshake that says the request has already been bridged is
+refused, and so is a carried request that would open a bridge of its own: the destination serves
+what arrives over the helper's local connection as an ordinary local request, so the rule is kept at
+the hop that knows one was crossed. A federated proxy is not part of this version.
 
 ### The enrolled environments, and the cached inventory
 
