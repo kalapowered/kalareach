@@ -70,10 +70,7 @@ pub const LIVENESS_COMMAND: &str = "echo kr-answering";
 pub const LIVENESS_MARKER: &str = "kr-answering";
 
 /// How long a session waits, over all its probes, for an editor to say it is reading.
-const READINESS: Duration = Duration::from_secs(30);
-
-/// How long one report of that wait is waited for before the probe is drawn again.
-const READINESS_STEP: Duration = Duration::from_secs(6);
+const READINESS: Duration = Duration::from_secs(45);
 
 /// Where a probe left the reader: the prompt its report carried, and the buffer revision with it.
 ///
@@ -897,33 +894,43 @@ impl Session {
         session
     }
 
-    /// Waits until this editor is reading the terminal itself, where one has to be waited for.
+    /// Waits until this editor is reading the terminal itself, before a key is offered to it.
     ///
     /// An editor that takes the terminal out of its own line mode reads a key as the key it binds.
     /// One typed before it takes the terminal goes through the terminal's own line discipline
-    /// instead, which holds it until a line ends, so a chord sent a moment early is lost. A person
-    /// waits for the prompt; against such an editor this session waits for the reader's own word
-    /// that it is inside its read, which is a different thing from the prompt being on the screen.
+    /// instead: an ordinary character waits there and reaches the editor when it takes over, but
+    /// the end-of-file character is the line discipline's own and is answered by the terminal
+    /// rather than held for anybody. A key of that kind offered a moment early is gone, whichever
+    /// of these four readers it was meant for.
     ///
-    /// That word is [`readiness_of`]'s rule, and nothing here infers it from a length of silence
-    /// or from a report that could belong to another prompt. The three other readers need no such
-    /// wait: their editors read what the terminal's line discipline held for them while the shell
-    /// was busy, so a key offered a moment early reaches them at the read it was meant for rather
-    /// than being lost. [`Dialect::types_at_the_prompt`] is where that difference is recorded.
+    /// So no session here offers a key until the reader has said, in a report of its own, that it
+    /// is inside the read the key is meant for. Nothing infers it from a length of silence or from
+    /// a report that could belong to another prompt.
+    ///
+    /// The three native readers write their idle report from inside the editor's own read loop,
+    /// where it is about to wait for a key and the terminal is already in the editor's modes, so
+    /// one report of theirs is the proof. The fourth writes its first report of a prompt before it
+    /// calls `ReadLine`, so there a probe is drawn and [`readiness_of`] decides the reports that
+    /// follow it.
     ///
     /// # Panics
     ///
     /// Panics when the shell draws no prompt at all, and when the reader never says it is inside
-    /// its read at the prompt it was probed at.
+    /// the read this waited for.
     pub fn ensure_reading(&mut self) {
+        let deadline = Instant::now() + READINESS;
         if !dialect(self.package_kind).types_at_the_prompt {
+            assert!(
+                self.a_native_reader_reports_itself_reading(deadline),
+                "the reader never reported itself inside its own read:\n{}",
+                self.terminal_output()
+            );
             return;
         }
-        let deadline = Instant::now() + READINESS;
         let mut probes = 0;
         while Instant::now() < deadline {
             probes += 1;
-            if self.probe_for_a_reading_editor() {
+            if self.probe_for_a_reading_editor(deadline) {
                 return;
             }
         }
@@ -934,12 +941,41 @@ impl Session {
         );
     }
 
+    /// Waits for one of the three native readers to report itself from inside its own read.
+    ///
+    /// Each of these packages writes that report where the reader is about to wait for a key:
+    /// inside `readline_internal` for one, inside `zlecore` for another, inside the reader loop
+    /// for the third. The terminal is in the editor's own modes by then, so a report is proof for
+    /// the prompt it names, and a report from a prompt before the one this session is at is not
+    /// taken for it.
+    ///
+    /// A reader already parked in its key wait has sent the report for that wait, and sends no
+    /// other until something happens, so the session gives it one key it binds: the cursor moves,
+    /// nothing else of the line changes, and the boundary that key ends at is a fresh report. That
+    /// key is an ordinary one the terminal holds for the editor rather than answering itself,
+    /// which is what makes it safe to offer before this has been established.
+    fn a_native_reader_reports_itself_reading(&mut self, deadline: Instant) -> bool {
+        self.forget_events();
+        let since = self
+            .last_entry
+            .as_ref()
+            .map_or(0, |entry| entry.prompt_generation.get());
+        self.type_bytes(STEP_KEY);
+        self.next_reader_report(deadline, |idle| {
+            idle.prompt_generation.get() >= since
+                && idle.editor.buffer_empty
+                && idle.snapshot.queued_keys == U64::ZERO
+                && idle.snapshot.pending_bytes == U64::ZERO
+        })
+        .is_some()
+    }
+
     /// Draws one probe and waits the reader out, returning whether it said it was reading.
     ///
-    /// False is the prompt having moved under the probe, or the reader having said nothing inside
-    /// [`READINESS_STEP`]: either way the answer is another probe at whatever prompt is there now,
-    /// not a longer wait at the one that has gone.
-    fn probe_for_a_reading_editor(&mut self) -> bool {
+    /// False is the prompt having moved under the probe, or `deadline` having passed: a prompt
+    /// that has moved is probed again where it is now, and a deadline that has passed ends the
+    /// wait in [`Session::ensure_reading`] rather than here.
+    fn probe_for_a_reading_editor(&mut self, deadline: Instant) -> bool {
         assert!(
             self.wait_for_prompt(),
             "the shell drew no prompt:\n{}",
@@ -975,7 +1011,7 @@ impl Session {
         // read for. They are held off until the two reports have been seen.
         let stepping = self.stepping;
         self.stepping = false;
-        let reading = self.watch_the_reader_clear_the_probe();
+        let reading = self.watch_the_reader_clear_the_probe(deadline);
         self.stepping = stepping;
         reading
     }
@@ -985,19 +1021,17 @@ impl Session {
     /// The first report proves the reader is inside its read: the buffer it carries holds the
     /// probe, and this reader reads its buffer only while it is reading. The second report is the
     /// one [`readiness_of`] calls [`ReadinessStep::Ready`], at that same prompt.
-    fn watch_the_reader_clear_the_probe(&mut self) -> bool {
+    fn watch_the_reader_clear_the_probe(&mut self, deadline: Instant) -> bool {
         // The probe character is the editor's own insertion, which this package does not sit in
         // front of, so the reader is given one key it does have a binding for: the cursor moves,
         // nothing else of the line changes, and the boundary that key ends at is where the reader
         // reads its own state and reports it.
         self.type_bytes(STEP_KEY);
-        let Some(held) = self.next_reader_report(READINESS_STEP, |idle| !idle.editor.buffer_empty)
-        else {
+        let Some(held) = self.next_reader_report(deadline, |idle| !idle.editor.buffer_empty) else {
             return false;
         };
         let since = ReaderMark::of(&held);
         self.clear_line();
-        let deadline = Instant::now() + READINESS_STEP;
         loop {
             while let Some(idle) = self.take_reader_report() {
                 match readiness_of(since, &idle) {
@@ -1026,12 +1060,11 @@ impl Session {
         None
     }
 
-    /// Waits inside `within` for the next report of the reader's that `accept` takes.
-    fn next_reader_report<F>(&mut self, within: Duration, accept: F) -> Option<ReaderIdle>
+    /// Waits until `deadline` for the next report of the reader's that `accept` takes.
+    fn next_reader_report<F>(&mut self, deadline: Instant, accept: F) -> Option<ReaderIdle>
     where
         F: Fn(&ReaderIdle) -> bool,
     {
-        let deadline = Instant::now() + within;
         loop {
             while let Some(idle) = self.take_reader_report() {
                 if accept(&idle) {

@@ -934,6 +934,7 @@ fn the_whole_invoking_sequence_is_the_gesture(case: &QualificationCase, session:
     );
     let _ = session.fenced_after_a_command(16);
     settle(session, Duration::from_millis(200), REPLY);
+    session.ensure_reading();
     session.type_bytes(shellpkg::ESCAPE);
     std::thread::sleep(Duration::from_millis(120));
     session.type_bytes(shellpkg::CTRL_D);
@@ -1189,9 +1190,21 @@ fn the_states_that_need_a_command_first(
     }
 
     if let Some(command) = shellpkg::read_builtin_command(case.shell) {
-        session.type_line(command);
-        std::thread::sleep(Duration::from_millis(500));
         session.forget_events();
+        session.type_line(command);
+        // The reader this gesture is for is the builtin's own, and its entry report is written
+        // from inside it: waiting for that report is what says the gesture is being offered to
+        // that reader rather than to the terminal, which would answer the key itself.
+        let (_, event) = session.expect_event("the read builtin's own reader", |event| {
+            matches!(
+                event,
+                BridgeEvent::EditorEnter(params)
+                    if params.reader_context == kr_protocol::root::ReaderContext::ReadBuiltin
+            )
+        });
+        let BridgeEvent::EditorEnter(_) = event else {
+            unreachable!("the predicate accepted an entry")
+        };
         session.type_bytes(shellpkg::CTRL_D);
         assert!(
             !session.saw_event(Duration::from_millis(600), |event| matches!(
@@ -1224,6 +1237,7 @@ fn the_states_that_need_a_command_first(
         let _ = session.next_prompt();
         settle(session, Duration::from_millis(200), REPLY);
         session.forget_events();
+        session.ensure_reading();
         // The key the person pressed is not the gesture; what the reader is reading is the macro
         // this binding pushed back, and a character from there is not a gesture either.
         session.type_bytes(shellpkg::CTRL_T);
@@ -1255,6 +1269,7 @@ fn the_states_that_need_a_command_first(
         let _ = session.next_prompt();
         settle(session, Duration::from_millis(300), REPLY);
         session.forget_events();
+        session.ensure_reading();
         session.type_bytes(shellpkg::ESCAPE);
         std::thread::sleep(Duration::from_millis(120));
         session.type_bytes(b"d");
@@ -1434,6 +1449,9 @@ fn the_gesture_follows_the_terminals_own_character(
     );
     let (_, fence) = session.fenced_after_a_command(14);
     settle(session, Duration::from_millis(200), REPLY);
+    // The character the gesture has moved to is the terminal's own end-of-file character now, so
+    // a terminal still in its line mode would answer this key itself.
+    session.ensure_reading();
     session.type_bytes(shellpkg::CTRL_G);
     let (id, event) = session.expect_event("eof_detach on the new gesture", |event| {
         matches!(event, BridgeEvent::EofDetach(_))
@@ -1462,6 +1480,7 @@ fn the_gesture_follows_the_terminals_own_character(
     };
     // A terminal with no end-of-file character has no gesture, so no character is one.
     let (_, _fence) = session.fenced_after_a_command(15);
+    session.ensure_reading();
     session.type_bytes(shellpkg::CTRL_G);
     assert!(
         !session.saw_event(Duration::from_millis(500), |event| matches!(
@@ -1570,6 +1589,7 @@ fn a_takeover_ends_a_wait_the_customisation_left_the_reader_in(
     }
 
     // A line of the person's, which the cancellation has to keep.
+    session.ensure_reading();
     session.type_bytes(b"kr-kept");
     std::thread::sleep(Duration::from_millis(120));
     session.type_bytes(wait.enter);
@@ -1728,6 +1748,7 @@ fn the_widget_puts_its_own_choice_in_the_line(
     );
 
     let before = session.written();
+    session.ensure_reading();
     session.type_bytes(CHORD);
     assert!(
         session.wait_for_output_after(before, CHOICE, REPLY),
