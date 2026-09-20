@@ -895,7 +895,10 @@ async fn a_refusal_this_host_can_decide_rejects_the_action_rather_than_leaving_i
         &mut client,
         request(
             Method::ActionRead,
-            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+            typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            }),
         ),
     )
     .await);
@@ -937,7 +940,10 @@ async fn a_value_the_store_could_not_write_down_as_it_was_given_is_refused_befor
         &mut client,
         request(
             Method::ActionRead,
-            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+            typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            }),
         ),
     )
     .await);
@@ -1022,7 +1028,10 @@ async fn an_action_the_store_can_no_longer_record_is_refused_rather_than_left_un
         &mut client,
         request(
             Method::ActionRead,
-            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+            typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            }),
         ),
     )
     .await);
@@ -1147,7 +1156,10 @@ async fn one_more_actor_than_the_store_admits_is_refused_before_the_action_is_di
         &mut client,
         request(
             Method::ActionRead,
-            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+            typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            }),
         ),
     )
     .await);

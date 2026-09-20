@@ -440,6 +440,10 @@ impl Visits {
                     gap: Nullable::some(HistoryGap {
                         from_cursor: requested,
                         to_cursor: U64::new(oldest_output_cursor),
+                        // The engine reads no store and keeps no clock, so it knows the range
+                        // moved and not which bound moved it. The session's own history page is
+                        // what carries a cause; a view's gap states the range alone.
+                        cause: None,
                     }),
                 }
             })
