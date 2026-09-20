@@ -528,6 +528,10 @@ else
   : >"$wslconfig_saved"
 fi
 
+# What WSL said the first time it brought a distribution up under the mode being asked for. A host
+# that cannot offer the mode says so there and falls back to another one.
+mode_notice=""
+
 networking_facts() {
   local mode="$1" distribution="$2" effective addresses
   # What WSL is actually doing, not what the file asks for.
@@ -535,8 +539,13 @@ networking_facts() {
   echo "  $mode: $distribution reports networking mode: ${effective:-unknown}"
   [ -n "$effective" ] ||
     fail "$mode: this WSL build does not report its networking mode, so the mode cannot be established"
+  # A mode that is not in effect is not a result about the bridge either way, so the failure names
+  # what refused it. On a host that cannot offer the mode, what is missing is the host: the bridge
+  # has simply not been measured there, and no automatic behaviour can be settled on one mode.
   [ "$effective" = "$mode" ] ||
-    fail "$mode was asked for and $effective is in effect"
+    fail "$mode networking was asked for and $effective is in effect, so the bridge has not been \
+measured in $mode on this machine. What this host said when it took the setting up: \
+${mode_notice:-nothing}"
   addresses="$(inside "$distribution" 'ip -br addr' || true)"
   echo "  $mode: $distribution addresses:"
   printf '    %s\n' "$addresses"
@@ -550,6 +559,12 @@ set_mode() {
   wsl.exe --shutdown >/dev/null 2>&1 ||
     fail "the distributions could not be shut down to take up $mode networking"
   sleep 3
+  # Bringing one distribution up is what makes WSL configure the network, and what makes it say so
+  # when it cannot. The exit status is part of that answer rather than a failure of this run.
+  if ! mode_notice="$(wsl.exe -d "$first" -u "$linux_user" --exec /bin/true 2>&1 | tr -d '\000\r')"; then
+    mode_notice="${mode_notice:-wsl.exe exited non-zero and said nothing}"
+  fi
+  [ -z "$mode_notice" ] || echo "  $mode: this host said: $mode_notice"
   daemons=""
   for distribution in "$first" "$second"; do
     start_daemon_inside "$distribution"
