@@ -69,15 +69,47 @@ function Get-KrPSReadLineVersion {
     $module.Version
 }
 
+function Get-KrPackageRoot {
+    <#
+    .SYNOPSIS
+    The installed package this module was imported from, or nothing when it was not.
+
+    .DESCRIPTION
+    A published package holds the module at <package>/modules/KalaReach.ShellBridge, so the
+    package is two directories up and its identity record sits there. A module imported from the
+    source tree has neither, and says so by answering with nothing.
+    #>
+    $root = Split-Path -Parent (Split-Path -Parent $script:ModuleRoot)
+    if ([string]::IsNullOrEmpty($root)) { return $null }
+    if (-not (Test-Path (Join-Path $root 'kr-shell-identity.json'))) { return $null }
+    $root
+}
+
+function Get-KrLauncherName {
+    if ($IsWindows) { 'pwsh.cmd' } else { 'pwsh' }
+}
+
 function Get-KrPackageIdentity {
+    <#
+    .SYNOPSIS
+    What this package declares about itself.
+
+    .DESCRIPTION
+    Every path here is the package's own. This package builds no shell: what it installs is the
+    launcher that starts the host it was qualified against, the module that binds into that host's
+    editor, and the marked startup entry. The host and the editor it qualified are recorded as
+    what was qualified rather than as things this package ships, because they are the person's.
+    #>
     $version = Get-KrPSReadLineVersion
     $abi = if ($null -eq $version) { 'psreadline-unknown' } else { "psreadline-$($version.Major).$($version.Minor)" }
-    $executable = try {
-        [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    } catch {
-        Join-Path $PSHOME 'pwsh'
+    $root = Get-KrPackageRoot
+    $executable = if ($null -eq $root) {
+        try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+        catch { Join-Path $PSHOME 'pwsh' }
+    } else {
+        Join-Path (Join-Path $root 'bin') (Get-KrLauncherName)
     }
-    $psrlPath = try { (Get-Module PSReadLine).ModuleBase } catch { '' }
+    $searchPath = if ($null -eq $root) { $script:ModuleRoot } else { Join-Path $root 'modules' }
     @{
         executable          = $executable
         upstream_version    = $PSVersionTable.PSVersion.ToString()
@@ -85,10 +117,23 @@ function Get-KrPackageIdentity {
         integration_version = $script:IntegrationVersion
         patches             = @()
         modules             = @(
-            @{ name = 'KalaReach.ShellBridge'; search_path = $script:ModuleRoot; editor_abi = $abi }
-            @{ name = 'PSReadLine'; search_path = "$psrlPath"; editor_abi = $abi }
+            @{ name = 'KalaReach.ShellBridge'; search_path = $searchPath; editor_abi = $abi }
         )
     }
+}
+
+function Get-KrQualifiedHost {
+    <#
+    .SYNOPSIS
+    The host and the editor this package was qualified against, as this process found them.
+    #>
+    $executable = try {
+        [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    } catch {
+        Join-Path $PSHOME 'pwsh'
+    }
+    $psrlPath = try { (Get-Module PSReadLine).ModuleBase } catch { '' }
+    @{ executable = $executable; psreadline_module_base = "$psrlPath" }
 }
 
 function Test-KrQualifiedEditor {
@@ -698,11 +743,41 @@ function Publish-KalaReachQualification {
     Copy-Item -Path (Join-Path $script:ModuleRoot '*') -Destination $modules -Recurse -Force
     Copy-Item -Path $startupSource -Destination (Join-Path $destination 'startup') -Force
 
+    # The launcher this package installs, and the only executable it has of its own. It starts the
+    # host this qualification found, with the runtime location that host needs: the host itself is
+    # the person's and lives wherever they installed it, and a package that recorded their path as
+    # its own would be describing an installation it does not hold.
+    $qualifiedHost = Get-KrQualifiedHost
+    $launchEnvironment = Get-KrLaunchEnvironment
+    $binaries = Join-Path $destination 'bin'
+    New-Item -ItemType Directory -Force -Path $binaries | Out-Null
+    $launcher = Join-Path $binaries (Get-KrLauncherName)
+    if ($IsWindows) {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add('@echo off')
+        $lines.Add('rem Starts the PowerShell host this package was qualified against.')
+        foreach ($name in $launchEnvironment.Keys) {
+            $lines.Add("set `"$name=$($launchEnvironment[$name])`"")
+        }
+        $lines.Add("`"$($qualifiedHost.executable)`" %*")
+        Set-Content -Path $launcher -Value $lines -Encoding ASCII
+    } else {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add('#!/bin/sh')
+        $lines.Add('# Starts the PowerShell host this package was qualified against.')
+        foreach ($name in $launchEnvironment.Keys) {
+            $lines.Add("$name='$($launchEnvironment[$name])'; export $name")
+        }
+        $lines.Add("exec '$($qualifiedHost.executable)' `"`$@`"")
+        Set-Content -Path $launcher -Value $lines -Encoding ASCII
+        if (Get-Command chmod -ErrorAction SilentlyContinue) { & chmod 755 $launcher | Out-Null }
+    }
+
     $record = [ordered]@{
         identity      = $identity
         shell         = [ordered]@{
             kind                = $manifest.shell
-            executable          = $identityInfo.executable
+            executable          = $launcher
             upstream_version    = $identityInfo.upstream_version
             editor_abi          = $identityInfo.editor_abi
             integration_version = $identityInfo.integration_version
@@ -710,9 +785,6 @@ function Publish-KalaReachQualification {
             modules             = @(
                 [ordered]@{ name = 'KalaReach.ShellBridge'
                             search_path = (Join-Path $destination 'modules')
-                            editor_abi = $identityInfo.editor_abi }
-                [ordered]@{ name = 'PSReadLine'
-                            search_path = "$((Get-Module PSReadLine -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1).ModuleBase)"
                             editor_abi = $identityInfo.editor_abi }
             )
         }
@@ -741,15 +813,21 @@ function Publish-KalaReachQualification {
             marker     = $manifest.startup.marker
             end_marker = $manifest.startup.end_marker
         }
+        # What this package was qualified against, which is the person's own host and editor. It
+        # is recorded here rather than among the paths this package holds, because it is neither
+        # installed nor replaced by this package.
         qualified     = [ordered]@{
-            psreadline_from   = $script:QualifiedFrom.ToString()
-            psreadline_before = $script:QualifiedBefore.ToString()
-            psreadline_found  = "$psrl"
+            psreadline_from        = $script:QualifiedFrom.ToString()
+            psreadline_before      = $script:QualifiedBefore.ToString()
+            psreadline_found       = "$psrl"
+            powershell_executable  = $qualifiedHost.executable
+            psreadline_module_base = $qualifiedHost.psreadline_module_base
         }
         # The host's own image needs its runtime's location, which the launcher that started this
-        # one passed in. A worker that starts the recorded executable directly needs the same.
+        # one passed in. The launcher this package installs sets it, and it is recorded here as
+        # well so a worker can see what the launcher does.
         launch        = [ordered]@{
-            environment = Get-KrLaunchEnvironment
+            environment = $launchEnvironment
         }
     }
     $record | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $destination 'kr-shell-identity.json')

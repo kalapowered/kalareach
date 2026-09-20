@@ -3121,3 +3121,70 @@ fn what_this_qualification_cannot_reach_is_recorded_with_its_reason_and_its_owne
         assert!(ids.contains(&named), "{named} is not recorded");
     }
 }
+
+/// KR-REQ-07.87, KR-REQ-07.16: an installation that holds every managed package still admits each
+/// of them.
+///
+/// The installation is read as a whole: a record the host cannot resolve refuses the shell it
+/// belongs to and, on this build, the installation with it. The package that builds no shell is
+/// the one that can say something the rule refuses, because the host and the editor it qualifies
+/// are the person's and live outside it. What it installs of its own — the launcher that starts
+/// that host, the module that binds into that editor, the marked startup entry — is what it
+/// records, and this is the case that says so for a whole installation rather than one package.
+#[test]
+fn an_installation_holding_every_package_still_resolves_each_of_them() {
+    let installed: Vec<Package> = ShellKind::ALL
+        .iter()
+        .filter_map(|kind| Package::find(*kind).ok())
+        .collect();
+    if installed.len() < ShellKind::ALL.len() {
+        let missing: Vec<&str> = ShellKind::ALL
+            .iter()
+            .filter(|kind| !installed.iter().any(|package| package.kind == **kind))
+            .map(|kind| kind.as_str())
+            .collect();
+        let reason = format!("this host holds no {} package", missing.join(", no "));
+        assert!(
+            std::env::var_os(shellpkg::REQUIRE).is_none(),
+            "{} is set and {reason}",
+            shellpkg::REQUIRE
+        );
+        println!("skipped: {reason}");
+        return;
+    }
+
+    let set = kr_shell_integration::host::package::PackageSet::discover(&shellpkg::package_root())
+        .unwrap_or_else(|fault| {
+            panic!(
+                "an installation holding every managed package could not be read, so no managed \
+                 session could be created on it at all: {fault}"
+            )
+        });
+    for package in &installed {
+        let resolved = set.get(package.kind).unwrap_or_else(|| {
+            panic!(
+                "the installation holds a {} package and the host resolved none",
+                package.kind.as_str()
+            )
+        });
+        let executable = resolved.executable();
+        assert!(
+            executable.is_file(),
+            "the {} package resolves to {}, which is not there",
+            package.kind.as_str(),
+            executable.display()
+        );
+        // Every path a package records is its own, so the one the host would launch is inside the
+        // package it came from rather than in somebody else's installation.
+        let directory = shellpkg::package_root()
+            .join(package.kind.as_str())
+            .join(&package.identity);
+        assert!(
+            executable.starts_with(&directory),
+            "the {} package would launch {}, which is outside {}",
+            package.kind.as_str(),
+            executable.display(),
+            directory.display()
+        );
+    }
+}

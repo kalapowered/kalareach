@@ -272,6 +272,12 @@ pub fn corpus_root() -> PathBuf {
     repository_root().join("tests").join("shells")
 }
 
+/// Where the built packages are installed, which is what a session resolves one from.
+#[must_use]
+pub fn package_root() -> PathBuf {
+    cache_root()
+}
+
 /// Where `scripts/fetch-shell-stacks.sh` installs what it fetched.
 #[must_use]
 pub fn stack_cache() -> PathBuf {
