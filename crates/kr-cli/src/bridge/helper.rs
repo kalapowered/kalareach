@@ -13,7 +13,10 @@
 //!   network actor as a local owner on the far side. A remote client reaches this environment
 //!   through that environment's own paired endpoint instead.
 //! * **A request crosses at most one bridge.** A federated proxy is outside version 1, so a
-//!   handshake that says the request has already been bridged is refused rather than chained.
+//!   handshake that says the request has already been bridged is refused rather than chained, and
+//!   so is a carried request that would open a bridge of its own. The destination cannot enforce
+//!   that second rule for itself: what arrives over this helper's local connection looks like any
+//!   other local request, and nothing in it says a bridge was crossed to get there.
 //! * **The protocol major must match**, because the frames are carried unchanged.
 //!
 //! What the helper never does is decide authority. The destination authenticates it by its own
@@ -266,6 +269,14 @@ async fn relay(
                     // Carried unchanged: the bytes are what a payload digest was taken over, and
                     // re-encoding them would risk changing what the caller signed for.
                     BridgeFrame::Control(carried) => {
+                        // Except for one thing this side has to decide: a request crosses at most
+                        // one bridge. The destination will serve what arrives here as an ordinary
+                        // local request, so a method that opens a bridge of its own would chain one
+                        // behind this helper's back. It is refused here, where the hop is known.
+                        if let Some(method) = crosses_again(&carried) {
+                            eprintln!("kr bridge: {} opens a bridge of its own", method.as_str());
+                            return refuse(output, Refusal::AlreadyBridged);
+                        }
                         writer.write_message(&*carried).await.map_err(CliError::Ipc)?;
                     }
                     // A second handshake, an acknowledgement or a refusal on this side of the
@@ -290,6 +301,29 @@ async fn first_frame(
 ) -> Option<Vec<u8>> {
     woken.recv().await?;
     incoming.try_recv().ok()
+}
+
+/// Returns the method a carried frame would run that opens a bridge of its own.
+///
+/// Section 3 allows a request to cross at most one process bridge, and a federated proxy is outside
+/// this version. The destination cannot enforce that for itself: what reaches it over this helper's
+/// local connection looks like any other local request, and nothing in it says a bridge was already
+/// crossed. So the rule is kept here, at the hop that knows.
+fn crosses_again(
+    carried: &kr_protocol::envelope::ControlFrame,
+) -> Option<kr_protocol::method::Method> {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::method::Method;
+
+    let name = match carried {
+        ControlFrame::Request(request) => request.method.as_str(),
+        ControlFrame::Mutation(mutation) => mutation.method.as_str(),
+        _ => return None,
+    };
+    let method = Method::from_wire(name)?;
+    // A refresh of an enrolled environment opens a process bridge to it. Enrolling, forgetting and
+    // listing change or read a record and open nothing.
+    matches!(method, Method::EnvironmentRefresh).then_some(method)
 }
 
 /// Decodes one bridge frame from a payload the reader already bounded.

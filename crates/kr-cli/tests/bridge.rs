@@ -518,6 +518,50 @@ async fn an_invoker_opens_a_bridge_and_carries_a_request_over_it() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_that_would_open_a_second_bridge_is_refused_at_the_first() {
+    // A federated proxy is outside this version. The destination serves what crosses as an ordinary
+    // local request and cannot tell that it arrived over a bridge, so the helper refuses to carry a
+    // method that would open another one. This goes through a real bridge rather than setting the
+    // handshake's own flag.
+    let tree = kr_ipc::testing::TempHost::create();
+    let environment = tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let served = ParamsValue::from_typed(&kr_protocol::hostinfo::EnvironmentListResult {
+        environments: Vec::new(),
+    })
+    .expect("the answer encodes");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(served)).await;
+
+    let opening = opening_against(&tree, tree.environment_id(), BridgeTarget::Controller);
+    let mut invocation = opening.launch().await.expect("the bridge opens");
+    let window = invocation.acknowledgement().action_window.clone();
+    let refusal = invocation
+        .mutate(MutationRequest {
+            request_id: RequestId::new(21),
+            method: Method::EnvironmentRefresh.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(tree.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: window.action_window_id,
+            requested_ttl_ms: DurationMs::new(10_000),
+            params: ParamsValue::empty(),
+        })
+        .await
+        .expect_err("a refusal");
+    match refusal {
+        kr_controller::bridge::invoke::Refusal::Destination(error) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            assert!(error.message.contains("at most one"), "{}", error.message);
+        }
+        other => panic!("expected the destination's refusal, got {other}"),
+    }
+    stub.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_environment_that_answers_with_another_identity_is_refused() {
     // A distribution registered again under the name it had, or a container recreated under a
     // reused one, answers as a different installation. The record does not carry over to it, and
