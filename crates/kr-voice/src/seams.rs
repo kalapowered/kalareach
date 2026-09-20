@@ -182,17 +182,27 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
 
     /// Writes a grant the coordinator planned.
     ///
+    /// `admission` is the window this change arrived under, and it is asked again inside the
+    /// store's own transaction: a write waits for a lock and for a file, and the last check before
+    /// an authority change has to be inside the thing that performs it.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the grant cannot be written.
-    fn issue(&self, plan: &crate::grant::VoiceGrantPlan) -> Result<Grant>;
+    /// Returns an error when the grant cannot be written, or the admission has run out.
+    fn issue(
+        &self,
+        plan: &crate::grant::VoiceGrantPlan,
+        admission: &dyn Admission,
+    ) -> Result<Grant>;
 
     /// Revokes a grant and everything delegated from it, and reports when.
     ///
+    /// `admission` is asked inside the store's own transaction, for the same reason.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the revocation cannot be written.
-    fn revoke(&self, grant_id: GrantId, now_ms: u64) -> Result<u64>;
+    /// Returns an error when the revocation cannot be written, or the admission has run out.
+    fn revoke(&self, grant_id: GrantId, now_ms: u64, admission: &dyn Admission) -> Result<u64>;
 
     /// This host's clock, in UTC milliseconds.
     ///

@@ -465,6 +465,10 @@ impl SyncBackupService for NullService {
 }
 
 impl ManagedVoiceService for NullService {
+    fn provider(&self) -> String {
+        "none".to_owned()
+    }
+
     fn start<'a>(
         &'a self,
         _request: &'a voice::VoiceSessionRequest,

@@ -81,6 +81,10 @@ impl OfflineProvider {
 }
 
 impl ManagedVoiceService for OfflineProvider {
+    fn provider(&self) -> String {
+        "the offline provider".to_owned()
+    }
+
     fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
             Ok(VoiceStart::Started(Box::new(VoiceSession {

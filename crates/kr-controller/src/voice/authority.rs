@@ -63,6 +63,14 @@ impl GrantAuthority {
     }
 }
 
+/// The refusal a change gets when its admitted lifetime ran out before the write.
+fn expired() -> VoiceError {
+    VoiceError::Host(kr_protocol::error::ProtocolError::new(
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "the deadline this action was admitted under passed before it could run".to_owned(),
+    ))
+}
+
 /// A store failure the coordinator reports rather than swallows.
 fn store(error: crate::error::ControllerError) -> VoiceError {
     VoiceError::Host(kr_protocol::error::ProtocolError::new(
@@ -130,7 +138,17 @@ impl VoiceAuthority for GrantAuthority {
             }))
     }
 
-    fn issue(&self, plan: &VoiceGrantPlan) -> kr_voice::Result<Grant> {
+    fn issue(
+        &self,
+        plan: &VoiceGrantPlan,
+        admission: &dyn kr_voice::Admission,
+    ) -> kr_voice::Result<Grant> {
+        // Asked immediately before the write, which is the last thing this host does with the
+        // window the change arrived under. The store's own transaction reads the parent and
+        // writes in one step, so nothing of this host's waits between here and the record.
+        if !admission.still_admitted() {
+            return Err(expired());
+        }
         let grant_id = GrantId::new(kr_ipc::new_uuid());
         let grant = plan.grant(grant_id);
         let now_ms = now_ms();
@@ -156,16 +174,34 @@ impl VoiceAuthority for GrantAuthority {
         Ok(grant)
     }
 
-    fn revoke(&self, grant_id: GrantId, now_ms: u64) -> kr_voice::Result<u64> {
+    fn revoke(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+        admission: &dyn kr_voice::Admission,
+    ) -> kr_voice::Result<u64> {
         // The store's own cascade: revoking a parent revokes its descendants, which is what makes
         // withdrawing a standing voice grant end the calls running under it.
         // The admission check inside the transaction is the caller's authority to revoke, which
         // the coordinator has already decided: it revokes only the grant of a voice session this
         // device holds, and it has just taken that session out of its own registry.
+        // The store's own admission hook, inside the transaction that performs the revocation and
+        // after it has read the subtree: the window this change arrived under is asked at the
+        // moment the record changes rather than before the read that precedes it.
         let revocation: GrantRevocation = self
             .sharing
             .grants()
-            .revoke(grant_id, now_ms, || Ok(()))
+            .revoke(grant_id, now_ms, || {
+                if admission.still_admitted() {
+                    Ok(())
+                } else {
+                    Err(crate::error::ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    })
+                }
+            })
             .map_err(store)?;
         let _ = revocation;
         Ok(now_ms)

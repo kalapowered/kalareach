@@ -242,7 +242,12 @@ impl VoiceAuthority for Authority {
             .cloned())
     }
 
-    fn issue(&self, plan: &VoiceGrantPlan) -> kr_voice::Result<Grant> {
+    fn issue(
+        &self,
+        plan: &VoiceGrantPlan,
+        admission: &dyn kr_voice::Admission,
+    ) -> kr_voice::Result<Grant> {
+        assert!(admission.still_admitted(), "a write inside its admission");
         let mut store = self.store.lock().expect("the store");
         let grant_id = GrantId::new(Uuid::from_bytes([store.next; 16]));
         store.next = store.next.wrapping_add(1);
@@ -251,7 +256,12 @@ impl VoiceAuthority for Authority {
         Ok(grant)
     }
 
-    fn revoke(&self, grant_id: GrantId, now_ms: u64) -> kr_voice::Result<u64> {
+    fn revoke(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+        _admission: &dyn kr_voice::Admission,
+    ) -> kr_voice::Result<u64> {
         // Held here, after the grant to replace has been read and before it is withdrawn: that is
         // the window a second change would read the same grant in.
         if self
@@ -537,6 +547,10 @@ fn running_call(name: &str) -> VoiceSession {
 }
 
 impl ManagedVoiceService for ManagedFake {
+    fn provider(&self) -> String {
+        "the managed broker".to_owned()
+    }
+
     fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         self.offers
             .lock()
@@ -603,6 +617,10 @@ struct OwnBackend {
 }
 
 impl ManagedVoiceService for OwnBackend {
+    fn provider(&self) -> String {
+        "a backend of the person's own".to_owned()
+    }
+
     fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move { Ok(VoiceStart::Started(Box::new(running_call("byok")))) })
     }
@@ -1559,6 +1577,59 @@ async fn a_delegation_outside_this_calls_timeline_or_already_spent_is_refused() 
         refusal(&again.outcome).0,
         VoiceRefusal::UnannouncedDelegation
     );
+}
+
+/// KR-REQ-23.51: one action identifier is one delegation. The same identifier carrying another
+/// delegation is refused, and an exact retry is answered with what that action came to.
+#[tokio::test]
+async fn one_action_identifier_carries_one_delegation() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, Some(&[VoiceAction::Status])).await;
+    let params = delegate_params(voice_session_id, delegation("one"), VoiceAction::Status);
+    let first = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_000)
+        .await
+        .expect("an answer");
+    assert!(matches!(
+        first.outcome,
+        VoiceDelegationOutcome::Performed { .. }
+    ));
+
+    // The same identifier, a different delegation: refused rather than performed a second time.
+    let another = delegate_params(voice_session_id, delegation("two"), VoiceAction::Status);
+    let refused = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &another, 11_100)
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&refused.outcome).0,
+        VoiceRefusal::UnannouncedDelegation
+    );
+
+    // The same identifier and the same delegation: the answer the action already came to, and the
+    // host performed it once.
+    let again = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_200)
+        .await
+        .expect("an answer");
+    assert_eq!(again.outcome, first.outcome);
+    assert_eq!(
+        fixture.submitter.proposals().len(),
+        1,
+        "the effect happened once"
+    );
+
+    // And a retry is told only while the authority it ran under still carries it.
+    fixture.authority.narrow_device_grant(&[]);
+    let after = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_300)
+        .await
+        .expect_err("a retry outside the grant is not answered from the record");
+    assert_eq!(after.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
 }
 
 /// KR-REQ-15.11: the delegation event supplies an identifier and a timeline offset, not task text.

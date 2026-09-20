@@ -783,6 +783,15 @@ pub trait ManagedVoiceService: Send + Sync + fmt::Debug {
     ///
     /// Returns a transport or protocol error.
     fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure>;
+
+    /// What this provider is, for a caller holding calls from more than one.
+    ///
+    /// A call identifier means something only to the provider that issued it, and two providers
+    /// can name a call the same thing. A host that holds calls from both tells them apart by this
+    /// and the identifier together, so it never ends one provider's call because another one
+    /// named a call the same way. Two clients of the same service answer the same thing; the
+    /// managed broker answers the origin it reaches.
+    fn provider(&self) -> String;
 }
 
 /// The managed voice broker client.
@@ -846,6 +855,12 @@ impl ManagedVoiceBroker {
 }
 
 impl ManagedVoiceService for ManagedVoiceBroker {
+    fn provider(&self) -> String {
+        // The origin this client reaches. Two clients of the same service are the same provider,
+        // and a client of another service is not.
+        self.origin.clone()
+    }
+
     fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
             let body = serde_json::to_vec(&request.body()?)
