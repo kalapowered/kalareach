@@ -14,6 +14,13 @@
       "why_here": "The scan is the control daemon's, in crates/kr-controller/src/service.rs, and the count it would read is a field on the session summary in kr-protocol. Neither is this crate, and this suite runs no daemon.",
       "owner": "kr-controller",
       "next_step": "Report how many launch confirmations a session is still waiting on, count it into the demand scan, and assert the demand before the revocation, after it, after the reader's answer and after a bridge loss."
+    },
+    {
+      "id": "a-native-module-built-against-another-editor-abi",
+      "what": "A native module of the person's own that loads into the shell and binds into an editor of an incompatible ABI, where the loader accepts the object and the mismatch is found at the point the integration reads it rather than at the point the file is opened.",
+      "why_here": "The corpus ships fixtures, and a module of that kind is a shared object compiled against one release of a shell's own headers. Building one needs a compiler and those headers on every host the qualification runs on, and it is a different object on each platform, so what the native-module cases ship is a file the loader refuses and what they qualify is the diagnosis.",
+      "owner": "packaging",
+      "next_step": "Build the module from source as part of the package build, beside the shell it is for, keep it out of the corpus as a fixture, and have the native-module cases load the built object and assert what the loader and the integration each say about it."
     }
   ]
 }

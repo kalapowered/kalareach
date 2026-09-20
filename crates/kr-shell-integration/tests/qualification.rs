@@ -3062,8 +3062,8 @@ fn what_this_qualification_cannot_reach_is_recorded_with_its_reason_and_its_owne
 /// KR-REQ-07.87, KR-REQ-07.16: an installation that holds every managed package still admits each
 /// of them.
 ///
-/// The installation is read as a whole: a record the host cannot resolve refuses the shell it
-/// belongs to and, on this build, the installation with it. The package that builds no shell is
+/// The installation is read shell by shell: a record the host cannot resolve refuses the shell it
+/// belongs to and leaves the packages beside it alone. The package that builds no shell is
 /// the one that can say something the rule refuses, because the host and the editor it qualifies
 /// are the person's and live outside it. What it installs of its own — the launcher that starts
 /// that host, the module that binds into that editor, the marked startup entry — is what it
