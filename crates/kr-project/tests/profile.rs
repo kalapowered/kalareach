@@ -1476,3 +1476,77 @@ fn a_reference_update_names_an_object_in_the_repositorys_own_format() {
         "nothing moved the reference"
     );
 }
+
+/// KR-REQ-14.27 and KR-REQ-14.05: the format that decides how long a full object name is comes
+/// from the repository the update **writes to**.
+///
+/// A working tree names its repository through an indirection it holds itself: a linked worktree's
+/// `.git` is a file saying where the repository is. Rewriting that file makes neither the working
+/// tree nor the Git directory this record opened a different object, so an answer read from the
+/// working tree could describe one repository while the update moved a reference in another. Both
+/// the format and the update are asked of the Git common directory, under the identity this record
+/// holds for it.
+#[cfg(unix)]
+#[test]
+fn a_reference_updates_object_format_is_read_from_the_repository_it_writes_to() {
+    let fixture = Fixture::create();
+    let repository_path = ordinary_repository(fixture.work(), "common");
+    // A second repository whose objects are named in the longer format. Nothing of this branch's
+    // work reaches it; it exists so the indirection below can name something with another answer.
+    let other = fixture.work().join("other");
+    std::fs::create_dir_all(&other).expect("a directory for the other repository");
+    support::git_raw(
+        &other,
+        ["init", "--object-format=sha256", "--initial-branch=main"],
+    );
+
+    // A linked worktree: its own `.git` is a file rather than a directory.
+    let linked = fixture.work().join("linked");
+    support::git_raw(
+        &repository_path,
+        [
+            std::ffi::OsStr::new("worktree"),
+            std::ffi::OsStr::new("add"),
+            std::ffi::OsStr::new("--detach"),
+            linked.as_os_str(),
+        ],
+    );
+    let profile = fixture.service().profile();
+    let repository = OpenedRepository::open(profile, fixture.environment_id(), &linked)
+        .expect("the linked worktree opens");
+    assert_eq!(
+        repository
+            .object_format(profile)
+            .expect("the repository says how it names its objects"),
+        kr_project::git::ObjectFormat::Sha1
+    );
+
+    // The indirection now names the other repository. What this record holds is the first
+    // repository's Git directory, and that is what a reference update writes in.
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", other.join(".git").display()),
+    )
+    .expect("the indirection is rewritten");
+    assert_eq!(
+        repository
+            .object_format(profile)
+            .expect("the repository still says how it names its objects"),
+        kr_project::git::ObjectFormat::Sha1,
+        "the answer comes from the repository this record holds, not from the working tree's \
+         own indirection"
+    );
+
+    // And the object names are held to that answer: a name of the longer format is refused, so
+    // nothing resolves it as a revision in the repository the update writes in.
+    let long = "a".repeat(64);
+    let refusal = repository
+        .update_ref(profile, "refs/heads/main", &long, &long, false)
+        .expect_err("a name of the other format's length is not an object here");
+    assert!(
+        refusal
+            .to_string()
+            .contains("a full object name in this repository is 40"),
+        "the refusal says what a full name is here, and said {refusal}"
+    );
+}

@@ -421,13 +421,24 @@ impl OpenedRepository {
 
     /// Returns the object format this repository names its objects in.
     ///
+    /// Asked of the **Git common directory**, under the identity this record holds for it, rather
+    /// than of the working tree. A working tree names its repository through an indirection it
+    /// holds itself — a linked worktree's `.git` is a file saying where the repository is — and
+    /// that indirection can be rewritten to name another repository without the working tree or
+    /// the Git directory this record opened becoming a different object. A reference update
+    /// writes in the Git directory, so the format that decides how long a full object name is has
+    /// to be read from the same place.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectError::GitFailed`] when the repository will not say, and
     /// [`ProjectError::InvalidArgument`] for a format this service does not know.
     pub fn object_format(&self, profile: &RestrictedProfile) -> Result<ObjectFormat> {
         let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("--show-object-format")];
-        let output = profile.run(&self.read(&arguments))?;
+        let request = GitRequest::read(&self.git_dir_path, &arguments)
+            .with_drivers(self.audit.drivers.clone())
+            .expecting(self.identity.git_dir);
+        let output = profile.run(&request)?;
         output.require_success()?;
         ObjectFormat::parse(output.text().trim())
     }
