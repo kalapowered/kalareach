@@ -150,6 +150,10 @@ fn stage(seed: u8, filename: &str, plaintext: &[u8]) -> StagedObject {
 fn admitting_a_generation_writes_its_objects_and_its_outbox_entry_with_it() {
     let environment = Environment::open();
     let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
     let objects = [stage(1, "a.cbor", b"one"), stage(2, "b.cbor", b"two")];
     let sealed = producer.seal(1, &objects);
 
@@ -212,6 +216,10 @@ fn admitting_a_generation_writes_its_objects_and_its_outbox_entry_with_it() {
 fn the_publish_step_is_enqueued_with_the_last_object_that_finished_uploading() {
     let environment = Environment::open();
     let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
     let objects = [stage(1, "a.cbor", b"one"), stage(2, "b.cbor", b"two")];
     let sealed = producer.seal(1, &objects);
     environment
@@ -246,9 +254,26 @@ fn the_publish_step_is_enqueued_with_the_last_object_that_finished_uploading() {
         );
     }
 
+    // One entry, not two: the upload step is retired in the same transaction that enqueues the
+    // publish step, so nothing can resume an upload that has finished.
     let outbox = environment.service().outbox().expect("a read");
-    assert_eq!(outbox.len(), 2);
-    assert_eq!(outbox[1].step, Step::Publish);
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].step, Step::Publish);
+
+    // And a repeated acknowledgement of an object that had already arrived does not enqueue a
+    // second publication.
+    let first = rows[0].object_id;
+    environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            first,
+            TimestampMs::new(6_500),
+        )
+        .expect("a repeated acknowledgement");
+    let outbox = environment.service().outbox().expect("a read");
+    assert_eq!(outbox.len(), 1, "one publication, however often it is told");
     let record = environment
         .service()
         .generation(archive_id(), BackupGeneration::new(1))
@@ -452,6 +477,153 @@ fn a_dispatched_upload_goes_back_in_hand_rather_than_becoming_unknown() {
     assert!(!outbox[0].dispatched, "it is back in hand");
 }
 
+#[test]
+fn a_fence_stops_admission_and_dispatch_and_survives_a_restart() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let second = producer.seal(2, &objects);
+    let admitted;
+    {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        admitted = service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+
+        service.fence(PrivacyGeneration::new(4));
+        assert_eq!(service.fenced_at().expect("a read"), Some(4));
+
+        // A fence that recorded a number and let the queue go would be a fence in name only.
+        assert!(
+            service.note_dispatched(admitted.sequence).is_err(),
+            "the entry the fence stopped does not leave this host"
+        );
+        assert!(
+            service
+                .admit(
+                    &second,
+                    &objects,
+                    producer.writer.key_id(),
+                    PrivacyGeneration::new(4),
+                    TimestampMs::new(6_000),
+                )
+                .is_err(),
+            "no more content-bearing backup work is admitted while the fence holds"
+        );
+    }
+
+    // A restart comes back fenced, and its reconciliation leaves the fenced work where it is
+    // rather than putting it back in hand.
+    let service = BackupService::open(&state).expect("the service opens again");
+    assert_eq!(service.fenced_at().expect("a read"), Some(4));
+    assert!(service.note_dispatched(admitted.sequence).is_err());
+    let outcome = service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    assert_eq!(
+        outcome.fenced,
+        vec![(archive_id(), BackupGeneration::new(1))]
+    );
+    assert!(outcome.resumed.is_empty());
+}
+
+#[test]
+fn a_writer_enrolled_for_one_archive_does_not_authorise_another() {
+    let environment = Environment::open();
+    let producer = Producer::generate();
+    let elsewhere = ArchiveId::new(Uuid::from_bytes([0x99; 16]));
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), elsewhere, TimestampMs::new(1))
+        .expect("the writer is enrolled for another archive");
+
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    assert!(
+        environment
+            .service()
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .is_err(),
+        "an enrolment for one collection does not authorise work for another"
+    );
+}
+
+#[test]
+fn a_generation_already_admitted_is_not_admitted_again() {
+    let environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    environment
+        .service()
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            PrivacyGeneration::INITIAL,
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    let staged: Vec<std::path::PathBuf> = environment
+        .service()
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .into_iter()
+        .map(|row| row.staged_path)
+        .collect();
+    let before: Vec<Vec<u8>> = staged
+        .iter()
+        .map(|path| std::fs::read(path).expect("the staged ciphertext"))
+        .collect();
+
+    // Sealing the same generation again produces different ciphertext under different keys. If it
+    // were staged over the top of the first, the rows this host has committed would name bytes
+    // that no longer open.
+    let again = producer.seal(1, &objects);
+    assert!(
+        environment
+            .service()
+            .admit(
+                &again,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(6_000),
+            )
+            .is_err(),
+        "a generation this host already accounts for is not admitted again"
+    );
+    for (path, bytes) in staged.iter().zip(before) {
+        assert_eq!(
+            std::fs::read(path).expect("the staged ciphertext"),
+            bytes,
+            "nothing wrote over the ciphertext this host is accounting for"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-24.16: generation and writer authority verified, and a restore that returns data only.
 // ---------------------------------------------------------------------------------------------
@@ -471,6 +643,7 @@ fn a_restore_verifies_the_owners_enrolment_the_writers_signature_and_the_generat
     };
 
     let verified = RestoreRequest {
+        archive_id: archive_id(),
         publication: &publication,
         descriptor_len: sealed.descriptor_bytes.len(),
         enrolment: &enrolment,
@@ -480,11 +653,11 @@ fn a_restore_verifies_the_owners_enrolment_the_writers_signature_and_the_generat
     }
     .verify()
     .expect("the restore is admitted");
-    assert_eq!(verified.archive_id, archive_id());
-    assert_eq!(verified.writer_key_id, producer.writer.key_id());
-    assert_eq!(verified.writer_revision, 1);
-    assert!(verified.generation.describe().contains("generation 4"));
-    assert!(!verified.generation.proves_no_newer_archive());
+    assert_eq!(verified.archive_id(), archive_id());
+    assert_eq!(verified.writer_key_id(), producer.writer.key_id());
+    assert_eq!(verified.writer_revision(), 1);
+    assert!(verified.generation().describe().contains("generation 4"));
+    assert!(!verified.generation().proves_no_newer_archive());
 }
 
 #[test]
@@ -499,6 +672,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
     // An enrolment signed by somebody who is not the collection's owner.
     assert!(
         RestoreRequest {
+            archive_id: archive_id(),
             publication: &publication,
             descriptor_len: sealed.descriptor_bytes.len(),
             enrolment: &enrolment,
@@ -514,6 +688,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
     // A writer key that is not the one the owner enrolled.
     assert!(
         RestoreRequest {
+            archive_id: archive_id(),
             publication: &publication,
             descriptor_len: sealed.descriptor_bytes.len(),
             enrolment: &enrolment,
@@ -533,6 +708,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
     };
     assert!(
         RestoreRequest {
+            archive_id: archive_id(),
             publication: &forged,
             descriptor_len: sealed.descriptor_bytes.len(),
             enrolment: &enrolment,
@@ -545,6 +721,22 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
         "the publication's own signature is verified under the enrolled writer"
     );
 
+    // A publication for another archive than the one being restored.
+    assert!(
+        RestoreRequest {
+            archive_id: ArchiveId::new(Uuid::from_bytes([0x99; 16])),
+            publication: &publication,
+            descriptor_len: sealed.descriptor_bytes.len(),
+            enrolment: &enrolment,
+            owner_key: producer.owner.public(),
+            writer_key: producer.writer.public(),
+            checkpoint: None,
+        }
+        .verify()
+        .is_err(),
+        "the caller's own expectation is checked before any signature"
+    );
+
     // A generation the checkpoint says is older than what the owner verified.
     let checkpoint = ArchiveCheckpoint {
         archive_id: archive_id(),
@@ -553,6 +745,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
         verified_at_ms: TimestampMs::new(3_000),
     };
     let refusal = RestoreRequest {
+        archive_id: archive_id(),
         publication: &publication,
         descriptor_len: sealed.descriptor_bytes.len(),
         enrolment: &enrolment,
@@ -567,6 +760,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
     // A descriptor over section 20's byte limit fails before anything else.
     assert!(
         RestoreRequest {
+            archive_id: archive_id(),
             publication: &publication,
             descriptor_len: kr_protocol::archive::MAX_ARCHIVE_DESCRIPTOR_LEN + 1,
             enrolment: &enrolment,
@@ -724,8 +918,8 @@ fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
     assert_eq!(exported.kind, "backup archive");
     assert!(exported.reference.contains("generation 2"));
     assert!(
-        exported.deletable,
-        "this host holds a reference it can ask the removal through"
+        !exported.deletable,
+        "this host holds no route to ask for the removal, and does not claim one"
     );
     assert!(
         !exported.reference.contains('/'),
@@ -741,7 +935,13 @@ fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
     }
 
     // Nothing is outstanding, and nothing failed, so cleanup is complete.
-    assert!(environment.service().faults().is_empty());
+    assert!(
+        environment
+            .service()
+            .obligations()
+            .expect("a read")
+            .is_empty()
+    );
     let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
@@ -806,9 +1006,13 @@ fn dispatched_backup_work_keeps_reconciliation_open_until_it_is_settled() {
 }
 
 #[test]
-fn a_result_produced_under_an_earlier_generation_is_not_published() {
+fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_under() {
     let environment = Environment::open();
     let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
     let objects = [stage(1, "a.cbor", b"one")];
     let sealed = producer.seal(1, &objects);
     environment
@@ -825,7 +1029,8 @@ fn a_result_produced_under_an_earlier_generation_is_not_published() {
     let mut mode = PrivacyMode::new();
     let now = mode.open_generation(TimestampMs::new(6_000));
 
-    // The answer to work admitted before privacy mode was enabled comes back afterwards.
+    // The answer to work admitted before privacy mode was enabled comes back afterwards. It is
+    // refused under the generation it was really admitted under.
     let refusal = environment
         .service()
         .note_published(
@@ -837,19 +1042,10 @@ fn a_result_produced_under_an_earlier_generation_is_not_published() {
         )
         .expect_err("a late old-generation result");
     assert!(refusal.to_string().contains("privacy generation 0"));
-    let record = environment
-        .service()
-        .generation(archive_id(), BackupGeneration::new(1))
-        .expect("a read")
-        .expect("the generation");
-    assert_ne!(
-        record.state,
-        GenerationState::Published,
-        "the refused result changed nothing"
-    );
 
-    // A result produced under the generation in force is published.
-    environment
+    // And relabelling it does not help: the generation the work was admitted under is the store's,
+    // not the caller's, so a caller that could name it could not name its way past the boundary.
+    let relabelled = environment
         .service()
         .note_published(
             archive_id(),
@@ -858,10 +1054,50 @@ fn a_result_produced_under_an_earlier_generation_is_not_published() {
             &mode,
             TimestampMs::new(7_000),
         )
-        .expect("a result from the generation in force");
+        .expect_err("a result relabelled with the generation in force");
+    assert!(
+        relabelled
+            .to_string()
+            .contains("this host admitted the work under 0")
+    );
     let record = environment
         .service()
         .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_ne!(
+        record.state,
+        GenerationState::Published,
+        "neither refused result changed anything"
+    );
+
+    // Work admitted under the generation in force publishes. Privacy mode is off again here,
+    // because a host in privacy mode admits no content-bearing backup work at all.
+    let resumed = mode.disable(TimestampMs::new(8_000));
+    let second = producer.seal(2, &objects);
+    environment
+        .service()
+        .admit(
+            &second,
+            &objects,
+            producer.writer.key_id(),
+            resumed.generation,
+            TimestampMs::new(9_000),
+        )
+        .expect("the generation is admitted");
+    environment
+        .service()
+        .note_published(
+            archive_id(),
+            BackupGeneration::new(2),
+            resumed.generation,
+            &mode,
+            TimestampMs::new(10_000),
+        )
+        .expect("a result from the generation in force");
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(2))
         .expect("a read")
         .expect("the generation");
     assert_eq!(record.state, GenerationState::Published);
@@ -877,7 +1113,7 @@ fn a_fence_is_recorded_durably_and_a_restart_comes_back_fenced() {
         assert_eq!(service.fenced_at().expect("a read"), None);
         let fenced = service.fence(PrivacyGeneration::new(4));
         assert_eq!(fenced.queues, 1);
-        assert!(service.faults().is_empty());
+        assert!(service.obligations().expect("a read").is_empty());
         assert_eq!(service.fenced_at().expect("a read"), Some(4));
     }
     // A host that held the fence in memory would come back and dispatch what it had just stopped.

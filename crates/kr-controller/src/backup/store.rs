@@ -316,6 +316,11 @@ impl BackupStore {
                      id                 INTEGER PRIMARY KEY CHECK (id = 0),
                      privacy_generation INTEGER NOT NULL,
                      fenced_at_ms       INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS obligations (
+                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     what         TEXT NOT NULL UNIQUE,
+                     recorded_at_ms INTEGER NOT NULL
                  );",
             )
             .map_err(ControllerError::registry)?;
@@ -508,25 +513,53 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         let complete = outstanding == 0;
         if complete {
-            let privacy_generation: i64 = transaction
+            // Exactly one publish entry, and the upload entry goes with it. A second
+            // acknowledgement of an object that had already arrived would otherwise enqueue a
+            // second publication, and reconciliation would resume an upload that had finished.
+            let already: i64 = transaction
                 .query_row(
-                    "SELECT privacy_generation FROM generations
-                     WHERE archive_id = ?1 AND backup_generation = ?2",
+                    "SELECT COUNT(*) FROM outbox
+                     WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3",
                     params![
                         archive_id.get().as_bytes().as_slice(),
                         i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                        Step::Publish.as_str(),
                     ],
                     |row| row.get(0),
                 )
                 .map_err(ControllerError::registry)?;
-            enqueue(
-                &transaction,
-                archive_id,
-                backup_generation,
-                Step::Publish,
-                u64::try_from(privacy_generation).unwrap_or(0),
-                now_ms,
-            )?;
+            if already == 0 {
+                let privacy_generation: i64 = transaction
+                    .query_row(
+                        "SELECT privacy_generation FROM generations
+                         WHERE archive_id = ?1 AND backup_generation = ?2",
+                        params![
+                            archive_id.get().as_bytes().as_slice(),
+                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(ControllerError::registry)?;
+                transaction
+                    .execute(
+                        "DELETE FROM outbox
+                         WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3",
+                        params![
+                            archive_id.get().as_bytes().as_slice(),
+                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                            Step::Upload.as_str(),
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                enqueue(
+                    &transaction,
+                    archive_id,
+                    backup_generation,
+                    Step::Publish,
+                    u64::try_from(privacy_generation).unwrap_or(0),
+                    now_ms,
+                )?;
+            }
         }
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(complete)
@@ -771,20 +804,30 @@ impl BackupStore {
         Ok(())
     }
 
-    /// Returns every writer this host may still publish under.
+    /// Returns every writer this host may still publish under, with the archive it may publish.
+    ///
+    /// The pair rather than the key, because an enrolment is for one collection: a writer enrolled
+    /// for archive A does not authorise unfinished work for archive B, and returning only key
+    /// identifiers would say that it did.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
-    pub fn authorised_writers(&self) -> Result<Vec<KeyId>> {
+    pub fn authorised_writers(&self) -> Result<Vec<(ArchiveId, KeyId)>> {
         let mut statement = self
             .connection
-            .prepare("SELECT writer_key_id FROM writers WHERE retired_at_ms IS NULL")
+            .prepare("SELECT archive_id, writer_key_id FROM writers WHERE retired_at_ms IS NULL")
             .map_err(ControllerError::registry)?;
         let rows = statement
             .query_map([], |row| {
-                let bytes: Vec<u8> = row.get(0)?;
-                Ok(key_id(&bytes))
+                let archive: Vec<u8> = row.get(0)?;
+                let writer: Vec<u8> = row.get(1)?;
+                Ok((|| -> Result<(ArchiveId, KeyId)> {
+                    Ok((
+                        ArchiveId::new(uuid(&archive, "an archive identifier")?),
+                        key_id(&writer)?,
+                    ))
+                })())
             })
             .map_err(ControllerError::registry)?;
         let mut writers = Vec::new();
@@ -792,6 +835,18 @@ impl BackupStore {
             writers.push(row.map_err(ControllerError::registry)??);
         }
         Ok(writers)
+    }
+
+    /// Returns true when this host holds an enrolment of that writer for that archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn authorises(&self, archive_id: ArchiveId, writer_key_id: KeyId) -> Result<bool> {
+        Ok(self
+            .authorised_writers()?
+            .into_iter()
+            .any(|(archive, writer)| archive == archive_id && writer == writer_key_id))
     }
 
     /// Puts one object back to staged, so a resumed upload continues from where it reached.
@@ -851,6 +906,59 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
         Ok(())
+    }
+
+    /// Records something privacy mode asked for and this host could not do.
+    ///
+    /// It is durable because a fault that lived in memory would be gone after a restart, and the
+    /// content it describes would not: privacy mode would then report complete over ciphertext
+    /// still on the disk. The text is the key, so recording the same failure twice records it
+    /// once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn record_obligation(&mut self, what: &str, now_ms: TimestampMs) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO obligations (what, recorded_at_ms) VALUES (?1, ?2)
+                 ON CONFLICT (what) DO NOTHING",
+                params![what, millis(now_ms)],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Clears one obligation, which only its own success does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn clear_obligation(&mut self, what: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM obligations WHERE what = ?1", params![what])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Returns everything privacy mode asked for that this host has not done.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn obligations(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT what FROM obligations ORDER BY id")
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(ControllerError::registry)?;
+        let mut outstanding = Vec::new();
+        for row in rows {
+            outstanding.push(row.map_err(ControllerError::registry)?);
+        }
+        Ok(outstanding)
     }
 
     /// Returns the privacy generation this host recorded a fence at, if it has.

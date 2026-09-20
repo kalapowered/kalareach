@@ -1396,40 +1396,60 @@ ciphertext in a `backup/` directory next to it. It holds generation records, obj
 state and an outbox. It holds **no object key, no plaintext and no filename**: the keys stay with
 the producer until the generation is sealed, and the filenames are inside the encrypted manifest.
 
-Every write changes the state *and* whatever follows from it, in one transaction. Admitting a
-generation writes its object rows and its first outbox entry with it. The object that finishes an
-upload writes the publish step with it, so a host that recorded the object and then died does not
-come back with a complete upload nothing publishes. A publication settles the generation and clears
-its outbox entries together. There is no point at which half a step is recorded, so nothing has to
-guess what the other half was.
+Every database write changes the state *and* whatever follows from it, in one transaction.
+Admitting a generation writes its object rows and its first outbox entry with it. The object that
+finishes an upload retires the upload step and writes the publish step with it, exactly once, so a
+host that recorded the object and then died does not come back with a complete upload nothing
+publishes, and a repeated acknowledgement does not enqueue a second publication. A publication
+settles the generation and clears its outbox entries together.
+
+Staging the ciphertext is the one step *outside* that transaction, and it goes first: each file is
+created exclusively, written, flushed and its directory entry flushed before any row names it, so a
+committed row never names a file that losing power took away. A crash between the two leaves files
+nothing claims, which a sweep can remove; the other order would leave rows naming files that are
+not there, which nothing can recover from. Exclusive creation is also what stops a second admission
+of the same generation writing over ciphertext the first is still accounting for, and that second
+admission is refused outright.
 
 ### What a restart resolves
 
-Reconciliation runs before anything can add to the store, and it gives one of three answers.
+Reconciliation runs before anything can add to the store, and it gives one of four answers.
 
-* A generation whose writer this host no longer holds an enrolment for is **cancelled**. It is work
-  this host may not do, whatever state it was left in.
-* A generation whose *publication* was dispatched and never answered is recorded as **unknown**.
-  The service may hold it and may not, and a host that wrote either answer would be writing
-  something it does not know; section 23 never retries that automatically.
+* A generation whose *publication* was dispatched and never answered is recorded as **unknown**,
+  and that is decided first. The service may hold it and may not, and a host that wrote either
+  answer would be writing something it does not know; section 23 never retries that automatically,
+  and retiring the writer afterwards does not rewrite an outcome this host never learned.
+* A generation whose writer this host no longer holds an enrolment **for that archive** is
+  **cancelled**. Authority is the pair: an enrolment for one collection does not authorise
+  unfinished work for another.
+* A generation left where privacy mode fenced it stays **fenced**. A restart does not un-fence work
+  a fence stopped; turning privacy mode off is what decides what becomes of it.
 * Everything else **resumes**, dispatched uploads included. The same object under the same identity
   and hash is the same object, so sending it again is not a second publication.
 
 ### What a restore checks, and in what order
 
-The owner's enrolment first, because it is the owner's own signature and it is what says this
-writer may publish for this collection at all. Then the writer key the recovery bundle supplied,
-which must be the key that enrolment names and must be its own identifier. Then the publication's
-structure and its signature under that writer. Then the generation against the checkpoint the owner
-trusts, which refuses an archive older than what the owner verified and one that claims the
-checkpoint's generation with a different manifest. A `VerifiedRestore` is built by that call and by
-nothing else, so the reading half is not reachable without the checking half.
+The caller's own expectation first: the archive it means to restore. Without it, a genuine
+enrolment and a genuine publication for a *different* collection of the same owner would pass every
+signature check. Then the owner's enrolment, because it is the owner's own signature and it is what
+says this writer may publish for this collection at all. Then the writer key the recovery bundle
+supplied, which must be the key that enrolment names and must be its own identifier. Then the
+publication's structure and its signature under that writer. Then the generation against the
+checkpoint the owner trusts, which refuses an archive older than what the owner verified and one
+that claims the checkpoint's generation with a different manifest.
 
-A restore returns data. Session content, device configuration and generation checkpoints come back;
-reusable endpoint and control-signing private keys, the notification extension's preview key, the
-recovery seed, this host's own grant and revocation authority and any revoked grant do not, each
-with the reason rather than as a silent omission. The table is `kr_crypto::backup`'s, so this host
-and the device that made the backup give the same answer.
+`VerifiedRestore` is built by that call and by nothing else, and its fields are private.
+`VerifiedRestore::expectation` builds what `kr_crypto::backup::open_archive` is handed, from what
+was verified rather than from anything the caller still holds, so the archive that is opened is the
+archive whose authority was established.
+
+What a restore puts back is decided by `kr_crypto::backup`'s table, so this host and the device that
+made the backup give the same answer: session content, device configuration and generation
+checkpoints come back; reusable endpoint and control-signing private keys, the notification
+extension's preview key, the recovery seed, this host's own grant and revocation authority and any
+revoked grant do not, each with the reason rather than as a silent omission. The table classifies
+material a caller names rather than inspecting an object's bytes, so it is the decision and the
+caller's export and import paths are the gate.
 
 ### What it does not do
 
@@ -1486,19 +1506,30 @@ claimed a functioning durable control system wrote no state at all would be clai
 untrue.
 
 Backup production is fenced where it is accounted for. The backup service records the privacy
-generation it is fenced at **durably**, so a host that fenced and restarted does not come back and
-dispatch the entries it had just stopped; it takes back every undispatched outbox entry and settles
-the generations that had nothing else in flight; and it removes the staged ciphertext it holds. It
-reports only what it actually removed: a file it could not unlink stays in the accounting, and the
-failure is recorded and counted as work outstanding, so privacy mode cannot report complete over a
-cleanup that did not happen. Two kinds of generation keep their record once their bytes have gone -
-one that has already been published, because it is shown as a retained artifact rather than
-forgotten, and one with work still in flight, because its outbox entry is what says the cleanup is
-not finished. A publication whose result was produced under an earlier generation is refused rather
-than recorded, under the same comparison every other subsystem uses.
+generation it is fenced at **durably**, and the record is what stops the work: while a fence is
+recorded, no generation is admitted, no outbox entry is dispatched, and a restart's reconciliation
+leaves fenced work where it is rather than putting it back in hand. The fence also takes back every
+undispatched outbox entry, settles the generations that had nothing else in flight, and removes the
+staged ciphertext this host holds.
 
-What has already left the host is shown rather than erased. An uploaded archive or notification is
-listed with a separately authorised deletion action for the copies this host holds a reference to;
+It reports only what it actually removed. A file it could not unlink stays in the accounting, and
+the failure becomes a **durable obligation**: it is counted as work outstanding, a restart comes
+back owing what it owed, and only the retry's own success clears it, so privacy mode cannot report
+complete over a cleanup that did not happen. Three kinds of generation keep their record once their
+bytes have gone: one already published, because it has left and is shown rather than pretended
+away; one whose outcome this host could not establish, for the same reason; and one with work still
+in flight, because its outbox entry is what says the cleanup is not finished.
+
+A publication is recorded only under the generation *this host admitted the work under*, which it
+reads from its own store rather than taking from the caller. A result from an earlier generation is
+refused, and so is one relabelled with the generation in force.
+
+What has already left the host is shown rather than erased. An uploaded archive is listed by its
+archive and generation, and so is one whose outcome this host could not establish, because a copy
+it cannot account for is still a copy. The backup service marks them **not** deletable: it holds no
+route through which it could ask the service to remove one, and offering an action nothing here can
+perform would be the false promise section 24 forbids. A notification or an archive this host does
+hold a reference to is listed with a separately authorised deletion action;
 it does not silently delete unrelated backup collections and does not claim a copy somebody else
 holds can be recalled. Local deletion is logical cleanup of this host's own records rather than a
 claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here

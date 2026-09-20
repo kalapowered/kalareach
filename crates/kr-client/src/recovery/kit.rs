@@ -47,9 +47,9 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// The most bytes a recovery kit may render to.
 ///
-/// A QR code carries the document in byte mode, and version 20 at the medium error correction a
-/// printed kit wants holds a little over a kilobyte. A kit that will not scan is refused when it
-/// is built rather than discovered at the camera.
+/// A QR code carries the document in byte mode. Version 25 at the medium error correction a
+/// printed kit wants holds 1 062 bytes, so a kit inside this bound fits one; a kit that would not
+/// is refused when it is built rather than discovered at the camera.
 pub const MAX_RECOVERY_KIT_BYTES: usize = 1024;
 
 /// Renders one kit as the printable and QR document.
@@ -325,8 +325,15 @@ fn symbol_value(character: char) -> Option<u8> {
 }
 
 /// Refuses a value a line-oriented document cannot carry unambiguously.
+///
+/// Printable ASCII, and no leading or trailing space. Reading trims the line, so a value that ends
+/// in a space would come back a different string, and a different locator or origin derives a
+/// different bundle key: the kit would round-trip to something that authenticates nothing.
 fn check_printable(what: &'static str, value: &str) -> Result<(), RecoveryError> {
     if value.is_empty() {
+        return Err(RecoveryError::UnprintableKit { what });
+    }
+    if value.trim() != value {
         return Err(RecoveryError::UnprintableKit { what });
     }
     if value

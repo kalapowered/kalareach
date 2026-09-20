@@ -57,28 +57,22 @@ pub struct ObjectSource<'a> {
 /// storage: a producer uploads [`Self::bytes`] and publishes [`Self::reference`], and everything
 /// else here stays on the device that made it.
 ///
-/// `Debug` is written rather than derived for the same reason: the key redacts itself, but the
-/// source digest is a fingerprint of the plaintext and a derived `Debug` would print it.
+/// **Its fields are private, and that is the rotation rule.** The only ways to obtain one are
+/// [`stage_object`] and [`resume_object`], which set the rotation from the argument they were
+/// given and re-encrypt when it has moved. A caller that could write the rotation could relabel
+/// ciphertext a revocation invalidated and seal it into the next generation, which is the one
+/// thing rotating a mutable shared collection's keys exists to prevent.
+///
+/// `Debug` is written rather than derived for the same reason the fields are private: the key
+/// redacts itself, but the source digest is a fingerprint of the plaintext and a derived `Debug`
+/// would print it.
 pub struct StagedObject {
-    /// The reference the manifest and every wrap name.
-    pub reference: EncryptedObjectRef,
-    /// The name the manifest records.
-    pub filename: String,
-    /// The ciphertext, `secretstream` header included, ending in the final authenticated record.
-    pub bytes: Vec<u8>,
-    /// The object key, held until the generation is sealed and wrapped for every recipient.
-    pub key: SymmetricKey,
-    /// The SHA-256 of the plaintext this ciphertext was made from.
-    ///
-    /// It is how a resumed upload tells an unchanged source from a changed one, and it never
-    /// leaves the device: a service that held it would hold a fingerprint of the plaintext.
-    pub source_digest: Digest256,
-    /// The key rotation this ciphertext was staged under.
-    ///
-    /// [`seal_archive`] refuses an object from before the recipient set's current rotation, so a
-    /// revocation that rotates a mutable shared collection's keys cannot be followed by a
-    /// generation sealed from the ciphertext that revocation invalidated.
-    pub rotation: KeyRotation,
+    reference: EncryptedObjectRef,
+    filename: String,
+    bytes: Vec<u8>,
+    key: SymmetricKey,
+    source_digest: Digest256,
+    rotation: KeyRotation,
 }
 
 impl std::fmt::Debug for ObjectSource<'_> {
@@ -107,6 +101,47 @@ impl std::fmt::Debug for StagedObject {
 }
 
 impl StagedObject {
+    /// Returns the reference the manifest and every wrap name.
+    #[must_use]
+    pub const fn reference(&self) -> &EncryptedObjectRef {
+        &self.reference
+    }
+
+    /// Returns the object's identity.
+    #[must_use]
+    pub const fn object_id(&self) -> BackupObjectId {
+        self.reference.object_id
+    }
+
+    /// Returns the name the manifest records.
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    /// Returns the ciphertext to upload: the `secretstream` header and every record, ending in the
+    /// final authenticated one.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the key rotation this ciphertext was made under.
+    #[must_use]
+    pub const fn rotation(&self) -> KeyRotation {
+        self.rotation
+    }
+
+    /// Returns true when this object is under the same key as `other`.
+    ///
+    /// It answers the question a caller actually has - did staging this again produce a new key? -
+    /// without the key leaving this type. A rotation or a changed source is supposed to produce a
+    /// different one, and this is how that is established.
+    #[must_use]
+    pub fn shares_key_with(&self, other: &Self) -> bool {
+        self.key.constant_time_eq(&other.key)
+    }
+
     /// Returns true when `plaintext` is the content this ciphertext was made from.
     #[must_use]
     pub fn matches_source(&self, plaintext: &[u8]) -> bool {

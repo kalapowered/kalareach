@@ -16,16 +16,14 @@ use std::sync::Arc;
 
 use kr_crypto::kdf::RecoverySeed;
 use kr_protocol::archive::{
-    ArchiveCheckpoint, RecoveryBundle, RecoveryContext, RecoveryKit, TrustedWriter,
+    ArchiveCheckpoint, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
+    RecoveryKit, TrustedProducer, TrustedWriter,
 };
-use kr_protocol::scalars::{KeyId, TimestampMs, U64};
+use kr_protocol::scalars::{KeyId, StoredEnvelopeKey, TimestampMs, U64};
 
 use crate::error::ClientError;
 use crate::recovery::{RecoveryError, Result};
 use crate::services::SyncBackupService;
-
-/// The bundle schema version this build writes.
-pub const BUNDLE_SCHEMA_VERSION: u64 = 1;
 
 /// Returns the collection name one bundle is stored under.
 ///
@@ -83,9 +81,10 @@ impl BundleStore {
     #[must_use]
     pub fn empty(now_ms: TimestampMs) -> RecoveryBundle {
         RecoveryBundle {
-            schema_version: U64::new(BUNDLE_SCHEMA_VERSION),
+            schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
             collections: Vec::new(),
             trusted_writers: [].into_iter().collect(),
+            trusted_producers: [].into_iter().collect(),
             checkpoints: [].into_iter().collect(),
             revision: U64::new(0),
             written_at_ms: now_ms,
@@ -175,16 +174,51 @@ impl BundleStore {
         let generation = self.commit(seed, bundle, now_ms).await?;
         Ok(WriterEnabled {
             writer_key_id,
+            context: self.context.clone(),
             bundle_revision: bundle.revision.get(),
             bundle_generation: generation,
         })
     }
 
-    /// Rotates a writer's signing key: the old key leaves the bundle and the new one enters it,
-    /// in one commit.
+    /// Enrols the producer whose key wraps a restore will have to open.
     ///
-    /// One commit rather than two, because a bundle that briefly held neither would refuse the
-    /// archives the writer had already published.
+    /// A restore that has only the kit needs the producer's *public* stored-envelope key: a wrap
+    /// is a `crypto_box` between two keys and the descriptor carries only an identifier, which is
+    /// a hash. Taking it from the archive instead would be taking key material from something
+    /// untrusted, which is the one thing section 20 ¶10 forbids.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::commit`] returns.
+    pub async fn enable_producer(
+        &mut self,
+        seed: &RecoverySeed,
+        bundle: &mut RecoveryBundle,
+        sender_key_id: KeyId,
+        stored_envelope_key: StoredEnvelopeKey,
+        now_ms: TimestampMs,
+    ) -> Result<u64> {
+        let mut producers: Vec<TrustedProducer> =
+            bundle.trusted_producers.iter().cloned().collect();
+        producers.retain(|held| held.sender_key_id != sender_key_id);
+        producers.push(TrustedProducer {
+            sender_key_id,
+            stored_envelope_key,
+            enrolled_at_ms: now_ms,
+        });
+        bundle.trusted_producers = producers.into_iter().collect();
+        self.commit(seed, bundle, now_ms).await
+    }
+
+    /// Rotates a writer's signing key: the replacement enters the bundle and the retired key
+    /// stays, in one commit.
+    ///
+    /// **The retired key stays.** The bundle is the only place a restore takes a writer key from,
+    /// so removing the old one would leave every archive it had already signed unverifiable: a
+    /// rotation would silently destroy the backups it was meant to protect. What rotation changes
+    /// is which writer may *publish*, and that is the collection's enrolment record rather than
+    /// this set. [`Self::retire_writer`] is the separate, deliberate step that drops a key once no
+    /// retained archive needs it.
     ///
     /// # Errors
     ///
@@ -193,21 +227,45 @@ impl BundleStore {
         &mut self,
         seed: &RecoverySeed,
         bundle: &mut RecoveryBundle,
-        retiring: &KeyId,
         replacement: TrustedWriter,
         now_ms: TimestampMs,
     ) -> Result<WriterEnabled> {
-        let mut writers: Vec<TrustedWriter> = bundle.trusted_writers.iter().cloned().collect();
-        writers.retain(|held| &held.writer_key_id != retiring);
-        bundle.trusted_writers = writers.into_iter().collect();
         self.enable_writer(seed, bundle, replacement, now_ms).await
     }
 
-    /// Records the latest generation the owner has verified for one archive.
+    /// Drops a writer key from the bundle, which no restore will verify against afterwards.
+    ///
+    /// It is separate from a rotation because it is a different decision: rotating a key is about
+    /// what may be published next, and dropping one is about what may still be read. A caller
+    /// takes this step when no retained archive is signed by that key any more.
     ///
     /// # Errors
     ///
     /// Returns whatever [`Self::commit`] returns.
+    pub async fn retire_writer(
+        &mut self,
+        seed: &RecoverySeed,
+        bundle: &mut RecoveryBundle,
+        retiring: &KeyId,
+        now_ms: TimestampMs,
+    ) -> Result<u64> {
+        let mut writers: Vec<TrustedWriter> = bundle.trusted_writers.iter().cloned().collect();
+        writers.retain(|held| &held.writer_key_id != retiring);
+        bundle.trusted_writers = writers.into_iter().collect();
+        self.commit(seed, bundle, now_ms).await
+    }
+
+    /// Records the latest generation the owner has verified for one archive.
+    ///
+    /// A checkpoint only ever moves forward. A verification of generation four arriving after one
+    /// of generation nine is a late answer, not a newer fact, and writing it would give a service
+    /// five generations of archives it could replay unnoticed. The compare-and-swap protects the
+    /// bundle's revision; this protects what the bundle says.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::CheckpointWentBackwards`] when the recorded generation is newer
+    /// than this one, and whatever [`Self::commit`] returns.
     pub async fn record_checkpoint(
         &mut self,
         seed: &RecoverySeed,
@@ -216,6 +274,25 @@ impl BundleStore {
         now_ms: TimestampMs,
     ) -> Result<u64> {
         let mut checkpoints: Vec<ArchiveCheckpoint> = bundle.checkpoints.iter().cloned().collect();
+        if let Some(held) = checkpoints
+            .iter()
+            .find(|held| held.archive_id == checkpoint.archive_id)
+        {
+            if held.backup_generation.get() > checkpoint.backup_generation.get() {
+                return Err(RecoveryError::CheckpointWentBackwards {
+                    recorded: held.backup_generation.get(),
+                    offered: checkpoint.backup_generation.get(),
+                });
+            }
+            if held.backup_generation == checkpoint.backup_generation
+                && held.encrypted_manifest_hash != checkpoint.encrypted_manifest_hash
+            {
+                return Err(RecoveryError::CheckpointWentBackwards {
+                    recorded: held.backup_generation.get(),
+                    offered: checkpoint.backup_generation.get(),
+                });
+            }
+        }
         checkpoints.retain(|held| held.archive_id != checkpoint.archive_id);
         checkpoints.push(checkpoint);
         bundle.checkpoints = checkpoints.into_iter().collect();
@@ -244,28 +321,28 @@ impl BundleStore {
         seed: &RecoverySeed,
         bundle: &mut RecoveryBundle,
         kit: &RecoveryKit,
+        destination_service: Arc<dyn SyncBackupService>,
         destination: RecoveryContext,
         now_ms: TimestampMs,
     ) -> Result<Migrated> {
         let origin = self.context.clone();
-        let mut moved = Self::new(Arc::clone(&self.service), destination.clone());
+        let mut moved = Self::new(destination_service, destination.clone());
         let generation = moved.commit(seed, bundle, now_ms).await?;
         // Read back and authenticate at the new location. The key there is a different key, so a
         // service that stored the old ciphertext under the new name fails here.
         let verified = moved.fetch(seed).await?;
-        if verified.revision != bundle.revision {
+        if &verified != bundle {
+            // The revision alone would not do: a service that served a different bundle at the
+            // same revision would pass. What was written is what has to come back.
             return Err(RecoveryError::BundleNotAuthentic);
         }
 
-        let mut origins: Vec<String> = kit
-            .service_origins
-            .iter()
-            .filter(|held| *held != &origin.service_origin)
-            .cloned()
-            .collect();
-        if !origins.contains(&destination.service_origin) {
-            origins.push(destination.service_origin.clone());
-        }
+        // The updated kit names the destination and nothing else. A kit's origins all share one
+        // locator, so an origin left in it would point at a bundle this migration did not move and
+        // would open, if anything, a superseded copy. An owner with several services migrates each
+        // one and keeps the kit each migration produced.
+        let origins = vec![destination.service_origin.clone()];
+        let _ = kit;
         let updated_kit =
             kr_crypto::kdf::RecoverySeed::to_kit(seed, origins, destination.bundle_locator.clone());
 
@@ -287,14 +364,42 @@ impl BundleStore {
 ///
 /// It is returned by [`BundleStore::enable_writer`] and built nowhere else, so holding one is
 /// holding the ordering section 20 requires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriterEnabled {
-    /// The writer now in the bundle.
-    pub writer_key_id: KeyId,
-    /// The bundle revision that carries it.
-    pub bundle_revision: u64,
-    /// The service generation the bundle was committed at.
-    pub bundle_generation: u64,
+    writer_key_id: KeyId,
+    context: RecoveryContext,
+    bundle_revision: u64,
+    bundle_generation: u64,
+}
+
+impl WriterEnabled {
+    /// Returns the writer this evidence is for.
+    #[must_use]
+    pub const fn writer_key_id(&self) -> KeyId {
+        self.writer_key_id
+    }
+
+    /// Returns where the bundle that carries it is stored.
+    ///
+    /// The evidence is about one bundle at one location. A writer enabled in the bundle at one
+    /// origin is not enabled in the bundle at another, and carrying the context is what stops that
+    /// being assumed.
+    #[must_use]
+    pub const fn context(&self) -> &RecoveryContext {
+        &self.context
+    }
+
+    /// Returns the bundle revision that carries the writer.
+    #[must_use]
+    pub const fn bundle_revision(&self) -> u64 {
+        self.bundle_revision
+    }
+
+    /// Returns the service generation the bundle was committed at.
+    #[must_use]
+    pub const fn bundle_generation(&self) -> u64 {
+        self.bundle_generation
+    }
 }
 
 /// A verified move of the bundle to another origin or locator.

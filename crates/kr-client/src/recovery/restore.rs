@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use kr_crypto::kdf::RecoverySeed;
 use kr_protocol::archive::{
-    ArchiveCheckpoint, CollectionLocator, RecoveryContext, RecoveryKit, TrustedWriter,
+    ArchiveCheckpoint, CollectionLocator, RecoveryContext, RecoveryKit, TrustedProducer,
+    TrustedWriter,
 };
 
 use crate::recovery::bundle::BundleStore;
@@ -63,6 +64,12 @@ pub struct TrustedMaterial {
     pub context: RecoveryContext,
     /// The writers whose manifests this restore may verify.
     pub trusted_writers: Vec<TrustedWriter>,
+    /// The producers whose key wraps this restore may open.
+    ///
+    /// A restore needs the producer's public stored-envelope key to open a wrap, and this is where
+    /// it comes from. Taking it from the archive would be taking key material from something
+    /// untrusted.
+    pub trusted_producers: Vec<TrustedProducer>,
     /// Where the owner's collections live.
     pub collections: Vec<CollectionLocator>,
     /// The latest generation the owner verified for each archive.
@@ -72,6 +79,14 @@ pub struct TrustedMaterial {
 }
 
 impl TrustedMaterial {
+    /// Returns the producer key one wrap's sender identifier names, when the bundle carries it.
+    #[must_use]
+    pub fn producer(&self, sender_key_id: kr_protocol::scalars::KeyId) -> Option<&TrustedProducer> {
+        self.trusted_producers
+            .iter()
+            .find(|producer| producer.sender_key_id == sender_key_id)
+    }
+
     /// Returns the checkpoint for one archive, when the bundle carries one.
     #[must_use]
     pub fn checkpoint(
@@ -168,6 +183,7 @@ impl FreshRestore {
         Ok(TrustedMaterial {
             context,
             trusted_writers: bundle.trusted_writers.iter().cloned().collect(),
+            trusted_producers: bundle.trusted_producers.iter().cloned().collect(),
             collections: bundle.collections.clone(),
             checkpoints: bundle.checkpoints.iter().cloned().collect(),
             bundle_revision: bundle.revision.get(),

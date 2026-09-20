@@ -126,11 +126,12 @@ fn every_object_is_encrypted_under_its_own_random_key() {
     let first = stage(1, "a.cbor", b"the same body");
     let second = stage(2, "b.cbor", b"the same body");
     assert!(
-        !first.key.constant_time_eq(&second.key),
+        !first.shares_key_with(&second),
         "two objects never share a key"
     );
     assert_ne!(
-        first.bytes, second.bytes,
+        first.bytes(),
+        second.bytes(),
         "identical plaintext under two keys is two ciphertexts"
     );
 }
@@ -145,7 +146,7 @@ fn an_object_is_written_in_one_mebibyte_records_and_needs_its_final_record() {
     let records = plaintext.len().div_ceil(RECORD_LEN);
     assert_eq!(records, 3, "two full records and a remainder");
     assert_eq!(
-        staged.bytes.len(),
+        staged.bytes().len(),
         kr_crypto::stream::HEADER_LEN
             + plaintext.len()
             + records * kr_crypto::stream::RECORD_OVERHEAD,
@@ -169,20 +170,20 @@ fn an_object_is_written_in_one_mebibyte_records_and_needs_its_final_record() {
         .restore_object(
             &reader,
             &parties.sender_key(),
-            staged.reference.object_id,
-            &staged.bytes,
+            staged.object_id(),
+            staged.bytes(),
         )
         .expect("the object restores");
     assert_eq!(restored.plaintext.expose(), plaintext.as_slice());
 
     // A length that is not the manifest's fails first, before the object is decrypted at all.
-    let truncated = &staged.bytes[..staged.bytes.len() - 64];
+    let truncated = &staged.bytes()[..staged.bytes().len() - 64];
     assert!(
         matches!(
             opened.restore_object(
                 &reader,
                 &parties.sender_key(),
-                staged.reference.object_id,
+                staged.object_id(),
                 truncated,
             ),
             Err(CryptoError::HashMismatch { .. })
@@ -190,55 +191,27 @@ fn an_object_is_written_in_one_mebibyte_records_and_needs_its_final_record() {
         "a stored object of another length is refused before it is decrypted"
     );
 
-    // And the final-record rule itself, reached by publishing the *truncated* bytes as the object:
-    // its hash and length are the manifest's, so every check before the framing rule passes and
-    // the only thing left to refuse it is the missing final record.
-    let cut_short = truncated_object(&staged);
-    let sealed = seal(&parties, 2, std::slice::from_ref(&cut_short));
-    let opened = open_archive(
-        &reader,
-        &parties.sender_key(),
-        &[trusted(&parties.writer)],
-        &expecting(),
-        &sealed.descriptor_bytes,
-        &sealed.encrypted_manifest,
-    )
-    .expect("the archive opens");
+    // And the final-record rule itself. `decrypt_object` is what a restore calls once it has the
+    // key and the manifest's reference, so it is driven here with bytes whose hash and length are
+    // its reference's: every check before the framing rule passes, and the missing final record is
+    // the only thing left to refuse it.
+    let object = archive::encrypt_object(object_id(4), &plaintext).expect("an object");
+    let one_record = kr_crypto::stream::HEADER_LEN
+        + kr_crypto::stream::RECORD_LEN
+        + kr_crypto::stream::RECORD_OVERHEAD;
+    let cut_short = &object.bytes[..one_record];
+    let reference = kr_protocol::archive::EncryptedObjectRef {
+        object_id: object_id(4),
+        encrypted_object_hash: Digest256::from_bytes(kr_cbor::sha256(cut_short)),
+        encrypted_len: U64::new(cut_short.len() as u64),
+    };
     assert!(
         matches!(
-            opened.restore_object(
-                &reader,
-                &parties.sender_key(),
-                cut_short.reference.object_id,
-                &cut_short.bytes,
-            ),
+            archive::decrypt_object(&object.key, &reference, cut_short),
             Err(CryptoError::MissingFinalRecord)
         ),
         "an upload cut short is not a shorter valid object"
     );
-}
-
-/// Publishes the first two records of an object as if they were the whole of it.
-///
-/// Its reference is the hash and the length of the truncated bytes, so a restore's length and hash
-/// checks both pass and the missing final record is what is left to catch it.
-fn truncated_object(staged: &StagedObject) -> StagedObject {
-    let record = kr_crypto::stream::HEADER_LEN
-        + kr_crypto::stream::RECORD_LEN
-        + kr_crypto::stream::RECORD_OVERHEAD;
-    let bytes = staged.bytes[..record].to_vec();
-    StagedObject {
-        reference: kr_protocol::archive::EncryptedObjectRef {
-            object_id: object_id(4),
-            encrypted_object_hash: Digest256::from_bytes(kr_cbor::sha256(&bytes)),
-            encrypted_len: U64::new(bytes.len() as u64),
-        },
-        filename: "cut-short.cbor".to_owned(),
-        bytes,
-        key: kr_crypto::secret::Secret::from_bytes(*staged.key.expose()),
-        source_digest: staged.source_digest,
-        rotation: staged.rotation,
-    }
 }
 
 #[test]
@@ -295,11 +268,11 @@ fn every_recipient_gets_its_own_wrap_of_every_key() {
                 .restore_object(
                     &reader,
                     &parties.sender_key(),
-                    staged.reference.object_id,
-                    &staged.bytes,
+                    staged.object_id(),
+                    staged.bytes(),
                 )
                 .expect("a member object restores");
-            assert_eq!(restored.filename, staged.filename);
+            assert_eq!(restored.filename, staged.filename());
         }
     }
 
@@ -352,12 +325,12 @@ fn every_wrap_carries_a_fresh_nonce_and_the_whole_declared_context() {
     for wrap in &payload.member_key_wraps {
         let named = objects
             .iter()
-            .find(|staged| staged.reference.object_id == wrap.context.object_id)
+            .find(|staged| staged.object_id() == wrap.context.object_id)
             .expect("a wrap names a member object");
         assert_eq!(wrap.context.purpose, KeyWrapPurpose::ObjectKey);
         assert_eq!(
             wrap.context.encrypted_object_hash,
-            named.reference.encrypted_object_hash
+            named.reference().encrypted_object_hash
         );
     }
 }
@@ -387,18 +360,18 @@ fn a_wrap_is_valid_only_for_its_own_object_and_recipient() {
         .member_key_wraps
         .iter()
         .find(|wrap| {
-            wrap.context.object_id == first_object.reference.object_id
+            wrap.context.object_id == first_object.object_id()
                 && wrap.context.recipient_key_id == parties.device.key_id()
         })
         .expect("a wrap")
         .clone();
     for wrap in &mut payload.member_key_wraps {
-        if wrap.context.object_id == second_object.reference.object_id
+        if wrap.context.object_id == second_object.object_id()
             && wrap.context.recipient_key_id == parties.device.key_id()
         {
             *wrap = moved.clone();
-            wrap.context.object_id = second_object.reference.object_id;
-            wrap.context.encrypted_object_hash = second_object.reference.encrypted_object_hash;
+            wrap.context.object_id = second_object.object_id();
+            wrap.context.encrypted_object_hash = second_object.reference().encrypted_object_hash;
         }
     }
     let (descriptor_bytes, encrypted_manifest) = reseal_manifest(
@@ -422,8 +395,8 @@ fn a_wrap_is_valid_only_for_its_own_object_and_recipient() {
             .restore_object(
                 &reader,
                 &parties.sender_key(),
-                second_object.reference.object_id,
-                &second_object.bytes,
+                second_object.object_id(),
+                second_object.bytes(),
             )
             .is_err(),
         "a wrap moved to another object does not open"
@@ -437,13 +410,13 @@ fn a_wrap_is_valid_only_for_its_own_object_and_recipient() {
         .member_key_wraps
         .iter()
         .find(|wrap| {
-            wrap.context.object_id == first_object.reference.object_id
+            wrap.context.object_id == first_object.object_id()
                 && wrap.context.recipient_key_id == second_device.key_id()
         })
         .expect("a wrap")
         .clone();
     for wrap in &mut payload.member_key_wraps {
-        if wrap.context.object_id == first_object.reference.object_id
+        if wrap.context.object_id == first_object.object_id()
             && wrap.context.recipient_key_id == parties.device.key_id()
         {
             *wrap = theirs.clone();
@@ -470,8 +443,8 @@ fn a_wrap_is_valid_only_for_its_own_object_and_recipient() {
             .restore_object(
                 &reader,
                 &parties.sender_key(),
-                first_object.reference.object_id,
-                &first_object.bytes,
+                first_object.object_id(),
+                first_object.bytes(),
             )
             .is_err(),
         "a wrap addressed to another recipient does not open for this one"
@@ -533,7 +506,7 @@ fn only_the_archive_identifier_and_object_references_are_outside_the_encrypted_m
     assert_eq!(manifest.objects[0].filename, "session-history.cbor");
     assert_eq!(
         manifest.objects[0].object.encrypted_object_hash,
-        objects[0].reference.encrypted_object_hash
+        objects[0].reference().encrypted_object_hash
     );
 }
 
@@ -615,7 +588,7 @@ fn a_tampered_object_fails_against_the_hash_the_manifest_named() {
     )
     .expect("the archive opens");
 
-    let mut bytes = objects[0].bytes.clone();
+    let mut bytes = objects[0].bytes().to_vec();
     let last = bytes.len() - 1;
     bytes[last] ^= 0x01;
     assert!(
@@ -623,7 +596,7 @@ fn a_tampered_object_fails_against_the_hash_the_manifest_named() {
             opened.restore_object(
                 &reader,
                 &parties.sender_key(),
-                objects[0].reference.object_id,
+                objects[0].object_id(),
                 &bytes,
             ),
             Err(CryptoError::HashMismatch { .. })
@@ -773,7 +746,7 @@ fn a_generation_of_many_objects_and_many_recipients_seals_and_opens() {
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
     assert!(recipients.add(*parties.device.public()));
     let mut devices = Vec::new();
-    for _ in 0..19 {
+    for _ in 0..39 {
         let device = StoredEnvelopeKeyPair::generate().expect("a device key");
         assert!(recipients.add(*device.public()));
         devices.push(device);
@@ -781,9 +754,10 @@ fn a_generation_of_many_objects_and_many_recipients_seals_and_opens() {
     let objects: Vec<StagedObject> = (0u8..120)
         .map(|seed| stage(seed, "member.cbor", b"a member object"))
         .collect();
-    // Two thousand four hundred member wraps: over the default 1 MiB message bound and over the
-    // default four-thousand-member collection bound on items, which is what this pins.
-    assert_eq!(objects.len() * recipients.len(), 2_400);
+    // Four thousand eight hundred member wraps, which is past every default bound this would have
+    // been decoded under before: the 1 MiB message, the 4 096-member collection and the 65 536
+    // items.
+    assert_eq!(objects.len() * recipients.len(), 4_800);
 
     let sealed = seal_archive(
         &parties.writer,
@@ -808,8 +782,8 @@ fn a_generation_of_many_objects_and_many_recipients_seals_and_opens() {
         .restore_object(
             &reader,
             &parties.sender_key(),
-            objects[77].reference.object_id,
-            &objects[77].bytes,
+            objects[77].object_id(),
+            objects[77].bytes(),
         )
         .expect("a member object restores");
     assert_eq!(restored.plaintext.expose(), b"a member object");
@@ -882,7 +856,7 @@ fn a_staged_object_never_prints_its_plaintext_or_its_fingerprint() {
         rendered.contains("Digest256(redacted)"),
         "the source digest is a fingerprint of the plaintext: {rendered}"
     );
-    let digest = kr_protocol::scalars::to_base64url(staged.source_digest.as_bytes().as_slice());
+    let digest = kr_protocol::scalars::to_base64url(&kr_cbor::sha256(plaintext));
     assert!(!rendered.contains(&digest));
 }
 
@@ -963,8 +937,8 @@ fn an_invalid_descriptor_fails_before_any_object_is_opened() {
 #[test]
 fn an_interrupted_upload_resumes_on_the_ciphertext_it_already_made() {
     let staged = stage(1, "a.cbor", b"the body");
-    let before = staged.bytes.clone();
-    let reference = staged.reference.clone();
+    let before = staged.bytes().to_vec();
+    let reference = staged.reference().clone();
 
     let resumed = resume_object(
         staged,
@@ -977,8 +951,12 @@ fn an_interrupted_upload_resumes_on_the_ciphertext_it_already_made() {
     )
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReusedCiphertext);
-    assert_eq!(resumed.staged.bytes, before, "not one byte is re-encrypted");
-    assert_eq!(resumed.staged.reference, reference);
+    assert_eq!(
+        resumed.staged.bytes(),
+        before,
+        "not one byte is re-encrypted"
+    );
+    assert_eq!(resumed.staged.reference(), &reference);
 
     // A source that was only renamed keeps its ciphertext and records the name it has now, so the
     // next manifest does not carry a filename the source no longer has.
@@ -994,17 +972,18 @@ fn an_interrupted_upload_resumes_on_the_ciphertext_it_already_made() {
     .expect("a resumed object");
     assert_eq!(renamed.decision, ResumeDecision::ReusedCiphertextRenamed);
     assert_eq!(
-        renamed.staged.bytes, before,
+        renamed.staged.bytes(),
+        before,
         "still not one byte re-encrypted"
     );
-    assert_eq!(renamed.staged.filename, "renamed.cbor");
+    assert_eq!(renamed.staged.filename(), "renamed.cbor");
 }
 
 #[test]
 fn a_source_that_changed_restarts_encryption_under_a_new_key() {
     let staged = stage(1, "a.cbor", b"the body");
-    let before = staged.bytes.clone();
-    let key_before = kr_crypto::secret::Secret::from_bytes(*staged.key.expose());
+    let before = staged.bytes().to_vec();
+    let kept = stage(1, "a.cbor", b"the body");
 
     let resumed = resume_object(
         staged,
@@ -1017,9 +996,9 @@ fn a_source_that_changed_restarts_encryption_under_a_new_key() {
     )
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReencryptedUnderNewKey);
-    assert_ne!(resumed.staged.bytes, before);
+    assert_ne!(resumed.staged.bytes(), before);
     assert!(
-        !resumed.staged.key.constant_time_eq(&key_before),
+        !resumed.staged.shares_key_with(&kept),
         "a changed source never continues under the old key"
     );
 }
@@ -1153,8 +1132,8 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
         .restore_object(
             &ArchiveReader::Device(&leaving),
             &parties.sender_key(),
-            objects[0].reference.object_id,
-            &objects[0].bytes,
+            objects[0].object_id(),
+            objects[0].bytes(),
         )
         .expect("a removed device reads what it already had");
     assert_eq!(restored.plaintext.expose(), b"one");
@@ -1173,7 +1152,9 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     assert!(shared.add(*leaving.public()));
     let before = shared.rotation();
     let staged = stage_at(1, "a.cbor", b"shared content", before);
-    let key_before = kr_crypto::secret::Secret::from_bytes(*staged.key.expose());
+    // The same object staged again at the same rotation, kept so the key after the rotation can be
+    // compared with a key from before it without either leaving its own type.
+    let twin = stage_at(1, "a.cbor", b"shared content", before);
 
     let rotated = shared.revoke(&leaving.key_id()).expect("a revocation");
     assert!(rotated.rotates_object_keys);
@@ -1208,7 +1189,7 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReencryptedAfterRotation);
     assert!(
-        !resumed.staged.key.constant_time_eq(&key_before),
+        !resumed.staged.shares_key_with(&twin),
         "the object is under a new key"
     );
     assert!(
@@ -1517,8 +1498,8 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
         .restore_object(
             &reader,
             &parties.sender_key(),
-            staged.reference.object_id,
-            &staged.bytes,
+            staged.object_id(),
+            staged.bytes(),
         )
         .expect("the member object restores");
     assert_eq!(restored.plaintext.expose(), b"one");

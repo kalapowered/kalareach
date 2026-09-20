@@ -89,6 +89,17 @@ pub enum RecoveryError {
     /// nothing else: no writer key is taken from the archive to make up for it.
     #[error("the recovery bundle did not authenticate at that origin and locator")]
     BundleNotAuthentic,
+    /// A checkpoint would have moved backwards, which is a late answer rather than a newer fact.
+    #[error(
+        "this archive's verified generation is {recorded}; recording {offered} would move it \
+         backwards"
+    )]
+    CheckpointWentBackwards {
+        /// The generation the bundle already records.
+        recorded: u64,
+        /// The generation that was offered.
+        offered: u64,
+    },
     /// The bundle at the locator was written by somebody else since this device last read it.
     #[error("the recovery bundle at generation {expected} has moved on; read it again")]
     BundleConflict {

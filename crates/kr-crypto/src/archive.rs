@@ -316,7 +316,10 @@ pub fn manifest_wrap_for<'a>(
 /// Returns an encoding error when the bundle is outside KR-CBOR-1, and a library error when
 /// libsodium fails.
 pub fn encrypt_recovery_bundle(key: &SymmetricKey, bundle: &RecoveryBundle) -> Result<Vec<u8>> {
-    let mut encoded = kr_cbor::to_canonical_vec(bundle)?;
+    // Encoded under the same bounds `decrypt_recovery_bundle` decodes with, so an owner never
+    // writes a bundle that the one restore that needs it cannot read.
+    let mut encoded =
+        kr_cbor::to_canonical_vec_within(bundle, &kr_protocol::archive::RECOVERY_BUNDLE_LIMITS)?;
     let object = stream::encrypt_object(key, &encoded);
     sodium::memzero(&mut encoded);
     object
@@ -334,10 +337,20 @@ pub fn encrypt_recovery_bundle(key: &SymmetricKey, bundle: &RecoveryBundle) -> R
 /// plaintext is not a valid bundle.
 pub fn decrypt_recovery_bundle(key: &SymmetricKey, object: &[u8]) -> Result<RecoveryBundle> {
     let plaintext = stream::decrypt_object(key, object)?;
-    Ok(kr_cbor::from_canonical_slice(
+    let bundle: RecoveryBundle = kr_cbor::from_canonical_slice(
         plaintext.expose(),
-        &kr_cbor::Limits::DEFAULT,
-    )?)
+        &kr_protocol::archive::RECOVERY_BUNDLE_LIMITS,
+    )?;
+    // The `secretstream` object authenticates the schema version; it does not establish that this
+    // build knows what that version means. A bundle written under a later schema is refused rather
+    // than read under this one's rules, because reading it wrongly would mean trusting the wrong
+    // writers.
+    if bundle.schema_version.get() != kr_protocol::archive::RECOVERY_BUNDLE_SCHEMA_VERSION {
+        return Err(CryptoError::BindingMismatch {
+            what: "a recovery bundle schema version this build does not read",
+        });
+    }
+    Ok(bundle)
 }
 
 #[cfg(test)]
@@ -513,6 +526,13 @@ mod tests {
             schema_version: U64::new(1),
             collections: Vec::new(),
             trusted_writers: [trusted(&owner)].into_iter().collect(),
+            trusted_producers: [kr_protocol::archive::TrustedProducer {
+                sender_key_id: owner.key_id(),
+                stored_envelope_key: kr_protocol::scalars::StoredEnvelopeKey::from_bytes([6; 32]),
+                enrolled_at_ms: TimestampMs::new(1),
+            }]
+            .into_iter()
+            .collect(),
             checkpoints: [ArchiveCheckpoint {
                 archive_id: archive_id(),
                 backup_generation: BackupGeneration::new(7),

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId};
 use crate::scalars::{
     AuthorisationKey, Bytes, CanonicalSet, Digest256, KeyId, Nonce192, SecretBytes32, Signature64,
-    TimestampMs, U64,
+    StoredEnvelopeKey, TimestampMs, U64,
 };
 
 /// The size of one `secretstream` record, in bytes.
@@ -598,6 +598,24 @@ pub struct TrustedWriter {
     pub enrolled_at_ms: TimestampMs,
 }
 
+/// One backup producer whose key wraps a restore may open.
+///
+/// A wrap is a `crypto_box` between the producer's stored-envelope key and the recipient's, and
+/// opening one needs the producer's *public* key rather than its identifier: the identifier is a
+/// hash and nothing is recoverable from it. A restore that has only the recovery kit therefore
+/// needs this from the authenticated bundle, which is the only place it can come from that an
+/// untrusted archive did not supply.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedProducer {
+    /// The producer's stored-envelope key identifier, which is what a wrap's context names.
+    pub sender_key_id: KeyId,
+    /// The producer's stored-envelope public key, which is what opens the wrap.
+    pub stored_envelope_key: StoredEnvelopeKey,
+    /// When the owner enrolled it, in UTC milliseconds.
+    pub enrolled_at_ms: TimestampMs,
+}
+
 /// One collection a recovery bundle can find.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -627,6 +645,26 @@ pub struct ArchiveCheckpoint {
     pub verified_at_ms: TimestampMs,
 }
 
+/// The recovery bundle schema version this build writes and reads.
+pub const RECOVERY_BUNDLE_SCHEMA_VERSION: u64 = 1;
+
+/// The most bytes one recovery bundle encodes to.
+pub const MAX_RECOVERY_BUNDLE_LEN: usize = 4 * 1024 * 1024;
+
+/// The bounds a recovery bundle is encoded *and* decoded under.
+///
+/// One set, for the same reason the manifest payload has one: an owner that wrote a bundle under
+/// looser bounds than a restore enforces would write a bundle the restore cannot read, and would
+/// not find out until the restore was the only thing left.
+pub const RECOVERY_BUNDLE_LIMITS: kr_cbor::Limits = kr_cbor::Limits {
+    max_message_len: MAX_RECOVERY_BUNDLE_LEN,
+    max_depth: 32,
+    max_items: 262_144,
+    max_collection_len: 4_096,
+    max_bytes_len: 1 << 20,
+    max_text_len: 1 << 20,
+};
+
 /// The versioned recovery bundle an owner keeps at a stable locator.
 ///
 /// Enabling a new backup writer or rotating its signing key commits an updated bundle before that
@@ -639,7 +677,18 @@ pub struct RecoveryBundle {
     /// Where the owner's collections live.
     pub collections: Vec<CollectionLocator>,
     /// The writers a restore may trust.
+    ///
+    /// A writer whose signing key has been rotated stays here while any archive it signed is still
+    /// retained: removing it would leave a retained backup nothing could verify. What rotation
+    /// changes is which writer may *publish*, which is the collection's enrolment record, not this
+    /// set.
     pub trusted_writers: CanonicalSet<TrustedWriter>,
+    /// The producers whose key wraps a restore may open.
+    ///
+    /// Section 20 ¶10 gives the bundle the keys a restore trusts, and a wrap needs the producer's
+    /// public stored-envelope key as well as the writer's signing key. Taking it from the archive
+    /// instead would be taking key material from something untrusted.
+    pub trusted_producers: CanonicalSet<TrustedProducer>,
     /// The latest generation the owner verified for each archive.
     pub checkpoints: CanonicalSet<ArchiveCheckpoint>,
     /// The bundle revision, advanced on every compare-and-swap write.

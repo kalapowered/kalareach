@@ -13348,7 +13348,20 @@ export interface RecoveryBundle {
    */
   schema_version: string
   /**
+   * The producers whose key wraps a restore may open.
+   *
+   * Section 20 ¶10 gives the bundle the keys a restore trusts, and a wrap needs the producer's
+   * public stored-envelope key as well as the writer's signing key. Taking it from the archive
+   * instead would be taking key material from something untrusted.
+   */
+  trusted_producers: TrustedProducer[]
+  /**
    * The writers a restore may trust.
+   *
+   * A writer whose signing key has been rotated stays here while any archive it signed is still
+   * retained: removing it would leave a retained backup nothing could verify. What rotation
+   * changes is which writer may *publish*, which is the collection's enrolment record, not this
+   * set.
    */
   trusted_writers: TrustedWriter1[]
   /**
@@ -13396,6 +13409,29 @@ export interface CollectionLocator {
    * The service origin the collection lives at.
    */
   service_origin: string
+}
+/**
+ * One backup producer whose key wraps a restore may open.
+ *
+ * A wrap is a `crypto_box` between the producer's stored-envelope key and the recipient's, and
+ * opening one needs the producer's *public* key rather than its identifier: the identifier is a
+ * hash and nothing is recoverable from it. A restore that has only the recovery kit therefore
+ * needs this from the authenticated bundle, which is the only place it can come from that an
+ * untrusted archive did not supply.
+ */
+export interface TrustedProducer {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  enrolled_at_ms: string
+  /**
+   * The producer's stored-envelope key identifier, which is what a wrap's context names.
+   */
+  sender_key_id: string
+  /**
+   * The producer's stored-envelope public key, which is what opens the wrap.
+   */
+  stored_envelope_key: string
 }
 /**
  * A backup writer a restore is allowed to trust.

@@ -17250,8 +17250,16 @@
           "$ref": "#/$defs/U64",
           "description": "The bundle schema version."
         },
+        "trusted_producers": {
+          "description": "The producers whose key wraps a restore may open.\n\nSection 20 ¶10 gives the bundle the keys a restore trusts, and a wrap needs the producer's\npublic stored-envelope key as well as the writer's signing key. Taking it from the archive\ninstead would be taking key material from something untrusted.",
+          "items": {
+            "$ref": "#/$defs/TrustedProducer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "trusted_writers": {
-          "description": "The writers a restore may trust.",
+          "description": "The writers a restore may trust.\n\nA writer whose signing key has been rotated stays here while any archive it signed is still\nretained: removing it would leave a retained backup nothing could verify. What rotation\nchanges is which writer may *publish*, which is the collection's enrolment record, not this\nset.",
           "items": {
             "$ref": "#/$defs/TrustedWriter"
           },
@@ -17267,6 +17275,7 @@
         "schema_version",
         "collections",
         "trusted_writers",
+        "trusted_producers",
         "checkpoints",
         "revision",
         "written_at_ms"
@@ -21994,6 +22003,30 @@
         "from_git_objects",
         "from_working_tree",
         "deleted_paths"
+      ],
+      "type": "object"
+    },
+    "TrustedProducer": {
+      "additionalProperties": false,
+      "description": "One backup producer whose key wraps a restore may open.\n\nA wrap is a `crypto_box` between the producer's stored-envelope key and the recipient's, and\nopening one needs the producer's *public* key rather than its identifier: the identifier is a\nhash and nothing is recoverable from it. A restore that has only the recovery kit therefore\nneeds this from the authenticated bundle, which is the only place it can come from that an\nuntrusted archive did not supply.",
+      "properties": {
+        "enrolled_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the owner enrolled it, in UTC milliseconds."
+        },
+        "sender_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The producer's stored-envelope key identifier, which is what a wrap's context names."
+        },
+        "stored_envelope_key": {
+          "$ref": "#/$defs/StoredEnvelopeKey",
+          "description": "The producer's stored-envelope public key, which is what opens the wrap."
+        }
+      },
+      "required": [
+        "sender_key_id",
+        "stored_envelope_key",
+        "enrolled_at_ms"
       ],
       "type": "object"
     },

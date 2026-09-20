@@ -374,14 +374,14 @@ async fn a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed(
         )
         .await
         .expect("the bundle commits and the writer is declared");
-    assert_eq!(enabled.writer_key_id, writer.key_id());
-    assert_eq!(enabled.bundle_revision, 1);
+    assert_eq!(enabled.writer_key_id(), writer.key_id());
+    assert_eq!(enabled.bundle_revision(), 1);
 
     // The declaration is only true because the bundle is at the locator: a fresh device reads it
     // back and finds the writer there.
     let mut reader = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let read = reader.fetch(&seed).await.expect("the bundle");
-    assert_eq!(read.revision.get(), enabled.bundle_revision);
+    assert_eq!(read.revision.get(), enabled.bundle_revision());
     assert!(
         read.trusted_writers
             .iter()
@@ -390,7 +390,7 @@ async fn a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed(
 
     assert_eq!(
         service.generation_of(bundle_collection(&context(ORIGIN))),
-        Some(enabled.bundle_generation)
+        Some(enabled.bundle_generation())
     );
 }
 
@@ -462,28 +462,127 @@ async fn rotating_a_writers_key_replaces_it_in_one_commit() {
         .rotate_writer(
             &seed,
             &mut bundle,
-            &retiring.key_id(),
             trusted(&replacement),
             TimestampMs::new(2_000),
         )
         .await
         .expect("the rotation commits");
-    assert_eq!(rotated.writer_key_id, replacement.key_id());
+    assert_eq!(rotated.writer_key_id(), replacement.key_id());
 
+    // Both keys are in the bundle. Dropping the rotated-out key would leave every archive it had
+    // already signed unverifiable, which would make a rotation destroy the backups it protects.
+    let read = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(read.trusted_writers.len(), 2);
+    for key in [replacement.key_id(), retiring.key_id()] {
+        assert!(
+            read.trusted_writers
+                .iter()
+                .any(|held| held.writer_key_id == key)
+        );
+    }
+
+    // Retiring it is the separate, deliberate step, taken when no retained archive needs it.
+    store
+        .retire_writer(
+            &seed,
+            &mut bundle,
+            &retiring.key_id(),
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the retirement commits");
     let read = store.fetch(&seed).await.expect("the bundle");
     assert_eq!(read.trusted_writers.len(), 1);
-    assert!(
-        read.trusted_writers
-            .iter()
-            .any(|held| held.writer_key_id == replacement.key_id())
-    );
     assert!(
         !read
             .trusted_writers
             .iter()
-            .any(|held| held.writer_key_id == retiring.key_id()),
-        "the retired key is gone from the bundle"
+            .any(|held| held.writer_key_id == retiring.key_id())
     );
+}
+
+#[tokio::test]
+async fn a_verified_generation_never_moves_backwards() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    let newest = ArchiveCheckpoint {
+        archive_id: archive_id(),
+        backup_generation: BackupGeneration::new(9),
+        encrypted_manifest_hash: Digest256::from_bytes([0xab; 32]),
+        verified_at_ms: TimestampMs::new(2),
+    };
+    store
+        .record_checkpoint(&seed, &mut bundle, newest.clone(), TimestampMs::new(1_000))
+        .await
+        .expect("the checkpoint commits");
+
+    // A verification of an older generation arriving late is a late answer, not a newer fact.
+    // Writing it would give a service five generations it could replay unnoticed.
+    let late = ArchiveCheckpoint {
+        backup_generation: BackupGeneration::new(4),
+        ..newest.clone()
+    };
+    assert!(matches!(
+        store
+            .record_checkpoint(&seed, &mut bundle, late, TimestampMs::new(2_000))
+            .await,
+        Err(RecoveryError::CheckpointWentBackwards {
+            recorded: 9,
+            offered: 4
+        })
+    ));
+
+    // And the same generation with a different manifest is a substitution, not an update.
+    let substituted = ArchiveCheckpoint {
+        encrypted_manifest_hash: Digest256::from_bytes([0xcd; 32]),
+        ..newest.clone()
+    };
+    assert!(
+        store
+            .record_checkpoint(&seed, &mut bundle, substituted, TimestampMs::new(2_000))
+            .await
+            .is_err()
+    );
+
+    // Forward is fine.
+    let newer = ArchiveCheckpoint {
+        backup_generation: BackupGeneration::new(11),
+        ..newest
+    };
+    store
+        .record_checkpoint(&seed, &mut bundle, newer, TimestampMs::new(3_000))
+        .await
+        .expect("a later generation is recorded");
+    let read = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(
+        read.checkpoints
+            .iter()
+            .next()
+            .expect("a checkpoint")
+            .backup_generation,
+        BackupGeneration::new(11)
+    );
+}
+
+#[test]
+fn a_kit_value_whose_spacing_would_change_when_read_is_refused() {
+    // Reading trims the line, so a locator that ends in a space would come back a different
+    // string, and a different locator derives a different bundle key: the kit would round-trip to
+    // something that authenticates nothing.
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut kit = seed.to_kit(vec![ORIGIN.to_owned()], "opaque-locator ".to_owned());
+    assert!(matches!(
+        render_kit(&kit),
+        Err(RecoveryError::UnprintableKit { .. })
+    ));
+    kit.bundle_locator = "opaque-locator".to_owned();
+    kit.service_origins = vec![format!(" {ORIGIN}")];
+    assert!(matches!(
+        render_kit(&kit),
+        Err(RecoveryError::UnprintableKit { .. })
+    ));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -515,6 +614,16 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
         )
         .await
         .expect("the bundle commits");
+    store
+        .enable_producer(
+            &seed,
+            &mut bundle,
+            producer.key_id(),
+            *producer.public(),
+            TimestampMs::new(1_100),
+        )
+        .await
+        .expect("the producer is enrolled");
 
     // A recovery-enabled collection wraps its manifest key for the recovery recipient.
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
@@ -543,7 +652,35 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     )
     .expect("a sealed archive");
 
-    // A fresh device holds the kit and nothing else.
+    // A fresh device holds the kit and the ciphertext it can reach, and nothing else. Everything
+    // the producer had is dropped here, so anything the restore still needs has to come out of the
+    // authenticated bundle.
+    let descriptor_bytes = sealed.descriptor_bytes.clone();
+    let encrypted_manifest = sealed.encrypted_manifest.clone();
+    let object_bytes = staged.bytes().to_vec();
+    let member_id = staged.object_id();
+    let forged = {
+        let impostor = AuthorisationKeyPair::generate().expect("a writer key");
+        seal_archive(
+            &impostor,
+            &producer,
+            &recipients,
+            &ArchivePlan {
+                archive_id: archive_id(),
+                backup_generation: BackupGeneration::new(5),
+                owner_device_id: DeviceId::new(Uuid::from_bytes([0x33; 16])),
+                manifest_object_id: BackupObjectId::new(Uuid::from_bytes([0xf1; 16])),
+                created_at_ms: TimestampMs::new(1_700_000_001_000),
+            },
+            std::slice::from_ref(&staged),
+        )
+        .expect("a sealed archive")
+    };
+    drop(producer);
+    drop(writer);
+    drop(sealed);
+    drop(staged);
+
     let kit = kit_of(&seed, &[ORIGIN]);
     let mut restore = FreshRestore::new(kit, RetrievalPolicy::Account);
     restore
@@ -559,6 +696,15 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     assert_eq!(material.trusted_writers.len(), 1);
     assert_eq!(material.collections.len(), 1);
 
+    // The producer's public key comes out of the bundle, keyed by the identifier the descriptor's
+    // wrap context names. It cannot come from the descriptor: that carries a hash.
+    let descriptor = kr_crypto::backup::read_descriptor(&descriptor_bytes).expect("a descriptor");
+    let sender_key_id = descriptor.manifest_key_wraps[0].context.sender_key_id;
+    let sender = material
+        .producer(sender_key_id)
+        .expect("the bundle names the producer")
+        .stored_envelope_key;
+
     let reader = ArchiveReader::Recovery(&recovery);
     let expectation = ArchiveExpectation {
         archive_id: archive_id(),
@@ -568,44 +714,24 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     };
     let opened = open_archive(
         &reader,
-        producer.public(),
+        &sender,
         &material.trusted_writers,
         &expectation,
-        &sealed.descriptor_bytes,
-        &sealed.encrypted_manifest,
+        &descriptor_bytes,
+        &encrypted_manifest,
     )
     .expect("the archive opens against the bundle's writers");
     let restored = opened
-        .restore_object(
-            &reader,
-            producer.public(),
-            staged.reference.object_id,
-            &staged.bytes,
-        )
+        .restore_object(&reader, &sender, member_id, &object_bytes)
         .expect("the member object restores");
     assert_eq!(restored.plaintext.expose(), b"what the session did");
 
     // The same archive, re-signed by a writer the bundle does not name, is refused. A restore has
     // no way to take that writer's key from the archive: the trusted set is the bundle's.
-    let impostor = AuthorisationKeyPair::generate().expect("a writer key");
-    let forged = seal_archive(
-        &impostor,
-        &producer,
-        &recipients,
-        &ArchivePlan {
-            archive_id: archive_id(),
-            backup_generation: BackupGeneration::new(5),
-            owner_device_id: DeviceId::new(Uuid::from_bytes([0x33; 16])),
-            manifest_object_id: BackupObjectId::new(Uuid::from_bytes([0xf1; 16])),
-            created_at_ms: TimestampMs::new(1_700_000_001_000),
-        },
-        std::slice::from_ref(&staged),
-    )
-    .expect("a sealed archive");
     assert!(
         open_archive(
             &reader,
-            producer.public(),
+            &sender,
             &material.trusted_writers,
             &expectation,
             &forged.descriptor_bytes,
@@ -618,7 +744,7 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     // The bundle's checkpoint is what a recovery-only restore compares the generation against, and
     // it still cannot claim that no newer archive exists.
     let standing = RestoreGeneration::against(
-        &sealed.descriptor,
+        &descriptor,
         material
             .checkpoint(archive_id())
             .map(|checkpoint| (CheckpointSource::RecoveryBundle, checkpoint)),
@@ -769,6 +895,9 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
         .expect("the bundle commits");
 
     let kit = kit_of(&seed, &[ORIGIN]);
+    // A different service, because migrating to another origin means writing somewhere else: a
+    // migration that wrote back to the service it was leaving would verify the wrong thing.
+    let destination_service = ScriptedService::shared();
     let destination = RecoveryContext {
         service_origin: OTHER_ORIGIN.to_owned(),
         bundle_locator: "moved-bundle-locator".to_owned(),
@@ -778,6 +907,7 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
             &seed,
             &mut bundle,
             &kit,
+            Arc::clone(&destination_service) as Arc<_>,
             destination.clone(),
             TimestampMs::new(3_000),
         )
@@ -807,7 +937,7 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
         })
         .expect("access to the new origin");
     let material = restore
-        .open_bundle(Arc::clone(&service) as Arc<_>, OTHER_ORIGIN)
+        .open_bundle(Arc::clone(&destination_service) as Arc<_>, OTHER_ORIGIN)
         .await
         .expect("the bundle authenticates at its new home");
     assert_eq!(material.trusted_writers.len(), 1);
@@ -947,7 +1077,7 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
         encrypted_bundle,
         descriptor: sealed.descriptor_bytes.clone(),
         encrypted_manifest: sealed.encrypted_manifest.clone(),
-        objects: vec![staged.bytes.clone()],
+        objects: vec![staged.bytes().to_vec()],
     };
     let bytes = kr_cbor::to_canonical_vec(&export).expect("canonical bytes");
     assert!(
@@ -980,7 +1110,7 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
         .restore_object(
             &reader,
             producer.public(),
-            staged.reference.object_id,
+            staged.object_id(),
             &restored.objects[0],
         )
         .expect("the exported object restores");
@@ -1089,6 +1219,7 @@ fn a_checkpoint_the_bundle_carries_is_the_one_a_restore_compares_against() {
     let material = kr_client::recovery::TrustedMaterial {
         context: context(ORIGIN),
         trusted_writers: Vec::new(),
+        trusted_producers: Vec::new(),
         collections: Vec::new(),
         checkpoints: bundle.checkpoints.iter().cloned().collect(),
         bundle_revision: bundle.revision.get(),

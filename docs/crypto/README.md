@@ -181,9 +181,11 @@ Revoking a recipient removes it from every future wrap, and for a mutable shared
 rotates the keys as well. The rotation is a rule rather than a report: revoking advances
 `ArchiveRecipients::rotation`, every staged object carries the rotation it was made under, and
 `seal_archive` refuses one from before the current rotation. Resuming it makes it again under a new
-key. A device that kept reading what the others wrote after it left would have lost nothing by
-being removed, so a caller cannot revoke and then seal the ciphertext that revocation invalidated,
-whatever it does with `Revocation::may_reuse_staged_ciphertext`. Nothing here claims retroactive
+key. `StagedObject`'s fields are private for that reason - the only ways to obtain one are
+`stage_object` and `resume_object`, both of which take the rotation as an argument - so a caller
+cannot revoke and then relabel and seal the ciphertext that revocation invalidated, whatever it
+does with `Revocation::may_reuse_staged_ciphertext`. A device that kept reading what the others
+wrote after it left would have lost nothing by being removed. Nothing here claims retroactive
 secrecy.
 `still_readable_after_revocation` computes what the removed device keeps - every generation
 published before the revocation - so a host shows a person that rather than implying otherwise, and
@@ -209,13 +211,19 @@ it is restoring.
 ### What a backup carries
 
 `may_back_up` and `may_restore` are one table, here rather than in each caller, so a device and a
-host cannot answer the question differently. A backup carries session data, device configuration,
-generation checkpoints and grant records. It never carries a reusable endpoint or control-signing
-private key, the notification extension's preview key, the recovery seed or this host's grant and
-revocation authority, and each refusal carries the reason. A restore refuses all of those and one
-more: a grant that had been revoked. `RestoreLimits` states what a restore cannot do whatever it
-put back - it always requires fresh owner-authorised pairing, and it never creates remote-control
+host cannot answer the question differently. Session data, device configuration, generation
+checkpoints and grant records may be carried. A reusable endpoint or control-signing private key,
+the notification extension's preview key, the recovery seed and this host's grant and revocation
+authority may not, and each refusal carries the reason; a restore refuses all of those and one
+more, a grant that had been revoked. `RestoreLimits` states what a restore cannot do whatever it
+put back: it always requires fresh owner-authorised pairing, and it never creates remote-control
 authority.
+
+**It is the decision, not the gate.** The layer below carries opaque bytes: `stage_object` encrypts
+whatever it is handed, and `restore_object` returns whatever the manifest named. A caller that
+wrote a private key into a member object and never asked this table about it would get that object
+back. What closes the rule is each export and import path asking, for every kind it carries; this
+crate supplies one answer so those paths cannot disagree.
 
 ## Envelopes and padding
 
@@ -436,11 +444,11 @@ answered by ending idle connections rather than by forgetting a challenge.
 
 ## Vectors
 
-`fixtures/crypto/` holds the documents below. The first four are regenerated with
+`fixtures/crypto/` holds the documents below. The first three are regenerated with
 `cargo run -p kr-crypto --bin kr-crypto-vectors` and checked in continuous integration with
-`--check`. `recovery-kit.json` is checked by `crates/kr-client/tests/recovery.rs::
-the_printed_kit_is_the_document_the_fixture_publishes` instead, because the rendering it pins
-belongs to `kr-client` rather than to the vector generator:
+`--check`, as is `relay.json`. `recovery-kit.json` is checked by `crates/kr-client/tests/
+recovery.rs::the_printed_kit_is_the_document_the_fixture_publishes` instead, because the rendering
+it pins belongs to `kr-client` rather than to the vector generator:
 
 | File | Contents |
 | --- | --- |
