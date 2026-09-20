@@ -1190,6 +1190,11 @@ fn the_states_that_need_a_command_first(
     }
 
     if let Some(command) = shellpkg::read_builtin_command(case.shell) {
+        // The drive above leaves one of these shells part way through a command it could not
+        // parse, where the next line typed is another line of that command rather than a command
+        // of its own. The reader this exclusion is about is the builtin's, so the shell is put
+        // back at a prompt of its own first and the line below starts something.
+        session.recover();
         session.forget_events();
         session.type_line(command);
         // The reader this gesture is for is the builtin's own, and its entry report is written
