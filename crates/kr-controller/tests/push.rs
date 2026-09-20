@@ -1988,7 +1988,7 @@ async fn controller_startup_constructs_delivery_module_and_runs_pass() {
             producer
                 .produce(
                     &notice,
-                    &[destination.clone()],
+                    std::slice::from_ref(&destination),
                     &Granted(BTreeSet::new()),
                     &[],
                     NOW,
