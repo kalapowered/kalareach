@@ -27,7 +27,7 @@
   "plugin": {
     "probe": "echo kr-plugin=$ZSH_HIGHLIGHT_VERSION",
     "marker": "kr-plugin=0.8.0",
-    "operation": "echo kr-plugin-$(( ${+ZSH_HIGHLIGHT_STYLES[command]} ))",
+    "operation": "echo kr-plugin-$(( ${+ZSH_HIGHLIGHT_STYLES[default]} ))",
     "operation_marker": "kr-plugin-1"
   },
   "covers": [
