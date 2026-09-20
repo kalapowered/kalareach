@@ -42,6 +42,14 @@ use crate::attention::{
     VisitChangedResult,
 };
 use crate::authority::MethodEntry;
+use crate::automation::{
+    CausalBudgetSummary, CausalParentRef, EdgeCondition, NodeReceiptSummary, NodeStatus,
+    WorkflowDeadlines, WorkflowDefinition, WorkflowDefinitionSummary, WorkflowEdge,
+    WorkflowEnableParams, WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult,
+    WorkflowNode, WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams,
+    WorkflowReadResult, WorkflowResourceScope, WorkflowRunParams, WorkflowRunResult,
+    WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
+};
 use crate::broker::{
     ActionToken, ActionTokenClaim, CapabilityMap, DecoderLedgerEntry, DecodingTrust,
     InstanceCapabilityRecord, LaunchProfile, PreparedEffect,
@@ -606,6 +614,31 @@ pub fn protocol_schema() -> Value {
         "voice_start_result" => VoiceStartResult,
         "voice_stop_params" => VoiceStopParams,
         "voice_stop_result" => VoiceStopResult,
+        // Automation: the definitions, runs, node receipts, causal budgets, and five method shapes.
+        "causal_budget_summary" => CausalBudgetSummary,
+        "causal_parent_ref" => CausalParentRef,
+        "edge_condition" => EdgeCondition,
+        "node_receipt_summary" => NodeReceiptSummary,
+        "node_status" => NodeStatus,
+        "workflow_deadlines" => WorkflowDeadlines,
+        "workflow_definition" => WorkflowDefinition,
+        "workflow_definition_summary" => WorkflowDefinitionSummary,
+        "workflow_edge" => WorkflowEdge,
+        "workflow_enable_params" => WorkflowEnableParams,
+        "workflow_enable_result" => WorkflowEnableResult,
+        "workflow_install_params" => WorkflowInstallParams,
+        "workflow_install_result" => WorkflowInstallResult,
+        "workflow_node" => WorkflowNode,
+        "workflow_pause_params" => WorkflowPauseParams,
+        "workflow_pause_result" => WorkflowPauseResult,
+        "workflow_read_params" => WorkflowReadParams,
+        "workflow_read_result" => WorkflowReadResult,
+        "workflow_resource_scope" => WorkflowResourceScope,
+        "workflow_run_params" => WorkflowRunParams,
+        "workflow_run_result" => WorkflowRunResult,
+        "workflow_run_status" => WorkflowRunStatus,
+        "workflow_run_summary" => WorkflowRunSummary,
+        "workflow_trigger" => WorkflowTrigger,
     }
     properties.insert(
         "identifiers".to_owned(),

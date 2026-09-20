@@ -111,6 +111,7 @@ pub mod archive;
 pub mod attachment;
 pub mod attention;
 pub mod authority;
+pub mod automation;
 pub mod broker;
 pub mod changeset;
 pub mod collection_keys;

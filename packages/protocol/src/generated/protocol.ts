@@ -533,6 +533,10 @@ export type DownloadSource =
       }
     }
 /**
+ * Condition required on an edge for traversal.
+ */
+export type EdgeCondition = 'success' | 'failure' | 'always'
+/**
  * One installed OS, distribution or container environment and OS user.
  */
 export type EnvironmentId = string
@@ -911,6 +915,11 @@ export type ResourceSelectorKind =
   | 'voice_session'
   | 'mailbox'
   | 'agent_target'
+/**
+ * Execution status of a single workflow action node.
+ */
+export type NodeStatus =
+  'pending' | 'running' | 'success' | 'failed' | 'unknown' | 'paused' | 'cancelled'
 /**
  * The least client version a policy accepts: alphanumeric with dots, hyphens and plus signs.
  */
@@ -1370,6 +1379,11 @@ export type VoiceAction =
   | 'shell_input'
   | 'apply_diff'
   | 'deliver_externally'
+/**
+ * Status of a workflow run.
+ */
+export type WorkflowRunStatus =
+  'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'cancelled'
 
 /**
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
@@ -1440,6 +1454,8 @@ export interface KalaReachProtocol {
   capability_map?: CapabilityMap1
   capability_record?: CapabilityRecord
   capture_count?: CaptureCount
+  causal_budget_summary?: CausalBudgetSummary
+  causal_parent_ref?: CausalParentRef
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
   change_set_version_record?: ChangeSetVersionRecord
@@ -1490,6 +1506,7 @@ export interface KalaReachProtocol {
   draft_record?: DraftRecord2
   draft_update_params?: DraftUpdateParams
   draft_update_result?: DraftUpdateResult
+  edge_condition?: EdgeCondition
   effective_configuration?: EffectiveConfiguration
   envelope_plaintext?: EnvelopePlaintext
   environment_capabilities_params?: EnvironmentCapabilitiesParams
@@ -1659,6 +1676,8 @@ export interface KalaReachProtocol {
   mutation_request?: MutationRequest
   named_approval_preview?: NamedApprovalPreview
   named_question_preview?: NamedQuestionPreview
+  node_receipt_summary?: NodeReceiptSummary
+  node_status?: NodeStatus
   notification?: Notification
   observed_path?: ObservedPath
   offline_validity_policy?: OfflineValidityPolicy
@@ -1851,6 +1870,25 @@ export interface KalaReachProtocol {
   worker_rendezvous?: WorkerRendezvous
   worker_verify_challenge?: WorkerVerifyChallenge
   worker_verify_proof?: WorkerVerifyProof
+  workflow_deadlines?: WorkflowDeadlines
+  workflow_definition?: WorkflowDefinition
+  workflow_definition_summary?: WorkflowDefinitionSummary
+  workflow_edge?: WorkflowEdge
+  workflow_enable_params?: WorkflowEnableParams
+  workflow_enable_result?: WorkflowEnableResult
+  workflow_install_params?: WorkflowInstallParams
+  workflow_install_result?: WorkflowInstallResult
+  workflow_node?: WorkflowNode
+  workflow_pause_params?: WorkflowPauseParams
+  workflow_pause_result?: WorkflowPauseResult
+  workflow_read_params?: WorkflowReadParams
+  workflow_read_result?: WorkflowReadResult
+  workflow_resource_scope?: WorkflowResourceScope1
+  workflow_run_params?: WorkflowRunParams
+  workflow_run_result?: WorkflowRunResult
+  workflow_run_status?: WorkflowRunStatus
+  workflow_run_summary?: WorkflowRunSummary
+  workflow_trigger?: WorkflowTrigger1
   workspace_create_params?: WorkspaceCreateParams
   workspace_create_result?: WorkspaceCreateResult
   workspace_list_params?: WorkspaceListParams
@@ -5992,6 +6030,84 @@ export interface CaptureCount {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   total: string
+}
+/**
+ * Summary of a causal budget and its consumption.
+ */
+export interface CausalBudgetSummary {
+  /**
+   * Causal root identifier.
+   */
+  causal_root_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  created_sessions: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  depth: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  elapsed_lifetime_ms: string
+  /**
+   * Whether any limit was exhausted.
+   */
+  exhausted: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_actions: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_depth: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_lifetime_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_runs: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_sessions: string
+  /**
+   * Whether the chain is paused due to limit exhaustion.
+   */
+  paused: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total_actions: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total_runs: string
+}
+/**
+ * Reference to a causal parent node and run.
+ */
+export interface CausalParentRef {
+  /**
+   * Root of the causal tree.
+   */
+  causal_root_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  depth: string
+  /**
+   * Parent node ID within that run.
+   */
+  parent_node_id: string
+  /**
+   * Parent workflow run ID.
+   */
+  parent_run_id: string
 }
 /**
  * The exact set of changes one installation made, and how to undo them.
@@ -12346,6 +12462,43 @@ export interface RequiredRight {
     | 'other_actor'
     | 'candidate_endpoint'
     | 'issuing_owner'
+}
+/**
+ * Summary receipt of an executed action node.
+ */
+export interface NodeReceiptSummary {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * Causal parent description.
+   */
+  causal_parent: string | null
+  /**
+   * When execution finished.
+   */
+  ended_at_ms: TimestampMs | null
+  /**
+   * Node identifier within the workflow.
+   */
+  node_id: string
+  /**
+   * Output result string, if available.
+   */
+  output: string | null
+  /**
+   * One automation run.
+   */
+  run_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * Node execution status.
+   */
+  status: 'pending' | 'running' | 'success' | 'failed' | 'unknown' | 'paused' | 'cancelled'
 }
 /**
  * A host owner's bounded offline-validity policy for personal remote access.
@@ -21751,6 +21904,483 @@ export interface ProtocolVersion8 {
    * The minor version. A peer selects the highest minor both sides support.
    */
   minor: number
+}
+/**
+ * Operational deadlines configured for a workflow.
+ */
+export interface WorkflowDeadlines {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  action_wait_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  run_deadline_ms: string
+}
+/**
+ * Complete versioned workflow definition document.
+ */
+export interface WorkflowDefinition {
+  deadlines: WorkflowDeadlines1
+  /**
+   * Optional description.
+   */
+  description: string | null
+  /**
+   * Graph edges.
+   */
+  edges: WorkflowEdge[]
+  /**
+   * Whether this workflow is enabled to process triggers.
+   */
+  enabled: boolean
+  /**
+   * One host-issued authority object.
+   */
+  grant_reference: string
+  /**
+   * Human-readable name.
+   */
+  name: string
+  /**
+   * Graph nodes.
+   */
+  nodes: WorkflowNode[]
+  resource_scope: WorkflowResourceScope
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  trigger: WorkflowTrigger
+  /**
+   * Unique workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Deadlines.
+ */
+export interface WorkflowDeadlines1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  action_wait_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  run_deadline_ms: string
+}
+/**
+ * A directed edge connecting two action nodes in a workflow graph.
+ */
+export interface WorkflowEdge {
+  /**
+   * Condition required to follow this edge.
+   */
+  condition: 'success' | 'failure' | 'always'
+  /**
+   * Source node identifier.
+   */
+  from_node: string
+  /**
+   * Destination node identifier.
+   */
+  to_node: string
+}
+/**
+ * A single action node in a workflow graph.
+ */
+export interface WorkflowNode {
+  /**
+   * Registered action kind (e.g., "shell_command", "run_tests", "request_review").
+   */
+  action_kind: string
+  /**
+   * Typed action parameters JSON string without template code.
+   */
+  action_params: string
+  /**
+   * Declared execution environment required for shell commands.
+   */
+  declared_environment: EnvironmentId | null
+  /**
+   * Unique identifier for this node within the workflow definition.
+   */
+  node_id: string
+}
+/**
+ * Resource scope.
+ */
+export interface WorkflowResourceScope {
+  /**
+   * Environment scope, if constrained.
+   */
+  environment_id: EnvironmentId | null
+  /**
+   * Session scope, if constrained.
+   */
+  session_id: SessionId | null
+  /**
+   * Workspace scope, if constrained.
+   */
+  workspace_id: WorkspaceId | null
+}
+/**
+ * Trigger configuration.
+ */
+export interface WorkflowTrigger {
+  /**
+   * Optional criteria or filter for the triggering event.
+   */
+  criteria: string | null
+  /**
+   * The event type that triggers the workflow (e.g., "turn_completed", "changeset_captured").
+   */
+  event_type: string
+}
+/**
+ * Summary of an installed workflow definition.
+ */
+export interface WorkflowDefinitionSummary {
+  /**
+   * Optional description.
+   */
+  description: string | null
+  /**
+   * Whether enabled.
+   */
+  enabled: boolean
+  /**
+   * One host-issued authority object.
+   */
+  grant_reference: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  installed_at_ms: string
+  /**
+   * Human-readable name.
+   */
+  name: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * Workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Parameters for `workflow.enable`.
+ */
+export interface WorkflowEnableParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * Workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Result of `workflow.enable`.
+ */
+export interface WorkflowEnableResult {
+  /**
+   * True when enabled.
+   */
+  enabled: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * Workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Parameters for `workflow.install`.
+ */
+export interface WorkflowInstallParams {
+  definition: WorkflowDefinition1
+  /**
+   * One host-issued authority object.
+   */
+  grant_reference: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * Workflow identifier to install or update.
+   */
+  workflow_id: string
+}
+/**
+ * Full definition document.
+ */
+export interface WorkflowDefinition1 {
+  deadlines: WorkflowDeadlines1
+  /**
+   * Optional description.
+   */
+  description: string | null
+  /**
+   * Graph edges.
+   */
+  edges: WorkflowEdge[]
+  /**
+   * Whether this workflow is enabled to process triggers.
+   */
+  enabled: boolean
+  /**
+   * One host-issued authority object.
+   */
+  grant_reference: string
+  /**
+   * Human-readable name.
+   */
+  name: string
+  /**
+   * Graph nodes.
+   */
+  nodes: WorkflowNode[]
+  resource_scope: WorkflowResourceScope
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  trigger: WorkflowTrigger
+  /**
+   * Unique workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Result of `workflow.install`.
+ */
+export interface WorkflowInstallResult {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  installed_at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * Installed workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Parameters for `workflow.pause`.
+ */
+export interface WorkflowPauseParams {
+  /**
+   * Optional reason for pausing.
+   */
+  reason: string | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * Workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Result of `workflow.pause`.
+ */
+export interface WorkflowPauseResult {
+  /**
+   * True when paused.
+   */
+  paused: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * Workflow identifier.
+   */
+  workflow_id: string
+}
+/**
+ * Parameters for `workflow.read`.
+ */
+export interface WorkflowReadParams {
+  /**
+   * Filter by causal root identifier.
+   */
+  causal_root_id: CausalRootId | null
+  /**
+   * Filter by definition revision.
+   */
+  revision: U64 | null
+  /**
+   * Filter by run identifier.
+   */
+  run_id: WorkflowRunId | null
+  /**
+   * Filter by workflow identifier.
+   */
+  workflow_id: WorkflowId | null
+}
+/**
+ * Result of `workflow.read`.
+ */
+export interface WorkflowReadResult {
+  /**
+   * Matching workflow definitions.
+   */
+  definitions: WorkflowDefinitionSummary[]
+  /**
+   * Matching node execution receipts.
+   */
+  node_receipts: NodeReceiptSummary[]
+  /**
+   * Remaining causal budget for requested causal root, if queried.
+   */
+  remaining_causal_budget: CausalBudgetSummary | null
+  /**
+   * Matching workflow runs.
+   */
+  runs: WorkflowRunSummary[]
+}
+/**
+ * Summary of a workflow run.
+ */
+export interface WorkflowRunSummary {
+  /**
+   * The root of a bounded cross-run causal chain.
+   */
+  causal_root_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  depth: string
+  /**
+   * When execution finished, if terminated.
+   */
+  ended_at_ms: TimestampMs | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * One automation run.
+   */
+  run_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * Current status.
+   */
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'cancelled'
+  /**
+   * Trigger event identifier.
+   */
+  trigger_event_id: string
+  /**
+   * One automation definition.
+   */
+  workflow_id: string
+}
+/**
+ * Resource scope binding for a workflow.
+ */
+export interface WorkflowResourceScope1 {
+  /**
+   * Environment scope, if constrained.
+   */
+  environment_id: EnvironmentId | null
+  /**
+   * Session scope, if constrained.
+   */
+  session_id: SessionId | null
+  /**
+   * Workspace scope, if constrained.
+   */
+  workspace_id: WorkspaceId | null
+}
+/**
+ * Parameters for `workflow.run`.
+ */
+export interface WorkflowRunParams {
+  /**
+   * Optional causal parent reference if triggered by a workflow.
+   */
+  causal_parent: CausalParentRef | null
+  /**
+   * Trigger event identifier.
+   */
+  event_id: string
+  /**
+   * Optional event payload string.
+   */
+  event_payload: string | null
+  /**
+   * Trigger event type.
+   */
+  event_type: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * One automation definition.
+   */
+  workflow_id: string
+}
+/**
+ * Result of `workflow.run`.
+ */
+export interface WorkflowRunResult {
+  /**
+   * The root of a bounded cross-run causal chain.
+   */
+  causal_root_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  depth: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * One automation run.
+   */
+  run_id: string
+  /**
+   * Current run status.
+   */
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'cancelled'
+  /**
+   * One automation definition.
+   */
+  workflow_id: string
+}
+/**
+ * An event trigger definition for a workflow.
+ */
+export interface WorkflowTrigger1 {
+  /**
+   * Optional criteria or filter for the triggering event.
+   */
+  criteria: string | null
+  /**
+   * The event type that triggers the workflow (e.g., "turn_completed", "changeset_captured").
+   */
+  event_type: string
 }
 /**
  * Parameters of `workspace.preview`, which is a read `workspace.create` shares its shape with.

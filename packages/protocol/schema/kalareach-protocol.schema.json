@@ -4188,6 +4188,109 @@
       ],
       "type": "object"
     },
+    "CausalBudgetSummary": {
+      "additionalProperties": false,
+      "description": "Summary of a causal budget and its consumption.",
+      "properties": {
+        "causal_root_id": {
+          "$ref": "#/$defs/CausalRootId",
+          "description": "Causal root identifier."
+        },
+        "created_sessions": {
+          "$ref": "#/$defs/U64",
+          "description": "Total sessions created."
+        },
+        "depth": {
+          "$ref": "#/$defs/U64",
+          "description": "Current depth reached."
+        },
+        "elapsed_lifetime_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "Elapsed lifetime in milliseconds."
+        },
+        "exhausted": {
+          "description": "Whether any limit was exhausted.",
+          "type": "boolean"
+        },
+        "max_actions": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum allowed action nodes."
+        },
+        "max_depth": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum allowed depth."
+        },
+        "max_lifetime_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum allowed lifetime in milliseconds."
+        },
+        "max_runs": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum allowed runs."
+        },
+        "max_sessions": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum allowed sessions created."
+        },
+        "paused": {
+          "description": "Whether the chain is paused due to limit exhaustion.",
+          "type": "boolean"
+        },
+        "total_actions": {
+          "$ref": "#/$defs/U64",
+          "description": "Total action nodes executed."
+        },
+        "total_runs": {
+          "$ref": "#/$defs/U64",
+          "description": "Total runs executed under this root."
+        }
+      },
+      "required": [
+        "causal_root_id",
+        "depth",
+        "max_depth",
+        "total_runs",
+        "max_runs",
+        "total_actions",
+        "max_actions",
+        "created_sessions",
+        "max_sessions",
+        "elapsed_lifetime_ms",
+        "max_lifetime_ms",
+        "paused",
+        "exhausted"
+      ],
+      "type": "object"
+    },
+    "CausalParentRef": {
+      "additionalProperties": false,
+      "description": "Reference to a causal parent node and run.",
+      "properties": {
+        "causal_root_id": {
+          "$ref": "#/$defs/CausalRootId",
+          "description": "Root of the causal tree."
+        },
+        "depth": {
+          "$ref": "#/$defs/U64",
+          "description": "Depth in the causal tree."
+        },
+        "parent_node_id": {
+          "description": "Parent node ID within that run.",
+          "type": "string"
+        },
+        "parent_run_id": {
+          "$ref": "#/$defs/WorkflowRunId",
+          "description": "Parent workflow run ID."
+        }
+      },
+      "required": [
+        "causal_root_id",
+        "parent_run_id",
+        "parent_node_id",
+        "depth"
+      ],
+      "type": "object"
+    },
     "CausalRootId": {
       "description": "The root of a bounded cross-run causal chain.",
       "format": "uuid",
@@ -9205,6 +9308,26 @@
       "description": "A duration in milliseconds, as a decimal string in JSON.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "EdgeCondition": {
+      "description": "Condition required on an edge for traversal.",
+      "oneOf": [
+        {
+          "const": "success",
+          "description": "Traverse when the source node succeeded.",
+          "type": "string"
+        },
+        {
+          "const": "failure",
+          "description": "Traverse when the source node failed.",
+          "type": "string"
+        },
+        {
+          "const": "always",
+          "description": "Traverse regardless of source node outcome.",
+          "type": "string"
+        }
+      ]
     },
     "EditorBufferRevision": {
       "description": "The revision of the editor's edit buffer. Every change to the buffer advances it.",
@@ -15792,6 +15915,116 @@
       "description": "One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.",
       "pattern": "^[!-~]{1,253}$",
       "type": "string"
+    },
+    "NodeReceiptSummary": {
+      "additionalProperties": false,
+      "description": "Summary receipt of an executed action node.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "Action identifier assigned to this execution."
+        },
+        "causal_parent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Causal parent description."
+        },
+        "ended_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When execution finished."
+        },
+        "node_id": {
+          "description": "Node identifier within the workflow.",
+          "type": "string"
+        },
+        "output": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Output result string, if available."
+        },
+        "run_id": {
+          "$ref": "#/$defs/WorkflowRunId",
+          "description": "Workflow run identifier."
+        },
+        "started_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When execution started."
+        },
+        "status": {
+          "$ref": "#/$defs/NodeStatus",
+          "description": "Node execution status."
+        }
+      },
+      "required": [
+        "run_id",
+        "node_id",
+        "action_id",
+        "causal_parent",
+        "status",
+        "output",
+        "started_at_ms",
+        "ended_at_ms"
+      ],
+      "type": "object"
+    },
+    "NodeStatus": {
+      "description": "Execution status of a single workflow action node.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Waiting for dependencies to complete.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "Currently executing.",
+          "type": "string"
+        },
+        {
+          "const": "success",
+          "description": "Completed successfully with authoritative outcome.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Completed with failure.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Outcome could not be established; paused for review.",
+          "type": "string"
+        },
+        {
+          "const": "paused",
+          "description": "Paused for review or budget exhaustion.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "Cancelled before execution or during execution.",
+          "type": "string"
+        }
+      ]
     },
     "Nonce192": {
       "contentEncoding": "base64url",
@@ -28838,17 +29071,736 @@
       ],
       "type": "object"
     },
+    "WorkflowDeadlines": {
+      "additionalProperties": false,
+      "description": "Operational deadlines configured for a workflow.",
+      "properties": {
+        "action_wait_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum time in milliseconds to wait for a single action outcome."
+        },
+        "run_deadline_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum run lifetime in milliseconds before timeout."
+        }
+      },
+      "required": [
+        "run_deadline_ms",
+        "action_wait_ms"
+      ],
+      "type": "object"
+    },
+    "WorkflowDefinition": {
+      "additionalProperties": false,
+      "description": "Complete versioned workflow definition document.",
+      "properties": {
+        "deadlines": {
+          "$ref": "#/$defs/WorkflowDeadlines",
+          "description": "Deadlines."
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional description."
+        },
+        "edges": {
+          "description": "Graph edges.",
+          "items": {
+            "$ref": "#/$defs/WorkflowEdge"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "description": "Whether this workflow is enabled to process triggers.",
+          "type": "boolean"
+        },
+        "grant_reference": {
+          "$ref": "#/$defs/GrantId",
+          "description": "Explicit grant reference required to run this workflow."
+        },
+        "name": {
+          "description": "Human-readable name.",
+          "type": "string"
+        },
+        "nodes": {
+          "description": "Graph nodes.",
+          "items": {
+            "$ref": "#/$defs/WorkflowNode"
+          },
+          "type": "array"
+        },
+        "resource_scope": {
+          "$ref": "#/$defs/WorkflowResourceScope",
+          "description": "Resource scope."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Revision counter of this definition."
+        },
+        "trigger": {
+          "$ref": "#/$defs/WorkflowTrigger",
+          "description": "Trigger configuration."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Unique workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "name",
+        "description",
+        "trigger",
+        "resource_scope",
+        "nodes",
+        "edges",
+        "deadlines",
+        "grant_reference",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "WorkflowDefinitionSummary": {
+      "additionalProperties": false,
+      "description": "Summary of an installed workflow definition.",
+      "properties": {
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional description."
+        },
+        "enabled": {
+          "description": "Whether enabled.",
+          "type": "boolean"
+        },
+        "grant_reference": {
+          "$ref": "#/$defs/GrantId",
+          "description": "Grant reference."
+        },
+        "installed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When installed."
+        },
+        "name": {
+          "description": "Human-readable name.",
+          "type": "string"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Revision of the definition."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "name",
+        "description",
+        "grant_reference",
+        "enabled",
+        "installed_at_ms"
+      ],
+      "type": "object"
+    },
+    "WorkflowEdge": {
+      "additionalProperties": false,
+      "description": "A directed edge connecting two action nodes in a workflow graph.",
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/EdgeCondition",
+          "description": "Condition required to follow this edge."
+        },
+        "from_node": {
+          "description": "Source node identifier.",
+          "type": "string"
+        },
+        "to_node": {
+          "description": "Destination node identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from_node",
+        "to_node",
+        "condition"
+      ],
+      "type": "object"
+    },
+    "WorkflowEnableParams": {
+      "additionalProperties": false,
+      "description": "Parameters for `workflow.enable`.",
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Revision to enable."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "WorkflowEnableResult": {
+      "additionalProperties": false,
+      "description": "Result of `workflow.enable`.",
+      "properties": {
+        "enabled": {
+          "description": "True when enabled.",
+          "type": "boolean"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Revision enabled."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "enabled"
+      ],
+      "type": "object"
+    },
     "WorkflowId": {
       "description": "One automation definition.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "WorkflowInstallParams": {
+      "additionalProperties": false,
+      "description": "Parameters for `workflow.install`.",
+      "properties": {
+        "definition": {
+          "$ref": "#/$defs/WorkflowDefinition",
+          "description": "Full definition document."
+        },
+        "grant_reference": {
+          "$ref": "#/$defs/GrantId",
+          "description": "Explicit grant reference."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Expected new revision."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier to install or update."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "definition",
+        "grant_reference"
+      ],
+      "type": "object"
+    },
+    "WorkflowInstallResult": {
+      "additionalProperties": false,
+      "description": "Result of `workflow.install`.",
+      "properties": {
+        "installed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "Timestamp when installed."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Installed revision."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Installed workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "installed_at_ms"
+      ],
+      "type": "object"
+    },
+    "WorkflowNode": {
+      "additionalProperties": false,
+      "description": "A single action node in a workflow graph.",
+      "properties": {
+        "action_kind": {
+          "description": "Registered action kind (e.g., \"shell_command\", \"run_tests\", \"request_review\").",
+          "type": "string"
+        },
+        "action_params": {
+          "description": "Typed action parameters JSON string without template code.",
+          "type": "string"
+        },
+        "declared_environment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EnvironmentId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared execution environment required for shell commands."
+        },
+        "node_id": {
+          "description": "Unique identifier for this node within the workflow definition.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_id",
+        "action_kind",
+        "action_params",
+        "declared_environment"
+      ],
+      "type": "object"
+    },
+    "WorkflowPauseParams": {
+      "additionalProperties": false,
+      "description": "Parameters for `workflow.pause`.",
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional reason for pausing."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Revision to pause."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "WorkflowPauseResult": {
+      "additionalProperties": false,
+      "description": "Result of `workflow.pause`.",
+      "properties": {
+        "paused": {
+          "description": "True when paused.",
+          "type": "boolean"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Revision paused."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "paused"
+      ],
+      "type": "object"
+    },
+    "WorkflowReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters for `workflow.read`.",
+      "properties": {
+        "causal_root_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CausalRootId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Filter by causal root identifier."
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Filter by definition revision."
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowRunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Filter by run identifier."
+        },
+        "workflow_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Filter by workflow identifier."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "run_id",
+        "causal_root_id"
+      ],
+      "type": "object"
+    },
+    "WorkflowReadResult": {
+      "additionalProperties": false,
+      "description": "Result of `workflow.read`.",
+      "properties": {
+        "definitions": {
+          "description": "Matching workflow definitions.",
+          "items": {
+            "$ref": "#/$defs/WorkflowDefinitionSummary"
+          },
+          "type": "array"
+        },
+        "node_receipts": {
+          "description": "Matching node execution receipts.",
+          "items": {
+            "$ref": "#/$defs/NodeReceiptSummary"
+          },
+          "type": "array"
+        },
+        "remaining_causal_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CausalBudgetSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Remaining causal budget for requested causal root, if queried."
+        },
+        "runs": {
+          "description": "Matching workflow runs.",
+          "items": {
+            "$ref": "#/$defs/WorkflowRunSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "definitions",
+        "runs",
+        "node_receipts",
+        "remaining_causal_budget"
+      ],
+      "type": "object"
+    },
+    "WorkflowResourceScope": {
+      "additionalProperties": false,
+      "description": "Resource scope binding for a workflow.",
+      "properties": {
+        "environment_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EnvironmentId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Environment scope, if constrained."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Session scope, if constrained."
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Workspace scope, if constrained."
+        }
+      },
+      "required": [
+        "environment_id",
+        "workspace_id",
+        "session_id"
+      ],
+      "type": "object"
+    },
     "WorkflowRunId": {
       "description": "One automation run.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "WorkflowRunParams": {
+      "additionalProperties": false,
+      "description": "Parameters for `workflow.run`.",
+      "properties": {
+        "causal_parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CausalParentRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional causal parent reference if triggered by a workflow."
+        },
+        "event_id": {
+          "description": "Trigger event identifier.",
+          "type": "string"
+        },
+        "event_payload": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional event payload string."
+        },
+        "event_type": {
+          "description": "Trigger event type.",
+          "type": "string"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Exact definition revision to run."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier to run."
+        }
+      },
+      "required": [
+        "workflow_id",
+        "revision",
+        "event_id",
+        "event_type",
+        "event_payload",
+        "causal_parent"
+      ],
+      "type": "object"
+    },
+    "WorkflowRunResult": {
+      "additionalProperties": false,
+      "description": "Result of `workflow.run`.",
+      "properties": {
+        "causal_root_id": {
+          "$ref": "#/$defs/CausalRootId",
+          "description": "Host-verified causal root identifier."
+        },
+        "depth": {
+          "$ref": "#/$defs/U64",
+          "description": "Causal tree depth."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Revision executed."
+        },
+        "run_id": {
+          "$ref": "#/$defs/WorkflowRunId",
+          "description": "Allocated run identifier."
+        },
+        "status": {
+          "$ref": "#/$defs/WorkflowRunStatus",
+          "description": "Current run status."
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier."
+        }
+      },
+      "required": [
+        "run_id",
+        "workflow_id",
+        "revision",
+        "causal_root_id",
+        "depth",
+        "status"
+      ],
+      "type": "object"
+    },
+    "WorkflowRunStatus": {
+      "description": "Status of a workflow run.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Queued and waiting for execution.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "Currently executing action nodes.",
+          "type": "string"
+        },
+        {
+          "const": "completed",
+          "description": "All reachable nodes finished successfully.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "One or more nodes failed without recovery.",
+          "type": "string"
+        },
+        {
+          "const": "paused",
+          "description": "Paused by user or limit breach.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "Cancelled by user request.",
+          "type": "string"
+        }
+      ]
+    },
+    "WorkflowRunSummary": {
+      "additionalProperties": false,
+      "description": "Summary of a workflow run.",
+      "properties": {
+        "causal_root_id": {
+          "$ref": "#/$defs/CausalRootId",
+          "description": "Causal root identifier."
+        },
+        "depth": {
+          "$ref": "#/$defs/U64",
+          "description": "Depth in causal chain."
+        },
+        "ended_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When execution finished, if terminated."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Definition revision executed."
+        },
+        "run_id": {
+          "$ref": "#/$defs/WorkflowRunId",
+          "description": "Run identifier."
+        },
+        "started_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When execution began."
+        },
+        "status": {
+          "$ref": "#/$defs/WorkflowRunStatus",
+          "description": "Current status."
+        },
+        "trigger_event_id": {
+          "description": "Trigger event identifier.",
+          "type": "string"
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId",
+          "description": "Workflow identifier."
+        }
+      },
+      "required": [
+        "run_id",
+        "workflow_id",
+        "revision",
+        "causal_root_id",
+        "depth",
+        "status",
+        "trigger_event_id",
+        "started_at_ms",
+        "ended_at_ms"
+      ],
+      "type": "object"
+    },
+    "WorkflowTrigger": {
+      "additionalProperties": false,
+      "description": "An event trigger definition for a workflow.",
+      "properties": {
+        "criteria": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional criteria or filter for the triggering event."
+        },
+        "event_type": {
+          "description": "The event type that triggers the workflow (e.g., \"turn_completed\", \"changeset_captured\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type",
+        "criteria"
+      ],
+      "type": "object"
     },
     "WorkspaceCreateParams": {
       "additionalProperties": false,
@@ -29471,6 +30423,12 @@
     "capture_count": {
       "$ref": "#/$defs/CaptureCount"
     },
+    "causal_budget_summary": {
+      "$ref": "#/$defs/CausalBudgetSummary"
+    },
+    "causal_parent_ref": {
+      "$ref": "#/$defs/CausalParentRef"
+    },
     "change_manifest": {
       "$ref": "#/$defs/ChangeManifest"
     },
@@ -29620,6 +30578,9 @@
     },
     "draft_update_result": {
       "$ref": "#/$defs/DraftUpdateResult"
+    },
+    "edge_condition": {
+      "$ref": "#/$defs/EdgeCondition"
     },
     "effective_configuration": {
       "$ref": "#/$defs/EffectiveConfiguration"
@@ -30118,6 +31079,12 @@
     },
     "named_question_preview": {
       "$ref": "#/$defs/NamedQuestionPreview"
+    },
+    "node_receipt_summary": {
+      "$ref": "#/$defs/NodeReceiptSummary"
+    },
+    "node_status": {
+      "$ref": "#/$defs/NodeStatus"
     },
     "notification": {
       "$ref": "#/$defs/Notification"
@@ -30694,6 +31661,63 @@
     },
     "worker_verify_proof": {
       "$ref": "#/$defs/WorkerVerifyProof"
+    },
+    "workflow_deadlines": {
+      "$ref": "#/$defs/WorkflowDeadlines"
+    },
+    "workflow_definition": {
+      "$ref": "#/$defs/WorkflowDefinition"
+    },
+    "workflow_definition_summary": {
+      "$ref": "#/$defs/WorkflowDefinitionSummary"
+    },
+    "workflow_edge": {
+      "$ref": "#/$defs/WorkflowEdge"
+    },
+    "workflow_enable_params": {
+      "$ref": "#/$defs/WorkflowEnableParams"
+    },
+    "workflow_enable_result": {
+      "$ref": "#/$defs/WorkflowEnableResult"
+    },
+    "workflow_install_params": {
+      "$ref": "#/$defs/WorkflowInstallParams"
+    },
+    "workflow_install_result": {
+      "$ref": "#/$defs/WorkflowInstallResult"
+    },
+    "workflow_node": {
+      "$ref": "#/$defs/WorkflowNode"
+    },
+    "workflow_pause_params": {
+      "$ref": "#/$defs/WorkflowPauseParams"
+    },
+    "workflow_pause_result": {
+      "$ref": "#/$defs/WorkflowPauseResult"
+    },
+    "workflow_read_params": {
+      "$ref": "#/$defs/WorkflowReadParams"
+    },
+    "workflow_read_result": {
+      "$ref": "#/$defs/WorkflowReadResult"
+    },
+    "workflow_resource_scope": {
+      "$ref": "#/$defs/WorkflowResourceScope"
+    },
+    "workflow_run_params": {
+      "$ref": "#/$defs/WorkflowRunParams"
+    },
+    "workflow_run_result": {
+      "$ref": "#/$defs/WorkflowRunResult"
+    },
+    "workflow_run_status": {
+      "$ref": "#/$defs/WorkflowRunStatus"
+    },
+    "workflow_run_summary": {
+      "$ref": "#/$defs/WorkflowRunSummary"
+    },
+    "workflow_trigger": {
+      "$ref": "#/$defs/WorkflowTrigger"
     },
     "workspace_create_params": {
       "$ref": "#/$defs/WorkspaceCreateParams"
