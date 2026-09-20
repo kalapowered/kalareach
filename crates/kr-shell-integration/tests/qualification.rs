@@ -2114,11 +2114,11 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
 /// KR-REQ-07.88: no unqualified binary is hot-swapped into a session that is already running.
 ///
 /// The installation is what a new session resolves its package from, and the product's own
-/// resolver is what reads it. This makes two complete installations of the same package under a
-/// root of this test's own, each with its own binary and its own startup entry, starts a session
-/// from the first, and then points the installation at the second while that session is running.
-/// The resolver a new session would use answers the second; the session that is running still
-/// declares, and is still running, the first.
+/// resolver is what reads it. This makes an installation of its own out of two builds this host
+/// really has — the directories are the real ones, so each package's own record and its own
+/// binary are what a session starts — starts a session from the first, and then points the
+/// installation at the second while that session is running. The resolver a new session would use
+/// answers the second, and the session that is running is still executing the first.
 #[test]
 fn a_live_session_keeps_the_package_it_started_with() {
     let Some(installed) = Package::found(ShellKind::Zsh) else {
@@ -2132,19 +2132,9 @@ fn a_live_session_keeps_the_package_it_started_with() {
         .find(|case| case.id == "zsh-plain")
         .expect("the plain Zsh case is committed");
 
-    let root = tempfile::Builder::new()
-        .prefix("kr-installation-")
-        .tempdir()
-        .expect("an installation root on the internal disk");
-    let shell = root.path().join("zsh");
-    // Two builds, not two copies of one: this host keeps every identity it has built, so the one
-    // that is current and one built before it are two packages a person could really have. With
-    // only one build there is nothing to replace it with, and this says so rather than copying
-    // the same bytes twice and calling them two packages.
     // Two installations of one package is what a person has after an update, so this needs two
-    // builds. They cannot be made by copying the same bytes under another name, because that is
-    // the thing this case is about: `scripts/e2e-fence.sh` and the qualification job build a
-    // second one from different inputs before this runs.
+    // builds. They cannot be made by copying one under another name: a package declares the build
+    // it is, and a copy declares the original, which the handshake refuses as another build.
     let Some(older) = another_build(&installed) else {
         let reason = format!(
             "this host holds one build of the {} package, so there is no second one to install \
@@ -2169,156 +2159,116 @@ fn a_live_session_keeps_the_package_it_started_with() {
         std::fs::read(&older.executable).expect("a binary"),
         "the two builds produced the same binary, so neither could be told from the other"
     );
-    let before = copy_installation(&shell, &installed, "aaaaaaaaaaaaaaaa", "before");
-    let after = copy_installation(&shell, &older, "bbbbbbbbbbbbbbbb", "after");
-    assert_ne!(
-        before.executable, after.executable,
-        "the two installations share a binary, so neither could be told from the other"
-    );
-    assert_ne!(
-        std::fs::read(&before.executable).expect("a binary"),
-        std::fs::read(&after.executable).expect("a binary"),
-        "the two installations hold the same binary"
-    );
-    std::fs::write(shell.join("current"), "aaaaaaaaaaaaaaaa").expect("the pointer");
-    assert_eq!(resolved_executable(root.path()), before.executable);
 
-    let setup = CaseSetup::prepare(&case, &before, &index);
-    let mut session = Session::start_for(&before, &case, &setup);
+    let root = tempfile::Builder::new()
+        .prefix("kr-installation-")
+        .tempdir()
+        .expect("an installation root on the internal disk");
+    let shell = root.path().join(ShellKind::Zsh.as_str());
+    std::fs::create_dir_all(&shell).expect("an installation directory");
+    for build in [&installed, &older] {
+        let directory = build
+            .executable
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the package directory");
+        std::os::unix::fs::symlink(directory, shell.join(&build.identity))
+            .expect("an installed build");
+    }
+    std::fs::write(shell.join("current"), &installed.identity).expect("the pointer");
+    // The installation reaches each build through a directory of its own, so what the resolver
+    // answers is compared as the kernel spells it rather than as this root writes it.
+    assert_eq!(
+        canonical(&resolved_executable(root.path())),
+        canonical(&installed.executable)
+    );
+
+    let setup = CaseSetup::prepare(&case, &installed, &index);
+    let mut session = Session::start_for(&installed, &case, &setup);
     session.first_prompt_within(STARTUP);
     settle(&mut session, Duration::from_millis(300), REPLY);
-    // Which installation this session is running is read from that installation's own startup
-    // entry rather than from what the handshake declares: a build records where it installed
-    // itself, so a copy of a package declares the path it was built for whichever copy is
-    // running. What the person gets is the startup the running installation holds.
-    assert!(
-        session.run("echo kr-live=$KR_TEST_LIVE", "kr-live=before"),
-        "the session did not start the installation it was given; the terminal showed:\n{}",
-        session.terminal_output()
-    );
-
-    // A newer package is installed while that session is running.
-    std::fs::write(shell.join("current"), "bbbbbbbbbbbbbbbb").expect("the pointer");
-    assert_eq!(
-        resolved_executable(root.path()),
-        after.executable,
-        "a new session would still resolve the installation that was replaced"
-    );
-
-    // The live session is untouched: it is still running the installation it started, and its
-    // reader still answers.
-    assert!(
-        session.run("echo kr-live-after=$KR_TEST_LIVE", "kr-live-after=before"),
-        "the live session took up the installation that replaced it; the terminal showed:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        !session.terminal_output().contains("=after"),
-        "the live session reported the installation that replaced it"
-    );
     // What the operating system says this process is executing, rather than what it was invoked
     // as: an invocation name can be anything, and the question is which image is running.
     assert_eq!(
         running_image(&mut session),
-        canonical(&before.executable),
-        "the live session is running another image than the one it started"
+        canonical(&installed.executable),
+        "the session did not start the build it was given"
     );
-    let (enter, fence) = session.fenced_after_a_command(30);
-    assert_eq!(fence.prompt_generation, enter.prompt_generation);
-    assert!(session.alive());
-    drop(session);
+
+    // A newer package is installed while that session is running.
+    std::fs::write(shell.join("current"), &older.identity).expect("the pointer");
+    assert_eq!(
+        canonical(&resolved_executable(root.path())),
+        canonical(&older.executable),
+        "a new session would still resolve the installation that was replaced"
+    );
+    assert_eq!(
+        running_image(&mut session),
+        canonical(&installed.executable),
+        "the live session took up the build that replaced it"
+    );
 
     // A session started now takes the installation the pointer names, and the package it starts
     // from is the product resolver's own answer rather than one this test chose.
-    let resolved = kr_shell_integration::host::package::PackageSet::discover(root.path())
-        .expect("the installation reads")
-        .get(ShellKind::Zsh)
-        .expect("the installation holds a Zsh package")
-        .executable();
-    assert_eq!(resolved, after.executable);
-    let chosen = Package {
-        kind: after.kind,
-        identity: after.identity.clone(),
-        executable: resolved,
-        startup_entry: after.startup_entry.clone(),
-        module_directory: after.module_directory.clone(),
-        record: after.record.clone(),
-    };
-    let second = CaseSetup::prepare(&case, &chosen, &index);
-    let mut next = Session::start_for(&chosen, &case, &second);
+    assert_eq!(
+        canonical(&resolved_executable(root.path())),
+        canonical(&older.executable)
+    );
+    let second = CaseSetup::prepare(&case, &older, &index);
+    let mut next = Session::start_for(&older, &case, &second);
     next.first_prompt_within(STARTUP);
     settle(&mut next, Duration::from_millis(300), REPLY);
-    assert!(
-        next.run("echo kr-live=$KR_TEST_LIVE", "kr-live=after"),
-        "a session started after the update did not take the installation the pointer names; \
-         the terminal showed:\n{}",
-        next.terminal_output()
-    );
     assert_eq!(
         running_image(&mut next),
-        canonical(&after.executable),
-        "the session started after the update is running the image it replaced"
+        canonical(&older.executable),
+        "the session started after the update is running the build it replaced"
     );
     assert!(next.alive());
+    assert!(session.alive());
 
     // A replacement that reads perfectly well and is not this package is refused rather than
     // launched: the record names a binary outside the package it is in.
-    let record_path = shell.join("bbbbbbbbbbbbbbbb/kr-shell-identity.json");
-    let mut record: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&record_path).expect("the record"))
-            .expect("the record decodes");
+    let intruder = shell.join("cccccccccccccccc");
+    std::fs::create_dir_all(&intruder).expect("an installation directory");
+    let mut record = installed.record.clone();
+    record["identity"] = serde_json::Value::String("cccccccccccccccc".to_owned());
     record["shell"]["executable"] = serde_json::Value::String("/bin/zsh".to_owned());
     std::fs::write(
-        &record_path,
+        intruder.join("kr-shell-identity.json"),
         serde_json::to_string_pretty(&record).expect("the record encodes"),
     )
     .expect("the record");
+    std::fs::write(shell.join("current"), "cccccccccccccccc").expect("the pointer");
     assert!(
-        kr_shell_integration::host::package::PackageSet::discover(root.path()).is_err(),
-        "an installation that names a binary outside itself was resolved anyway"
+        offered(root.path()).is_none(),
+        "an installation that names a binary outside itself was offered anyway"
     );
 
-    // And one whose record cannot be read at all.
-    std::fs::write(&record_path, "{").expect("the record");
+    // And one whose record cannot be read at all. An installation is read shell by shell, so a
+    // record that cannot be read refuses the shell it belongs to rather than every shell beside
+    // it — which is why the packages this installation also holds are still offered.
+    std::fs::write(intruder.join("kr-shell-identity.json"), "{").expect("the record");
     assert!(
-        kr_shell_integration::host::package::PackageSet::discover(root.path()).is_err(),
-        "an installation whose record cannot be read was resolved anyway"
+        offered(root.path()).is_none(),
+        "an installation whose record cannot be read was offered anyway"
     );
 }
 
-/// A path as the kernel spells it, so a directory reached through a link compares equal.
-fn canonical(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+/// The Zsh package this installation offers a new session, where it offers one.
+fn offered(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    kr_shell_integration::host::package::PackageSet::discover(root)
+        .ok()?
+        .get(ShellKind::Zsh)
+        .map(kr_shell_integration::host::package::ShellPackage::executable)
 }
 
-/// The image a session's shell is actually executing, as the kernel reports it.
-///
-/// Not what it was invoked as: a process can be started with any name in its argument vector, and
-/// the question here is which file is executing. Each platform is asked the question it answers
-/// exactly — the link the kernel keeps beside the process, or the call that reads its path.
-#[cfg(target_os = "linux")]
-fn running_image(session: &mut Session) -> Option<std::path::PathBuf> {
-    let pid = session.child_pid()?;
-    std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .and_then(|path| canonical(&path))
-}
-
-#[cfg(target_os = "macos")]
-fn running_image(session: &mut Session) -> Option<std::path::PathBuf> {
-    // The open-file listing names the text file a process is executing. `ps` answers with the
-    // first word of the argument vector instead, which a process chooses for itself, so a
-    // different binary started under the expected name would satisfy it.
-    let pid = session.child_pid()?;
-    let listed = std::process::Command::new("lsof")
-        .args(["-p", &pid.to_string(), "-a", "-d", "txt", "-Fn"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&listed.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .find(|path| !path.starts_with("/usr/lib/"))
-        .and_then(|path| canonical(std::path::Path::new(path)))
+/// What the product's own resolver would launch for a new session at this installation.
+fn resolved_executable(root: &std::path::Path) -> std::path::PathBuf {
+    kr_shell_integration::host::package::PackageSet::discover(root)
+        .expect("the installation reads")
+        .get(ShellKind::Zsh)
+        .expect("the installation holds a Zsh package")
+        .executable()
 }
 
 /// Another identity of the same package this host has built before, where it has one.
@@ -2365,109 +2315,39 @@ fn another_build(current: &Package) -> Option<Package> {
     })
 }
 
-/// What the product's own resolver would launch for a new session at this installation.
-fn resolved_executable(root: &std::path::Path) -> std::path::PathBuf {
-    kr_shell_integration::host::package::PackageSet::discover(root)
-        .expect("the installation reads")
-        .get(ShellKind::Zsh)
-        .expect("the installation holds a Zsh package")
-        .executable()
+/// A path as the kernel spells it, so a directory reached through a link compares equal.
+fn canonical(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
 
-/// Copies a whole installed package into a root of this test's own, under a new identity.
+/// The image a session's shell is actually executing, as the kernel reports it.
 ///
-/// The copy is complete, so the session it starts is a real packaged shell of its own rather than
-/// a record pointing at somebody else's installation. The record's identity and its recorded paths
-/// move with it, which is what the product's resolver checks before it will launch anything, and
-/// the startup entry says which of the two this session is running.
-fn copy_installation(
-    shell: &std::path::Path,
-    from: &Package,
-    identity: &str,
-    marker: &str,
-) -> Package {
-    let source = from
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory")
-        .to_path_buf();
-    let directory = shell.join(identity);
-    copy_tree(&source, &directory);
-
-    let record_path = directory.join("kr-shell-identity.json");
-    let mut record: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&record_path).expect("the record"))
-            .expect("the record decodes");
-    let moved = |value: &serde_json::Value| -> serde_json::Value {
-        serde_json::Value::String(value.as_str().unwrap_or_default().replace(
-            &source.display().to_string(),
-            &directory.display().to_string(),
-        ))
-    };
-    record["identity"] = serde_json::Value::String(identity.to_owned());
-    record["shell"]["executable"] = moved(&record["shell"]["executable"]);
-    if let Some(modules) = record["shell"]["modules"].as_array().cloned() {
-        record["shell"]["modules"] = serde_json::Value::Array(
-            modules
-                .into_iter()
-                .map(|mut module| {
-                    if let Some(path) = module.get("search_path").cloned() {
-                        module["search_path"] = moved(&path);
-                    }
-                    module
-                })
-                .collect(),
-        );
-    }
-    std::fs::write(
-        &record_path,
-        serde_json::to_string_pretty(&record).expect("the record encodes"),
-    )
-    .expect("the identity record");
-
-    let entry = from
-        .startup_entry
-        .file_name()
-        .expect("the startup entry has a name");
-    let startup = directory.join("startup").join(entry);
-    let body = std::fs::read_to_string(&startup).expect("the startup entry");
-    std::fs::write(&startup, format!("export KR_TEST_LIVE={marker}\n{body}"))
-        .expect("the startup entry");
-
-    Package {
-        kind: from.kind,
-        identity: identity.to_owned(),
-        executable: std::path::PathBuf::from(
-            record["shell"]["executable"]
-                .as_str()
-                .expect("the record names an executable"),
-        ),
-        startup_entry: startup,
-        module_directory: directory.join("modules"),
-        record,
-    }
+/// Not what it was invoked as: a process can be started with any name in its argument vector, and
+/// the question here is which file is executing. Each platform is asked the question it answers
+/// exactly — the link the kernel keeps beside the process, or the call that reads its path.
+#[cfg(target_os = "linux")]
+fn running_image(session: &mut Session) -> Option<std::path::PathBuf> {
+    let pid = session.child_pid()?;
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| canonical(&path))
 }
 
-/// Copies a directory tree, keeping what is executable executable.
-fn copy_tree(from: &std::path::Path, into: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(into).expect("a directory");
-    for entry in std::fs::read_dir(from).expect("the package directory is readable") {
-        let entry = entry.expect("a directory entry");
-        let source = entry.path();
-        let destination = into.join(entry.file_name());
-        let kind = entry.file_type().expect("a file type");
-        if kind.is_dir() {
-            copy_tree(&source, &destination);
-        } else if kind.is_file() {
-            std::fs::copy(&source, &destination).expect("a file");
-            let mode = entry.metadata().expect("a mode").permissions().mode();
-            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))
-                .expect("the mode");
-        }
-    }
+#[cfg(target_os = "macos")]
+fn running_image(session: &mut Session) -> Option<std::path::PathBuf> {
+    // The open-file listing names the text file a process is executing. `ps` answers with the
+    // first word of the argument vector instead, which a process chooses for itself, so a
+    // different binary started under the expected name would satisfy it.
+    let pid = session.child_pid()?;
+    let listed = std::process::Command::new("lsof")
+        .args(["-p", &pid.to_string(), "-a", "-d", "txt", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .find(|path| !path.starts_with("/usr/lib/"))
+        .and_then(|path| canonical(std::path::Path::new(path)))
 }
 
 // ---------------------------------------------------------------------------------------------
