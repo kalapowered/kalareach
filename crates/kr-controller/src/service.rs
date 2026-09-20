@@ -2418,17 +2418,14 @@ impl Controller {
             controller: Arc::clone(self),
             deadline: accepted.deadline,
         };
-        // What this action already produced, if it produced anything. Answered before the claim,
-        // so a retry of a completed change is its own result rather than a conflict.
-        if let Some(answered) = self.voice_answered(actor_id, mutation).await? {
-            return Ok(answered);
-        }
-        // A delegation does not go through this store, and cannot yet: the answer to a first
-        // submission of an action that needs a confirmation is the challenge, a claim taken before
-        // that answer is held for longer than the confirmation itself lives, and the store has no
-        // way to give a claim back. What makes one delegation one action is the coordinator's own
-        // rule, taken under its lock before it waits for anything. The gap that leaves is in the
-        // handoff with what closing it needs.
+        // A delegation does not go through this host's action store at all, and cannot yet: the
+        // answer to a first submission of an action that needs a confirmation is the challenge, a
+        // claim taken before that answer is held for longer than the confirmation itself lives,
+        // and the store has no way to give a claim back. It is not read here either, because an
+        // answer that store holds for a delegation is one an earlier build wrote and is content
+        // whose authority nothing on this path re-checks. What makes one delegation one action is
+        // the coordinator's own rule, taken under its lock before it waits for anything; the gap
+        // that leaves is in the handoff with what closing it needs.
         if method == Method::VoiceDelegate {
             return self
                 .voice()
@@ -2441,6 +2438,11 @@ impl Controller {
                     &admission,
                 )
                 .await;
+        }
+        // What this action already produced, if it produced anything. Answered before the claim,
+        // so a retry of a completed change is its own result rather than a conflict.
+        if let Some(answered) = self.voice_answered(actor_id, mutation).await? {
+            return Ok(answered);
         }
         match self.claim_voice_action(actor_id, mutation)? {
             Ok(()) => {}
@@ -2463,45 +2465,16 @@ impl Controller {
 
     /// The digest one voice action is claimed and answered under.
     ///
-    /// The mutation's own digest, except for a delegation, whose confirmation is left out of it.
-    /// Section 15 ¶8 binds a confirmation to the request that asked for it, so the signed
-    /// resubmission is the same action carrying a different payload; a digest that covered the
-    /// signature would make the two different actions, and the ceremony could never complete.
-    /// Everything the host acts on is still inside it.
+    /// The mutation's own digest. A delegation does not reach this: a confirmation is bound to the
+    /// request that asked for it, so its signed resubmission is the same action carrying a
+    /// different payload, which is what a payload digest refuses.
     fn voice_action_digest(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-        method: Method,
     ) -> Result<kr_protocol::scalars::Digest256> {
-        let carried;
-        let mutation = if method == Method::VoiceDelegate {
-            let mut params: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
-            params.confirmation = Nullable::null();
-            let mut without = mutation.clone();
-            without.params = ParamsValue::from_typed(&params)
-                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-            carried = without;
-            &carried
-        } else {
-            mutation
-        };
         kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
-    }
-
-    /// The digest one voice action is claimed under, for a test that checks what it covers.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the parameters are not the shape the method declares.
-    pub fn voice_action_digest_for_test(
-        &self,
-        actor_id: &ActorId,
-        mutation: &MutationRequest,
-        method: Method,
-    ) -> Result<kr_protocol::scalars::Digest256> {
-        self.voice_action_digest(actor_id, mutation, method)
     }
 
     /// Claims one voice action for this attempt, or answers with what it already produced.
@@ -2510,12 +2483,7 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<std::result::Result<(), ParamsValue>> {
-        let Some(method) = mutation.method.method() else {
-            return Err(ControllerError::NotListed {
-                method: mutation.method.as_str().to_owned(),
-            });
-        };
-        let digest = self.voice_action_digest(actor_id, mutation, method)?;
+        let digest = self.voice_action_digest(actor_id, mutation)?;
         match self.sharing.grants().claim_action(
             actor_id,
             mutation.action_id,
@@ -2538,24 +2506,18 @@ impl Controller {
         }
     }
 
-    /// What one voice action already produced, when this host has its answer and this caller may
-    /// still be given it.
+    /// What one voice action already produced, when this host has its answer.
     ///
-    /// A retained answer is a read of somebody's result: section 23 wants present authority over
-    /// the subject before either half of one goes back, and a delegation's answer can carry
-    /// content about a session. So the answer of a delegation is served only while the same device
-    /// still holds the authority it ran under and the session it named is still inside what that
-    /// device's history may see; otherwise this host says what the action was without saying what
-    /// it found.
+    /// The three voice changes this answers for name no session and carry no content about one:
+    /// what each produced is the grant it wrote, the call it created or the call it ended. A
+    /// delegation does not reach this, because its answer can carry content about a session and
+    /// nothing on this path re-checks the authority that content was found under.
     async fn voice_answered(
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<Option<ParamsValue>> {
-        let Some(method) = mutation.method.method() else {
-            return Ok(None);
-        };
-        let digest = self.voice_action_digest(actor_id, mutation, method)?;
+        let digest = self.voice_action_digest(actor_id, mutation)?;
         let Some(result) =
             self.sharing
                 .grants()

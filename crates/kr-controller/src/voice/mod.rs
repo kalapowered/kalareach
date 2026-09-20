@@ -225,9 +225,10 @@ impl VoiceModule {
     ///
     /// # Errors
     ///
-    /// Returns the refusal the caller is given. A voice mutation is deduplicated by its action
-    /// identifier, so the caller of this is the one that claims the action and retains what it
-    /// produced; this performs the effect exactly once for that claim.
+    /// Returns the refusal the caller is given. The caller of this is the one that claims a voice
+    /// change and retains what it produced, so this performs the effect once for that claim; a
+    /// delegation carries no claim, and what makes one of those one action is the coordinator's
+    /// own rule about the delegation it names.
     pub async fn answer(
         &self,
         actor: VoiceActor,
