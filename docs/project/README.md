@@ -261,10 +261,12 @@ any abbreviation of those long options are each refused by name, as `--force` in
 attached `-c` are refused for every subcommand. The reference is named in full, as `refs/...`, and
 `@` is an ordinary character in it: only Git's own `@{` reflog and upstream syntax is refused,
 because that names something other than the reference. Each object is a **full object name in the
-format the repository itself writes**, forty hexadecimal characters or sixty-four, read from the
-repository before the invocation is built; a name of the other length is refused, because Git would
-resolve it as a revision and a reference whose own name is that many hexadecimal characters would
-then decide what moved. The null object in either position is refused for what it is: as the new
+format the repository itself writes**, forty hexadecimal characters or sixty-four; a name of the
+other length is refused, because Git would resolve it as a revision and a reference whose own name
+is that many hexadecimal characters would then decide what moved. The format is read from the Git
+common directory, under the identity this host recorded for it, rather than from the working tree:
+a linked worktree names its repository through a file it holds itself, and rewriting that file
+would otherwise describe one repository while the update moved a reference in another. The null object in either position is refused for what it is: as the new
 value it deletes the reference and as the expected old value it asserts the reference is absent,
 and this service moves one reference that exists to one object that exists. The invocation runs
 with the repository's Git common directory as its working directory and a write grant for that
