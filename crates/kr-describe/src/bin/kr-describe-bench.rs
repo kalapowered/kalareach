@@ -134,7 +134,7 @@ fn hardware() -> String {
     let mut system = sysinfo::System::new_all();
     system.refresh_all();
     format!(
-        "{} {} | {} logical processors | {:.1} GiB RAM",
+        "{} {} | {} physical cores | {:.1} GiB RAM",
         std::env::consts::OS,
         std::env::consts::ARCH,
         system
@@ -142,6 +142,29 @@ fn hardware() -> String {
             .map_or_else(|| "unknown".to_owned(), |cores| cores.to_string()),
         system.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0),
     )
+}
+
+/// Samples this process's peak processor use over a window, in hundredths of one core.
+///
+/// The window is spent rather than slept through because `sysinfo` computes processor use from the
+/// interval between two refreshes of one process. A refresh taken any sooner than
+/// `MINIMUM_CPU_UPDATE_INTERVAL` is arithmetic over a gap the operating system never reported, and
+/// the figure it produces is not a measurement of anything.
+fn peak_process_cpu_centis(window: std::time::Duration) -> u64 {
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut system = sysinfo::System::new();
+    let until = Instant::now() + window;
+    let mut peak = 0;
+    loop {
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if let Some(process) = system.process(pid) {
+            peak = peak.max(process.cpu_usage().round() as u64);
+        }
+        if Instant::now() >= until {
+            return peak;
+        }
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    }
 }
 
 /// Reads this process's own resident set.
@@ -190,7 +213,11 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         return Err("the profile names no weights asset".to_owned());
     }
 
+    // What this process costs before the model is in it. Both baselines are what the separated
+    // figures are separated by: whatever the process held and burned without a model is not the
+    // model's, and the report says so rather than attributing the harness to the runtime.
     let baseline_rss = process_rss_bytes();
+    let baseline_cpu = peak_process_cpu_centis(3 * sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     let peak_load_rss = Arc::new(AtomicU64::new(baseline_rss));
     let peak_load_cpu = Arc::new(AtomicU64::new(0));
     let load_sampling = Arc::new(AtomicBool::new(true));
@@ -209,7 +236,9 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 let current_cpu = p.cpu_usage().round() as u64;
                 peak_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // The cadence is the shortest one `sysinfo` computes processor use over. A faster loop
+            // reports memory sooner and processor use that means nothing.
+            std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         }
     });
 
@@ -260,7 +289,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         whole_product_rss_bytes: peak_rss_during_load,
         model_rss_bytes: peak_rss_during_load.saturating_sub(baseline_rss),
         whole_product_cpu_centis: model_cpu,
-        model_cpu_centis: model_cpu,
+        model_cpu_centis: model_cpu.saturating_sub(baseline_cpu),
     };
     println!(
         "measured_rss_bytes: whole process {}, model and runtime {}, process without the model {} [{machine}]",
@@ -274,15 +303,24 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         figures.model_cpu_centis,
         figures.product_without_model_cpu_centis()
     );
+    println!(
+        "figures_are_of: one process, which holds the runtime, this harness and its samplers; the \
+         model and runtime share is what the process grew by over the baseline above, and the \
+         product's other processes are not in these figures [{machine}]"
+    );
+    // A breached budget is a failed qualification target and the run says so at the end, having
+    // measured everything it can still measure. Stopping here would answer the memory question by
+    // withholding the latency ones, and section 27 asks for both.
+    let mut unmet: Vec<String> = Vec::new();
     let ceiling_held = figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes;
     println!(
         "process_ceiling_bytes: {} held: {} [{machine}]",
         budgets.process_memory_ceiling_bytes, ceiling_held
     );
     if !ceiling_held {
-        return Err(format!(
-            "the 4 GiB process ceiling was breached during model load: {} bytes",
-            figures.whole_product_rss_bytes
+        unmet.push(format!(
+            "the {} byte process ceiling was breached during model load: {} bytes",
+            budgets.process_memory_ceiling_bytes, figures.whole_product_rss_bytes
         ));
     }
 
@@ -357,6 +395,16 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         })
         .map_err(|error| error.to_string())?;
 
+    // The terminal workload is this run's contention, and it runs in this process. What it costs on
+    // its own, before a single job is admitted, is what the active figures below take out of the
+    // model and runtime share: a report that called the workload's processor use the model's would
+    // be measuring the harness and publishing it as the product.
+    let workload_cpu_centis = peak_process_cpu_centis(4 * sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    println!(
+        "terminal_workload_cpu_centis: {workload_cpu_centis} (measured with the workload running \
+         and no job admitted) [{machine}]"
+    );
+
     let bench_sampling = Arc::new(AtomicBool::new(true));
     let bench_sampling_clone = bench_sampling.clone();
     let peak_bench_rss = Arc::new(AtomicU64::new(peak_rss_during_load));
@@ -374,7 +422,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 let current_cpu = p.cpu_usage().round() as u64;
                 peak_bench_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         }
     });
 
@@ -475,7 +523,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         whole_product_rss_bytes: active_rss,
         model_rss_bytes: active_rss.saturating_sub(baseline_rss),
         whole_product_cpu_centis: active_cpu,
-        model_cpu_centis: active_cpu,
+        model_cpu_centis: active_cpu.saturating_sub(workload_cpu_centis.max(baseline_cpu)),
     };
     println!(
         "measured_active_inference_rss_bytes: whole process {}, model and runtime {}, process without the model {} [{machine}]",
@@ -496,9 +544,9 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         budgets.process_memory_ceiling_bytes, active_ceiling_held
     );
     if !active_ceiling_held {
-        return Err(format!(
-            "the 4 GiB process ceiling was breached during active inference: {} bytes",
-            active_figures.whole_product_rss_bytes
+        unmet.push(format!(
+            "the {} byte process ceiling was breached during active inference: {} bytes",
+            budgets.process_memory_ceiling_bytes, active_figures.whole_product_rss_bytes
         ));
     }
 
@@ -584,15 +632,26 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         label.source.as_str()
     );
     if !matches!(paused, Tick::ResourcePaused { .. }) {
-        return Err("the paused case did not pause".to_owned());
+        unmet.push(format!("the resource-pause case did not pause: {paused:?}"));
     }
 
     let total: u32 = published.values().map(|(described, _, _)| described).sum();
     if total == 0 {
-        return Err("no description was produced, so nothing here is a measurement".to_owned());
+        unmet.push("no description was produced, so nothing here is a measurement".to_owned());
+    } else {
+        println!("--- {total} descriptions produced against real weights on {machine} ---");
     }
-    println!("--- {total} descriptions produced against real weights on {machine} ---");
-    Ok(())
+
+    if unmet.is_empty() {
+        return Ok(());
+    }
+    for target in &unmet {
+        println!("qualification_target_not_met: {target} [{machine}]");
+    }
+    Err(format!(
+        "{} qualification target(s) were not met on {machine}; the figures above are the run",
+        unmet.len()
+    ))
 }
 
 fn verify(asset: &Asset, path: &Path) -> Result<(), String> {
