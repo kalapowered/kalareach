@@ -115,6 +115,13 @@ class VoiceCallService : android.app.Service() {
 
     override fun onDestroy() {
         running = false
+        // The service going away takes the microphone with it, so the call goes too. A call whose
+        // service has been destroyed would be a call with no foreground service holding its
+        // capture open, which is the state section 15 paragraph 22 asks to be shown rather than
+        // silently carried.
+        VoiceCallHolder.current?.let { call ->
+            call.stop()
+        }
         super.onDestroy()
     }
 

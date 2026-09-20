@@ -55,6 +55,37 @@ pub fn sign_voice_confirmation(
     })
 }
 
+/// One fixed challenge, and the exact bytes every client must sign for it.
+///
+/// The three clients sign on three platforms in three languages, and a client that encodes the
+/// challenge its own way produces a proof the host rejects without any client-side test noticing.
+/// This module is where the three are held to one encoding: the desktop test below asserts the
+/// bytes the shared protocol produces, and the iOS and Android ceremony tests assert their own
+/// encoders against the same two constants.
+#[cfg(test)]
+pub(crate) mod vector {
+    /// The fixed challenge, field by field, as every language's test builds it.
+    pub const CONFIRMATION_ID: [u8; 16] = [0x11; 16];
+    pub const VOICE_SESSION_ID: [u8; 16] = [0x22; 16];
+    pub const ACTION: &str = "apply_diff";
+    pub const ACTION_DIGEST: [u8; 32] = [0x33; 32];
+    pub const ACTION_ID: [u8; 16] = [0x44; 16];
+    pub const HOST_DEVICE_ID: [u8; 16] = [0x55; 16];
+    pub const DEVICE_ID: [u8; 16] = [0x66; 16];
+    pub const NONCE: [u8; 32] = [0x77; 32];
+    pub const EXPIRES_AT_MS: u64 = 1_700_000_000_000;
+
+    /// A fixed Ed25519 public key, for the signer identifier vector.
+    pub const PUBLIC_KEY: [u8; 32] = [0x88; 32];
+
+    /// `CBOR(["kr-voice/confirm/1", request])` for that challenge, hex encoded.
+    pub const SIGNING_INPUT_HEX: &str = "82726b722d766f6963652f636f6e6669726d2f31a9656e6f6e63655820777777777777777777777777777777777777777777777777777777777777777766616374696f6e6a6170706c795f6469666669616374696f6e5f69645044444444444444444444444444444444696465766963655f696450666666666666666666666666666666666d616374696f6e5f646967657374582033333333333333333333333333333333333333333333333333333333333333336d657870697265735f61745f6d731b0000018bcfe568006e686f73745f6465766963655f696450555555555555555555555555555555556f636f6e6669726d6174696f6e5f6964501111111111111111111111111111111170766f6963655f73657373696f6e5f69645022222222222222222222222222222222";
+
+    /// `SHA256(CBOR(["kr-key-id/1", "authorisation", key]))` for that key, hex encoded.
+    pub const SIGNER_KEY_ID_HEX: &str =
+        "a1e1283a5a7d9396772f55cfbd0867b9836c583a4381dd3f70a7a78afd9dec7f";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +94,45 @@ mod tests {
     use kr_protocol::scalars::{Digest256, Nullable, Uuid};
     use kr_protocol::voice::{VoiceAction, VoiceActionPlan, VoiceRefusal};
     use kr_voice::confirm::{ConfirmationLedger, issue_confirmation, verify_confirmation};
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The cross-language vector: the exact bytes a voice confirmation is signed over.
+    #[test]
+    fn confirmation_signing_input_matches_the_cross_language_vector() {
+        use super::vector;
+        use kr_protocol::ids::ConfirmationId;
+        use kr_protocol::scalars::{Nonce256, TimestampMs};
+        use kr_protocol::voice::VoiceConfirmationRequest;
+
+        let request = VoiceConfirmationRequest {
+            confirmation_id: ConfirmationId::new(Uuid::from_bytes(vector::CONFIRMATION_ID)),
+            voice_session_id: VoiceSessionId::new(Uuid::from_bytes(vector::VOICE_SESSION_ID)),
+            action: VoiceAction::ApplyDiff,
+            action_digest: Digest256::from_bytes(vector::ACTION_DIGEST),
+            action_id: ActionId::new(Uuid::from_bytes(vector::ACTION_ID)),
+            host_device_id: DeviceId::new(Uuid::from_bytes(vector::HOST_DEVICE_ID)),
+            device_id: DeviceId::new(Uuid::from_bytes(vector::DEVICE_ID)),
+            nonce: Nonce256::from_bytes(vector::NONCE),
+            expires_at_ms: TimestampMs::new(vector::EXPIRES_AT_MS),
+        };
+
+        assert_eq!(request.action.as_str(), vector::ACTION);
+        let input = request.signing_input().expect("the challenge encodes");
+        assert_eq!(hex(&input), vector::SIGNING_INPUT_HEX);
+    }
+
+    /// The cross-language vector: the identifier of the key that signs it.
+    #[test]
+    fn signer_key_id_matches_the_cross_language_vector() {
+        use super::vector;
+        use kr_protocol::pairing::{KeyPurpose, key_id};
+
+        let derived = key_id(KeyPurpose::Authorisation, &vector::PUBLIC_KEY);
+        assert_eq!(hex(derived.as_bytes()), vector::SIGNER_KEY_ID_HEX);
+    }
 
     fn test_device_id(seed: u8) -> DeviceId {
         DeviceId::new(Uuid::from_bytes([seed; 16]))

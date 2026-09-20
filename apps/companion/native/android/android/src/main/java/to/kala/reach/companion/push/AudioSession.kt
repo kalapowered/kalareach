@@ -13,11 +13,21 @@ import android.os.Build
  * it is what decides whether a person's music is ducked or stopped. Asking from native code is
  * what makes that true.
  *
- * What uses the session is the voice surface, which is built elsewhere. This is the session, and
- * it is deliberately the smallest thing that can be correct.
+ * One session owns one focus request, so the instance that asked is the instance that gives it
+ * back. A second instance constructed to release the first one's focus releases nothing.
+ *
+ * The listener is how a caller learns that the system took focus away: a call that loses focus to
+ * an alarm or another application must show that state rather than keep claiming it is being
+ * heard.
  */
-class AudioSession(private val context: Context) {
+class AudioSession(
+    private val context: Context,
+    private val onFocusChange: ((Int) -> Unit)? = null,
+) {
     private var request: AudioFocusRequest? = null
+    private val listener = AudioManager.OnAudioFocusChangeListener { change ->
+        onFocusChange?.invoke(change)
+    }
 
     /** Asks for focus for speech. Returns true when the system granted it. */
     fun activate(): Boolean {
@@ -25,7 +35,7 @@ class AudioSession(private val context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             @Suppress("DEPRECATION")
             return manager.requestAudioFocus(
-                null,
+                listener,
                 AudioManager.STREAM_VOICE_CALL,
                 AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
             ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
@@ -40,16 +50,22 @@ class AudioSession(private val context: Context) {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
+                .setOnAudioFocusChangeListener(listener)
                 .build()
         request = made
         return manager.requestAudioFocus(made) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
     }
 
-    /** Gives focus back. */
+    /** Gives focus back. Only this instance's own request, and only once. */
     fun deactivate() {
         val manager = context.getSystemService(AudioManager::class.java) ?: return
-        val made = request ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) manager.abandonAudioFocusRequest(made)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val made = request ?: return
+            manager.abandonAudioFocusRequest(made)
+        } else {
+            @Suppress("DEPRECATION")
+            manager.abandonAudioFocus(listener)
+        }
         request = null
     }
 }

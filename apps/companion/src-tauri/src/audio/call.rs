@@ -16,6 +16,15 @@ use crate::audio::buffer::PcmRingBuffer;
 use crate::audio::device::AudioDevice;
 use crate::error::{CommandError, Result};
 
+/// How many provider events are held before the oldest is dropped.
+pub const MAX_PENDING_PROVIDER_EVENTS: usize = 256;
+
+/// The largest single provider event this end will hold, in bytes.
+///
+/// The control socket's own frame bound. An event larger than a frame is not one this client can
+/// act on, and holding it would only be storing what the far end sent.
+pub const MAX_PROVIDER_EVENT_BYTES: usize = 4096;
+
 /// A running desktop voice call.
 pub struct DesktopVoiceCall {
     /// Whether the person has muted their own microphone locally.
@@ -223,8 +232,17 @@ impl DesktopVoiceCall {
     }
 
     /// Records incoming provider data channel bytes (read-only data channel).
+    ///
+    /// Bounded, and the oldest is dropped first. What arrives here is written by the provider, so
+    /// an unbounded queue would let the far end decide how much memory this process holds.
     pub fn receive_provider_event(&self, bytes: Vec<u8>) {
+        if bytes.len() > MAX_PROVIDER_EVENT_BYTES {
+            return;
+        }
         if let Ok(mut events) = self.provider_events.lock() {
+            while events.len() >= MAX_PENDING_PROVIDER_EVENTS {
+                events.remove(0);
+            }
             events.push(bytes);
         }
     }
@@ -314,6 +332,18 @@ mod tests {
         call.receive_provider_event(b"test_event".to_vec());
         let events = call.drain_provider_events();
         assert_eq!(events, vec![b"test_event".to_vec()]);
+
+        // What the far end sends does not decide how much this process holds.
+        for index in 0..(MAX_PENDING_PROVIDER_EVENTS + 50) {
+            call.receive_provider_event(format!("event_{index}").into_bytes());
+        }
+        call.receive_provider_event(vec![0u8; MAX_PROVIDER_EVENT_BYTES + 1]);
+        let held = call.drain_provider_events();
+        assert_eq!(held.len(), MAX_PENDING_PROVIDER_EVENTS);
+        assert!(
+            held.iter()
+                .all(|event| event.len() <= MAX_PROVIDER_EVENT_BYTES)
+        );
 
         // Stop call
         call.stop();

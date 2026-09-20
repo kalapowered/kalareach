@@ -172,4 +172,50 @@ class VoiceCeremonyTest {
     }
 
     private fun proofMatchesSigner(proof: VoiceConfirmationProof): VoiceConfirmationProof = proof
+
+    /**
+     * The cross-language vector: the exact bytes the host signs, for one fixed challenge.
+     *
+     * The same two constants are asserted by the desktop ceremony tests, against the shared
+     * protocol's own encoder, and by the iOS ceremony tests. A client that signs anything else
+     * produces proofs the host rejects, and no test of this client alone would notice.
+     */
+    @Test
+    fun signing_input_matches_the_cross_language_vector() {
+        val challenge = VoiceConfirmationChallenge(
+            confirmationId = ByteArray(16) { 0x11.toByte() },
+            voiceSessionId = ByteArray(16) { 0x22.toByte() },
+            action = "apply_diff",
+            actionDigest = ByteArray(32) { 0x33.toByte() },
+            actionId = ByteArray(16) { 0x44.toByte() },
+            hostDeviceId = ByteArray(16) { 0x55.toByte() },
+            clientDeviceId = ByteArray(16) { 0x66.toByte() },
+            nonce = ByteArray(32) { 0x77.toByte() },
+            expiresAtMillis = 1_700_000_000_000L
+        )
+
+        assertEquals(SIGNING_INPUT_VECTOR, hexadecimal(challenge.signingInput()))
+    }
+
+    /** The identifier the host derives for the key that signs a proof. */
+    @Test
+    fun signer_key_identifier_matches_the_cross_language_vector() {
+        val identifier = authorisationKeyId(ByteArray(32) { 0x88.toByte() })
+        assertEquals(SIGNER_KEY_ID_VECTOR, hexadecimal(identifier))
+    }
+
+    private fun hexadecimal(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02x".format(it) }
+
+    private companion object {
+        const val SIGNING_INPUT_VECTOR = "82726b722d766f6963652f636f6e6669726d2f31a9656e6f6e6365582077777777777777777777777777777777777777" +
+        "7777777777777777777777777766616374696f6e6a6170706c795f6469666669616374696f6e5f696450444444444444" +
+        "44444444444444444444696465766963655f696450666666666666666666666666666666666d616374696f6e5f646967" +
+        "657374582033333333333333333333333333333333333333333333333333333333333333336d657870697265735f6174" +
+        "5f6d731b0000018bcfe568006e686f73745f6465766963655f696450555555555555555555555555555555556f636f6e" +
+        "6669726d6174696f6e5f6964501111111111111111111111111111111170766f6963655f73657373696f6e5f69645022" +
+        "222222222222222222222222222222"
+
+        const val SIGNER_KEY_ID_VECTOR = "a1e1283a5a7d9396772f55cfbd0867b9836c583a4381dd3f70a7a78afd9dec7f"
+    }
 }

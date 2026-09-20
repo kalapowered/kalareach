@@ -15,6 +15,99 @@ import CryptoKit
 import Foundation
 import LocalAuthentication
 
+/// The deterministic encoding the host signs and verifies.
+///
+/// The host builds its signing input from canonical CBOR, so a client that concatenates fields in
+/// its own order produces a signature over different bytes and every proof it makes is rejected.
+/// This is that encoding, restricted to the four shapes a confirmation uses: an unsigned integer, a
+/// byte string, a text string and a map whose keys are ordered shortest first and then by their
+/// bytes.
+enum CanonicalCbor {
+    case unsigned(UInt64)
+    case bytes(Data)
+    case text(String)
+    indirect case array([CanonicalCbor])
+    indirect case map([(String, CanonicalCbor)])
+
+    /// The canonical bytes of this value.
+    func encoded() -> Data {
+        switch self {
+        case let .unsigned(value):
+            return Self.head(major: 0, argument: value)
+        case let .bytes(value):
+            return Self.head(major: 2, argument: UInt64(value.count)) + value
+        case let .text(value):
+            let utf8 = Data(value.utf8)
+            return Self.head(major: 3, argument: UInt64(utf8.count)) + utf8
+        case let .array(items):
+            return items.reduce(into: Self.head(major: 4, argument: UInt64(items.count))) {
+                $0 += $1.encoded()
+            }
+        case let .map(entries):
+            // Shortest key first, then by the key's own bytes. The host orders its maps this way,
+            // and a map in any other order is a different document.
+            let ordered = entries.sorted { left, right in
+                let a = Array(left.0.utf8)
+                let b = Array(right.0.utf8)
+                if a.count != b.count { return a.count < b.count }
+                return a.lexicographicallyPrecedes(b)
+            }
+            var out = Self.head(major: 5, argument: UInt64(ordered.count))
+            for (key, value) in ordered {
+                out += CanonicalCbor.text(key).encoded()
+                out += value.encoded()
+            }
+            return out
+        }
+    }
+
+    /// The major type and its argument, in the shortest form that holds the argument.
+    private static func head(major: UInt8, argument: UInt64) -> Data {
+        let prefix = major << 5
+        switch argument {
+        case ..<24:
+            return Data([prefix | UInt8(argument)])
+        case ..<0x100:
+            return Data([prefix | 24, UInt8(argument)])
+        case ..<0x1_0000:
+            return Data([prefix | 25]) + be(argument, bytes: 2)
+        case ..<0x1_0000_0000:
+            return Data([prefix | 26]) + be(argument, bytes: 4)
+        default:
+            return Data([prefix | 27]) + be(argument, bytes: 8)
+        }
+    }
+
+    private static func be(_ value: UInt64, bytes count: Int) -> Data {
+        var out = Data(capacity: count)
+        for shift in stride(from: (count - 1) * 8, through: 0, by: -8) {
+            out.append(UInt8((value >> UInt64(shift)) & 0xff))
+        }
+        return out
+    }
+}
+
+/// The domain the confirmation signature is bound to.
+let voiceConfirmDomain = "kr-voice/confirm/1"
+
+/// The domain a key identifier is derived under, and the purpose of the key that signs a proof.
+let keyIdDomain = "kr-key-id/1"
+let authorisationKeyPurpose = "authorisation"
+
+/// `SHA256(CBOR(["kr-key-id/1", purpose, key]))` over the raw 32-byte public key.
+///
+/// The host derives the identifier from the key a caller presents rather than believing a claimed
+/// one, so the same bytes under two purposes name two different keys. A digest of the key on its
+/// own would name neither.
+func authorisationKeyId(rawPublicKey: Data) -> Data {
+    let value = CanonicalCbor.array([
+        .text(keyIdDomain),
+        .text(authorisationKeyPurpose),
+        .bytes(rawPublicKey)
+    ])
+    return Data(SHA256.hash(data: value.encoded()))
+}
+
 /// A request from the host to confirm a sensitive voice action on an unlocked screen.
 public struct VoiceConfirmationChallenge: Equatable, Sendable {
     public let confirmationId: Data
@@ -49,20 +142,26 @@ public struct VoiceConfirmationChallenge: Equatable, Sendable {
         self.expiresAtMilliseconds = expiresAtMilliseconds
     }
 
-    /// The canonical signing input for this challenge under domain `kr-voice/confirm/1`.
+    /// The exact bytes the host signs and verifies: `CBOR(["kr-voice/confirm/1", request])`.
+    ///
+    /// The field names are the host's own, because the host's map is what is hashed. A cross
+    /// language vector in `VoiceCeremonyTests` holds these bytes to the ones the shared protocol
+    /// produces for the same challenge.
     public func signingInput() -> Data {
-        var data = Data("kr-voice/confirm/1".utf8)
-        data.append(confirmationId)
-        data.append(voiceSessionId)
-        data.append(Data(action.utf8))
-        data.append(actionDigest)
-        data.append(actionId)
-        data.append(hostDeviceId)
-        data.append(clientDeviceId)
-        data.append(nonce)
-        var expires = expiresAtMilliseconds.bigEndian
-        data.append(Data(bytes: &expires, count: MemoryLayout<UInt64>.size))
-        return data
+        CanonicalCbor.array([
+            .text(voiceConfirmDomain),
+            .map([
+                ("confirmation_id", .bytes(confirmationId)),
+                ("voice_session_id", .bytes(voiceSessionId)),
+                ("action", .text(action)),
+                ("action_digest", .bytes(actionDigest)),
+                ("action_id", .bytes(actionId)),
+                ("host_device_id", .bytes(hostDeviceId)),
+                ("device_id", .bytes(clientDeviceId)),
+                ("nonce", .bytes(nonce)),
+                ("expires_at_ms", .unsigned(expiresAtMilliseconds))
+            ])
+        ]).encoded()
     }
 }
 
@@ -154,11 +253,10 @@ public struct VoiceCeremony: Sendable {
             throw VoiceCeremonyRefusal.signingFailed
         }
 
-        let signerKeyId = SHA256.hash(data: signingKey.publicKey.rawRepresentation)
         return VoiceConfirmationProof(
             challenge: challenge,
             signature: Data(signature),
-            signerKeyId: Data(signerKeyId)
+            signerKeyId: authorisationKeyId(rawPublicKey: signingKey.publicKey.rawRepresentation)
         )
     }
 
@@ -183,7 +281,7 @@ public struct VoiceCeremony: Sendable {
             return .failure(.confirmationMismatch)
         }
 
-        let expectedKeyId = Data(SHA256.hash(data: expectedSignerPublicKey.rawRepresentation))
+        let expectedKeyId = authorisationKeyId(rawPublicKey: expectedSignerPublicKey.rawRepresentation)
         if proof.signerKeyId != expectedKeyId {
             return .failure(.confirmationMismatch)
         }

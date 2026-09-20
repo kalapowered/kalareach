@@ -194,4 +194,46 @@ final class VoiceCeremonyTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
     }
+
+    // MARK: - The cross-language vector
+
+    /// The exact bytes the host signs, for one fixed challenge.
+    ///
+    /// The same two constants are asserted by the desktop ceremony tests, against the shared
+    /// protocol's own encoder, and by the Android ceremony tests. A client that signs anything else
+    /// produces proofs the host rejects, and no test of this client alone would notice.
+    func testSigningInputMatchesTheCrossLanguageVector() {
+        let challenge = VoiceConfirmationChallenge(
+            confirmationId: Data(repeating: 0x11, count: 16),
+            voiceSessionId: Data(repeating: 0x22, count: 16),
+            action: "apply_diff",
+            actionDigest: Data(repeating: 0x33, count: 32),
+            actionId: Data(repeating: 0x44, count: 16),
+            hostDeviceId: Data(repeating: 0x55, count: 16),
+            clientDeviceId: Data(repeating: 0x66, count: 16),
+            nonce: Data(repeating: 0x77, count: 32),
+            expiresAtMilliseconds: 1_700_000_000_000
+        )
+
+        XCTAssertEqual(hexadecimal(challenge.signingInput()), Self.signingInputVector)
+    }
+
+    /// The identifier the host derives for the key that signs a proof.
+    func testSignerKeyIdentifierMatchesTheCrossLanguageVector() {
+        let identifier = authorisationKeyId(rawPublicKey: Data(repeating: 0x88, count: 32))
+        XCTAssertEqual(hexadecimal(identifier), Self.signerKeyIdVector)
+    }
+
+    private func hexadecimal(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static let signingInputVector = "82726b722d766f6963652f636f6e6669726d2f31a9656e6f6e6365582077777777777777777777777777777777777777"
+        + "7777777777777777777777777766616374696f6e6a6170706c795f6469666669616374696f6e5f696450444444444444"
+        + "44444444444444444444696465766963655f696450666666666666666666666666666666666d616374696f6e5f646967"
+        + "657374582033333333333333333333333333333333333333333333333333333333333333336d657870697265735f6174"
+        + "5f6d731b0000018bcfe568006e686f73745f6465766963655f696450555555555555555555555555555555556f636f6e"
+        + "6669726d6174696f6e5f6964501111111111111111111111111111111170766f6963655f73657373696f6e5f69645022"
+        + "222222222222222222222222222222"
+    private static let signerKeyIdVector = "a1e1283a5a7d9396772f55cfbd0867b9836c583a4381dd3f70a7a78afd9dec7f"
 }

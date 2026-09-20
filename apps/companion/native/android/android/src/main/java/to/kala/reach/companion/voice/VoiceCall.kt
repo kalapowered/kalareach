@@ -57,6 +57,18 @@ class VoiceCall private constructor(
     private var announcedFirstAudio = false
     private var routeCallback: AudioDeviceCallback? = null
 
+    /**
+     * The one focus request this call holds.
+     *
+     * The instance that asked for focus is the instance that gives it back, and it carries the
+     * listener that turns a focus loss into a state the screen and the notification show.
+     */
+    private val audioSession = AudioSession(context) { change -> onFocusChange(change) }
+
+    /** Whether this call has already been stopped. Stopping twice must do nothing the second time. */
+    @Volatile
+    private var stopped = false
+
     /** Whether the person has muted their own microphone. */
     var isMutedByPerson: Boolean = false
         private set
@@ -66,6 +78,9 @@ class VoiceCall private constructor(
         private set
 
     companion object {
+        /** How long a description may take to be created or applied before the call is closed. */
+        private const val DESCRIPTION_TIMEOUT_SECONDS = 30L
+
         /**
          * Opens the microphone and builds a call.
          *
@@ -94,7 +109,7 @@ class VoiceCall private constructor(
     }
 
     private fun open() {
-        if (!AudioSession(context).activate()) {
+        if (!audioSession.activate()) {
             observer.onCaptureState(VoiceCaptureState.UNAVAILABLE)
             throw IllegalStateException("this device would not give up audio focus for a call")
         }
@@ -119,6 +134,10 @@ class VoiceCall private constructor(
         }
         observer.onCaptureState(VoiceCaptureState.CAPTURING)
         watchRoute()
+        // The notification's mute and stop act on this call, and they are pressed while no
+        // interface is running. Publishing the call is what connects them to the media; without it
+        // they change a notification and nothing else.
+        VoiceCallHolder.current = this
     }
 
     /**
@@ -171,15 +190,18 @@ class VoiceCall private constructor(
 
     /** Ends the call and gives the microphone back. Local and immediate, as mute is. */
     fun stop() {
+        if (stopped) return
+        stopped = true
+        // Cleared before the service is told, so the service's own stop cannot re-enter this call.
+        VoiceCallHolder.current = null
         microphone?.setEnabled(false)
         routeCallback?.let {
             context.getSystemService(AudioManager::class.java)?.unregisterAudioDeviceCallback(it)
         }
         routeCallback = null
         connection.close()
-        AudioSession(context).deactivate()
+        audioSession.deactivate()
         VoiceCallService.stop(context)
-        VoiceCallHolder.current = null
         observer.onCaptureState(VoiceCaptureState.IDLE)
     }
 
@@ -273,10 +295,20 @@ class VoiceCall private constructor(
                 latch.countDown()
             }
         })
-        latch.await(30, TimeUnit.SECONDS)
+        if (!latch.await(DESCRIPTION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            stop()
+            throw IllegalStateException("this device did not finish making an offer in time")
+        }
         return made ?: throw IllegalStateException(failure ?: "this device could not make an offer")
     }
 
+    /**
+     * Waits for one description to be applied.
+     *
+     * A timeout is a failure, not a success. Returning normally when no callback arrived would
+     * leave a half-negotiated connection that the caller believes is ready, so the call is closed
+     * and the caller is told.
+     */
     private fun awaitSet(ask: (SdpObserver) -> Unit) {
         val latch = CountDownLatch(1)
         var failure: String? = null
@@ -288,8 +320,14 @@ class VoiceCall private constructor(
                 latch.countDown()
             }
         })
-        latch.await(30, TimeUnit.SECONDS)
-        failure?.let { throw IllegalStateException(it) }
+        if (!latch.await(DESCRIPTION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            stop()
+            throw IllegalStateException("this device did not apply a session description in time")
+        }
+        failure?.let {
+            stop()
+            throw IllegalStateException(it)
+        }
     }
 
     private abstract class SimpleSdpObserver : SdpObserver {

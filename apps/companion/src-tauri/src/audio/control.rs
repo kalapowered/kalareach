@@ -26,6 +26,12 @@ use crate::error::{CommandError, Result};
 /// The default heartbeat interval in seconds.
 pub const HEARTBEAT_INTERVAL_SECONDS: u64 = 20;
 
+/// How many delegation identifiers one call keeps.
+///
+/// The provider writes these and a call is metered in minutes, so the set a call can have heard is
+/// small. A bound means a stream of announcements cannot grow this process without limit.
+pub const MAX_KNOWN_DELEGATIONS: usize = 256;
+
 /// The heartbeat frame sent every 20 seconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceHeartbeatFrame {
@@ -44,19 +50,34 @@ impl Default for VoiceHeartbeatFrame {
 
 /// Validates and constructs an outbound context frame.
 ///
+/// `known_delegations` is what this call has actually been told about. A frame that names a
+/// delegation this call never saw is refused here rather than sent: a delegation identifier is
+/// correlation data the provider wrote, and answering one that was never announced would let a
+/// name invented anywhere reach the service as though the call had heard it.
+///
 /// # Errors
 ///
 /// Returns an error if the frame exceeds 4096 bytes, if the append content exceeds 500 UTF-8 bytes,
-/// if the command does not match content expectations, or if the identifier is invalid.
+/// if the command does not match content expectations, if the identifier is invalid, or if the
+/// frame names a delegation this call has not seen.
 pub fn validate_context_frame(
     id: &str,
     command: VoiceCommand,
     delegation_id: Option<String>,
     content: Option<String>,
+    known_delegations: &[String],
 ) -> Result<VoiceContextFrame> {
     if id.trim().is_empty() || id.len() > 128 {
         return Err(CommandError::invalid(
             "context request requires a valid identifier",
+        ));
+    }
+
+    if let Some(ref named) = delegation_id
+        && !known_delegations.iter().any(|known| known == named)
+    {
+        return Err(CommandError::invalid(
+            "that delegation was never announced on this call",
         ));
     }
 
@@ -123,6 +144,7 @@ impl ControlSocketHandler {
             } => {
                 self.call_id = Some(call_id.clone());
                 self.known_delegations = delegations.clone();
+                self.known_delegations.truncate(MAX_KNOWN_DELEGATIONS);
             }
             VoiceControlEvent::HeartbeatAcknowledged { remaining_seconds } => {
                 self.remaining_seconds = Some(*remaining_seconds);
@@ -139,6 +161,9 @@ impl ControlSocketHandler {
             }
             VoiceControlEvent::Delegation { delegation_id, .. } => {
                 if !self.known_delegations.contains(delegation_id) {
+                    if self.known_delegations.len() >= MAX_KNOWN_DELEGATIONS {
+                        self.known_delegations.remove(0);
+                    }
                     self.known_delegations.push(delegation_id.clone());
                 }
             }
@@ -174,23 +199,72 @@ mod tests {
             VoiceCommand::Thinking,
             None,
             Some("context data".to_owned()),
+            &[],
         );
         assert!(valid.is_ok());
 
         // Oversized content (> 500 bytes) is refused.
         let overlong = "x".repeat(VOICE_CONTEXT_BYTES + 1);
-        let invalid = validate_context_frame("req_2", VoiceCommand::Thinking, None, Some(overlong));
+        let invalid =
+            validate_context_frame("req_2", VoiceCommand::Thinking, None, Some(overlong), &[]);
         assert!(invalid.is_err());
 
         // Mute carrying text is refused (only Instructions, Thinking, Commentary carry text).
-        let mute_with_text =
-            validate_context_frame("req_3", VoiceCommand::Mute, None, Some("text".to_owned()));
+        let mute_with_text = validate_context_frame(
+            "req_3",
+            VoiceCommand::Mute,
+            None,
+            Some("text".to_owned()),
+            &[],
+        );
         assert!(mute_with_text.is_err());
 
         // Instructions without text is refused.
         let empty_instructions =
-            validate_context_frame("req_4", VoiceCommand::Instructions, None, None);
+            validate_context_frame("req_4", VoiceCommand::Instructions, None, None, &[]);
         assert!(empty_instructions.is_err());
+    }
+
+    #[test]
+    fn a_delegation_the_call_never_heard_is_refused() {
+        // KR-REQ-15.17 and section 15 paragraph 7: a delegation identifier is correlation data the
+        // provider announced. One this call never saw cannot be answered.
+        let invented = validate_context_frame(
+            "req_5",
+            VoiceCommand::Commentary,
+            Some("del_invented".to_owned()),
+            Some("done".to_owned()),
+            &["del_1".to_owned()],
+        );
+        assert!(
+            invented.is_err(),
+            "an unannounced delegation must be refused"
+        );
+
+        let announced = validate_context_frame(
+            "req_6",
+            VoiceCommand::Commentary,
+            Some("del_1".to_owned()),
+            Some("done".to_owned()),
+            &["del_1".to_owned()],
+        );
+        assert!(
+            announced.is_ok(),
+            "the delegation this call heard is allowed"
+        );
+    }
+
+    #[test]
+    fn the_handler_bounds_what_one_call_remembers() {
+        let mut handler = ControlSocketHandler::new();
+        for index in 0..(MAX_KNOWN_DELEGATIONS + 20) {
+            handler.handle_event(&json!({
+                "type": "delegation",
+                "delegationId": format!("del_{index}"),
+                "at": 0
+            }));
+        }
+        assert!(handler.known_delegations.len() <= MAX_KNOWN_DELEGATIONS);
     }
 
     #[test]
