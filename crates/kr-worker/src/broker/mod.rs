@@ -95,7 +95,9 @@ pub use crate::broker::gateway::{
     Connection, ConnectionOrigin, Forwarded, Gateway, PreparedResponse, ReverseRequest,
     RichInvocation,
 };
-pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
+pub use crate::broker::ledger::{
+    BindingRecord, ClientIntent, ClientRequestOutcome, Ledger, UnresolvedRecord,
+};
 pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
@@ -319,6 +321,29 @@ pub struct NativeAnswer {
     pub resource_id: PendingResourceId,
     /// The bytes to forward, exactly as the native client wrote them.
     pub frame: Vec<u8>,
+}
+
+/// One request of the native client's, admitted to be forwarded to its own upstream.
+///
+/// It exists only as the return value of [`Broker::admit_client_request`], which classifies the
+/// method, retains the bytes as a source event, records the intent and suspends this instance's
+/// rich mutations for a method the table does not classify — all before anything is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientRequest {
+    /// This host's own record of the request.
+    intent_id: Uuid,
+    /// The instance it is going to.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The binding revision in force when it was admitted.
+    pub binding_revision: AgentBindingRevision,
+    /// The method the client named.
+    pub method: UpstreamMethod,
+    /// How the connection's own pinned table classified it.
+    pub classification: kr_protocol::gateway::NativeClassification,
+    /// The source event the client's own bytes were retained as.
+    pub source: SourceEventHandle,
+    /// True when admitting it suspended this instance's rich mutations.
+    pub suspends_rich_mutations: bool,
 }
 
 /// One draft as it stood when an invocation was admitted against it.
@@ -1107,6 +1132,119 @@ impl Broker {
             instance.retain(source_frame);
         }
         Ok((forwarded, Some(resource)))
+    }
+
+    /// Admits one request or notification the native client is making of its own upstream.
+    ///
+    /// The native client and the upstream are two ends of one connection, and a frame the client
+    /// writes changes upstream state exactly as a frame the upstream writes does. So it goes
+    /// through the same admission rather than straight onto the socket: the method is classified
+    /// with the table this host pinned, the bytes are retained as a source event of the instance,
+    /// the intent is recorded before anything is written, and a method the table does not classify
+    /// suspends this instance's rich mutations *first*. Section 11 forbids an unclassified request
+    /// acting while rich mutations stay enabled, and the order here is what makes that true rather
+    /// than likely.
+    ///
+    /// The caller writes the frame and then reports what happened through
+    /// [`Broker::client_request_settled`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when the connection is not a worker-launched
+    /// native one, [`BrokerError::UnknownSubject`] when the connection or its instance is not one
+    /// this broker holds, [`BrokerError::InvalidArgument`] when the frame names no method, and
+    /// [`BrokerError::LedgerUnavailable`] when the intent cannot be recorded.
+    pub fn admit_client_request(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+        upstream_request_id: Option<&UpstreamRequestId>,
+        now: TimestampMs,
+    ) -> Result<ClientRequest> {
+        let mut state = self.state();
+        let (method, classification) = state.gateway.classify_native(connection, frame)?;
+        let application_instance_id = state
+            .gateway
+            .connection(connection)
+            .map(|held| held.application_instance_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
+        let instance = state
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let binding_revision = instance.binding_revision;
+        let source_generation = instance.source_generation;
+        let source = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
+            .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
+        let source_frame = SourceFrame::new(source.clone(), source_generation, frame, now)?;
+        let intent = crate::broker::ledger::ClientIntent {
+            intent_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
+            application_instance_id,
+            connection,
+            upstream_request_id: upstream_request_id.cloned(),
+            method: method.clone(),
+            classification,
+            source: source.clone(),
+            outcome: crate::broker::ledger::ClientRequestOutcome::Recorded,
+            recorded_at: now,
+        };
+        // Recorded before the bytes, exactly as an upstream request is. A crash between the two
+        // leaves a row saying this host was about to forward something it could not classify,
+        // which is the honest record; a row written afterwards would say nothing about the frame
+        // that went out during the crash.
+        if state.volatile.writes_are_durable() {
+            state.ledger.record_client_intent(&intent)?;
+        }
+        // The native path keeps working while the journal is faulted, and the gap records that it
+        // did.
+        state.volatile.note_native_request();
+        let suspends_rich_mutations = classification.suspends_rich_mutations();
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            if suspends_rich_mutations {
+                instance.rich_suspension = Some(format!(
+                    "{method} is not classified by this connector's table, so what the terminal \
+                     asked for is unknown"
+                ));
+            }
+            instance.retain(source_frame);
+        }
+        Ok(ClientRequest {
+            intent_id: intent.intent_id,
+            application_instance_id,
+            binding_revision,
+            method,
+            classification,
+            source,
+            suspends_rich_mutations,
+        })
+    }
+
+    /// Returns every request of the native client's this host recorded, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the records cannot be read.
+    pub fn client_requests(&self) -> Result<Vec<crate::broker::ledger::ClientIntent>> {
+        self.state().ledger.client_intents()
+    }
+
+    /// Records what became of one admitted client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the record cannot be written.
+    pub fn client_request_settled(
+        &self,
+        request: &ClientRequest,
+        outcome: crate::broker::ledger::ClientRequestOutcome,
+    ) -> Result<()> {
+        let state = self.state();
+        if !state.volatile.writes_are_durable() {
+            return Ok(());
+        }
+        state
+            .ledger
+            .settle_client_intent(request.intent_id, outcome)
     }
 
     /// Admits the native client's own answer to be forwarded, exclusively.

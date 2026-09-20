@@ -309,22 +309,22 @@ impl Gateway {
             .filter(move |connection| connection.application_instance_id == application_instance_id)
     }
 
-    /// Reads one native frame with the connection's own declarative table.
+    /// Reads the method one native frame names and classifies it with the connection's own table.
     ///
-    /// No component is called. The table says how the protocol frames and which members carry the
-    /// identifier and the method, and this reads them, so a component that is faulted, disabled or
-    /// simply slow changes nothing about what happens here.
+    /// It is the one classification, used in both directions. A request the upstream sends and a
+    /// request the native client sends are read with the same pinned table and given the same
+    /// class, so a method this host cannot classify is unclassified whichever end wrote it.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] when the connection is not a worker-launched
-    /// native one, and [`BrokerError::InvalidArgument`] when the frame is too large or is not a
-    /// frame the table describes.
-    pub fn forward_native(
+    /// native one, and [`BrokerError::InvalidArgument`] when the frame is too large or names no
+    /// method.
+    pub fn classify_native(
         &self,
         connection: GatewayConnectionId,
         frame: &[u8],
-    ) -> Result<Forwarded> {
+    ) -> Result<(UpstreamMethod, NativeClassification)> {
         let held = self
             .connections
             .get(&connection)
@@ -348,6 +348,31 @@ impl Gateway {
         let method = UpstreamMethod::new(method)
             .map_err(|error| BrokerError::invalid(format!("upstream method: {error}")))?;
         let classification = held.table.classify(&method);
+        Ok((method, classification))
+    }
+
+    /// Reads one native frame with the connection's own declarative table.
+    ///
+    /// No component is called. The table says how the protocol frames and which members carry the
+    /// identifier and the method, and this reads them, so a component that is faulted, disabled or
+    /// simply slow changes nothing about what happens here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when the connection is not a worker-launched
+    /// native one, and [`BrokerError::InvalidArgument`] when the frame is too large or is not a
+    /// frame the table describes.
+    pub fn forward_native(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+    ) -> Result<Forwarded> {
+        let (method, classification) = self.classify_native(connection, frame)?;
+        let held = self
+            .connections
+            .get(&connection)
+            .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
+        let body = read_frame(frame)?;
         let request = match read_identifier(&body, &held.table.request_id_field) {
             Some(upstream) => Some(DownstreamRequestId::new(connection, upstream?)),
             None => None,

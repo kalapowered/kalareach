@@ -47,6 +47,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::broker::Broker;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
+use crate::broker::ledger::ClientRequestOutcome;
 use crate::broker::methods::{
     PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
 };
@@ -794,9 +795,18 @@ pub enum Carried {
     ClientRequest {
         /// The identifier this host sent it under.
         upstream_request_id: UpstreamRequestId,
+        /// How the connection's own table classified the method it named.
+        classification: kr_protocol::gateway::NativeClassification,
+        /// True when admitting it suspended this instance's rich mutations.
+        suspended_rich_mutations: bool,
     },
     /// A notification the client sent, forwarded as it is.
-    ClientNotification,
+    ClientNotification {
+        /// How the connection's own table classified the method it named.
+        classification: kr_protocol::gateway::NativeClassification,
+        /// True when admitting it suspended this instance's rich mutations.
+        suspended_rich_mutations: bool,
+    },
     /// A reply the upstream sent to a request the client made, returned to the client.
     ClientReply {
         /// The identifier this host had sent it under.
@@ -1021,7 +1031,7 @@ impl Duplex {
         // client answering the upstream. Reading every client frame as an answer would leave the
         // native terminal's own requests and notifications with nowhere to go.
         if let Some(named) = self.client_request(frame)? {
-            return self.forward_to_upstream(named).await;
+            return self.forward_to_upstream(named, now).await;
         }
         // The admission is held by a guard for the whole of the wait. This runs inside a reader
         // that a connection ending cancels, and an admitted answer whose caller went away is one
@@ -1051,7 +1061,7 @@ impl Duplex {
     }
 
     /// Reads one frame the client sent, when it is a request or a notification of its own.
-    fn client_request(&self, frame: &[u8]) -> Result<Option<ClientRequest>> {
+    fn client_request(&self, frame: &[u8]) -> Result<Option<ClientFrame>> {
         let held = self.broker.connection(self.connection).ok_or_else(|| {
             BrokerError::unknown(format!("no gateway connection {}", self.connection))
         })?;
@@ -1079,37 +1089,67 @@ impl Duplex {
                  sends, and a client request cannot be one of those"
             )));
         }
-        Ok(Some(ClientRequest {
+        Ok(Some(ClientFrame {
             body,
             identifier,
             request_id_field: held.table.request_id_field.clone(),
+            frame: frame.to_vec(),
         }))
     }
 
     /// Carries one request or notification of the client's to the upstream.
     ///
-    /// A notification is written as it is: there is nothing to correlate. A request is rewritten
-    /// under an identifier of this host's own and the client's identifier is kept, so that the
-    /// upstream's answer comes back to the client under the identifier the client used.
-    async fn forward_to_upstream(&self, named: ClientRequest) -> Result<Carried> {
-        let ClientRequest {
+    /// The frame is admitted before it is queued. The client is the person's own terminal and the
+    /// upstream is the agent, and a frame the terminal writes changes upstream state exactly as a
+    /// frame the agent writes does; so it is classified with the table this host pinned, its bytes
+    /// are retained, its intent is recorded, and a method the table does not classify suspends
+    /// this instance's rich mutations before anything is written.
+    ///
+    /// A notification is then written as it is: there is nothing to correlate. A request is
+    /// rewritten under an identifier of this host's own and the client's identifier is kept, so
+    /// the upstream's answer comes back to the client under the identifier the client used.
+    async fn forward_to_upstream(&self, named: ClientFrame, now: TimestampMs) -> Result<Carried> {
+        let ClientFrame {
             mut body,
             identifier,
             request_id_field,
-            ..
+            frame,
         } = named;
         let Some(client_identifier) = identifier else {
-            let queued = self
-                .upstream
-                .queue(&serde_json::to_vec(&body).map_err(|error| {
-                    BrokerError::invalid(format!("this notification will not encode: {error}"))
-                })?)?;
-            if let Some(refusal) = queued.delivered().await.refusal() {
+            let admitted = self
+                .broker
+                .admit_client_request(self.connection, &frame, None, now)?;
+            let encoded = serde_json::to_vec(&body).map_err(|error| {
+                BrokerError::invalid(format!("this notification will not encode: {error}"))
+            })?;
+            let queued = match self.upstream.queue(&encoded) {
+                Ok(queued) => queued,
+                Err(error) => {
+                    let _ = self
+                        .broker
+                        .client_request_settled(&admitted, ClientRequestOutcome::Unsent);
+                    return Err(error);
+                }
+            };
+            let delivered = queued.delivered().await;
+            let _ = self
+                .broker
+                .client_request_settled(&admitted, outcome_of(delivered));
+            if let Some(refusal) = delivered.refusal() {
                 return Err(refusal);
             }
-            return Ok(Carried::ClientNotification);
+            return Ok(Carried::ClientNotification {
+                classification: admitted.classification,
+                suspended_rich_mutations: admitted.suspends_rich_mutations,
+            });
         };
         let upstream_request_id = self.outstanding.allocate()?;
+        let admitted = self.broker.admit_client_request(
+            self.connection,
+            &frame,
+            Some(&upstream_request_id),
+            now,
+        )?;
         let minted: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
             .map_err(|error| {
                 BrokerError::invalid(format!("this identifier will not encode: {error}"))
@@ -1128,15 +1168,24 @@ impl Duplex {
             Ok(queued) => queued,
             Err(error) => {
                 self.outstanding.client_identifier(&upstream_request_id);
+                let _ = self
+                    .broker
+                    .client_request_settled(&admitted, ClientRequestOutcome::Unsent);
                 return Err(error);
             }
         };
-        if let Some(refusal) = queued.delivered().await.refusal() {
+        let delivered = queued.delivered().await;
+        let _ = self
+            .broker
+            .client_request_settled(&admitted, outcome_of(delivered));
+        if let Some(refusal) = delivered.refusal() {
             self.outstanding.client_identifier(&upstream_request_id);
             return Err(refusal);
         }
         Ok(Carried::ClientRequest {
             upstream_request_id,
+            classification: admitted.classification,
+            suspended_rich_mutations: admitted.suspends_rich_mutations,
         })
     }
 
@@ -1278,10 +1327,21 @@ impl Duplex {
 
 /// One frame the native client sent that is a request or a notification of its own.
 #[derive(Debug)]
-struct ClientRequest {
+struct ClientFrame {
     body: serde_json::Value,
     identifier: Option<serde_json::Value>,
     request_id_field: String,
+    /// The bytes as the client wrote them, which is what the admission classifies and retains.
+    frame: Vec<u8>,
+}
+
+/// Turns what reached the socket into what the client's intent is recorded as.
+const fn outcome_of(delivery: Delivery) -> ClientRequestOutcome {
+    match delivery {
+        Delivery::Transmitted => ClientRequestOutcome::Transmitted,
+        Delivery::Partial => ClientRequestOutcome::Uncertain,
+        Delivery::Unsent => ClientRequestOutcome::Unsent,
+    }
 }
 
 /// One admitted native answer, held until something says what happened to it.

@@ -24,11 +24,15 @@
 //! * **Evidence gaps** record each spell of volatile operation, so the gap is committed when
 //!   storage returns rather than quietly forgotten.
 //! * **Adapter checkpoints** are the consumed semantic cursor a restart replays from.
+//! * **Client intents** are the requests the native terminal made of its own upstream, recorded
+//!   with their classification before their bytes go. A restart that found one of them unsettled
+//!   knows an operation it did not classify may already have changed upstream state.
 
 use kr_protocol::broker::{BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile};
-use kr_protocol::gateway::{EvidenceGap, PendingResource, PendingState};
+use kr_protocol::gateway::{EvidenceGap, NativeClassification, PendingResource, PendingState};
 use kr_protocol::ids::{
-    ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceEventHandle, StreamCursor,
+    ApplicationInstanceId, BrokerBindingId, GatewayConnectionId, PendingResourceId,
+    SourceEventHandle, StreamCursor, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::session::Durability;
@@ -37,7 +41,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::broker::error::{BrokerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How long the ledger waits for another connection to finish writing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -72,6 +76,81 @@ pub struct UnresolvedRecord {
     pub dispatched: bool,
     /// The binding whose decoder produced it, where one did.
     pub decoder: Option<BrokerBindingId>,
+}
+
+/// What became of one request the native client made of its upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientRequestOutcome {
+    /// It is recorded and its bytes have not been written yet.
+    Recorded,
+    /// Every byte of it reached the upstream.
+    Transmitted,
+    /// Part of it reached the upstream, so whether the upstream read it cannot be established.
+    Uncertain,
+    /// None of it reached the upstream.
+    Unsent,
+}
+
+impl ClientRequestOutcome {
+    /// Returns the stable stored string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Transmitted => "transmitted",
+            Self::Uncertain => "uncertain",
+            Self::Unsent => "unsent",
+        }
+    }
+}
+
+/// One request or notification the native client sent its own upstream.
+///
+/// It is recorded before its bytes go, with the classification the connection's own table gave it.
+/// That is what makes an unclassified request something a restart can see: the row says a method
+/// this host could not classify was forwarded, and whether it went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientIntent {
+    /// This host's own record of the request.
+    pub intent_id: Uuid,
+    /// The instance it was forwarded to.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The connection it arrived on.
+    pub connection: GatewayConnectionId,
+    /// The identifier this host forwarded it under; absent for a notification.
+    pub upstream_request_id: Option<UpstreamRequestId>,
+    /// The method the client named.
+    pub method: UpstreamMethod,
+    /// How the connection's own pinned table classified it.
+    pub classification: NativeClassification,
+    /// The retained source frame the bytes were kept as.
+    pub source: SourceEventHandle,
+    /// What became of it.
+    pub outcome: ClientRequestOutcome,
+    /// When it was recorded.
+    pub recorded_at: TimestampMs,
+}
+
+/// Reads one stored classification back.
+fn class_from(text: &str) -> Result<kr_protocol::gateway::NativeMethodClass> {
+    kr_protocol::gateway::NativeMethodClass::ALL
+        .iter()
+        .copied()
+        .find(|class| class.as_str() == text)
+        .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored classification")))
+}
+
+/// Reads one stored client-request outcome back.
+fn outcome_from(text: &str) -> Result<ClientRequestOutcome> {
+    [
+        ClientRequestOutcome::Recorded,
+        ClientRequestOutcome::Transmitted,
+        ClientRequestOutcome::Uncertain,
+        ClientRequestOutcome::Unsent,
+    ]
+    .into_iter()
+    .find(|outcome| outcome.as_str() == text)
+    .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored outcome")))
 }
 
 /// The broker's durable records, in the worker's own journal file.
@@ -167,7 +246,21 @@ impl Ledger {
                      application_instance_id BLOB PRIMARY KEY,
                      consumed_cursor         INTEGER NOT NULL,
                      updated_at_ms           INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS broker_client_requests (
+                     intent_id               BLOB PRIMARY KEY,
+                     application_instance_id BLOB NOT NULL,
+                     connection_id           INTEGER NOT NULL,
+                     upstream_request_id     TEXT,
+                     method                  TEXT NOT NULL,
+                     class                   TEXT NOT NULL,
+                     declared                INTEGER NOT NULL,
+                     source_handle           TEXT NOT NULL,
+                     outcome                 TEXT NOT NULL,
+                     recorded_at_ms          INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS broker_client_requests_by_instance
+                     ON broker_client_requests (application_instance_id);",
             )
             .map_err(BrokerError::ledger)?;
         let recorded: Option<i64> = self
@@ -185,6 +278,19 @@ impl Ledger {
                     .map_err(BrokerError::ledger)?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
+            // Every version this build has added is a table that was not there before, and the
+            // statements above have just created it. So an older ledger is brought forward by
+            // recording the version it now has: the tables it gained are empty, which is exactly
+            // what a ledger written before they existed knows about them. This one-way step goes
+            // when the retained-ledger policy replaces it.
+            Some(version) if version < SCHEMA_VERSION => {
+                self.connection
+                    .execute(
+                        "UPDATE broker_schema SET version = ?1",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(BrokerError::ledger)?;
+            }
             Some(version) => {
                 return Err(BrokerError::ledger(format!(
                     "this ledger is at schema version {version}; this build reads {SCHEMA_VERSION}"
@@ -748,6 +854,143 @@ impl Ledger {
                     },
                 })
             })
+            .collect()
+    }
+
+    // -- the native client's own requests -----------------------------------------------------
+
+    /// Records one request of the native client's before its bytes go.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn record_client_intent(&self, intent: &ClientIntent) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO broker_client_requests
+                     (intent_id, application_instance_id, connection_id, upstream_request_id,
+                      method, class, declared, source_handle, outcome, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    intent.intent_id.as_bytes().as_slice(),
+                    intent.application_instance_id.get().as_bytes().as_slice(),
+                    i64::try_from(intent.connection.get()).unwrap_or(i64::MAX),
+                    intent
+                        .upstream_request_id
+                        .as_ref()
+                        .map(|id| id.as_str().to_owned()),
+                    intent.method.as_str(),
+                    intent.classification.class.as_str(),
+                    i64::from(intent.classification.declared),
+                    intent.source.as_str(),
+                    intent.outcome.as_str(),
+                    i64::try_from(intent.recorded_at.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Records what became of one recorded client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails or the intent is not one
+    /// this ledger holds.
+    pub fn settle_client_intent(
+        &self,
+        intent_id: Uuid,
+        outcome: ClientRequestOutcome,
+    ) -> Result<()> {
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE broker_client_requests SET outcome = ?2 WHERE intent_id = ?1",
+                params![intent_id.as_bytes().as_slice(), outcome.as_str()],
+            )
+            .map_err(BrokerError::ledger)?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(BrokerError::ledger(format!(
+                "client request {intent_id} is not one this ledger recorded"
+            )))
+        }
+    }
+
+    /// Reads every recorded client request, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails or a row is unreadable.
+    pub fn client_intents(&self) -> Result<Vec<ClientIntent>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT intent_id, application_instance_id, connection_id, upstream_request_id,
+                        method, class, declared, source_handle, outcome, recorded_at_ms
+                 FROM broker_client_requests ORDER BY recorded_at_ms, rowid",
+            )
+            .map_err(BrokerError::ledger)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            })
+            .map_err(BrokerError::ledger)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(BrokerError::ledger)?;
+        rows.into_iter()
+            .map(
+                |(
+                    intent_id,
+                    instance,
+                    connection,
+                    upstream,
+                    method,
+                    class,
+                    declared,
+                    source,
+                    outcome,
+                    recorded,
+                )| {
+                    Ok(ClientIntent {
+                        intent_id: uuid_from(&intent_id)?,
+                        application_instance_id: ApplicationInstanceId::new(uuid_from(&instance)?),
+                        connection: GatewayConnectionId::new(
+                            u64::try_from(connection).unwrap_or_default(),
+                        ),
+                        upstream_request_id: upstream
+                            .map(UpstreamRequestId::new)
+                            .transpose()
+                            .map_err(|error| {
+                                BrokerError::ledger(format!("a stored identifier: {error}"))
+                            })?,
+                        method: UpstreamMethod::new(method).map_err(|error| {
+                            BrokerError::ledger(format!("a stored method: {error}"))
+                        })?,
+                        classification: NativeClassification {
+                            class: class_from(&class)?,
+                            declared: declared != 0,
+                        },
+                        source: SourceEventHandle::new(source).map_err(|error| {
+                            BrokerError::ledger(format!("a stored source handle: {error}"))
+                        })?,
+                        outcome: outcome_from(&outcome)?,
+                        recorded_at: TimestampMs::new(u64::try_from(recorded).unwrap_or_default()),
+                    })
+                },
+            )
             .collect()
     }
 

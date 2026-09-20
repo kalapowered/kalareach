@@ -1390,6 +1390,7 @@ async fn kr_req_12_13_traffic_in_both_directions_keeps_identifiers_that_look_ali
         .expect("the client's own request is carried");
     let Carried::ClientRequest {
         upstream_request_id: forwarded,
+        ..
     } = carried
     else {
         panic!("a request of the client's is what this was");
@@ -1509,6 +1510,177 @@ async fn kr_req_12_13_traffic_in_both_directions_keeps_identifiers_that_look_ali
 /// True when this identifier text is one the host's own namespace covers.
 fn is_host_minted_text(text: &str) -> bool {
     text.starts_with("\"kr-")
+}
+
+/// KR-REQ-11.30 and KR-REQ-12.13: the native client's own request goes through native admission,
+/// and an unclassified one suspends rich mutations before a byte of it is written.
+///
+/// The terminal is a writer on this connection exactly as the agent is, so a frame it sends is
+/// classified with the table this host pinned, recorded with the bytes it was, and — when this
+/// host cannot say what it does — it suspends rich mutations first. The upstream here never reads,
+/// so the request is still unwritten while all of that is asserted: the record and the suspension
+/// are not what happened afterwards, they are what happened before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_before_it_is_written()
+{
+    let broker = broker();
+    // A pipe of a few bytes with nothing reading it: the frame is taken by the owner and its
+    // bytes stop in the pipe, so nothing about it has reached the agent while this test runs.
+    let (upstream_here, upstream_there) = tokio::io::duplex(8);
+    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (owner, writes) = Duplex::new(
+        Arc::clone(&broker),
+        GatewayConnectionId::new(1),
+        Framing::new(NativeFraming::JsonLines),
+        upstream_here,
+        tokio::io::split(client_here).1,
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        "agent-user",
+    );
+    let drained = tokio::spawn(writes);
+    // Bound, so that what refuses the rich mutation below is the suspension and not the absence of
+    // anything to carry it.
+    broker
+        .bind_dispatch(instance(), owner.dispatch().expect("it carries operations"))
+        .expect("the transport is bound");
+
+    // The terminal asks its agent for something this connector's table does not list.
+    let carrying = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            owner
+                .from_client(
+                    br#"{"id":4,"method":"session/set_mode","params":{"mode":"yolo"}}"#,
+                    TimestampMs::new(2),
+                )
+                .await
+        })
+    };
+
+    // Before any of it goes: the intent is recorded, the source is retained and rich mutations
+    // are suspended.
+    let recorded = loop {
+        let held = broker.client_requests().expect("the records read");
+        if let Some(intent) = held.first() {
+            break intent.clone();
+        }
+        assert!(!carrying.is_finished(), "the frame is still unwritten");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+    assert_eq!(
+        recorded.method,
+        method("session/set_mode"),
+        "the method the terminal named"
+    );
+    assert_eq!(recorded.classification.class, NativeMethodClass::Mutation);
+    assert!(
+        !recorded.classification.declared,
+        "the table did not classify it, so it is presumed a mutation"
+    );
+    assert_eq!(
+        recorded.outcome,
+        kr_worker::broker::ClientRequestOutcome::Recorded,
+        "recorded before its bytes went, not after"
+    );
+    assert!(
+        recorded
+            .upstream_request_id
+            .as_ref()
+            .is_some_and(|id| is_host_minted_text(id.as_str())),
+        "under the identifier this host forwards it as: {:?}",
+        recorded.upstream_request_id
+    );
+    assert!(
+        broker.source(instance(), &recorded.source).is_some(),
+        "the bytes the terminal wrote are retained as this instance's own source event"
+    );
+    let suspended = broker
+        .binding_state(instance())
+        .expect("the instance reads");
+    assert!(
+        suspended.rich_mutations_suspended,
+        "an unclassified request suspends rich mutations"
+    );
+    assert!(!carrying.is_finished(), "and none of it has been written");
+
+    // And a rich mutation is refused while that is true, which is the whole point of the order.
+    let refused = broker
+        .agent_prompt(
+            &kr_worker::broker::Caller {
+                actor_id: ActorId::new("device-1").expect("valid"),
+                grant_id: None,
+            },
+            &kr_protocol::agent::AgentPromptParams {
+                target: target(),
+                draft_id: Nullable::null(),
+                text: Nullable::some(kr_protocol::agent::PromptText::new("hello").expect("valid")),
+            },
+            false,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect_err("rich mutations are suspended");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::DraftConflict,
+        "a precondition the instance has stopped meeting"
+    );
+
+    carrying.abort();
+    drop(upstream_there);
+    drained.abort();
+}
+
+/// KR-REQ-11.30: a client request the table does classify is recorded and leaves rich mutations
+/// alone, and what became of its bytes is recorded too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_30_a_classified_client_request_is_recorded_and_suspends_nothing() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let owner = Arc::clone(&served.owner);
+    let mut upstream = tokio::io::BufReader::new(served.upstream);
+
+    let carried = owner
+        .from_client(
+            br#"{"id":11,"method":"session/update","params":{"from":"the terminal"}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the terminal's own request is carried");
+    let Carried::ClientRequest {
+        classification,
+        suspended_rich_mutations,
+        ..
+    } = carried
+    else {
+        panic!("a request of the client's is what this was");
+    };
+    assert!(classification.declared, "the table lists this method");
+    assert_eq!(classification.class, NativeMethodClass::Observation);
+    assert!(!suspended_rich_mutations);
+    assert!(
+        !broker
+            .binding_state(instance())
+            .expect("the instance reads")
+            .rich_mutations_suspended,
+        "a method this host can classify suspends nothing"
+    );
+    let _ = next_line(&mut upstream).await;
+    let recorded = broker
+        .client_requests()
+        .expect("the records read")
+        .into_iter()
+        .next()
+        .expect("the request was recorded");
+    assert_eq!(recorded.method, method("session/update"));
+    assert!(recorded.classification.declared);
+    assert_eq!(
+        recorded.outcome,
+        kr_worker::broker::ClientRequestOutcome::Transmitted,
+        "and what became of its bytes is recorded"
+    );
+
+    served.drained.abort();
 }
 
 /// KR-REQ-09 and KR-REQ-11.33: a write that blocks, one that goes in part and a reply that never
