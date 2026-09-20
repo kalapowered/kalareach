@@ -587,8 +587,17 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
         .await
         .expect("connects");
 
+    // The transfer is asked for by a third window, which is section 8's own flow - an actor names
+    // an eligible terminal, whoever it belongs to - and it is what lets both of the terminals this
+    // test is about be asked what they were told. A client discards a notification that arrives
+    // while it is waiting for an answer to a call of its own, so the connection that asks for the
+    // transfer is the one connection that cannot be asked.
+    let mut console = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
     let desk_attachment = attach_over(&mut desk, &wired, CANONICAL, true).await;
     let phone_attachment = attach_over(&mut phone, &wired, Dimensions::new(48, 16), true).await;
+    attach_over(&mut console, &wired, Dimensions::new(30, 10), false).await;
     subscribe_over(&mut desk, &wired, desk_attachment).await;
     subscribe_over(&mut phone, &wired, phone_attachment).await;
     produced(&wired.runtime, b"kr-ready.").await;
@@ -596,7 +605,7 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     let epoch = wired.runtime.session().geometry().epoch;
     // A stale epoch is refused. The size is not moved by a caller working from a view that has
     // already changed.
-    let refused: kr_protocol::error::ProtocolError = phone
+    let refused: kr_protocol::error::ProtocolError = console
         .mutate(
             Method::TerminalGeometryTransfer,
             ActionId::new(kr_ipc::new_uuid()),
@@ -617,7 +626,7 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     );
 
     // The deliberate "use this terminal's size" action.
-    let transferred: GeometryResult = phone
+    let transferred: GeometryResult = console
         .mutate(
             Method::TerminalGeometryTransfer,
             ActionId::new(kr_ipc::new_uuid()),
@@ -654,6 +663,7 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
 
     drop(desk);
     drop(phone);
+    drop(console);
     wired
         .runtime
         .close(ClosureReason::CloseRequested)
