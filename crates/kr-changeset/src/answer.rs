@@ -166,6 +166,7 @@ mod tests {
                 after_version: kr_protocol::scalars::Nullable(None),
                 applied_version: kr_protocol::scalars::Nullable(None),
                 staged_path: kr_protocol::scalars::Nullable(None),
+                staged_leftovers: vec![hostile.to_owned()],
                 detail: hostile.to_owned(),
             },
             limitations: vec![hostile.to_owned()],
@@ -179,5 +180,6 @@ mod tests {
         // A path is a value the caller named and asked about; the rule leaves it alone, and the
         // wire boundary's own rule covers what reaches a message.
         assert_eq!(result.changed_paths[0], hostile);
+        assert_eq!(result.recovery.staged_leftovers[0], hostile);
     }
 }

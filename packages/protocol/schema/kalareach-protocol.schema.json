@@ -20740,6 +20740,13 @@
           "description": "What these objects are and are not, in this host's own words.",
           "type": "string"
         },
+        "staged_leftovers": {
+          "description": "Destination paths beside which an interrupted apply left a temporary this host could not\nprove it made, so it removed nothing.\n\nEmpty is the ordinary answer. A path here is one a person has to look at: the name beside\nit is taken, and this host will not delete a file it cannot show is its own.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "staged_path": {
           "anyOf": [
             {
@@ -20757,6 +20764,7 @@
         "after_version",
         "applied_version",
         "staged_path",
+        "staged_leftovers",
         "detail"
       ],
       "type": "object"

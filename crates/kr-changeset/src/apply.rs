@@ -113,8 +113,12 @@ pub struct ApplyOrder<'a> {
 }
 
 /// What a test runs immediately before one path's rename, named by that path.
+///
+/// Answering `false` abandons the apply right there, with the temporary still beside the
+/// destination and nothing settled: that is what a daemon that died between staging a path and
+/// publishing it leaves behind, and it is the one window a test cannot otherwise reach.
 #[cfg(feature = "fault-injection")]
-pub type BeforeRename = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+pub type BeforeRename = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What a test does to an apply that is already running.
 ///
@@ -828,6 +832,7 @@ fn proposal(
             after_version: Nullable(Some(reference)),
             applied_version: Nullable(Some(order.version)),
             staged_path: Nullable(None),
+            staged_leftovers: Vec::new(),
             detail: "the destination as it stands, and the version it would hold; no working tree \
                      was written, so there is nothing to undo"
                 .to_owned(),
@@ -1187,6 +1192,7 @@ fn direct(
             })),
             applied_version: Nullable(Some(order.version)),
             staged_path: Nullable(Some(staged_name)),
+            staged_leftovers: Vec::new(),
             detail: "the destination as it stood before this apply and as it stands after it, \
                      both immutable and both materialisable; what is not claimed is that every \
                      intermediate version was captured"
@@ -1334,6 +1340,10 @@ fn run_operations(
         #[cfg(feature = "fault-injection")]
         let fault = service.fault();
         let installed = install(
+            &Staging {
+                service,
+                action_id: order.action_id,
+            },
             service.project().profile(),
             repository,
             path,
@@ -1343,8 +1353,19 @@ fn run_operations(
             fault
                 .as_ref()
                 .and_then(|fault| fault.before_rename.as_ref())
-                .map(|act| act.as_ref() as &dyn Fn(&str)),
+                .map(|act| act.as_ref() as &dyn Fn(&str) -> bool),
         )?;
+        #[cfg(feature = "fault-injection")]
+        if matches!(installed, Installed::Abandoned) {
+            // Nothing is settled for this path: the row stays as the plan left it, which is what
+            // a daemon that died between staging and publishing leaves in the journal.
+            run.abandoned = Some(
+                fault
+                    .as_ref()
+                    .map_or_else(String::new, |fault| fault.detail.clone()),
+            );
+            return Ok(run);
+        }
         let row = match &installed {
             Installed::Written(after) => ProgressRow {
                 path: path.clone(),
@@ -1376,6 +1397,9 @@ fn run_operations(
                 after_digest: None,
                 detail: detail.clone(),
             },
+            // Returned above, before anything of this path is settled.
+            #[cfg(feature = "fault-injection")]
+            Installed::Abandoned => unreachable!("an abandoned path returns before it is settled"),
         };
         service.locked()?.settle_path(order.action_id, &row)?;
         run.progress.push(wire_progress(&row));
@@ -1396,6 +1420,8 @@ fn run_operations(
             // A path this host could not resolve does not stop the apply: the caller asked for
             // every operation, and the answer lists each one's own outcome.
             Installed::Unresolved(_) => {}
+            #[cfg(feature = "fault-injection")]
+            Installed::Abandoned => unreachable!("an abandoned path returns before it is settled"),
         }
         #[cfg(feature = "fault-injection")]
         if let Some(fault) = fault
@@ -1473,6 +1499,44 @@ fn staged_name(path: &str) -> String {
     hex_of(digest_of(path.as_bytes()))
 }
 
+/// What one apply tells the journal about the temporaries it puts beside its destinations.
+///
+/// The name beside a destination is the same every time that path is applied, so a temporary left
+/// behind by a daemon that died blocks the next apply of that path. What makes it removable rather
+/// than a thing a person has to find is this record: the name, and the object this host created
+/// at it. A recovery removes what is at the name **only while it is still that object**, which is
+/// the same rule the live cleanup follows.
+struct Staging<'a> {
+    service: &'a ChangeSetService,
+    action_id: ActionId,
+}
+
+impl Staging<'_> {
+    /// Records the name before it exists, with no identity: this host is about to make it.
+    fn about_to_create(&self, path: &str, entry: &str) -> Result<()> {
+        self.service
+            .locked()?
+            .stage_path(self.action_id, path, entry, None)
+    }
+
+    /// Records the object this host made, which is what a recovery compares against.
+    fn created(
+        &self,
+        path: &str,
+        entry: &str,
+        identity: kr_transfer::ObjectIdentity,
+    ) -> Result<()> {
+        self.service
+            .locked()?
+            .stage_path(self.action_id, path, entry, Some(identity))
+    }
+
+    /// Records that this apply has nothing of its own at that name any more.
+    fn gone(&self, path: &str) -> Result<()> {
+        self.service.locked()?.unstage_path(self.action_id, path)
+    }
+}
+
 /// What one operation does to one destination path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
@@ -1488,6 +1552,10 @@ enum Operation {
 enum Installed {
     /// The content is in the destination and this host read it back.
     Written(Digest256),
+    /// This host stopped inside the window between staging the path and publishing it, exactly
+    /// where a daemon that died would stop. The temporary is still there and nothing is settled.
+    #[cfg(feature = "fault-injection")]
+    Abandoned,
     /// The destination stopped being what the request expected before anything was written.
     Conflicted(Option<Digest256>),
     /// This host could not establish what the destination holds.
@@ -1515,14 +1583,21 @@ enum Installed {
 /// Step 6 is why `Written` means what it says. Between steps 4 and 5 another writer is not
 /// excluded — that is the limitation this class states — but a rename that installed something
 /// other than the validated content is caught rather than recorded as a success.
+///
+/// The journal is told about the temporary **before the name is created** and again the moment
+/// the file exists, and the record is cleared only once the temporary has been published or taken
+/// away. So a daemon that dies inside this window leaves a journal that names exactly what it left
+/// beside the destination, and `recover_before_serving` can take away that object and nothing
+/// else.
 #[allow(clippy::too_many_lines)]
 fn install(
+    staging: &Staging<'_>,
     profile: &RestrictedProfile,
     repository: &OpenedRepository,
     path: &str,
     operation: &Operation,
     expected: Option<&AffectedVersion>,
-    #[cfg(feature = "fault-injection")] before_rename: Option<&dyn Fn(&str)>,
+    #[cfg(feature = "fault-injection")] before_rename: Option<&dyn Fn(&str) -> bool>,
 ) -> Result<Installed> {
     let name = RelativeName::parse(path)?;
     let components = name.components();
@@ -1549,8 +1624,10 @@ fn install(
                 return Ok(conflict);
             }
             #[cfg(feature = "fault-injection")]
-            if let Some(act) = before_rename {
-                act(path);
+            if let Some(act) = before_rename
+                && !act(path)
+            {
+                return Ok(Installed::Abandoned);
             }
             if let Err(error) = here.remove(&leaf_name) {
                 return Ok(Installed::Unresolved(error.to_string()));
@@ -1581,10 +1658,18 @@ fn install(
     };
     // The temporary is created **exclusively**, beside the destination, so an occupied name is a
     // file this host leaves exactly as it is rather than one it removes to make room.
-    let temporary = RelativeName::parse(&format!(".kr-apply-{}", staged_name(path)))?;
+    let entry = format!(".kr-apply-{}", staged_name(path));
+    let temporary = RelativeName::parse(&entry)?;
+    // Recorded before the name exists: a crash between this and the creation leaves a name the
+    // journal knows about and an identity it does not, which is a file this host cannot prove it
+    // made and therefore never removes.
+    staging.about_to_create(path, &entry)?;
     let mut staged = match here.create_new(&temporary) {
         Ok(file) => file,
         Err(error) => {
+            // The name was taken by something this host did not make, so there is nothing of its
+            // own here to account for.
+            staging.gone(path)?;
             return Ok(Installed::Unresolved(format!(
                 "this host did not write anything, because the name it would have staged through \
                  is taken and it removes nothing to make room: {error}"
@@ -1592,6 +1677,7 @@ fn install(
         }
     };
     let staged_identity = staged.identity();
+    staging.created(path, &entry, staged_identity)?;
     let outcome = (|| -> Result<Installed> {
         staged
             .handle_mut()
@@ -1617,8 +1703,10 @@ fn install(
             return Ok(conflict);
         }
         #[cfg(feature = "fault-injection")]
-        if let Some(act) = before_rename {
-            act(path);
+        if let Some(act) = before_rename
+            && !act(path)
+        {
+            return Ok(Installed::Abandoned);
         }
         // The name this host is about to rename has to still be the file it created. A name
         // somebody replaced between the creation and here is a file this host neither wrote nor
@@ -1636,6 +1724,10 @@ fn install(
         }
         here.rename_into(&temporary, &here, &leaf_name)?;
         here.sync()?;
+        // The temporary is gone as a temporary: the rename is what published it, and the name it
+        // had holds nothing now. What the journal keeps recording after this would be a file
+        // nobody could find.
+        staging.gone(path)?;
         // What actually landed, read **twice**: once through the handle this host published
         // through, and once by resolving the path again from the working tree's own handle. A
         // parent somebody moved aside while this was running would let the first read succeed in
@@ -1672,14 +1764,25 @@ fn install(
             )),
         }
     })();
-    if !matches!(outcome, Ok(Installed::Written(_))) {
+    #[cfg(feature = "fault-injection")]
+    let stopped_here = matches!(outcome, Ok(Installed::Abandoned));
+    #[cfg(not(feature = "fault-injection"))]
+    let stopped_here = false;
+    // A host that stopped inside the window leaves everything exactly as it was: that is the
+    // whole of what this fixture reproduces, and cleaning up here would hide it.
+    if !matches!(outcome, Ok(Installed::Written(_))) && !stopped_here {
         // The temporary this host made goes away — **that object**, not that name. A file somebody
         // put at the name after this host created its own is a file this host leaves alone.
-        if here
-            .open_read(&temporary, ObjectPolicy::ReadableFile)
-            .is_ok_and(|found| found.identity() == staged_identity)
-        {
-            let _ = here.remove(&temporary);
+        match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
+            Ok(found) if found.identity() == staged_identity => {
+                if here.remove(&temporary).is_ok() {
+                    staging.gone(path)?;
+                }
+            }
+            // Either the name holds nothing, or it holds something this host did not make. Both
+            // are names this apply has nothing of its own left at, and a record of one would send
+            // a recovery after somebody else's file.
+            _ => staging.gone(path)?,
         }
     }
     outcome
@@ -2469,6 +2572,7 @@ fn clean_preflight(order: &ApplyOrder<'_>, limitations: &[String]) -> DiffApplyR
             after_version: Nullable(None),
             applied_version: Nullable(Some(order.version)),
             staged_path: Nullable(None),
+            staged_leftovers: Vec::new(),
             detail: "a preflight writes nothing, so there is nothing to recover from".to_owned(),
         },
         limitations: limitations.to_vec(),
@@ -2492,6 +2596,12 @@ fn clean_preflight(order: &ApplyOrder<'_>, limitations: &[String]) -> DiffApplyR
 /// what the daemon does when it opens the service. Calling it beside a live apply would settle
 /// that apply as interrupted while it was still going.
 ///
+/// It also clears up after the window between staging a destination path and publishing it. The
+/// journal names the temporary the interrupted apply left and the object it created there, so
+/// what is at that name is removed **while it is still that object** and left exactly as it is
+/// otherwise. A name a person or another program took is named in the answer and touched by
+/// nothing.
+///
 /// # Errors
 ///
 /// Returns [`ChangeSetError::StoreUnavailable`] when the journal cannot be read or written.
@@ -2499,6 +2609,7 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
     let mut recovery = crate::service::Recovery::default();
     let undecided = service.locked()?.undecided_applies()?;
     for row in undecided {
+        let staged = clear_staged(service, &row, &mut recovery)?;
         let progress = service.locked()?.progress(row.action_id)?;
         let written = progress
             .iter()
@@ -2519,11 +2630,30 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
         // a crash between the two leaves the apply undecided, so the next recovery does both
         // again; settling it afterwards would leave a decided apply that no later recovery looks
         // at and an action nothing ever answers.
-        let detail = format!(
+        let mut detail = format!(
             "this apply was interrupted: {written} path(s) are in the destination and this host \
              confirmed each of them, and {unresolved} path(s) are ones it did not establish an \
              outcome for, which is not the same as ones it did not write"
         );
+        if staged.removed > 0 {
+            detail.push_str(&format!(
+                ". It had staged {} path(s) it had not published, and this host took away the \
+                 temporaries it could prove were its own",
+                staged.removed
+            ));
+        }
+        if !staged.left.is_empty() {
+            detail.push_str(&format!(
+                ". Beside {} it left a temporary this host cannot prove it made, so it removed \
+                 nothing there",
+                staged
+                    .left
+                    .iter()
+                    .map(|path| kr_project::git::redact(path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         settle_recovered_action(
             service,
             row.action_id,
@@ -2559,6 +2689,113 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
         recovery.actions_settled += 1;
     }
     Ok(recovery)
+}
+
+/// What a recovery did about one interrupted apply's staged temporaries.
+#[derive(Default)]
+struct StagedCleanup {
+    /// How many temporaries this host proved were its own and took away.
+    removed: usize,
+    /// The destination paths whose staged name is occupied by something this host cannot prove it
+    /// made, and so left alone.
+    left: Vec<String>,
+}
+
+/// What is at one staged name now.
+enum Staged {
+    /// The object the journal names, which this host made and has taken away.
+    TakenAway,
+    /// Nothing at all, so there is nothing left to account for.
+    NotThere,
+    /// Something this host cannot prove it made, which it leaves exactly as it is.
+    NotOurs,
+}
+
+/// Takes away the temporaries one interrupted apply left beside its destinations.
+///
+/// Only the object the journal names, and only while it is still that object. Anything else at
+/// that name is somebody's file, and this host reports it rather than removing it. A workspace
+/// this host cannot open any more leaves every one of that apply's names reported: a recovery
+/// runs before a daemon serves anything, and it never fails to run because a destination moved.
+fn clear_staged(
+    service: &ChangeSetService,
+    row: &crate::store::ApplyRow,
+    recovery: &mut crate::service::Recovery,
+) -> Result<StagedCleanup> {
+    let mut cleanup = StagedCleanup::default();
+    let staged = service.locked()?.staged_paths(row.action_id)?;
+    if staged.is_empty() {
+        return Ok(cleanup);
+    }
+    let opened = row
+        .workspace_id
+        .and_then(|workspace_id| service.resolve(workspace_id).ok())
+        .and_then(|resolved| service.open_repository(&resolved).ok());
+    let Some(repository) = opened else {
+        cleanup.left = staged.into_iter().map(|entry| entry.path).collect();
+        recovery.staged_left += cleanup.left.len() as u64;
+        return Ok(cleanup);
+    };
+    for entry in staged {
+        match staged_now(&repository, &entry) {
+            Staged::TakenAway => {
+                service.locked()?.unstage_path(row.action_id, &entry.path)?;
+                cleanup.removed += 1;
+                recovery.staged_removed += 1;
+            }
+            Staged::NotThere => service.locked()?.unstage_path(row.action_id, &entry.path)?,
+            Staged::NotOurs => {
+                cleanup.left.push(entry.path);
+                recovery.staged_left += 1;
+            }
+        }
+    }
+    Ok(cleanup)
+}
+
+/// Looks at one staged name and takes away only what this host can prove it made.
+fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -> Staged {
+    // No identity is a temporary this host did not get as far as creating, or one it created and
+    // died before recording. Either way it cannot show the file is its own.
+    let Some(identity) = entry.identity else {
+        return Staged::NotOurs;
+    };
+    let Ok(name) = RelativeName::parse(&entry.path) else {
+        return Staged::NotOurs;
+    };
+    let components = name.components();
+    let Some((_, parents)) = components.split_last() else {
+        return Staged::NotOurs;
+    };
+    let Ok(mut here) = clone_handle(repository.work_tree()) else {
+        return Staged::NotOurs;
+    };
+    for component in parents {
+        let Ok(component) = RelativeName::parse(component) else {
+            return Staged::NotOurs;
+        };
+        match here.subdirectory(&component) {
+            Ok(directory) => here = directory,
+            // The directory the temporary was in is gone, so the temporary is gone with it.
+            Err(kr_transfer::Escape::NotFound { .. }) => return Staged::NotThere,
+            Err(_) => return Staged::NotOurs,
+        }
+    }
+    let Ok(temporary) = RelativeName::parse(&entry.entry) else {
+        return Staged::NotOurs;
+    };
+    match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
+        Ok(found) if found.identity() == identity => {
+            if here.remove(&temporary).is_ok() {
+                let _ = here.sync();
+                Staged::TakenAway
+            } else {
+                Staged::NotOurs
+            }
+        }
+        Err(kr_transfer::Escape::NotFound { .. }) => Staged::NotThere,
+        _ => Staged::NotOurs,
+    }
 }
 
 /// Settles the action one recovered apply was performed under, from what the journal holds.
@@ -2603,6 +2840,13 @@ pub fn read_apply(service: &ChangeSetService, action_id: ActionId) -> Result<Dif
             detail: format!("no apply under action {action_id}").into(),
         })?;
     let progress = store.progress(action_id)?;
+    // What the journal still names is what is still beside a destination: the record of a
+    // temporary is cleared the moment that temporary is published or taken away.
+    let leftovers: Vec<String> = store
+        .staged_paths(action_id)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
     drop(store);
     let changed: Vec<String> = progress
         .iter()
@@ -2681,6 +2925,7 @@ pub fn read_apply(service: &ChangeSetService, action_id: ActionId) -> Result<Dif
                 version: row.version,
             })),
             staged_path: Nullable(row.staged_name),
+            staged_leftovers: leftovers,
             detail: "what this host recorded on each side of the apply".to_owned(),
         },
         limitations: limitations(row.destination),

@@ -899,6 +899,12 @@ pub struct RecoveryObjects {
     pub applied_version: Nullable<VersionRef>,
     /// The staging directory the validated content was written through, while it is still there.
     pub staged_path: Nullable<String>,
+    /// Destination paths beside which an interrupted apply left a temporary this host could not
+    /// prove it made, so it removed nothing.
+    ///
+    /// Empty is the ordinary answer. A path here is one a person has to look at: the name beside
+    /// it is taken, and this host will not delete a file it cannot show is its own.
+    pub staged_leftovers: Vec<String>,
     /// What these objects are and are not, in this host's own words.
     pub detail: String,
 }

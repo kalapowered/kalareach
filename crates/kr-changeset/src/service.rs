@@ -109,6 +109,12 @@ pub struct Recovery {
     pub applies_settled: u64,
     /// How many decided applies an earlier daemon left without an answer to their action.
     pub actions_settled: u64,
+    /// How many staged temporaries this host took away because the journal proved they were its
+    /// own.
+    pub staged_removed: u64,
+    /// How many names an interrupted apply staged through are still occupied by something this
+    /// host cannot prove it made, and so left exactly as it is.
+    pub staged_left: u64,
 }
 
 /// The change-set service of one environment.

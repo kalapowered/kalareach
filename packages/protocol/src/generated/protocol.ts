@@ -8209,6 +8209,14 @@ export interface RecoveryObjects {
    */
   detail: string
   /**
+   * Destination paths beside which an interrupted apply left a temporary this host could not
+   * prove it made, so it removed nothing.
+   *
+   * Empty is the ordinary answer. A path here is one a person has to look at: the name beside
+   * it is taken, and this host will not delete a file it cannot show is its own.
+   */
+  staged_leftovers: string[]
+  /**
    * The staging directory the validated content was written through, while it is still there.
    */
   staged_path: string | null

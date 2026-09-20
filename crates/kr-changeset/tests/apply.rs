@@ -1248,6 +1248,7 @@ fn a_write_in_the_window_this_host_cannot_close_is_recoverable_from_the_before_v
                 std::fs::write(racing.join("README.md"), b"somebody else wrote this\n")
                     .expect("the other writer writes");
             }
+            true
         })),
         stop: false,
         detail: String::new(),
@@ -1329,6 +1330,7 @@ fn a_destination_that_does_not_hold_what_was_installed_is_never_recorded_as_writ
                 std::fs::write(racing.join(temporary), b"something else entirely\n")
                     .expect("the other writer replaces the staged copy");
             }
+            true
         })),
         stop: false,
         detail: String::new(),
@@ -2137,4 +2139,177 @@ fn read_whole_list(
     }
     let handle = options.open(path).expect("the object opens for reading");
     kr_transfer::read_access_control(handle.as_handle()).expect("its list is read")
+}
+
+/// The single-component name one destination path is staged through, which is the same name every
+/// time that path is applied.
+fn staged_entry(path: &str) -> String {
+    format!(
+        ".kr-apply-{}",
+        kr_changeset::objects::hex_of(kr_changeset::objects::digest_of(path.as_bytes()))
+    )
+}
+
+/// Stops one apply inside the window between staging a path and publishing it, and returns the
+/// action it was performed under.
+fn stopped_between_staging_and_publishing(
+    fixture: &Fixture,
+    destination: &Path,
+    workspace: kr_protocol::ids::WorkspaceId,
+    record: &kr_protocol::changeset::ChangeSetVersionRecord,
+) -> kr_protocol::ids::ActionId {
+    let affected = expectations(destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    fixture.service().inject(Some(Fault {
+        after_paths: usize::MAX,
+        act: None,
+        before_rename: Some(std::sync::Arc::new(|path: &str| path != "README.md")),
+        stop: false,
+        detail: "the daemon stopped between staging this path and publishing it".to_owned(),
+    }));
+    let order = support::apply_order(
+        reference(record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let action = order.action_id;
+    let failure = apply::apply(fixture.service(), &order).expect_err("the apply is stopped");
+    assert_eq!(failure.code(), ErrorCode::OutcomeUnknown);
+    fixture.service().inject(None);
+    action
+}
+
+/// KR-REQ-14.28: a crash between staging a destination path and publishing it leaves a temporary
+/// beside the destination, the journal names it, and the recovery that follows takes away that
+/// object and nothing else.
+#[test]
+fn a_crash_between_staging_and_publishing_is_cleared_up_by_the_recovery() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "staged-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("staged-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "staged-destination");
+    let workspace = fixture.workspace("staged-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    // The temporary really is beside the destination, under the name that path is always staged
+    // through, and the destination itself is untouched.
+    let entry = staged_entry("README.md");
+    assert_eq!(
+        support::read_bytes(&destination, &entry),
+        b"the change\n",
+        "the staged copy is there, waiting for a rename that never happened"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"a repository\n",
+        "and nothing was published"
+    );
+
+    // A replacement service reads an apply nobody decided, and the journal names what it left.
+    let replacement = fixture.reopen();
+    let open = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(open.outcome, Nullable(None));
+    assert_eq!(
+        open.recovery.staged_leftovers,
+        vec!["README.md".to_owned()],
+        "the journal names the path whose temporary is still there"
+    );
+
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.applies_settled, 1);
+    assert_eq!(recovery.staged_removed, 1, "it took away its own temporary");
+    assert_eq!(recovery.staged_left, 0);
+    assert!(
+        !destination.join(&entry).exists(),
+        "and the name is free again"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"a repository\n",
+        "the destination is exactly as it was"
+    );
+
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.outcome,
+        Nullable(Some(ApplyOutcomeClass::InterruptedApply))
+    );
+    assert!(settled.recovery.staged_leftovers.is_empty());
+    assert!(
+        settled.detail.contains("took away the temporaries"),
+        "the answer says what it cleared up: {}",
+        settled.detail
+    );
+
+    // And the path can be applied again, which the occupied name would have prevented.
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let again = apply::apply(
+        &replacement,
+        &support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &limitations,
+        ),
+    )
+    .expect("the second apply runs");
+    assert_eq!(again.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"the change\n"
+    );
+}
+
+/// KR-REQ-14.28: a file at the staged name that this host cannot prove it made is left exactly as
+/// it is, and the answer names the path so a person can look at it.
+#[test]
+fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "theirs-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("theirs-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "theirs-destination");
+    let workspace = fixture.workspace("theirs-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    // Somebody replaces what is at the staged name with a file of their own, so the object the
+    // journal recorded is not what is there any more.
+    let entry = staged_entry("README.md");
+    std::fs::remove_file(destination.join(&entry)).expect("their editor replaces it");
+    std::fs::write(destination.join(&entry), b"somebody else's file\n").expect("their file");
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.applies_settled, 1);
+    assert_eq!(
+        recovery.staged_removed, 0,
+        "this host removes nothing it cannot prove it made"
+    );
+    assert_eq!(recovery.staged_left, 1);
+    assert_eq!(
+        support::read_bytes(&destination, &entry),
+        b"somebody else's file\n",
+        "their file is exactly as they left it"
+    );
+
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.recovery.staged_leftovers,
+        vec!["README.md".to_owned()],
+        "and the answer names the path a person has to look at"
+    );
+    assert!(
+        settled.detail.contains("cannot prove it made"),
+        "the answer says why it removed nothing: {}",
+        settled.detail
+    );
 }

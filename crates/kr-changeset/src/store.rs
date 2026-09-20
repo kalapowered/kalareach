@@ -171,7 +171,18 @@ pub struct ApplyRow {
     pub decided_at_ms: Option<TimestampMs>,
 }
 
-/// One path's progress inside one apply.
+/// One temporary an apply has beside a destination path, while it is still there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedPath {
+    /// The destination path the temporary sits beside.
+    pub path: String,
+    /// The single-component name of the temporary itself.
+    pub entry: String,
+    /// The object this host created there, when it got as far as creating one.
+    pub identity: Option<kr_transfer::ObjectIdentity>,
+}
+
+/// What one path of one apply came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgressRow {
     /// The path.
@@ -384,6 +395,17 @@ impl Store {
                      before_digest BLOB,
                      after_digest  BLOB,
                      detail        TEXT NOT NULL,
+                     -- The single-component name this host stages this destination path through,
+                     -- recorded while the temporary beside the destination is still there. It is
+                     -- written before the name is created and cleared once the temporary is
+                     -- published or taken away, so what is left here after a crash is exactly
+                     -- what recovery has to account for.
+                     staged_entry   TEXT,
+                     -- The object this host created at that name. A recovery removes the
+                     -- temporary only when what is at the name is still this object, which is how
+                     -- it never deletes a file it cannot prove it made.
+                     staged_device  INTEGER,
+                     staged_file_id INTEGER,
                      PRIMARY KEY (action_id, path)
                  );",
             )
@@ -1649,11 +1671,19 @@ impl Store {
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
     pub fn settle_path(&self, action_id: ActionId, row: &ProgressRow) -> Result<()> {
+        // What a path came to and what is staged beside it are separate records of separate
+        // facts. A temporary this host has not taken away is still there whatever the path's
+        // outcome says, so settling the outcome leaves the staging record exactly as it is.
         self.connection
             .execute(
-                "INSERT OR REPLACE INTO apply_progress
+                "INSERT INTO apply_progress
                    (action_id, path, state, before_digest, after_digest, detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (action_id, path) DO UPDATE SET
+                   state = excluded.state,
+                   before_digest = excluded.before_digest,
+                   after_digest = excluded.after_digest,
+                   detail = excluded.detail",
                 params![
                     uuid_bytes(action_id.get()),
                     row.path,
@@ -1665,6 +1695,102 @@ impl Store {
             )
             .map_err(ChangeSetError::store)?;
         Ok(())
+    }
+
+    /// Records that this host is about to create, or has created, a temporary beside one
+    /// destination path.
+    ///
+    /// Written **before** the name is created, with no identity, and written again the moment the
+    /// file exists. A crash between the two leaves a name recorded and no identity, which is a
+    /// temporary this host cannot prove it made: recovery names it and removes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn stage_path(
+        &self,
+        action_id: ActionId,
+        path: &str,
+        entry: &str,
+        identity: Option<kr_transfer::ObjectIdentity>,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO apply_progress
+                   (action_id, path, state, detail, staged_entry, staged_device, staged_file_id)
+                 VALUES (?1, ?2, ?3, '', ?4, ?5, ?6)
+                 ON CONFLICT (action_id, path) DO UPDATE SET
+                   staged_entry = excluded.staged_entry,
+                   staged_device = excluded.staged_device,
+                   staged_file_id = excluded.staged_file_id",
+                params![
+                    uuid_bytes(action_id.get()),
+                    path,
+                    progress_text(PathProgressState::Planned),
+                    entry,
+                    identity.map(|identity| identity.device as i64),
+                    identity.map(|identity| identity.file_id as i64),
+                ],
+            )
+            .map_err(ChangeSetError::store)?;
+        Ok(())
+    }
+
+    /// Forgets the temporary recorded beside one destination path.
+    ///
+    /// Called only once this host has published that temporary or taken it away, so what the
+    /// journal still names is what is still on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn unstage_path(&self, action_id: ActionId, path: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE apply_progress
+                    SET staged_entry = NULL, staged_device = NULL, staged_file_id = NULL
+                  WHERE action_id = ?1 AND path = ?2",
+                params![uuid_bytes(action_id.get()), path],
+            )
+            .map_err(ChangeSetError::store)?;
+        Ok(())
+    }
+
+    /// Returns every temporary one apply still has recorded beside a destination path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn staged_paths(&self, action_id: ActionId) -> Result<Vec<StagedPath>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path, staged_entry, staged_device, staged_file_id FROM apply_progress
+                  WHERE action_id = ?1 AND staged_entry IS NOT NULL ORDER BY path",
+            )
+            .map_err(ChangeSetError::store)?;
+        let rows = statement
+            .query_map(params![uuid_bytes(action_id.get())], |row| {
+                let device: Option<i64> = row.get(2)?;
+                let file_id: Option<i64> = row.get(3)?;
+                Ok(StagedPath {
+                    path: row.get(0)?,
+                    entry: row.get(1)?,
+                    // Half an identity is no identity: a temporary this host cannot name exactly
+                    // is one it will not remove.
+                    identity: match (device, file_id) {
+                        (Some(device), Some(file_id)) => Some(kr_transfer::ObjectIdentity {
+                            device: device as u64,
+                            file_id: file_id as u64,
+                        }),
+                        _ => None,
+                    },
+                })
+            })
+            .map_err(ChangeSetError::store)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChangeSetError::store)?;
+        Ok(rows)
     }
 
     /// Returns every path's progress inside one apply, in path order.
