@@ -28,6 +28,7 @@
 //! | [`sync`] | Encrypted settings sync, its compare-and-swap client and its privacy hook |
 //! | [`cursors`] | Cursors, receipts and the order state is restored in |
 //! | [`reconnect`] | The reconnect loop and what it refuses to carry across |
+//! | [`recovery`] | The recovery seed, its kit, the bundle at its locator and what a restore puts back |
 //! | [`retry`] | What a failure means for the request, and what it means for the person |
 //! | [`services`] | Replaceable service clients and the null implementation |
 //! | [`uploads`] | One upload, from a local file to a verified attachment handle |
@@ -53,6 +54,7 @@ pub mod ipc;
 #[cfg(feature = "terminal")]
 pub mod projection;
 pub mod reconnect;
+pub mod recovery;
 pub mod retry;
 pub mod services;
 pub mod session;

@@ -37,12 +37,18 @@
 //! sealed key wrap carries its whole authenticated context beside the box, which is 648 bytes per
 //! recipient. [`seal_archive`] refuses over either limit and names the one it hit.
 //!
+//! # What a backup carries
+//!
+//! [`may_back_up`] and [`may_restore`] are the whole of it. They are here rather than in each
+//! caller so a device and a host cannot answer the same question differently.
+//!
 //! # What a restore trusts
 //!
 //! The owner's recovery bundle, through the trusted writers passed to [`open_archive`]. An archive
 //! cannot introduce a writer: nothing here reads a signing key out of a descriptor or a manifest.
 
 mod generations;
+mod material;
 mod produce;
 mod recipients;
 mod restore;
@@ -54,6 +60,10 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration};
 use kr_protocol::scalars::KeyId;
 
 pub use crate::backup::generations::{CheckpointSource, GenerationStanding, RestoreGeneration};
+pub use crate::backup::material::{
+    Admission, Material, RestoreAdmissions, RestoreLimits, admit_for_restore, may_back_up,
+    may_restore,
+};
 pub use crate::backup::produce::{
     ArchivePlan, ObjectSource, RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, ResumeDecision, ResumedObject,
     SealedArchive, StagedObject, resume_object, seal_archive, stage_object,
