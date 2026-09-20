@@ -1215,23 +1215,9 @@ fn nested_repositories<'a>(
         return Err(unplaceable("this working tree"));
     }
     refused.insert((reported.device, reported.file_id));
-    // **The handle this repository's identity was read through**, not the path it was read from. A
-    // path resolved a second time can reach a different object: something mounted over the
-    // administrative directory while this ran would be the thing this scan accounted for, and the
-    // data it covered would go unexamined. The handle cannot be covered, and this one's object is
-    // what the recorded identity names, so an open that reached anything else refused before this
-    // capture began.
-    let common = repository
-        .git_dir()
-        .try_clone()
-        .and_then(AuthorisedDirectory::confined_to_one_mount)
-        .map_err(|_| unplaceable("this repository's own data"))?;
-    // And this worktree's own directory, which nothing records. This host reaches it itself, from
-    // the tree's own `.git`, and requires what it reached to be the object Git reported: two
-    // answers about where this worktree keeps its data, agreeing. It is seeded whether or not it
-    // is the same object as the common one, because the seed is what this host reached rather
-    // than what it was handed.
-    let own = own_directory(tree, repository.own_dir())?;
+    // Both administrative directories, reached from the tree's own `.git` rather than taken from
+    // a pathname, and required to be the objects Git reported.
+    let (own, common) = administrative_directories(tree, repository)?;
     for held in [&common, &own] {
         // Outside this working tree or inside it, the object is the object, and it goes in
         // unconditionally: what decides anything later is whether a directory this capture opens
@@ -1322,61 +1308,141 @@ fn nested_repositories<'a>(
     Ok(found)
 }
 
-/// Returns this working tree's **own** administrative directory, reached by this host rather than
-/// taken from a path, and refuses the capture when the two answers about it disagree.
+/// Returns this repository's two administrative directories, reached from the working tree's own
+/// `.git` and then required to be the objects Git reported.
 ///
-/// The common directory needs none of this: it is the object this repository's recorded identity
-/// names, so an open that reached anything else refused before a capture began. Nothing records
-/// this worktree's own directory, and Git reports it as a path. A directory covered by a mount
-/// while that path was opened would then be the object a scan accounted for, while the data it
-/// covered went unexamined and its files were captured as ordinary content.
+/// Nothing here starts from a pathname Git handed over. A path is a name, and a name can be made
+/// to reach a different object between one open and the next: a directory covered while this host
+/// opened it would be the object a scan accounted for, while the data it covered went unexamined
+/// and its files were captured as ordinary content. So this host walks to both directories itself,
+/// from the one entry every working tree has, and each step is an open of one component against
+/// the handle above it with no link followed:
 ///
-/// So this host reaches the directory from the tree's own `.git`: the directory itself where a
-/// repository keeps it there, the directory that file names where it names one inside the tree,
-/// and where it names one outside the tree, the object at that name. Whichever it reaches has to
-/// be the object Git reported, and anything else refuses. Two answers taken at different moments
-/// agreeing is what a cover cannot arrange: a cover in place for only one of them makes them
-/// differ, and one still in place while this capture reads the tree is refused by the mount
-/// comparison every read of the tree carries.
-fn own_directory(
+/// * `.git` is a directory — that is this worktree's own administrative directory;
+/// * `.git` is a file naming a place **inside** this tree — descended from the tree's own handle,
+///   which compares every step with the tree's mount, as a content read does;
+/// * `.git` is a file naming a place outside it — walked from the root of that name, component by
+///   component, refusing a link at each. Outside the tree there is no mount to compare with, so
+///   what stands in its place is the identity: it has to be the object Git reported.
+///
+/// Where the shared directory is is then read from the private one's own `commondir`, resolved the
+/// same way, and it too has to be the object Git reported — which for the shared directory is the
+/// object this repository's recorded identity names, so an open that reached anything else refused
+/// before this capture began.
+///
+/// # Errors
+///
+/// Refuses the capture when either directory cannot be reached this way, when a step is a link or
+/// crosses a mount inside the tree, or when what was reached is not what Git reported.
+fn administrative_directories(
     tree: &AuthorisedDirectory,
-    reported: &AuthorisedDirectory,
-) -> Result<AuthorisedDirectory> {
+    repository: &OpenedRepository,
+) -> Result<(AuthorisedDirectory, AuthorisedDirectory)> {
     let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
-    let reached = match tree.probe(&administrative) {
-        // Where a repository keeps its own data beside its tree.
+    let stack = match tree.probe(&administrative) {
         Ok(kr_transfer::authority::ObjectKind::Directory) => {
-            open_beneath(tree, &administrative, ".git")?
-                .map_err(|_| unplaceable("this repository's own data"))?
+            let mut stack = vec![clone_of(tree)?];
+            stack.push(
+                open_beneath(tree, &administrative, ".git")?
+                    .map_err(|_| unplaceable("this repository's own data"))?,
+            );
+            stack
         }
-        // Or wherever the file that stands in for it says.
         Ok(kr_transfer::authority::ObjectKind::File) => {
             let target = read_target(".git", tree, &administrative)?;
             if std::path::Path::new(&target).is_absolute() {
-                // Named from outside this tree, which no descent from this handle reaches. The
-                // object at that name is opened and then required to be the reported one.
-                AuthorisedDirectory::open_root(tree.environment_id(), std::path::Path::new(&target))
-                    .and_then(AuthorisedDirectory::confined_to_one_mount)
-                    .map_err(|_| unplaceable("this repository's own data"))?
+                from_root(&target, tree.environment_id())?
             } else {
-                let from = vec![clone_of(tree)?];
-                let stack = resolve_target(from, ".git", tree, &administrative)?
-                    .ok_or_else(|| unplaceable("this repository's own data"))?;
-                let last = stack
-                    .last()
-                    .ok_or_else(|| unplaceable("this repository's own data"))?;
-                clone_of(last)?
+                resolve_target(vec![clone_of(tree)?], ".git", tree, &administrative)?
+                    .ok_or_else(|| unplaceable("this repository's own data"))?
             }
         }
         // A tree whose own data this host cannot find from the tree is one it does not read
         // around: it would be excluding what it was handed rather than what is there.
         _ => return Err(unplaceable("this repository's own data")),
     };
-    if identity_of(&reached) == identity_of(reported) {
-        Ok(reached)
-    } else {
-        Err(unplaceable("this repository's own data"))
+    let own = stack
+        .last()
+        .ok_or_else(|| unplaceable("this repository's own data"))?;
+    if identity_of(own) != identity_of(repository.own_dir()) {
+        return Err(unplaceable("this repository's own data"));
     }
+    // And what every worktree of this repository shares, named by the private directory itself.
+    let commondir = RelativeName::parse("commondir")?;
+    let common = match own.probe(&commondir) {
+        // It keeps everything in the one place.
+        Err(kr_transfer::Escape::NotFound { .. }) => clone_of(own)?,
+        Ok(_) => {
+            let target = read_target("commondir", own, &commondir)?;
+            let reached = if std::path::Path::new(&target).is_absolute() {
+                from_root(&target, tree.environment_id())?
+            } else {
+                resolve_target(clone_stack(&stack)?, "commondir", own, &commondir)?
+                    .ok_or_else(|| unplaceable("this repository's own data"))?
+            };
+            let last = reached
+                .last()
+                .ok_or_else(|| unplaceable("this repository's own data"))?;
+            clone_of(last)?
+        }
+        Err(_) => return Err(unplaceable("this repository's own data")),
+    };
+    if identity_of(&common) != identity_of(repository.git_dir()) {
+        return Err(unplaceable("this repository's own data"));
+    }
+    // Each one's own mount, so a mount **inside** either of them is refused when it is walked.
+    let own = clone_of(own)?
+        .confined_to_one_mount()
+        .map_err(|_| unplaceable("this repository's own data"))?;
+    let common = common
+        .confined_to_one_mount()
+        .map_err(|_| unplaceable("this repository's own data"))?;
+    Ok((own, common))
+}
+
+/// Returns the handles from the root of an absolute name down to what it names, step by step.
+///
+/// A place named from outside this working tree is not reachable from the tree's own handle, and
+/// opening the whole name in one call would follow whatever each component is at the instant it is
+/// resolved. So it is walked the way everything else here is: one component against the handle
+/// above it, refusing a link at each. A name with a `.` or a `..` in it is refused rather than
+/// followed, because what those reach depends on what the components around them are.
+fn from_root(
+    target: &str,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> Result<Vec<AuthorisedDirectory>> {
+    let mut root = std::path::PathBuf::new();
+    let mut names: Vec<String> = Vec::new();
+    for component in std::path::Path::new(target).components() {
+        match component {
+            std::path::Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            std::path::Component::RootDir => root.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::Normal(name) => {
+                let Some(name) = name.to_str() else {
+                    return Err(unplaceable("this repository's own data"));
+                };
+                names.push(name.to_owned());
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(unplaceable("this repository's own data"));
+            }
+        }
+    }
+    let mut stack = vec![
+        AuthorisedDirectory::open_root(environment_id, &root)
+            .map_err(|_| unplaceable("this repository's own data"))?,
+    ];
+    for name in names {
+        let step = RelativeName::parse(&name)?;
+        let here = stack
+            .last()
+            .ok_or_else(|| unplaceable("this repository's own data"))?;
+        let next = here
+            .subdirectory(&step)
+            .map_err(|_| unplaceable("this repository's own data"))?;
+        stack.push(next);
+    }
+    Ok(stack)
 }
 
 /// Adds the identity of every directory beneath one administrative directory, and refuses a
@@ -1587,8 +1653,21 @@ fn reading_paths(reading: &Reading) -> impl Iterator<Item = &str> {
 /// # Errors
 ///
 /// Returns whatever this host's own accounting of the tree refuses.
-pub fn administrative_here(repository: &OpenedRepository, paths: &[String]) -> Result<Vec<String>> {
-    let nested = nested_repositories(repository, paths.iter().map(String::as_str))?;
+pub fn administrative_here(
+    profile: &RestrictedProfile,
+    repository: &OpenedRepository,
+    paths: &[String],
+) -> Result<Vec<String>> {
+    // The whole tree, not only the paths the caller named. A repository nested here can keep its
+    // own data under a name **no requested path goes near**: the directory that holds the data is
+    // one the request never mentions, and the repository that owns it is found by looking at the
+    // tree rather than at the request. So discovery sees everything this repository's own reading
+    // sees, with the requested paths added to it.
+    let reading = Reading::take(profile, repository, &FileGrant::default(), None)?;
+    let nested = nested_repositories(
+        repository,
+        reading_paths(&reading).chain(paths.iter().map(String::as_str)),
+    )?;
     Ok(paths
         .iter()
         .filter(|path| {

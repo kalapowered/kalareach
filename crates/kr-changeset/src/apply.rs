@@ -656,7 +656,10 @@ fn preflight(
         .map(|affected| affected.path.clone())
         .chain(carried.iter().map(|entry| entry.path.clone()))
         .collect();
-    if let Some(path) = crate::capture::administrative_here(&repository, &named)?.first() {
+    if let Some(path) =
+        crate::capture::administrative_here(service.project().profile(), &repository, &named)?
+            .first()
+    {
         return Err(ChangeSetError::Unsupported {
             detail: format!(
                 "{} is this repository's own administrative data at this destination, or the tree \
