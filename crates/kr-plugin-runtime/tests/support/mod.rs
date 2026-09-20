@@ -306,10 +306,8 @@ impl Generation {
             "2036-01-01T00:00:00Z".parse().expect("a literal instant");
         let expires = root_expires;
 
-        let root_v2 = new_keys.root_document_with_version(
-            NonZeroU64::new(2).expect("two is not zero"),
-            root_expires,
-        );
+        let root_v2 = new_keys
+            .root_document_with_version(NonZeroU64::new(2).expect("two is not zero"), root_expires);
 
         let old_root_doc = self.keys.root_document(root_expires);
         let old_signed = SignedRole::new(
@@ -362,7 +360,8 @@ impl Generation {
             .map(|(_, bytes)| bytes.clone())
             .expect("a manifest");
         let manifest_digest = PayloadDigest::of(&manifest_bytes);
-        let entry = IndexEntry::from_manifest(&manifest, manifest_digest, manifest_bytes.len() as u64);
+        let entry =
+            IndexEntry::from_manifest(&manifest, manifest_digest, manifest_bytes.len() as u64);
         let index = CatalogueIndex {
             index_version: INDEX_VERSION,
             generation: RepositoryGeneration::new(2),
@@ -500,7 +499,9 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         let index_target = Target::from_path(targets.join("index.json"))
             .await
             .expect("an index target");
-        editor.add_target("index.json", index_target).expect("added");
+        editor
+            .add_target("index.json", index_target)
+            .expect("added");
 
         let vendor_key = TestKey::generate();
         let vendor_sources: Vec<Box<dyn KeySource>> = vec![Box::new(vendor_key.clone())];
@@ -571,7 +572,9 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
                 let target_name = format!("{prefix}/{name}");
                 let target_path = targets.join(&prefix).join(name);
                 let target = Target::from_path(&target_path).await.expect("a target");
-                editor.add_target(target_name.as_str(), target).expect("added");
+                editor
+                    .add_target(target_name.as_str(), target)
+                    .expect("added");
             }
         }
 

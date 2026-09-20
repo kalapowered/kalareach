@@ -275,8 +275,13 @@ pub async fn verify(
             let datastore_root = datastore.join("root.json");
             if let Ok(bytes) = std::fs::read(&datastore_root) {
                 if !bytes.is_empty() && bytes != enrolment.root {
-                    if let Ok(new_signed) = serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&bytes) {
-                        if let Ok(old_signed) = serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&enrolment.root) {
+                    if let Ok(new_signed) =
+                        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&bytes)
+                    {
+                        if let Ok(old_signed) = serde_json::from_slice::<
+                            tough::schema::Signed<tough::schema::Root>,
+                        >(&enrolment.root)
+                        {
                             if new_signed.signed.version > old_signed.signed.version {
                                 on_root_rotated(bytes)?;
                             }
@@ -303,8 +308,8 @@ pub async fn verify(
 
     let delegations = scope_delegations(&repository.targets().signed)?;
 
-    let index_record = resolve_target(&repository, INDEX_TARGET)?
-        .ok_or_else(|| CatalogueError::Untrusted {
+    let index_record =
+        resolve_target(&repository, INDEX_TARGET)?.ok_or_else(|| CatalogueError::Untrusted {
             detail: format!("the generation's metadata does not pin {INDEX_TARGET}"),
         })?;
     let mut targets = BTreeMap::new();
@@ -358,8 +363,8 @@ pub async fn verify(
         crate::catalogue::extract::check_declared(entry, ledger)?;
     }
     for name in declared_target_names(&index) {
-        let record = resolve_target(&repository, &name)?
-            .ok_or_else(|| CatalogueError::Untrusted {
+        let record =
+            resolve_target(&repository, &name)?.ok_or_else(|| CatalogueError::Untrusted {
                 detail: format!("target {name} could not be resolved through delegation"),
             })?;
         targets.insert(name, record);

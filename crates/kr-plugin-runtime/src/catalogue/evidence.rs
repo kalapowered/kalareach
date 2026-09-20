@@ -349,7 +349,8 @@ mod tests {
             state,
             source: EvidenceSource::SignedRecord,
             profile_digest: PayloadDigest::of(b"profile"),
-            statement: Summary::new("Qualified against ExternalApp 1.4").expect("a valid statement"),
+            statement: Summary::new("Qualified against ExternalApp 1.4")
+                .expect("a valid statement"),
         }
     }
 

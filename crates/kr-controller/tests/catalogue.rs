@@ -1243,18 +1243,12 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
 
     let expired = refusal(
         host.module
-            .write_frame(
-                &actor,
-                &req_expired,
-                Method::CataloguePin,
-                None,
-                || {
-                    Err(kr_protocol::error::ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "window expired",
-                    ))
-                },
-            )
+            .write_frame(&actor, &req_expired, Method::CataloguePin, None, || {
+                Err(kr_protocol::error::ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "window expired",
+                ))
+            })
             .await,
     );
     assert_eq!(expired.code, ErrorCode::PermissionDenied);

@@ -997,8 +997,14 @@ impl Catalogue {
         // this too. What it may not do is admit a different generation: a payload is fetched out
         // of the generation this host accepted, and one the repository has moved on from is an
         // absence rather than a quiet substitution.
-        let verified =
-            trust::verify(&enrolment, &datastore, &ledger, &self.transport, &mut |_| Ok(())).await?;
+        let verified = trust::verify(
+            &enrolment,
+            &datastore,
+            &ledger,
+            &self.transport,
+            &mut |_| Ok(()),
+        )
+        .await?;
         let index_digest = verified
             .index
             .digest()

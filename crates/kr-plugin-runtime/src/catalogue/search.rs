@@ -384,8 +384,14 @@ mod tests {
     #[test]
     fn an_exact_rule_beats_an_inferred_one() {
         let catalogue = index(vec![
-            entry("guess", vec![rule("a", "sampletool", MatchConfidence::Inferred)]),
-            entry("exact", vec![rule("b", "sampletool", MatchConfidence::Exact)]),
+            entry(
+                "guess",
+                vec![rule("a", "sampletool", MatchConfidence::Inferred)],
+            ),
+            entry(
+                "exact",
+                vec![rule("b", "sampletool", MatchConfidence::Exact)],
+            ),
         ]);
         let lookup = MatchIndex::build(&catalogue);
         let found = lookup.candidates(&Observation {
@@ -427,11 +433,17 @@ mod tests {
 
     #[test]
     fn search_reads_the_whole_index_and_touches_nothing_else() {
-        let mut second = entry("custom-cli", vec![rule("a", "custom-cli", MatchConfidence::Exact)]);
+        let mut second = entry(
+            "custom-cli",
+            vec![rule("a", "custom-cli", MatchConfidence::Exact)],
+        );
         second.display_name = kr_plugin_sdk::text::Label::new("Custom CLI").expect("a valid label");
         second.version = PackageVersion::parse("0.2.0").expect("a valid version");
         let catalogue = index(vec![
-            entry("sampletool", vec![rule("a", "sampletool", MatchConfidence::Exact)]),
+            entry(
+                "sampletool",
+                vec![rule("a", "sampletool", MatchConfidence::Exact)],
+            ),
             second,
         ]);
         assert_eq!(search(&catalogue, "custom-cli", 10).len(), 1);

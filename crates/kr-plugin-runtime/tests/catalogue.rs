@@ -370,7 +370,9 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
         CapabilityCeiling::default_ceiling(),
     )
     .expect("enrollable");
-    catalogue2.enrol(enrolment2, true).expect("enrolled with root v1");
+    catalogue2
+        .enrol(enrolment2, true)
+        .expect("enrolled with root v1");
 
     generation.withhold_root_v2();
     let refusal = catalogue2
@@ -389,7 +391,10 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
         .expect("sync generation 2 advances root to v2");
     assert_eq!(outcome2.generation.get(), 2);
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&catalogue2.repository(&repository()).expect("enrolled").root).expect("readable"),
+        serde_json::from_slice::<serde_json::Value>(
+            &catalogue2.repository(&repository()).expect("enrolled").root
+        )
+        .expect("readable"),
         serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
     );
 
@@ -425,7 +430,10 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
     // Restart retains root v2
     let mut restarted = Catalogue::open(&home.path().join("catalogue")).expect("reopenable");
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&restarted.repository(&repository()).expect("enrolled").root).expect("readable"),
+        serde_json::from_slice::<serde_json::Value>(
+            &restarted.repository(&repository()).expect("enrolled").root
+        )
+        .expect("readable"),
         serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
     );
 
@@ -2083,10 +2091,9 @@ async fn failed_index_fetch_must_keep_rotated_root() {
     let new_root = generation.rotate_root_to_v2(&KeySet::generate()).await;
     std::fs::remove_file(generation.targets_dir().join("index.json")).expect("removed index");
     assert!(catalogue.sync(&repository()).await.is_err());
-    let actual: serde_json::Value = serde_json::from_slice(
-        &catalogue.repository(&repository()).expect("enrolled").root,
-    )
-    .expect("json");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&catalogue.repository(&repository()).expect("enrolled").root)
+            .expect("json");
     let expected: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
     assert_eq!(
         actual["signed"]["version"], expected["signed"]["version"],
@@ -2110,10 +2117,9 @@ async fn failed_timestamp_fetch_must_keep_rotated_root() {
     std::fs::remove_file(generation.metadata_dir().join("timestamp.json"))
         .expect("removed timestamp");
     assert!(catalogue.sync(&repository()).await.is_err());
-    let actual: serde_json::Value = serde_json::from_slice(
-        &catalogue.repository(&repository()).expect("enrolled").root,
-    )
-    .expect("json");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&catalogue.repository(&repository()).expect("enrolled").root)
+            .expect("json");
     let expected: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
     assert_eq!(
         actual["signed"]["version"], expected["signed"]["version"],

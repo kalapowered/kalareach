@@ -38,7 +38,9 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActionId, ActorId, EnvironmentId, PluginId, RepositoryGeneration, RequestId};
+use kr_protocol::ids::{
+    ActionId, ActorId, EnvironmentId, PluginId, RepositoryGeneration, RequestId,
+};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::{Digest256, Nullable, U64};
 use serde::{Deserialize, Serialize};
@@ -97,7 +99,10 @@ fn read_action_record(
         Err(error) => {
             return Err(ProtocolError::new(
                 ErrorCode::StorageUnavailable,
-                format!("failed to read action record at {}: {error}", path.display()),
+                format!(
+                    "failed to read action record at {}: {error}",
+                    path.display()
+                ),
             ));
         }
     };
@@ -114,8 +119,9 @@ fn read_action_record(
             let bytes = unhex(&result_hex).ok_or_else(|| {
                 ProtocolError::new(ErrorCode::StorageUnavailable, "unreadable retained result")
             })?;
-            let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
-                .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+            let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT).map_err(|error| {
+                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
+            })?;
             Ok(Some(ParamsValue::new(value)))
         }
         ("applied", None, _) => Ok(Some(ParamsValue::empty())),
@@ -125,7 +131,9 @@ fn read_action_record(
         )),
         ("dispatching", _, _) => Err(ProtocolError::new(
             ErrorCode::OutcomeUnknown,
-            format!("action {action_id} is in progress or was interrupted; read status before retrying"),
+            format!(
+                "action {action_id} is in progress or was interrupted; read status before retrying"
+            ),
         )),
         _ => Err(ProtocolError::new(
             ErrorCode::OutcomeUnknown,
@@ -337,7 +345,10 @@ impl CatalogueModule {
                     ),
                     _ => ProtocolError::new(
                         ErrorCode::PermissionDenied,
-                        format!("{} is not a read this daemon serves", request.method.as_str()),
+                        format!(
+                            "{} is not a read this daemon serves",
+                            request.method.as_str()
+                        ),
                     ),
                 });
             }
@@ -375,7 +386,8 @@ impl CatalogueModule {
                     .map_err(ProtocolError::from)?;
                 let generation = active.map(|a| a.generation).unwrap_or(1);
                 let evidence_records = if let Ok(index) = catalogue.index(&installation.repository)
-                    && let Some(entry) = index.find(&plugin_id_of(&installation)?, &installation.version)
+                    && let Some(entry) =
+                        index.find(&plugin_id_of(&installation)?, &installation.version)
                 {
                     evidence(entry, &installation, generation)?
                 } else {
@@ -502,7 +514,9 @@ impl CatalogueModule {
         admission()?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
-        if let Some(retained) = read_action_record(catalogue.root(), actor_id, mutation.action_id, &digest)? {
+        if let Some(retained) =
+            read_action_record(catalogue.root(), actor_id, mutation.action_id, &digest)?
+        {
             return Ok(retained);
         }
         mark_dispatching(catalogue.root(), actor_id, mutation.action_id, &digest)?;
@@ -511,7 +525,13 @@ impl CatalogueModule {
             .await;
         match outcome {
             Ok(result) => {
-                settle_action(catalogue.root(), actor_id, mutation.action_id, &digest, &result)?;
+                settle_action(
+                    catalogue.root(),
+                    actor_id,
+                    mutation.action_id,
+                    &digest,
+                    &result,
+                )?;
                 Ok(result)
             }
             Err(error) => {
@@ -539,7 +559,8 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: &(impl Fn() -> Answer<()> + Send + Sync),
     ) -> Answer<ParamsValue> {
-        let mut admit = || admission().map_err(|e| CatalogueError::PermissionDenied { detail: e.message });
+        let mut admit =
+            || admission().map_err(|e| CatalogueError::PermissionDenied { detail: e.message });
         match method {
             Method::CatalogueAdd => {
                 let params: wire::CatalogueAddParams = typed(&mutation.params)?;
@@ -708,7 +729,12 @@ impl CatalogueModule {
                 let pin = params.package_digest.0.as_deref().map(digest).transpose()?;
                 admission()?;
                 let installation = catalogue
-                    .pin_package_with_admission(params.environment_id, &params.plugin_id, pin, &mut admit)
+                    .pin_package_with_admission(
+                        params.environment_id,
+                        &params.plugin_id,
+                        pin,
+                        &mut admit,
+                    )
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginPinResult {
                     plugin: summary_of(catalogue, &installation)?,
@@ -767,7 +793,12 @@ impl CatalogueModule {
                 recheck(confirmations, &confirmed, plan.action_digest(), "grant")?;
                 admission()?;
                 let installation = catalogue
-                    .set_grant_with_admission(params.environment_id, &params.plugin_id, grant, &mut admit)
+                    .set_grant_with_admission(
+                        params.environment_id,
+                        &params.plugin_id,
+                        grant,
+                        &mut admit,
+                    )
                     .map_err(ProtocolError::from)?;
                 let decisions = catalogue
                     .capabilities(

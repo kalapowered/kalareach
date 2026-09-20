@@ -309,11 +309,7 @@ impl Store {
             serde_json::to_vec(&active).map_err(|source| CatalogueError::StorageUnavailable {
                 detail: format!("the active generation could not be recorded: {source}"),
             })?;
-        write_atomically(
-            &self.root.join("staging"),
-            &self.active_path(),
-            &pointer,
-        )?;
+        write_atomically(&self.root.join("staging"), &self.active_path(), &pointer)?;
         Ok(active)
     }
 
@@ -692,8 +688,8 @@ fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResul
 fn flush_directory(path: &Path) -> CatalogueResult<()> {
     #[cfg(unix)]
     {
-        let directory = std::fs::File::open(path)
-            .map_err(|source| CatalogueError::storage(path, &source))?;
+        let directory =
+            std::fs::File::open(path).map_err(|source| CatalogueError::storage(path, &source))?;
         directory
             .sync_all()
             .map_err(|source| CatalogueError::storage(path, &source))?;
@@ -710,8 +706,8 @@ fn flush_tree(path: &Path) -> CatalogueResult<()> {
     #[cfg(unix)]
     {
         if path.is_dir() {
-            for entry in std::fs::read_dir(path)
-                .map_err(|source| CatalogueError::storage(path, &source))?
+            for entry in
+                std::fs::read_dir(path).map_err(|source| CatalogueError::storage(path, &source))?
             {
                 let entry = entry.map_err(|source| CatalogueError::storage(path, &source))?;
                 let entry_path = entry.path();
@@ -924,7 +920,7 @@ mod tests {
         let path = store.root.join(".lock");
         #[cfg(unix)]
         {
-            use rustix::fs::{flock, FlockOperation};
+            use rustix::fs::{FlockOperation, flock};
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
