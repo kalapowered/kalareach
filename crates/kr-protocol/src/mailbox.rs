@@ -14,9 +14,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use kr_cbor::CborError;
+
 use crate::ids::{EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId};
+use crate::pairing::{AuthorityRevisionRecord, RevocationRequest};
 use crate::scalars::{
-    Bytes, Digest256, KeyId, Nonce192, Nullable, StoredEnvelopeKey, TimestampMs, U64,
+    Bytes, Digest256, KeyId, Nonce192, Nullable, Signature64, StoredEnvelopeKey, TimestampMs, U64,
 };
 
 /// The envelope format this build writes and reads.
@@ -108,6 +111,70 @@ impl MailboxPayloadType {
             | Self::StateReference
             | Self::NotificationPreview
             | Self::SyncChange => false,
+        }
+    }
+}
+
+/// What the payload of a `signed_authority_object` envelope decodes as.
+///
+/// Section 20 signs an authorisation-bearing payload **before** encryption, so pairwise message
+/// authentication can never substitute for an issuer's grant signature. The set is closed, and it
+/// is closed on one property: every member carries its issuer's key identifier and a signature
+/// over a domain-separated transcript of its own fields. A payload outside it carries no authority
+/// a reader could check, so the mailbox does not forward it as authority.
+///
+/// Nothing here is authority by arriving. [`Self::issuer_key_id`] names the key the signature must
+/// verify under, and a reader resolves that name through the authority it already holds: section
+/// 19 makes content data, and the envelope supplies no key of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ForwardedAuthority {
+    /// A remote owner's signed revocation request.
+    RevocationRequest(RevocationRequest),
+    /// One ordered authority revision a host issued.
+    AuthorityRevision(AuthorityRevisionRecord),
+}
+
+impl ForwardedAuthority {
+    /// Returns the key identifier of the issuer whose signature covers this object.
+    ///
+    /// It is a name, not a key. What it names is resolved against the reader's own authority
+    /// records; an object that names a key the reader does not hold is refused rather than trusted.
+    #[must_use]
+    pub const fn issuer_key_id(&self) -> KeyId {
+        match self {
+            Self::RevocationRequest(request) => request.issuer_key_id,
+            Self::AuthorityRevision(record) => record.host_key_id,
+        }
+    }
+
+    /// Returns the issuer's signature over [`Self::signing_input`].
+    #[must_use]
+    pub const fn signature(&self) -> Signature64 {
+        match self {
+            Self::RevocationRequest(request) => request.signature,
+            Self::AuthorityRevision(record) => record.signature,
+        }
+    }
+
+    /// Returns the domain the signature covers.
+    #[must_use]
+    pub const fn domain(&self) -> &'static str {
+        match self {
+            Self::RevocationRequest(_) => crate::pairing::REVOCATION_DOMAIN,
+            Self::AuthorityRevision(_) => crate::pairing::AUTHORITY_REVISION_DOMAIN,
+        }
+    }
+
+    /// Builds the canonical bytes this object's signature covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the object cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
+        match self {
+            Self::RevocationRequest(request) => request.signing_input(),
+            Self::AuthorityRevision(record) => record.signing_input(),
         }
     }
 }

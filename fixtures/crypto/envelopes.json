@@ -1,4 +1,62 @@
 {
+  "authority_object": {
+    "description": "A signed revocation request forwarded in a mailbox envelope. The issuer's signature is what authorises it; the envelope only delivers it, and a reader resolves the issuer key identifier through its own authority records rather than through anything the envelope carries.",
+    "envelope": {
+      "opened_at_ms": 1764000100000,
+      "plaintext_json": {
+        "created_at_ms": "1764000100000",
+        "envelope_id": "25252525-2525-2525-2525-252525252525",
+        "environment_id": null,
+        "expires_at_ms": "1764000700000",
+        "grant_id": "26262626-2626-2626-2626-262626262626",
+        "payload": "oXJyZXZvY2F0aW9uX3JlcXVlc3SnZnRhcmdldKFmZ3JhbnRzoWlncmFudF9pZHOBUCYmJiYmJiYmJiYmJiYmJiZpc2lnbmF0dXJlWEBVcqUD02oGh0S14B8F_IO3TFf_vRz1nXrL4CwlRItZmQIXT4pSbz5x6-s6DZTdKGwpP1ryGuCYbc62FacmGLUKanJlcXVlc3RfaWRQJycnJycnJycnJycnJycnJ2xpc3N1ZWRfYXRfbXMbAAABmraZbqBtaXNzdWVyX2tleV9pZFgg2zzJls3aOBwVcPM2azV5Tutp51e7Eff_TU2sOqEHM1luaG9zdF9kZXZpY2VfaWRQKSkpKSkpKSkpKSkpKSkpKXBpc3N1ZXJfZGV2aWNlX2lkUCgoKCgoKCgoKCgoKCgoKCg",
+        "payload_type": "signed_authority_object",
+        "recipient_key_id": "vRrTv0ognZUizFntkUy4A42g62ItvWIH0T2cHzVbSTs",
+        "sender_key_id": "Zl74JqVAQ1qLlpm9sYxgxsXcbGFS95j3pm74MRPRYlI",
+        "session_epoch": null,
+        "session_id": null,
+        "thread_id": null,
+        "version": "kr-mailbox/1"
+      },
+      "sealed_json": {
+        "ciphertext": "Y1wpXTMDihMTuz9QE61vPJHxfeoniVc2TBzkZfT3RgjouH5s3K4wJFZTHqbldsYTweVE_jnIMvWziul8cA3iRXjBqx3ocFuFfTueZZIvWWkvZSB5ot78YWf4eB8_o9hmgyCtlamkYvdXAW1p78yYTwjeB-B9VxPMeIOURdpyX5-MjhHP9aL_EExP6Go5YZaEdl2_JH-QLj5AqJHkTniH5NqxDGE6KLV5dZkRTjS3j7E7uCASqPh6YJCqte5k9FIppfVtDrClTWeorH5SRE68TYv96Bv-G4R5cp_BcDmdc-_LNic3kUuOA9o5uO_Wx07El8UUsvVbEIPZr74RJEvq1D9EHiJehe8DYQhxVCTFKTFZftM2NiuIvncilBKsYoALpgH5ChlKGwIRsNb7retJShf8ZANCpYSvtgo0bzb8rCeRdVZ-tPxQ2G4CUwdw9wIHH1mleE_Vkrv4KJLYl-oJk9emHw_gvsaOSGdcQWR6u856Il2NOmGAiDJ2Yln4oEl13Z4Spq_qibwehxeoHq6aRalN6-C0Pd5uPPwM90e5WKiT04Eo-oMAp2LW0sryygznu0kTKK-YJYjCxz6MW8mYEq7Q3jwXNrRAcBl0SlU45u0iiEPkbgwnO5O1b3_UhCfLdNnvo4ajUI0ykjTUNKkg7lB8_0orAvNSKy6Dld5ukrHsqZmhAj3Sv0FumWCjuMv_lxn3L7jA6-UZsA26Ip4JCNgu3uZ96_NDahxxB600C7JwR-eWpAvH1rsxERwziiRMh3avhKYnSESN_Tt57D_MgZOqcd0Yn0SNurbk4Yhb7dNtrPjqKxJrm0CR0xxiZ5AvnLXgpcVWXQwUrVgwh5irN9qKTmI_TqTkdxyORzUiajXRHSOiFXpDi_qdNh6NyyyRwBZQg1VgIA_O1nYhugm0Dvkc5YK6LNVQTW1u5nnNjf7EbhTIair0uorxkFnVzjxhMvMRtRkQoH2jUYNG1Lwuq4tpHoV1yjdLQ9hoX3xpEcWeMsKmzrcZ70mUQkOWu8NQTVEvHq0pX6pg618QD0WgqSnMAQ1SxWlsEPO0GgPQACq1_-r7HMptZwYB5g5OPsEhUoFq2Aj9GK_FSqEKOAkfLoJbe9dfyTBs-mghSmSeg7lmnJA4TX4mRQxjvblxNqWI_UEQeIpnCu9LFq4EO7xVTNm82X5A9WkhgtQjEfO3pBNTvS-BR7hfAD5vIcmpfHUceoqMC9L9i-3uza_mpHiy7CxfC5wqWoQ-MCeWtFZRl88QT_Gd3tojjzfMwrOH6cur_f_2bSAU5ZwG2aW4JQxoXydeAIR29N6Nr-EjaO9oPmC_p5RsYIA6yOgPt6Rvuw365puF2jMkT3GfhuEAjT0_luAVHl0ATDfwOZD4Elh2u1w",
+        "nonce": "x8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fH",
+        "routing": {
+          "envelope_id": "25252525-2525-2525-2525-252525252525",
+          "expires_at_ms": "1764000700000",
+          "payload_type": "signed_authority_object",
+          "recipient_key_id": "vRrTv0ognZUizFntkUy4A42g62ItvWIH0T2cHzVbSTs",
+          "sender_key_id": "Zl74JqVAQ1qLlpm9sYxgxsXcbGFS95j3pm74MRPRYlI",
+          "size_bucket_bytes": "1024",
+          "thread_id": null
+        }
+      }
+    },
+    "issuer": {
+      "key_id_hex": "db3cc996cdda381c1570f3366b35794eeb69e757bb11f7ff4d4dac3aa1073359",
+      "public_key_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"
+    },
+    "object_json": {
+      "revocation_request": {
+        "host_device_id": "29292929-2929-2929-2929-292929292929",
+        "issued_at_ms": "1764000100000",
+        "issuer_device_id": "28282828-2828-2828-2828-282828282828",
+        "issuer_key_id": "2zzJls3aOBwVcPM2azV5Tutp51e7Eff_TU2sOqEHM1k",
+        "request_id": "27272727-2727-2727-2727-272727272727",
+        "signature": "VXKlA9NqBodEteAfBfyDt0xX_70c9Z16y-AsJUSLWZkCF0-KUm8-cevrOg2U3ShsKT9a8hrgmG3OthWnJhi1Cg",
+        "target": {
+          "grants": {
+            "grant_ids": [
+              "26262626-2626-2626-2626-262626262626"
+            ]
+          }
+        }
+      }
+    },
+    "payload_canonical_hex": "a1727265766f636174696f6e5f72657175657374a766746172676574a1666772616e7473a1696772616e745f696473815026262626262626262626262626262626697369676e617475726558405572a503d36a068744b5e01f05fc83b74c57ffbd1cf59d7acbe02c25448b599902174f8a526f3e71ebeb3a0d94dd286c293f5af21ae0986dceb615a72618b50a6a726571756573745f696450272727272727272727272727272727276c6973737565645f61745f6d731b0000019ab6996ea06d6973737565725f6b65795f69645820db3cc996cdda381c1570f3366b35794eeb69e757bb11f7ff4d4dac3aa10733596e686f73745f6465766963655f69645029292929292929292929292929292929706973737565725f6465766963655f69645028282828282828282828282828282828",
+    "signing_domain": "kr-revocation/1",
+    "signing_input_hex": "876f6b722d7265766f636174696f6e2f31502727272727272727272727272727272750282828282828282828282828282828285029292929292929292929292929292929a1666772616e7473a1696772616e745f6964738150262626262626262626262626262626261b0000019ab6996ea05820db3cc996cdda381c1570f3366b35794eeb69e757bb11f7ff4d4dac3aa1073359"
+  },
   "description": "Mailbox envelope and backup key wrap encodings, sealed with crypto_box_easy under fixed test keys and nonces.",
   "envelope": {
     "canonical_hex": "ad677061796c6f616458186b722d617574686f726974792d666565642d6368616e67656776657273696f6e6c6b722d6d61696c626f782f31686772616e745f69645022222222222222222222222222222222697468726561645f6964f66a73657373696f6e5f696450242424242424242424242424242424246b656e76656c6f70655f696450212121212121212121212121212121216c7061796c6f61645f7479706575617574686f726974795f666565645f6368616e67656d637265617465645f61745f6d731b0000019ab697e8006d657870697265735f61745f6d731b0000019ab6a10fc06d73656e6465725f6b65795f69645820665ef826a540435a8b9699bdb18c60c6c5dc6c6152f798f7a66ef83113d162526d73657373696f6e5f65706f6368016e656e7669726f6e6d656e745f6964502323232323232323232323232323232370726563697069656e745f6b65795f69645820bd1ad3bf4a209d9522cc59ed914cb8038da0eb622dbd6207d13d9c1f355b493b",

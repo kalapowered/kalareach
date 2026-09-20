@@ -23,6 +23,7 @@
 //!
 //! This reduces precision. It does not hide traffic patterns, and section 20 says so.
 
+mod authority;
 mod paired;
 
 use std::collections::BTreeMap;
@@ -41,6 +42,7 @@ use crate::keys::{StoredEnvelopeKeyPair, key_id};
 use crate::sealed;
 use crate::sodium;
 
+pub use authority::{AuthorityDirectory, verify_authority_payload};
 pub use paired::{PairedSenders, open_delivered_envelope};
 
 /// Seals one envelope for one recipient.

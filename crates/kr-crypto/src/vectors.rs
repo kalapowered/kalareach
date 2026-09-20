@@ -18,12 +18,15 @@ use kr_protocol::ids::{
     ArchiveId, BackupGeneration, BackupObjectId, EnvelopeId, EnvironmentId, GrantId, SessionEpoch,
     SessionId,
 };
+use kr_protocol::ids::{DeviceId, RevocationRequestId};
 use kr_protocol::mailbox::{
-    EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MailboxPayloadType, SealedEnvelope,
-    mailbox_size_bucket, notification_size_bucket,
+    EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, ForwardedAuthority, MailboxPayloadType,
+    SealedEnvelope, mailbox_size_bucket, notification_size_bucket,
 };
-use kr_protocol::pairing::KeyPurpose;
-use kr_protocol::scalars::{Bytes, Digest256, Nonce192, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::pairing::{KeyPurpose, RevocationRequest, RevocationTarget};
+use kr_protocol::scalars::{
+    Bytes, CanonicalSet, Digest256, Nonce192, Nullable, Signature64, TimestampMs, U64, Uuid,
+};
 use serde_json::{Value, json};
 
 use crate::error::{CryptoError, Result};
@@ -59,6 +62,10 @@ const RECIPIENT_ENVELOPE_SEED: [u8; 32] = [0xb4; 32];
 const ENVELOPE_NONCE: [u8; 24] = [0xc5; 24];
 /// The fixed nonce the key wrap vector uses.
 const KEY_WRAP_NONCE: [u8; 24] = [0xc6; 24];
+/// The fixed nonce the signed authority object's envelope uses.
+const AUTHORITY_ENVELOPE_NONCE: [u8; 24] = [0xc7; 24];
+/// The grant the signed authority object's envelope references.
+const AUTHORITY_GRANT: [u8; 16] = [0x26; 16];
 /// The test recovery seed.
 const RECOVERY_SEED: [u8; 32] = [0xd7; 32];
 /// The test seed of a relay instance key.
@@ -587,6 +594,96 @@ fn envelope_plaintext(
     })
 }
 
+/// The signed authority object the envelope vector forwards, and the envelope that carries it.
+///
+/// Section 20 signs an authorisation-bearing payload before encryption. The vector publishes the
+/// object, the exact bytes its signature covers and the envelope those bytes travel in, so a
+/// reader in either language can check that the signature is the issuer's own and that the
+/// envelope only delivers it.
+fn authority_object(
+    issuer: &AuthorisationKeyPair,
+    sender: &StoredEnvelopeKeyPair,
+    recipient: &StoredEnvelopeKeyPair,
+) -> Result<Value> {
+    let mut grant_ids = CanonicalSet::new();
+    grant_ids.insert(GrantId::new(Uuid::from_bytes(AUTHORITY_GRANT)));
+    let mut request = RevocationRequest {
+        request_id: RevocationRequestId::new(Uuid::from_bytes([0x27; 16])),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0x28; 16])),
+        host_device_id: DeviceId::new(Uuid::from_bytes([0x29; 16])),
+        target: RevocationTarget::Grants { grant_ids },
+        issued_at_ms: TimestampMs::new(1_764_000_100_000),
+        issuer_key_id: issuer.key_id(),
+        signature: Signature64::from_bytes([0; 64]),
+    };
+    let signing_input = request.signing_input()?;
+    request.signature = crate::sign::sign(
+        issuer,
+        &SigningTranscript::from_canonical_bytes(
+            kr_protocol::pairing::REVOCATION_DOMAIN,
+            signing_input.clone(),
+        )?,
+    )?;
+
+    let object = ForwardedAuthority::RevocationRequest(request);
+    let payload = kr_cbor::to_canonical_vec(&object)?;
+
+    let plaintext = EnvelopePlaintext {
+        version: EnvelopeVersion::V1,
+        envelope_id: EnvelopeId::new(Uuid::from_bytes([0x25; 16])),
+        sender_key_id: sender.key_id(),
+        recipient_key_id: recipient.key_id(),
+        payload_type: MailboxPayloadType::SignedAuthorityObject,
+        created_at_ms: TimestampMs::new(1_764_000_100_000),
+        expires_at_ms: TimestampMs::new(1_764_000_700_000),
+        grant_id: Nullable::some(GrantId::new(Uuid::from_bytes(AUTHORITY_GRANT))),
+        environment_id: Nullable::null(),
+        session_id: Nullable::null(),
+        session_epoch: Nullable::null(),
+        // A payload that carries authority is never coalesced, so it names no thread.
+        thread_id: Nullable::null(),
+        payload: Bytes::new(payload.clone()),
+    };
+    let (mut padded, bucket) = crate::envelope::pad_plaintext(&plaintext)?;
+    let ciphertext = sodium::box_easy(
+        &padded,
+        &AUTHORITY_ENVELOPE_NONCE,
+        recipient.public().as_bytes(),
+        sender.secret().expose(),
+    )?;
+    sodium::memzero(&mut padded);
+    let sealed = SealedEnvelope {
+        routing: EnvelopeRouting {
+            envelope_id: plaintext.envelope_id,
+            recipient_key_id: plaintext.recipient_key_id,
+            sender_key_id: plaintext.sender_key_id,
+            expires_at_ms: plaintext.expires_at_ms,
+            payload_type: plaintext.payload_type,
+            thread_id: plaintext.thread_id,
+            size_bucket_bytes: U64::new(bucket),
+        },
+        nonce: Nonce192::from_bytes(AUTHORITY_ENVELOPE_NONCE),
+        ciphertext: Bytes::new(ciphertext),
+    };
+
+    Ok(json!({
+        "description": "A signed revocation request forwarded in a mailbox envelope. The issuer's signature is what authorises it; the envelope only delivers it, and a reader resolves the issuer key identifier through its own authority records rather than through anything the envelope carries.",
+        "issuer": {
+            "public_key_hex": hex::encode(issuer.public().as_bytes()),
+            "key_id_hex": hex::encode(issuer.key_id().as_bytes()),
+        },
+        "object_json": serde_json::to_value(&object).expect("a forwarded object is serialisable"),
+        "signing_input_hex": hex::encode(&signing_input),
+        "signing_domain": kr_protocol::pairing::REVOCATION_DOMAIN,
+        "payload_canonical_hex": hex::encode(&payload),
+        "envelope": {
+            "plaintext_json": serde_json::to_value(&plaintext).expect("an envelope is serialisable"),
+            "opened_at_ms": plaintext.created_at_ms.get(),
+            "sealed_json": serde_json::to_value(&sealed).expect("a sealed envelope is serialisable"),
+        },
+    }))
+}
+
 fn envelopes() -> Result<Value> {
     let sender = envelope_sender_key()?;
     let recipient = envelope_recipient_key()?;
@@ -670,6 +767,7 @@ fn envelopes() -> Result<Value> {
             "opened_at_ms": plaintext.created_at_ms.get(),
             "sealed_json": serde_json::to_value(&sealed_envelope).expect("a sealed envelope is serialisable"),
         },
+        "authority_object": authority_object(&host_authorisation_key()?, &sender, &recipient)?,
         "key_wrap": {
             "description": "One manifest key wrap: CBOR([context, object_key]) sealed for the recipient.",
             "object_key_hex": hex::encode(OBJECT_KEY),
