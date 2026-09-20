@@ -994,4 +994,42 @@ fn a_macos_access_control_list_preserves_acl_level_flags() {
         }
         _ => panic!("expected Apple ACL"),
     }
+
+    // Second: A 44-byte fixture with zero entries and a nonzero ACL flag (e.g. ACL_FLAG_DEFER_INHERIT = 1).
+    // Exercises preservation of ACL-level flags on empty entry lists without discarding as absence.
+    let zero_name = RelativeName::parse("zero_entries_flagged.txt").expect("a name");
+    std::fs::write(
+        root.path().join("zero_entries_flagged.txt"),
+        b"zero_entries\n",
+    )
+    .expect("a file");
+    let file_zero = authority.open_write(&zero_name).expect("opens write");
+
+    let mut raw_zero = vec![0_u8; 44];
+    raw_zero[0..4].copy_from_slice(&0x012c_c16d_u32.to_ne_bytes());
+    raw_zero[36..40].copy_from_slice(&0_u32.to_ne_bytes());
+    raw_zero[40..44].copy_from_slice(&1_u32.to_ne_bytes());
+    let acl_zero =
+        kr_transfer::AppleAcl::from_bytes(&raw_zero).expect("valid 44-byte zero-entry flagged acl");
+    assert_eq!(acl_zero.entry_count(), 0);
+    assert_eq!(acl_zero.flags(), 1);
+    assert!(!acl_zero.has_entries());
+    assert!(acl_zero.has_flags());
+
+    file_zero
+        .set_access_control(&kr_transfer::AccessControl::Apple(acl_zero.clone()))
+        .expect("setting a zero-entry flagged acl succeeds");
+    drop(file_zero);
+
+    // On macOS APFS, assigning an ACL with 0 entries via acl_set_fd clears the ACL from the inode
+    // (POSIX.1e / Darwin convention where acl_init(0) deletes the ACL), so reading from the descriptor
+    // reports no ACL.
+    let read_zero = authority
+        .open_read(&zero_name, ObjectPolicy::ReadableFile)
+        .expect("opens read");
+    assert_eq!(
+        read_zero.access_control().expect("reads acl"),
+        kr_transfer::AccessControl::None,
+        "macOS filesystem clears ACL when entry count is zero"
+    );
 }

@@ -148,8 +148,10 @@ impl AppleAcl {
 /// Returns true when the file behind one descriptor carries an access-control list with entries or flags.
 ///
 /// A list with no entries and no flags says nothing mode bits do not, and is not one either.
+/// When inspecting the descriptor fails for any reason other than absence, returns true so the host
+/// does not report an unprotected destination when it could not establish protection.
 pub(crate) fn carries_access_control(fd: BorrowedFd<'_>) -> bool {
-    matches!(read_access_control(fd), Ok(Some(_)))
+    !matches!(read_access_control(fd), Ok(None))
 }
 
 /// Reads the access-control list from a descriptor, returning its lossless representation if it
@@ -172,8 +174,9 @@ pub(crate) fn read_access_control(fd: BorrowedFd<'_>) -> std::io::Result<Option<
         unsafe { acl_free(acl) };
         return Err(err);
     }
-    let mut buf = vec![0_u8; size as usize];
-    let written = unsafe { acl_copy_ext_native(buf.as_mut_ptr().cast(), acl, size) };
+    let u64_count = (size as usize).div_ceil(8);
+    let mut storage = vec![0_u64; u64_count];
+    let written = unsafe { acl_copy_ext_native(storage.as_mut_ptr().cast(), acl, size) };
     let err = if written <= 0 {
         Some(std::io::Error::last_os_error())
     } else {
@@ -183,8 +186,9 @@ pub(crate) fn read_access_control(fd: BorrowedFd<'_>) -> std::io::Result<Option<
     if let Some(err) = err {
         return Err(err);
     }
-    buf.truncate(written as usize);
-    let parsed = AppleAcl::from_bytes(&buf)
+    let byte_slice =
+        unsafe { core::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), written as usize) };
+    let parsed = AppleAcl::from_bytes(byte_slice)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.0))?;
     if !parsed.has_entries() && !parsed.has_flags() {
         return Ok(None);
@@ -278,5 +282,13 @@ mod tests {
         let ok_entry = AppleAcl::from_bytes(&valid_68).expect("valid 68-byte acl with 1 entry");
         assert_eq!(ok_entry.entry_count(), 1);
         assert!(ok_entry.has_entries());
+    }
+
+    #[test]
+    fn read_failures_do_not_report_absence_in_carries_access_control() {
+        use std::os::fd::BorrowedFd;
+        let bad_fd = unsafe { BorrowedFd::borrow_raw(99999) };
+        assert!(read_access_control(bad_fd).is_err());
+        assert!(carries_access_control(bad_fd));
     }
 }
