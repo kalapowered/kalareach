@@ -258,9 +258,17 @@ only: exactly three positional arguments — the reference, the new object and t
 object** — with `--no-deref` as the only option it accepts. A deletion (`-d`, `--delete`), a batch
 read from standard input (`--stdin`), an update with no expected old value, a fourth argument, and
 any abbreviation of those long options are each refused by name, as `--force` in any form and an
-attached `-c` are refused for every subcommand. The invocation runs with the repository's Git
-common directory as its working directory and a write grant for that directory alone: the working
-tree is not writable by it.
+attached `-c` are refused for every subcommand. The reference is named in full, as `refs/...`, and
+`@` is an ordinary character in it: only Git's own `@{` reflog and upstream syntax is refused,
+because that names something other than the reference. Each object is a **full object name in the
+format the repository itself writes**, forty hexadecimal characters or sixty-four, read from the
+repository before the invocation is built; a name of the other length is refused, because Git would
+resolve it as a revision and a reference whose own name is that many hexadecimal characters would
+then decide what moved. The null object in either position is refused for what it is: as the new
+value it deletes the reference and as the expected old value it asserts the reference is absent,
+and this service moves one reference that exists to one object that exists. The invocation runs
+with the repository's Git common directory as its working directory and a write grant for that
+directory alone: the working tree is not writable by it.
 
 ### Cleanup and retention
 
@@ -988,9 +996,7 @@ invocation, writes to no working tree and removes nothing. `commit`, `push`, `re
 
 A version is not deleted while anything the change-set store holds names it: a materialisation that
 has not been released, a review acknowledgement or any other evidence, a later version derived from
-it, a recorded result, or an apply that names it on either side. A pin the project service holds
-against the workspace is read before the deletion and refuses it, and the paragraph after this one
-says what that reading is and what is left. The
+it, a recorded result, or an apply that names it on either side. The
 counting and the removal are one transaction inside the change-set store, and a materialisation, a
 result with both the version it attests and the reading it carries beside it, a derived version and
 an apply with every version it names on either side are each written under a check, in the same
@@ -998,8 +1004,8 @@ transaction, that those versions are still there — so a holder recorded while 
 deciding is either counted or refused, and never left pointing at something that is gone.
 
 The project service's pin lives in another store, and the two stores do not share a transaction.
-What the project service offers instead is a pair of **guarded** operations that take one lock in
-one order. The pins against a change set are read with the project journal held, and whatever the
+What the project service offers is a pair of **guarded** operations that take one lock in one
+order. The pins against a change set are read with the project journal held, and whatever the
 caller does with them happens inside that hold; a pin is recorded with the same journal held, under
 the caller's own answer to "is this version still there", asked inside that hold. So a pin is
 either recorded before the reading, where it is counted, or refused because the version it names
@@ -1007,6 +1013,11 @@ has gone. The pins are found by the change set they name rather
 than through the workspace that holds them, so the reading does not depend on knowing which
 workspaces to ask about: recording one pin twice is one pin, and two pins whose reasons read alike
 are two pins.
+
+The change-set store calls neither of them: a deletion there reads the pins of the workspace the
+version was captured in, without either hold, so a pin recorded against another workspace while a
+deletion decides is not counted. Closing that is the change-set store's own change, as the caller
+of both operations above.
 
 ### Authority, and where it is decided
 
