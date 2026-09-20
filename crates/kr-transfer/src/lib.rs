@@ -91,7 +91,7 @@ mod windows;
 mod apple;
 
 pub use crate::authority::{
-    AuthorisedDirectory, AuthorisedFile, Escape, ObjectIdentity, ObjectPolicy, Privacy,
+    AuthorisedDirectory, AuthorisedFile, Escape, MountId, ObjectIdentity, ObjectPolicy, Privacy,
     RelativeName,
 };
 pub use crate::clock::{Clock, ManualClock, SystemClock};

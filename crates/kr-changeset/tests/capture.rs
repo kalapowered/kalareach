@@ -1402,10 +1402,171 @@ fn a_repository_whose_own_data_holds_a_link_is_not_captured_around() {
             None,
         )
         .expect_err("a repository whose own data holds a link is not captured around");
+    let said = failure.to_string();
     assert!(
-        failure.to_string().contains("cannot account for"),
-        "the refusal says why: {failure}"
+        said.contains("cannot account for") && said.contains("holds a link at"),
+        "the refusal names the link it found: {failure}"
     );
+}
+
+/// KR-REQ-14.33 and D-087d: a directory already excluded is still looked inside.
+///
+/// Being excluded and having been looked at are different questions. A nested worktree **inside**
+/// a repository's own data is excluded the moment it is discovered, and it can still hold a link
+/// out at the tree that nothing has seen. The layout below is the whole of it: `vendor` is a
+/// repository's data kept under an ordinary name, `vendor/logs` is a worktree of it, and the link
+/// inside that worktree makes `history` the place the reflogs are written. Read around, the tree's
+/// own `history/heads/main` is administrative data under an ordinary path.
+#[test]
+fn a_directory_already_excluded_is_still_looked_inside() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "excluded-and-unseen");
+    // A repository's own data under an ordinary name, which is the outer capture's content.
+    write(&path, "vendor/HEAD", "ref: refs/heads/main\n");
+    write(&path, "vendor/config", "[core]\n\trepositoryformatversion = 0\n");
+    std::fs::create_dir_all(path.join("vendor/objects")).expect("its object directory");
+    std::fs::create_dir_all(path.join("vendor/refs/heads")).expect("its reference directory");
+    // A worktree of it, inside it, which discovery excludes before anything looks in it.
+    write(&path, "vendor/logs/.git", "gitdir: ..\n");
+    write(&path, "vendor/logs/note.txt", "a file this capture names\n");
+    // And the link out at the tree, which is the whole point of looking inside.
+    write(&path, "history/heads/main", "the reflog this would alias\n");
+    std::os::unix::fs::symlink("../../history", path.join("vendor/logs/refs"))
+        .expect("a link out at the tree");
+
+    let workspace = fixture.workspace("excluded-and-unseen");
+    let failure = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect_err("a repository whose own data holds a link is not captured around");
+    let said = failure.to_string();
+    assert!(
+        said.contains("cannot account for") && said.contains("holds a link at"),
+        "the refusal names the link inside the directory it had already excluded: {failure}"
+    );
+}
+
+/// KR-REQ-14.33 and D-087d: a repository whose own data is on another filesystem is ordinary.
+///
+/// The mount comparison is between a directory and the directory it was opened beneath, never
+/// between a directory and the working tree. A repository can keep its data on another filesystem
+/// altogether, and every directory of that data is then on neither the tree's mount nor anything
+/// near it. What the rule refuses is a mount **inside** a tree, and this is not one.
+#[test]
+fn a_repository_whose_own_data_is_on_another_filesystem_is_captured() {
+    let fixture = Fixture::create();
+    let Some(elsewhere) = another_filesystem(fixture.work()) else {
+        println!("not exercised: this host offers no second filesystem to keep the data on");
+        return;
+    };
+    let data = elsewhere.path().join("data");
+    git_raw(
+        fixture.work(),
+        [
+            std::ffi::OsString::from("init"),
+            std::ffi::OsString::from("--initial-branch=main"),
+            std::ffi::OsString::from("--separate-git-dir"),
+            data.clone().into_os_string(),
+            std::ffi::OsString::from("data-elsewhere"),
+        ],
+    );
+    let path = fixture.work().join("data-elsewhere");
+    {
+        // The case is only the case while the two really are on different filesystems.
+        use std::os::unix::fs::MetadataExt as _;
+        let tree = std::fs::metadata(&path).expect("the tree").dev();
+        let held = std::fs::metadata(&data).expect("its data").dev();
+        assert_ne!(tree, held, "the data is on another filesystem from the tree");
+    }
+    write(&path, "README.md", "a repository whose data is somewhere else\n");
+    git_raw(&path, ["add", "-A"]);
+    git_raw(&path, ["commit", "-m", "the first commit"]);
+
+    let workspace = fixture.workspace("data-elsewhere");
+    let record = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect("a repository whose own data is on another filesystem is captured");
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest.paths.iter().any(|entry| entry.path == "README.md"),
+        "the tree's own content is in the version"
+    );
+    for entry in &manifest.paths {
+        assert!(
+            !entry.path.contains(".git"),
+            "and nothing of its administrative data is: {}",
+            entry.path
+        );
+    }
+}
+
+/// KR-REQ-14.33 and D-087d: data deeper than this host reads refuses rather than goes unread.
+#[test]
+fn a_repository_whose_own_data_is_deeper_than_this_host_reads_refuses() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "deep-data");
+    let mut deep = path.join(".git");
+    for _ in 0..(kr_changeset::capture::MAX_WALK_DEPTH + 2) {
+        deep.push("down");
+    }
+    std::fs::create_dir_all(&deep).expect("a chain deeper than this host reads");
+
+    let workspace = fixture.workspace("deep-data");
+    let failure = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect_err("data this host cannot read to the bottom of is not captured around");
+    let said = failure.to_string();
+    assert!(
+        said.contains("cannot account for") && said.contains("levels deep"),
+        "the refusal says it is the depth: {failure}"
+    );
+}
+
+/// Returns a temporary directory on a filesystem other than the one `beside` is on.
+///
+/// Where the host offers none, the case that needs one says so rather than reporting a result it
+/// did not produce.
+fn another_filesystem(beside: &std::path::Path) -> Option<tempfile::TempDir> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let here = std::fs::metadata(beside).ok()?.dev();
+    let mut candidates = vec![
+        std::env::temp_dir(),
+        std::path::PathBuf::from("/dev/shm"),
+        std::path::PathBuf::from("/private/tmp"),
+    ];
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        candidates.push(directory.to_path_buf());
+    }
+    candidates.into_iter().find_map(|candidate| {
+        let metadata = std::fs::metadata(&candidate).ok()?;
+        if metadata.dev() == here {
+            return None;
+        }
+        tempfile::TempDir::new_in(&candidate).ok()
+    })
 }
 
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,

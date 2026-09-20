@@ -656,6 +656,16 @@ removes is never opened at all:
    inside would otherwise be that repository's configuration, which holds its remotes and can hold
    a credential, and its object database, which holds every version of every file in it.
 
+   A link is not the only way a path reaches content the path does not name, so two more things are
+   refused. A directory on a **different mount** from the directory it was opened beneath is not
+   read: a mount over a name inside a tree holds another tree entirely, and the path that reaches
+   it crosses nothing. And a repository's own data is read through once, entry by entry: data that
+   holds a link, a mount, or anything that is not a plain file or a plain directory is data this
+   host does not capture around, because a link **out** of it makes a directory of the tree part of
+   that repository's own data under a path that crosses nothing either. Data deeper, or larger in
+   entries, than this host reads refuses on the same terms. Each of these says which directory it
+   found and why, and none of them is skipped.
+
    What this covers is what a capture reads: a repository in a directory no path of the capture
    goes near is one the capture does not reach either.
 

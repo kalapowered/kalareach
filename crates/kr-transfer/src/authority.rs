@@ -23,6 +23,12 @@
 //! * Each prefix of the path is opened with the no-follow open before the object itself is, so a
 //!   component that is a symbolic link or a reparse point at the moment it is resolved fails the
 //!   lookup instead of redirecting it. The object itself is opened with the no-follow open too.
+//! * Every directory a name resolves through is on the **same mount** as the authorised directory
+//!   itself, and one that is not refuses the name. A link is not the only way a path reaches
+//!   content the path does not name: a directory mounted over a name inside the tree reaches
+//!   another tree entirely, and the path that gets there crosses nothing. A bind mount shares its
+//!   device with what it came from, so the device number alone does not see one and the mount the
+//!   handle was resolved through is asked for where the platform answers.
 //! * On Linux the underlying open is `openat2` with `RESOLVE_BENEATH`, which resolves the whole
 //!   accumulated path in one syscall; on other Unix systems it is a component-wise `openat` with
 //!   `O_NOFOLLOW` beneath the same start directory; on Windows it is a relative `NtCreateFile`.
@@ -124,6 +130,16 @@ pub enum Escape {
     #[error("{component} is a link, and resolution beneath an authorised directory follows none")]
     Link {
         /// The component that is a link.
+        component: String,
+    },
+    /// A component is a directory on another mount, and resolution beneath an authority crosses
+    /// none.
+    #[error(
+        "{component} is on a different mount from the authorised directory, and resolution \
+         beneath one crosses no mount"
+    )]
+    CrossedMount {
+        /// The component that is somewhere else.
         component: String,
     },
     /// The operation accepts only a name with nothing to resolve above it.
@@ -376,6 +392,25 @@ impl std::fmt::Display for ObjectIdentity {
     }
 }
 
+/// Which mount an opened directory was resolved through.
+///
+/// Two parts, because one platform answers more than another. Linux names the mount itself, which
+/// is what sees a bind mount: a second mount of one filesystem shares its device with the first,
+/// so a device number alone would call the two the same place. Everywhere else the device is the
+/// whole of what a host can say, and it still sees a mount of another filesystem. Both are
+/// compared, so neither answer is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MountId {
+    mount: u64,
+    device: u64,
+}
+
+impl std::fmt::Display for MountId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.mount, self.device)
+    }
+}
+
 /// What an opened object may be used for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectPolicy {
@@ -417,6 +452,9 @@ pub struct AuthorisedDirectory {
     environment_id: EnvironmentId,
     directory: Dir,
     identity: ObjectIdentity,
+    /// The mount the handle was resolved through, read when it was opened. Every name resolved
+    /// beneath this directory is compared with it.
+    mount: MountId,
     /// The path the directory was opened from. Diagnostics only: the handle is the authority, and
     /// re-resolving this path would let a rename hand the grant to an unrelated tree.
     display: PathBuf,
@@ -446,13 +484,7 @@ impl AuthorisedDirectory {
                 }
             }
         })?;
-        let identity = directory_identity(&directory, path)?;
-        Ok(Self {
-            environment_id,
-            directory,
-            identity,
-            display: path.to_path_buf(),
-        })
+        Self::from_handle(environment_id, directory, path.to_path_buf())
     }
 
     /// Wraps a directory handle a caller already holds.
@@ -466,10 +498,12 @@ impl AuthorisedDirectory {
         display: PathBuf,
     ) -> Result<Self, Escape> {
         let identity = directory_identity(&directory, &display)?;
+        let mount = mount_of(&directory, &display.display().to_string())?;
         Ok(Self {
             environment_id,
             directory,
             identity,
+            mount,
             display,
         })
     }
@@ -484,6 +518,12 @@ impl AuthorisedDirectory {
     #[must_use]
     pub const fn identity(&self) -> ObjectIdentity {
         self.identity
+    }
+
+    /// Returns the mount the directory was resolved through when it was opened.
+    #[must_use]
+    pub const fn mount(&self) -> MountId {
+        self.mount
     }
 
     /// Returns the path the directory was opened from, for diagnostics.
@@ -583,7 +623,15 @@ impl AuthorisedDirectory {
         for component in name.components() {
             display.push(component);
         }
-        Self::from_handle(self.environment_id, directory, display)
+        let child = Self::from_handle(self.environment_id, directory, display)?;
+        // The mount of what was opened, rather than of the prefix that was checked and let go: a
+        // name mounted over between the two resolutions is refused here.
+        if child.mount != self.mount {
+            return Err(Escape::CrossedMount {
+                component: name.as_str().to_owned(),
+            });
+        }
+        Ok(child)
     }
 
     /// Creates a subdirectory, owner-only, and opens it as an authority of its own.
@@ -922,7 +970,15 @@ impl AuthorisedDirectory {
                 prefix.push('/');
             }
             prefix.push_str(component);
-            drop(open_directory(&self.directory, &prefix)?);
+            let held = open_directory(&self.directory, &prefix)?;
+            // And on this authority's own mount. A directory mounted over a name inside the tree
+            // holds content the name never named, reached by a path that crosses no link, so a
+            // name that resolves through one does not resolve at all.
+            if mount_of(&held, &prefix)? != self.mount {
+                return Err(Escape::CrossedMount {
+                    component: prefix.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -1138,6 +1194,45 @@ fn directory_identity(directory: &Dir, what: &Path) -> Result<ObjectIdentity, Es
     Ok(ObjectIdentity {
         device: metadata.dev(),
         file_id: metadata.ino(),
+    })
+}
+
+/// Returns the mount an open directory was resolved through.
+///
+/// The kernel's own answer where there is one: `statx` carries the mount a handle was resolved
+/// through, which is what tells a bind mount from the tree it was made from. A kernel too old to
+/// carry it leaves the field the same for everything, and then the device is the whole comparison,
+/// which still tells one filesystem from another.
+#[cfg(target_os = "linux")]
+fn mount_of(directory: &Dir, what: &str) -> Result<MountId, Escape> {
+    let stat = rustix::fs::statx(
+        directory,
+        "",
+        rustix::fs::AtFlags::EMPTY_PATH,
+        rustix::fs::StatxFlags::MNT_ID,
+    )
+    .map_err(|error| Escape::Unopenable {
+        component: what.to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(MountId {
+        mount: stat.stx_mnt_id,
+        device: rustix::fs::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+    })
+}
+
+/// Returns the device an open directory is on, which is what this platform says about mounts.
+#[cfg(not(target_os = "linux"))]
+fn mount_of(directory: &Dir, what: &str) -> Result<MountId, Escape> {
+    let metadata = directory
+        .dir_metadata()
+        .map_err(|error| Escape::Unopenable {
+            component: what.to_owned(),
+            detail: error.to_string(),
+        })?;
+    Ok(MountId {
+        mount: 0,
+        device: metadata.dev(),
     })
 }
 

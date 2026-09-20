@@ -627,3 +627,63 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
         ),
     }
 }
+
+/// KR-REQ-14.05: a name resolves through directories on this authority's own mount, and one on
+/// another mount is refused before anything beneath it is reached.
+///
+/// A link is not the only way a path reaches content the path does not name. A directory mounted
+/// over a name inside the tree holds another tree entirely, and the path that gets there crosses
+/// nothing a no-follow open would see. So the mount is compared as the object is, and a name that
+/// resolves through another one does not resolve.
+#[test]
+fn a_name_that_resolves_through_another_mount_is_refused() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(root.path().join("src/inner")).expect("creates the tree");
+    std::fs::write(root.path().join("src/inner/notes.txt"), b"inside").expect("writes a file");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
+
+    // One mount, which is the ordinary case and stays ordinary.
+    let inner = RelativeName::parse("src/inner").expect("a valid relative name");
+    let held = authority.subdirectory(&inner).expect("opens what is there");
+    assert_eq!(
+        held.mount(),
+        authority.mount(),
+        "a directory of the tree is on the tree's own mount"
+    );
+    let name = RelativeName::parse("src/inner/notes.txt").expect("a valid relative name");
+    authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("reads through directories on one mount");
+
+    // A boundary this host already carries, asked for through the directory that holds it. Where
+    // the platform has none to cross, this says so rather than reporting a case it did not run.
+    let Ok(top) = AuthorisedDirectory::open_root(environment(), Path::new("/")) else {
+        println!("not exercised: this platform would not open the root directory");
+        return;
+    };
+    let device = RelativeName::parse("dev").expect("a valid relative name");
+    match top.subdirectory(&device) {
+        Err(Escape::CrossedMount { .. }) => {}
+        Ok(_) => {
+            println!("not exercised: this host puts /dev on the mount that holds /");
+            return;
+        }
+        Err(other) => {
+            println!("not exercised: this host would not open /dev: {other}");
+            return;
+        }
+    }
+    let beneath = RelativeName::parse("dev/null").expect("a valid relative name");
+    assert!(
+        matches!(
+            top.open_read(&beneath, ObjectPolicy::ReadableFile),
+            Err(Escape::CrossedMount { .. })
+        ),
+        "a read refuses at the directory that crosses the mount, before what is under it"
+    );
+    assert!(
+        matches!(top.probe(&beneath), Err(Escape::CrossedMount { .. })),
+        "so does a question about what is under it"
+    );
+}

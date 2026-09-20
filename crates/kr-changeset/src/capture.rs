@@ -602,12 +602,10 @@ pub fn read_status(
     let entries = kr_project::workspace::parse_status(reported)?;
     let mut expanded = Vec::with_capacity(entries.len());
     let mut budget = MAX_WALK_ENTRIES;
-    let root_mount = mount_of(repository.work_tree())?;
     for entry in entries {
         if let Some(prefix) = entry.path.strip_suffix('/') {
             walk(
                 repository.work_tree(),
-                root_mount,
                 prefix,
                 entry.class,
                 grant,
@@ -653,7 +651,6 @@ fn exactly<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str> {
 #[allow(clippy::too_many_arguments)]
 fn walk(
     tree: &kr_transfer::AuthorisedDirectory,
-    root_mount: Mount,
     prefix: &str,
     class: InclusionClass,
     grant: &FileGrant,
@@ -695,7 +692,7 @@ fn walk(
         });
         return Ok(());
     };
-    let Ok(directory) = open_beneath(tree, &name, root_mount, prefix)? else {
+    let Ok(directory) = open_beneath(tree, &name, prefix)? else {
         // Not a directory after all, or not reachable. It is still one entry the status reported,
         // and the content read decides what it is.
         out.push(kr_project::workspace::StatusEntry {
@@ -753,7 +750,6 @@ fn walk(
         if kind.is_dir() {
             walk(
                 tree,
-                root_mount,
                 &child,
                 class,
                 grant,
@@ -1158,7 +1154,6 @@ fn nested_repositories(
         }
     }
     let tree = repository.work_tree();
-    let root_mount = mount_of(tree)?;
     let mut budget = MAX_WALK_ENTRIES;
     let mut charge = |directory: &str| -> Result<()> {
         budget = budget
@@ -1196,7 +1191,7 @@ fn nested_repositories(
             Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => continue,
             Err(_) => return Err(unplaceable(directory)),
         }
-        match open_beneath(tree, &name, root_mount, directory)? {
+        match open_beneath(tree, &name, directory)? {
             Ok(held) => opened.push((directory, held)),
             // It was a directory a moment ago and this host cannot open it. It will not say a
             // tree is free of another repository it could not look for.
@@ -1243,18 +1238,12 @@ fn nested_repositories(
         // are reachable as ordinary content under a path that crosses neither. What answers that
         // is the same thing that answers the rest: the object. So every directory beneath this one
         // is asked what it is, and the capture compares what it opens with all of them.
-        // Its own mount, not the tree's: a repository can keep its data on another filesystem
-        // and an ordinary directory of that data is then not on the tree's mount at all. What
-        // this refuses is a mount **inside** the administrative tree.
-        let seed_mount = mount_of(&held)?;
-        administrative_descendants(
-            &held,
-            seed_mount,
-            &mut refused,
-            &mut inspected,
-            &mut budget,
-            0,
-        )?;
+        //
+        // Each step of that descent is compared with the directory it is opened beneath, not with
+        // the working tree: a repository can keep its data on another filesystem altogether, and
+        // an ordinary directory of that data is then on neither the tree's mount nor anything
+        // near it. What this refuses is a mount **inside** the administrative tree.
+        administrative_descendants(&held, &mut refused, &mut inspected, &mut budget, 0)?;
     }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
@@ -1272,10 +1261,9 @@ fn nested_repositories(
             // Its data is beside its tree, which is the ordinary nested repository.
             kr_transfer::authority::ObjectKind::Directory => {
                 let mut stack = descend_to(tree, directory)?;
-                stack.push(
-                    held.subdirectory(&administrative)
-                        .map_err(|_| unplaceable(directory))?,
-                );
+                let data = open_beneath(held, &administrative, directory)?
+                    .map_err(|_| unplaceable(directory))?;
+                stack.push(data);
                 stack
             }
             // Its data is wherever its own file says, reached by descending rather than by reading
@@ -1295,15 +1283,7 @@ fn nested_repositories(
             return Err(unplaceable(directory));
         }
         refused.insert(identity_of(data));
-        let data_mount = mount_of(data)?;
-        administrative_descendants(
-            data,
-            data_mount,
-            &mut refused,
-            &mut inspected,
-            &mut budget,
-            0,
-        )?;
+        administrative_descendants(data, &mut refused, &mut inspected, &mut budget, 0)?;
         let common = RelativeName::parse("commondir")?;
         match data.probe(&common) {
             // It keeps everything in one place.
@@ -1316,15 +1296,7 @@ fn nested_repositories(
                         return Err(unplaceable(directory));
                     }
                     refused.insert(identity_of(last));
-                    let common_mount = mount_of(last)?;
-                    administrative_descendants(
-                        last,
-                        common_mount,
-                        &mut refused,
-                        &mut inspected,
-                        &mut budget,
-                        0,
-                    )?;
+                    administrative_descendants(last, &mut refused, &mut inspected, &mut budget, 0)?;
                 }
             }
             Err(_) => return Err(unplaceable(directory)),
@@ -1352,11 +1324,15 @@ fn nested_repositories(
 /// captured path crosses nothing. So an administrative tree that holds one is a repository this
 /// host does not read around at all, and it says so.
 ///
+/// Each directory is opened through the same authority as the rest, so each is compared with the
+/// directory it is opened beneath rather than with the working tree: a repository whose data sits
+/// on another filesystem is an ordinary repository, and what this refuses is a mount **inside**
+/// that data.
+///
 /// Every entry is charged against the budget, not only the directories, and the descent is bounded
 /// in depth as the rest of this capture's reading is. Exceeding either refuses rather than skips.
 fn administrative_descendants(
     directory: &AuthorisedDirectory,
-    root: Mount,
     into: &mut BTreeSet<(u64, u64)>,
     inspected: &mut BTreeSet<(u64, u64)>,
     budget: &mut usize,
@@ -1410,22 +1386,30 @@ fn administrative_descendants(
             )));
         }
         let name = RelativeName::parse(&name)?;
-        let held = directory
-            .subdirectory(&name)
-            .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?;
-        if mount_of(&held)? != root {
-            return Err(unreadable_data(
-                "it holds a mount, which puts a directory of this tree inside this repository's \
-                 own data"
-                    .to_owned(),
-            ));
-        }
+        // Through the same opener as everything else, which compares each directory with the one
+        // it is opened beneath. Inside a repository's own data that comparison is what finds a
+        // mount, and a mount here puts a directory of this tree inside the data.
+        let held = match directory.subdirectory(&name) {
+            Ok(held) => held,
+            Err(kr_transfer::Escape::CrossedMount { .. }) => {
+                return Err(unreadable_data(format!(
+                    "it holds a mount at {}, which puts a directory of this tree inside this \
+                     repository's own data",
+                    kr_project::git::redact(name.as_str())
+                )));
+            }
+            Err(_) => {
+                return Err(unreadable_data(
+                    "this host could not read what is in it".to_owned(),
+                ));
+            }
+        };
         // Two sets, because "already excluded" is not "already looked at": a directory can be in
         // the exclusion set because it is a nested repository's tree and still hold a link this
         // host has not seen. What stops the descent running away is having **inspected** it.
         into.insert(identity_of(&held));
         if inspected.insert(identity_of(&held)) {
-            administrative_descendants(&held, root, into, inspected, budget, depth + 1)?;
+            administrative_descendants(&held, into, inspected, budget, depth + 1)?;
         }
     }
     Ok(())
@@ -1442,56 +1426,32 @@ fn unreadable_data(why: String) -> ChangeSetError {
     }
 }
 
-/// Opens one directory beneath another and refuses one that is **on a different mount** (D-087c).
+/// Opens one directory beneath another, the one way this capture opens a directory at all.
+///
+/// Three things are refused here rather than at each caller: a link, which the authority refuses
+/// for every open it makes; a directory **on another mount** than the directory it was opened
+/// beneath, which the authority compares because a mount is the other way a path reaches content
+/// the path does not name; and everything else the name could break. A mount refuses the whole
+/// capture: what is under such a directory is not what the tree's own path says, and this host
+/// does not guess which of the two it was asked for.
 fn open_beneath(
     parent: &AuthorisedDirectory,
     name: &RelativeName,
-    root: Mount,
     what: &str,
 ) -> Result<std::result::Result<AuthorisedDirectory, kr_transfer::Escape>> {
-    let held = match parent.subdirectory(name) {
-        Ok(held) => held,
-        Err(escape) => return Ok(Err(escape)),
-    };
-    if mount_of(&held)? != root {
-        return Err(ChangeSetError::Unsupported {
+    match parent.subdirectory(name) {
+        Ok(held) => Ok(Ok(held)),
+        Err(kr_transfer::Escape::CrossedMount { .. }) => Err(ChangeSetError::Unsupported {
             detail: format!(
-                "{} is on a different mount from this working tree, and a tree that holds one is \
-                 not one this host reads: what is under it is not what the tree's own path says",
+                "{} is on a different mount from the directory it is in, and a tree that holds \
+                 one is not one this host reads: what is under it is not what the tree's own path \
+                 says",
                 kr_project::git::redact(what)
             )
             .into(),
-        });
+        }),
+        Err(escape) => Ok(Err(escape)),
     }
-    Ok(Ok(held))
-}
-
-/// What mount one open directory is on.
-type Mount = u64;
-
-/// Returns the mount one open directory is on.
-///
-/// The kernel's own answer where it has one: a bind mount shares its device with what it came
-/// from, so a device number alone would not see it, and this asks for the mount instead. Where a
-/// platform has no such answer, the device number is the whole of what it can say.
-#[cfg(target_os = "linux")]
-fn mount_of(directory: &AuthorisedDirectory) -> Result<Mount> {
-    let stat = rustix::fs::statx(
-        directory.handle(),
-        "",
-        rustix::fs::AtFlags::EMPTY_PATH,
-        rustix::fs::StatxFlags::MNT_ID,
-    )
-    .map_err(|error| ChangeSetError::StorageUnavailable {
-        detail: format!("this host could not ask what mount a directory is on: {error}").into(),
-    })?;
-    Ok(stat.stx_mnt_id)
-}
-
-/// Returns the device one open directory is on.
-#[cfg(not(target_os = "linux"))]
-fn mount_of(directory: &AuthorisedDirectory) -> Result<Mount> {
-    Ok(directory.identity().device)
 }
 
 /// Returns the object one open directory is.
@@ -1509,9 +1469,7 @@ fn descend_to(tree: &AuthorisedDirectory, directory: &str) -> Result<Vec<Authori
     for component in directory.split('/') {
         let step = RelativeName::parse(component)?;
         let here = stack.last().ok_or_else(|| unplaceable(directory))?;
-        let next = here
-            .subdirectory(&step)
-            .map_err(|_| unplaceable(directory))?;
+        let next = open_beneath(here, &step, directory)?.map_err(|_| unplaceable(directory))?;
         stack.push(next);
     }
     Ok(stack)
@@ -1590,9 +1548,8 @@ fn resolve_target(
                     // A link, or something this host could not ask about.
                     _ => return Err(unplaceable(directory)),
                 }
-                let next = here
-                    .subdirectory(&step)
-                    .map_err(|_| unplaceable(directory))?;
+                let next =
+                    open_beneath(here, &step, directory)?.map_err(|_| unplaceable(directory))?;
                 stack.push(next);
             }
         }
@@ -2505,42 +2462,40 @@ mod tests {
     }
 
     #[test]
-    fn one_directory_and_a_second_handle_on_it_are_the_same_mount() {
-        // What the mount rule rests on: two handles on one directory answer the same mount, so a
-        // directory that answers a different one is genuinely somewhere else. Where this host can
-        // reach a real mount boundary it checks that too; where it cannot, it says so rather than
-        // asserting something it did not exercise.
+    fn a_directory_on_another_mount_is_not_opened_beneath_this_one() {
+        // What the mount rule rests on, through the opener this capture actually uses: a boundary
+        // this host has is refused, and an ordinary subdirectory beside it is not. Where the
+        // platform offers no boundary to cross, the refusal is not exercised and this says so
+        // rather than asserting something it did not run.
         let host = kr_ipc::testing::TempHost::create();
-        let root = host.environment().state_dir().to_path_buf();
         let environment_id = host.environment_id();
-        let one = kr_transfer::AuthorisedDirectory::open_root(environment_id, &root)
+        let state = host.environment().state_dir().to_path_buf();
+        std::fs::create_dir_all(state.join("ordinary")).expect("a directory is made");
+        let here = kr_transfer::AuthorisedDirectory::open_root(environment_id, &state)
             .expect("the directory opens");
-        let two = kr_transfer::AuthorisedDirectory::open_root(environment_id, &root)
-            .expect("it opens again");
-        assert_eq!(
-            mount_of(&one).expect("a mount"),
-            mount_of(&two).expect("a mount"),
-            "two handles on one directory are on one mount"
-        );
-        // A boundary this platform usually has. On one where it does not, the comparison is not
-        // exercised and this says so.
-        let elsewhere = std::path::Path::new("/dev");
-        match kr_transfer::AuthorisedDirectory::open_root(environment_id, elsewhere) {
-            Ok(other) => {
-                let (here, there) = (
-                    mount_of(&one).expect("a mount"),
-                    mount_of(&other).expect("a mount"),
+        let ordinary = RelativeName::parse("ordinary").expect("a name");
+        open_beneath(&here, &ordinary, "ordinary")
+            .expect("an ordinary directory is not refused")
+            .expect("it opens");
+
+        // A mount every Unix host carries, asked for through the root that holds it.
+        let root = std::path::Path::new("/");
+        let Ok(top) = kr_transfer::AuthorisedDirectory::open_root(environment_id, root) else {
+            println!("not exercised: this host would not open the root directory");
+            return;
+        };
+        let name = RelativeName::parse("dev").expect("a name");
+        match top.subdirectory(&name) {
+            Err(kr_transfer::Escape::CrossedMount { .. }) => {
+                let refusal = open_beneath(&top, &name, "dev")
+                    .expect_err("a directory on another mount refuses the capture");
+                assert!(
+                    format!("{refusal}").contains("different mount"),
+                    "the refusal names the mount: {refusal}"
                 );
-                if here == there {
-                    println!(
-                        "not exercised: this host puts {} on the same mount as its state",
-                        elsewhere.display()
-                    );
-                } else {
-                    assert_ne!(here, there, "two mounts answer differently");
-                }
             }
-            Err(_) => println!("not exercised: this host would not open a second mount"),
+            Ok(_) => println!("not exercised: this host puts /dev on the mount that holds /"),
+            Err(other) => println!("not exercised: this host would not open /dev: {other}"),
         }
     }
 
