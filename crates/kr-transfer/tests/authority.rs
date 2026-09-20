@@ -1021,9 +1021,10 @@ fn a_macos_access_control_list_preserves_acl_level_flags() {
         .expect("setting a zero-entry flagged acl succeeds");
     drop(file_zero);
 
-    // On macOS APFS, assigning an ACL with 0 entries via acl_set_fd clears the ACL from the inode
-    // (POSIX.1e / Darwin convention where acl_init(0) deletes the ACL), so reading from the descriptor
-    // reports no ACL.
+    // What the filesystem then keeps is its own decision, and on APFS it keeps nothing: a list of
+    // no entries put on an inode deletes the inode's list, so reading the file back reports the
+    // absence the platform made. That is an observation about the store, not about this host's
+    // reading, which the case below settles on the representation itself.
     let read_zero = authority
         .open_read(&zero_name, ObjectPolicy::ReadableFile)
         .expect("opens read");
@@ -1031,5 +1032,50 @@ fn a_macos_access_control_list_preserves_acl_level_flags() {
         read_zero.access_control().expect("reads acl"),
         kr_transfer::AccessControl::None,
         "macOS filesystem clears ACL when entry count is zero"
+    );
+}
+
+/// KR-REQ-14.29: a list of no entries that carries a flag of its own is still a list.
+///
+/// The filesystem will not hold such a list on an inode, so a case that wrote one and read it back
+/// would prove what APFS does rather than what this host decides. This asks the decoding and the
+/// classification directly instead: the representation the platform hands back is read, and what
+/// the host makes of it is what a replacement consults before it takes a destination's protection
+/// away.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_list_of_no_entries_that_carries_a_flag_is_protection_beyond_the_mode_bits() {
+    /// The list's own flag that stops its entries being inherited by what is made below it.
+    const KAUTH_ACL_NO_INHERIT: u32 = 1 << 17;
+
+    let mut raw = vec![0_u8; 44];
+    raw[0..4].copy_from_slice(&0x012c_c16d_u32.to_ne_bytes());
+    raw[36..40].copy_from_slice(&0_u32.to_ne_bytes());
+    raw[40..44].copy_from_slice(&KAUTH_ACL_NO_INHERIT.to_ne_bytes());
+
+    let acl = kr_transfer::AppleAcl::from_bytes(&raw).expect("a 44-byte list of no entries");
+    assert_eq!(acl.entry_count(), 0, "the list has no entries");
+    assert_eq!(
+        acl.flags(),
+        KAUTH_ACL_NO_INHERIT,
+        "the list's own flag survives the decoding"
+    );
+    assert!(!acl.has_entries());
+    assert!(acl.has_flags());
+    assert_eq!(
+        acl.as_bytes(),
+        raw.as_slice(),
+        "the representation is carried across byte for byte"
+    );
+
+    let carried = kr_transfer::AccessControl::Apple(acl);
+    assert!(
+        carried.has_entries(),
+        "a flag with no entries is protection a replacement would take away"
+    );
+    assert_ne!(
+        carried,
+        kr_transfer::AccessControl::None,
+        "a list of no entries is not the absence of a list"
     );
 }

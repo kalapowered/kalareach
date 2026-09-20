@@ -151,7 +151,16 @@ impl AppleAcl {
 /// When inspecting the descriptor fails for any reason other than absence, returns true so the host
 /// does not report an unprotected destination when it could not establish protection.
 pub(crate) fn carries_access_control(fd: BorrowedFd<'_>) -> bool {
-    !matches!(read_access_control(fd), Ok(None))
+    carries_list(&read_access_control(fd))
+}
+
+/// Decides from one reading of a descriptor whether the file carries protection beyond its mode bits.
+///
+/// Absence is the only answer that says a file carries nothing. A reading that failed leaves this
+/// host unable to establish what protection the file has, and answering "none" there is how a
+/// replacement takes protection away from a file that had it.
+fn carries_list(read: &std::io::Result<Option<AppleAcl>>) -> bool {
+    !matches!(read, Ok(None))
 }
 
 /// Reads the access-control list from a descriptor, returning its lossless representation if it
@@ -246,6 +255,22 @@ pub(crate) fn set_access_control(
 mod tests {
     use super::*;
 
+    /// The list's own flag that stops entries being inherited by what is made below.
+    const KAUTH_ACL_NO_INHERIT: u32 = 1 << 17;
+
+    /// Builds an external representation with the given entry count and list flags.
+    ///
+    /// Every entry is zeroed: what these cases decide is the header, which is what this host reads
+    /// to tell a list from the absence of one.
+    fn representation(entry_count: u32, flags: u32) -> Vec<u8> {
+        let entries = entry_count as usize * ACE_ENTRY_LEN;
+        let mut raw = vec![0_u8; ACL_HEADER_LEN + entries];
+        raw[0..4].copy_from_slice(&ACL_EXT_MAGIC.to_ne_bytes());
+        raw[36..40].copy_from_slice(&entry_count.to_ne_bytes());
+        raw[40..44].copy_from_slice(&flags.to_ne_bytes());
+        raw
+    }
+
     #[test]
     fn malformed_acl_binary_representations_are_rejected() {
         // Less than 44 bytes
@@ -284,11 +309,38 @@ mod tests {
         assert!(ok_entry.has_entries());
     }
 
+    /// A reading that failed is not a file without a list.
+    ///
+    /// The platform answers every failure it can attribute to the file with "there is none", so the
+    /// failures that reach this host are the ones it cannot attribute at all: a descriptor that is
+    /// no longer a file, a device that stopped answering. Each of those has to keep the destination
+    /// protected, and the only reading that may report a file as unprotected is the one that
+    /// succeeded and found nothing.
     #[test]
-    fn read_failures_do_not_report_absence_in_carries_access_control() {
-        use std::os::fd::BorrowedFd;
-        let bad_fd = unsafe { BorrowedFd::borrow_raw(99999) };
-        assert!(read_access_control(bad_fd).is_err());
-        assert!(carries_access_control(bad_fd));
+    fn only_a_reading_that_found_nothing_reports_a_file_as_unprotected() {
+        assert!(
+            !carries_list(&Ok(None)),
+            "a file whose protection is its mode bits alone carries no list"
+        );
+
+        let flags_only = AppleAcl::from_bytes(&representation(0, KAUTH_ACL_NO_INHERIT))
+            .expect("a list with a flag and no entries");
+        assert!(
+            carries_list(&Ok(Some(flags_only))),
+            "a list with a flag of its own is protection no mode bit states"
+        );
+
+        let one_entry = AppleAcl::from_bytes(&representation(1, 0)).expect("a list with one entry");
+        assert!(carries_list(&Ok(Some(one_entry))));
+
+        for os_error in [libc::EBADF, libc::EIO, libc::ENOMEM] {
+            assert!(
+                carries_list(&Err(std::io::Error::from_raw_os_error(os_error))),
+                "a reading that failed with {os_error} leaves the file protected"
+            );
+        }
+        assert!(carries_list(&Err(std::io::Error::from(
+            std::io::ErrorKind::InvalidData
+        ))));
     }
 }
