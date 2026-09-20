@@ -177,10 +177,6 @@ impl DescriptionFence {
             return Ok(PublishGate::DeadlineExceeded);
         }
         store.publish(session_id, description, wall_ms)?;
-        if cancellation.is_cancelled() {
-            let _ = store.remove_generated_for(session_id);
-            return Ok(PublishGate::Cancelled);
-        }
         Ok(PublishGate::Allowed)
     }
 }

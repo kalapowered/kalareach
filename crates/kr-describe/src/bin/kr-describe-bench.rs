@@ -274,11 +274,17 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         figures.model_cpu_centis,
         figures.product_without_model_cpu_centis()
     );
+    let ceiling_held = figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes;
     println!(
         "process_ceiling_bytes: {} held: {} [{machine}]",
-        budgets.process_memory_ceiling_bytes,
-        figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes
+        budgets.process_memory_ceiling_bytes, ceiling_held
     );
+    if !ceiling_held {
+        return Err(format!(
+            "the 4 GiB process ceiling was breached during model load: {} bytes",
+            figures.whole_product_rss_bytes
+        ));
+    }
 
     // One service, one runtime, the real weights. The runtime is moved into the factory, so the
     // first mapping takes it and a second would be a fault rather than a second set of weights.
@@ -483,11 +489,18 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         active_figures.model_cpu_centis,
         active_figures.product_without_model_cpu_centis()
     );
+    let active_ceiling_held =
+        active_figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes;
     println!(
         "active_inference_process_ceiling_bytes: {} held: {} [{machine}]",
-        budgets.process_memory_ceiling_bytes,
-        active_figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes
+        budgets.process_memory_ceiling_bytes, active_ceiling_held
     );
+    if !active_ceiling_held {
+        return Err(format!(
+            "the 4 GiB process ceiling was breached during active inference: {} bytes",
+            active_figures.whole_product_rss_bytes
+        ));
+    }
 
     for reading in ledger.published() {
         report(
