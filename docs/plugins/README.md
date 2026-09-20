@@ -469,6 +469,10 @@ bytes, which is what lets a signature over an index mean "these packages" rather
 the builder". The rendering is compact because a host holds the whole index so that search works
 offline, and indentation would spend roughly half the metadata budget on whitespace nobody reads.
 
+`docs/plugins/catalogue.md` says what a host does with that index: how a generation is verified,
+when a payload is fetched, what makes an activation atomic, and what a signed qualification may not
+do.
+
 ## Findings
 
 The validator reports stable codes. A publisher's build, the catalogue pipeline and a host all

@@ -485,6 +485,42 @@ rich bindings, kills no worker and loses no request; a worker notices, re-regist
 `docs/plugins/runtime.md` has the execution model, the per-instance limits, the compiled-code cache
 and the protocol.
 
+### The plugin catalogue
+
+The daemon also owns the environment's plugin catalogues: the repositories it is enrolled in, the
+signed metadata snapshot of each one, the packages installed from them and what each package may do.
+It keeps them under `catalogue/` in the environment's state directory, one directory per repository:
+
+```text
+catalogue/
+  state.json                 the enrolments and installations that survive a restart
+  <repository>/
+    root.json                the trust root this host adopted for it, and no other
+    datastore/               the client's own trusted metadata
+    index/<n>.json           each verified generation's index, whole
+    index/active.json        which generation is current
+    payloads/<digest>        cached payloads, by content hash
+    packages/<digest>/       an activated package's files, under its manifest digest
+```
+
+Both method groups arrive through the ordinary path. A read is checked against current authority; a
+mutation carries an action window, is checked against the method registry, and the admission is
+checked once more immediately before the change, because everything in between can wait and an
+action whose accepted deadline passed while it queued does not go on to change a trust root or
+install a package.
+
+Two decisions are the owner's and are not side effects of anything else. Adopting a trust root is
+`catalogue.add`, performed by a caller this endpoint authenticated as the owner; a sync verifies
+inside the ceiling the enrolment already has and refuses a generation that would need more. Granting
+a capability is `plugin.grant`; an install refuses a grant wider than the installation already held
+and says which method that decision belongs to.
+
+Removing a repository stops trusting its root and uninstalls nothing. A package installed from it is
+still installed, on the hash it was installed at, and the answer names what is still there.
+
+`docs/plugins/catalogue.md` has the sync, the budgets, the extraction rules and what a signed
+qualification may not do.
+
 ## Creating a session
 
 1. The daemon records the reservation durably: the actor, the create token, the immutable payload
