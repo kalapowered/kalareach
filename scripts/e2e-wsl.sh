@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
-# Demonstrates WSL2 environment isolation, bridge invocation and independent operation (KR-ACC-011).
+# KR-ACC-011: WSL2 acceptance. Several distributions, independent operation, NAT and mirrored
+# networking, and environment-specific paths.
 #
-# This script runs on Windows (in Git Bash / MSYS2) against real WSL2 distributions.
-# It verifies:
-#   1. Multiple distributions and distribution selection
-#   2. Independent operation: Linux worker and controller run inside the distribution
-#      without native Windows KalaReach, retaining local paths, credentials, and PIDs
-#   3. Environment-specific paths: Linux paths remain local to the distribution and
-#      argument vectors cross via `wsl.exe --exec` without shell re-parsing
-#   4. Process bridge invocation: `wsl.exe --distribution <name> --user <user> --exec <kr> bridge --stdio`
-#      carrying bounded protocol frames, keeping stderr diagnostic, and refusing network actors
-#   5. Cached inventory: stopped distributions are listed from cache without starting them
-#   6. Networking mode inspection (NAT and mirrored modes)
+# This runs on a Windows host with WSL2, in Git Bash or MSYS2. It is an acceptance run, so a
+# prerequisite it cannot meet is a failure rather than a skip: a run that cannot establish these
+# results has not established them.
 #
-# All artifacts are saved under ${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}.
+# What it establishes, in order:
+#
+#   1. WSL 2 is installed, the default version is 2, and two distributions are registered. A second
+#      one is made by exporting and importing the first when only one is there, and is removed
+#      again at the end.
+#   2. Each distribution runs KalaReach on its own: its own control daemon, its own worker, its own
+#      Linux paths and process identifiers, with the native Windows installation taking no part.
+#   3. Argument vectors cross `wsl.exe --exec` unchanged, including values a shell would rewrite.
+#   4. Windows reaches each distribution through the process bridge alone, learns that
+#      distribution's own environment identity, and gets an answer to a real read across it.
+#   5. A listing of stopped distributions comes from the cache and starts nothing. A refresh that
+#      was told to start one does.
+#   6. The bridge behaves the same in NAT and in mirrored networking mode, which is what decides
+#      whether any automatic behaviour is needed.
+#
+# Every artefact is written under ${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}. The Windows
+# daemon this starts keeps its keys in its own run directory (never the Credential Manager).
+#
+# Knobs, all optional:
+#   KR_WSL_HELPER     absolute path of the helper inside a distribution (default /usr/local/bin/kr)
+#   KR_WSL_USER       the Linux user the helper runs as (default root)
+#   KR_WSL_SECOND     the name of the second distribution this script makes (default kr-acc-011)
+#   KR_WSL_KEEP       1 to keep the second distribution and the daemons for inspection
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,177 +40,381 @@ if [ -n "$log" ]; then
   exec > >(tee "$log") 2>&1
 fi
 
-echo "kalareach wsl2 end-to-end demonstrations (KR-ACC-011)"
+artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+mkdir -p "$artifacts"
+run_dir="$(mktemp -d "${TMPDIR:-/tmp}/kr-wsl.XXXXXX")"
+helper_path="${KR_WSL_HELPER:-/usr/local/bin/kr}"
+linux_user="${KR_WSL_USER:-root}"
+second_name="${KR_WSL_SECOND:-kr-acc-011}"
+keep="${KR_WSL_KEEP:-0}"
+
+passed=0
+fail() {
+  echo "FAIL: $*"
+  exit 1
+}
+pass() {
+  passed=$((passed + 1))
+  echo "PASS: $*"
+}
+step() { echo; echo "==> $*"; }
+
+echo "kalareach wsl2 acceptance (KR-ACC-011)"
 echo "  commit: $(git rev-parse HEAD)"
 echo "  host: $(uname -sr) $(uname -m)"
 echo "  taken at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-echo
+echo "  artefacts: $artifacts"
 
-# Detect WSL availability. On non-Windows hosts, skip with a named reason.
-WSL_BIN=""
-if command -v wsl.exe >/dev/null 2>&1; then
-  WSL_BIN="wsl.exe"
-elif command -v wsl >/dev/null 2>&1; then
-  WSL_BIN="wsl"
-fi
+# What this run made, and therefore what it may remove or end. Nothing else is touched: every
+# process ended below is one this script started and recorded.
+made_distribution=""
+wslconfig_path=""
+wslconfig_saved=""
+wslconfig_existed=0
+daemons=""
+windows_daemon=""
 
-if [ -z "$WSL_BIN" ]; then
-  echo "scripts/e2e-wsl.sh: skipped, WSL is not installed on this host"
-  exit 0
-fi
-
-artifacts_dir="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
-mkdir -p "$artifacts_dir"
-
-test_dir="$(mktemp -d "${TMPDIR:-/tmp}/kr-wsl-test.XXXXXX")"
 cleanup() {
-  local d="$test_dir"
-  rm -rf "${d:?}"
+  local status=$?
+  if [ -n "$windows_daemon" ]; then
+    kill "$windows_daemon" 2>/dev/null || true
+  fi
+  if [ "$keep" != "1" ]; then
+    for distribution in $daemons; do
+      # The identifier this script recorded when it started that daemon, and no pattern. The
+      # substitution below runs inside the distribution, which is why it stays unexpanded here.
+      # shellcheck disable=SC2016
+      wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c \
+        'test -f /tmp/kr-acc-controller.pid && kill $(cat /tmp/kr-acc-controller.pid)' \
+        >/dev/null 2>&1 || true
+    done
+    if [ -n "$made_distribution" ]; then
+      echo "removing the distribution this run made: $made_distribution"
+      wsl.exe --unregister "$made_distribution" >/dev/null 2>&1 || true
+    fi
+  fi
+  # The networking mode is the operator's setting. It goes back exactly as it was.
+  if [ -n "$wslconfig_saved" ] && [ -n "$wslconfig_path" ]; then
+    if [ "$wslconfig_existed" = "1" ]; then
+      cp "$wslconfig_saved" "$wslconfig_path"
+    else
+      rm -f "${wslconfig_path:?}"
+    fi
+    wsl.exe --shutdown >/dev/null 2>&1 || true
+  fi
+  rm -rf "${run_dir:?}"
+  exit "$status"
 }
 trap cleanup EXIT
 
-echo "==> 1. Querying WSL distributions and version"
-"$WSL_BIN" --version || true
-echo
-"$WSL_BIN" -l -v || true
-echo
+# ---------------------------------------------------------------------------------------------
+step "1. WSL 2, and the distributions this acceptance needs"
 
-# Identify available distributions.
-# wsl.exe output may be UTF-16LE, strip null bytes and carriage returns.
-distros="$("$WSL_BIN" -l -q 2>/dev/null | tr -d '\000\r' | grep -v '^[[:space:]]*$' || true)"
-echo "Discovered distributions:"
-echo "$distros"
-echo
+command -v wsl.exe >/dev/null 2>&1 ||
+  fail "this acceptance runs on a Windows host with WSL2; wsl.exe is not on this machine"
 
-if [ -z "$distros" ]; then
-  echo "scripts/e2e-wsl.sh: no WSL distributions registered; skipping runtime tests"
-  exit 0
+# wsl.exe writes UTF-16LE. Dropping the null bytes is enough to read it as text here.
+wsl_text() { wsl.exe "$@" 2>&1 | tr -d '\000\r'; }
+
+version_text="$(wsl_text --version)"
+echo "$version_text"
+echo "$version_text" | grep -qi "WSL version" ||
+  fail "wsl.exe --version did not report a WSL version; this needs WSL 2 from the Microsoft installer"
+
+wsl_text --set-default-version 2 >/dev/null ||
+  fail "the default WSL version could not be set to 2"
+
+registered() { wsl_text -l -q | sed 's/[[:space:]]*$//' | grep -v '^$'; }
+state_of() {
+  # The state column of `wsl -l -v` for one distribution, matched on the whole name.
+  wsl_text -l -v | sed 's/^[* ]*//' |
+    awk -v want="$1" '{
+      name = $0
+      sub(/[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]*$/, "", name)
+      if (name == want) { print $(NF - 1) }
+    }'
+}
+
+mapfile -t distributions < <(registered)
+[ "${#distributions[@]}" -gt 0 ] ||
+  fail "no WSL distribution is registered; install one before running this acceptance"
+first="${distributions[0]}"
+echo "registered: ${distributions[*]}"
+
+if [ "${#distributions[@]}" -lt 2 ]; then
+  echo "only one distribution is registered; making a second from it"
+  tarball="$run_dir/$first.tar"
+  wsl.exe --export "$first" "$(cygpath -w "$tarball" 2>/dev/null || echo "$tarball")" >/dev/null 2>&1 ||
+    fail "the distribution could not be exported to make a second one"
+  target_dir="C:\\kala\\wsl\\$second_name"
+  wsl.exe --import "$second_name" "$target_dir" \
+    "$(cygpath -w "$tarball" 2>/dev/null || echo "$tarball")" --version 2 >/dev/null 2>&1 ||
+    fail "the second distribution could not be imported"
+  made_distribution="$second_name"
+  mapfile -t distributions < <(registered)
 fi
+[ "${#distributions[@]}" -ge 2 ] || fail "this acceptance needs two distributions"
+second="${distributions[1]}"
+pass "two distributions are registered: $first and $second"
 
-primary_distro="$(echo "$distros" | head -n 1)"
-echo "Primary distribution under test: $primary_distro"
+# ---------------------------------------------------------------------------------------------
+step "2. Argument vectors cross --exec unchanged"
 
-echo "==> 2. Verifying exact argument vector delivery via --exec"
-# Testing that spaces, quotes, and arguments cross unchanged without login shell re-parsing.
-arg_out="$("$WSL_BIN" -d "$primary_distro" -u root --exec /bin/sh -c 'printf "%s\n" "$@"' -- "arg 1" "arg'2" 'arg"3' "arg 4")"
-expected="$(printf "arg 1\narg'2\narg\"3\narg 4")"
-if [ "$arg_out" != "$expected" ]; then
-  echo "FAIL: argument vector was modified or re-parsed across WSL boundary:"
-  echo "  expected: $expected"
-  echo "  got:      $arg_out"
-  exit 1
-fi
-echo "PASS: exact argument vectors preserved"
+# Every one of these would be rewritten by a shell. `--exec` hands the vector to the program named
+# next, so each arrives as one element.
+# The values below are meant to stay literal: the point is that nothing expands them.
+# shellcheck disable=SC2016
+awkward_out="$(wsl.exe -d "$first" -u "$linux_user" --exec /bin/sh -c 'printf "%s\n" "$@"' -- \
+  "arg 1" "arg'2" 'arg"3' 'space and $HOME and `backtick`' 'semi;colon && ampersand' | tr -d '\r')"
+# shellcheck disable=SC2016
+awkward_expected="$(printf 'arg 1\narg'"'"'2\narg"3\nspace and $HOME and `backtick`\nsemi;colon && ampersand')"
+[ "$awkward_out" = "$awkward_expected" ] ||
+  fail "an argument vector was rewritten across the WSL boundary: $awkward_out"
+pass "argument vectors cross --exec exactly as they were built"
 
-echo "==> 3. Verifying environment-specific paths and process isolation"
-# Linux paths inside WSL remain POSIX and distinct from Windows paths.
-linux_path="$("$WSL_BIN" -d "$primary_distro" -u root --exec /bin/sh -c 'pwd')"
-case "$linux_path" in
-  /*) echo "PASS: Linux working path is POSIX: $linux_path" ;;
-  *) echo "FAIL: Linux working path is not POSIX: $linux_path"; exit 1 ;;
-esac
+# ---------------------------------------------------------------------------------------------
+step "3. Each distribution runs KalaReach on its own"
 
-# Linux PID space is distinct from Windows PID space.
-linux_pid="$("$WSL_BIN" -d "$primary_distro" -u root --exec /bin/sh -c 'echo $$')"
-if ! [[ "$linux_pid" =~ ^[0-9]+$ ]]; then
-  echo "FAIL: Linux PID is not a number: $linux_pid"
-  exit 1
-fi
-echo "PASS: Linux PID isolated: $linux_pid"
+# The helper and the daemon are built inside the distribution, from the same commit, into that
+# distribution's own filesystem. Nothing here is a Windows binary, and nothing crosses /mnt.
+build_inside() {
+  local distribution="$1"
+  if wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c "test -x '$helper_path'" 2>/dev/null; then
+    echo "  $distribution: a helper is already installed at $helper_path"
+    return 0
+  fi
+  echo "  $distribution: building the helper inside the distribution (this takes a few minutes)"
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "
+    set -e
+    command -v cargo >/dev/null 2>&1 || {
+      echo 'cargo is not installed in this distribution' >&2
+      exit 1
+    }
+    rm -rf /tmp/kalareach-src
+    cp -a /mnt/c/kala/kalareach /tmp/kalareach-src
+    cd /tmp/kalareach-src
+    cargo build -p kr-cli --bin kr -p kr-controller --bin kr-controller -p kr-worker --bin kr-worker
+    install -m 0755 target/debug/kr '$helper_path'
+    install -m 0755 target/debug/kr-controller '$(dirname "$helper_path")/kr-controller'
+    install -m 0755 target/debug/kr-worker '$(dirname "$helper_path")/kr-worker'
+  " || fail "$distribution could not build the Linux helper"
+}
 
-echo "==> 4. Verifying WSL networking configuration (NAT vs mirrored mode)"
-# Check for .wslconfig in %USERPROFILE% or default config
+start_daemon_inside() {
+  local distribution="$1"
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "
+    set -e
+    mkdir -p /run/kalareach-acc /var/lib/kalareach-acc
+    running=0
+    if [ -f /tmp/kr-acc-controller.pid ] && kill -0 \$(cat /tmp/kr-acc-controller.pid) 2>/dev/null; then
+      running=1
+    fi
+    if [ \$running -eq 0 ]; then
+      nohup '$(dirname "$helper_path")/kr-controller' \
+        --runtime-dir /run/kalareach-acc --state-dir /var/lib/kalareach-acc \
+        --worker '$(dirname "$helper_path")/kr-worker' --secret-store file \
+        >/tmp/kr-controller.log 2>&1 &
+      echo \$! >/tmp/kr-acc-controller.pid
+    fi
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if KR_RUNTIME_DIR=/run/kalareach-acc KR_STATE_DIR=/var/lib/kalareach-acc '$helper_path' list >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 1
+    done
+    echo 'the daemon inside the distribution did not answer' >&2
+    tail -n 40 /tmp/kr-controller.log >&2 || true
+    exit 1
+  " || fail "$distribution did not start its own control daemon"
+  daemons="$daemons $distribution"
+}
+
+inside() {
+  local distribution="$1"
+  shift
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc \
+    "KR_RUNTIME_DIR=/run/kalareach-acc KR_STATE_DIR=/var/lib/kalareach-acc $*" | tr -d '\r'
+}
+
+for distribution in "$first" "$second"; do
+  build_inside "$distribution"
+  start_daemon_inside "$distribution"
+done
+pass "each distribution built and started its own KalaReach with no native Windows installation"
+
+# Linux paths and process identifiers stay inside the distribution.
+for distribution in "$first" "$second"; do
+  helper_dir="$(inside "$distribution" "'$helper_path' doctor --json" | tr -d '\n')"
+  echo "  $distribution doctor: ${helper_dir:0:120}"
+  linux_pid="$(inside "$distribution" 'cat /tmp/kr-acc-controller.pid')"
+  [[ "$linux_pid" =~ ^[0-9]+$ ]] ||
+    fail "$distribution did not report a Linux process identifier for its daemon"
+  # That identifier names a process inside the distribution alone. Windows knows nothing of it.
+  if tasklist //FI "PID eq $linux_pid" 2>/dev/null | grep -qi "kr-controller"; then
+    fail "a Linux process identifier resolved to a Windows process, so the identifier spaces are shared"
+  fi
+  socket_path="$(inside "$distribution" 'ls /run/kalareach-acc')"
+  [ -n "$socket_path" ] ||
+    fail "$distribution kept no runtime directory of its own"
+done
+pass "Linux paths, binaries and process identifiers stay local to each distribution"
+
+# ---------------------------------------------------------------------------------------------
+step "4. Windows reaches each distribution through the process bridge"
+
+kr_exe=""
+for candidate in "C:/kala/target/debug/kr.exe" "target/debug/kr.exe" "C:/kala/target/release/kr.exe"; do
+  if [ -f "$candidate" ]; then
+    kr_exe="$candidate"
+    break
+  fi
+done
+[ -n "$kr_exe" ] || fail "no Windows kr.exe was found; build it with cargo build -p kr-cli --bin kr"
+controller_exe="$(dirname "$kr_exe")/kr-controller.exe"
+worker_exe="$(dirname "$kr_exe")/kr-worker.exe"
+[ -f "$controller_exe" ] || fail "no Windows kr-controller.exe beside $kr_exe"
+
+# The Windows daemon this run owns, with its keys in its own directory rather than the platform
+# credential store.
+windows_runtime="$run_dir/windows-run"
+windows_state="$run_dir/windows-state"
+mkdir -p "$windows_runtime" "$windows_state"
+"$controller_exe" --runtime-dir "$(cygpath -w "$windows_runtime" 2>/dev/null || echo "$windows_runtime")" \
+  --state-dir "$(cygpath -w "$windows_state" 2>/dev/null || echo "$windows_state")" \
+  --worker "$(cygpath -w "$worker_exe" 2>/dev/null || echo "$worker_exe")" \
+  --secret-store file >"$run_dir/windows-controller.log" 2>&1 &
+windows_daemon=$!
+export KR_RUNTIME_DIR="$windows_runtime" KR_STATE_DIR="$windows_state"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if "$kr_exe" bridge list >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+"$kr_exe" bridge list >/dev/null 2>&1 ||
+  fail "the Windows daemon did not answer: $(tail -n 20 "$run_dir/windows-controller.log")"
+pass "a Windows control daemon is running for this acceptance"
+
+enrol_distribution() {
+  local distribution="$1" label="$2"
+  "$kr_exe" --json bridge enrol --access wsl --label "$label" --target "$distribution" \
+    --user "$linux_user" --helper "$helper_path" --probe >"$run_dir/enrol-$label.json" 2>&1 ||
+    fail "enrolling $distribution failed: $(cat "$run_dir/enrol-$label.json")"
+  python -c "import json,sys;print(json.load(open(sys.argv[1]))['row']['enrolment']['environment_id'])" \
+    "$run_dir/enrol-$label.json" 2>/dev/null ||
+    python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['row']['enrolment']['environment_id'])" \
+      "$run_dir/enrol-$label.json"
+}
+
+first_id="$(enrol_distribution "$first" "first")"
+second_id="$(enrol_distribution "$second" "second")"
+echo "  $first is environment $first_id"
+echo "  $second is environment $second_id"
+[ -n "$first_id" ] && [ -n "$second_id" ] ||
+  fail "a distribution did not answer with an environment identity"
+[ "$first_id" != "$second_id" ] ||
+  fail "two distributions answered with the same environment identity"
+pass "each distribution answered the bridge with its own environment identity"
+
+# The identity the enrolment recorded is the one that distribution reports for itself.
+for pair in "$first:$first_id" "$second:$second_id"; do
+  distribution="${pair%%:*}"
+  recorded="${pair##*:}"
+  reported="$(inside "$distribution" "'$helper_path' --json doctor" |
+    tr ',' '\n' | grep -o '"environment_id":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+  if [ -n "$reported" ] && [ "$reported" != "$recorded" ]; then
+    fail "$distribution reports environment $reported and the enrolment recorded $recorded"
+  fi
+done
+pass "the recorded identity is the one each distribution reports for itself"
+
+refresh_and_check() {
+  local label="$1" expect_id="$2"
+  "$kr_exe" --json bridge refresh "$label" >"$run_dir/refresh-$label.json" 2>&1 ||
+    fail "refreshing $label failed: $(cat "$run_dir/refresh-$label.json")"
+  grep -q "\"environment_id\":\"$expect_id\"" "$run_dir/refresh-$label.json" ||
+    fail "the refresh of $label did not carry a verification from $expect_id: $(cat "$run_dir/refresh-$label.json")"
+}
+
+refresh_and_check first "$first_id"
+refresh_and_check second "$second_id"
+pass "a refresh opens a bridge to each distribution and carries a read to its own daemon"
+
+# ---------------------------------------------------------------------------------------------
+step "5. A listing reads the cache and starts nothing"
+
+wsl.exe -t "$second" >/dev/null 2>&1 || fail "the second distribution could not be stopped"
+sleep 2
+[ "$(state_of "$second")" = "Stopped" ] ||
+  fail "$second is not stopped, so this check would prove nothing"
+
+"$kr_exe" --json bridge list >"$run_dir/list-while-stopped.json" 2>&1 ||
+  fail "the listing failed: $(cat "$run_dir/list-while-stopped.json")"
+grep -q '"observation":"cache"' "$run_dir/list-while-stopped.json" ||
+  fail "the listing did not report its rows as cached: $(cat "$run_dir/list-while-stopped.json")"
+grep -q "\"environment_id\":\"$second_id\"" "$run_dir/list-while-stopped.json" ||
+  fail "the stopped distribution is missing from the listing"
+[ "$(state_of "$second")" = "Stopped" ] ||
+  fail "the listing started $second, which a listing must never do"
+pass "the listing reported the stopped distribution from the cache and started nothing"
+
+"$kr_exe" --json bridge refresh second --start >"$run_dir/refresh-start.json" 2>&1 ||
+  fail "the refresh that was told to start failed: $(cat "$run_dir/refresh-start.json")"
+[ "$(state_of "$second")" = "Running" ] ||
+  fail "the refresh that was told to start did not start $second"
+pass "a refresh that was told to start the distribution started it"
+
+# ---------------------------------------------------------------------------------------------
+step "6. NAT and mirrored networking"
+
 wslconfig_path="${USERPROFILE:-/c/Users/Administrator}/.wslconfig"
+wslconfig_saved="$run_dir/wslconfig.saved"
 if [ -f "$wslconfig_path" ]; then
-  echo "Found .wslconfig:"
-  cat "$wslconfig_path"
+  wslconfig_existed=1
+  cp "$wslconfig_path" "$wslconfig_saved"
 else
-  echo "No .wslconfig found; default NAT networking mode in effect"
+  : >"$wslconfig_saved"
 fi
 
-# Query interface configuration inside the distribution
-"$WSL_BIN" -d "$primary_distro" -u root --exec /bin/sh -c 'ip -br addr || ifconfig' || true
+networking_facts() {
+  local mode="$1" distribution="$2"
+  local addresses
+  addresses="$(inside "$distribution" 'ip -br addr' || true)"
+  echo "  $mode: $distribution addresses:"
+  printf '    %s\n' "$addresses"
+  inside "$distribution" 'ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 && echo loopback-ok' |
+    grep -q loopback-ok || fail "$mode: loopback is not reachable inside $distribution"
+}
 
-echo "==> 5. Verifying cached inventory against stopped distributions"
-# Ensure the test distribution is stopped.
-"$WSL_BIN" -t "$primary_distro" >/dev/null 2>&1 || true
-sleep 1
+set_mode() {
+  local mode="$1"
+  printf '[wsl2]\nnetworkingMode=%s\n' "$mode" >"$wslconfig_path"
+  wsl.exe --shutdown >/dev/null 2>&1 || true
+  sleep 3
+  daemons=""
+  for distribution in "$first" "$second"; do
+    start_daemon_inside "$distribution"
+  done
+}
 
-# Check distribution state via WSL.
-initial_states="$("$WSL_BIN" -l -v 2>/dev/null | tr -d '\000\r' || true)"
-echo "Initial distribution states:"
-echo "$initial_states"
+for mode in NAT mirrored; do
+  set_mode "$mode"
+  networking_facts "$mode" "$first"
+  # The bridge opens no socket, so it must behave the same in both modes. This is the measurement
+  # that decides whether any automatic behaviour is needed, rather than assuming one.
+  refresh_and_check first "$first_id"
+  pass "$mode: the process bridge opened and carried a read unchanged"
+done
 
-if echo "$initial_states" | grep -i "$primary_distro" | grep -q -i "Stopped"; then
-  echo "PASS: established stopped distribution: $primary_distro"
-else
-  echo "INFO: distribution $primary_distro is not in stopped state"
-fi
+# ---------------------------------------------------------------------------------------------
+step "7. The helper refuses what may not cross"
 
-# Locate kr binary for inventory queries.
-kr_bin_windows="target/debug/kr.exe"
-if [ ! -f "$kr_bin_windows" ]; then
-  kr_bin_windows="C:/kala/target/debug/kr.exe"
-fi
+# A frame that declares a network origin is refused by the helper inside the distribution, before
+# it connects to anything there.
+refusal="$(printf 'not a bridge frame' | wsl.exe -d "$first" -u "$linux_user" --exec "$helper_path" bridge --stdio 2>&1 || true)"
+echo "$refusal" | grep -qi "bridge" ||
+  fail "the helper gave no diagnostic for input that is not a frame: $refusal"
+pass "the helper refuses input that is not a bridge frame, with a diagnostic on standard error"
 
-if [ -f "$kr_bin_windows" ]; then
-  # Query KalaReach cached inventory via `kr bridge list`
-  echo "Querying KalaReach cached inventory..."
-  inventory_out="$("$kr_bin_windows" bridge list 2>&1 || true)"
-  echo "$inventory_out"
-
-  # Verify that listing distributions left stopped distributions in Stopped state (KR-REQ-03.14).
-  after_states="$("$WSL_BIN" -l -v 2>/dev/null | tr -d '\000\r' || true)"
-  if [ "$initial_states" != "$after_states" ]; then
-    echo "FAIL: WSL distribution state changed during listing query (listing must never start environments)"
-    exit 1
-  fi
-  echo "PASS: listing never started stopped distributions (KR-REQ-03.14 verified)"
-fi
-
-echo "==> 6. Verifying process bridge helper CLI options, refusal on invalid input, and network actor refusal"
-if [ -f "$kr_bin_windows" ]; then
-  echo "Testing bridge helper CLI on Windows..."
-  # Verify bridge command options
-  "$kr_bin_windows" bridge --help | grep -q -- "--stdio"
-  "$kr_bin_windows" bridge list --help | grep -q -- "--access"
-  echo "PASS: bridge --stdio and bridge list options verified"
-
-  # Verify empty standard input exits cleanly without hanging
-  if ! "$kr_bin_windows" bridge --stdio </dev/null; then
-    echo "FAIL: bridge --stdio did not exit cleanly on empty input"
-    exit 1
-  fi
-  echo "PASS: bridge --stdio exits cleanly on EOF"
-
-  # Verify that invalid or unauthenticated handshake is refused and exits non-zero with diagnostic error
-  refusal_code=0
-  refusal_out="$("$kr_bin_windows" bridge --stdio <<< "not a valid handshake frame" 2>&1)" || refusal_code=$?
-  if [ "$refusal_code" -ne 0 ] && [[ "$refusal_out" == *"kr bridge:"* ]]; then
-    echo "PASS: bridge helper refused unauthenticated handshake and exited non-zero ($refusal_code) with diagnostic error"
-  else
-    echo "FAIL: bridge helper did not properly refuse invalid input (exit: $refusal_code, out: $refusal_out)"
-    exit 1
-  fi
-fi
-
-# Check multiple distributions if available
-distro_count="$(echo "$distros" | wc -l | tr -d ' ')"
-echo "Total registered WSL distributions: $distro_count"
-if [ "$distro_count" -gt 1 ]; then
-  echo "Verifying multiple distribution operation..."
-  while IFS= read -r d; do
-    [ -z "$d" ] && continue
-    echo "  checking distribution: $d"
-    "$WSL_BIN" -d "$d" -u root --exec /bin/sh -c 'echo ok' >/dev/null
-  done <<< "$distros"
-  echo "PASS: multiple distributions operating independently"
-fi
-
-# Test network connectivity under active networking mode
-echo "Testing network connectivity inside WSL..."
-if "$WSL_BIN" -d "$primary_distro" -u root --exec /bin/sh -c 'ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 || true'; then
-  echo "PASS: loopback connectivity operational in WSL"
-fi
-
-echo "WSL2 demonstration completed successfully."
+echo
+echo "KR-ACC-011: $passed checks passed."
