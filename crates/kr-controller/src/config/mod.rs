@@ -37,20 +37,104 @@ pub fn open(paths: &EnvironmentPaths) -> Resolver {
     Resolver::open(paths)
 }
 
-/// One applied edit, with the lock still held.
+/// One written edit, with the lock still held.
 ///
-/// The lock outlives the write on purpose: a change that also has to be put somewhere else, such
-/// as the session number the registry admits against, has to do that before another writer can
-/// prepare an edit of its own. Dropping this value releases the lock.
+/// The lock outlives the write on purpose: the effects of the new document have to land before
+/// another writer can prepare an edit of its own. Dropping this value releases the lock.
+///
+/// What the edit *did* is not here, because writing a document is not putting it into force. The
+/// caller passes the written document through the one acceptance path, and what comes back from
+/// that is [`Applied`].
 #[derive(Debug)]
-pub struct AppliedEdit {
-    /// What the edit did.
-    pub applied: Applied,
+pub struct WrittenEdit {
+    /// The revision now on disk.
+    pub revision: u64,
+    /// Whether it applies immediately or only to sessions created afterwards.
+    pub effect: ValueEffect,
     /// The lock, held until this value is dropped.
     pub lock: configuration::EditLock,
 }
 
+/// What this host has accepted, and what its effects did.
+///
+/// One value carries both, which is the whole point of it: a report is built from this rather
+/// than from a second reading of the document, so the number a person is shown and the number
+/// admission enforces cannot be two different readings of the same file.
+#[derive(Debug)]
+pub struct Accepted {
+    /// The configuration the effects below came from.
+    pub resolver: Resolver,
+    /// The session number admission enforces.
+    pub sessions: Enforced,
+    /// What this document owed beyond the registry write.
+    pub owed: configuration::Owed,
+    /// The fence this acceptance raised, when the document's authority ceiling moved.
+    pub barrier: Option<kr_protocol::action::RevocationBarrier>,
+    /// Why the document is not in force, when something stopped it.
+    ///
+    /// A failure cannot be dropped on the floor here: it is part of the value every caller
+    /// already has to hold, so the report says it and the edit path returns it.
+    pub not_in_force: Option<String>,
+}
+
+impl Accepted {
+    /// The state of a host acting on exactly what this document says.
+    ///
+    /// What the daemon's acceptance comes to when every effect landed, and what a report built
+    /// without one describes: one reading, nothing outstanding, and this document's own numbers
+    /// in force.
+    #[must_use]
+    pub fn in_force(resolver: Resolver, limits: HardLimits) -> Self {
+        let sessions = session_limit_in_force(&resolver, limits).map_or(
+            Enforced {
+                value: kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64,
+                from_document: false,
+            },
+            |value| Enforced {
+                value,
+                from_document: true,
+            },
+        );
+        Self {
+            resolver,
+            sessions,
+            owed: configuration::Owed::default(),
+            barrier: None,
+            not_in_force: None,
+        }
+    }
+}
+
+/// The session number admission enforces, and where it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Enforced {
+    /// The number admission enforces right now.
+    pub value: u64,
+    /// True when the document this report describes is what decided it.
+    ///
+    /// A document that is absent, one this build cannot read and one whose effects failed all
+    /// leave the restriction the owner accepted exactly where it was, and then this is false and
+    /// the number is the retained one. Reporting the product default in that case would print a
+    /// number nothing is enforcing.
+    pub from_document: bool,
+}
+
+/// What this daemon last accepted, so the next acceptance can tell what moved.
+#[derive(Clone, Debug, Default)]
+pub struct AcceptedState {
+    /// The revision whose effects are in force.
+    pub revision: u64,
+    /// The document those effects came from, when this host could use one.
+    pub document: Option<configuration::ConfigurationDocument>,
+    /// The session number admission enforces because of it.
+    pub sessions: u64,
+}
+
 /// What one applied edit did.
+///
+/// Every field but the first two is what the acceptance path observed, not what the request
+/// intended: a change that names the value the document already held fences nothing and
+/// invalidates nothing, and this says so.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     /// The revision now in force.
@@ -62,7 +146,8 @@ pub struct Applied {
     /// Invalidated, never migrated: a running worker keeps the profile it was created in, and the
     /// new value applies to sessions created afterwards.
     pub invalidated: Vec<CapabilityInvalidation>,
-    /// True when this change affects authority, so dispatch is fenced before it is acknowledged.
+    /// True when this change moved the authority ceiling, so dispatch was fenced before it was
+    /// acknowledged.
     pub fences_dispatch: bool,
     /// The revision the fence was raised at, when one was.
     pub authority_revision: Option<kr_protocol::ids::AuthorityRevision>,
@@ -93,14 +178,15 @@ pub struct Applied {
 /// ran without the lock, which is what a document restored from a backup underneath a running
 /// host looks like.
 ///
-/// Fencing dispatch and invalidating capability evidence are the caller's, because both need the
-/// running daemon. [`Applied`] says which of them this change owes.
+/// Putting the written document into force is the caller's, because every effect needs the running
+/// daemon, and it happens through the one acceptance path an externally edited document also takes
+/// rather than through a second one built from the request.
 ///
 /// # Errors
 ///
 /// Returns [`ControllerError::Configuration`] when the document may not be edited, when the result
 /// does not validate, or when another writer moved the revision first.
-pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> Result<AppliedEdit> {
+pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> Result<WrittenEdit> {
     // Held across the read, the edit and the replacement, and handed back to the caller so the
     // effects of the edit land before another writer can prepare one.
     let lock = kr_worker::config::lock(paths).map_err(ControllerError::Configuration)?;
@@ -114,18 +200,9 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> R
         return Err(ControllerError::Configuration(problem));
     }
     write(paths, &edited)?;
-    Ok(AppliedEdit {
-        applied: Applied {
-            revision: edited.revision,
-            effect: edited.effect,
-            invalidated: change.invalidates(),
-            fences_dispatch: change.affects_authority(),
-            authority_revision: None,
-            // Nothing was fenced here, so nothing is outstanding. A change that does fence sets
-            // both of these from the barrier the fence returned.
-            barrier_holds: true,
-            pending_workers: 0,
-        },
+    Ok(WrittenEdit {
+        revision: edited.revision,
+        effect: edited.effect,
         lock,
     })
 }
@@ -182,10 +259,11 @@ fn refused(refused: EditRefused) -> ControllerError {
 /// and any document beside this one that this build no longer reads.
 #[must_use]
 pub fn effective(
-    resolver: &Resolver,
+    accepted: &Accepted,
     limits: HardLimits,
     platform_profile: WorkerProfile,
 ) -> EffectiveConfiguration {
+    let resolver = &accepted.resolver;
     let ceilings = resolver.ceilings();
     let power = resolver.sleep_inhibition(None);
     let profile = resolver.worker_profile(None, platform_profile);
@@ -197,35 +275,53 @@ pub fn effective(
         effective_value(&runtime, runtime.value.clone()),
         effective_value(&state, state.value.clone()),
     ];
-    let sessions = ceilings::session_limit(&ceilings, limits);
+    // What the document asks for, narrowed by what this machine allows, and then replaced by the
+    // number admission is actually enforcing. The two are the same on an ordinary host; where they
+    // differ - an unusable document, or effects that failed - the report prints the one in force
+    // and says why it is not the one written down.
+    let sessions = ceilings::enforced(
+        ceilings::session_limit(&ceilings, limits),
+        accepted.sessions,
+    );
     let enrolment = ceilings::enrolment(&ceilings);
     let rights = ceilings::configured_rights(&ceilings);
 
     let doc_path = resolver.document().display().to_string();
-    let session_source = if ceilings.session_limit.is_present() {
-        configuration::ValueSource::HostConfiguration
+    let (session_source, session_origin) = if !accepted.sessions.from_document {
+        // The document in front of this report did not decide the number. Saying it came from the
+        // host configuration would name the wrong document; saying it is the product default
+        // would be a number nothing is enforcing.
+        (
+            if sessions.value == kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64 {
+                configuration::ValueSource::Default
+            } else {
+                configuration::ValueSource::HostConfiguration
+            },
+            None,
+        )
+    } else if ceilings.session_limit.is_present() {
+        (
+            configuration::ValueSource::HostConfiguration,
+            Some(doc_path.clone()),
+        )
     } else {
-        configuration::ValueSource::Default
-    };
-    let session_origin = if ceilings.session_limit.is_present() {
-        Some(doc_path.clone())
-    } else {
-        None
+        (configuration::ValueSource::Default, None)
     };
 
-    // An enrolment section may name one budget and leave the other nine to the schema default, so
-    // "the document supplied this" is per budget rather than per section. A budget that matches
-    // the default is reported as the default, whether the document spelled it out or said nothing
-    // about it, because both leave the same number in force from the same place.
-    let configured_budgets = enrolment.configured.unwrap_or_default();
-    let default_budgets = configuration::EnrolmentBudgets::default();
-    let supplied_budgets = configured_budgets != default_budgets;
-    let enrolment_source = if supplied_budgets {
-        configuration::ValueSource::HostConfiguration
-    } else {
+    // An enrolment section may name one budget and leave the other nine out, so "the document
+    // supplied this" is per budget rather than per section, and it is presence that answers it: a
+    // budget written with the number the schema already uses was still chosen by whoever wrote it.
+    let supplied_budgets = ceilings
+        .enrolment
+        .as_ref()
+        .map(configuration::ConfiguredEnrolmentBudgets::supplied)
+        .unwrap_or_default();
+    let enrolment_source = if supplied_budgets.is_empty() {
         configuration::ValueSource::Default
+    } else {
+        configuration::ValueSource::HostConfiguration
     };
-    let enrolment_origin = supplied_budgets.then(|| doc_path.clone());
+    let enrolment_origin = (!supplied_budgets.is_empty()).then(|| doc_path.clone());
 
     let rights_source = if ceilings.grant_rights.is_present() {
         configuration::ValueSource::HostConfiguration
@@ -287,11 +383,13 @@ pub fn effective(
                     );
                     // Which of the ten this host's configuration chose, so one budget raised in a
                     // document cannot read as ten budgets the owner set.
-                    let supplied = ceilings::supplied_budgets(budgets);
-                    if supplied.is_empty() {
+                    if supplied_budgets.is_empty() {
                         line.push_str("; every budget is the default");
                     } else {
-                        line.push_str(&format!("; configured here: {}", supplied.join(", ")));
+                        line.push_str(&format!(
+                            "; configured here: {}",
+                            supplied_budgets.join(", ")
+                        ));
                     }
                     line
                 },
@@ -337,15 +435,16 @@ pub fn effective(
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
+        not_in_force: kr_protocol::scalars::Nullable(accepted.not_in_force.clone()),
     }
 }
 
 /// The diagnostics this host's configuration contributes.
 ///
-/// Four checks, each with the evidence `kr doctor --verbose` prints: where the document is and
-/// what it turned out to be, the precedence order and the locations, the documented overrides and
-/// which of them are set, and the ceilings with what narrowed them. A stale document beside the
-/// configuration is one line inside the first of them.
+/// Five checks, each with the evidence `kr doctor --verbose` prints: where the document is and
+/// what it turned out to be, whether this host put it into force, the precedence order and the
+/// locations, the documented overrides and which of them are set, and the ceilings with what
+/// narrowed them. A stale document beside the configuration is one line inside the first of them.
 #[must_use]
 pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
@@ -371,14 +470,40 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         detail,
         wrong.then(|| {
             if status.state.is_a_problem() {
-                "Every value is the product default while this document cannot be used. It is \
-                 left exactly as it is: nothing here rewrites it."
+                "Every ordinary preference is the product default while this document cannot be \
+                 used, and every restriction this host already enforces stays in force. The file \
+                 is left exactly as it is: nothing here rewrites it."
                     .to_owned()
             } else {
                 "That document has no effect. Remove it once you have moved anything you still \
                  want into the configuration above."
                     .to_owned()
             }
+        }),
+    ));
+    // Whether the values below are what this host is acting on. A report that described a
+    // document nothing is enforcing would be worse than no report, so this says which it is.
+    checks.push(DoctorCheck::new(
+        "configuration-in-force",
+        "This host is acting on the configuration it reports",
+        if effective.not_in_force.is_present() {
+            DoctorStatus::Failed
+        } else {
+            DoctorStatus::Ok
+        },
+        effective.not_in_force.as_ref().map_or_else(
+            || {
+                format!(
+                    "revision {} is in force; every value below is the one this host acts on",
+                    effective.revision.get()
+                )
+            },
+            Clone::clone,
+        ),
+        effective.not_in_force.as_ref().map(|_| {
+            "The values below are what this host is enforcing, not what the document asks for. \
+             Fix what the line above names and run this again."
+                .to_owned()
         }),
     ));
     checks.push(DoctorCheck::new(
@@ -524,21 +649,24 @@ pub fn sleep_inhibition(paths: &EnvironmentPaths) -> SleepInhibitionSetting {
     Resolver::open(paths).sleep_inhibition(None).value
 }
 
-/// Returns the session number this host admits against, when the configuration names one.
+/// Returns the session number a document puts in force, when it decides one.
 ///
-/// `None` means the document says nothing about it, and nothing here changes what the environment
-/// already admits against. A document this host cannot use says nothing either: a restriction an
-/// owner accepted must not be lifted because a later build could not read the file it was in.
+/// A document this host can use decides it whether it names a number or leaves it to the product
+/// default: both are things the document says, and an owner who removes a ceiling has removed it.
+///
+/// `None` is a document that decides nothing at all - one that is absent, and one this build
+/// cannot read. Then the number the environment already admits against stays exactly as it is: a
+/// restriction an owner accepted must not be lifted because a later build could not read the file
+/// it was in.
+///
+/// One rule, used by the daemon's startup and by every acceptance after it, so a restart can
+/// never put a different number in force from the one a running daemon would.
 #[must_use]
-pub fn configured_session_limit(resolver: &Resolver, limits: HardLimits) -> Option<u64> {
-    if resolver.status().state.is_a_problem() {
+pub fn session_limit_in_force(resolver: &Resolver, limits: HardLimits) -> Option<u64> {
+    if resolver.status().state != configuration::DocumentState::Loaded {
         return None;
     }
-    let ceilings = resolver.ceilings();
-    ceilings
-        .session_limit
-        .is_present()
-        .then(|| ceilings::session_limit(&ceilings, limits).value)
+    Some(ceilings::session_limit(&resolver.ceilings(), limits).value)
 }
 
 #[cfg(test)]

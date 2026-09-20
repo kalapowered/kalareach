@@ -2,16 +2,43 @@
 
 use kr_protocol::desktop::CapabilityInvalidation;
 use kr_protocol::hostinfo::configuration::{
-    Change, ConfigurationCeilings, ConfigurationDocument, DocumentState, EnrolmentBudgets,
-    ValueEffect,
+    Change, ConfigurationCeilings, ConfigurationDocument, ConfiguredEnrolmentBudgets,
+    DocumentState, EnrolmentBudgets, ValueEffect,
 };
 use kr_protocol::scalars::Nullable;
 
 use super::*;
 
 /// One edit, applied the way the host applies it, with the lock released before the assertion.
-fn edit_once(environment: &kr_ipc::paths::EnvironmentPaths, change: &Change) -> Result<Applied> {
-    apply(environment, change, HardLimits::default()).map(|edit| edit.applied.clone())
+fn edit_once(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    change: &Change,
+) -> Result<WrittenEdit> {
+    apply(environment, change, HardLimits::default())
+}
+
+/// One edit, and what the document it wrote owes beyond being written.
+///
+/// Read from the two documents rather than from the change, because that is what the daemon
+/// does: a person editing the same file in a text editor owes the same effects.
+fn edit_and_owed(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    change: &Change,
+) -> Result<(WrittenEdit, configuration::Owed)> {
+    let before = kr_worker::config::load(environment).document;
+    let edit = edit_once(environment, change)?;
+    let after = kr_worker::config::load(environment).document;
+    let owed = configuration::owed(before.as_ref(), after.as_ref());
+    Ok((edit, owed))
+}
+
+/// The report of a host acting on exactly what its document says.
+fn reported(environment: &kr_ipc::paths::EnvironmentPaths) -> EffectiveConfiguration {
+    effective(
+        &Accepted::in_force(open(environment), HardLimits::default()),
+        HardLimits::default(),
+        WorkerProfile::HeadlessUser,
+    )
 }
 
 /// KR-REQ-26.16: an edit is validated, then a revision is applied, then it is written.
@@ -20,19 +47,20 @@ fn an_edit_applies_one_revision_and_a_refused_edit_applies_none() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
 
-    let applied = edit_once(
+    let (applied, owed) = edit_and_owed(
         &environment,
         &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
     )
     .expect("the owner's choice");
     assert_eq!(applied.revision, 1);
     assert_eq!(applied.effect, ValueEffect::Immediately);
-    assert!(!applied.fences_dispatch);
-    assert!(applied.invalidated.is_empty());
+    assert!(!owed.fences_dispatch);
+    assert!(owed.invalidated.is_empty());
     assert_eq!(
         sleep_inhibition(&environment),
         SleepInhibitionSetting::MainsOnly
     );
+    drop(applied);
 
     let refused = edit_once(&environment, &Change::SessionLimit(Some(0)))
         .expect_err("a ceiling that admits nothing");
@@ -52,19 +80,32 @@ fn an_edit_applies_one_revision_and_a_refused_edit_applies_none() {
 fn a_profile_change_invalidates_the_evidence_taken_under_the_old_one() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    let applied = edit_once(
+    let (applied, owed) = edit_and_owed(
         &environment,
         &Change::WorkerProfile(WorkerProfile::HeadlessUser),
     )
     .expect("the owner's choice");
     assert_eq!(applied.effect, ValueEffect::NewSessionsOnly);
     assert_eq!(
-        applied.invalidated,
+        owed.invalidated,
         vec![CapabilityInvalidation::WorkerProfile]
     );
     assert!(
-        !applied.fences_dispatch,
+        !owed.fences_dispatch,
         "a profile is not authority, so nothing is fenced"
+    );
+    drop(applied);
+
+    // The same profile again is a new revision of the document and no movement at all, so it
+    // invalidates nothing: what decides an effect is what changed, not what was asked for.
+    let (_applied, owed) = edit_and_owed(
+        &environment,
+        &Change::WorkerProfile(WorkerProfile::HeadlessUser),
+    )
+    .expect("the owner's choice again");
+    assert!(
+        owed.invalidated.is_empty(),
+        "a value that did not move invalidates nothing: {owed:?}"
     );
 }
 
@@ -73,13 +114,14 @@ fn a_profile_change_invalidates_the_evidence_taken_under_the_old_one() {
 fn a_grant_ceiling_change_fences_dispatch_before_it_is_acknowledged() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    let applied = edit_once(
+    let (applied, owed) = edit_and_owed(
         &environment,
         &Change::GrantRights(Some(vec!["session.view".to_owned()])),
     )
     .expect("a ceiling naming a right this build knows");
-    assert!(applied.fences_dispatch);
+    assert!(owed.fences_dispatch);
     assert_eq!(applied.effect, ValueEffect::Immediately);
+    drop(applied);
 
     let refused = edit_once(
         &environment,
@@ -190,7 +232,7 @@ fn an_edit_the_intersection_would_refuse_leaves_the_document_alone() {
     let resolver = open(&environment);
     assert_eq!(resolver.revision(), 1, "a refused edit applies no revision");
     assert_eq!(
-        configured_session_limit(&resolver, measured),
+        session_limit_in_force(&resolver, measured),
         Some(3),
         "and the number the owner accepted is still the one in force"
     );
@@ -199,9 +241,9 @@ fn an_edit_the_intersection_would_refuse_leaves_the_document_alone() {
 /// KR-REQ-26.15: a payload budget above the default without the explicit setting is refused.
 #[test]
 fn an_enrolment_budget_above_the_default_needs_the_explicit_setting() {
-    let mut budgets = EnrolmentBudgets {
-        cached_payload_bytes: 8 * 1024 * 1024 * 1024,
-        ..EnrolmentBudgets::default()
+    let mut budgets = ConfiguredEnrolmentBudgets {
+        cached_payload_bytes: Nullable::some(8 * 1024 * 1024 * 1024),
+        ..ConfiguredEnrolmentBudgets::default()
     };
     let asked = ConfigurationCeilings {
         enrolment: Nullable::some(budgets),
@@ -219,7 +261,7 @@ fn an_enrolment_budget_above_the_default_needs_the_explicit_setting() {
         "and the catalogue reads what is in force, not what was asked for"
     );
 
-    budgets.full_offline_mirror = true;
+    budgets.full_offline_mirror = Nullable::some(true);
     let chosen = ConfigurationCeilings {
         enrolment: Nullable::some(budgets),
         ..ConfigurationCeilings::default()
@@ -268,11 +310,7 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     )
     .expect("the owner's choice");
 
-    let report = effective(
-        &open(&environment),
-        HardLimits::default(),
-        WorkerProfile::HeadlessUser,
-    );
+    let report = reported(&environment);
     assert_eq!(report.schema_version.get(), configuration::VERSION);
     assert_eq!(report.revision.get(), 1);
     assert_eq!(report.status.state, DocumentState::Loaded);
@@ -311,17 +349,14 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
 fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    let report = effective(
-        &open(&environment),
-        HardLimits::default(),
-        WorkerProfile::HeadlessUser,
-    );
+    let report = reported(&environment);
     let produced = checks(&report);
     let ids: Vec<&str> = produced.iter().map(|check| check.id.as_str()).collect();
     assert_eq!(
         ids,
         vec![
             "configuration-document",
+            "configuration-in-force",
             "configuration-precedence",
             "configuration-overrides",
             "configuration-ceilings",
@@ -330,7 +365,13 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
     for check in &produced {
         assert!(!check.evidence().is_empty(), "{} has evidence", check.id);
     }
-    let precedence = &produced[1];
+    let by_id = |id: &str| {
+        produced
+            .iter()
+            .find(|check| check.id == id)
+            .unwrap_or_else(|| panic!("the {id} check"))
+    };
+    let precedence = by_id("configuration-precedence");
     assert!(
         precedence.detail.contains("explicit request"),
         "{precedence:?}"
@@ -339,7 +380,7 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
         precedence.detail.contains("product default"),
         "{precedence:?}"
     );
-    let overrides = &produced[2];
+    let overrides = by_id("configuration-overrides");
     assert!(overrides.detail.contains("KR_STATE_DIR"), "{overrides:?}");
     assert!(
         overrides
@@ -366,11 +407,7 @@ fn a_stale_power_document_is_reported_by_the_document_check() {
     )
     .expect("writes the superseded document");
 
-    let report = effective(
-        &open(&environment),
-        HardLimits::default(),
-        WorkerProfile::HeadlessUser,
-    );
+    let report = reported(&environment);
     assert_eq!(report.stale_documents.len(), 1);
     let document = &checks(&report)[0];
     assert!(document.detail.contains("no longer reads"), "{document:?}");
@@ -512,13 +549,13 @@ fn the_configured_session_number_reaches_the_limit_admission_reads() {
     );
 
     assert_eq!(
-        configured_session_limit(&open(&environment), limits),
+        session_limit_in_force(&open(&environment), limits),
         None,
         "a document that says nothing about it changes nothing"
     );
 
     edit_once(&environment, &Change::SessionLimit(Some(3))).expect("the owner's number");
-    let limit = configured_session_limit(&open(&environment), limits).expect("a configured number");
+    let limit = session_limit_in_force(&open(&environment), limits).expect("a configured number");
     registry
         .set_session_limit(limit)
         .expect("the number reaches the registry");
@@ -531,7 +568,7 @@ fn the_configured_session_number_reaches_the_limit_admission_reads() {
     )
     .expect("a document from a later build");
     assert_eq!(
-        configured_session_limit(&open(&environment), limits),
+        session_limit_in_force(&open(&environment), limits),
         None,
         "and a restriction is never lifted because a file could not be read"
     );
@@ -664,6 +701,59 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
     assert!(decided.refused_rights.contains(&ActionRight::HostManage));
 }
 
+/// KR-REQ-01.23, KR-REQ-26.16: effects that failed leave the report describing what is enforced,
+/// and say plainly that the document is not in force.
+#[test]
+fn a_document_whose_effects_failed_is_reported_as_not_in_force() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    edit_once(&environment, &Change::SessionLimit(Some(9))).expect("the owner's ceiling");
+
+    // What the daemon hands the report when the number a document asks for could not be recorded:
+    // the number still in force, and the sentence saying why it is not the one written down.
+    let accepted = Accepted {
+        sessions: Enforced {
+            value: 4,
+            from_document: false,
+        },
+        not_in_force: Some("this host still admits 4 sessions".to_owned()),
+        ..Accepted::in_force(open(&environment), HardLimits::default())
+    };
+    let report = effective(
+        &accepted,
+        HardLimits::default(),
+        WorkerProfile::HeadlessUser,
+    );
+    let ceiling = report
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "session_limit")
+        .expect("the session ceiling");
+    assert_eq!(
+        ceiling.configured.0.as_deref(),
+        Some("9"),
+        "the report says what the document asks for"
+    );
+    assert_eq!(
+        ceiling.value, "4",
+        "and prints the number admission is enforcing, not the one it asked for"
+    );
+    let produced = checks(&report);
+    let in_force = produced
+        .iter()
+        .find(|check| check.id == "configuration-in-force")
+        .expect("the in-force check");
+    assert_eq!(in_force.status, DoctorStatus::Failed);
+    assert!(
+        in_force.detail.contains("still admits 4 sessions"),
+        "{in_force:?}"
+    );
+    assert!(
+        in_force.remedy.is_present(),
+        "and it says what to do: {in_force:?}"
+    );
+}
+
 /// KR-REQ-01.23: an enrolment section that names one budget is one budget the owner configured,
 /// not ten.
 #[test]
@@ -671,11 +761,7 @@ fn each_enrolment_budget_keeps_whether_it_was_configured_or_defaulted() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
 
-    let report = effective(
-        &open(&environment),
-        HardLimits::default(),
-        WorkerProfile::HeadlessUser,
-    );
+    let report = reported(&environment);
     let enrolment = report
         .ceilings
         .iter()
@@ -693,17 +779,13 @@ fn each_enrolment_budget_keeps_whether_it_was_configured_or_defaulted() {
     );
 
     // One budget raised, the other nine left out of the document entirely.
-    let raised = EnrolmentBudgets {
-        retained_generations: 5,
-        ..EnrolmentBudgets::default()
+    let raised = ConfiguredEnrolmentBudgets {
+        retained_generations: Nullable::some(5),
+        ..ConfiguredEnrolmentBudgets::default()
     };
     edit_once(&environment, &Change::Enrolment(raised)).expect("the owner's budget");
 
-    let report = effective(
-        &open(&environment),
-        HardLimits::default(),
-        WorkerProfile::HeadlessUser,
-    );
+    let report = reported(&environment);
     let enrolment = report
         .ceilings
         .iter()
@@ -722,8 +804,37 @@ fn each_enrolment_budget_keeps_whether_it_was_configured_or_defaulted() {
         enrolment.value
     );
     assert_eq!(
-        ceilings::supplied_budgets(&raised),
+        raised.supplied(),
         vec!["retained_generations"],
         "the rest are the schema's own numbers"
+    );
+
+    // A budget written with the number the schema already uses. Equality would call it a default;
+    // presence calls it what it is, which is a number this host's owner wrote down.
+    let spelled_out = ConfiguredEnrolmentBudgets {
+        metadata_bytes: Nullable::some(EnrolmentBudgets::default().metadata_bytes),
+        ..ConfiguredEnrolmentBudgets::default()
+    };
+    edit_once(&environment, &Change::Enrolment(spelled_out)).expect("the owner's budget");
+    let report = reported(&environment);
+    let enrolment = report
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "enrolment")
+        .expect("the enrolment ceiling");
+    assert_eq!(
+        enrolment.source,
+        configuration::ValueSource::HostConfiguration,
+        "a budget spelled out is a budget somebody chose"
+    );
+    assert!(
+        enrolment.origin.is_present(),
+        "and the document they wrote it in is named: {:?}",
+        enrolment.origin
+    );
+    assert!(
+        enrolment.value.contains("configured here: metadata_bytes"),
+        "{}",
+        enrolment.value
     );
 }

@@ -80,18 +80,7 @@ configuration file this host reads.
   "ceilings": {
     "session_limit": 16,
     "grant_rights": null,
-    "enrolment": {
-      "metadata_bytes": 67108864,
-      "metadata_entries": 100000,
-      "retained_generations": 2,
-      "cached_payload_bytes": 1073741824,
-      "package_bytes": 268435456,
-      "object_count": 100000,
-      "expanded_pack_bytes": 536870912,
-      "transfer_bytes": 2147483648,
-      "compilation_ms": 60000,
-      "full_offline_mirror": false
-    }
+    "enrolment": { "retained_generations": 5 }
   },
   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }]
 }
@@ -104,6 +93,7 @@ configuration file this host reads.
 | 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |
 | owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
 | unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
+| omitted fields | The product's own value, and reported as the product's own. Every budget inside `enrolment` is separate: the example above configures one of the ten, and `kr doctor` names that one rather than reporting ten choices nobody made |
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
 operating-system lock on `.config.lock` in the environment's state directory, reads, validates,
@@ -117,6 +107,14 @@ A change that would affect authority fences dispatch before the change is acknow
 admitted under the old authority cannot be dispatched by the time the caller is told the change is
 in force. A change to the execution context invalidates the capability evidence taken under the old
 one and migrates no worker: a running session keeps the context it was created in.
+
+Those effects belong to the document, not to the command that wrote it. The host puts the document
+on disk into force whenever it reads it, and what it does is decided by what moved since the last
+time it read one, so a ceiling lowered in a text editor fences dispatch and a profile changed there
+replaces the evidence, exactly as the same edit made through `kr` does. It is also one reading:
+what `kr doctor` prints is what was put into force, so a value in a report is never a value nothing
+is enforcing. Where an effect cannot be applied, the report prints what is in force, says what the
+document asked for, and the `configuration-in-force` check fails with the reason.
 
 The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
 assertion under; `worker_profile` is the execution context a create request gets when it does not
@@ -182,9 +180,11 @@ force is refused and reported as refused.
 A ceiling is applied where the thing it restricts reads it, and an edit whose value the
 intersection would refuse is refused before it is written rather than recorded and then quietly
 read back narrower. `session_limit` becomes the number this host admits a create against, at
-startup and again after every edit, and a document that says nothing about it leaves that number
-alone: a restriction an owner accepted is never lifted because a later build could not read the
-file it was in. `grant_rights` narrows a grant before the method's required rights are checked, so
+startup and again after every acceptance. A document this host can use decides that number whether
+it names one or leaves it to the product default, because removing a ceiling is a choice. A
+document that is absent and one this build cannot read decide nothing at all, and then the number
+already in force stays and is what the report prints: a restriction an owner accepted is never
+lifted, or reported as lifted, because a later build could not read the file it was in. `grant_rights` narrows a grant before the method's required rights are checked, so
 a method whose right the ceiling has removed is refused rather than permitted with nothing in it.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls

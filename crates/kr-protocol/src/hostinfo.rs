@@ -296,6 +296,13 @@ pub struct EffectiveConfiguration {
     pub secrets: Vec<configuration::SecretReference>,
     /// Documents found beside the configuration that this build no longer reads.
     pub stale_documents: Vec<String>,
+    /// Why this host could not put the document into force, when something stopped it.
+    ///
+    /// Null on an ordinary host. A registry this host cannot write, a fence it cannot raise or
+    /// capability evidence it cannot re-read leaves the values above describing what is actually
+    /// in force and this sentence saying what the document asked for and did not get. A report
+    /// that stayed silent about it would be a report of a value nothing is enforcing.
+    pub not_in_force: Nullable<String>,
 }
 
 impl EffectiveConfiguration {
@@ -352,6 +359,9 @@ impl EffectiveConfiguration {
                     item: redaction::redact(&reference.item),
                 })
                 .collect(),
+            // The sentence carries whatever the failure said, which on a registry error is a
+            // filesystem path and a platform message.
+            not_in_force: Nullable(self.not_in_force.0.as_deref().map(redaction::redact)),
             ..self
         }
     }
@@ -382,6 +392,7 @@ impl EffectiveConfiguration {
             ceilings: Vec::new(),
             secrets: Vec::new(),
             stale_documents: Vec::new(),
+            not_in_force: Nullable::null(),
         }
     }
 }
@@ -894,7 +905,7 @@ pub mod configuration {
         /// in this list is not available on this host however a grant was issued.
         pub grant_rights: Nullable<Vec<String>>,
         /// The repository enrolment budgets section 11 calls configuration.
-        pub enrolment: Nullable<EnrolmentBudgets>,
+        pub enrolment: Nullable<ConfiguredEnrolmentBudgets>,
     }
 
     impl Default for ConfigurationCeilings {
@@ -912,7 +923,132 @@ pub mod configuration {
         /// Returns the enrolment budgets in force, defaulting to [`EnrolmentBudgets::default`].
         #[must_use]
         pub fn enrolment_budgets(&self) -> EnrolmentBudgets {
-            self.enrolment.0.unwrap_or_default()
+            self.enrolment.as_ref().map_or_else(
+                EnrolmentBudgets::default,
+                ConfiguredEnrolmentBudgets::resolve,
+            )
+        }
+    }
+
+    /// The enrolment budgets a document chooses, each present only where its owner wrote one.
+    ///
+    /// [`EnrolmentBudgets`] is what a caller acts on: ten numbers, every one of them decided. This
+    /// is what the document holds, and a budget nobody wrote is absent here rather than equal to
+    /// the default. Keeping the two apart is the whole of what lets a report say which numbers a
+    /// person chose: a budget that happens to equal the default is not evidence that anybody set
+    /// it, and inferring the source from the value would report the one they did set as the
+    /// product's own.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct ConfiguredEnrolmentBudgets {
+        /// The metadata budget per repository, in bytes.
+        pub metadata_bytes: Nullable<u64>,
+        /// The metadata budget per repository, in entries.
+        pub metadata_entries: Nullable<u64>,
+        /// How many metadata generations a repository may retain.
+        pub retained_generations: Nullable<u64>,
+        /// The cached payload budget per repository, in bytes.
+        pub cached_payload_bytes: Nullable<u64>,
+        /// The largest single package or asset a repository may fetch, in bytes.
+        pub package_bytes: Nullable<u64>,
+        /// How many objects one package may hold.
+        pub object_count: Nullable<u64>,
+        /// The largest an expanded pack may become, in bytes, checked during processing.
+        pub expanded_pack_bytes: Nullable<u64>,
+        /// How many bytes one synchronisation may transfer.
+        pub transfer_bytes: Nullable<u64>,
+        /// How long one package's compilation may take, in milliseconds.
+        pub compilation_ms: Nullable<u64>,
+        /// Whether this host keeps a full offline mirror, which is the explicit setting a payload
+        /// budget above the default needs.
+        pub full_offline_mirror: Nullable<bool>,
+    }
+
+    impl ConfiguredEnrolmentBudgets {
+        /// Returns the budgets in force: the ones this document chose, and the schema's own for
+        /// the rest.
+        #[must_use]
+        pub fn resolve(&self) -> EnrolmentBudgets {
+            let default = EnrolmentBudgets::default();
+            EnrolmentBudgets {
+                metadata_bytes: self.metadata_bytes.0.unwrap_or(default.metadata_bytes),
+                metadata_entries: self.metadata_entries.0.unwrap_or(default.metadata_entries),
+                retained_generations: self
+                    .retained_generations
+                    .0
+                    .unwrap_or(default.retained_generations),
+                cached_payload_bytes: self
+                    .cached_payload_bytes
+                    .0
+                    .unwrap_or(default.cached_payload_bytes),
+                package_bytes: self.package_bytes.0.unwrap_or(default.package_bytes),
+                object_count: self.object_count.0.unwrap_or(default.object_count),
+                expanded_pack_bytes: self
+                    .expanded_pack_bytes
+                    .0
+                    .unwrap_or(default.expanded_pack_bytes),
+                transfer_bytes: self.transfer_bytes.0.unwrap_or(default.transfer_bytes),
+                compilation_ms: self.compilation_ms.0.unwrap_or(default.compilation_ms),
+                full_offline_mirror: self
+                    .full_offline_mirror
+                    .0
+                    .unwrap_or(default.full_offline_mirror),
+            }
+        }
+
+        /// Names the budgets this document chose, in schema order.
+        ///
+        /// Presence, not comparison: a budget written with the same number the schema already
+        /// uses was still chosen by the person who wrote it, and one left out was not chosen
+        /// however unusual its default looks.
+        #[must_use]
+        pub fn supplied(&self) -> Vec<&'static str> {
+            let mut named = Vec::new();
+            for (name, present) in [
+                ("metadata_bytes", self.metadata_bytes.is_present()),
+                ("metadata_entries", self.metadata_entries.is_present()),
+                (
+                    "retained_generations",
+                    self.retained_generations.is_present(),
+                ),
+                (
+                    "cached_payload_bytes",
+                    self.cached_payload_bytes.is_present(),
+                ),
+                ("package_bytes", self.package_bytes.is_present()),
+                ("object_count", self.object_count.is_present()),
+                ("expanded_pack_bytes", self.expanded_pack_bytes.is_present()),
+                ("transfer_bytes", self.transfer_bytes.is_present()),
+                ("compilation_ms", self.compilation_ms.is_present()),
+                ("full_offline_mirror", self.full_offline_mirror.is_present()),
+            ] {
+                if present {
+                    named.push(name);
+                }
+            }
+            named
+        }
+
+        /// Returns the budgets this document names, each with its number.
+        ///
+        /// What validation and the intersection ask about: a budget nobody wrote has nothing to
+        /// check, and a budget of zero is a refusal wherever it was written.
+        #[must_use]
+        pub fn written(&self) -> Vec<(&'static str, u64)> {
+            [
+                ("metadata_bytes", self.metadata_bytes.0),
+                ("metadata_entries", self.metadata_entries.0),
+                ("retained_generations", self.retained_generations.0),
+                ("cached_payload_bytes", self.cached_payload_bytes.0),
+                ("package_bytes", self.package_bytes.0),
+                ("object_count", self.object_count.0),
+                ("expanded_pack_bytes", self.expanded_pack_bytes.0),
+                ("transfer_bytes", self.transfer_bytes.0),
+                ("compilation_ms", self.compilation_ms.0),
+            ]
+            .into_iter()
+            .filter_map(|(name, value)| value.map(|value| (name, value)))
+            .collect()
         }
     }
 
@@ -1227,25 +1363,18 @@ pub mod configuration {
             }
         }
         if let Some(budgets) = document.ceilings.enrolment.0.as_ref() {
-            for (field, value) in [
-                ("metadata_bytes", budgets.metadata_bytes),
-                ("metadata_entries", budgets.metadata_entries),
-                ("retained_generations", budgets.retained_generations),
-                ("cached_payload_bytes", budgets.cached_payload_bytes),
-                ("package_bytes", budgets.package_bytes),
-                ("object_count", budgets.object_count),
-                ("expanded_pack_bytes", budgets.expanded_pack_bytes),
-                ("transfer_bytes", budgets.transfer_bytes),
-                ("compilation_ms", budgets.compilation_ms),
-            ] {
+            // Only the budgets this document actually names. One left out is the schema's own
+            // number, which validated when this build chose it.
+            for (field, value) in budgets.written() {
                 if value == 0 {
                     problems.push(format!(
                         "an enrolment budget of zero for {field} would enrol no repository"
                     ));
                 }
             }
-            if budgets.cached_payload_bytes > DEFAULT_CACHED_PAYLOAD_BYTES
-                && !budgets.full_offline_mirror
+            let resolved = budgets.resolve();
+            if resolved.cached_payload_bytes > DEFAULT_CACHED_PAYLOAD_BYTES
+                && !resolved.full_offline_mirror
             {
                 problems.push(format!(
                     "a cached payload budget above {DEFAULT_CACHED_PAYLOAD_BYTES} bytes is a full \
@@ -1292,7 +1421,10 @@ pub mod configuration {
         /// Set the rights a grant may carry on this host, or clear the ceiling.
         GrantRights(Option<Vec<String>>),
         /// Set this host's repository enrolment budgets.
-        Enrolment(EnrolmentBudgets),
+        ///
+        /// The whole section, not one budget of it: what this names becomes what the document
+        /// says, and a budget left out of it goes back to the schema's own number.
+        Enrolment(ConfiguredEnrolmentBudgets),
     }
 
     impl Change {
@@ -1319,34 +1451,65 @@ pub mod configuration {
                 Self::WorkerProfile(_) => ValueEffect::NewSessionsOnly,
             }
         }
+    }
 
-        /// Returns true when this change alters what a caller is authorised to do, so dispatch is
-        /// fenced before the change is acknowledged.
+    /// What a document owes beyond being written, once it has moved.
+    ///
+    /// Derived from the two documents rather than from the request that produced the new one, so
+    /// an edit a person makes in a text editor owes exactly what the same edit made through this
+    /// host owes. It is the answer to one question - what is different now - and nothing else
+    /// decides which effects run.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Owed {
+        /// True when the ceiling on what a grant may carry moved.
         ///
-        /// One change does: the ceiling on what a grant may carry. Lowering it takes rights away
-        /// from grants that are already live, and work admitted under the old ceiling must be
-        /// fenced before the person is told the change is in force. A session ceiling, a sleep
-        /// policy and an enrolment budget each change what this host admits or costs, not what a
-        /// caller is authorised to do, so none of them fences anything.
-        #[must_use]
-        pub const fn affects_authority(&self) -> bool {
-            matches!(self, Self::GrantRights(_))
+        /// Lowering it takes rights away from grants that are already live, so work admitted
+        /// under the old ceiling is fenced before anyone is told the change is in force. A
+        /// session ceiling, a sleep policy and an enrolment budget each change what this host
+        /// admits or costs rather than what a caller is authorised to do, so none of them fences
+        /// anything.
+        pub fences_dispatch: bool,
+        /// The capability evidence this move invalidated.
+        ///
+        /// Invalidated, never migrated: a running session keeps the profile it was created in,
+        /// and the new value applies to sessions created afterwards.
+        pub invalidated: Vec<crate::desktop::CapabilityInvalidation>,
+    }
+
+    /// Returns what moving from `before` to `after` owes.
+    ///
+    /// A document this host cannot use is `None` on either side and decides nothing: what was in
+    /// force stays in force, which is why an unreadable file never lifts a restriction.
+    #[must_use]
+    pub fn owed(
+        before: Option<&ConfigurationDocument>,
+        after: Option<&ConfigurationDocument>,
+    ) -> Owed {
+        let Some(after) = after else {
+            return Owed::default();
+        };
+        // A host with no usable document is compared against an empty one rather than against
+        // nothing, so a document that appears saying what the defaults already said owes nothing.
+        let empty = ConfigurationDocument::empty();
+        let before = before.unwrap_or(&empty);
+        // The profile a session is created in is resolved from the host preference, the named
+        // profiles and the default selection together, so any of the three moving is the evidence
+        // moving. Re-reading evidence that turns out to be the same costs one reading; not
+        // re-reading it publishes records about a profile this host no longer creates sessions in.
+        let profile = |document: &ConfigurationDocument| {
+            (
+                document.preferences.worker_profile,
+                document.profiles.clone(),
+                document.default_profile.clone(),
+            )
+        };
+        let mut invalidated = Vec::new();
+        if profile(before) != profile(after) {
+            invalidated.push(crate::desktop::CapabilityInvalidation::WorkerProfile);
         }
-
-        /// Returns the capability evidence this change invalidates.
-        ///
-        /// A profile change moves what a session's processes can reach, so the evidence taken
-        /// under the old profile is no longer about this host. Nothing here migrates a worker: a
-        /// running session keeps the profile it was created in, and the new one applies to
-        /// sessions created afterwards.
-        #[must_use]
-        pub fn invalidates(&self) -> Vec<crate::desktop::CapabilityInvalidation> {
-            match self {
-                Self::WorkerProfile(_) => {
-                    vec![crate::desktop::CapabilityInvalidation::WorkerProfile]
-                }
-                _ => Vec::new(),
-            }
+        Owed {
+            fences_dispatch: before.ceilings.grant_rights != after.ceilings.grant_rights,
+            invalidated,
         }
     }
 
@@ -3052,9 +3215,9 @@ mod tests {
     /// KR-REQ-26.15: a full mirror above the default payload budget needs the explicit setting.
     #[test]
     fn a_payload_budget_above_the_default_needs_the_mirror_setting() {
-        let mut budgets = configuration::EnrolmentBudgets {
-            cached_payload_bytes: 4 * 1024 * 1024 * 1024,
-            ..configuration::EnrolmentBudgets::default()
+        let mut budgets = configuration::ConfiguredEnrolmentBudgets {
+            cached_payload_bytes: Nullable::some(4 * 1024 * 1024 * 1024),
+            ..configuration::ConfiguredEnrolmentBudgets::default()
         };
         let loaded = configuration::load(None);
         let refused = configuration::edit(&loaded, &Change::Enrolment(budgets))
@@ -3063,9 +3226,19 @@ mod tests {
             format!("{refused}").contains("full_offline_mirror"),
             "{refused}"
         );
-        budgets.full_offline_mirror = true;
-        configuration::edit(&loaded, &Change::Enrolment(budgets))
+        budgets.full_offline_mirror = Nullable::some(true);
+        let applied = configuration::edit(&loaded, &Change::Enrolment(budgets))
             .expect("with the setting it is the owner's choice");
+        assert_eq!(
+            applied
+                .document
+                .ceilings
+                .enrolment
+                .as_ref()
+                .map(configuration::ConfiguredEnrolmentBudgets::supplied),
+            Some(vec!["cached_payload_bytes", "full_offline_mirror"]),
+            "and the document holds the two budgets they wrote, not ten"
+        );
     }
 
     /// KR-REQ-26.13: one function, and the order section 26 states.

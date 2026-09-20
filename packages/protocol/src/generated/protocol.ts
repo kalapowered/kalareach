@@ -4982,7 +4982,7 @@ export interface ConfigurationCeilings {
   /**
    * The repository enrolment budgets section 11 calls configuration.
    */
-  enrolment?: EnrolmentBudgets | null
+  enrolment?: ConfiguredEnrolmentBudgets | null
   /**
    * The rights a grant may carry on this host, as the stable action-right strings.
    *
@@ -4999,57 +4999,57 @@ export interface ConfigurationCeilings {
   session_limit?: number | null
 }
 /**
- * The repository enrolment budgets, checked before a fetch and during processing.
+ * The enrolment budgets a document chooses, each present only where its owner wrote one.
  *
- * Section 11 names the budgets and gives three of the numbers: 64 MiB of metadata, 100,000
- * metadata entries and a 1 GiB cached payload, above which a full mirror needs an explicit
- * setting. The rest of the defaults are this build's own, chosen to be the smallest that
- * still work, and an owner may raise any of them. The catalogue client reads them through
- * this host's configuration rather than carrying its own copy, so one document answers "what
- * may a repository cost here".
+ * [`EnrolmentBudgets`] is what a caller acts on: ten numbers, every one of them decided. This
+ * is what the document holds, and a budget nobody wrote is absent here rather than equal to
+ * the default. Keeping the two apart is the whole of what lets a report say which numbers a
+ * person chose: a budget that happens to equal the default is not evidence that anybody set
+ * it, and inferring the source from the value would report the one they did set as the
+ * product's own.
  */
-export interface EnrolmentBudgets {
+export interface ConfiguredEnrolmentBudgets {
   /**
    * The cached payload budget per repository, in bytes.
    */
-  cached_payload_bytes?: number
+  cached_payload_bytes?: number | null
   /**
    * How long one package's compilation may take, in milliseconds.
    */
-  compilation_ms?: number
+  compilation_ms?: number | null
   /**
    * The largest an expanded pack may become, in bytes, checked during processing.
    */
-  expanded_pack_bytes?: number
+  expanded_pack_bytes?: number | null
   /**
    * Whether this host keeps a full offline mirror, which is the explicit setting a payload
    * budget above the default needs.
    */
-  full_offline_mirror?: boolean
+  full_offline_mirror?: boolean | null
   /**
    * The metadata budget per repository, in bytes.
    */
-  metadata_bytes?: number
+  metadata_bytes?: number | null
   /**
    * The metadata budget per repository, in entries.
    */
-  metadata_entries?: number
+  metadata_entries?: number | null
   /**
    * How many objects one package may hold.
    */
-  object_count?: number
+  object_count?: number | null
   /**
    * The largest single package or asset a repository may fetch, in bytes.
    */
-  package_bytes?: number
+  package_bytes?: number | null
   /**
    * How many metadata generations a repository may retain.
    */
-  retained_generations?: number
+  retained_generations?: number | null
   /**
    * How many bytes one synchronisation may transfer.
    */
-  transfer_bytes?: number
+  transfer_bytes?: number | null
 }
 /**
  * The ordinary preferences that apply when no profile is selected.
@@ -7366,6 +7366,15 @@ export interface EffectiveConfiguration {
    */
   document: string
   /**
+   * Why this host could not put the document into force, when something stopped it.
+   *
+   * Null on an ordinary host. A registry this host cannot write, a fence it cannot raise or
+   * capability evidence it cannot re-read leaves the values above describing what is actually
+   * in force and this sentence saying what the document asked for and did not get. A report
+   * that stayed silent about it would be a report of a value nothing is enforcing.
+   */
+  not_in_force: string | null
+  /**
    * The documented environment overrides.
    */
   overrides: OverrideReport[]
@@ -8978,6 +8987,15 @@ export interface EffectiveConfiguration1 {
    * Where the configuration document is.
    */
   document: string
+  /**
+   * Why this host could not put the document into force, when something stopped it.
+   *
+   * Null on an ordinary host. A registry this host cannot write, a fence it cannot raise or
+   * capability evidence it cannot re-read leaves the values above describing what is actually
+   * in force and this sentence saying what the document asked for and did not get. A report
+   * that stayed silent about it would be a report of a value nothing is enforcing.
+   */
+  not_in_force: string | null
   /**
    * The documented environment overrides.
    */
@@ -16799,6 +16817,15 @@ export interface EffectiveConfiguration2 {
    * Where the configuration document is.
    */
   document: string
+  /**
+   * Why this host could not put the document into force, when something stopped it.
+   *
+   * Null on an ordinary host. A registry this host cannot write, a fence it cannot raise or
+   * capability evidence it cannot re-read leaves the values above describing what is actually
+   * in force and this sentence saying what the document asked for and did not get. A report
+   * that stayed silent about it would be a report of a value nothing is enforcing.
+   */
+  not_in_force: string | null
   /**
    * The documented environment overrides.
    */

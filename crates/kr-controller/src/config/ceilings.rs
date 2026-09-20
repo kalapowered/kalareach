@@ -88,7 +88,7 @@ pub fn session_limit(ceilings: &ConfigurationCeilings, limits: HardLimits) -> Ce
 #[must_use]
 pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> {
     let default = EnrolmentBudgets::default();
-    let Some(configured) = ceilings.enrolment.0 else {
+    let Some(written) = ceilings.enrolment.0 else {
         return Ceiling {
             configured: None,
             value: default,
@@ -96,6 +96,10 @@ pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> 
             refused: false,
         };
     };
+    // The budgets the document names, with the schema's own numbers for the rest. Which of them
+    // the document named is kept separately, because that is what the report's source field is
+    // about and a resolved set of ten numbers can no longer say it.
+    let configured = written.resolve();
     if configured.cached_payload_bytes > default.cached_payload_bytes
         && !configured.full_offline_mirror
     {
@@ -118,68 +122,30 @@ pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> 
     }
 }
 
-/// Names the enrolment budgets in `budgets` that differ from the schema default.
+/// Replaces what a ceiling *would be* with the number admission is enforcing.
 ///
-/// An enrolment section may name one budget and leave the rest out, and `serde` fills the rest
-/// with the default before this crate ever sees them, so the section alone does not say which
-/// numbers a person chose. What differs from the default does, and it is the same answer for the
-/// purpose a report has: a budget that matches the default is in force because it is the default,
-/// whether the document spelled it out or said nothing about it.
+/// The intersection above answers what this document asks for once this machine's limits have
+/// narrowed it. That is the right number on an ordinary host and the wrong one where the document
+/// never reached admission: an unusable file, or a registry write that failed. Then the number in
+/// force is the one this host was already enforcing, and the report says so rather than printing
+/// what the document would have asked for.
 #[must_use]
-pub fn supplied_budgets(budgets: &EnrolmentBudgets) -> Vec<&'static str> {
-    let default = EnrolmentBudgets::default();
-    let mut named = Vec::new();
-    for (name, chosen, fallback) in [
-        (
-            "metadata_bytes",
-            budgets.metadata_bytes,
-            default.metadata_bytes,
-        ),
-        (
-            "metadata_entries",
-            budgets.metadata_entries,
-            default.metadata_entries,
-        ),
-        (
-            "retained_generations",
-            budgets.retained_generations,
-            default.retained_generations,
-        ),
-        (
-            "cached_payload_bytes",
-            budgets.cached_payload_bytes,
-            default.cached_payload_bytes,
-        ),
-        (
-            "package_bytes",
-            budgets.package_bytes,
-            default.package_bytes,
-        ),
-        ("object_count", budgets.object_count, default.object_count),
-        (
-            "expanded_pack_bytes",
-            budgets.expanded_pack_bytes,
-            default.expanded_pack_bytes,
-        ),
-        (
-            "transfer_bytes",
-            budgets.transfer_bytes,
-            default.transfer_bytes,
-        ),
-        (
-            "compilation_ms",
-            budgets.compilation_ms,
-            default.compilation_ms,
-        ),
-    ] {
-        if chosen != fallback {
-            named.push(name);
-        }
+pub fn enforced(intersected: Ceiling<u64>, sessions: crate::config::Enforced) -> Ceiling<u64> {
+    if sessions.from_document {
+        return intersected;
     }
-    if budgets.full_offline_mirror != default.full_offline_mirror {
-        named.push("full_offline_mirror");
+    Ceiling {
+        configured: intersected.configured,
+        value: sessions.value,
+        // Only where there is something to explain. A host that enforces the product default
+        // because nothing ever restricted it is the ordinary first run, not a retained number.
+        narrowed_by: (sessions.value != DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64).then(|| {
+            "this host is still enforcing the number it last accepted, because this document did \
+             not decide it"
+                .to_owned()
+        }),
+        refused: false,
     }
-    named
 }
 
 /// Returns the configured grant-rights ceiling, when the document sets one.

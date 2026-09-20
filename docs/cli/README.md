@@ -539,7 +539,8 @@ version 1, revision 3): version 1
   runtime_directory = /run/user/1000/kalareach/70a528be from default, applies new_sessions_only
   state_directory = …/environments/70a528be from default, applies new_sessions_only
   session_limit ceiling 128
-  enrolment ceiling 67108864 metadata bytes, 100000 entries, 2 generations retained, …
+  enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
+    configured here: retained_generations
   grant_rights ceiling every right the grant and the host policy allow
 ok             The runtime directory is owner-only
 warning        Every published descriptor answered its challenge
@@ -551,7 +552,10 @@ not_applicable Catalogue metadata and its capability evidence
 ```
 
 Each engineering default the product makes configurable is printed with the value in force and the
-rung it came from, so what this host is doing and why are one reading rather than two.
+rung it came from, so what this host is doing and why are one reading rather than two. The value in
+force is the one the host is enforcing, not the one the document asks for: where an effect could
+not be applied, the `configuration-in-force` check fails and says what stopped it, and the ceiling
+lines show both what was asked for and what is in force.
 
 The exit status is 0 when no check failed and 1 when one did. `--json` returns one document with
 `ok`, `host`, `doctor`, `configuration` and `environment`, and `bundle` when one was written.

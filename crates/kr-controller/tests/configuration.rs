@@ -230,11 +230,12 @@ async fn a_more_permissive_configured_ceiling_is_refused_rather_than_applied() {
     let environment = host.tree().environment();
 
     let mut document = ConfigurationDocument::empty();
-    document.ceilings.enrolment =
-        Nullable::some(kr_protocol::hostinfo::configuration::EnrolmentBudgets {
-            cached_payload_bytes: 8 * 1024 * 1024 * 1024,
+    document.ceilings.enrolment = Nullable::some(
+        kr_protocol::hostinfo::configuration::ConfiguredEnrolmentBudgets {
+            cached_payload_bytes: Nullable::some(8 * 1024 * 1024 * 1024),
             ..Default::default()
-        });
+        },
+    );
     let asked = ceilings::enrolment(&document.ceilings);
     assert!(
         asked.refused,
@@ -410,7 +411,7 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
         config::HardLimits::default(),
     )
     .expect("the owner's choice");
-    assert_eq!(applied.applied.revision, 1);
+    assert_eq!(applied.revision, 1);
     drop(applied);
 
     let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
@@ -604,6 +605,173 @@ async fn a_document_edited_underneath_this_host_is_accepted_before_it_is_reporte
     host.stop().await;
 }
 
+/// KR-REQ-01.23, KR-REQ-26.15: a document this host cannot use lifts no restriction, and the
+/// report prints the number still in force rather than the product default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_this_build_cannot_use_keeps_the_ceiling_and_reports_it() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+
+    controller
+        .apply_configuration(&Change::SessionLimit(Some(4)))
+        .await
+        .expect("the owner's ceiling");
+
+    // A document written by a build that knows a schema this one does not. It is left alone and
+    // read as nothing, which must not be read as "no ceiling".
+    let document = kr_worker::config::document_path(controller.paths());
+    let contents = std::fs::read_to_string(&document).expect("the document this host wrote");
+    let mut edited: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
+    edited["version"] = serde_json::json!(u64::from(u32::MAX));
+    kr_ipc::paths::write_owner_only_file(
+        &document,
+        serde_json::to_string(&edited).expect("JSON").as_bytes(),
+    )
+    .expect("the document from a later build");
+
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.status.state, DocumentState::UnknownVersion);
+    let ceiling = effective
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "session_limit")
+        .expect("the session ceiling");
+    assert_eq!(
+        ceiling.value, "4",
+        "the number in force is the one this host accepted, not the product default"
+    );
+    assert_eq!(
+        ceiling.source,
+        ValueSource::HostConfiguration,
+        "and it did not come from the product: {ceiling:?}"
+    );
+    assert!(
+        ceiling
+            .narrowed_by
+            .as_ref()
+            .is_some_and(|why| why.contains("last accepted")),
+        "and the report says why it is that number: {ceiling:?}"
+    );
+
+    // The same answer with no document at all. Removing the file is not a way to lift a ceiling.
+    std::fs::remove_file(&document).expect("the owner deletes their configuration");
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.status.state, DocumentState::Absent);
+    assert_eq!(
+        effective
+            .ceilings
+            .iter()
+            .find(|ceiling| ceiling.key == "session_limit")
+            .expect("the session ceiling")
+            .value,
+        "4"
+    );
+
+    let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("host.info is served to the device"),
+    );
+    assert_eq!(
+        info.session_limit.get(),
+        4,
+        "admission enforces exactly what the report printed"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-26.16: a grant ceiling edited outside this daemon fences dispatch, and a profile edited
+/// outside it invalidates the evidence taken under the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_external_edit_fences_dispatch_and_invalidates_evidence() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+    let mut control = host.client().await;
+
+    let before = controller
+        .announce_authority_revision()
+        .await
+        .expect("this host's authority revision")
+        .authority_revision;
+    let evidence_before = evidence_revision(&mut control, host.environment_id).await;
+
+    // One edit, made the way a person makes it: a text editor and no daemon. It moves both the
+    // authority ceiling and the profile a session is created in.
+    let document = kr_worker::config::document_path(controller.paths());
+    let mut edited = ConfigurationDocument::empty();
+    edited.revision = 1;
+    edited.ceilings.grant_rights =
+        Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]);
+    edited.preferences.worker_profile =
+        Nullable::some(kr_protocol::identity::WorkerProfile::HeadlessUser);
+    kr_ipc::paths::write_owner_only_file(
+        &document,
+        kr_protocol::hostinfo::configuration::contents(&edited).as_bytes(),
+    )
+    .expect("the edited document");
+
+    // Reading the configuration is what accepts it, and accepting it is what owes the effects.
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.revision.get(), 1);
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "every effect landed: {:?}",
+        effective.not_in_force
+    );
+
+    let after = controller
+        .announce_authority_revision()
+        .await
+        .expect("this host's authority revision")
+        .authority_revision;
+    assert!(
+        after > before,
+        "the ceiling somebody else wrote fenced dispatch: {before:?} to {after:?}"
+    );
+    // The fence reached the connections admitted under the authority it withdrew, which is what
+    // fencing dispatch means, so the evidence is read on a new one.
+    assert_eq!(
+        control
+            .request(
+                Method::EnvironmentCapabilities,
+                &kr_protocol::desktop::EnvironmentCapabilitiesParams {
+                    environment_id: host.environment_id,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect_err("a connection admitted under the withdrawn authority is not served")
+            .code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    let mut control = host.client().await;
+    assert!(
+        evidence_revision(&mut control, host.environment_id).await > evidence_before,
+        "and the evidence taken under the old profile was replaced"
+    );
+
+    // Reading it again changes nothing. An effect is owed by a document that moved, not by every
+    // person who asks what the configuration is.
+    controller.effective_configuration().await;
+    assert_eq!(
+        controller
+            .announce_authority_revision()
+            .await
+            .expect("this host's authority revision")
+            .authority_revision,
+        after,
+        "a document that did not move fences nothing"
+    );
+
+    host.stop().await;
+}
+
 /// KR-REQ-26.16: a change affecting authority is not acknowledged while a worker still holds work
 /// admitted under the authority it withdrew.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -626,5 +794,139 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
         "and it is acknowledged only because every barrier held: {applied:?}"
     );
 
+    // A worker this daemon cannot reach and cannot account for: durably recorded, never verified,
+    // and its process still running. It is exactly the worker section 9 will not let a revocation
+    // report as done, because work admitted under the withdrawn authority may still be in it.
+    let mut unreachable = std::process::Command::new("/bin/sleep")
+        .arg("120")
+        // A directory on the internal disk, never the workspace this test was built in.
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("a process this daemon can be told about");
+    let session_id = record_unreachable_worker(controller.paths(), unreachable.id());
+
+    let refused = controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionRename.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("a fence no worker has acknowledged is not a change in force");
+    let refused = format!("{refused}");
+    assert!(
+        refused.contains("revision 2 is written"),
+        "the revision that was written is named: {refused}"
+    );
+    assert!(
+        refused.contains("1 of this host's workers have not acknowledged"),
+        "and so is what is outstanding: {refused}"
+    );
+    assert!(
+        refused.contains(&session_id.to_string()),
+        "and which worker it is: {refused}"
+    );
+
+    // The revision is on disk and the ceiling is in force, which is what "written and not
+    // acknowledged" means: the change is not undone by the worker that has not answered.
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.revision.get(), 2);
+    assert_eq!(
+        effective
+            .ceilings
+            .iter()
+            .find(|ceiling| ceiling.key == "grant_rights")
+            .expect("the rights ceiling")
+            .value,
+        ActionRight::SessionRename.as_str()
+    );
+
+    // The worker ends. A revocation is complete for a worker once it acknowledges the revision or
+    // is confirmed gone, so the barrier holds from here on without anything being written again.
+    unreachable.kill().expect("the recorded process ends");
+    unreachable.wait().expect("and is collected");
+    let barrier = controller
+        .announce_authority_revision()
+        .await
+        .expect("the revocation is announced again");
+    assert!(
+        barrier.holds(),
+        "a worker confirmed gone satisfies the barrier: {barrier:?}"
+    );
+
     host.stop().await;
+}
+
+/// The revision this host's capability evidence is published under.
+async fn evidence_revision(
+    control: &mut kr_ipc::client::LocalClient,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> kr_protocol::ids::CapabilityRevision {
+    let result: kr_protocol::desktop::EnvironmentCapabilitiesResult = typed(
+        &control
+            .request(
+                Method::EnvironmentCapabilities,
+                &kr_protocol::desktop::EnvironmentCapabilitiesParams { environment_id },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("environment.capabilities succeeds"),
+    );
+    result
+        .desktop
+        .records
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .expect("this host publishes capability records")
+}
+
+/// Records a live worker this daemon has never reached, and returns its session.
+///
+/// Straight into the registry, which is where a worker that outlived a daemon is found on the next
+/// start: durable membership is the registry's, and the verified directory is only what this
+/// daemon has managed to speak to since.
+fn record_unreachable_worker(
+    paths: &kr_ipc::paths::EnvironmentPaths,
+    pid: u32,
+) -> kr_protocol::ids::SessionId {
+    let mut registry =
+        kr_controller::registry::Registry::open(paths.registry_database(), paths.environment_id())
+            .expect("the registry this daemon keeps its workers in");
+    let admission = registry
+        .reserve(
+            &kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+                .expect("a principal"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+            &[0xa0],
+            kr_protocol::scalars::TimestampMs::new(1),
+        )
+        .expect("a reservation");
+    let reservation = admission.reservation;
+    registry
+        .set_phase(
+            reservation.reservation_id,
+            kr_controller::registry::LaunchPhase::Claimed,
+        )
+        .expect("the reservation is claimed");
+    registry
+        .record_worker(
+            reservation.reservation_id,
+            &kr_controller::registry::WorkerRecord {
+                session_id: reservation.session_id,
+                display_number: reservation.display_number,
+                public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([9; 32]),
+                process_identity: kr_ipc::identity::process_start_identity(pid)
+                    .expect("the kernel describes a process this test started"),
+                endpoint: paths
+                    .state_dir()
+                    .join("unreachable.sock")
+                    .display()
+                    .to_string(),
+                profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                state: kr_protocol::session::SessionState::Live,
+                acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+            },
+        )
+        .expect("the worker is recorded");
+    reservation.session_id
 }

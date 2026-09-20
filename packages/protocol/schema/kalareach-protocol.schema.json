@@ -4320,7 +4320,7 @@
         "enrolment": {
           "anyOf": [
             {
-              "$ref": "#/$defs/EnrolmentBudgets"
+              "$ref": "#/$defs/ConfiguredEnrolmentBudgets"
             },
             {
               "type": "null"
@@ -4423,6 +4423,151 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ConfiguredEnrolmentBudgets": {
+      "additionalProperties": false,
+      "description": "The enrolment budgets a document chooses, each present only where its owner wrote one.\n\n[`EnrolmentBudgets`] is what a caller acts on: ten numbers, every one of them decided. This\nis what the document holds, and a budget nobody wrote is absent here rather than equal to\nthe default. Keeping the two apart is the whole of what lets a report say which numbers a\nperson chose: a budget that happens to equal the default is not evidence that anybody set\nit, and inferring the source from the value would report the one they did set as the\nproduct's own.",
+      "properties": {
+        "cached_payload_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The cached payload budget per repository, in bytes."
+        },
+        "compilation_ms": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How long one package's compilation may take, in milliseconds."
+        },
+        "expanded_pack_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The largest an expanded pack may become, in bytes, checked during processing."
+        },
+        "full_offline_mirror": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether this host keeps a full offline mirror, which is the explicit setting a payload\nbudget above the default needs."
+        },
+        "metadata_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The metadata budget per repository, in bytes."
+        },
+        "metadata_entries": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The metadata budget per repository, in entries."
+        },
+        "object_count": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How many objects one package may hold."
+        },
+        "package_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The largest single package or asset a repository may fetch, in bytes."
+        },
+        "retained_generations": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How many metadata generations a repository may retain."
+        },
+        "transfer_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How many bytes one synchronisation may transfer."
         }
       },
       "type": "object"
@@ -7290,6 +7435,17 @@
           "description": "Where the configuration document is.",
           "type": "string"
         },
+        "not_in_force": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why this host could not put the document into force, when something stopped it.\n\nNull on an ordinary host. A registry this host cannot write, a fence it cannot raise or\ncapability evidence it cannot re-read leaves the values above describing what is actually\nin force and this sentence saying what the document asked for and did not get. A report\nthat stayed silent about it would be a report of a value nothing is enforcing."
+        },
         "overrides": {
           "description": "The documented environment overrides.",
           "items": {
@@ -7358,7 +7514,8 @@
         "values",
         "ceilings",
         "secrets",
-        "stale_documents"
+        "stale_documents",
+        "not_in_force"
       ],
       "type": "object"
     },
@@ -7449,81 +7606,6 @@
       "description": "A 32-byte iroh endpoint public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
-    },
-    "EnrolmentBudgets": {
-      "additionalProperties": false,
-      "description": "The repository enrolment budgets, checked before a fetch and during processing.\n\nSection 11 names the budgets and gives three of the numbers: 64 MiB of metadata, 100,000\nmetadata entries and a 1 GiB cached payload, above which a full mirror needs an explicit\nsetting. The rest of the defaults are this build's own, chosen to be the smallest that\nstill work, and an owner may raise any of them. The catalogue client reads them through\nthis host's configuration rather than carrying its own copy, so one document answers \"what\nmay a repository cost here\".",
-      "properties": {
-        "cached_payload_bytes": {
-          "default": 1073741824,
-          "description": "The cached payload budget per repository, in bytes.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "compilation_ms": {
-          "default": 60000,
-          "description": "How long one package's compilation may take, in milliseconds.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "expanded_pack_bytes": {
-          "default": 536870912,
-          "description": "The largest an expanded pack may become, in bytes, checked during processing.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "full_offline_mirror": {
-          "default": false,
-          "description": "Whether this host keeps a full offline mirror, which is the explicit setting a payload\nbudget above the default needs.",
-          "type": "boolean"
-        },
-        "metadata_bytes": {
-          "default": 67108864,
-          "description": "The metadata budget per repository, in bytes.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "metadata_entries": {
-          "default": 100000,
-          "description": "The metadata budget per repository, in entries.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "object_count": {
-          "default": 100000,
-          "description": "How many objects one package may hold.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "package_bytes": {
-          "default": 268435456,
-          "description": "The largest single package or asset a repository may fetch, in bytes.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "retained_generations": {
-          "default": 2,
-          "description": "How many metadata generations a repository may retain.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "transfer_bytes": {
-          "default": 2147483648,
-          "description": "How many bytes one synchronisation may transfer.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
     },
     "EnvelopeId": {
       "description": "One stored mailbox envelope: 128 random bits.",

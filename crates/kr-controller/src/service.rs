@@ -300,14 +300,17 @@ pub struct Controller {
     /// host that has never synchronised a catalogue, and the diagnostic says so rather than
     /// claiming anything about a catalogue this host does not have.
     catalogue_evidence: Option<Arc<dyn crate::config::catalogue::CatalogueEvidence>>,
-    /// The configuration revision whose effects this daemon has put into force.
+    /// The configuration this daemon has put into force.
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the
-    /// session number admission enforces is in the registry, not in the document. This is what
-    /// keeps the two the same fact. Every revision is accepted through one path, and holding this
-    /// across the read and the effects is what puts them in order: two acceptances cannot
-    /// interleave, so the one that finishes last is the one that read the document on disk.
-    accepted_configuration: Mutex<u64>,
+    /// session number admission enforces is in the registry, the authority fence is in the lease
+    /// issuer, and the capability evidence is in the desktop reading. This is what keeps them one
+    /// fact. It holds the document those effects came from, so the next acceptance can tell what
+    /// moved and run exactly the effects the move owes, whoever wrote it. Every revision is
+    /// accepted through one path, and holding this across the read and the effects is what puts
+    /// them in order: two acceptances cannot interleave, so the one that finishes last is the one
+    /// that read the document on disk.
+    accepted_configuration: Mutex<crate::config::AcceptedState>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -502,14 +505,19 @@ impl Controller {
         // document that says nothing, and one this build cannot read, must not lift a restriction
         // the owner accepted through some other path.
         let startup_configuration = crate::config::open(&setup.paths);
-        let accepted_configuration = startup_configuration.revision();
-        if let Some(limit) = crate::config::configured_session_limit(
+        let mut accepted_configuration = crate::config::AcceptedState {
+            revision: startup_configuration.revision(),
+            document: startup_configuration.loaded().document.clone(),
+            sessions: registry.session_limit()?,
+        };
+        if let Some(limit) = crate::config::session_limit_in_force(
             &startup_configuration,
             crate::config::HardLimits {
                 sessions_per_environment: None,
             },
         ) {
             registry.set_session_limit(limit)?;
+            accepted_configuration.sessions = limit;
         }
         drop(startup_configuration);
         let identity = (setup.identity)()?;
@@ -4456,57 +4464,148 @@ impl Controller {
 
     /// Returns what this host's configuration currently resolves to.
     ///
-    /// The document's effects are put into force first, so a report can never describe a ceiling
-    /// that admission is not enforcing. A document edited outside this daemon therefore takes
-    /// effect the next time anything asks this question, at the revision this host accepted it
-    /// under, rather than at the next restart.
+    /// The document is put into force first and the report is built from that same reading, so a
+    /// value a person is shown is the value this host is acting on rather than a second reading of
+    /// a file that may since have moved. A document edited outside this daemon therefore takes
+    /// effect - ceiling, fence and capability invalidation alike - the next time anything asks
+    /// this question, rather than at the next restart.
     pub async fn effective_configuration(&self) -> kr_protocol::hostinfo::EffectiveConfiguration {
-        // The report is built whatever the effects did. A registry this host cannot write is
-        // already a failed diagnostic of its own, and answering nothing would take away the one
-        // report a person has to find out why.
-        let _ = self.accept_configuration().await;
+        let accepted = self.accept_configuration().await;
+        self.report_configuration(&accepted).await
+    }
+
+    /// Builds the effective-value report from one accepted configuration.
+    async fn report_configuration(
+        &self,
+        accepted: &crate::config::Accepted,
+    ) -> kr_protocol::hostinfo::EffectiveConfiguration {
         crate::config::effective(
-            &self.configuration(),
-            crate::config::HardLimits::default(),
+            accepted,
+            self.hard_limits(),
             crate::desktop::default_profile(&self.desktop().await.0),
         )
     }
 
-    /// Puts the current configuration document's effects into force, and returns the revision.
+    /// Puts the configuration document on disk into force, and returns what is in force.
     ///
     /// The one ordered path, and the whole of the ordering is this lock: it is taken *before* the
     /// document is read, so an edit applying its own effects and a reader accepting what it found
     /// cannot interleave, and whichever of them runs last is the one that read the document that
-    /// is actually on disk. The effects are applied on every acceptance rather than only when the
-    /// revision number moved, because a document edited by hand can change what it says without
-    /// changing what it calls itself.
+    /// is actually on disk. The effects are derived from what moved since the last acceptance
+    /// rather than from the request that caused it, which is what makes a document edited in a
+    /// text editor owe exactly what the same edit made through this daemon owes; and they are
+    /// applied on every acceptance rather than only when the revision number moved, because a
+    /// document edited by hand can change what it says without changing what it calls itself.
     ///
-    /// # Errors
-    ///
-    /// Returns an error when an effect could not be applied.
-    async fn accept_configuration(&self) -> Result<u64> {
-        let mut accepted = self.accepted_configuration.lock().await;
+    /// Nothing here returns an error. A failure is what the returned value carries, because the
+    /// report is built from it and a report that quietly dropped the failure would describe a
+    /// document this host is not acting on.
+    async fn accept_configuration(&self) -> crate::config::Accepted {
+        let mut state = self.accepted_configuration.lock().await;
         let resolver = self.configuration();
-        let revision = resolver.revision();
-        self.apply_effects(&resolver).await?;
-        *accepted = revision;
-        Ok(revision)
+        let owed = kr_protocol::hostinfo::configuration::owed(
+            state.document.as_ref(),
+            resolver.loaded().document.as_ref(),
+        );
+        let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
+        let mut barrier = None;
+        if failure.is_none() && owed.fences_dispatch {
+            // Before anything is told the ceiling moved. Work admitted under the ceiling this
+            // document withdrew has to stop being dispatchable first, whoever wrote the document.
+            match self.revoke_authority().await {
+                Ok(raised) => barrier = Some(raised),
+                Err(error) => failure = Some(format!("dispatch could not be fenced: {error}")),
+            }
+        }
+        if failure.is_none()
+            && owed
+                .invalidated
+                .contains(&kr_protocol::desktop::CapabilityInvalidation::WorkerProfile)
+            && let Err(error) = self.invalidate_profile_evidence().await
+        {
+            failure = Some(format!(
+                "the capability evidence taken under the old profile could not be replaced: \
+                 {error}"
+            ));
+        }
+        if failure.is_none() {
+            // Recorded once every effect has landed, so a failed acceptance is retried by the
+            // next one instead of being remembered as done.
+            *state = crate::config::AcceptedState {
+                revision: resolver.revision(),
+                document: resolver.loaded().document.clone(),
+                sessions: sessions.value,
+            };
+        }
+        drop(state);
+        crate::config::Accepted {
+            resolver,
+            sessions,
+            owed,
+            barrier,
+            not_in_force: failure,
+        }
     }
 
-    /// Puts one reading of the document's ceilings where the things they restrict read them.
+    /// Puts the document's session ceiling where admission reads it, and returns what is in force.
     ///
     /// A document this host can read decides the number admission enforces, whether it names one
     /// or leaves it to the product default: both are things the document says. A document that is
-    /// absent, and one this build cannot read, says nothing, and then the number admission already
-    /// enforces stays exactly as it is: a restriction the owner accepted must not be lifted
-    /// because a later build could not read the file it was in.
-    async fn apply_effects(&self, resolver: &kr_worker::config::Resolver) -> Result<()> {
-        if resolver.status().state != kr_protocol::hostinfo::configuration::DocumentState::Loaded {
-            return Ok(());
+    /// absent, one this build cannot read and one whose write failed decide nothing, and then the
+    /// number admission already enforces stays exactly as it is and is what the report prints: a
+    /// restriction the owner accepted must not be lifted because a later build could not read the
+    /// file it was in, and it must not be *reported* as lifted either.
+    async fn apply_session_limit(
+        &self,
+        resolver: &kr_worker::config::Resolver,
+        state: &crate::config::AcceptedState,
+    ) -> (crate::config::Enforced, Option<String>) {
+        let retained = crate::config::Enforced {
+            value: state.sessions,
+            from_document: false,
+        };
+        let Some(limit) = crate::config::session_limit_in_force(resolver, self.hard_limits())
+        else {
+            return (retained, None);
+        };
+        match self.registry.lock().await.set_session_limit(limit) {
+            Ok(()) => (
+                crate::config::Enforced {
+                    value: limit,
+                    from_document: true,
+                },
+                None,
+            ),
+            Err(error) => (
+                retained,
+                Some(format!(
+                    "this host still admits {} sessions, because the number this document asks \
+                     for could not be recorded: {error}",
+                    state.sessions
+                )),
+            ),
         }
-        let limit =
-            crate::config::ceilings::session_limit(&resolver.ceilings(), self.hard_limits()).value;
-        self.registry.lock().await.set_session_limit(limit)?;
+    }
+
+    /// Replaces the capability evidence taken under a profile this host no longer creates sessions
+    /// in.
+    ///
+    /// Nothing migrates a worker: a running session keeps the profile it was created in, and the
+    /// new value applies to sessions created afterwards. What is replaced is the evidence, because
+    /// evidence about a profile this host has stopped using is no longer about this host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the replacement evidence could not be recorded. Reporting success
+    /// would publish records under a revision that no longer describes them, which is the one
+    /// thing a revision exists to prevent.
+    async fn invalidate_profile_evidence(&self) -> Result<()> {
+        let mut reading = self.desktop.lock().await;
+        reading.read_at = std::time::Instant::now()
+            .checked_sub(DESKTOP_REREAD_INTERVAL)
+            .unwrap_or_else(std::time::Instant::now);
+        drop(reading);
+        self.capability_report().await?;
         Ok(())
     }
 
@@ -4520,80 +4619,69 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the edit is refused or the fence cannot be raised.
+    /// Returns an error when the edit is refused, when an effect could not be applied, or when a
+    /// worker has not yet acknowledged the fence the change raised.
     pub async fn apply_configuration(
         self: &Arc<Self>,
         change: &kr_protocol::hostinfo::configuration::Change,
     ) -> Result<crate::config::Applied> {
         let edit = crate::config::apply(&self.paths, change, self.hard_limits())?;
-        // Inside the lock, and through the same ordered path every other revision takes. What the
-        // new document says goes where the thing it restricts actually reads it before another
-        // writer can prepare an edit of its own, so a slower older edit cannot put its number back
-        // after a newer one has landed.
-        let mut accepted = self.accepted_configuration.lock().await;
-        if matches!(
-            change,
-            kr_protocol::hostinfo::configuration::Change::SessionLimit(None)
-        ) {
-            // Clearing the number is an explicit removal rather than a document that says nothing,
-            // so the product default goes back.
-            self.registry.lock().await.set_session_limit(
-                kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64,
-            )?;
-        } else {
-            self.apply_effects(&self.configuration()).await?;
-        }
-        *accepted = edit.applied.revision;
-        drop(accepted);
-        let mut applied = edit.applied.clone();
-        if applied.fences_dispatch {
-            // Before the caller is told the change is in force. The barrier travels with the
-            // answer: a revision that advanced while a worker has not yet acknowledged its fence
-            // is not a completed revocation, and section 9 asks for the per-worker state rather
-            // than for the revision alone.
-            let barrier = self.revoke_authority().await?;
-            applied.pending_workers = barrier.pending().len() as u64;
-            applied.barrier_holds = barrier.holds();
-            applied.authority_revision = Some(barrier.authority_revision);
-            if !barrier.holds() {
-                // Section 26 says a change affecting authority fences dispatch *before* it is
-                // acknowledged. A worker that has not acknowledged its fence still holds work
-                // admitted under the authority this change withdrew, so the revision is recorded
-                // and the caller is told what is outstanding rather than told it is done.
-                let pending = barrier
+        // Inside the edit lock, and through the one path every other revision takes: what this
+        // daemon does with a document it wrote is what it does with a document somebody else
+        // wrote. Holding the lock across it is what keeps the effects and the write together, so
+        // a slower older edit cannot put its number back after a newer one has landed.
+        let accepted = self.accept_configuration().await;
+        let applied = crate::config::Applied {
+            revision: edit.revision,
+            effect: edit.effect,
+            invalidated: accepted.owed.invalidated.clone(),
+            fences_dispatch: accepted.owed.fences_dispatch,
+            authority_revision: accepted
+                .barrier
+                .as_ref()
+                .map(|barrier| barrier.authority_revision),
+            barrier_holds: accepted
+                .barrier
+                .as_ref()
+                .is_none_or(RevocationBarrier::holds),
+            pending_workers: accepted
+                .barrier
+                .as_ref()
+                .map_or(0, |barrier| barrier.pending().len() as u64),
+        };
+        let pending = accepted
+            .barrier
+            .as_ref()
+            .filter(|barrier| !barrier.holds())
+            .map(|barrier| {
+                barrier
                     .pending()
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join(", ");
-                drop(edit);
-                return Err(ControllerError::Configuration(format!(
-                    "revision {} is written and dispatch is fenced, but {} of this host's workers \
-                     have not acknowledged the fence yet ({pending}); the change is in force for \
-                     dispatch once they do",
-                    applied.revision, applied.pending_workers
-                )));
-            }
-        }
-        if applied
-            .invalidated
-            .contains(&kr_protocol::desktop::CapabilityInvalidation::WorkerProfile)
-        {
-            let mut reading = self.desktop.lock().await;
-            reading.read_at = std::time::Instant::now()
-                .checked_sub(DESKTOP_REREAD_INTERVAL)
-                .unwrap_or_else(std::time::Instant::now);
-            drop(reading);
-            // The evidence taken under the old profile is replaced here, under the same lock the
-            // edit holds, and a failure to record the revision it changed to is this call's
-            // failure. Returning success would publish records under a revision that no longer
-            // describes them, which is the one thing a revision exists to prevent.
-            let report = self.capability_report().await;
-            drop(edit);
-            report?;
-            return Ok(applied);
-        }
+                    .join(", ")
+            });
+        let not_in_force = accepted.not_in_force.clone();
+        drop(accepted);
         drop(edit);
+        if let Some(problem) = not_in_force {
+            return Err(ControllerError::Configuration(format!(
+                "revision {} is written and is not in force: {problem}",
+                applied.revision
+            )));
+        }
+        if let Some(pending) = pending {
+            // Section 26 says a change affecting authority fences dispatch *before* it is
+            // acknowledged. A worker that has not acknowledged its fence still holds work admitted
+            // under the authority this change withdrew, so the revision is recorded and the caller
+            // is told what is outstanding rather than told it is done.
+            return Err(ControllerError::Configuration(format!(
+                "revision {} is written and dispatch is fenced, but {} of this host's workers \
+                 have not acknowledged the fence yet ({pending}); the change is in force for \
+                 dispatch once they do",
+                applied.revision, applied.pending_workers
+            )));
+        }
         Ok(applied)
     }
 
@@ -4644,8 +4732,12 @@ impl Controller {
                     .to_owned()
             }),
         ));
+        // One acceptance, one reading, and every configuration line below comes from it. The
+        // sleep policy asking the document a second time is how a check and the report it sits
+        // beside come to disagree about the same file.
+        let accepted = self.accept_configuration().await;
         let power = self.power_state().await;
-        let resolved = self.configuration().sleep_inhibition(None);
+        let resolved = accepted.resolver.sleep_inhibition(None);
         checks.push(DoctorCheck::new(
             "sleep-setting",
             "This host's sleep policy is the owner's choice",
@@ -4699,7 +4791,9 @@ impl Controller {
         // The configuration, its precedence, its overrides and its ceilings. After the checks
         // above because those are about whether this host is working; these are about what it is
         // working from.
-        let effective = self.effective_configuration().await;
+        let budgets = crate::config::catalogue::budgets(&accepted.resolver.ceilings());
+        let effective = self.report_configuration(&accepted).await;
+        drop(accepted);
         checks.extend(crate::config::checks(&effective));
         checks.push(DoctorCheck::new(
             "configuration-secrets",
@@ -4713,7 +4807,7 @@ impl Controller {
         // catalogue this host does not have.
         checks.push(crate::config::catalogue::check(
             self.catalogue_evidence.as_deref(),
-            crate::config::catalogue::budgets(&self.configuration().ceilings()),
+            budgets,
         ));
         encode(&HostDoctorResult::new(checks, effective))
     }
