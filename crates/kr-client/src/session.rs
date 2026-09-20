@@ -484,6 +484,80 @@ impl Session {
         P: Serialize + ?Sized,
         E: Serialize + ?Sized,
     {
+        let action_id = ActionId::new(kr_transport::random::fresh_uuid_v4()?);
+        self.submit_mutation(
+            action_id,
+            method,
+            target,
+            grant_id,
+            expected,
+            params,
+            requested_ttl,
+        )
+        .await
+    }
+
+    /// Submits the evidence a host asked for, under the identity of the request that asked.
+    ///
+    /// Some methods answer a first submission by naming what else they need before they will act:
+    /// a confirmation taken on the device's unlocked screen, for instance. The host binds that
+    /// demand to the action it was asked about, so the answer has to come back as the same action.
+    /// A fresh identifier here would be a second intent, and the host would refuse it for naming a
+    /// request it never challenged.
+    ///
+    /// `continues` is therefore the identifier the host's own challenge carries, read out of the
+    /// evidence the caller is submitting rather than chosen. Nothing about this weakens what the
+    /// host checks: the host still compares the evidence against the action it issued the demand
+    /// for, and a caller that names a different action is refused there.
+    ///
+    /// In every other respect this is [`Session::mutate`], including the outstanding bound and the
+    /// uncertainty an interrupted send leaves behind.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Session::mutate`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mutate_continuing<P, E>(
+        &self,
+        continues: ActionId,
+        method: Method,
+        target: ActionTarget,
+        grant_id: Option<GrantId>,
+        expected: &E,
+        params: &P,
+        requested_ttl: DurationMs,
+    ) -> Result<Settled>
+    where
+        P: Serialize + ?Sized,
+        E: Serialize + ?Sized,
+    {
+        self.submit_mutation(
+            continues,
+            method,
+            target,
+            grant_id,
+            expected,
+            params,
+            requested_ttl,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_mutation<P, E>(
+        &self,
+        action_id: ActionId,
+        method: Method,
+        target: ActionTarget,
+        grant_id: Option<GrantId>,
+        expected: &E,
+        params: &P,
+        requested_ttl: DurationMs,
+    ) -> Result<Settled>
+    where
+        P: Serialize + ?Sized,
+        E: Serialize + ?Sized,
+    {
         let entry = method.entry();
         if entry.effect != EffectClass::Write {
             return Err(ClientError::WrongEffect {
@@ -511,7 +585,6 @@ impl Session {
             window.action_window_id.clone()
         };
 
-        let action_id = ActionId::new(kr_transport::random::fresh_uuid_v4()?);
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
         let target_record = target.clone();

@@ -389,6 +389,76 @@ async fn a_read_returns_a_typed_result_and_a_mutation_returns_what_settled_it() 
 }
 
 #[tokio::test]
+async fn evidence_a_host_asked_for_comes_back_as_the_action_it_asked_about() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let asked_about = session
+        .mutate(
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("a settlement")
+        .receipt()
+        .expect("this host answers with a receipt")
+        .action_id;
+
+    // A host that answers by naming what else it needs binds that demand to the action it was
+    // asked about, so the answer has to arrive as the same action.
+    let continued = session
+        .mutate_continuing(
+            asked_about,
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("a settlement");
+    assert_eq!(
+        continued
+            .receipt()
+            .expect("this host answers with a receipt")
+            .action_id,
+        asked_about
+    );
+
+    // Anything that is not a continuation is still a separate intent with its own identity.
+    let separate = session
+        .mutate(
+            Method::SessionCreate,
+            target,
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("a settlement")
+        .receipt()
+        .expect("this host answers with a receipt")
+        .action_id;
+    assert_ne!(separate, asked_about);
+
+    let actions = script.actions.lock().await;
+    assert_eq!(actions.as_slice(), [asked_about, asked_about, separate]);
+
+    session.close();
+    serving.abort();
+}
+
+#[tokio::test]
 async fn the_registry_decides_the_shape_of_a_call() {
     let host = side(1, true).await;
     let client = side(2, false).await;

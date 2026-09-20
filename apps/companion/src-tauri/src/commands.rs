@@ -433,10 +433,75 @@ mutate_command!(
     /// Creates or updates a voice grant.
     voice_grant, Method::VoiceGrant, kr_protocol::voice::VoiceGrantParams
 );
-mutate_command!(
-    /// Submits a voice delegation.
-    voice_delegate, Method::VoiceDelegate, kr_protocol::voice::VoiceDelegateParams
-);
+/// The request a delegation continues, when it carries the evidence a host asked for.
+///
+/// `None` is a first submission, which is a new intent and takes a new identity.
+fn delegation_continues(
+    params: &kr_protocol::voice::VoiceDelegateParams,
+) -> Option<kr_protocol::ids::ActionId> {
+    params
+        .confirmation
+        .as_ref()
+        .map(|proof: &kr_protocol::voice::VoiceConfirmationProof| proof.request.action_id)
+}
+
+/// Submits a voice delegation, with the confirmation the host asked for when it asked for one.
+///
+/// A delegation the host will not act on without a confirmation on this device's unlocked screen
+/// is answered with a challenge rather than a receipt, and that challenge names the request it was
+/// issued for. The signed proof therefore has to come back as that same request: a second intent
+/// with a fresh identity is a delegation the host never challenged, and it refuses it.
+///
+/// The identity comes out of the proof itself, so the only request this can continue is the one
+/// whose challenge is being answered. The host still checks the proof against the challenge it
+/// issued, and this changes nothing about that.
+#[tauri::command]
+pub async fn voice_delegate(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    let typed: kr_protocol::voice::VoiceDelegateParams = decode(params)?;
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    let answer = match delegation_continues(&typed) {
+        Some(action_id) => {
+            session
+                .mutate_continuing(
+                    action_id,
+                    Method::VoiceDelegate,
+                    target,
+                    None,
+                    &NoPreconditions {},
+                    &typed,
+                    MUTATION_TTL,
+                )
+                .await
+        }
+        None => {
+            session
+                .mutate(
+                    Method::VoiceDelegate,
+                    target,
+                    None,
+                    &NoPreconditions {},
+                    &typed,
+                    MUTATION_TTL,
+                )
+                .await
+        }
+    };
+    match answer {
+        Ok(value) => settled(&value),
+        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
+            receipt: None,
+            value: None,
+            action_id: Some(action_id.to_string()),
+        }),
+        Err(error) => Err(CommandError::from(error)),
+    }
+}
+
 read_command!(
     /// Reads the selected voice context.
     voice_context, Method::VoiceContext,
@@ -771,6 +836,61 @@ pub fn connection_state(state: State<'_, AppState>) -> crate::connection::Connec
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// A delegation, with the confirmation a host's challenge asked for when one is supplied.
+    fn delegation(
+        confirmation: Option<kr_protocol::ids::ActionId>,
+    ) -> kr_protocol::voice::VoiceDelegateParams {
+        use kr_protocol::ids::{ConfirmationId, DeviceId, VoiceSessionId};
+        use kr_protocol::scalars::{Digest256, Nonce256, Nullable, TimestampMs, Uuid};
+
+        let proof = confirmation.map(|action_id| kr_protocol::voice::VoiceConfirmationProof {
+            request: kr_protocol::voice::VoiceConfirmationRequest {
+                confirmation_id: ConfirmationId::new(Uuid::from_bytes([7; 16])),
+                voice_session_id: VoiceSessionId::new(Uuid::from_bytes([8; 16])),
+                action: kr_protocol::voice::VoiceAction::ApplyDiff,
+                action_digest: Digest256::from_bytes([3; 32]),
+                action_id,
+                host_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+                device_id: DeviceId::new(Uuid::from_bytes([2; 16])),
+                nonce: Nonce256::from_bytes([4; 32]),
+                expires_at_ms: TimestampMs::new(1_700_000_000_000),
+            },
+            signer_key_id: kr_protocol::scalars::KeyId::from_bytes([5; 32]),
+            signature: kr_protocol::scalars::Signature64::from_bytes([6; 64]),
+        });
+
+        kr_protocol::voice::VoiceDelegateParams {
+            voice_session_id: VoiceSessionId::new(Uuid::from_bytes([8; 16])),
+            delegation_id: kr_protocol::voice::VoiceDelegationId::new("d-1".to_owned())
+                .expect("a delegation identifier"),
+            offset_ms: kr_protocol::scalars::U64::new(1_200),
+            action: kr_protocol::voice::VoiceAction::ApplyDiff,
+            session_id: Nullable::null(),
+            spoken_destination: Nullable::null(),
+            approval: Nullable::null(),
+            turn_id: Nullable::null(),
+            confirmation: Nullable(proof),
+        }
+    }
+
+    #[test]
+    fn a_confirmed_delegation_continues_the_request_the_challenge_names() {
+        use kr_protocol::ids::ActionId;
+        use kr_protocol::scalars::Uuid;
+
+        // A first submission is a new intent, so it takes a new identity.
+        assert_eq!(delegation_continues(&delegation(None)), None);
+
+        // The confirmed submission answers one challenge, and that challenge was issued for one
+        // request. Continuing anything else would be answering for a delegation the host never
+        // challenged, and the host refuses that.
+        let challenged = ActionId::new(Uuid::from_bytes([0xab; 16]));
+        assert_eq!(
+            delegation_continues(&delegation(Some(challenged))),
+            Some(challenged)
+        );
+    }
 
     #[test]
     fn every_named_command_is_unique() {
