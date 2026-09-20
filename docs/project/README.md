@@ -819,21 +819,16 @@ and leaves exactly as it is.
 Permissions are the destination's own, put on the staged copy through the handle this host created
 it with, before the rename, so a file that was executable stays executable and one that was not
 does not become one. A destination whose permissions this host cannot read is a path it does not
-replace. What it carries is the platform's mode bits. An access-control list beside them it does
-**not** carry, and a destination that has one is a path it refuses rather than replaces, so the
-protection is never lost quietly. That is the answer on macOS, which keeps a list beside the mode
-bits, and on Linux, where the question is whether the file carries the extended attribute a list
-lives in: a file whose protection is its mode bits alone carries none. A directory can also put a list on every file made
-inside it, so the copy this host stages is asked as well: on Linux that inherited list is taken off
-it, through the copy's own descriptor, before the mode is set, and elsewhere a copy that has one
-ends the operation and the destination is left exactly as it was. Every question about whether a
-file has a list at all is asked of the handle this host holds on that file, never of its name, on
-the platforms this host knows how to ask, and an answer it cannot establish refuses the
-replacement. A platform whose lists it does not
-know how to ask answers that there is none, which leaves the mode bits carried alone. On a platform whose lists this host does not read, only the mode bits
-are carried. **Preserving** a destination's own list is not implemented at all: a destination that
-has one is refused. Content is written byte for
-byte, so a line ending is whatever the version holds.
+replace. What it carries is the platform's mode bits and access-control list. Under KR-REQ-14.29, an
+access-control list is preserved across a replacement rather than refused: the destination's list is
+read through its open descriptor, restored onto the staged copy before the rename, any inherited
+directory list is cleared if the destination carries none, and the published file is read back
+through its handle to verify both mode bits and the exact access-control list. This is implemented
+on macOS (extended ACL native binary representation via descriptor libc calls) and Linux (POSIX
+ACLs via `system.posix_acl_access` extended attributes on descriptors). On Unix platforms where this
+host cannot read or verify access-control lists, the apply is refused before rename so that no file
+is published without protection verification. Content is written byte for byte, so a line ending is
+whatever the version holds.
 
 An apply comes to one of five classes. **A preflight conflict is an error, not a result**:
 `diff.apply` and `diff.revert` return `DRAFT_CONFLICT`, and a preflight that finds the destination

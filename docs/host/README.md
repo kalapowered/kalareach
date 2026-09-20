@@ -1507,6 +1507,11 @@ unfinished uploads after twenty-four hours, unused attachments after seven days,
 snapshots at their own expiry. At startup the service resolves any publication an earlier daemon
 left between its two commits, so a handle never names a file this host has not found.
 
+Filesystem operations beneath authorised roots go through `AuthorisedDirectory` and `AuthorisedFile`,
+confining operations to descriptors without path reopening races. Under KR-REQ-14.29, `AuthorisedFile`
+provides lossless access-control list reading and restoration, allowing destination protection (mode
+bits and access-control lists) to be carried across atomic replacements on macOS and Linux.
+
 `docs/transfer/` has the protocol, the limits, the storage layout and the authority model.
 
 ## The project service

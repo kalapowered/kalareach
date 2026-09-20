@@ -340,18 +340,21 @@ that performs them, and they run on Windows.
 ### Two limits the host states rather than hides
 
 A download published into a client's destination with the user's explicit overwrite action cannot be
-rolled back: the temporary name is checked against the verified object immediately before the
-rename, and a rename replaces atomically with nothing to restore afterwards. The no-replace publish
+rolled back (Residual 5): the temporary name is checked against the verified object immediately before the
+rename, and a rename replaces atomically with nothing to restore afterwards. Once an overwrite publish
+succeeds, previous content cannot be recovered from the transfer subsystem itself; this is by design and
+callers must retain their own copies if rollback is needed. The no-replace publish
 has no such window, because a link that finds the name taken fails. The window that remains is
 inside the service's own owner-only private directory, where anything able to swap the temporary
 name could already have tampered with the bytes before they were verified.
 
-A byte copy of a source this service does not own is not an atomic snapshot. It refuses every change
-the host can observe: the source's identity, its size, its modification time, and the digest of a
-second bounded read compared with the copy. A writer that reproduces the same interleaving in both
-reads is not excluded. Where the filesystem offers a clone, `cloned_snapshot` has the property
-outright, and a caller that needs it on a filesystem without one coordinates with the writer or
-copies the file itself.
+A byte copy of a source this service does not own is not an atomic snapshot (Residual 6). Two
+uncoordinated reads without coordinated locking do not constitute an atomic snapshot across multiple
+files. It refuses every change the host can observe: the source's identity, its size, its modification
+time, and the digest of a second bounded read compared with the copy. A writer that reproduces the same
+interleaving in both reads is not excluded. Where the filesystem offers a clone, `cloned_snapshot` has
+the property outright, and a caller that needs it on a filesystem without one coordinates with the
+writer or copies the file itself.
 
 ### What this does not promise
 
@@ -388,6 +391,19 @@ Where `openat2` with `RESOLVE_BENEATH` is available, Linux resolves an accumulat
 syscall and there is no window inside it. `cap-std` falls back to its own component-wise resolution
 where that syscall is unavailable or returns `EAGAIN`, which is the same shape as the other Unix
 platforms. `cap-std`'s own documentation is the authority on what that leaves open.
+
+Residual 4 (native Windows qualification): the Windows cross-compilation and check gates pass under
+`x86_64-pc-windows-gnu`. Native Windows runtime qualification is assigned to worker T-025, respecting
+lead ruling D-114.8 (T-024b holds the Windows host during current qualification passes).
+
+Under KR-REQ-14.29, `AuthorisedFile` exposes descriptor-bound access-control list inspection
+(`access_control`), restoration (`set_access_control`), and clearing (`clear_access_control`), used
+by `kr-changeset` to preserve destination access-control lists across atomic apply replacements
+without path reopening. On macOS, this operates through descriptor libc ACL calls (`acl_get_fd`,
+`acl_set_fd`) using native binary representation (`acl_copy_ext_native`, `acl_copy_int_native`). On
+Linux, this operates through descriptor extended attribute calls (`fgetxattr`, `fsetxattr`,
+`fremovexattr`) on `system.posix_acl_access`. On unsupported Unix platforms, operations are refused
+before rename rather than risking unverified publication.
 
 ## Verified downloads
 
