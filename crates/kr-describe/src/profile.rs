@@ -272,13 +272,20 @@ pub struct TokenizerIdentity {
     pub tokenizer_config_sha256: String,
     /// The source chat template's SHA-256.
     pub chat_template_sha256: String,
-    /// Whether the runtime uses the tokenizer and template **embedded in the asset**.
+    /// Whether the tokenizer and template the profile is about are **embedded in the asset**.
     ///
     /// It is true for every profile here, and it is what makes the three digests above provenance
     /// rather than the thing inference reads. A GGUF carries its own tokenizer and chat template,
     /// and those are bound by the asset digest; a publisher that regenerated the template during
     /// conversion has an embedded template whose bytes are not the source file's, and the asset
     /// digest is what pins it.
+    ///
+    /// The tokenizer is the one inference uses: the runtime tokenizes through the model's own
+    /// vocabulary. The chat template is **not** applied by this build, which sends the instruction
+    /// and the data section as a plain prompt. The digest is recorded so a profile that changed
+    /// its template is a different profile, and applying the template - with the reasoning
+    /// directive beside it - is named in this crate's documentation as work this build does not
+    /// do.
     pub embedded_in_asset: bool,
 }
 

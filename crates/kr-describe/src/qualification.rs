@@ -150,6 +150,12 @@ pub struct Row {
     pub evidence: Evidence,
     /// Which of the required targets it has actually been exercised on.
     pub targets: &'static [&'static str],
+    /// What the evidence above does **not** cover.
+    ///
+    /// It is a field rather than a comment because a matrix that printed only what it had would be
+    /// the thing section 22 is guarding against. A test against the deterministic runtime proves a
+    /// rule; it does not prove the model, the library or the machine, and this says which.
+    pub not_covered: &'static str,
 }
 
 /// The 13 September smoke results, carried exactly as they were reported.
@@ -211,6 +217,7 @@ const BENCHED_TARGETS: &[&str] = &[];
 static BUILTIN: &[Row] = &[
     Row {
         case: Case::UsefulTitles,
+        not_covered: "nothing has run: usefulness is a property of the model's output on real weights",
         evidence: Evidence::NotRun {
             owner: "scripts/bench-descriptions.sh",
         },
@@ -218,6 +225,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::UnsupportedClaims,
+        not_covered: "the test proves generated text cannot reach a status or an authority; whether a model makes unsupported claims in its text is the benchmark's",
         evidence: Evidence::Test {
             name: "generated_text_cannot_reach_a_status_a_permission_or_a_review",
         },
@@ -225,6 +233,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::Stability,
+        not_covered: "nothing has run: stability is a property of a long run on real weights",
         evidence: Evidence::NotRun {
             owner: "scripts/bench-descriptions.sh",
         },
@@ -232,6 +241,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::Grammar,
+        not_covered: "the test drives the validator that refuses a result; whether the sampler holds the grammar is the benchmark's",
         evidence: Evidence::Test {
             name: "a_result_that_is_not_the_grammars_object_is_rejected_rather_than_tidied",
         },
@@ -239,6 +249,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::MultilingualNames,
+        not_covered: "the test drives the codepoint bounds; whether names in other scripts are any good is the benchmark's",
         evidence: Evidence::Test {
             name: "a_title_is_bounded_in_codepoints_rather_than_bytes",
         },
@@ -246,6 +257,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::MaliciousProjectText,
+        not_covered: "the test proves the text is carried as data and changes no authority; whether a model is misled by it is the benchmark's",
         evidence: Evidence::Test {
             name: "project_text_that_gives_instructions_is_carried_as_data_and_changes_nothing",
         },
@@ -253,6 +265,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::LongActiveTurns,
+        not_covered: "the test drives the debounce window; whether the text is useful during a long turn is the benchmark's",
         evidence: Evidence::Test {
             name: "a_session_changing_continuously_still_settles_every_debounce",
         },
@@ -260,6 +273,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::RapidCwdChanges,
+        not_covered: "the test drives the coalescing; the cost of it on real weights is the benchmark's",
         evidence: Evidence::Test {
             name: "rapid_directory_changes_coalesce_into_one_revision",
         },
@@ -267,6 +281,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::ColdStart,
+        not_covered: "nothing has run: a cold start is a measurement of loading real weights",
         evidence: Evidence::NotRun {
             owner: "scripts/bench-descriptions.sh",
         },
@@ -274,6 +289,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::Memory,
+        not_covered: "the test drives the reserve arithmetic and the refusal; the measured process ceiling under real inference is the benchmark's",
         evidence: Evidence::Test {
             name: "a_reserve_that_cannot_be_held_pauses_rather_than_loads",
         },
@@ -281,6 +297,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::CpuContention,
+        not_covered: "nothing has run: contention is a measurement of a busy machine",
         evidence: Evidence::NotRun {
             owner: "scripts/bench-descriptions.sh",
         },
@@ -288,6 +305,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::Cancellation,
+        not_covered: "the test cancels before the runtime starts and proves nothing is published; interrupting a running decode is the benchmark's",
         evidence: Evidence::Test {
             name: "a_cancelled_job_publishes_nothing_and_keeps_the_title_it_had",
         },
@@ -295,6 +313,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::QueueFairness,
+        not_covered: "the test drives the bound over a deterministic runtime; the same bound under real service times is the benchmark's",
         evidence: Evidence::Test {
             name: "an_oldest_ordinary_job_runs_after_three_priority_jobs",
         },
@@ -302,6 +321,7 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::StaleResultRejection,
+        not_covered: "the test drives every rejection the validator makes; a late result from a real run is the benchmark's",
         evidence: Evidence::Test {
             name: "a_result_from_a_remapped_profile_is_refused_as_stale",
         },

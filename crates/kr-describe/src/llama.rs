@@ -7,13 +7,19 @@
 //!
 //! # Zero GPU layers
 //!
-//! Section 22 keeps *zero GPU layers as the agreed CPU-only design*, the profile records it, and
-//! [`LlamaRuntime::load`] refuses a profile that records anything else before it opens a file.
-//! The model parameters then ask for nought, so no layer is offloaded to any backend. On Apple
-//! silicon the pinned binding compiles the Metal backend in whether or not it is wanted - its
-//! manifest enables that feature for the target rather than behind an option - so the CPU-only
-//! guarantee here is the zero layers, enforced in two places, rather than the absence of the
-//! backend from the binary.
+//! Section 22 keeps *zero GPU layers as the agreed CPU-only design*, and CPU-only here is two
+//! settings rather than one, because zero layers on its own is not enough.
+//!
+//! The profile records zero GPU layers, [`LlamaRuntime::load`] refuses a profile that records
+//! anything else before it opens a file, and the model parameters ask for nought, so no layer's
+//! weights are placed on an accelerator. That leaves the library's *operation* offload, which is
+//! on by default and will send a large enough matrix multiply to a registered backend even when
+//! its weights are in host memory; the context parameters turn it off.
+//!
+//! Both are needed on Apple silicon, where the pinned binding compiles the Metal backend in
+//! whether or not it is wanted - its manifest enables that feature for the target rather than
+//! behind an option - so what makes this build CPU-only is the two settings rather than the
+//! absence of the backend from the binary.
 //!
 //! # A context per job
 //!
@@ -199,7 +205,12 @@ impl InferenceRuntime for LlamaRuntime {
             .with_n_ctx(NonZeroU32::new(context_tokens))
             .with_n_batch(BATCH_TOKENS as u32)
             .with_n_threads(threads)
-            .with_n_threads_batch(threads);
+            .with_n_threads_batch(threads)
+            // Zero GPU layers keeps the weights on the processor; this keeps the *operations*
+            // there too. The library's scheduler will otherwise offload an operation whose weights
+            // are in host memory to whatever backend is registered, and on Apple silicon the
+            // pinned binding registers one whether or not it was asked for.
+            .with_op_offload(false);
         let mut context = self
             .model
             .new_context(backend, parameters)
@@ -269,8 +280,10 @@ impl InferenceRuntime for LlamaRuntime {
             if started.elapsed().as_millis() as u64 >= request.deadline_ms {
                 return Ok(Produced::DeadlineExceeded);
             }
+            // `sample` accepts the token itself, which the binding documents. Accepting it again
+            // would advance the grammar twice and let a second opening brace empty its stack,
+            // which the library ends the process over.
             let token = sampler.sample(&context, -1);
-            sampler.accept(token);
             if self.model.is_eog_token(token) {
                 break;
             }

@@ -25,6 +25,9 @@ use crate::error::{DescribeError, Result};
 use crate::profile::catalogue::MetGates;
 use crate::profile::{ModelProfile, ProfileRevision};
 
+/// How many unload records this map keeps.
+const MAX_UNLOAD_RECORDS: usize = 32;
+
 /// What kind of execution environment this is.
 ///
 /// The distinction that matters here is not the operating system but whether a model may be
@@ -250,28 +253,22 @@ impl ModelMapping {
         self.mapped.len()
     }
 
-    /// Records a profile as this environment's mapping, returning whatever it replaced.
+    /// Answers whether this environment may map a profile, recording nothing.
     ///
-    /// Three things are checked here because this is the boundary a profile crosses to become the
-    /// thing a host runs: the environment may run a model at all, the profile lists this target,
-    /// and every gate the profile declares has been met on this host. The last is what stops a
-    /// caller that obtained a candidate profile some other way from running it without the
-    /// platform, resource and quality gates section 22 requires.
+    /// It is the check [`Self::map`] makes, separated so a caller can ask before it loads weights:
+    /// refusing after a two-gigabyte read would be doing the thing the refusal exists to prevent.
     ///
     /// # Errors
     ///
-    /// Returns [`DescribeError::PlacementRefused`] when the environment runs no model,
-    /// [`DescribeError::IncompatibleTarget`] when the profile does not list this target, and
-    /// [`DescribeError::GatesOutstanding`] when a candidate's gates have not been met.
-    pub fn map(
-        &mut self,
+    /// The same three refusals [`Self::map`] returns.
+    pub fn admits(
+        &self,
         environment: &ExecutionEnvironment,
         choice: Option<&DataAccessChoice>,
         profile: &ModelProfile,
         met: &MetGates,
         target: &str,
-        now_ms: TimestampMs,
-    ) -> Result<Remapped> {
+    ) -> Result<()> {
         match environment.placement(choice) {
             Placement::Refused(refusal) => {
                 return Err(DescribeError::PlacementRefused {
@@ -298,13 +295,39 @@ impl ModelMapping {
                     .join(", "),
             });
         }
+        Ok(())
+    }
+
+    /// Records a profile as this environment's mapping, returning whatever it replaced.
+    ///
+    /// Three things are checked here because this is the boundary a profile crosses to become the
+    /// thing a host runs: the environment may run a model at all, the profile lists this target,
+    /// and every gate the profile declares has been met on this host. The last is what stops a
+    /// caller that obtained a candidate profile some other way from running it without the
+    /// platform, resource and quality gates section 22 requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescribeError::PlacementRefused`] when the environment runs no model,
+    /// [`DescribeError::IncompatibleTarget`] when the profile does not list this target, and
+    /// [`DescribeError::GatesOutstanding`] when a candidate's gates have not been met.
+    pub fn map(
+        &mut self,
+        environment: &ExecutionEnvironment,
+        choice: Option<&DataAccessChoice>,
+        profile: &ModelProfile,
+        met: &MetGates,
+        target: &str,
+        now_ms: TimestampMs,
+    ) -> Result<Remapped> {
+        self.admits(environment, choice, profile, met, target)?;
         // The previous record comes out before the new one goes in, and it is returned so its
         // owner releases the weights before it loads more. Section 22 states that order, and the
         // order is what keeps the process ceiling a ceiling: two sets of weights resident at once
         // would exceed it for as long as the changeover took.
         let unloaded = self.mapped.remove(environment.id());
         if let Some(previous) = unloaded.clone() {
-            self.unloaded.push(previous);
+            self.note_unloaded(previous);
         }
         let mapped = MappedModel {
             profile_id: profile.profile_id().to_owned(),
@@ -319,9 +342,20 @@ impl ModelMapping {
     pub fn unload(&mut self, environment_id: &EnvironmentId) -> Option<MappedModel> {
         let unloaded = self.mapped.remove(environment_id);
         if let Some(previous) = unloaded.clone() {
-            self.unloaded.push(previous);
+            self.note_unloaded(previous);
         }
         unloaded
+    }
+
+    /// Keeps the newest unload records, and only those.
+    ///
+    /// A host runs for weeks and unloads on every idle interval and every pressure event, so the
+    /// whole history would grow without a bound. What a reader needs is the recent ones.
+    fn note_unloaded(&mut self, mapping: MappedModel) {
+        self.unloaded.push(mapping);
+        while self.unloaded.len() > MAX_UNLOAD_RECORDS {
+            self.unloaded.remove(0);
+        }
     }
 
     /// Returns whether a result produced under a profile revision may still be published.

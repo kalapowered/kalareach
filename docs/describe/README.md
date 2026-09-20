@@ -51,11 +51,13 @@ published at, the runtime, the verified size and SHA-256 of every asset, the tok
 chat-template digests, the sampler values, that reasoning is off, that there is no tools or vision
 component, zero GPU layers and the targets it declares as compatible.
 
-Two things the profile is careful not to claim. The `converter_revision` is empty for both shipped
+Three things the profile is careful not to claim. The `converter_revision` is empty for both shipped
 profiles, because neither publisher states which tool produced their GGUF; what binds the asset is
-its digest, not a converter this product cannot see. And the tokenizer and chat-template digests are
-the *source* files' - what inference reads is the copy embedded in the asset, which the asset digest
-pins.
+its digest, not a converter this product cannot see. The tokenizer and chat-template digests are the
+*source* files' - the tokenizer inference uses is the one embedded in the asset, which the asset
+digest pins. And the chat template is recorded rather than applied: this build sends the instruction
+and the data section as a plain prompt, so the template digest is provenance for a profile's
+identity rather than a description of what the runtime does with it.
 
 There is one way to get a profile: a document plus a detached signature from a key the host
 accepts. The profiles shipped here are compiled in beside their signatures and the public half of
@@ -101,7 +103,9 @@ either.
 ## When inference runs, and when it does not
 
 Before loading, the host checks that the model's cost plus a reserve of **at least the larger of
-1 GiB or 20% of physical RAM** still fits in the memory it can actually see. If it does not, the
+1 GiB or 20% of physical RAM** still fits in the memory it can actually see. A model that is already
+resident is not free either: the key-value cache, the other caches and the batch buffers are built
+again for every job, and that peak has to fit beside the reserve before the next job starts. If it does not, the
 state is `resource_paused`, the reason is named, and the deterministic titles are unaffected.
 
 - **Battery** pauses inference by default. A host that cannot read its own power source is treated
@@ -213,10 +217,15 @@ copy elsewhere for privacy mode to offer a separate deletion of.
 The model stays mapped while there is work and sessions to justify it, and a host with no sessions
 at all unloads after fifteen minutes.
 
-Missing weights, a cancellation, a load failure and a crash of the inference process all do the same
-thing: they restart inference and nothing else. The store, the pins, the provenance, the queue
-positions, every session and every deterministic title survive untouched, and the next tick maps the
-model again.
+Missing weights, a cancellation and a load or inference failure the runtime reports all do the same
+thing: they release the model and nothing else. The store, the pins, the provenance, every session
+and every deterministic title survive untouched, and the next tick maps the model again. The job
+that was running is not retried; the session's next meaningful change queues another.
+
+The runtime runs inside the host process in this build, so what is restarted is the model rather
+than a process. A failure the library cannot report as an error is a failure of the process it is
+in, and the separate inference process that would contain one is named in the qualification matrix
+as work that has not been done.
 
 ## Measuring it
 
@@ -247,7 +256,9 @@ contention, cancellation, queue fairness and stale-result rejection, across the 
 architectures.
 
 Each case names what stands behind it: a named test, on the targets the suite has been run on, or
-nothing yet with the owner that will run it. A case is never recorded as evidence on a target
+nothing yet with the owner that will run it. Each also names what its evidence does **not** cover,
+because a test against a deterministic runtime proves a rule and not the model, the library or the
+machine. A case is never recorded as evidence on a target
 nothing has run on, and the cases that need real weights stay outstanding until a benchmark run is
 recorded against a commit and a target. `Matrix::gaps` is that list, and it is a method rather than
 a comment so a report that prints the matrix prints the gaps with it.

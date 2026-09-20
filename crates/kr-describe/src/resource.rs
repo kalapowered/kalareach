@@ -331,8 +331,11 @@ impl ResourcePolicy {
         // `available` first. Which world this is comes from the caller, which holds the runtime:
         // inferring it from the previous state is how a host comes to refuse a load and then admit
         // the same load a tick later.
+        // Resident means the weights are already out of `available`; it does not mean the next
+        // job's context, caches and batch buffers are, because the runtime builds those again for
+        // every job. So the resident branch still takes that peak out.
         let headroom = if resident {
-            available
+            available.saturating_sub(cost.per_job_peak())
         } else {
             available.saturating_sub(cost.total())
         };

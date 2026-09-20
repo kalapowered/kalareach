@@ -22,7 +22,7 @@
 //! | --- | --- |
 //! | `fence` | Raises the fence for this session and cancels its job if one is running |
 //! | `cancel_undispatched` | Drops this session's queued job, and counts a running one as in flight |
-//! | `remove_retained` | Deletes this session's generated description and forgets its context |
+//! | `remove_retained` | Deletes this session's generated description and forgets its context and events |
 //! | `outstanding` | Its running job, plus a removal that did not finish |
 //! | `kept` | Its pin, named, with why it stays |
 //! | `exported` | Nothing. A description is never sent anywhere |
@@ -50,7 +50,7 @@ use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
 };
 
-use crate::context::ContextTracker;
+use crate::context::{ContextTracker, SemanticEvent};
 use crate::priority::Cancellation;
 use crate::queue::Scheduler;
 use crate::store::DescriptionStore;
@@ -290,6 +290,7 @@ pub struct DescriptionPrivacy<'a> {
     fence: &'a DescriptionFence,
     scheduler: &'a mut Scheduler,
     tracker: Option<&'a mut ContextTracker>,
+    events: Option<&'a mut Vec<SemanticEvent>>,
     store: &'a DescriptionStore,
     in_flight: &'a InFlight,
     running: &'a RunningJob,
@@ -306,6 +307,7 @@ impl<'a> DescriptionPrivacy<'a> {
         fence: &'a DescriptionFence,
         scheduler: &'a mut Scheduler,
         tracker: Option<&'a mut ContextTracker>,
+        events: Option<&'a mut Vec<SemanticEvent>>,
         store: &'a DescriptionStore,
         in_flight: &'a InFlight,
         running: &'a RunningJob,
@@ -316,6 +318,7 @@ impl<'a> DescriptionPrivacy<'a> {
             fence,
             scheduler,
             tracker,
+            events,
             store,
             in_flight,
             running,
@@ -367,6 +370,12 @@ impl PrivacySubsystem for DescriptionPrivacy<'_> {
         // leaving it would let a change captured while private reach a job after privacy ended.
         if let Some(tracker) = self.tracker.as_deref_mut() {
             tracker.forget();
+        }
+        // The retained semantic events go with it. They are the other half of what this host had
+        // captured for the session, and one left behind would reach the next job after the fence
+        // came down.
+        if let Some(events) = self.events.as_deref_mut() {
+            events.clear();
         }
         // Pins are counted before the removal so the figure reported as kept is of rows that are
         // still there afterwards rather than of rows that were there before.

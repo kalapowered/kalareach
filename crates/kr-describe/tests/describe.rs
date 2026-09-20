@@ -537,6 +537,7 @@ fn in_flight_work_keeps_reconciliation_outstanding() {
             &fence,
             &mut scheduler,
             None,
+            None,
             &store,
             &in_flight,
             &running,
@@ -560,6 +561,7 @@ fn in_flight_work_keeps_reconciliation_outstanding() {
             session(1),
             &fence,
             &mut scheduler,
+            None,
             None,
             &store,
             &in_flight,
@@ -599,6 +601,7 @@ fn a_cleanup_that_could_not_finish_stays_outstanding_across_hooks() {
             &fence,
             &mut scheduler,
             None,
+            None,
             &store,
             &in_flight,
             &running,
@@ -616,6 +619,7 @@ fn a_cleanup_that_could_not_finish_stays_outstanding_across_hooks() {
         session(1),
         &fence,
         &mut scheduler,
+        None,
         None,
         &store,
         &in_flight,
@@ -675,6 +679,21 @@ fn a_private_session_captures_no_context_at_all() {
     let behaviour = SharedBehaviour::new();
     let mut service = service(&behaviour);
     service.session_opened(session(1), SessionEpoch::V1, binding());
+    // Something captured before the fence went up, which the cleanup has to reach as well.
+    service.observe(
+        &session(1),
+        ContextSignal::TaskIntent("a task from before".to_owned()),
+        at(0),
+    );
+    assert!(service.note_event(
+        &session(1),
+        kr_describe::context::SemanticEvent {
+            cursor: 1,
+            kind: kr_describe::context::SemanticEventKind::CommandAccepted,
+            summary:
+                kr_describe::context::ProjectText::new("an earlier command").expect("a summary"),
+        }
+    ));
     service.fence().raise(session(1), PrivacyGeneration::new(1));
     assert_eq!(
         service.observe(
@@ -718,10 +737,12 @@ fn a_private_session_captures_no_context_at_all() {
         .first()
         .map(|job| job.context.data_section())
         .expect("a job");
-    assert!(
-        !job.contains("a private task"),
-        "context captured while private reached a later job: {job}"
-    );
+    for private in ["a private task", "a task from before", "an earlier command"] {
+        assert!(
+            !job.contains(private),
+            "context captured before or during privacy mode reached a later job: {job}"
+        );
+    }
 }
 
 /// KR-REQ-22.19 and KR-REQ-24.14: a pinned name is never overwritten by generated text.
@@ -1044,6 +1065,11 @@ fn the_qualification_matrix_covers_every_case_and_names_its_gaps() {
     // been run and says who will. Nothing in between, and nothing that claims a run that has not
     // happened.
     for row in matrix.rows() {
+        assert!(
+            !row.not_covered.is_empty(),
+            "{} does not say what its evidence leaves out",
+            row.case.as_str()
+        );
         match row.evidence {
             Evidence::Test { name } => {
                 assert!(!name.is_empty());

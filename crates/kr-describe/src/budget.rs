@@ -121,6 +121,20 @@ impl ResidentCost {
             .saturating_add(self.runtime_overhead_bytes)
     }
 
+    /// Returns what one job allocates again even when the weights are already resident.
+    ///
+    /// A runtime that keeps its weights between jobs does not keep its context: the key-value
+    /// cache, the other caches and the batch buffers are built for each job and released after it.
+    /// So a host with a model resident still needs this much headroom before the next job, and a
+    /// reserve check that only asked whether the weights fit would admit a job that then could not
+    /// allocate.
+    #[must_use]
+    pub const fn per_job_peak(&self) -> u64 {
+        self.kv_cache_bytes
+            .saturating_add(self.additional_cache_bytes)
+            .saturating_add(self.batch_bytes)
+    }
+
     /// Returns the total that is not the weights, which is what file size alone would miss.
     #[must_use]
     pub const fn beyond_the_weights(&self) -> u64 {

@@ -135,7 +135,7 @@ fn normalise(text: &str, limit: usize) -> String {
         // Unicode's Bidi_Control set go, which is what stops a right-to-left override reordering
         // what is shown. `char::is_control` does not cover the format characters, so they are
         // named: U+061C is one Rust would otherwise let through.
-        if character.is_control() || is_bidi_control(character) || is_line_separator(character) {
+        if is_forbidden_in_a_label(character) {
             continue;
         }
         if character.is_whitespace() {
@@ -157,6 +157,17 @@ fn normalise(text: &str, limit: usize) -> String {
         codepoints += 1;
     }
     out
+}
+
+/// Returns whether a character has no place in a label.
+///
+/// One predicate, used twice on purpose. The deterministic path removes these, because the text
+/// came from a directory name nobody chose to be shown; the generated path refuses a result that
+/// contains one, because a grammar that excluded them and a result that has one disagree. Both
+/// need the same answer to what "one" means.
+#[must_use]
+pub const fn is_forbidden_in_a_label(character: char) -> bool {
+    character.is_control() || is_bidi_control(character) || is_line_separator(character)
 }
 
 /// Returns whether a character is one of Unicode's bidirectional controls.

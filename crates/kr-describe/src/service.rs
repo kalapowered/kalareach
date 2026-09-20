@@ -339,6 +339,17 @@ impl DescriptionService {
         self.runtime.as_ref().and_then(|runtime| runtime.priority())
     }
 
+    /// Returns the handle that cancels the job the runtime is executing.
+    ///
+    /// It is shared, so a caller on another thread can cancel the job this service is inside. A
+    /// caller on *this* thread cannot: [`Self::tick`] holds the service for the whole of a
+    /// synchronous generation, and a host that needs to interrupt one runs the service on a thread
+    /// of its own.
+    #[must_use]
+    pub const fn running_job(&self) -> &RunningJob {
+        &self.running
+    }
+
     /// Returns what cleanup privacy mode is still owed.
     #[must_use]
     pub const fn cleanup_debt(&self) -> &CleanupDebt {
@@ -393,6 +404,7 @@ impl DescriptionService {
             &self.fence,
             &mut self.scheduler,
             self.trackers.get_mut(&session_id),
+            self.events.get_mut(&session_id),
             &self.store,
             &self.in_flight,
             &self.running,
@@ -761,9 +773,16 @@ impl DescriptionService {
         let request = GenerationRequest {
             prompt: prompt(&job.context),
             grammar: crate::output::DESCRIPTION_GRAMMAR,
-            context_tokens: budgets.context_tokens,
-            max_output_tokens: budgets.max_output_tokens,
-            cpu_threads: budgets.cpu_threads,
+            // The profile's own figures, bounded by section 22's budgets. A profile that asked for
+            // more threads or a longer answer than the budget allows gets the budget; one that
+            // asked for less gets what it asked for, because that is what it was qualified with.
+            context_tokens: budgets
+                .context_tokens
+                .min(profile.execution().context_tokens),
+            max_output_tokens: budgets
+                .max_output_tokens
+                .min(profile.execution().max_output_tokens),
+            cpu_threads: budgets.cpu_threads.min(profile.execution().cpu_threads),
             sampler: *profile.sampler(),
             deadline_ms: remaining_ms,
             cancellation,
@@ -794,6 +813,11 @@ impl DescriptionService {
                 return Ok(Tick::InferenceFailed { session_id, detail });
             }
         };
+        // The deadline again, over the whole job rather than over the runtime's own view of it:
+        // a load that ran long leaves a result nobody asked for by the time it arrives.
+        if elapsed_ms(dequeued) > budgets.execution_deadline_ms {
+            return Ok(Tick::DeadlineExceeded { session_id });
+        }
         // The fence again, now that the runtime has answered. A session made private while its job
         // was running has a result produced under the generation before the enabling, and section
         // 24 refuses it rather than publishing it.
@@ -885,7 +909,34 @@ impl DescriptionService {
         }
         self.runtime = None;
         self.mapping.unload(self.environment.id());
+        // Every reason this environment may not run this profile is decided before a byte of it is
+        // read: a WSL distribution with no data-access choice, a mobile device, a target the
+        // profile does not list and a candidate whose gates are outstanding all refuse here, and
+        // loading weights first would be doing the thing the refusal exists to prevent.
+        self.mapping.admits(
+            &self.environment,
+            self.choice.as_ref(),
+            profile,
+            &self.met,
+            &self.target,
+        )?;
         let runtime = (self.factory)(profile)?;
+        // And what came back is the profile that was asked for. A runtime that loaded something
+        // else would have every description attributed to a model this host is not running.
+        let handle = runtime.handle();
+        if handle.profile_id != profile.profile_id()
+            || handle.profile_revision != profile.revision()
+        {
+            return Err(DescribeError::Runtime {
+                detail: format!(
+                    "{} revision {} was asked for and {} revision {} was loaded",
+                    profile.profile_id(),
+                    profile.revision().get(),
+                    handle.profile_id,
+                    handle.profile_revision.get()
+                ),
+            });
+        }
         self.mapping.map(
             &self.environment,
             self.choice.as_ref(),
