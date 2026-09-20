@@ -122,17 +122,77 @@ pub fn decode_output(bytes: &[u8]) -> String {
 /// and takes seconds, not minutes.
 pub const PLATFORM_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The most output one platform command's answer may take up, in bytes.
+///
+/// These answers are listings of a few lines. A launcher that keeps printing has nothing this host
+/// can use, and reading it to its end would let it fill this process's memory well inside the time
+/// limit.
+const PLATFORM_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+/// Reads one pipe on a thread of its own, handing each piece over as it arrives.
+///
+/// The pieces cross a channel rather than being returned from the thread, because the caller has a
+/// deadline and this thread may not: a descendant that inherited the pipe holds it open after the
+/// child has gone, and a read to the end of it would never return. The caller drops the receiving
+/// end when it has waited long enough, and the next hand-over ends the thread.
+fn read_in_the_background<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Some(mut stream) = stream else { return };
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => {
+                    if sender.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
+    });
+    receiver
+}
+
+/// Collects what one reader hands over, until the pipe ends or the deadline passes.
+fn collect_until(
+    pieces: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Instant,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while bytes.len() < PLATFORM_OUTPUT_LIMIT {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match pieces.recv_timeout(remaining) {
+            Ok(piece) => bytes.extend_from_slice(&piece),
+            // The pipe ended, or the deadline did. Either way this is the whole answer.
+            Err(_) => break,
+        }
+    }
+    bytes.truncate(PLATFORM_OUTPUT_LIMIT);
+    bytes
+}
+
 /// Runs one argument vector, ending it when it outlasts `limit`.
 ///
-/// The output is read on threads of its own, because a child that fills a pipe while nobody reads
-/// it would wait for a reader that is itself waiting for the child.
+/// The child and the reading are both bounded by one deadline. The output is read on threads of its
+/// own, because a child that fills a pipe while nobody reads it would wait for a reader that is
+/// itself waiting for the child; and what those threads have read is collected through a channel
+/// rather than by joining them, because a descendant that inherited the pipe keeps it open after
+/// the child has gone, whether the child exited or was ended. What arrived by the deadline is the
+/// answer, and a thread still waiting on a pipe nobody closed ends with that pipe.
 fn run_bounded(
     program: &str,
     arguments: &[String],
     limit: std::time::Duration,
 ) -> Result<std::process::Output> {
-    use std::io::Read;
-
+    let deadline = std::time::Instant::now() + limit;
     let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::null())
@@ -142,24 +202,9 @@ fn run_bounded(
         .map_err(|error| {
             ControllerError::supervision(format!("{program} could not be run: {error}"))
         })?;
-    let mut out = child.stdout.take();
-    let mut err = child.stderr.take();
-    let reading_out = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(stream) = out.as_mut() {
-            let _ = stream.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let reading_err = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(stream) = err.as_mut() {
-            let _ = stream.read_to_end(&mut bytes);
-        }
-        bytes
-    });
+    let reading_out = read_in_the_background(child.stdout.take());
+    let reading_err = read_in_the_background(child.stderr.take());
 
-    let deadline = std::time::Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -179,8 +224,8 @@ fn run_bounded(
             }
         }
     };
-    let stdout = reading_out.join().unwrap_or_default();
-    let stderr = reading_err.join().unwrap_or_default();
+    let stdout = collect_until(&reading_out, deadline);
+    let stderr = collect_until(&reading_err, deadline);
     let Some(status) = status else {
         return Err(ControllerError::supervision(format!(
             "{program} said nothing for {} seconds and was ended",
@@ -318,6 +363,55 @@ mod tests {
             "/bin/sleep",
             &["600".to_owned()],
             std::time::Duration::from_millis(200),
+        )
+        .expect_err("the command is ended");
+        assert!(error.to_string().contains("was ended"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "it returned after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_that_holds_a_pipe_does_not_hold_the_answer() {
+        // The command exits at once and leaves a descendant holding its standard output. Reading
+        // that pipe to its end would never return, so the bound covers the reading too, and what
+        // the command printed before the deadline is still the answer.
+        let started = std::time::Instant::now();
+        let output = super::run_bounded(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "sleep 600 & echo answered; exit 0".to_owned(),
+            ],
+            std::time::Duration::from_millis(300),
+        )
+        .expect("the command exited, so it has an answer");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("answered"),
+            "{:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "it returned after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_is_ended_does_not_wait_on_a_descendant_that_holds_its_pipe() {
+        // The same pipe, held across a kill rather than across an exit. The record lock is held
+        // for the length of this call either way.
+        let started = std::time::Instant::now();
+        let error = super::run_bounded(
+            "/bin/sh",
+            &["-c".to_owned(), "sleep 600 & sleep 600".to_owned()],
+            std::time::Duration::from_millis(300),
         )
         .expect_err("the command is ended");
         assert!(error.to_string().contains("was ended"), "{error}");
