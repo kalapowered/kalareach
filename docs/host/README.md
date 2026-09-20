@@ -1422,7 +1422,12 @@ generation it belonged to cannot be admitted again until it is removed by hand.
 
 ### What a restart resolves
 
-Reconciliation runs before anything can add to the store, and it gives one of four answers.
+Reconciliation runs before anything can add to the store. A generation that has already settled is
+left alone unless its outbox is not empty, which is what a cancellation over work that had already
+left this host leaves behind. That wait ends at the restart: nothing in the new process can receive
+the old one's answers, so a dispatched publication makes the outcome **unknown** and anything else
+is **cleared** with the state it settled in, rather than holding privacy-mode cleanup open for ever.
+For everything still unfinished there are four answers.
 
 * A generation whose *publication* was dispatched and never answered is recorded as **unknown**,
   and that is decided first. The service may hold it and may not, and a host that wrote either
@@ -1521,8 +1526,13 @@ Backup production is fenced where it is accounted for. The backup service record
 generation it is fenced at **durably**, and the record is what stops the work: while a fence is
 recorded, no generation is admitted, no outbox entry is dispatched, and a restart's reconciliation
 leaves fenced work where it is rather than putting it back in hand. The fence also takes back every
-undispatched outbox entry, settles the generations that had nothing else in flight, and removes the
-staged ciphertext this host holds.
+undispatched outbox entry, settles every generation still producing, and removes the staged
+ciphertext this host holds. A generation whose work had already left is settled too, and says so:
+its record is cancelled while its dispatched entry stays, because the entry is what says the
+cleanup is not finished and the settled record is what stops the transfer's end becoming a late
+publication. When that transfer does end, the entry goes and nothing takes its place. An object the
+service acknowledged before privacy mode removed its staged copy still counts as an object that
+arrived, so a generation whose transfers have all finished is not left waiting on one of them.
 
 It reports only what it actually removed. A file it could not unlink stays in the accounting, and
 the failure becomes a **durable obligation**, named for the step that owed it: it is counted as

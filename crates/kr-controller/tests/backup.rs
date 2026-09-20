@@ -1431,3 +1431,299 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
         .expect("record");
     assert_eq!(record.state, GenerationState::Cancelled);
 }
+
+#[test]
+fn a_publication_that_left_before_the_cancellation_survives_a_repeated_upload_acknowledgement() {
+    let mut environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let admitted = environment
+        .service()
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            PrivacyGeneration::new(0),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    environment
+        .service()
+        .note_dispatched(admitted.sequence)
+        .expect("the upload is in flight");
+
+    // Both objects arrive, so the publication is enqueued, and it leaves this host.
+    let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+    environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            objects[0].object_id(),
+            TimestampMs::new(6_000),
+        )
+        .expect("the member is acknowledged");
+    assert!(
+        environment
+            .service()
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                manifest_id,
+                TimestampMs::new(6_001),
+            )
+            .expect("the manifest is acknowledged")
+    );
+    let publication = environment.service().outbox().expect("a read");
+    assert_eq!(publication.len(), 1);
+    assert_eq!(publication[0].step, Step::Publish);
+    environment
+        .service()
+        .note_dispatched(publication[0].sequence)
+        .expect("the publication is in flight");
+
+    // Privacy mode draws its line while the publication is out there.
+    let _fenced = environment.service.fence(PrivacyGeneration::new(1));
+    let cancelled = environment
+        .service
+        .cancel_undispatched(PrivacyGeneration::new(1));
+    assert_eq!(cancelled.in_flight, 1, "the publication had already left");
+
+    // The service acknowledges an object a second time. That says nothing about the publication,
+    // and the entry this host is still owed an answer for stays where it is.
+    assert!(
+        environment
+            .service()
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                objects[0].object_id(),
+                TimestampMs::new(7_000),
+            )
+            .expect("the repeated acknowledgement is recorded")
+    );
+    let outbox = environment.service().outbox().expect("a read");
+    assert_eq!(
+        outbox.len(),
+        1,
+        "the dispatched publication is not deleted by an upload acknowledgement: {outbox:?}"
+    );
+    assert_eq!(outbox[0].step, Step::Publish);
+    assert!(outbox[0].dispatched);
+
+    // And cleanup is not reported complete over it.
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+    assert!(
+        !PrivacyMode::reconcile(&subsystems).is_complete(),
+        "a publication whose answer is still owed keeps cleanup open"
+    );
+}
+
+#[test]
+fn a_restart_ends_the_wait_over_an_upload_cancelled_after_it_left_this_host() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let admitted = service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        service
+            .note_dispatched(admitted.sequence)
+            .expect("the upload is in flight");
+        let _fenced = service.fence(PrivacyGeneration::new(1));
+        service.cancel_undispatched(PrivacyGeneration::new(1));
+        service.release_fence().expect("privacy mode is turned off");
+    }
+
+    // Nothing in this process can hear the answer the last one was waiting for, so the wait ends
+    // rather than holding cleanup open for ever. The cancellation itself stands.
+    let service = BackupService::open(&state).expect("the service opens again");
+    let outcome = service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    assert_eq!(
+        outcome.cancelled_in_flight,
+        vec![(archive_id(), BackupGeneration::new(1))]
+    );
+    assert!(outcome.outcome_unknown.is_empty());
+    assert!(outcome.resumed.is_empty());
+    assert!(service.outbox().expect("a read").is_empty());
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(record.state, GenerationState::Cancelled);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+}
+
+#[test]
+fn a_restart_records_a_cancelled_generation_whose_publication_left_as_unknown() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let admitted = service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        service
+            .note_dispatched(admitted.sequence)
+            .expect("the upload is in flight");
+        let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+        service
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                objects[0].object_id(),
+                TimestampMs::new(6_000),
+            )
+            .expect("the member is acknowledged");
+        service
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                manifest_id,
+                TimestampMs::new(6_001),
+            )
+            .expect("the manifest is acknowledged");
+        let publication = service.outbox().expect("a read");
+        service
+            .note_dispatched(publication[0].sequence)
+            .expect("the publication is in flight");
+        let _fenced = service.fence(PrivacyGeneration::new(1));
+        service.cancel_undispatched(PrivacyGeneration::new(1));
+    }
+
+    // A publication left this host and was never answered. Whether the service holds it is not
+    // something this host can say, and a cancellation does not make it say otherwise.
+    let service = BackupService::open(&state).expect("the service opens again");
+    let outcome = service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    assert_eq!(
+        outcome.outcome_unknown,
+        vec![(archive_id(), BackupGeneration::new(1))]
+    );
+    assert!(outcome.cancelled_in_flight.is_empty());
+    assert!(service.outbox().expect("a read").is_empty());
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(record.state, GenerationState::Unknown);
+    assert!(
+        service
+            .exported()
+            .iter()
+            .any(|artifact| artifact.kind == "backup archive, outcome unknown"),
+        "a copy this host cannot account for is shown rather than pretended away"
+    );
+}
+
+#[test]
+fn an_object_acknowledged_before_its_staged_copy_went_still_finishes_the_upload() {
+    let mut environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let admitted = environment
+        .service()
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            PrivacyGeneration::new(0),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    environment
+        .service()
+        .note_dispatched(admitted.sequence)
+        .expect("the upload is in flight");
+    environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            objects[0].object_id(),
+            TimestampMs::new(6_000),
+        )
+        .expect("the member arrives before privacy mode is enabled");
+
+    // The whole privacy sequence, staged ciphertext and all.
+    let mut mode = PrivacyMode::new();
+    mode.open_generation(TimestampMs::new(6_500));
+    let enabling = {
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut environment.service];
+        mode.apply(&mut subsystems, TimestampMs::new(6_500))
+    };
+    assert_eq!(enabling.in_flight(), 1);
+    for row in environment
+        .service()
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(!row.staged_path.exists(), "the ciphertext left this host");
+    }
+
+    // The transfer that was already out there finishes. Every object has now reached the service,
+    // so the upload this host was waiting on is over and cleanup completes.
+    let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+    assert!(
+        environment
+            .service()
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                manifest_id,
+                TimestampMs::new(7_000),
+            )
+            .expect("the manifest is acknowledged")
+    );
+    let outbox = environment.service().outbox().expect("a read");
+    assert!(
+        outbox.is_empty(),
+        "the upload is over and nothing is published in its place: {outbox:?}"
+    );
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+    assert!(
+        PrivacyMode::reconcile(&subsystems).is_complete(),
+        "every transfer has ended, so the cleanup has too"
+    );
+}

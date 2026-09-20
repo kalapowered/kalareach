@@ -89,6 +89,12 @@ pub struct Reconciliation {
     pub no_longer_authorised: Vec<(ArchiveId, BackupGeneration)>,
     /// Generations whose publication left this host and was never answered.
     pub outcome_unknown: Vec<(ArchiveId, BackupGeneration)>,
+    /// Generations cancelled while work was in flight, whose wait for an answer a restart ended.
+    ///
+    /// The cancellation stands; what changes is that this host stops counting the transfer as
+    /// something still being cleaned up. No answer can reach this process, so leaving the entry
+    /// would hold privacy-mode cleanup open over work nothing will ever report on.
+    pub cancelled_in_flight: Vec<(ArchiveId, BackupGeneration)>,
     /// Generations left where they are because privacy mode fenced this host.
     ///
     /// A restart does not un-fence work a fence stopped. They are neither resumed nor settled:
@@ -103,6 +109,7 @@ impl Reconciliation {
         self.resumed.is_empty()
             && self.no_longer_authorised.is_empty()
             && self.outcome_unknown.is_empty()
+            && self.cancelled_in_flight.is_empty()
             && self.fenced.is_empty()
     }
 }
@@ -601,8 +608,14 @@ impl BackupService {
 
     /// Records that one object's bytes reached the service.
     ///
-    /// Returns true when it was the last one, which is when the publish step is enqueued in the
-    /// same transaction.
+    /// Returns true when this acknowledgement finished the generation's upload. That is a fact
+    /// about the objects, not about the call: an acknowledgement repeated after the upload had
+    /// finished returns true again and changes nothing.
+    ///
+    /// A finished upload ordinarily enqueues the publish step in the same transaction. A
+    /// generation privacy mode cancelled, or one finishing while production is fenced, gets no
+    /// publication at all: the upload leaves the outbox and nothing takes its place, so a true
+    /// here is not a promise that anything is waiting to be published.
     ///
     /// # Errors
     ///
@@ -706,7 +719,13 @@ impl BackupService {
 
     /// Resolves whatever an earlier daemon left unfinished.
     ///
-    /// Four answers, in this order:
+    /// A generation that has already settled is left alone unless its outbox is not empty, which
+    /// is what a cancellation over work that had already left this host leaves behind. That wait
+    /// ends here: a dispatched publication makes the outcome **unknown**, and anything else is
+    /// **cleared** with the settled state it already had, because no answer from the previous
+    /// process can reach this one and privacy-mode cleanup cannot stay open for ever over it.
+    ///
+    /// For everything still unfinished there are four answers, in this order:
     ///
     /// * A generation whose *publication* was dispatched and never answered is recorded as
     ///   **unknown**, and that is decided first. The service may hold it and may not, and a host
@@ -733,9 +752,6 @@ impl BackupService {
         let outbox = store.outbox()?;
         let mut outcome = Reconciliation::default();
         for record in generations {
-            if record.state.is_settled() {
-                continue;
-            }
             let entries: Vec<&OutboxEntry> = outbox
                 .iter()
                 .filter(|entry| {
@@ -743,6 +759,45 @@ impl BackupService {
                         && entry.backup_generation == record.backup_generation
                 })
                 .collect();
+            if record.state.is_settled() {
+                if entries.is_empty() {
+                    continue;
+                }
+                // A generation privacy mode cancelled while its work was in flight keeps that
+                // entry, because the answer it is waiting for is what ends the cleanup. This
+                // process cannot receive the last one's answers, so the wait ends here instead:
+                // a publication that left is an outcome nobody here can state, and anything else
+                // is cleared so the cancellation does not hold cleanup open for ever.
+                let state = if entries
+                    .iter()
+                    .any(|entry| entry.dispatched && entry.step == Step::Publish)
+                {
+                    outcome
+                        .outcome_unknown
+                        .push((record.archive_id, record.backup_generation));
+                    GenerationState::Unknown
+                } else {
+                    outcome
+                        .cancelled_in_flight
+                        .push((record.archive_id, record.backup_generation));
+                    record.state
+                };
+                let detail = if state == GenerationState::Unknown {
+                    "its publication left this host and was never answered, so whether the \
+                     service holds it is not something this host can say"
+                } else {
+                    "it was cancelled while work was in flight, and the restart ended the wait \
+                     for an answer this host can no longer receive"
+                };
+                store.settle(
+                    record.archive_id,
+                    record.backup_generation,
+                    state,
+                    Some(detail),
+                    now_ms,
+                )?;
+                continue;
+            }
             // An uncertain outcome is settled as uncertain even when the writer has since been
             // retired: retiring a writer stops future work and does not rewrite what this host
             // already dispatched and never heard back about.

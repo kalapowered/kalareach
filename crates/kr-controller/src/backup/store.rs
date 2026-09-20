@@ -467,8 +467,16 @@ impl BackupStore {
 
     /// Records that one object's bytes reached the service.
     ///
-    /// When it was the last one, the publish step is enqueued in the same transaction: a host that
-    /// wrote the object and then died would otherwise have a complete upload nothing publishes.
+    /// Returns true when this acknowledgement finished the generation's upload, which is decided
+    /// by the object rows and not by how often the caller says so: an acknowledgement repeated
+    /// after the upload finished returns true again.
+    ///
+    /// What happens in the same transaction depends on what the generation is still allowed to do.
+    /// Ordinarily the publish step is enqueued, because a host that wrote the last object and then
+    /// died would otherwise have a complete upload nothing publishes. A generation privacy mode
+    /// cancelled, or one finishing while production is fenced, gets no publication: its upload
+    /// step is taken out of the outbox instead, so the cleanup it owed is finished rather than
+    /// turned into a late result.
     ///
     /// # Errors
     ///
@@ -528,14 +536,22 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
 
+        // What is left to arrive. An object whose staged copy privacy mode has since removed still
+        // counts as arrived when the service had acknowledged all of its bytes first: the state
+        // then says where the ciphertext is and `uploaded_bytes` says what the service has, and
+        // reading the removal as an object still to come would leave a generation whose transfers
+        // had all finished waiting on one of them for ever.
         let outstanding: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM objects
-                 WHERE archive_id = ?1 AND backup_generation = ?2 AND state <> ?3",
+                 WHERE archive_id = ?1 AND backup_generation = ?2
+                   AND state <> ?3
+                   AND NOT (state = ?4 AND uploaded_bytes >= encrypted_len)",
                 params![
                     archive_id.get().as_bytes().as_slice(),
                     i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
                     ObjectState::Uploaded.as_str(),
+                    ObjectState::Removed.as_str(),
                 ],
                 |row| row.get(0),
             )
@@ -554,19 +570,11 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         let gen_state = GenerationState::parse(&state)?;
         if gen_state == GenerationState::Cancelled && outstanding == 0 {
-            // This generation was cancelled (e.g. by privacy mode) while uploads were in flight.
-            // Now that the last upload has completed, clean up any remaining outbox entries
-            // so outstanding() reconciliation completes.
-            transaction
-                .execute(
-                    "DELETE FROM outbox
-                     WHERE archive_id = ?1 AND backup_generation = ?2",
-                    params![
-                        archive_id.get().as_bytes().as_slice(),
-                        i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    ],
-                )
-                .map_err(ControllerError::registry)?;
+            // A generation privacy mode cancelled while its upload was already in flight keeps
+            // that entry until the transfer ends, which is what says the cleanup is not finished.
+            // This acknowledgement is the end of it, so the entry goes and nothing is enqueued in
+            // its place. A publication that had already left stays, because its answer has not.
+            clear_unfinished_work(&transaction, archive_id, backup_generation)?;
             transaction.commit().map_err(ControllerError::registry)?;
             return Ok(true);
         }
@@ -581,34 +589,33 @@ impl BackupStore {
                 .optional()
                 .map_err(ControllerError::registry)?;
             if let Some(fenced_at) = fenced_at {
-                // When fenced, no new publication work may be enqueued into outbox. Settle the
-                // generation as cancelled rather than leaving publication work to be dispatched
-                // after fence release.
-                transaction
-                    .execute(
-                        "DELETE FROM outbox
-                         WHERE archive_id = ?1 AND backup_generation = ?2",
-                        params![
-                            archive_id.get().as_bytes().as_slice(),
-                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                        ],
-                    )
-                    .map_err(ControllerError::registry)?;
-                transaction
-                    .execute(
-                        "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
-                         WHERE archive_id = ?1 AND backup_generation = ?2",
-                        params![
-                            archive_id.get().as_bytes().as_slice(),
-                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                            GenerationState::Cancelled.as_str(),
-                            millis(now_ms),
-                            format!(
-                                "privacy mode fenced backup production at privacy generation {fenced_at} before publication was enqueued"
-                            ),
-                        ],
-                    )
-                    .map_err(ControllerError::registry)?;
+                // A fence enqueues no publication. The upload step goes rather than being left for
+                // a dispatch after the fence is released, and the generation settles as cancelled.
+                //
+                // Unless a publication left this host before the fence: that one is still owed an
+                // answer, so its entry stays and the record stays unsettled until the answer says
+                // what became of it. Publishing it is not what that allows; the late-result rule
+                // in `note_published` is what decides that, and it refuses a result produced under
+                // a privacy generation the fence has moved past.
+                let publication_owed =
+                    clear_unfinished_work(&transaction, archive_id, backup_generation)?;
+                if !publication_owed {
+                    transaction
+                        .execute(
+                            "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
+                             WHERE archive_id = ?1 AND backup_generation = ?2",
+                            params![
+                                archive_id.get().as_bytes().as_slice(),
+                                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                                GenerationState::Cancelled.as_str(),
+                                millis(now_ms),
+                                format!(
+                                    "privacy mode fenced backup production at privacy generation {fenced_at} before publication was enqueued"
+                                ),
+                            ],
+                        )
+                        .map_err(ControllerError::registry)?;
+                }
                 transaction.commit().map_err(ControllerError::registry)?;
                 return Ok(true);
             }
@@ -1176,6 +1183,10 @@ impl BackupStore {
 
     /// Marks one generation's objects as no longer staged on this host.
     ///
+    /// The state says where the ciphertext is, and after this it is nowhere here. What the service
+    /// acknowledged is not written over: `uploaded_bytes` keeps it, so an object that had arrived
+    /// before its staged copy was removed is still an object that arrived.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
@@ -1198,12 +1209,14 @@ impl BackupStore {
         Ok(())
     }
 
-    /// Cancels every undispatched outbox entry and settles the generations that had nothing else
-    /// in flight, in one transaction.
+    /// Cancels every undispatched outbox entry and settles every generation still producing, in
+    /// one transaction.
     ///
     /// Returns how many entries were taken back and how many were already dispatched. The second
     /// figure is what reconciliation waits on: dispatched work has left this host and cannot be
-    /// taken back, only followed.
+    /// taken back, only followed. Its entry therefore stays, which is the one place in this store
+    /// where a settled generation has an outbox that is not yet empty; [`Self::settle`] and the
+    /// completion paths of [`Self::note_object_uploaded`] are what empty it.
     ///
     /// # Errors
     ///
@@ -1225,10 +1238,33 @@ impl BackupStore {
                 )
                 .map_err(ControllerError::registry)?;
         }
-        // Every generation that was staging or uploading is cancelled by privacy mode.
-        // If it still has dispatched work in flight, the dispatched outbox entries are
-        // preserved so PrivacyMode::reconcile() tracks them until completion, but the
-        // generation itself is marked Cancelled so no publication can ever be enqueued.
+        // Every generation still producing is cancelled, whether or not any of it had been
+        // dispatched. A generation with work already in flight keeps that entry, so the cleanup it
+        // owes stays visible until the transfer ends, but the record settles now: an upload that
+        // finishes afterwards must find a generation nothing may be published for, and a fence
+        // that is released in between must not turn that upload into a late publication.
+        //
+        // Two statements because the two say different things. The first runs before the second
+        // takes the rest, so each generation is described by what was actually true of it.
+        transaction
+            .execute(
+                "UPDATE generations SET state = ?1, settled_at_ms = ?2, detail = ?3
+                 WHERE state IN (?4, ?5)
+                   AND EXISTS (SELECT 1 FROM outbox
+                               WHERE outbox.archive_id = generations.archive_id
+                                 AND outbox.backup_generation = generations.backup_generation
+                                 AND outbox.dispatched = 1)",
+                params![
+                    GenerationState::Cancelled.as_str(),
+                    millis(now_ms),
+                    format!(
+                        "{detail}, and what had already left this host is followed to its answer"
+                    ),
+                    GenerationState::Staging.as_str(),
+                    GenerationState::Uploading.as_str(),
+                ],
+            )
+            .map_err(ControllerError::registry)?;
         transaction
             .execute(
                 "UPDATE generations SET state = ?1, settled_at_ms = ?2, detail = ?3
@@ -1245,6 +1281,43 @@ impl BackupStore {
         transaction.commit().map_err(ControllerError::registry)?;
         Ok((taken_back.len() as u64, dispatched))
     }
+}
+
+/// Takes a generation's unfinished work out of the outbox, and says whether a publication that
+/// already left this host is still owed an answer.
+///
+/// The upload is over either way: it has either finished or been cancelled, and its entry asks for
+/// nothing more. An undispatched publication is work this host has not started, so it goes with
+/// it. A *dispatched* publication is neither: its answer is what decides whether the service holds
+/// the generation, and an entry deleted here would be a cleanup reported complete over work that
+/// is still out there.
+fn clear_unfinished_work(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+) -> Result<bool> {
+    transaction
+        .execute(
+            "DELETE FROM outbox
+             WHERE archive_id = ?1 AND backup_generation = ?2 AND (step = ?3 OR dispatched = 0)",
+            params![
+                archive_id.get().as_bytes().as_slice(),
+                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                Step::Upload.as_str(),
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    let owed: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2",
+            params![
+                archive_id.get().as_bytes().as_slice(),
+                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(owed > 0)
 }
 
 fn enqueue(
