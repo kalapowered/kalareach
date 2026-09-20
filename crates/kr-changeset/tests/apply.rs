@@ -444,6 +444,72 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
     );
 }
 
+/// Puts an access-control list on one file through the file's own descriptor, and returns what the
+/// platform reports afterwards.
+///
+/// The list is built here rather than asked of the platform's command-line tool. That tool is a
+/// package a host need not have, and a case that quietly does nothing where the package is missing
+/// is a case that proves nothing on the machine that most needs it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn give_an_access_control_list(
+    environment: kr_protocol::ids::EnvironmentId,
+    path: &Path,
+) -> Option<kr_transfer::AccessControl> {
+    let directory = path.parent()?;
+    let leaf = kr_transfer::RelativeName::parse(path.file_name()?.to_str()?).ok()?;
+    let authority = kr_transfer::AuthorisedDirectory::open_root(environment, directory).ok()?;
+    let file = authority.open_write(&leaf).ok()?;
+    #[cfg(target_os = "macos")]
+    let wanted = {
+        // One entry, allowing one right, under this platform's external representation: a 44-byte
+        // header declaring one entry, and 24 bytes of entry after it.
+        let mut raw = vec![0_u8; 68];
+        raw[0..4].copy_from_slice(&0x012c_c16d_u32.to_ne_bytes());
+        raw[36..40].copy_from_slice(&1_u32.to_ne_bytes());
+        raw[44..48].copy_from_slice(&1_u32.to_ne_bytes());
+        raw[60..64].copy_from_slice(&1_u32.to_ne_bytes());
+        kr_transfer::AccessControl::Apple(kr_transfer::AppleAcl::from_bytes(&raw).ok()?)
+    };
+    #[cfg(target_os = "linux")]
+    let wanted = {
+        // A POSIX list in the attribute's own layout: a version, then one eight-byte entry per
+        // row, each a tag, the rights it allows and the user or group it names. Naming a user is
+        // what makes the list say more than the mode bits do, and a list that names one carries a
+        // mask beside it.
+        let owner = file.owner().ok()?;
+        let mut raw = Vec::with_capacity(4 + 5 * 8);
+        raw.extend_from_slice(&2_u32.to_le_bytes());
+        for (tag, rights, who) in [
+            (0x0001_u16, 0x0006_u16, u32::MAX),
+            (0x0002, 0x0004, owner.user),
+            (0x0004, 0x0004, u32::MAX),
+            (0x0010, 0x0004, u32::MAX),
+            (0x0020, 0x0004, u32::MAX),
+        ] {
+            raw.extend_from_slice(&tag.to_le_bytes());
+            raw.extend_from_slice(&rights.to_le_bytes());
+            raw.extend_from_slice(&who.to_le_bytes());
+        }
+        kr_transfer::AccessControl::Posix(raw)
+    };
+    file.set_access_control(&wanted).ok()?;
+    drop(file);
+    let read = authority
+        .open_read(&leaf, kr_transfer::ObjectPolicy::ReadableFile)
+        .ok()?;
+    let carried = read.access_control().ok()?;
+    carried.has_entries().then_some(carried)
+}
+
+/// Returns nothing: this platform keeps its access-control lists where this host cannot write one.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn give_an_access_control_list(
+    _environment: kr_protocol::ids::EnvironmentId,
+    _path: &Path,
+) -> Option<kr_transfer::AccessControl> {
+    None
+}
+
 /// KR-REQ-14.29: a direct apply preserves an access-control list on the destination.
 ///
 /// An access-control list is protection this host must neither lose silently nor refuse across
@@ -459,22 +525,9 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
 
     let destination = ordinary_repository(fixture.work(), "destination-tree");
     let readme_path = destination.join("README.md");
-    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
-    let given = if cfg!(target_os = "macos") {
-        std::process::Command::new("/bin/chmod")
-            .arg("+a")
-            .arg(format!("{who} allow read"))
-            .arg(&readme_path)
-            .status()
-    } else {
-        std::process::Command::new("setfacl")
-            .arg("-m")
-            .arg(format!("u:{who}:r"))
-            .arg(&readme_path)
-            .status()
-    };
+    let given = give_an_access_control_list(fixture.service().environment_id(), &readme_path);
     match given {
-        Ok(status) if status.success() => {
+        Some(_) => {
             let authority_before = kr_transfer::AuthorisedDirectory::open_root(
                 fixture.service().environment_id(),
                 &destination,
@@ -534,9 +587,9 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
                 "the destination's access-control list matches before apply exactly"
             );
         }
-        _ => println!(
-            "not exercised: this platform's access-control tool did not run, so the \
-             ACL preservation apply test was skipped"
+        None => println!(
+            "not exercised: this platform did not take an access-control list, so the \
+             preservation of one across an apply was not checked here"
         ),
     }
 }
@@ -552,9 +605,12 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
     let record = fixture.capture(source_workspace, &include_everything());
 
     let destination = ordinary_repository(fixture.work(), "tampered-acl-destination");
-    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
-    // Destination has no ACL initially.
+    // The destination starts with no list of its own, so the one this fault puts on the staged
+    // copy is protection the file being replaced never had.
+    let environment = fixture.service().environment_id();
     let racing = destination.clone();
+    let tampered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tampered_by_fault = std::sync::Arc::clone(&tampered);
     fixture.service().inject(Some(Fault {
         after_paths: usize::MAX,
         act: None,
@@ -567,23 +623,9 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
                     ))
                 );
                 let staged_path = racing.join(temporary);
-                let status = if cfg!(target_os = "macos") {
-                    std::process::Command::new("/bin/chmod")
-                        .arg("+a")
-                        .arg(format!("{who} allow read"))
-                        .arg(&staged_path)
-                        .status()
-                } else {
-                    std::process::Command::new("setfacl")
-                        .arg("-m")
-                        .arg(format!("u:{who}:r"))
-                        .arg(&staged_path)
-                        .status()
-                };
-                assert!(
-                    status.expect("tampering command ran").success(),
-                    "tampering staged ACL succeeded"
-                );
+                if give_an_access_control_list(environment, &staged_path).is_some() {
+                    tampered_by_fault.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         })),
         stop: false,
@@ -601,6 +643,13 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
         &limitations,
     );
     let result = apply::apply(fixture.service(), &order).expect("the apply runs");
+    if !tampered.load(std::sync::atomic::Ordering::SeqCst) {
+        println!(
+            "not exercised: this platform did not take an access-control list, so the read-back \
+             of an altered one was not checked here"
+        );
+        return;
+    }
     assert_ne!(
         result.outcome,
         Nullable(Some(ApplyOutcomeClass::Applied)),

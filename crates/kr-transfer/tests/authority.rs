@@ -604,37 +604,14 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
     );
     drop(file);
 
-    // The other half needs the platform's own tool. Where it is not installed, this says so rather
-    // than reporting a case it did not run.
+    // The other half needs a file with a list. The list is built here and written through the
+    // file's own descriptor, so the case runs on every host this crate supports rather than only
+    // on one with the platform's command-line tool installed.
     let listed = root.path().join("listed.txt");
     std::fs::write(&listed, b"content\n").expect("a second file");
-    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
-    let given = if cfg!(target_os = "macos") {
-        // Add both an allow ACE and a deny ACE to verify multi-entry and deny-entry preservation.
-        let s1 = std::process::Command::new("/bin/chmod")
-            .arg("+a")
-            .arg(format!("{who} allow read"))
-            .arg(&listed)
-            .status();
-        let s2 = std::process::Command::new("/bin/chmod")
-            .arg("+a")
-            .arg("everyone deny delete")
-            .arg(&listed)
-            .status();
-        match (s1, s2) {
-            (Ok(a), Ok(b)) if a.success() && b.success() => Ok(a),
-            _ => Err(std::io::Error::other("chmod failed")),
-        }
-    } else {
-        std::process::Command::new("setfacl")
-            .arg("-m")
-            .arg(format!("u:{who}:r"))
-            .arg(&listed)
-            .status()
-    };
-    match given {
-        Ok(status) if status.success() => {
-            let second = RelativeName::parse("listed.txt").expect("a name");
+    let second = RelativeName::parse("listed.txt").expect("a name");
+    match give_an_access_control_list(&authority, &second) {
+        Some(acl) => {
             let file = authority
                 .open_read(&second, ObjectPolicy::ReadableFile)
                 .expect("it opens");
@@ -642,10 +619,10 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
                 file.carries_access_control(),
                 "a file with a list says so through its own handle"
             );
-            let acl = file.access_control().expect("reads access control");
-            assert!(
-                acl.has_entries(),
-                "read access-control list carries entries"
+            assert_eq!(
+                file.access_control().expect("reads access control"),
+                acl,
+                "the list read through the handle is the one the file was given"
             );
             drop(file);
 
@@ -694,11 +671,72 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
                 kr_transfer::AccessControl::None
             );
         }
-        _ => println!(
-            "not exercised: this platform's access-control tool did not run, so only the \
+        None => println!(
+            "not exercised: this platform did not take an access-control list, so only the \
              no-list half of this case was checked"
         ),
     }
+}
+
+/// Puts an access-control list on one file through its own descriptor, and returns what the
+/// platform reports afterwards.
+///
+/// The list is built here rather than asked of the platform's command-line tool. That tool is a
+/// package a host need not have, and a case that quietly does nothing where the package is missing
+/// is a case that proves nothing on the machine that most needs it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn give_an_access_control_list(
+    authority: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> Option<kr_transfer::AccessControl> {
+    let file = authority.open_write(name).ok()?;
+    #[cfg(target_os = "macos")]
+    let wanted = {
+        // One entry, allowing one right, under this platform's external representation: a 44-byte
+        // header declaring one entry, and 24 bytes of entry after it.
+        let mut raw = vec![0_u8; 68];
+        raw[0..4].copy_from_slice(&0x012c_c16d_u32.to_ne_bytes());
+        raw[36..40].copy_from_slice(&1_u32.to_ne_bytes());
+        raw[44..48].copy_from_slice(&1_u32.to_ne_bytes());
+        raw[60..64].copy_from_slice(&1_u32.to_ne_bytes());
+        kr_transfer::AccessControl::Apple(kr_transfer::AppleAcl::from_bytes(&raw).ok()?)
+    };
+    #[cfg(target_os = "linux")]
+    let wanted = {
+        // A POSIX list in the attribute's own layout: a version, then one eight-byte entry per
+        // row, each a tag, the rights it allows and the user or group it names. Naming a user is
+        // what makes the list say more than the mode bits do, and a list that names one carries a
+        // mask beside it.
+        let owner = file.owner().ok()?;
+        let mut raw = Vec::with_capacity(4 + 5 * 8);
+        raw.extend_from_slice(&2_u32.to_le_bytes());
+        for (tag, rights, who) in [
+            (0x0001_u16, 0x0006_u16, u32::MAX),
+            (0x0002, 0x0004, owner.user),
+            (0x0004, 0x0004, u32::MAX),
+            (0x0010, 0x0004, u32::MAX),
+            (0x0020, 0x0004, u32::MAX),
+        ] {
+            raw.extend_from_slice(&tag.to_le_bytes());
+            raw.extend_from_slice(&rights.to_le_bytes());
+            raw.extend_from_slice(&who.to_le_bytes());
+        }
+        kr_transfer::AccessControl::Posix(raw)
+    };
+    file.set_access_control(&wanted).ok()?;
+    drop(file);
+    let read = authority.open_read(name, ObjectPolicy::ReadableFile).ok()?;
+    let carried = read.access_control().ok()?;
+    carried.has_entries().then_some(carried)
+}
+
+/// Returns nothing: this platform keeps its access-control lists where this host cannot write one.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn give_an_access_control_list(
+    _authority: &AuthorisedDirectory,
+    _name: &RelativeName,
+) -> Option<kr_transfer::AccessControl> {
+    None
 }
 
 /// KR-REQ-14.05: a name resolves through directories on this authority's own mount, and one on
