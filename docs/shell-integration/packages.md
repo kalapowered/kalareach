@@ -192,8 +192,8 @@ with the runtime location that host needs. The host and the editor are the perso
 wherever they installed them, so the package records them under what it qualified rather than
 among the paths it holds: every path a package declares is inside the package, which is what lets
 a session resolve one without resolving into somebody else's installation. A record that named the
-person's own host as the package's executable could not be read at all, and an installation with
-one unreadable record admits no managed session for any shell in it.
+person's own host as the package's executable could not be read at all, which refuses a managed
+PowerShell session by name and leaves the packages beside it alone.
 
 [README.md](README.md) states what this mechanism can and cannot establish. The short of it is that
 the reader is reached when it steps: the module's queue is serviced on the reader's own thread, and

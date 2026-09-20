@@ -2265,25 +2265,57 @@ fn a_live_session_keeps_the_package_it_started_with() {
     .expect("the record");
     std::fs::write(shell.join("current"), "cccccccccccccccc").expect("the pointer");
     assert!(
-        offered(root.path()).is_none(),
+        offered(root.path(), ShellKind::Zsh).is_none(),
         "an installation that names a binary outside itself was offered anyway"
     );
 
-    // And one whose record cannot be read at all. An installation is read shell by shell, so a
-    // record that cannot be read refuses the shell it belongs to rather than every shell beside
-    // it — which is why the packages this installation also holds are still offered.
+    // And one whose record cannot be read at all.
     std::fs::write(intruder.join("kr-shell-identity.json"), "{").expect("the record");
     assert!(
-        offered(root.path()).is_none(),
+        offered(root.path(), ShellKind::Zsh).is_none(),
         "an installation whose record cannot be read was offered anyway"
     );
+    // An installation is read shell by shell, so a record that cannot be read refuses the shell it
+    // belongs to and leaves the packages beside it alone. The Bash package is put into this same
+    // installation to check that, rather than to say it.
+    match Package::found(ShellKind::Bash) {
+        Some(beside) => {
+            let directory = beside
+                .executable
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("the package directory");
+            let bash = root.path().join(ShellKind::Bash.as_str());
+            std::fs::create_dir_all(&bash).expect("an installation directory");
+            std::os::unix::fs::symlink(directory, bash.join(&beside.identity))
+                .expect("an installed build");
+            std::fs::write(bash.join("current"), &beside.identity).expect("the pointer");
+            assert_eq!(
+                offered(root.path(), ShellKind::Bash)
+                    .as_deref()
+                    .and_then(canonical),
+                canonical(&beside.executable),
+                "a Zsh record that cannot be read took the Bash package beside it with it"
+            );
+        }
+        None => {
+            let reason = "this host holds no Bash package, so what a Zsh record that cannot be \
+                          read leaves beside it is not checked here";
+            assert!(
+                std::env::var_os(shellpkg::REQUIRE).is_none(),
+                "{} is set and {reason}",
+                shellpkg::REQUIRE
+            );
+            println!("skipped: {reason}");
+        }
+    }
 }
 
-/// The Zsh package this installation offers a new session, where it offers one.
-fn offered(root: &std::path::Path) -> Option<std::path::PathBuf> {
+/// The package of one shell this installation offers a new session, where it offers one.
+fn offered(root: &std::path::Path, kind: ShellKind) -> Option<std::path::PathBuf> {
     kr_shell_integration::host::package::PackageSet::discover(root)
         .ok()?
-        .get(ShellKind::Zsh)
+        .get(kind)
         .map(kr_shell_integration::host::package::ShellPackage::executable)
 }
 
