@@ -1,4 +1,5 @@
-//! Opening a bridge: what may cross it, and what is refused before a process starts.
+//! Opening a bridge: what may cross it, what is refused before a process starts, and the frames
+//! the invoking side carries once one is open.
 //!
 //! This is the gate section 3 puts on the near side. The process bridges serve locally
 //! authenticated command-line invocations only, and **a Windows controller must not route a
@@ -16,15 +17,37 @@
 //! is exactly the point: the record on the far side then names where the request entered rather
 //! than the local IPC hop the helper made, and there is no arrangement of hops that turns a
 //! network device into a local owner.
+//!
+//! **The environment that answers is the one that was enrolled.** An opening carries the identity
+//! the record names, and the acknowledgement is compared against it before a single request
+//! crosses. A distribution reinstalled under the same name, or a container recreated under a name
+//! that was reused, answers with a different identity and is refused rather than inheriting the
+//! enrolment.
+//!
+//! **Every length is bounded before it is allocated.** Section 9 sets the control-frame maximum
+//! and requires large messages to be rejected before allocation. Both directions here take that
+//! bound from the frame codec, so a destination cannot make this host reserve memory by declaring
+//! a large frame, and an oversized frame ends the bridge rather than being truncated.
 
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
-use kr_protocol::identity::{BridgeHello, BridgeTarget, EnvironmentEnrolment};
-use kr_protocol::ids::{BuildId, EnvironmentId};
+use kr_protocol::envelope::{ControlFrame, MutationRequest, Request, Response};
+use kr_protocol::error::ProtocolError;
+use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
+use kr_protocol::hello::ProtocolVersion;
+use kr_protocol::identity::EnvironmentEnrolment;
+use kr_protocol::identity::{BridgeFrame, BridgeHello, BridgeHelloAck, BridgeTarget};
+use kr_protocol::ids::{BuildId, EnvironmentId, RequestId};
+use kr_protocol::local::LocalRole;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::bridge::launch::{self, BridgeCommand, LaunchError};
 
-/// Why this host will not open a bridge for a request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why this host will not open a bridge for a request, or will not go on using one.
+///
+/// Each variant is one cause, and each says what happened. A person reading a connection
+/// diagnostic has to be able to tell a helper that never started from one that answered as the
+/// wrong environment, so no two causes share a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The request did not arrive on a locally authenticated ingress.
     ///
@@ -37,10 +60,51 @@ pub enum Refusal {
     AlreadyBridged,
     /// The enrolment is not reached by a process bridge, or is incomplete.
     Launch(LaunchError),
+    /// The helper could not be started at all.
+    NotStarted {
+        /// The program this host tried to run.
+        program: String,
+        /// What the operating system said.
+        detail: String,
+    },
+    /// A stream to or from the helper failed part way through.
+    Stream {
+        /// What the stream said.
+        detail: String,
+    },
+    /// The helper wrote something this invoker cannot read: a frame past the bound, or one that is
+    /// not a canonical bridge frame.
+    Unreadable {
+        /// What the codec said.
+        detail: String,
+    },
+    /// The helper's first frame was not an acknowledgement.
+    NotAnAcknowledgement,
+    /// The destination speaks a protocol major this host does not.
+    ProtocolMajor {
+        /// The major the destination answered with.
+        destination: u16,
+        /// The major this host speaks.
+        invoker: u16,
+    },
+    /// The destination answered in a role the opening did not ask for.
+    WrongRole {
+        /// The role the opening asked for.
+        expected: LocalRole,
+        /// The role that answered.
+        answered: LocalRole,
+    },
+    /// The environment that answered is not the one the enrolment names.
+    IdentityMismatch {
+        /// The identity the enrolment records.
+        enrolled: EnvironmentId,
+        /// The identity that answered.
+        answered: EnvironmentId,
+    },
+    /// The destination refused the bridge, in its own words.
+    Destination(ProtocolError),
     /// The targeted session has closed.
     SessionClosed,
-    /// The destination refused the bridge.
-    DestinationRefused,
 }
 
 impl core::fmt::Display for Refusal {
@@ -56,10 +120,40 @@ impl core::fmt::Display for Refusal {
                 formatter.write_str("a request crosses at most one process bridge")
             }
             Self::Launch(error) => write!(formatter, "{error}"),
-            Self::SessionClosed => formatter.write_str("that session is closed"),
-            Self::DestinationRefused => {
-                formatter.write_str("the destination helper refused the opening handshake")
+            Self::NotStarted { program, detail } => {
+                write!(formatter, "{program} could not be started: {detail}")
             }
+            Self::Stream { detail } => write!(formatter, "the bridge stream failed: {detail}"),
+            Self::Unreadable { detail } => write!(
+                formatter,
+                "the destination wrote a frame this host cannot read: {detail}"
+            ),
+            Self::NotAnAcknowledgement => formatter
+                .write_str("the destination answered the opening frame with something else"),
+            Self::ProtocolMajor {
+                destination,
+                invoker,
+            } => write!(
+                formatter,
+                "the destination speaks protocol major {destination} and this host speaks {invoker}"
+            ),
+            Self::WrongRole { expected, answered } => write!(
+                formatter,
+                "the opening asked for the {} and the {} answered",
+                expected.as_str(),
+                answered.as_str()
+            ),
+            Self::IdentityMismatch { enrolled, answered } => write!(
+                formatter,
+                "the enrolment names environment {enrolled} and {answered} answered; enrol the \
+                 environment that is installed there rather than reusing this record"
+            ),
+            Self::Destination(error) => write!(
+                formatter,
+                "the destination refused the bridge: {}",
+                error.message
+            ),
+            Self::SessionClosed => formatter.write_str("that session is closed"),
         }
     }
 }
@@ -69,17 +163,26 @@ impl std::error::Error for Refusal {}
 impl From<Refusal> for crate::error::ControllerError {
     fn from(refusal: Refusal) -> Self {
         match refusal {
-            // Both admission refusals are permission failures, and both say the same thing to the
-            // caller. An incomplete enrolment is the caller's own record being wrong.
+            // The admission refusals are permission failures, and so is a destination that refused
+            // the handshake: in each case the answer is that this request may not cross.
             Refusal::NetworkActor { .. }
             | Refusal::AlreadyBridged
-            | Refusal::DestinationRefused => Self::PermissionDenied {
+            | Refusal::Destination(_)
+            | Refusal::IdentityMismatch { .. } => Self::PermissionDenied {
                 detail: refusal.to_string(),
             },
             Refusal::SessionClosed => Self::SessionClosed {
                 session: "the bridged session".to_owned(),
             },
+            // An incomplete enrolment is the caller's own record being wrong.
             Refusal::Launch(_) => Self::InvalidArgument(refusal.to_string()),
+            // The rest are this host failing to reach a destination it was told to reach.
+            Refusal::NotStarted { .. }
+            | Refusal::Stream { .. }
+            | Refusal::Unreadable { .. }
+            | Refusal::NotAnAcknowledgement
+            | Refusal::ProtocolMajor { .. }
+            | Refusal::WrongRole { .. } => Self::supervision(refusal.to_string()),
         }
     }
 }
@@ -89,279 +192,255 @@ impl From<Refusal> for crate::error::ControllerError {
 pub struct Opening {
     /// The command the helper is started with.
     pub command: BridgeCommand,
+    /// The identity the enrolment names. The destination has to answer with it.
+    pub environment_id: EnvironmentId,
     /// The opening frame written to its standard input.
     pub hello: BridgeHello,
 }
 
-/// An active bridge process that has exchanged handshakes and is ready for frames.
+/// A bridge that is open: the helper is running and has acknowledged the opening frame.
 #[derive(Debug)]
 pub struct Invocation {
-    /// The running helper child process.
-    pub child: tokio::process::Child,
-    /// Standard input stream to the helper.
-    pub stdin: tokio::process::ChildStdin,
-    /// Standard output stream from the helper.
-    pub stdout: tokio::process::ChildStdout,
-    /// The destination's verified acknowledgement.
-    pub acknowledgement: kr_protocol::identity::BridgeHelloAck,
+    /// The running helper.
+    child: tokio::process::Child,
+    /// The helper's standard input, which carries frames to the destination.
+    stdin: tokio::process::ChildStdin,
+    /// The helper's standard output, which carries the destination's answers back.
+    stdout: tokio::process::ChildStdout,
+    /// What the destination acknowledged: its identity, its user, its role and its bounds.
+    acknowledgement: BridgeHelloAck,
 }
 
 impl Opening {
-    /// Spawns the bridge helper command, writes the opening handshake, reads the response,
-    /// and checks the destination acknowledgement.
+    /// Starts the helper, exchanges the opening frames and checks what answered.
+    ///
+    /// The acknowledgement is accepted only when the destination speaks this protocol major,
+    /// answers in the role the opening asked for, and names the environment the enrolment records.
+    /// The helper is ended when any of those fails, so a refused opening leaves no process behind.
     ///
     /// # Errors
     ///
-    /// Returns [`Refusal`] if the helper refused the handshake or launch failed.
+    /// Returns the [`Refusal`] naming what stopped the bridge: the helper not starting, a stream
+    /// failing, a frame this host cannot read, a protocol major, a role, an identity that is not
+    /// the enrolled one, or the destination's own refusal, including a closed session.
     pub async fn launch(self) -> Result<Invocation, Refusal> {
-        let mut command = tokio::process::Command::new(&self.command.program);
-        command
+        let mut child = tokio::process::Command::new(&self.command.program)
             .args(&self.command.arguments)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            // Section 3 keeps standard error diagnostic. It belongs to whoever ran the command.
+            .stderr(std::process::Stdio::inherit())
+            // A handshake this host refuses ends the helper with it rather than leaving a
+            // distribution or a container process running behind a failed connection.
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| Refusal::NotStarted {
+                program: self.command.program.clone(),
+                detail: error.to_string(),
+            })?;
 
-        let mut child = command.spawn().map_err(|_error| {
-            Refusal::Launch(LaunchError::Incomplete(
-                kr_protocol::identity::EnrolmentError::EmptyTarget,
-            ))
+        let mut stdin = child.stdin.take().ok_or_else(|| Refusal::NotStarted {
+            program: self.command.program.clone(),
+            detail: "its standard input is not a pipe".to_owned(),
+        })?;
+        let mut stdout = child.stdout.take().ok_or_else(|| Refusal::NotStarted {
+            program: self.command.program.clone(),
+            detail: "its standard output is not a pipe".to_owned(),
         })?;
 
-        let mut stdin = child.stdin.take().ok_or(Refusal::AlreadyBridged)?;
-        let mut stdout = child.stdout.take().ok_or(Refusal::AlreadyBridged)?;
-
-        let hello_frame = kr_protocol::identity::BridgeFrame::Hello(Box::new(self.hello.clone()));
-        let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
-            .encode_message(&hello_frame)
-            .map_err(|_| Refusal::AlreadyBridged)?;
-        tokio::io::AsyncWriteExt::write_all(&mut stdin, &encoded)
-            .await
-            .map_err(|_| Refusal::AlreadyBridged)?;
-        tokio::io::AsyncWriteExt::flush(&mut stdin)
-            .await
-            .map_err(|_| Refusal::AlreadyBridged)?;
-
-        let mut prefix = [0_u8; 4];
-        tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut prefix)
-            .await
-            .map_err(|_| Refusal::AlreadyBridged)?;
-        let len = u32::from_be_bytes(prefix) as usize;
-        if len > kr_protocol::frame::StreamKind::Control.max_payload_len() {
-            return Err(Refusal::AlreadyBridged);
-        }
-        let mut payload = vec![0_u8; len];
-        tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut payload)
-            .await
-            .map_err(|_| Refusal::AlreadyBridged)?;
-
-        let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
-            &payload,
-            &kr_protocol::frame::StreamKind::Control.cbor_limits(),
+        write_frame(
+            &mut stdin,
+            &BridgeFrame::Hello(Box::new(self.hello.clone())),
         )
-        .map_err(|_| Refusal::AlreadyBridged)?;
+        .await?;
+        let acknowledgement = match read_frame(&mut stdout).await? {
+            BridgeFrame::HelloAck(acknowledgement) => *acknowledgement,
+            BridgeFrame::Refused(error) => {
+                return Err(
+                    if error.code == kr_protocol::error::ErrorCode::SessionClosed {
+                        Refusal::SessionClosed
+                    } else {
+                        Refusal::Destination(error)
+                    },
+                );
+            }
+            _ => return Err(Refusal::NotAnAcknowledgement),
+        };
 
-        match frame {
-            kr_protocol::identity::BridgeFrame::HelloAck(ack) => {
-                if ack.protocol_version.major != self.hello.protocol_version.major {
-                    return Err(Refusal::AlreadyBridged);
-                }
-                match self.hello.target {
-                    BridgeTarget::Controller => {
-                        if ack.role != kr_protocol::local::LocalRole::Controller {
-                            return Err(Refusal::AlreadyBridged);
-                        }
-                    }
-                    BridgeTarget::Session { .. } => {
-                        if ack.role != kr_protocol::local::LocalRole::Worker {
-                            return Err(Refusal::AlreadyBridged);
-                        }
-                    }
-                }
-                Ok(Invocation {
-                    child,
-                    stdin,
-                    stdout,
-                    acknowledgement: *ack,
-                })
-            }
-            kr_protocol::identity::BridgeFrame::Refused(err) => {
-                if err.code == kr_protocol::error::ErrorCode::SessionClosed {
-                    Err(Refusal::SessionClosed)
-                } else {
-                    Err(Refusal::DestinationRefused)
-                }
-            }
-            _ => Err(Refusal::AlreadyBridged),
+        let invoker = self.hello.protocol_version.major;
+        if acknowledgement.protocol_version.major != invoker {
+            return Err(Refusal::ProtocolMajor {
+                destination: acknowledgement.protocol_version.major,
+                invoker,
+            });
         }
+        let expected = match self.hello.target {
+            BridgeTarget::Controller => LocalRole::Controller,
+            BridgeTarget::Session { .. } => LocalRole::Worker,
+        };
+        if acknowledgement.role != expected {
+            return Err(Refusal::WrongRole {
+                expected,
+                answered: acknowledgement.role,
+            });
+        }
+        // The enrolment is a record of one installation. An environment that answers with another
+        // identity is another installation, whatever name it was reached by.
+        if acknowledgement.environment_id != self.environment_id {
+            return Err(Refusal::IdentityMismatch {
+                enrolled: self.environment_id,
+                answered: acknowledgement.environment_id,
+            });
+        }
+
+        Ok(Invocation {
+            child,
+            stdin,
+            stdout,
+            acknowledgement,
+        })
     }
 }
 
 impl Invocation {
-    /// Writes a request over the bridge and awaits the response.
+    /// What the destination acknowledged.
+    #[must_use]
+    pub const fn acknowledgement(&self) -> &BridgeHelloAck {
+        &self.acknowledgement
+    }
+
+    /// Carries one request to the destination and returns the answer it gave.
     ///
     /// # Errors
     ///
-    /// Returns the host's error, or a transport failure.
-    pub async fn request(
-        &mut self,
-        request: kr_protocol::envelope::Request,
-    ) -> std::result::Result<kr_protocol::envelope::Response, kr_protocol::error::ProtocolError> {
+    /// Returns the [`Refusal`] naming the stream, frame or destination failure. A method that the
+    /// destination answered with an error is an [`Response`] carrying that error, not a refusal:
+    /// the bridge carried it unchanged.
+    pub async fn request(&mut self, request: Request) -> Result<Response, Refusal> {
         let request_id = request.request_id;
-        let frame = kr_protocol::identity::BridgeFrame::Control(Box::new(
-            kr_protocol::envelope::ControlFrame::Request(request),
-        ));
-        let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
-            .encode_message(&frame)
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::UnsupportedSchema,
-                    error.to_string(),
-                )
-            })?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stdin, &encoded)
-            .await
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::ResourceUnavailable,
-                    error.to_string(),
-                )
-            })?;
-        tokio::io::AsyncWriteExt::flush(&mut self.stdin)
-            .await
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::ResourceUnavailable,
-                    error.to_string(),
-                )
-            })?;
-
-        loop {
-            let mut prefix = [0_u8; 4];
-            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut prefix)
-                .await
-                .map_err(|error| {
-                    kr_protocol::error::ProtocolError::new(
-                        kr_protocol::error::ErrorCode::ResourceUnavailable,
-                        error.to_string(),
-                    )
-                })?;
-            let len = u32::from_be_bytes(prefix) as usize;
-            let mut payload = vec![0_u8; len];
-            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut payload)
-                .await
-                .map_err(|error| {
-                    kr_protocol::error::ProtocolError::new(
-                        kr_protocol::error::ErrorCode::ResourceUnavailable,
-                        error.to_string(),
-                    )
-                })?;
-            let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
-                &payload,
-                &kr_protocol::frame::StreamKind::Control.cbor_limits(),
-            )
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::UnsupportedSchema,
-                    error.to_string(),
-                )
-            })?;
-            match frame {
-                kr_protocol::identity::BridgeFrame::Control(carried) => match *carried {
-                    kr_protocol::envelope::ControlFrame::Response(resp)
-                        if resp.request_id == request_id =>
-                    {
-                        return Ok(resp);
-                    }
-                    _ => continue,
-                },
-                kr_protocol::identity::BridgeFrame::Refused(err) => return Err(err),
-                _ => continue,
-            }
-        }
+        self.exchange(
+            BridgeFrame::Control(Box::new(ControlFrame::Request(request))),
+            request_id,
+        )
+        .await
     }
 
-    /// Writes a mutation over the bridge and awaits the response.
+    /// Carries one mutation to the destination and returns the answer it gave.
     ///
     /// # Errors
     ///
-    /// Returns the host's error, or a transport failure.
-    pub async fn mutate(
-        &mut self,
-        mutation: kr_protocol::envelope::MutationRequest,
-    ) -> std::result::Result<kr_protocol::envelope::Response, kr_protocol::error::ProtocolError> {
+    /// As [`Self::request`].
+    pub async fn mutate(&mut self, mutation: MutationRequest) -> Result<Response, Refusal> {
         let request_id = mutation.request_id;
-        let frame = kr_protocol::identity::BridgeFrame::Control(Box::new(
-            kr_protocol::envelope::ControlFrame::Mutation(Box::new(mutation)),
-        ));
-        let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
-            .encode_message(&frame)
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::UnsupportedSchema,
-                    error.to_string(),
-                )
-            })?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stdin, &encoded)
-            .await
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::ResourceUnavailable,
-                    error.to_string(),
-                )
-            })?;
-        tokio::io::AsyncWriteExt::flush(&mut self.stdin)
-            .await
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::ResourceUnavailable,
-                    error.to_string(),
-                )
-            })?;
+        self.exchange(
+            BridgeFrame::Control(Box::new(ControlFrame::Mutation(Box::new(mutation)))),
+            request_id,
+        )
+        .await
+    }
 
+    /// Ends the bridge: the helper's input is closed and the helper is waited for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refusal::Stream`] when the helper could not be waited for.
+    pub async fn close(mut self) -> Result<(), Refusal> {
+        drop(self.stdin);
+        self.child
+            .wait()
+            .await
+            .map(|_status| ())
+            .map_err(|error| Refusal::Stream {
+                detail: error.to_string(),
+            })
+    }
+
+    /// Writes one frame and reads until the answer to `request_id` arrives.
+    ///
+    /// Anything else the destination sends in the meantime — an event, a keepalive — is carried
+    /// past rather than mistaken for the answer.
+    async fn exchange(
+        &mut self,
+        frame: BridgeFrame,
+        request_id: RequestId,
+    ) -> Result<Response, Refusal> {
+        write_frame(&mut self.stdin, &frame).await?;
         loop {
-            let mut prefix = [0_u8; 4];
-            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut prefix)
-                .await
-                .map_err(|error| {
-                    kr_protocol::error::ProtocolError::new(
-                        kr_protocol::error::ErrorCode::ResourceUnavailable,
-                        error.to_string(),
-                    )
-                })?;
-            let len = u32::from_be_bytes(prefix) as usize;
-            let mut payload = vec![0_u8; len];
-            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut payload)
-                .await
-                .map_err(|error| {
-                    kr_protocol::error::ProtocolError::new(
-                        kr_protocol::error::ErrorCode::ResourceUnavailable,
-                        error.to_string(),
-                    )
-                })?;
-            let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
-                &payload,
-                &kr_protocol::frame::StreamKind::Control.cbor_limits(),
-            )
-            .map_err(|error| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::UnsupportedSchema,
-                    error.to_string(),
-                )
-            })?;
-            match frame {
-                kr_protocol::identity::BridgeFrame::Control(carried) => match *carried {
-                    kr_protocol::envelope::ControlFrame::Response(resp)
-                        if resp.request_id == request_id =>
-                    {
-                        return Ok(resp);
+            match read_frame(&mut self.stdout).await? {
+                BridgeFrame::Control(carried) => match *carried {
+                    ControlFrame::Response(response) if response.request_id == request_id => {
+                        return Ok(response);
                     }
                     _ => continue,
                 },
-                kr_protocol::identity::BridgeFrame::Refused(err) => return Err(err),
-                _ => continue,
+                BridgeFrame::Refused(error) => {
+                    return Err(
+                        if error.code == kr_protocol::error::ErrorCode::SessionClosed {
+                            Refusal::SessionClosed
+                        } else {
+                            Refusal::Destination(error)
+                        },
+                    );
+                }
+                _ => return Err(Refusal::NotAnAcknowledgement),
             }
         }
     }
+}
+
+/// Writes one bridge frame and flushes it.
+///
+/// The codec refuses to encode a frame past the control bound, so an oversized frame never reaches
+/// the stream.
+async fn write_frame<W: AsyncWrite + Unpin>(
+    sink: &mut W,
+    frame: &BridgeFrame,
+) -> Result<(), Refusal> {
+    let bytes = FrameCodec::new(StreamKind::Control)
+        .encode_message(frame)
+        .map_err(|error| Refusal::Unreadable {
+            detail: error.to_string(),
+        })?;
+    sink.write_all(&bytes)
+        .await
+        .map_err(|error| Refusal::Stream {
+            detail: error.to_string(),
+        })?;
+    sink.flush().await.map_err(|error| Refusal::Stream {
+        detail: error.to_string(),
+    })
+}
+
+/// Reads one bridge frame.
+///
+/// The declared length is checked against section 9's control-frame bound *before* a payload
+/// buffer exists, so a destination that declares a large frame is refused rather than served with
+/// the memory it asked for.
+async fn read_frame<R: AsyncRead + Unpin>(source: &mut R) -> Result<BridgeFrame, Refusal> {
+    let mut prefix = [0_u8; FRAME_LENGTH_PREFIX_LEN];
+    source
+        .read_exact(&mut prefix)
+        .await
+        .map_err(|error| Refusal::Stream {
+            detail: error.to_string(),
+        })?;
+    let declared = FrameCodec::new(StreamKind::Control)
+        .decode_length(prefix)
+        .map_err(|error| Refusal::Unreadable {
+            detail: error.to_string(),
+        })?;
+    let mut payload = vec![0_u8; declared];
+    source
+        .read_exact(&mut payload)
+        .await
+        .map_err(|error| Refusal::Stream {
+            detail: error.to_string(),
+        })?;
+    kr_cbor::from_canonical_slice(&payload, &StreamKind::Control.cbor_limits()).map_err(|error| {
+        Refusal::Unreadable {
+            detail: error.to_string(),
+        }
+    })
 }
 
 /// Decides whether a request may cross a bridge, and builds what opens it.
@@ -393,6 +472,7 @@ pub fn open(
     let command = launch::command(enrolment).map_err(Refusal::Launch)?;
     Ok(Opening {
         command,
+        environment_id: enrolment.environment_id,
         hello: BridgeHello {
             protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
             build_id,
@@ -405,9 +485,17 @@ pub fn open(
     })
 }
 
+/// The protocol version this host opens bridges with.
+#[must_use]
+pub const fn invoker_version() -> ProtocolVersion {
+    kr_protocol::hello::PROTOCOL_VERSION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::frame::FrameError;
     use kr_protocol::identity::EnvironmentAccess;
     use kr_protocol::ids::{ActorId, ConnectionId, ControllerGeneration, DeviceId};
     use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
@@ -464,6 +552,9 @@ mod tests {
         assert_eq!(opening.hello.origin_environment_id, here());
         assert!(!opening.hello.already_bridged);
         assert_eq!(opening.command.program, "wsl.exe");
+        // The identity the destination will have to answer with comes from the record, never from
+        // the caller.
+        assert_eq!(opening.environment_id, enrolment().environment_id);
     }
 
     #[test]
@@ -545,6 +636,156 @@ mod tests {
             Refusal::Launch(LaunchError::NotAProcessBridge {
                 access: EnvironmentAccess::SshHost
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_length_past_the_bound_is_refused_before_a_buffer_exists() {
+        // One byte past the control-frame payload maximum, and nothing behind it. A reader that
+        // allocated first would reserve the memory the destination asked for and then wait for
+        // bytes that are not coming.
+        for declared in [
+            u32::try_from(StreamKind::Control.max_payload_len() + 1).expect("fits"),
+            u32::MAX,
+        ] {
+            let stream = declared.to_be_bytes().to_vec();
+            let refusal = read_frame(&mut stream.as_slice())
+                .await
+                .expect_err("a refusal");
+            assert!(
+                matches!(&refusal, Refusal::Unreadable { detail }
+                    if detail.contains(&StreamKind::Control.max_payload_len().to_string())),
+                "{refusal}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_at_the_bound_is_read_rather_than_refused() {
+        // The bound itself is allowed: the refusal is for what exceeds it, not for what reaches it.
+        let codec = FrameCodec::new(StreamKind::Control);
+        let length = codec
+            .decode_length(
+                u32::try_from(StreamKind::Control.max_payload_len())
+                    .expect("fits")
+                    .to_be_bytes(),
+            )
+            .expect("the maximum is within the bound");
+        assert_eq!(length, StreamKind::Control.max_payload_len());
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_inside_a_frame_is_a_stream_failure_rather_than_a_short_frame() {
+        let mut stream = 8_u32.to_be_bytes().to_vec();
+        stream.extend_from_slice(&[1, 2, 3]);
+        let refusal = read_frame(&mut stream.as_slice())
+            .await
+            .expect_err("a refusal");
+        assert!(matches!(refusal, Refusal::Stream { .. }), "{refusal}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_length_frame_is_refused() {
+        let stream = 0_u32.to_be_bytes().to_vec();
+        let refusal = read_frame(&mut stream.as_slice())
+            .await
+            .expect_err("a refusal");
+        assert!(
+            matches!(&refusal, Refusal::Unreadable { detail }
+                if detail == &FrameError::EmptyPayload.to_string()),
+            "{refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_written_here_is_read_back_whole() {
+        let original = BridgeFrame::Refused(ProtocolError::new(ErrorCode::PermissionDenied, "no"));
+        let mut buffer: Vec<u8> = Vec::new();
+        write_frame(&mut buffer, &original).await.expect("written");
+        let read = read_frame(&mut buffer.as_slice()).await.expect("read back");
+        assert_eq!(read, original);
+    }
+
+    #[test]
+    fn every_failure_class_says_something_different() {
+        // A diagnostic that named two causes the same way would send whoever reads it to the wrong
+        // place. Section 18 asks for connection diagnostics; this is what makes them worth reading.
+        let refusals = [
+            Refusal::NetworkActor {
+                ingress: ActorIngress::PairedDevice,
+            },
+            Refusal::AlreadyBridged,
+            Refusal::Launch(LaunchError::NotAProcessBridge {
+                access: EnvironmentAccess::SshHost,
+            }),
+            Refusal::NotStarted {
+                program: "wsl.exe".to_owned(),
+                detail: "no such file".to_owned(),
+            },
+            Refusal::Stream {
+                detail: "broken pipe".to_owned(),
+            },
+            Refusal::Unreadable {
+                detail: "not canonical".to_owned(),
+            },
+            Refusal::NotAnAcknowledgement,
+            Refusal::ProtocolMajor {
+                destination: 9,
+                invoker: invoker_version().major,
+            },
+            Refusal::WrongRole {
+                expected: LocalRole::Controller,
+                answered: LocalRole::Worker,
+            },
+            Refusal::IdentityMismatch {
+                enrolled: here(),
+                answered: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+            },
+            Refusal::Destination(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the destination said no",
+            )),
+            Refusal::SessionClosed,
+        ];
+        let mut messages: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+        messages.sort();
+        let count = messages.len();
+        messages.dedup();
+        assert_eq!(messages.len(), count, "two refusals read the same");
+    }
+
+    #[test]
+    fn a_failure_to_reach_a_destination_is_not_reported_as_a_permission_refusal() {
+        // A helper that did not start is this host's own failure. Reporting it as a permission
+        // refusal would send a person looking for a grant that was never the problem.
+        let unreachable: crate::error::ControllerError = Refusal::NotStarted {
+            program: "wsl.exe".to_owned(),
+            detail: "no such file".to_owned(),
+        }
+        .into();
+        assert!(
+            matches!(
+                unreachable,
+                crate::error::ControllerError::Supervision { .. }
+            ),
+            "{unreachable:?}"
+        );
+        let mismatched: crate::error::ControllerError = Refusal::IdentityMismatch {
+            enrolled: here(),
+            answered: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+        }
+        .into();
+        assert!(
+            matches!(
+                mismatched,
+                crate::error::ControllerError::PermissionDenied { .. }
+            ),
+            "{mismatched:?}"
+        );
+        let closed: crate::error::ControllerError = Refusal::SessionClosed.into();
+        assert!(
+            matches!(closed, crate::error::ControllerError::SessionClosed { .. }),
+            "{closed:?}"
         );
     }
 }

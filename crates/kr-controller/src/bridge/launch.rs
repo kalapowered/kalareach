@@ -247,9 +247,38 @@ mod tests {
                 2,
                 "the distribution and the user are both carried whole: {value}"
             );
-            let container =
-                command(&enrolment(EnvironmentAccess::Container, value, value)).expect("a command");
+            // A container is named by the identifier its runtime issued, so the awkward value is
+            // the user here. It crosses whole for the same reason.
+            let container = command(&enrolment(
+                EnvironmentAccess::Container,
+                &"0a".repeat(32),
+                value,
+            ))
+            .expect("a command");
             assert!(container.arguments.contains(&value.to_owned()), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_container_named_by_a_reusable_name_is_refused_rather_than_started() {
+        // Section 3: a reused human container name is not its identity. The refusal is here,
+        // before a runtime is asked to resolve the name to whatever holds it now.
+        for name in ["build", "My Distro", "-leading-dash", "0a1b"] {
+            let refused = command(&enrolment(EnvironmentAccess::Container, name, "kala"))
+                .expect_err("a refusal");
+            assert_eq!(
+                refused,
+                LaunchError::Incomplete(
+                    kr_protocol::identity::EnrolmentError::ContainerTargetNotIdentifier
+                ),
+                "{name}"
+            );
+            for build in [observe, start] {
+                assert!(
+                    build(&enrolment(EnvironmentAccess::Container, name, "kala")).is_err(),
+                    "{name} is not observed or started by name either"
+                );
+            }
         }
     }
 
