@@ -1421,9 +1421,18 @@ impl DraftSync {
         // What this device last saw the service hold, read with the draft above. A draft that has
         // never been published expects nothing to be there, which is generation zero.
         let expected = note.map_or(0, |note| note.generation.get());
+        // One identity per attempt. This half keeps no record of a publication it has sent, so it
+        // has nothing to present a second time: every call is a first attempt, and saying so is
+        // more honest than reusing an identity whose receipt would answer for a different draft.
+        let request_id = kr_transport::random::fresh_uuid_v4()?;
         match self
             .service
-            .compare_exchange(&draft_collection(draft_id), expected, &ciphertext)
+            .compare_exchange(
+                &draft_collection(draft_id),
+                request_id,
+                expected,
+                &ciphertext,
+            )
             .await
         {
             Ok(accepted) => {

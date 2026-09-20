@@ -91,7 +91,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use kr_protocol::ids::{InstallationId, RelayLeaseId};
-use kr_protocol::scalars::EndpointKey;
+use kr_protocol::scalars::{EndpointKey, Uuid};
 
 use crate::error::{ClientError, Result};
 
@@ -382,18 +382,68 @@ pub trait PushService: Send + Sync + std::fmt::Debug {
     fn revoke<'a>(&'a self, installation_id: InstallationId) -> ServiceFuture<'a, ()>;
 }
 
+/// What a synchronisation service recorded about one request.
+///
+/// Section 9 gives every mutation a receipt under the de-duplication key
+/// `(verified_actor_id, action_id)` and keeps it for thirty days. That is what makes a lost answer
+/// answerable: the device asks about the identity it sent, not about the object, because what the
+/// object holds afterwards is a fact about the object rather than about any one write of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncRequestStatus {
+    /// The service applied the write, leaving the object at this generation.
+    Applied {
+        /// The generation the write left the object at.
+        ///
+        /// It is the generation the exchange would have answered with, which the service recorded
+        /// when it applied the write. A service whose own revisions are not generations keeps the
+        /// association itself; nothing downstream of this trait can reconstruct one.
+        generation: u64,
+    },
+    /// The service refused the comparison, so this request stored nothing.
+    Refused,
+    /// The service holds no receipt for this request.
+    ///
+    /// Two different things look like this from here: a request that never arrived, and a receipt
+    /// that has passed section 9's thirty-day retention. Neither establishes that the write did
+    /// not land, which is why this is one answer rather than two.
+    Unknown,
+}
+
 /// Where encrypted settings and backups are exchanged.
 ///
 /// The service stores ciphertext. It never holds the keys, so a compare-and-exchange here is over
 /// opaque bytes.
+///
+/// Every exchange carries an identity for the request itself, and [`Self::request_status`] answers
+/// about that identity afterwards. Without it, a device whose answer was lost could not establish
+/// whether its write landed: the comparison is about the object, and asking what the object holds
+/// later says nothing about one write of it.
 pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// Publishes an encrypted object under a compare-and-exchange generation.
+    ///
+    /// `request_id` names this request. It is the de-duplication key of section 9 and it belongs
+    /// to the piece of work rather than to the object, so a retry of the same work presents the
+    /// same identity and is answered from the receipt instead of being applied twice. Presenting
+    /// one identity with different content is refused as `ID_CONFLICT`.
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,
+        request_id: Uuid,
         expected_generation: u64,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, u64>;
+
+    /// Returns what the service recorded about one request.
+    ///
+    /// It reads the receipt and nothing else, so the answer is about that request even when the
+    /// object has moved on since. A request the service has no receipt for is
+    /// [`SyncRequestStatus::Unknown`] rather than a failure: not knowing is an answer, and the
+    /// caller decides what to do with it.
+    fn request_status<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus>;
 
     /// Fetches an encrypted object and the generation it is held at.
     ///
@@ -609,9 +659,18 @@ impl SyncBackupService for NullService {
     fn compare_exchange<'a>(
         &'a self,
         _collection: &'a str,
+        _request_id: Uuid,
         _expected_generation: u64,
         _ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, u64> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn request_status<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus> {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 

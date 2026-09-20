@@ -325,6 +325,10 @@ impl SyncClient {
             .service
             .compare_exchange(
                 &collection,
+                // The work's own identity, which is what makes this request answerable
+                // afterwards: the record on disk carries it, so a device that lost the answer asks
+                // about the same request rather than about the object.
+                staged.work_id,
                 staged.expected_generation.get(),
                 &staged.ciphertext,
             )

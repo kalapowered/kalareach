@@ -12,7 +12,7 @@ use kr_client::drafts::{
     Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, NotSubmittable,
     Published as DraftPublished,
 };
-use kr_client::services::{ServiceFuture, SyncBackupService};
+use kr_client::services::{ServiceFuture, SyncBackupService, SyncRequestStatus};
 use kr_client::sync::{
     ClientSelection, ConflictCopy, Published, Restored, SettingValue, StorageFeature, SyncBody,
     SyncClient, SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision,
@@ -30,16 +30,64 @@ use tokio::sync::Mutex;
 
 const NOW: u64 = 1_764_000_000_000;
 
-/// A compare-and-exchange store over opaque bytes, which is all a service is.
+/// What one request was answered with, kept under the identity that request presented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recorded {
+    /// The write was applied, leaving the object at this generation.
+    Applied(u64),
+    /// The comparison was refused, so the request stored nothing.
+    Refused,
+}
+
+/// The receipt one request left behind.
+#[derive(Clone, Debug)]
+struct Receipt {
+    /// The request this receipt answered. The deployed service records a digest of these fields;
+    /// holding them whole applies the same rule.
+    request: (u64, Vec<u8>),
+    /// The reply that was given.
+    recorded: Recorded,
+}
+
+/// One exchange as this device sent it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Exchange {
+    collection: String,
+    request_id: Uuid,
+    expected_generation: u64,
+    ciphertext: Vec<u8>,
+}
+
+/// What becomes of the next exchange, so a test can lose an answer the way a network does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Interruption {
+    /// The service applies the request and the answer never reaches the device.
+    AfterTheWrite,
+    /// The request never reaches the service, so no receipt is ever written for it.
+    BeforeItArrives,
+}
+
+/// A compare-and-exchange store over opaque bytes, and the request receipts beside it.
+///
+/// It is the service's half of section 20's compare and swap and of section 9's receipt: it holds
+/// one generation and one object per collection, records the reply it gave each request identity,
+/// replays that reply for an exact retry, refuses a reused identity carrying different content,
+/// and answers about an identity it has no receipt for by saying it holds none.
 #[derive(Debug, Default)]
 struct Service {
     objects: Mutex<BTreeMap<String, (u64, Vec<u8>)>>,
+    receipts: Mutex<BTreeMap<(String, Uuid), Receipt>>,
+    sent: Mutex<Vec<Exchange>>,
+    asked: Mutex<Vec<(String, Uuid)>>,
+    interruption: Mutex<Option<Interruption>>,
+    status_unreachable: Mutex<bool>,
 }
 
 impl Service {
     /// Forgets everything, which is what a reset or a replaced service looks like to a device.
     async fn reset(&self) {
         self.objects.lock().await.clear();
+        self.receipts.lock().await.clear();
     }
 
     async fn stored(&self, collection: &str) -> Option<(u64, Vec<u8>)> {
@@ -49,29 +97,144 @@ impl Service {
     async fn collections(&self) -> Vec<String> {
         self.objects.lock().await.keys().cloned().collect()
     }
+
+    /// Applies the next exchange and loses its answer on the way back.
+    async fn lose_the_next_answer(&self) {
+        *self.interruption.lock().await = Some(Interruption::AfterTheWrite);
+    }
+
+    /// Stops the next exchange before the service sees it, so it leaves no receipt.
+    async fn drop_the_next_request(&self) {
+        *self.interruption.lock().await = Some(Interruption::BeforeItArrives);
+    }
+
+    /// Makes every status query fail, which is a service this device cannot ask.
+    async fn stop_answering_about_requests(&self) {
+        *self.status_unreachable.lock().await = true;
+    }
+
+    /// Every exchange this device sent, whether or not the service acted on it.
+    async fn exchanges(&self) -> Vec<Exchange> {
+        self.sent.lock().await.clone()
+    }
+
+    /// Every request identity this device asked the status of.
+    async fn status_queries(&self) -> Vec<(String, Uuid)> {
+        self.asked.lock().await.clone()
+    }
+
+    /// Answers one exchange, from the receipt when this identity has one.
+    async fn exchange(
+        &self,
+        collection: &str,
+        request_id: Uuid,
+        expected_generation: u64,
+        ciphertext: &[u8],
+    ) -> kr_client::Result<u64> {
+        let key = (collection.to_owned(), request_id);
+        let request = (expected_generation, ciphertext.to_vec());
+        let mut receipts = self.receipts.lock().await;
+        if let Some(receipt) = receipts.get(&key) {
+            // An exact retry is answered from the receipt and applied no second time. The same
+            // identity carrying different content is a second request wearing the first one's
+            // name, which section 9 refuses rather than answers.
+            if receipt.request != request {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::IdConflict,
+                    "that identity already answered a different request",
+                )));
+            }
+            return answer(receipt.recorded);
+        }
+        let mut objects = self.objects.lock().await;
+        let current = objects
+            .get(collection)
+            .map_or(0, |(generation, _)| *generation);
+        let recorded = if current == expected_generation {
+            let next = current + 1;
+            objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
+            Recorded::Applied(next)
+        } else {
+            Recorded::Refused
+        };
+        receipts.insert(key, Receipt { request, recorded });
+        answer(recorded)
+    }
+}
+
+/// The reply a receipt records, as the exchange itself would have answered.
+fn answer(recorded: Recorded) -> kr_client::Result<u64> {
+    match recorded {
+        Recorded::Applied(generation) => Ok(generation),
+        Recorded::Refused => Err(ClientError::Host(ProtocolError::new(
+            ErrorCode::DraftConflict,
+            "another writer got there first",
+        ))),
+    }
+}
+
+/// An answer that never came back, which is the one refusal that establishes nothing.
+fn lost(what: &'static str) -> ClientError {
+    ClientError::Host(ProtocolError::new(ErrorCode::UpstreamUnavailable, what))
 }
 
 impl SyncBackupService for Service {
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,
+        request_id: Uuid,
         expected_generation: u64,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, u64> {
         Box::pin(async move {
-            let mut objects = self.objects.lock().await;
-            let current = objects
-                .get(collection)
-                .map_or(0, |(generation, _)| *generation);
-            if current != expected_generation {
-                return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::DraftConflict,
-                    "another writer got there first",
-                )));
+            self.sent.lock().await.push(Exchange {
+                collection: collection.to_owned(),
+                request_id,
+                expected_generation,
+                ciphertext: ciphertext.to_vec(),
+            });
+            let interruption = self.interruption.lock().await.take();
+            if interruption == Some(Interruption::BeforeItArrives) {
+                return Err(lost("the request never reached the service"));
             }
-            let next = current + 1;
-            objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
-            Ok(next)
+            let answered = self
+                .exchange(collection, request_id, expected_generation, ciphertext)
+                .await;
+            if interruption == Some(Interruption::AfterTheWrite) {
+                return Err(lost("the answer never came back"));
+            }
+            answered
+        })
+    }
+
+    fn request_status<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus> {
+        Box::pin(async move {
+            self.asked
+                .lock()
+                .await
+                .push((collection.to_owned(), request_id));
+            if *self.status_unreachable.lock().await {
+                return Err(lost("the service could not be asked"));
+            }
+            Ok(
+                match self
+                    .receipts
+                    .lock()
+                    .await
+                    .get(&(collection.to_owned(), request_id))
+                    .map(|receipt| receipt.recorded)
+                {
+                    Some(Recorded::Applied(generation)) => {
+                        SyncRequestStatus::Applied { generation }
+                    }
+                    Some(Recorded::Refused) => SyncRequestStatus::Refused,
+                    None => SyncRequestStatus::Unknown,
+                },
+            )
         })
     }
 
@@ -132,6 +295,7 @@ impl SyncBackupService for GatedService {
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,
+        request_id: Uuid,
         expected_generation: u64,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, u64> {
@@ -143,9 +307,17 @@ impl SyncBackupService for GatedService {
                 .expect("the gate is open")
                 .forget();
             self.inner
-                .compare_exchange(collection, expected_generation, ciphertext)
+                .compare_exchange(collection, request_id, expected_generation, ciphertext)
                 .await
         })
+    }
+
+    fn request_status<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus> {
+        self.inner.request_status(collection, request_id)
     }
 
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
@@ -191,6 +363,11 @@ fn refused(error: kr_crypto::CryptoError) -> ClientError {
 
 fn device(byte: u8) -> DeviceId {
     DeviceId::new(Uuid::from_bytes([byte; 16]))
+}
+
+/// One identity for a request a test sends itself, rather than through a client.
+fn fresh_request_id() -> Uuid {
+    kr_transport::random::fresh_uuid_v4().expect("an identity")
 }
 
 fn settings(pairs: &[(&str, &str)], pinned: &[&str]) -> SyncSettings {
@@ -523,6 +700,7 @@ async fn an_object_that_is_not_the_one_the_collection_was_asked_for_is_refused()
     service
         .compare_exchange(
             &sync_collection(SyncObjectKind::Settings, elsewhere),
+            fresh_request_id(),
             0,
             &ciphertext,
         )
@@ -720,6 +898,7 @@ async fn a_draft_is_synchronised_as_a_draft_and_never_as_an_execution_request() 
     service
         .compare_exchange(
             &sync_collection(SyncObjectKind::Settings, object_id),
+            fresh_request_id(),
             0,
             &draft_bytes,
         )

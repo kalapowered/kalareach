@@ -19,6 +19,7 @@ use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
 use kr_client::services::{
     ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
+    SyncRequestStatus,
 };
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
@@ -909,18 +910,21 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
 
 /// A synchronisation service that holds one generation and one object per collection.
 ///
-/// It is the service's half of section 20's compare and swap, and nothing else: it stores opaque
-/// bytes, refuses a write whose expected generation is not the one it holds, and never decides
-/// which of two writers was right.
+/// It is the service's half of section 20's compare and swap and of section 9's receipt: it stores
+/// opaque bytes, refuses a write whose expected generation is not the one it holds, never decides
+/// which of two writers was right, and records the reply it gave each request identity so it can
+/// be asked about that request afterwards.
 #[derive(Debug, Default)]
 struct RemoteObjects {
     objects: Mutex<std::collections::HashMap<String, (u64, Vec<u8>)>>,
+    receipts: Mutex<std::collections::HashMap<(String, Uuid), SyncRequestStatus>>,
 }
 
 impl kr_client::services::SyncBackupService for RemoteObjects {
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,
+        request_id: Uuid,
         expected_generation: u64,
         ciphertext: &'a [u8],
     ) -> kr_client::services::ServiceFuture<'a, u64> {
@@ -929,7 +933,12 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
             let current = objects
                 .get(collection)
                 .map_or(0, |(generation, _)| *generation);
+            let key = (collection.to_owned(), request_id);
             if current != expected_generation {
+                self.receipts
+                    .lock()
+                    .await
+                    .insert(key, SyncRequestStatus::Refused);
                 return Err(ClientError::Host(ProtocolError::new(
                     ErrorCode::DraftConflict,
                     "another writer got there first",
@@ -937,7 +946,27 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
             }
             let next = current + 1;
             objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
+            self.receipts
+                .lock()
+                .await
+                .insert(key, SyncRequestStatus::Applied { generation: next });
             Ok(next)
+        })
+    }
+
+    fn request_status<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> kr_client::services::ServiceFuture<'a, SyncRequestStatus> {
+        Box::pin(async move {
+            Ok(self
+                .receipts
+                .lock()
+                .await
+                .get(&(collection.to_owned(), request_id))
+                .copied()
+                .unwrap_or(SyncRequestStatus::Unknown))
         })
     }
 
@@ -1052,7 +1081,12 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .seal(&DraftStore::encode_payload(&theirs).expect("canonical bytes"))
         .expect("sealed");
     service
-        .compare_exchange(&draft_collection(draft.draft_id), 0, &sealed)
+        .compare_exchange(
+            &draft_collection(draft.draft_id),
+            kr_transport::random::fresh_uuid_v4().expect("an identity"),
+            0,
+            &sealed,
+        )
         .await
         .expect("the other device's write");
 
@@ -1096,7 +1130,12 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         )
         .expect("sealed");
     service
-        .compare_exchange(&draft_collection(draft.draft_id), 1, &misfiled)
+        .compare_exchange(
+            &draft_collection(draft.draft_id),
+            kr_transport::random::fresh_uuid_v4().expect("an identity"),
+            1,
+            &misfiled,
+        )
         .await
         .expect("a misfiled write");
     let error = sync
