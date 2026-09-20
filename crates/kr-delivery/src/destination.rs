@@ -371,6 +371,14 @@ impl DestinationRecord {
     ///
     /// `configured_at_ms` is left out: re-writing an unchanged record is not a change of
     /// destination.
+    ///
+    /// The notification-preview keys are left out too, and that is the point of section 16's
+    /// retention: a rotation keeps the previous key until the notifications sealed to it expire,
+    /// so those notifications are still the device's to read and still go where they were
+    /// admitted to go. A key says what the recipient can read, not who the recipient is. Binding
+    /// to it would revoke every outstanding notification the moment the device rotated, and would
+    /// revoke them a second time when the retained key was forgotten. What previews are allowed to
+    /// carry at all is a policy rather than a key, so `previews_enabled` stays.
     #[must_use]
     pub fn binding_digest(&self) -> String {
         use std::fmt::Write as _;
@@ -393,20 +401,10 @@ impl DestinationRecord {
             Destination::Push(push) => {
                 let _ = write!(
                     input,
-                    "push;installation={};sender={};previews={};revision={};key={};previous={};mailbox={};",
+                    "push;installation={};sender={};previews={};mailbox={};",
                     push.installation_id,
                     push.sender_record_id,
                     push.previews_enabled,
-                    push.preview_keys.revision,
-                    hex(push.preview_keys.current.as_bytes()),
-                    push.preview_keys.previous.as_ref().map_or_else(
-                        || "-".to_owned(),
-                        |previous| format!(
-                            "{}:{}",
-                            previous.revision,
-                            hex(previous.key.as_bytes())
-                        )
-                    ),
                     push.mailbox_key
                         .as_ref()
                         .map_or_else(|| "-".to_owned(), |key| hex(key.as_bytes())),
@@ -542,6 +540,71 @@ mod tests {
             third.retained_previous(5_000),
             None,
             "and it is still bounded"
+        );
+    }
+
+    fn push_record(keys: PreviewKeys) -> DestinationRecord {
+        DestinationRecord {
+            id: DestinationId::new("desk-phone").expect("an identifier"),
+            destination: Destination::Push(Box::new(PushDestination {
+                installation_id: InstallationId::new(kr_protocol::scalars::Uuid::from_bytes(
+                    [7_u8; 16],
+                )),
+                sender_record_id: PushSenderRecordId::new(kr_protocol::scalars::Uuid::from_bytes(
+                    [9_u8; 16],
+                )),
+                preview_keys: keys,
+                previews_enabled: true,
+                mailbox_key: None,
+            })),
+            rule: Some(DeliveryRule {
+                name: "mentions".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    #[test]
+    fn rotating_and_forgetting_a_preview_key_leaves_the_dispatch_binding_alone() {
+        let rotated =
+            PreviewKeys::only(key(1), 1).rotated(key(2), 2, Some(TimestampMs::new(5_000)));
+        let mut forgotten = rotated.clone();
+        forgotten.forget_expired(5_000);
+        let before = push_record(PreviewKeys::only(key(1), 1)).binding_digest();
+        assert_eq!(
+            push_record(rotated).binding_digest(),
+            before,
+            "a device that rotated its preview key is the same device, and section 16 keeps the \
+             replaced key so the notifications sealed to it still arrive"
+        );
+        assert_eq!(
+            push_record(forgotten).binding_digest(),
+            before,
+            "and forgetting the retired key is housekeeping, not a change of recipient"
+        );
+    }
+
+    #[test]
+    fn what_decides_where_a_notification_goes_changes_the_binding() {
+        let keys = PreviewKeys::only(key(1), 1);
+        let before = push_record(keys.clone()).binding_digest();
+        let mut disabled = push_record(keys.clone());
+        disabled.enabled = false;
+        assert_ne!(disabled.binding_digest(), before);
+        let mut unruled = push_record(keys.clone());
+        unruled.rule = None;
+        assert_ne!(unruled.binding_digest(), before);
+        let mut elsewhere = push_record(keys);
+        if let Destination::Push(push) = &mut elsewhere.destination {
+            push.installation_id =
+                InstallationId::new(kr_protocol::scalars::Uuid::from_bytes([8_u8; 16]));
+        }
+        assert_ne!(
+            elsewhere.binding_digest(),
+            before,
+            "another installation is another device"
         );
     }
 
