@@ -275,9 +275,9 @@ fn check_reference_name(name: &str) -> Result<()> {
         || name.contains("//")
         || name.contains("..")
         // `@{` is Git's own reflog and upstream syntax, which names something other than the
-        // reference. A bare `@` is an ordinary character in a reference name.
+        // reference. A bare `@` is an ordinary character in a reference name, in any position:
+        // `refs/heads/release@` and `refs/heads/release@2026` are both names a repository holds.
         || name.contains("@{")
-        || name.ends_with('@')
         || name.contains('\\')
         || name.contains('~')
         || name.contains('^')
@@ -291,7 +291,8 @@ fn check_reference_name(name: &str) -> Result<()> {
     if refused {
         return Err(ProjectError::InvalidArgument(
             format!(
-                "{} is not a full reference name; this service moves a reference named in full,                  as refs/...",
+                "{} is not a full reference name; this service moves a reference named in full, \
+                 as refs/...",
                 redact(name)
             )
             .into(),
@@ -306,6 +307,12 @@ fn check_reference_name(name: &str) -> Result<()> {
 /// removes the reference, and as the expected old value it asserts the reference does not exist.
 /// This service moves a reference that exists to another object that exists, so neither position
 /// takes it.
+///
+/// An argument vector carries no repository, so this accepts a full name of **either** object
+/// format. A name of the length the repository does not use is not a full object name in that
+/// repository at all: Git would resolve it as a revision, and a reference whose own name happens
+/// to be that many hexadecimal characters would then decide what the update moves.
+/// [`check_object_name_width`] is that second check, and it runs where the repository is known.
 fn check_object_name(name: &str, position: &str) -> Result<()> {
     if !OBJECT_NAME_LENGTHS.contains(&name.len())
         || !name
@@ -322,6 +329,77 @@ fn check_object_name(name: &str, position: &str) -> Result<()> {
             format!(
                 "the null object as {} deletes or creates a reference; this service moves one \
                  reference that exists to one object that exists",
+                position
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The object format a repository names its objects in.
+///
+/// A repository uses one of them for its whole life, and the two write names of different lengths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectFormat {
+    /// Names are forty hexadecimal characters.
+    Sha1,
+    /// Names are sixty-four hexadecimal characters.
+    Sha256,
+}
+
+impl ObjectFormat {
+    /// Returns the format Git names, or a refusal for one this service does not know.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::InvalidArgument`] for any other answer, because a format whose
+    /// name length this service cannot state is one it cannot check an object name against.
+    pub fn parse(named: &str) -> Result<Self> {
+        match named {
+            "sha1" => Ok(Self::Sha1),
+            "sha256" => Ok(Self::Sha256),
+            other => Err(ProjectError::InvalidArgument(
+                format!(
+                    "this repository names its objects in {}, and this service updates a \
+                     reference only where it can say how long a full object name is",
+                    redact(other)
+                )
+                .into(),
+            )),
+        }
+    }
+
+    /// Returns how many characters a full object name has in this format.
+    #[must_use]
+    pub const fn name_length(self) -> usize {
+        match self {
+            Self::Sha1 => 40,
+            Self::Sha256 => 64,
+        }
+    }
+}
+
+/// Refuses an object name that is not full **in this repository's own format**.
+///
+/// The argument check above accepts either format, because an argument vector carries no
+/// repository. Here the repository is known, and a name of the other format's length is refused:
+/// Git resolves it as a revision, so a reference or a tag whose own name is that many hexadecimal
+/// characters would decide what the update moves, and this service names the object it moves to.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::InvalidArgument`] when the name is not full in `format`.
+pub fn check_object_name_width(name: &str, format: ObjectFormat, position: &str) -> Result<()> {
+    check_object_name(name, position)?;
+    if name.len() != format.name_length() {
+        return Err(ProjectError::InvalidArgument(
+            format!(
+                "{} is {} characters and a full object name in this repository is {}, so {} \
+                 names a revision rather than an object",
+                redact(name),
+                name.len(),
+                format.name_length(),
                 position
             )
             .into(),
@@ -3574,6 +3652,44 @@ mod tests {
             .unchanged(&later)
             .expect_err("a configuration that changed is refused");
         assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::SourceChanged);
+    }
+
+    #[test]
+    fn an_object_name_is_full_in_the_format_the_repository_writes() {
+        let short = "0123456789abcdef0123456789abcdef01234567";
+        let long = "a".repeat(64);
+        // Each format takes its own length and refuses the other's, in either position. A vector
+        // check cannot make this decision, because a vector carries no repository.
+        check_object_name_width(short, ObjectFormat::Sha1, "the new value")
+            .expect("forty characters is a full name where objects are named in forty");
+        check_object_name_width(&long, ObjectFormat::Sha256, "the new value")
+            .expect("sixty-four characters is a full name where objects are named in sixty-four");
+        let refusal = check_object_name_width(&long, ObjectFormat::Sha1, "the new value")
+            .expect_err("sixty-four characters names a revision in a repository of forty");
+        assert!(refusal.to_string().contains("in this repository is 40"));
+        let refusal =
+            check_object_name_width(short, ObjectFormat::Sha256, "the expected old value")
+                .expect_err("forty characters names a revision in a repository of sixty-four");
+        assert!(refusal.to_string().contains("in this repository is 64"));
+        assert!(refusal.to_string().contains("the expected old value"));
+        // The rules the vector check already applies still apply: the null object of the
+        // repository's own format deletes or creates a reference, whichever format that is.
+        assert!(
+            check_object_name_width(&"0".repeat(64), ObjectFormat::Sha256, "the new value")
+                .expect_err("the null object is refused in its own format")
+                .to_string()
+                .contains("deletes or creates a reference")
+        );
+        // A format this service cannot state a length for is refused rather than guessed at.
+        assert_eq!(
+            ObjectFormat::parse("sha1").expect("git names it"),
+            ObjectFormat::Sha1
+        );
+        assert_eq!(
+            ObjectFormat::parse("sha256").expect("git names it"),
+            ObjectFormat::Sha256
+        );
+        assert!(ObjectFormat::parse("blake3").is_err());
     }
 
     #[test]

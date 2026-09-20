@@ -28,7 +28,7 @@ use kr_protocol::scalars::U64;
 use kr_transfer::{AuthorisedDirectory, ObjectIdentity};
 
 use crate::error::{ProjectError, Result};
-use crate::git::{ConfigurationAudit, GitRequest, RestrictedProfile};
+use crate::git::{ConfigurationAudit, GitRequest, ObjectFormat, RestrictedProfile};
 
 /// Returns the wire form of one filesystem identity.
 #[must_use]
@@ -419,15 +419,35 @@ impl OpenedRepository {
         Ok((revision, reference))
     }
 
+    /// Returns the object format this repository names its objects in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitFailed`] when the repository will not say, and
+    /// [`ProjectError::InvalidArgument`] for a format this service does not know.
+    pub fn object_format(&self, profile: &RestrictedProfile) -> Result<ObjectFormat> {
+        let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("--show-object-format")];
+        let output = profile.run(&self.read(&arguments))?;
+        output.require_success()?;
+        ObjectFormat::parse(output.text().trim())
+    }
+
     /// Performs a reference update via `update-ref` with expected old value.
     ///
     /// The write is bounded by a write grant for the repository's Git common directory
     /// (`git_dir_path`) and nothing wider: the working tree is not writable.
     ///
+    /// Both object names are checked against **this repository's own format** before the
+    /// invocation is built. A full name of the other format's length is a revision here rather
+    /// than an object, and Git would resolve it: a reference or a tag whose own name is that many
+    /// hexadecimal characters would then decide what the update moves or what it was compared
+    /// against, which is not the compare-and-swap this method offers.
+    ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::GitFailed`] when the reference cannot be updated or the old value
-    /// does not match.
+    /// Returns [`ProjectError::InvalidArgument`] when either name is not full in this
+    /// repository's format, and [`ProjectError::GitFailed`] when the reference cannot be updated
+    /// or the old value does not match.
     pub fn update_ref(
         &self,
         profile: &RestrictedProfile,
@@ -436,6 +456,9 @@ impl OpenedRepository {
         old_oid: &str,
         no_deref: bool,
     ) -> Result<()> {
+        let format = self.object_format(profile)?;
+        crate::git::check_object_name_width(new_oid, format, "the new value")?;
+        crate::git::check_object_name_width(old_oid, format, "the expected old value")?;
         let mut arguments: Vec<&OsStr> = vec![OsStr::new("update-ref")];
         if no_deref {
             arguments.push(OsStr::new("--no-deref"));

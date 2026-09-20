@@ -357,6 +357,16 @@ fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
         OsStr::new(&"b".repeat(64)),
     ])
     .expect("a reference and objects a repository can really hold are permitted");
+    // `@` in any position, including the last. `git check-ref-format` accepts both of these.
+    for held in ["refs/heads/release@", "refs/heads/@"] {
+        check_arguments(&[
+            OsStr::new("update-ref"),
+            OsStr::new(held),
+            OsStr::new("0123456789abcdef0123456789abcdef01234567"),
+            OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+        ])
+        .unwrap_or_else(|error| panic!("{held} is a name a repository holds: {error}"));
+    }
 
     for (refused, reason) in [
         (
@@ -1413,4 +1423,56 @@ fn reference_update_with_expected_old_value_performs_compare_and_swap_bounded_to
     // The working tree is not written by it: the update is bounded to the Git common directory,
     // and a reference update does not atomically update a dirty working tree.
     assert!(path.join("extra.txt").exists());
+}
+
+/// KR-REQ-14.27: the compare-and-swap names an *object*, so each value has to be a full object
+/// name in the format this repository writes.
+///
+/// A name of the other format's length is a revision here rather than an object, and Git resolves
+/// a revision: a branch or a tag whose own name is sixty-four hexadecimal characters would decide
+/// what the update moved, or what it was compared against, while the caller believed it had named
+/// an object. Both positions are refused before Git runs, and the reference does not move.
+#[test]
+fn a_reference_update_names_an_object_in_the_repositorys_own_format() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "format");
+    let profile = fixture.service().profile();
+    let repository = OpenedRepository::open(profile, fixture.environment_id(), &path)
+        .expect("the repository opens");
+    assert_eq!(
+        repository
+            .object_format(profile)
+            .expect("the repository says how it names its objects"),
+        kr_project::git::ObjectFormat::Sha1,
+        "a repository created without an object format names its objects in the shorter one"
+    );
+    let (head, _) = repository.head(profile).expect("the head reads");
+    let held = head.expect("commit exists");
+
+    // A name of the longer format, in each position. The argument check accepts both lengths
+    // because an argument vector carries no repository; this one does carry it.
+    let long = "a".repeat(64);
+    for (new_oid, old_oid, position) in [
+        (long.as_str(), held.as_str(), "the new value"),
+        (held.as_str(), long.as_str(), "the expected old value"),
+    ] {
+        let refusal = repository
+            .update_ref(profile, "refs/heads/main", new_oid, old_oid, false)
+            .expect_err("a name of the other format's length is not an object here");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("a full object name in this repository is 40"),
+            "the refusal says what a full name is here, and said {said}"
+        );
+        assert!(
+            said.contains(position),
+            "the refusal names the position it refused, and said {said}"
+        );
+    }
+    let (unmoved, _) = repository.head(profile).expect("the head reads");
+    assert_eq!(
+        unmoved.as_deref(),
+        Some(held.as_str()),
+        "nothing moved the reference"
+    );
 }
