@@ -1,0 +1,56 @@
+{
+  "lock_version": 1,
+  "packages": [
+    {
+      "directory": "fixture",
+      "manifest": {
+        "digest": "f8434aef081de78d9b63e34d1172b9a64399182a7420bb4f0b3352762a5aeccb",
+        "path": "plugin.json",
+        "size_bytes": "2953"
+      },
+      "payloads": [
+        {
+          "digest": "8696fa4d9de1f26d0b021aff9a30545d086a30fff8f6298ba7d84f13dbbfec8e",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "1288"
+        },
+        {
+          "digest": "4f5b9b87257fd2edb479b34640edfe14b81f826a980e4ad6a42e7ef426120935",
+          "path": "fixtures/visibility.json",
+          "role": "fixture",
+          "size_bytes": "1301"
+        },
+        {
+          "digest": "7a73bc88d59a7343fcd910476055dff51a68263b618d97466addd0ff47a9903c",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "2523"
+        }
+      ],
+      "plugin_id": "kalareach/example-declarative",
+      "plugin_name": "example-declarative",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.0, <0.2.0",
+      "total_size_bytes": "8065",
+      "version": "0.1.0",
+      "wit_range": ">=0.1.0, <0.2.0"
+    }
+  ],
+  "source": {
+    "commit": "44084fc058106bca25bfb4f2118cc349187419df",
+    "generation": "1",
+    "generation_path": "snapshots/development",
+    "produced_at": "1760000000000",
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "tree_url": "https://github.com/kalapowered/kalareach-plugins/tree/44084fc058106bca25bfb4f2118cc349187419df/snapshots/development"
+  },
+  "trust_root": {
+    "digest": "874233c78ea4a6db808b3967fe6b750c6419084edf2007d2c4fc2e5486d1ed8e",
+    "expires": "2036-09-12T13:27:01.481482Z",
+    "key_ids": [
+      "f14e4ac91420a6515eb9ae321fcba909420d2cd09cf8c5fd42244af8f0e5fdf2"
+    ],
+    "version": 1
+  }
+}
