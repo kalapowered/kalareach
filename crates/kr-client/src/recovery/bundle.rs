@@ -396,14 +396,29 @@ impl BundleStore {
             return Err(RecoveryError::KitIsForAnotherSeed);
         }
 
+        // The kit the migration will hand back has to be one its owner can actually keep. A
+        // destination whose locator cannot be printed, or whose kit is larger than a scannable
+        // code, would otherwise be found out after the bundle had been written there, which is
+        // the one failure this call cannot undo.
+        let origins = vec![destination.service_origin.clone()];
+        let updated_kit =
+            kr_crypto::kdf::RecoverySeed::to_kit(seed, origins, destination.bundle_locator.clone());
+        drop(crate::recovery::kit::render(&updated_kit)?);
+
         // The bundle being moved has to be the one at the old location *now*, not the one this
         // device read at some point. Migrating a snapshot from before somebody else's write would
         // move an older writer set and older checkpoints to the new location and point the updated
         // kit at them. Reading it again is also what proves this seed opens it: a seed that does
         // not is an authentication failure here rather than a bundle re-encrypted under the wrong
         // authority at the destination.
+        //
+        // Authentication says who could have written the ciphertext, never how long ago. A service
+        // that serves a bundle this device has already seen superseded is serving a replay, so the
+        // revision this store knew is held against what comes back: a source that has gone
+        // backwards is a conflict, not a migration that quietly drops the writers in between.
+        let known = self.held.as_ref().map(|held| held.revision.get());
         let current = self.fetch(seed).await?;
-        if &current != bundle {
+        if &current != bundle || known.is_some_and(|known| known > current.revision.get()) {
             return Err(RecoveryError::BundleConflict {
                 expected: self.generation.unwrap_or(0),
             });
@@ -423,10 +438,6 @@ impl BundleStore {
             // same revision would pass. What was written is what has to come back.
             return Err(RecoveryError::BundleNotAuthentic);
         }
-
-        let origins = vec![destination.service_origin.clone()];
-        let updated_kit =
-            kr_crypto::kdf::RecoverySeed::to_kit(seed, origins, destination.bundle_locator.clone());
 
         *bundle = candidate;
         *self = moved;

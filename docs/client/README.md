@@ -301,7 +301,16 @@ this bundle belongs to - this origin, this locator, this recovery seed - and the
 location is read again and has to be the one the caller is holding, so a write another device made
 in between is a conflict rather than a migration that quietly moves an older writer set. A kit that
 names another seed is refused outright, because the updated kit is built from the seed and handing
-back a kit the owner's existing archives were never wrapped for would be losing them.
+back a kit the owner's existing archives were never wrapped for would be losing them. The kit the
+migration would hand back is rendered before the write as well: a destination whose locator cannot
+be printed, or whose kit is larger than a scannable code, is a bundle moved somewhere its owner
+could keep no kit for.
+
+Reading the old location again is a freshness check, not only an authentication one. Authentication
+says who could have written the ciphertext and never how long ago, so a service that serves a
+revision this device has already seen superseded is serving a replay. The revision this store knew
+is held against what comes back, and a source that has gone backwards is a conflict rather than a
+migration that drops the writers enrolled in between.
 
 What cannot be checked first is the write itself, so a migration is **not** atomic and does not
 claim to be: a destination that takes the bundle and then fails to serve it back leaves the new

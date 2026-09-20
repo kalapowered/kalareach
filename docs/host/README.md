@@ -1427,7 +1427,10 @@ left alone unless its outbox is not empty, which is what a cancellation over wor
 left this host leaves behind. That wait ends at the restart: nothing in the new process can receive
 the old one's answers, so a dispatched publication makes the outcome **unknown** and anything else
 is **cleared** with the state it settled in, rather than holding privacy-mode cleanup open for ever.
-For everything still unfinished there are four answers.
+Ending that wait is not reporting the cleanup done: a generation whose staged ciphertext is still
+here leaves a durable obligation to remove it, so a restart between the cancellation and the removal
+owes the removal rather than losing it with the entry. For everything still unfinished there are
+four answers.
 
 * A generation whose *publication* was dispatched and never answered is recorded as **unknown**,
   and that is decided first. The service may hold it and may not, and a host that wrote either

@@ -467,9 +467,9 @@ impl BackupStore {
 
     /// Records that one object's bytes reached the service.
     ///
-    /// Returns true when this acknowledgement finished the generation's upload, which is decided
-    /// by the object rows and not by how often the caller says so: an acknowledgement repeated
-    /// after the upload finished returns true again.
+    /// Returns true when the generation has no object left to arrive. That is a fact about the
+    /// object rows and not about the call, so an acknowledgement repeated after the upload
+    /// finished returns true again, whatever became of the generation afterwards.
     ///
     /// What happens in the same transaction depends on what the generation is still allowed to do.
     /// Ordinarily the publish step is enqueued, because a host that wrote the last object and then
@@ -569,16 +569,18 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
         let gen_state = GenerationState::parse(&state)?;
-        if gen_state == GenerationState::Cancelled && outstanding == 0 {
-            // A generation privacy mode cancelled while its upload was already in flight keeps
-            // that entry until the transfer ends, which is what says the cleanup is not finished.
-            // This acknowledgement is the end of it, so the entry goes and nothing is enqueued in
-            // its place. A publication that had already left stays, because its answer has not.
+        let complete = outstanding == 0;
+        if complete && gen_state.is_settled() {
+            // A settled generation takes no more transitions, and nothing is enqueued for it. What
+            // is left to do is end the wait its outbox may still hold: a generation privacy mode
+            // cancelled while its upload was in flight keeps that entry until the transfer ends,
+            // and this acknowledgement is the end of it. A publication that had already left stays,
+            // because its answer has not. A published generation and one whose outcome is unknown
+            // have empty outboxes already, so this does nothing to them.
             clear_unfinished_work(&transaction, archive_id, backup_generation)?;
             transaction.commit().map_err(ControllerError::registry)?;
             return Ok(true);
         }
-        let complete = outstanding == 0 && !gen_state.is_settled();
         if complete {
             let fenced_at: Option<i64> = transaction
                 .query_row(

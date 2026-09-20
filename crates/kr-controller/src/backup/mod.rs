@@ -608,9 +608,10 @@ impl BackupService {
 
     /// Records that one object's bytes reached the service.
     ///
-    /// Returns true when this acknowledgement finished the generation's upload. That is a fact
-    /// about the objects, not about the call: an acknowledgement repeated after the upload had
-    /// finished returns true again and changes nothing.
+    /// Returns true when the generation has no object left to arrive. That is a fact about the
+    /// objects, not about the call: an acknowledgement repeated after the upload had finished
+    /// returns true again and changes nothing, whether the generation has since been published,
+    /// cancelled or recorded with an outcome nobody knows.
     ///
     /// A finished upload ordinarily enqueues the publish step in the same transaction. A
     /// generation privacy mode cancelled, or one finishing while production is fenced, gets no
@@ -796,6 +797,18 @@ impl BackupService {
                     Some(detail),
                     now_ms,
                 )?;
+                // The entry was also the last thing counting this generation's cleanup. Removing
+                // it must not report the cleanup done over ciphertext that is still here: a crash
+                // between the cancellation and the removal leaves the staged copies on the disk,
+                // and what says so is the obligation rather than an outbox entry whose answer is
+                // never coming.
+                if store
+                    .objects(record.archive_id, record.backup_generation)?
+                    .iter()
+                    .any(|object| object.state != ObjectState::Removed)
+                {
+                    self.owe(&mut store, REMOVE_STEP.to_owned());
+                }
                 continue;
             }
             // An uncertain outcome is settled as uncertain even when the writer has since been

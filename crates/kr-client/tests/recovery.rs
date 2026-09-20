@@ -1642,3 +1642,124 @@ async fn a_migration_that_does_not_read_back_leaves_the_caller_holding_what_it_h
         .expect("the old location is intact");
     assert_eq!(still_there, before);
 }
+
+#[tokio::test]
+async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_refused() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second_writer = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let superseded = bundle.clone();
+    let replayed = service
+        .collections
+        .lock()
+        .expect("store")
+        .get(LOCATOR)
+        .expect("the bundle is there")
+        .ciphertext
+        .clone();
+
+    // A second writer is enrolled, so this device knows the bundle has moved to revision 2.
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&second_writer),
+            TimestampMs::new(1_500),
+        )
+        .await
+        .expect("the second commit lands");
+
+    // The service now serves the first revision's ciphertext again. It authenticates, because the
+    // owner wrote it; authentication says who could have written it and never how long ago.
+    service.substitute(LOCATOR, replayed);
+    let destination_service = ScriptedService::shared();
+    let mut stale = superseded;
+    let err = store
+        .migrate(
+            &seed,
+            &mut stale,
+            &kit_of(&seed, &[ORIGIN]),
+            Arc::clone(&destination_service) as Arc<_>,
+            RecoveryContext {
+                service_origin: OTHER_ORIGIN.to_owned(),
+                bundle_locator: "moved-bundle-locator".to_owned(),
+            },
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("a source that has gone backwards is a conflict");
+    assert!(matches!(err, RecoveryError::BundleConflict { .. }));
+    assert!(
+        destination_service
+            .collections
+            .lock()
+            .expect("store")
+            .is_empty(),
+        "the second writer is not dropped by a replay"
+    );
+}
+
+#[tokio::test]
+async fn migrating_to_a_destination_whose_kit_cannot_be_kept_is_refused_before_the_write() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // A locator a line-oriented document cannot hold, and one that would not fit a scannable code.
+    // A migration that wrote first would leave the bundle somewhere its owner has no kit for.
+    for locator in [
+        "moved\nbundle\tlocator".to_owned(),
+        "m".repeat(MAX_RECOVERY_KIT_BYTES),
+    ] {
+        let destination_service = ScriptedService::shared();
+        let err = store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit_of(&seed, &[ORIGIN]),
+                Arc::clone(&destination_service) as Arc<_>,
+                RecoveryContext {
+                    service_origin: OTHER_ORIGIN.to_owned(),
+                    bundle_locator: locator,
+                },
+                TimestampMs::new(2_000),
+            )
+            .await
+            .expect_err("a destination whose kit cannot be kept is refused");
+        assert!(matches!(
+            err,
+            RecoveryError::UnprintableKit { .. } | RecoveryError::KitTooLarge { .. }
+        ));
+        assert!(
+            destination_service
+                .collections
+                .lock()
+                .expect("store")
+                .is_empty(),
+            "nothing is written at the destination"
+        );
+    }
+}

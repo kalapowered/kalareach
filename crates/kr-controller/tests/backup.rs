@@ -1572,8 +1572,11 @@ fn a_restart_ends_the_wait_over_an_upload_cancelled_after_it_left_this_host() {
         .expect("a read")
         .expect("the record");
     assert_eq!(record.state, GenerationState::Cancelled);
+    // Ending the wait is not the same as finishing the cleanup. What this host still holds is a
+    // separate obligation, which `a_restart_that_ends_the_wait_still_owes_the_ciphertext_this_host_holds`
+    // follows to its end.
     let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
-    assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+    assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
 #[test]
@@ -1726,4 +1729,161 @@ fn an_object_acknowledged_before_its_staged_copy_went_still_finishes_the_upload(
         PrivacyMode::reconcile(&subsystems).is_complete(),
         "every transfer has ended, so the cleanup has too"
     );
+}
+
+#[test]
+fn a_restart_that_ends_the_wait_still_owes_the_ciphertext_this_host_holds() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let staged_paths: Vec<std::path::PathBuf>;
+    {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let admitted = service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        service
+            .note_dispatched(admitted.sequence)
+            .expect("the upload is in flight");
+        staged_paths = service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .into_iter()
+            .map(|row| row.staged_path)
+            .collect();
+
+        // Privacy mode fences and cancels, and this host stops before it removes anything.
+        let _fenced = service.fence(PrivacyGeneration::new(1));
+        service.cancel_undispatched(PrivacyGeneration::new(1));
+    }
+
+    // The restart ends the wait for an answer nothing can deliver. It does not thereby report a
+    // cleanup that did not happen: the staged ciphertext is still here, and what says so is the
+    // obligation the outbox entry was standing in for.
+    let mut service = BackupService::open(&state).expect("the service opens again");
+    let outcome = service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    assert_eq!(
+        outcome.cancelled_in_flight,
+        vec![(archive_id(), BackupGeneration::new(1))]
+    );
+    assert!(service.outbox().expect("a read").is_empty());
+    for path in &staged_paths {
+        assert!(path.exists(), "the ciphertext is still on this host");
+    }
+    assert!(!service.obligations().expect("a read").is_empty());
+    {
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        assert!(
+            !PrivacyMode::reconcile(&subsystems).is_complete(),
+            "cleanup is not complete while this host still holds the ciphertext"
+        );
+    }
+
+    // The removal it owed clears it, and only then is the cleanup complete.
+    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    assert!(removed.bytes > 0);
+    for path in &staged_paths {
+        assert!(!path.exists(), "the ciphertext left this host");
+    }
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+}
+
+#[test]
+fn an_acknowledgement_repeated_after_publication_still_says_the_upload_had_finished() {
+    let environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let admitted = environment
+        .service()
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            PrivacyGeneration::INITIAL,
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    environment
+        .service()
+        .note_dispatched(admitted.sequence)
+        .expect("the upload is in flight");
+    let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+    environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            objects[0].object_id(),
+            TimestampMs::new(6_000),
+        )
+        .expect("the member is acknowledged");
+    assert!(
+        environment
+            .service()
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                manifest_id,
+                TimestampMs::new(6_001),
+            )
+            .expect("the manifest is acknowledged")
+    );
+
+    let publication = environment.service().outbox().expect("a read");
+    environment
+        .service()
+        .note_dispatched(publication[0].sequence)
+        .expect("the publication is in flight");
+    let mode = PrivacyMode::new();
+    environment
+        .service()
+        .note_published(
+            archive_id(),
+            BackupGeneration::new(1),
+            PrivacyGeneration::INITIAL,
+            &mode,
+            TimestampMs::new(6_500),
+        )
+        .expect("the service accepted it");
+
+    // What the answer says is what the objects say, and every object had arrived. A settled
+    // generation takes no more transitions, and nothing is enqueued in its place.
+    assert!(
+        environment
+            .service()
+            .note_object_uploaded(
+                archive_id(),
+                BackupGeneration::new(1),
+                objects[0].object_id(),
+                TimestampMs::new(7_000),
+            )
+            .expect("the repeated acknowledgement is recorded")
+    );
+    assert!(environment.service().outbox().expect("a read").is_empty());
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(record.state, GenerationState::Published);
 }
