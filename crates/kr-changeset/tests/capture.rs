@@ -1887,8 +1887,8 @@ fn another_filesystem(beside: &std::path::Path) -> Option<tempfile::TempDir> {
     })
 }
 
-/// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
-/// because nothing this host can reach holds a working tree still for the whole of a read.
+/// KR-REQ-14.32: a quiescence declaration without a reservation never decides the consistency
+/// class, and the version's policy records what was actually held rather than what was asked for.
 #[test]
 fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
     let fixture = Fixture::create();
@@ -1903,7 +1903,7 @@ fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
         .capture_declaring_quiescence(workspace)
         .expect("the capture succeeds");
     assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
-    assert!(record.policy.quiescence_declared);
+    assert!(!record.policy.quiescence_declared);
     assert!(
         record
             .consistency_detail
@@ -1923,6 +1923,7 @@ fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
         .capture_declaring_quiescence(workspace)
         .expect("the capture succeeds");
     assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
+    assert!(!record.policy.quiescence_declared);
     assert!(
         record
             .consistency_detail
@@ -1930,6 +1931,223 @@ fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
         "and says so: {}",
         record.consistency_detail
     );
+}
+
+/// D-083 and KR-REQ-14.32: a capture with an active quiescence reservation produces a quiesced
+/// capture, releases the reservation after reading, and records quiescence held on the policy.
+#[test]
+fn a_capture_with_an_active_reservation_produces_a_quiesced_capture() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "res");
+    let workspace = fixture.workspace("res");
+
+    #[derive(Debug)]
+    struct ActiveRes {
+        released: std::sync::atomic::AtomicBool,
+    }
+    impl kr_changeset::capture::QuiescenceReservation for ActiveRes {
+        fn is_valid(&self) -> bool {
+            true
+        }
+        fn release(&self) -> kr_changeset::Result<()> {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let res = ActiveRes {
+        released: std::sync::atomic::AtomicBool::new(false),
+    };
+    let policy = include_everything();
+    let grant = FileGrant::default();
+    let record = fixture
+        .capture_with_reservation(workspace, &policy, &grant, None, None, Some(&res))
+        .expect("capture succeeds");
+    assert_eq!(record.consistency, SourceConsistency::QuiescedCapture);
+    assert!(record.policy.quiescence_declared);
+    assert!(
+        record
+            .consistency_detail
+            .contains("active quiescence reservation"),
+        "detail names the reservation: {}",
+        record.consistency_detail
+    );
+    assert!(
+        res.released.load(std::sync::atomic::Ordering::SeqCst),
+        "reservation was released after reading"
+    );
+}
+
+/// D-083 and KR-REQ-14.32: a capture with a refused reservation falls back to a per-file capture.
+#[test]
+fn a_capture_with_a_refused_reservation_falls_back_to_per_file_capture() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "refused");
+    let workspace = fixture.workspace("refused");
+
+    #[derive(Debug)]
+    struct RefusedRes;
+    impl kr_changeset::capture::QuiescenceReservation for RefusedRes {
+        fn take_reservation(&self) -> kr_changeset::Result<bool> {
+            Ok(false)
+        }
+        fn is_valid(&self) -> bool {
+            false
+        }
+    }
+
+    let res = RefusedRes;
+    let policy = include_everything();
+    let grant = FileGrant::default();
+    let record = fixture
+        .capture_with_reservation(workspace, &policy, &grant, None, None, Some(&res))
+        .expect("capture succeeds");
+    assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
+    assert!(!record.policy.quiescence_declared);
+    assert!(
+        record
+            .consistency_detail
+            .contains("reservation was refused"),
+        "detail names refusal: {}",
+        record.consistency_detail
+    );
+}
+
+/// D-083 and KR-REQ-14.32: a capture whose reservation expires mid-read falls back to a per-file
+/// capture with concurrent-change detection.
+#[test]
+fn a_capture_whose_reservation_expires_mid_read_falls_back_to_per_file_capture() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "expired");
+    let workspace = fixture.workspace("expired");
+
+    #[derive(Debug)]
+    struct ExpiringRes {
+        taken: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+    }
+    impl kr_changeset::capture::QuiescenceReservation for ExpiringRes {
+        fn take_reservation(&self) -> kr_changeset::Result<bool> {
+            self.taken.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+        fn is_valid(&self) -> bool {
+            false
+        }
+        fn release(&self) -> kr_changeset::Result<()> {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let res = ExpiringRes {
+        taken: std::sync::atomic::AtomicBool::new(false),
+        released: std::sync::atomic::AtomicBool::new(false),
+    };
+    let policy = include_everything();
+    let grant = FileGrant::default();
+    let record = fixture
+        .capture_with_reservation(workspace, &policy, &grant, None, None, Some(&res))
+        .expect("capture succeeds");
+    assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
+    assert!(!record.policy.quiescence_declared);
+    assert!(
+        record.consistency_detail.contains("reservation expired"),
+        "detail names expiry: {}",
+        record.consistency_detail
+    );
+    assert!(
+        res.taken.load(std::sync::atomic::Ordering::SeqCst),
+        "reservation was taken before readings"
+    );
+}
+
+/// D-083 and KR-REQ-14.32: requiring quiesced_capture when reservation is absent, refused or
+/// expired refuses the capture with InvalidArgument.
+#[test]
+fn requiring_quiesced_capture_when_reservation_is_refused_or_expired_or_absent_refuses_the_capture()
+{
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "req");
+    let workspace = fixture.workspace("req");
+    let policy = include_everything();
+    let grant = FileGrant::default();
+
+    // 1. Absent reservation
+    let err = fixture
+        .capture_with_reservation(
+            workspace,
+            &policy,
+            &grant,
+            None,
+            Some(SourceConsistency::QuiescedCapture),
+            None,
+        )
+        .expect_err("absent reservation must fail when quiesced_capture required");
+    assert!(matches!(
+        err,
+        kr_changeset::ChangeSetError::InvalidArgument(_)
+    ));
+    assert!(
+        err.to_string()
+            .contains("no quiescence reservation was provided")
+    );
+
+    // 2. Refused reservation
+    #[derive(Debug)]
+    struct RefusedRes;
+    impl kr_changeset::capture::QuiescenceReservation for RefusedRes {
+        fn take_reservation(&self) -> kr_changeset::Result<bool> {
+            Ok(false)
+        }
+        fn is_valid(&self) -> bool {
+            false
+        }
+    }
+    let err = fixture
+        .capture_with_reservation(
+            workspace,
+            &policy,
+            &grant,
+            None,
+            Some(SourceConsistency::QuiescedCapture),
+            Some(&RefusedRes),
+        )
+        .expect_err("refused reservation must fail when quiesced_capture required");
+    assert!(matches!(
+        err,
+        kr_changeset::ChangeSetError::InvalidArgument(_)
+    ));
+    assert!(err.to_string().contains("reservation was refused"));
+
+    // 3. Expired reservation
+    #[derive(Debug)]
+    struct ExpiringRes;
+    impl kr_changeset::capture::QuiescenceReservation for ExpiringRes {
+        fn take_reservation(&self) -> kr_changeset::Result<bool> {
+            Ok(true)
+        }
+        fn is_valid(&self) -> bool {
+            false
+        }
+    }
+    let err = fixture
+        .capture_with_reservation(
+            workspace,
+            &policy,
+            &grant,
+            None,
+            Some(SourceConsistency::QuiescedCapture),
+            Some(&ExpiringRes),
+        )
+        .expect_err("expired reservation must fail when quiesced_capture required");
+    assert!(matches!(
+        err,
+        kr_changeset::ChangeSetError::InvalidArgument(_)
+    ));
+    assert!(err.to_string().contains("reservation expired mid-read"));
 }
 
 /// KR-REQ-01.27: an independent clone is a workspace of its own repository, and capturing one

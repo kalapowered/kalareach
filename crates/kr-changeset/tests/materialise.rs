@@ -413,6 +413,7 @@ fn a_pin_against_the_workspace_holds_the_version() {
             grant: &kr_protocol::changeset::FileGrant::default(),
             quiescence_declared: false,
             required_consistency: None,
+            reservation: None,
         },
         pin: true,
         provenance: support::provenance(),

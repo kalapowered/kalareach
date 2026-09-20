@@ -158,6 +158,29 @@ pub struct CaptureRequest<'a> {
     pub quiescence_declared: bool,
     /// The class the caller requires, when it requires one.
     pub required_consistency: Option<SourceConsistency>,
+    /// The quiescence reservation seam, when one is provided.
+    pub reservation: Option<&'a dyn QuiescenceReservation>,
+}
+
+/// A reservation that holds a workspace still for a capture.
+///
+/// This is the seam [`crate`] exposes and the workflow service (`T-038`) owns (D-083,
+/// KR-REQ-14.32).
+pub trait QuiescenceReservation: Send + Sync + std::fmt::Debug {
+    /// Attempts to take the reservation before readings begin.
+    ///
+    /// Returns `Ok(true)` if the reservation was obtained, or `Ok(false)` if refused.
+    fn take_reservation(&self) -> Result<bool> {
+        Ok(self.is_valid())
+    }
+
+    /// Checks whether the held reservation is still valid and active.
+    fn is_valid(&self) -> bool;
+
+    /// Releases the reservation after readings finish.
+    fn release(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// What one capture established.
@@ -260,6 +283,50 @@ pub fn capture(
         };
         return snapshot(profile, repository, store, request);
     }
+    let mut reservation_held = false;
+    let mut reservation_refused = false;
+    let mut reservation_expired = false;
+    if let Some(res) = request.reservation {
+        if res.take_reservation()? {
+            reservation_held = true;
+        } else {
+            reservation_refused = true;
+            if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
+                return Err(ChangeSetError::InvalidArgument(
+                    "this capture's source was not quiesced because the reservation was refused: \
+                     the request requires a quiesced_capture"
+                        .into(),
+                ));
+            }
+        }
+    } else if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
+        return Err(ChangeSetError::InvalidArgument(
+            "this capture's source was not quiesced because no quiescence reservation was \
+             provided: the request requires a quiesced_capture"
+                .into(),
+        ));
+    }
+
+    struct ReservationGuard<'a> {
+        reservation: Option<&'a dyn QuiescenceReservation>,
+        held: bool,
+    }
+
+    impl Drop for ReservationGuard<'_> {
+        fn drop(&mut self) {
+            if self.held {
+                if let Some(res) = self.reservation {
+                    let _ = res.release();
+                }
+                self.held = false;
+            }
+        }
+    }
+
+    let mut guard = ReservationGuard {
+        reservation: request.reservation,
+        held: reservation_held,
+    };
     let nothing = BTreeSet::new();
     let request = Scope {
         request,
@@ -275,6 +342,22 @@ pub fn capture(
             request.administrative_prefix,
         )?;
         let quiet_before = quiet()?;
+        if guard.held {
+            if let Some(res) = guard.reservation {
+                if !res.is_valid() {
+                    guard.held = false;
+                    reservation_expired = true;
+                    if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
+                        return Err(ChangeSetError::InvalidArgument(
+                            "this capture's source was not quiesced because the quiescence \
+                             reservation expired mid-read: the request requires a \
+                             quiesced_capture"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
         // Where every repository nested in this tree keeps its own data, worked out from the
         // directories this reading names. It has to be done before anything is planned, because a
         // path under one of them is never content whatever else decides about it.
@@ -293,6 +376,22 @@ pub fn capture(
             }
             Err(error) => return Err(error),
         };
+        if guard.held {
+            if let Some(res) = guard.reservation {
+                if !res.is_valid() {
+                    guard.held = false;
+                    reservation_expired = true;
+                    if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
+                        return Err(ChangeSetError::InvalidArgument(
+                            "this capture's source was not quiesced because the quiescence \
+                             reservation expired mid-read: the request requires a \
+                             quiesced_capture"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
         // Everything the selection was decided from is read again. A file this host did not touch
         // changing is exactly what a per-file capture cannot exclude, and what it must not
         // describe as one instant.
@@ -313,7 +412,29 @@ pub fn capture(
             return Err(changed(&last_change));
         }
         let quiet_after = quiet()?;
-        let (consistency, consistency_detail) = classify(request, quiet_before && quiet_after);
+        if guard.held {
+            if let Some(res) = guard.reservation {
+                if !res.is_valid() {
+                    guard.held = false;
+                    reservation_expired = true;
+                    if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
+                        return Err(ChangeSetError::InvalidArgument(
+                            "this capture's source was not quiesced because the quiescence \
+                             reservation expired mid-read: the request requires a \
+                             quiesced_capture"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        let (consistency, consistency_detail) = classify(
+            request,
+            guard.held,
+            reservation_refused,
+            reservation_expired,
+            quiet_before && quiet_after,
+        );
         if let Some(required) = request.required_consistency
             && !consistency.satisfies(required)
         {
@@ -328,6 +449,12 @@ pub fn capture(
             ));
         }
         let objects = distinct_objects(&manifest);
+        if guard.held {
+            guard.held = false;
+            if let Some(res) = guard.reservation {
+                res.release()?;
+            }
+        }
         return Ok(Captured {
             manifest,
             base_revision: before.revision,
@@ -3359,17 +3486,41 @@ pub fn classify_content(bytes: &[u8]) -> ContentClass {
 
 /// Decides the consistency class from what the capture actually did.
 ///
-/// A capture that read the live working tree is a **per-file capture**, and this host produces no
-/// other class for one. [`SourceConsistency::QuiescedCapture`] needs a mechanism that holds the
-/// tree still for the whole read, and nothing this host can reach does that: the project service
-/// records which sessions and runs are bound to a workspace, but a reading of that record before
-/// and after the capture says nothing about the interval between them, and an editor outside
-/// KalaReach is outside it altogether. A declaration plus two readings would be that class in name
-/// and not in fact, which is exactly what section 14 forbids.
-///
-/// The declaration is still recorded, on the version's own policy, because a caller that quiesced
-/// its work said so and a reader should see it. What it does not do is change the class.
-fn classify(request: Scope<'_>, quiet: bool) -> (SourceConsistency, String) {
+/// A capture that read the live working tree without an active quiescence reservation is a
+/// **per-file capture**. [`SourceConsistency::QuiescedCapture`] requires a valid reservation
+/// that held the tree still for the read. A caller declaration without an active reservation
+/// records the declaration on the version's policy but does not change the class.
+fn classify(
+    request: Scope<'_>,
+    reservation_held: bool,
+    reservation_refused: bool,
+    reservation_expired: bool,
+    quiet: bool,
+) -> (SourceConsistency, String) {
+    if reservation_held {
+        return (
+            SourceConsistency::QuiescedCapture,
+            "the working tree was captured under an active quiescence reservation that held the \
+             workspace still for the read"
+                .to_owned(),
+        );
+    }
+    if reservation_expired {
+        return (
+            SourceConsistency::PerFileCapture,
+            "the quiescence reservation expired during the capture; captured as a per-file \
+             capture with concurrent-change detection"
+                .to_owned(),
+        );
+    }
+    if reservation_refused {
+        return (
+            SourceConsistency::PerFileCapture,
+            "the caller requested quiescence, but the reservation was refused; captured as a \
+             per-file capture with concurrent-change detection"
+                .to_owned(),
+        );
+    }
     let mut detail = "files were read one at a time from a live working tree; each one was the \
                       same object of the same length written at the same instant after its read \
                       as before it, and the base revision, the index and the status were \
@@ -3470,6 +3621,7 @@ mod tests {
             grant: granted,
             quiescence_declared: false,
             required_consistency: None,
+            reservation: None,
         }
     }
 
@@ -3992,8 +4144,8 @@ mod tests {
     fn this_host_produces_no_quiesced_capture_at_all() {
         // Section 14 forbids advertising a stronger source-consistency class without a real
         // mechanism, and nothing this host can reach holds a working tree still for the whole of a
-        // read. So the class is one this host never assigns, and the declaration is recorded
-        // beside the class rather than deciding it.
+        // read without an active quiescence reservation. A declaration alone is recorded beside the
+        // class rather than deciding it.
         let policy = InclusionPolicy::base_only();
         let granted = FileGrant::default();
         let declared = CaptureRequest {
@@ -4001,23 +4153,44 @@ mod tests {
             ..request(&policy, &granted)
         };
         for quiet in [true, false] {
-            let (class, detail) = classify(scope(&declared), quiet);
+            let (class, detail) = classify(scope(&declared), false, false, false, quiet);
             assert_eq!(class, SourceConsistency::PerFileCapture);
             assert!(
                 detail.contains("detection rather than one instant"),
                 "the detail says what it is: {detail}"
             );
         }
-        let (class, detail) = classify(scope(&declared), true);
+        let (class, detail) = classify(scope(&declared), false, false, false, true);
         assert!(
             detail.contains("it does not make this a quiesced capture"),
             "and says plainly that the declaration did not decide it: {detail}"
         );
         // Without the declaration the detail says nothing about one.
-        let (class_without, detail_without) = classify(scope(&request(&policy, &granted)), true);
+        let (class_without, detail_without) = classify(
+            scope(&request(&policy, &granted)),
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(class_without, SourceConsistency::PerFileCapture);
         assert!(!detail_without.contains("quiesced"));
         assert_eq!(class, SourceConsistency::PerFileCapture);
+
+        // With an active reservation held, it produces QuiescedCapture.
+        let (class_held, detail_held) = classify(scope(&declared), true, false, false, true);
+        assert_eq!(class_held, SourceConsistency::QuiescedCapture);
+        assert!(detail_held.contains("active quiescence reservation"));
+
+        // With an expired reservation, it produces PerFileCapture.
+        let (class_exp, detail_exp) = classify(scope(&declared), false, false, true, true);
+        assert_eq!(class_exp, SourceConsistency::PerFileCapture);
+        assert!(detail_exp.contains("reservation expired"));
+
+        // With a refused reservation, it produces PerFileCapture.
+        let (class_ref, detail_ref) = classify(scope(&declared), false, true, false, true);
+        assert_eq!(class_ref, SourceConsistency::PerFileCapture);
+        assert!(detail_ref.contains("reservation was refused"));
     }
 
     #[test]

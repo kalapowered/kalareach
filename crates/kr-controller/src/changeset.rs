@@ -420,6 +420,7 @@ fn capture(
             grant: &params.grant,
             quiescence_declared: params.quiescence_declared,
             required_consistency: params.required_consistency.0,
+            reservation: None,
         },
         pin: params.pin,
         provenance: Provenance {

@@ -2239,6 +2239,7 @@ fn capture_destination(
             grant: &grant,
             quiescence_declared: false,
             required_consistency: None,
+            reservation: None,
         },
         pin: false,
         provenance: Provenance {

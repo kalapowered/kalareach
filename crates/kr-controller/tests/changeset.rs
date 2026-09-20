@@ -26,7 +26,7 @@ use kr_protocol::changeset::{
     ApplyOutcomeClass, ChangesetCaptureParams, ChangesetCaptureResult, ChangesetMaterializeParams,
     ChangesetMaterializeResult, ChangesetReadParams, ChangesetReadResult, DestinationClass,
     DiffApplyParams, DiffApplyResult, DiffReadParams, DiffReadResult, FileGrant,
-    MaterialisationPurpose, PathClass,
+    MaterialisationPurpose, PathClass, SourceConsistency,
 };
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -343,6 +343,35 @@ async fn every_change_set_method_runs_end_to_end_through_the_daemon() {
     assert_eq!(
         reread.version.content_digest,
         captured.version.content_digest
+    );
+
+    // Requiring QuiescedCapture over the daemon path without a reservation returns INVALID_ARGUMENT.
+    let err = control
+        .mutate(
+            Method::ChangesetCapture,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &ChangesetCaptureParams {
+                workspace_id: workspace,
+                change_set_id: Nullable::null(),
+                label: "requiring quiesced".to_owned(),
+                policy: include_everything(),
+                grant: FileGrant::default(),
+                quiescence_declared: false,
+                required_consistency: Nullable::some(SourceConsistency::QuiescedCapture),
+                pin: true,
+                session_id: Nullable::null(),
+                workflow_run_id: Nullable::null(),
+                note: "requiring quiesced capture without reservation".to_owned(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("requiring quiesced capture without reservation must fail");
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    assert!(
+        err.message
+            .contains("no quiescence reservation was provided")
     );
 
     // A second capture is a second version, and both are visible.

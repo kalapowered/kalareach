@@ -435,10 +435,11 @@ impl ChangeSetService {
         // The number is taken from a counter that only goes up, so a number a deleted version
         // used is never handed out again and two captures never choose the same one.
         let version = self.locked()?.reserve_version(change_set_id)?;
+        let quiescence_held = captured.consistency == SourceConsistency::QuiescedCapture;
         let policy = kr_protocol::changeset::CapturePolicy {
             inclusion: *order.request.policy,
             grant: crate::grant::recorded(order.request.grant),
-            quiescence_declared: order.request.quiescence_declared,
+            quiescence_declared: quiescence_held,
             required_consistency: Nullable(order.request.required_consistency),
         };
         let mut included = policy.grant.included_paths.clone();
@@ -457,7 +458,7 @@ impl ChangeSetService {
                 policy: order.request.policy,
                 included_paths: &included,
                 excluded_paths: &excluded,
-                quiescence_declared: order.request.quiescence_declared,
+                quiescence_declared: quiescence_held,
             },
             &captured.manifest,
         );

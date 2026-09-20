@@ -222,6 +222,7 @@ impl Fixture {
                 grant: &grant,
                 quiescence_declared: true,
                 required_consistency: None,
+                reservation: None,
             },
             pin: false,
             provenance: provenance(),
@@ -242,6 +243,23 @@ impl Fixture {
         change_set_id: Option<kr_protocol::ids::ChangeSetId>,
         required: Option<SourceConsistency>,
     ) -> kr_changeset::Result<ChangeSetVersionRecord> {
+        self.capture_with_reservation(workspace_id, policy, grant, change_set_id, required, None)
+    }
+
+    /// Captures one version, including an optional quiescence reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the capture returns.
+    pub fn capture_with_reservation(
+        &self,
+        workspace_id: WorkspaceId,
+        policy: &InclusionPolicy,
+        grant: &FileGrant,
+        change_set_id: Option<kr_protocol::ids::ChangeSetId>,
+        required: Option<SourceConsistency>,
+        reservation: Option<&dyn kr_changeset::capture::QuiescenceReservation>,
+    ) -> kr_changeset::Result<ChangeSetVersionRecord> {
         let order = CaptureOrder {
             workspace_id,
             change_set_id,
@@ -251,6 +269,7 @@ impl Fixture {
                 grant,
                 quiescence_declared: false,
                 required_consistency: required,
+                reservation,
             },
             pin: false,
             provenance: provenance(),
