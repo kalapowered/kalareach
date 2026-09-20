@@ -83,6 +83,16 @@ rust {
 dependencies {
     // The decisions the receiver and the worker make, as plain Kotlin with its own tests.
     implementation(project(":krnative"))
+    // Native WebRTC. Section 15 paragraph 2 requires native WebRTC and native platform audio to own
+    // capture and playback, so the application links the library itself rather than reaching a
+    // WebView's `getUserMedia`. The constraint is strict rather than a plain version: a checksum
+    // verifies bytes, and only a strict constraint stops conflict resolution raising the version
+    // that is fetched. This artefact's PT_LOAD segments align to 16 KiB, which is what Android 15
+    // and later require.
+    implementation("io.github.webrtc-sdk:android") { version { strictly("150.7871.01") } }
+    // The device-owner ceremony an unlocked-screen confirmation needs, with the device-credential
+    // fallback for a device that has no biometric enrolled.
+    implementation("androidx.biometric:biometric:1.4.0")
     // Push, and the scheduler that runs what a message callback cannot finish in its budget.
     implementation("com.google.firebase:firebase-messaging:24.1.2")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
@@ -97,5 +107,45 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
 }
+
+/*
+ * What this build is allowed to link.
+ *
+ * A version number selects an artefact; it does not establish that the same bytes arrive next
+ * time. The media library carries native code into the packaged application, so its bytes are
+ * checked as well as its version. Gradle's own `verification-metadata.xml` is deliberately not
+ * used: once that file exists Gradle verifies every artefact in the graph and fails on any without
+ * an entry, which would make one pinned library the whole build's problem. This checks the one
+ * artefact this task pinned, and says plainly when it cannot find it.
+ */
+val voiceMediaSha256 = "0a1627b1a48c2bc17d9a40d62fc47bd45166f44a311e95917f147c402de379b0"
+
+val verifyVoiceMedia by tasks.registering {
+    description = "Checks the native media library's bytes against the digest this build pins."
+    doLast {
+        val artefact = configurations.getByName("debugRuntimeClasspath")
+            .resolvedConfiguration
+            .resolvedArtifacts
+            .firstOrNull {
+                it.moduleVersion.id.group == "io.github.webrtc-sdk" &&
+                    it.moduleVersion.id.name == "android"
+            }
+            ?: throw GradleException(
+                "the native media library io.github.webrtc-sdk:android was not resolved, so its " +
+                    "bytes could not be checked"
+            )
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(artefact.file.readBytes())
+            .joinToString("") { "%02x".format(it) }
+        if (digest != voiceMediaSha256) {
+            throw GradleException(
+                "the native media library's bytes are not the ones this build pins: expected " +
+                    "$voiceMediaSha256, found $digest"
+            )
+        }
+    }
+}
+
+tasks.named("preBuild") { dependsOn(verifyVoiceMedia) }
 
 apply(from = "tauri.build.gradle.kts")

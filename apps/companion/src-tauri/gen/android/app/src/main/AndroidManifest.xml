@@ -3,6 +3,19 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Showing a notification at all, from Android 13 on. The person still grants it. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+      Voice. The microphone is opened only for a call the person started, and the foreground
+      service below is what keeps that call running when the screen locks. Section 15 paragraph 21
+      is precise that this preserves an explicitly started call and does not authorise unattended
+      microphone activation.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Reading whether a phone call is in progress, so an interruption is an explicit state. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
     <!-- Camera and photo input, which the WebView's own file chooser opens. -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
@@ -39,6 +52,17 @@
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
         </service>
+
+        <!--
+          The call itself. A microphone foreground service is what Android requires before capture
+          continues with the screen locked, and its notification is what makes the call visible:
+          section 15 paragraph 22 wants user-visible native playback, mute and stop to stay
+          available, and the notification carries them.
+        -->
+        <service
+            android:name="to.kala.reach.companion.voice.VoiceCallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
         <provider
           android:name="androidx.core.content.FileProvider"

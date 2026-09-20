@@ -4,6 +4,15 @@ options:
   deploymentTarget:
     iOS: 14.0
 fileGroups: [../../src]
+# Native WebRTC, as a prebuilt binary framework. Section 15 paragraph 2 requires native WebRTC and
+# native platform audio to own capture and playback, so the application links the framework itself
+# rather than reaching a WebView's `getUserMedia`. It is pinned by revision rather than by tag:
+# a tag can be moved upstream and a revision cannot, and that revision's own manifest fixes the
+# binary's address and its SHA-256.
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    revision: 4266157cd08f92115de885ab12d87196a8db87e1
 configs:
   debug: debug
   release: release
@@ -72,6 +81,11 @@ targets:
       - path: ../../../native/ios/Tests
       - path: ../../../native/ios/Shared
       - path: ../../../native/ios/KalaReachNative
+    # The test target compiles `KalaReachNative`, which imports WebRTC for the call and the audio
+    # session, so it links the same product the application does.
+    dependencies:
+      - package: WebRTC
+        product: WebRTC
     settings:
       base:
         PRODUCT_NAME: KalaReachNativeTests
@@ -128,7 +142,8 @@ targets:
         NSPhotoLibraryUsageDescription:
           Choose a photo or a video to attach it to a session on one of your hosts.
         NSMicrophoneUsageDescription:
-          Speak to a session on one of your hosts.
+          Speak to a session on one of your hosts. The microphone is open only during a call you
+          started, and keeps running if the screen locks during that call.
         # The keychain group the extension shares with this application, with the team prefix the
         # build resolves. Swift does not expand build variables inside a string literal, so the
         # one place the expanded value exists is the description the build writes.
@@ -139,6 +154,12 @@ targets:
         KRPrivateKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion
         UIBackgroundModes:
           - remote-notification
+          # An explicitly started voice call keeps running when the screen locks. Section 15
+          # paragraph 21 is precise about what this is and is not: it preserves a call the person
+          # started, and it does not authorise unattended microphone activation. The audio session
+          # is opened on one path, for a call, and WebRTC is held in manual audio mode so nothing
+          # else can open the microphone.
+          - audio
     # Remote notifications, and the two keychain groups this application writes to. The shared
     # group holds one limited key that the notification extension reads; the application's own
     # group holds everything the extension must never see.
@@ -171,6 +192,10 @@ targets:
       - framework: libapp.a
         embed: false
       - target: KalaReachNotificationService
+      # Declaring the package is not enough: the product is what the target links, and the
+      # framework is embedded and re-signed by this build because the downloaded one is unsigned.
+      - package: WebRTC
+        product: WebRTC
       - sdk: AVFoundation.framework
       - sdk: UserNotifications.framework
       # The shared client reads this device's own network interfaces to decide how it can reach a
