@@ -853,9 +853,13 @@ pub struct AgentResourceEvent {
 /// the broker is still arbitrating at that position.
 ///
 /// The two fit together at exactly one place. Everything this describes happened at or before
-/// `cursor`; every event delivered after this snapshot was taken carries a higher position. So a
-/// view installs the resources here, then applies the events whose `sequence` is above `cursor`
-/// and ignores the rest, and has the whole stream with nothing counted twice.
+/// `cursor`, and every transition committed after this snapshot was taken carries a higher
+/// position. What arrives afterwards is not ordered by that, though: an event committed earlier
+/// can still be in flight and reach the view after this does. So a view installs the resources
+/// here and then, within the same `stream_generation`, applies the events whose `sequence` is
+/// above `cursor` and discards the rest. That gives it the whole stream with nothing counted
+/// twice. An event of another generation belongs to another run of the host and is not comparable
+/// with this position at all: the view installs a fresh snapshot for it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResourceSnapshot {

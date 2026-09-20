@@ -529,6 +529,11 @@ impl OutputHub {
     }
 
     /// Tells one subscriber to resynchronise for a reason other than its queue.
+    ///
+    /// A subscriber that has already been told is not told again. The instruction is to discard
+    /// everything and install a fresh state, so a second marker asks for nothing the first did
+    /// not; and these markers cost the queue nothing, so repeating them is the one thing that
+    /// could grow a bounded queue without bound.
     pub fn require_resync(
         &mut self,
         attachment_id: AttachmentId,
@@ -537,21 +542,11 @@ impl OutputHub {
         oldest_retained_cursor: u64,
     ) {
         if let Some(subscriber) = self.subscribers.get_mut(&attachment_id) {
-            // The same accounting rule as an overflow. Bytes already queued still belong to the
-            // subscriber and it releases them as it reads; zeroing the counter here would make
-            // every one of those releases subtract from nothing.
-            subscriber.resynchronising = true;
-            let _ = subscriber
-                .sender
-                .send(OutputDelivery::Resync(ResyncRequired {
-                    reason,
-                    cursor: U64::new(cursor),
-                    oldest_retained_cursor: U64::new(oldest_retained_cursor),
-                }));
+            Self::mark_resynchronising(subscriber, reason, cursor, oldest_retained_cursor);
         }
     }
 
-    /// Tells every subscriber to resynchronise.
+    /// Tells every subscriber that has not already been told to resynchronise.
     pub fn require_resync_all(
         &mut self,
         reason: ResyncReason,
@@ -559,15 +554,31 @@ impl OutputHub {
         oldest_retained_cursor: u64,
     ) {
         for subscriber in self.subscribers.values_mut() {
-            subscriber.resynchronising = true;
-            let _ = subscriber
-                .sender
-                .send(OutputDelivery::Resync(ResyncRequired {
-                    reason,
-                    cursor: U64::new(cursor),
-                    oldest_retained_cursor: U64::new(oldest_retained_cursor),
-                }));
+            Self::mark_resynchronising(subscriber, reason, cursor, oldest_retained_cursor);
         }
+    }
+
+    /// Marks one subscriber as owing a fresh state, and queues the one marker that says so.
+    fn mark_resynchronising(
+        subscriber: &mut Subscriber,
+        reason: ResyncReason,
+        cursor: u64,
+        oldest_retained_cursor: u64,
+    ) {
+        if subscriber.resynchronising {
+            return;
+        }
+        // The same accounting rule as an overflow. Bytes already queued still belong to the
+        // subscriber and it releases them as it reads; zeroing the counter here would make every
+        // one of those releases subtract from nothing.
+        subscriber.resynchronising = true;
+        let _ = subscriber
+            .sender
+            .send(OutputDelivery::Resync(ResyncRequired {
+                reason,
+                cursor: U64::new(cursor),
+                oldest_retained_cursor: U64::new(oldest_retained_cursor),
+            }));
     }
 }
 
@@ -689,6 +700,44 @@ mod tests {
             sequence: U64::new(1),
             event_id: Uuid::from_bytes([4; 16]),
             parent_sequence: kr_protocol::scalars::Nullable(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_already_owes_a_fresh_state_is_not_told_again() {
+        let mut hub = OutputHub::new();
+        let mut view = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+
+        // Several recoveries in a row, each of which would otherwise queue its own marker. The
+        // markers cost the queue nothing, so repeating them is the one way a bounded queue could
+        // grow without bound.
+        for _ in 0..32 {
+            hub.require_resync_all(ResyncReason::SendQueueFull, 4, 0);
+            hub.require_resync(identifier(1), ResyncReason::HistoryEvicted, 4, 0);
+        }
+        assert!(hub.is_resynchronising(identifier(1)));
+
+        match view.recv().await.expect("the one marker") {
+            OutputDelivery::Resync(marker) => {
+                assert_eq!(marker.reason, ResyncReason::SendQueueFull)
+            }
+            other => panic!("an unexpected delivery: {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), view.recv())
+                .await
+                .is_err(),
+            "one instruction to install a fresh state is the whole of what there is to say"
+        );
+
+        // Resubscribing is the client saying it has done so, and the next one is told again.
+        let mut fresh = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        hub.require_resync_all(ResyncReason::AgentStreamGap, 8, 0);
+        match fresh.recv().await.expect("a marker after the fresh state") {
+            OutputDelivery::Resync(marker) => {
+                assert_eq!(marker.reason, ResyncReason::AgentStreamGap);
+            }
+            other => panic!("an unexpected delivery: {other:?}"),
         }
     }
 
