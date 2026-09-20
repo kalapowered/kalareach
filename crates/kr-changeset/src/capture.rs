@@ -1277,20 +1277,35 @@ fn nested_repositories<'a>(
             return Err(unplaceable(directory));
         }
         refused.insert(identity_of(data));
-        administrative_descendants(data, &mut refused, &mut inspected, &mut budget, 0)?;
+        // Its own mount, before anything inside it is looked at: a nested repository's data is
+        // read under the same rule as this repository's, so a mount **inside** it is refused
+        // wherever the data itself happens to be.
+        let data = clone_of(data)?
+            .confined_to_one_mount()
+            .map_err(|_| unplaceable(directory))?;
+        administrative_descendants(&data, &mut refused, &mut inspected, &mut budget, 0)?;
         let common = RelativeName::parse("commondir")?;
         match data.probe(&common) {
             // It keeps everything in one place.
             Err(kr_transfer::Escape::NotFound { .. }) => {}
             Ok(_) => {
                 let from = clone_stack(&stack)?;
-                if let Some(elsewhere) = resolve_target(from, directory, data, &common, tree)? {
+                if let Some(elsewhere) = resolve_target(from, directory, &data, &common, tree)? {
                     let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
                     if elsewhere.len() == 1 {
                         return Err(unplaceable(directory));
                     }
                     refused.insert(identity_of(last));
-                    administrative_descendants(last, &mut refused, &mut inspected, &mut budget, 0)?;
+                    let last = clone_of(last)?
+                        .confined_to_one_mount()
+                        .map_err(|_| unplaceable(directory))?;
+                    administrative_descendants(
+                        &last,
+                        &mut refused,
+                        &mut inspected,
+                        &mut budget,
+                        0,
+                    )?;
                 }
             }
             Err(_) => return Err(unplaceable(directory)),
@@ -1672,14 +1687,21 @@ fn clone_stack(stack: &[AuthorisedDirectory]) -> Result<Vec<AuthorisedDirectory>
 /// directory the file is in, and takes the file's own components one at a time: `.` is nothing,
 /// `..` steps back to the directory the descent actually came from, and every other component is
 /// **asked about first** and has to be a directory. A link anywhere along the way ends it, because
-/// a `..` after a link means something this descent cannot reproduce; so does a step above this
-/// working tree, and so does an absolute name, which names a place outside what this handle
-/// reaches. Each of those refuses the whole capture.
+/// a `..` after a link means something this descent cannot reproduce, and so does a `..` inside a
+/// name given in full, which is arithmetic on a name this walk did not take. Each of those refuses
+/// the whole capture.
+///
+/// A name that climbs above where the walk started is followed the same way: each `..` gives back
+/// a handle the walk already holds, and at the bottom the directory the last handle is **in** is
+/// opened from that handle rather than resolved from outside. A name given in full climbs to the
+/// root of its filesystem that way and comes back down its own components. Both climbs are
+/// bounded, because the directory a handle is in is not something this host can hold still.
 ///
 /// What comes back is the whole descent, so a file **beside** what it found is resolved from there
 /// rather than from where this one started. A descent that arrives at this working tree continues
 /// through the tree's own handle from that step on, so a name that walks out of the tree and back
-/// into it is still read as the tree's own.
+/// into it is still read as the tree's own; outside the tree there is no mount to compare with and
+/// none is claimed.
 fn resolve_target(
     from: Vec<AuthorisedDirectory>,
     directory: &str,
@@ -1696,13 +1718,31 @@ fn resolve_target(
         // down the name from there. Nothing is opened from outside, so the one way into this tree
         // is the same descent every other name takes.
         let base = stack.first().ok_or_else(|| unplaceable(directory))?;
-        let mut root = clone_of(base)?;
+        // Outside this tree there is no mount to hold a walk to, so the climb is made with plain
+        // handles; what the mount is used for here is knowing when the climb has ended.
+        let mut root = plain_clone(base)?;
+        let mut below = mount_reading(&root)?;
+        let mut climbed = 0;
         loop {
+            // Bounded, because the directory a handle is in is not something this host can hold
+            // still: an account that can rename two directories above this one can hand the climb
+            // a new parent for as long as it likes, and a walk with no end is a walk this host
+            // refuses rather than one it keeps taking.
+            climbed += 1;
+            if climbed > MAX_WALK_DEPTH {
+                return Err(unplaceable(directory));
+            }
             let above = root.parent().map_err(|_| unplaceable(directory))?;
-            if identity_of(&above) == identity_of(&root) {
+            let above_mount = mount_reading(&above)?;
+            // The root of a filesystem is the one directory that **is** what it is in, on the
+            // mount it is on. The object alone would not do: a directory mounted over itself has
+            // the identity of what it came from, and a climb that stopped there would come back
+            // down a name that means something else.
+            if identity_of(&above) == identity_of(&root) && above_mount == below {
                 break;
             }
             root = above;
+            below = above_mount;
         }
         stack = vec![root];
         let mut steps = Vec::new();
@@ -1778,6 +1818,24 @@ fn resolve_target(
 /// them.
 fn confined_tree(repository: &OpenedRepository) -> Result<AuthorisedDirectory> {
     Ok(clone_of(repository.work_tree())?.confined_to_one_mount()?)
+}
+
+/// Returns a second authority over the same open directory, with **no** rule on it.
+fn plain_clone(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
+    let handle = directory
+        .handle()
+        .try_clone()
+        .map_err(ChangeSetError::storage)?;
+    Ok(AuthorisedDirectory::from_handle(
+        directory.environment_id(),
+        handle,
+        directory.display_path().to_path_buf(),
+    )?)
+}
+
+/// Returns which mount one open directory is on, whatever rule it carries.
+fn mount_reading(directory: &AuthorisedDirectory) -> Result<Option<kr_transfer::MountId>> {
+    Ok(plain_clone(directory)?.confined_to_one_mount()?.mount())
 }
 
 /// Returns a second authority over the same open directory, with the same rule on it.
