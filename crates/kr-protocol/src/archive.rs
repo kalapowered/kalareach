@@ -245,6 +245,24 @@ pub struct SignedArchiveManifest {
     pub signature: Signature64,
 }
 
+/// What the encrypted manifest object carries: the signed manifest and every member key wrap.
+///
+/// Section 20 keeps object identifiers, filenames and encrypted-object hashes inside the encrypted
+/// manifest, and a member key wrap names all three. So the member wraps travel here rather than in
+/// the public descriptor, which carries only the opaque archive identifier, the encrypted-manifest
+/// reference and the manifest-key wraps.
+///
+/// One manifest object serves every recipient. Each wrap is addressed to one of them and opens for
+/// that one alone, exactly as the descriptor's manifest-key wraps do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestPayload {
+    /// The signed manifest.
+    pub manifest: SignedArchiveManifest,
+    /// Each member object's key, wrapped once per authorised recipient.
+    pub member_key_wraps: Vec<SealedKeyWrap>,
+}
+
 /// The public descriptor of one archive.
 ///
 /// Everything outside it is opaque: the archive identity and encrypted-object references. The

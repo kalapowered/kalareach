@@ -47,6 +47,7 @@
 //! | [`connect`] | The `kr-connect/1` mutual proof |
 //! | [`envelope`] | Mailbox envelopes |
 //! | [`archive`] | Backup objects, key wraps, signed manifests and recovery bundles |
+//! | [`backup`] | The backup producer: staging, resume, sealing one generation and opening it |
 //!
 //! # Example
 //!
@@ -95,6 +96,7 @@
 
 pub mod aead;
 pub mod archive;
+pub mod backup;
 pub mod connect;
 pub mod envelope;
 mod error;
