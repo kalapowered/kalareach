@@ -452,3 +452,42 @@ fn a_result_from_a_different_profile_is_refused_at_the_same_revision() {
         Err(Rejection::StaleProfileRevision { .. })
     ));
 }
+
+/// KR-REQ-22.19: a generated field carrying a bidirectional control is refused, not tidied.
+///
+/// The deterministic path removes these, because the text came from a directory name nobody chose
+/// to be shown. A generated field is different: the grammar excludes them, so one that arrives is
+/// evidence the grammar did not hold, and section 22 says reject.
+#[test]
+fn a_generated_field_with_a_bidirectional_control_is_refused() {
+    for control in ["\\u061c", "\\u202e", "\\u2066", "\\u2028"] {
+        let body = format!(
+            "{{\"title\":\"a{control}b\",\"activity_text\":\"Builds\",\
+             \"source_cursor\":{{\"from\":3,\"to\":11}},\"context_revision\":2}}"
+        );
+        assert_eq!(
+            validate(body.as_bytes(), &produced_under(), &expectation(2)),
+            Err(Rejection::ControlCharacter { field: "title" }),
+            "{control} was not refused"
+        );
+    }
+    // And an ordinary Arabic letter, which is not a control, is carried.
+    let arabic = "{\"title\":\"مرحبا\",\"activity_text\":\"Builds\",\
+         \"source_cursor\":{\"from\":3,\"to\":11},\"context_revision\":2}";
+    assert!(validate(arabic.as_bytes(), &produced_under(), &expectation(2)).is_ok());
+}
+
+/// KR-REQ-22.17: a closed session whose cleanup failed keeps its fence and its debt.
+#[test]
+fn a_closed_session_keeps_a_cleanup_it_could_not_finish() {
+    let debt = kr_describe::privacy::CleanupDebt::new();
+    debt.owe(
+        kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+        "the store would not answer".to_owned(),
+    );
+    assert!(!debt.is_empty());
+    debt.settle(&kr_protocol::ids::SessionId::new(
+        kr_protocol::scalars::Uuid::from_bytes([1; 16]),
+    ));
+    assert!(debt.is_empty());
+}

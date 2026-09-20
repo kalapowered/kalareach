@@ -321,7 +321,10 @@ fn check_field(
     value: &str,
     limit: usize,
 ) -> std::result::Result<(), Rejection> {
-    if value.chars().any(char::is_control) {
+    // The same set the deterministic path removes, refused here instead of removed. Section 22
+    // says *reject*, and a title with a right-to-left override in it is evidence that the grammar
+    // did not hold rather than something to tidy up.
+    if value.chars().any(crate::metadata::is_forbidden_in_a_label) {
         return Err(Rejection::ControlCharacter { field });
     }
     let codepoints = value.chars().count();

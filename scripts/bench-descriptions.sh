@@ -107,17 +107,19 @@ cut -f1,4 "$manifest"
 echo "=== KR-PERF-009 ==="
 # Four processors, which is section 22's default, enforced by the operating system as well as by
 # the profile. A run that used every core would measure a machine this product never promises.
-pin=()
+# One command array, never an empty one: an empty array under `set -u` is an unbound variable on
+# the bash macOS ships, whatever it is expanded beside.
+run_command=("$binary" --run "${profile_args[@]}" --cache "$cache")
 if command -v taskset >/dev/null 2>&1; then
-  pin=(taskset -c "0-$((threads - 1))")
-  echo "pinned with: ${pin[*]}"
+  run_command=(taskset -c "0-$((threads - 1))" "${run_command[@]}")
+  echo "pinned with: taskset -c 0-$((threads - 1))"
 else
   echo "no taskset on this platform: the four-thread bound is the profile's own"
 fi
 
 cd "$run_dir"
 set +e
-"${pin[@]}" "$binary" --run "${profile_args[@]}" --cache "$cache"
+"${run_command[@]}"
 status=$?
 set -e
 cd "$root"

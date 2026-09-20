@@ -120,10 +120,13 @@ state is `resource_paused`, the reason is named, and the deterministic titles ar
 The 4 GiB process ceiling is checked against the process rather than against the profile's estimate:
 a run that has grown past it unloads and reports `resource_paused`.
 
-Inference asks for zero GPU layers, and that is what makes it CPU-only: no layer is offloaded to
-any backend. On Apple silicon the pinned binding compiles the Metal backend in whether or not it is
-wanted, because its manifest enables that feature for the target rather than behind an option, so
-the guarantee is the zero layers rather than the absence of the backend from the binary.
+CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
+processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
+scheduler would otherwise send a large enough matrix multiply to a registered backend even when its
+weights are in host memory. Both are needed on Apple silicon, where the pinned binding compiles the
+Metal backend in whether or not it is wanted: its manifest enables that feature for the target
+rather than behind an option, so what makes this build CPU-only is the two settings rather than the
+absence of the backend from the binary.
 
 Inference runs at the background scheduling class each platform offers — `SCHED_BATCH` on Linux,
 the lowest ordinary thread priority elsewhere — and the report says which mechanism was applied. No
@@ -217,8 +220,8 @@ copy elsewhere for privacy mode to offer a separate deletion of.
 The model stays mapped while there is work and sessions to justify it, and a host with no sessions
 at all unloads after fifteen minutes.
 
-Missing weights, a cancellation and a load or inference failure the runtime reports all do the same
-thing: they release the model and nothing else. The store, the pins, the provenance, every session
+A load or inference failure the runtime reports releases the model and nothing else; a cancellation
+and a passed deadline release nothing and simply publish nothing. The store, the pins, the provenance, every session
 and every deterministic title survive untouched, and the next tick maps the model again. The job
 that was running is not retried; the session's next meaningful change queues another.
 

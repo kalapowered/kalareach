@@ -248,6 +248,22 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         factory,
     );
 
+    // The service selects for itself, from the catalogue and the gates this host has met. A
+    // benchmark that loaded one profile and handed it to a service that selected another would be
+    // attributing every figure below to the wrong model, so it refuses instead.
+    let selected = service
+        .selection()
+        .profile()
+        .map(|selected| selected.profile_id().to_owned());
+    if selected.as_deref() != Some(profile.profile_id()) {
+        return Err(format!(
+            "this host selects {} and {} was asked for; a profile is measured only where it is the \
+             one the host would run",
+            selected.as_deref().unwrap_or("no profile"),
+            profile.profile_id()
+        ));
+    }
+
     let conditions = platform::read_conditions();
     let mut ledger = LatencyLedger::new();
     let mut published = BTreeMap::new();
