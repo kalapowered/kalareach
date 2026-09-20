@@ -232,6 +232,7 @@ pub const PERMITTED_SUBCOMMANDS: &[&str] = &[
     "show-ref",
     "status",
     "symbolic-ref",
+    "update-ref",
     "worktree",
 ];
 
@@ -332,6 +333,64 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
                     "{} names a template directory whose hooks would be copied into the new \
                  repository",
                     redact(&text)
+                )
+                .into(),
+            ));
+        }
+    }
+    if subcommand.as_ref() == "update-ref" {
+        let mut positional_count = 0;
+        for argument in &arguments[1..] {
+            let text = argument.to_string_lossy();
+            let head = text.split_once('=').map_or(text.as_ref(), |(head, _)| head);
+            if text == "--no-deref" {
+                continue;
+            }
+            if text == "-d"
+                || (head.starts_with("--")
+                    && head.len() > 2
+                    && ("--delete".starts_with(head) || head.starts_with("--delete")))
+            {
+                return Err(ProjectError::InvalidArgument(
+                    format!(
+                        "{} deletes a reference; git update-ref requires an expected old value",
+                        redact(&text)
+                    )
+                    .into(),
+                ));
+            }
+            if head.starts_with("--")
+                && head.len() > 2
+                && ("--stdin".starts_with(head) || head.starts_with("--stdin"))
+            {
+                return Err(ProjectError::InvalidArgument(
+                    format!(
+                        "{} reads updates from standard input; this service updates one reference with its expected old value",
+                        redact(&text)
+                    )
+                    .into(),
+                ));
+            }
+            if text.starts_with('-') {
+                return Err(ProjectError::InvalidArgument(
+                    format!(
+                        "{} is not an argument this service passes for git update-ref",
+                        redact(&text)
+                    )
+                    .into(),
+                ));
+            }
+            positional_count += 1;
+        }
+        if positional_count < 3 {
+            return Err(ProjectError::InvalidArgument(
+                "git update-ref requires an expected old value: reference, new-oid, old-oid".into(),
+            ));
+        }
+        if positional_count > 3 {
+            return Err(ProjectError::InvalidArgument(
+                format!(
+                    "git update-ref takes exactly 3 positional arguments (reference, new-oid, old-oid), but {positional_count} were provided"
                 )
                 .into(),
             ));

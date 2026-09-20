@@ -393,14 +393,13 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
 
 /// KR-REQ-23.42 and KR-REQ-23.43: what a device is refused while its destination is unauthorised.
 ///
+/// A device with an unbounded grant is refused the five mutations whose destination it cannot authorise.
+///
 /// Section 14 asks for an authorised destination handle and section 23 for a destination policy
-/// and for source and destination grants. The project service resolves the absolute parent
-/// directory a request names with this host's own authority and bounds a working copy's source by
-/// nothing but the environment, so a device holding `project.create` would reach every directory
-/// this host can open. Until that authority exists these five are refused to a device, by name,
-/// and the owner's own path is untouched.
+/// and for source and destination grants. An unbounded grant (`EnvironmentSelector::Any`) cannot
+/// authorise a host-local path, so these five are refused by name with PermissionDenied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authorise() {
+async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_cannot_authorise() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut control = host.client().await;
@@ -439,7 +438,7 @@ async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authori
         .0
         .expect("a creation returns the workspace");
 
-    for (method, params) in [
+    for (method, params, expected_resource) in [
         (
             Method::ProjectInit,
             ParamsValue::from_typed(&ProjectInitParams {
@@ -448,6 +447,7 @@ async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authori
                 initial_branch: Nullable::null(),
             })
             .expect("encodes"),
+            "the directory it creates a repository in",
         ),
         (
             Method::ProjectClone,
@@ -463,6 +463,7 @@ async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authori
                 },
             })
             .expect("encodes"),
+            "the directory it creates a repository in",
         ),
         (
             Method::ProjectAdopt,
@@ -472,10 +473,12 @@ async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authori
                 flow: AdoptionFlow::ExistingCheckout,
             })
             .expect("encodes"),
+            "the directory it creates a repository in",
         ),
         (
             Method::WorkspaceCreate,
             ParamsValue::from_typed(&workspace_params(&host, project, "never")).expect("encodes"),
+            "the repository it takes a working copy from",
         ),
         (
             Method::WorkspaceRemove,
@@ -484,6 +487,7 @@ async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authori
                 retention: RetentionPolicy::RemoveRetained,
             })
             .expect("encodes"),
+            "the working copy it removes",
         ),
     ] {
         let refused = remote_mutation(&session, host.environment_id, method, &params)
@@ -492,14 +496,14 @@ async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authori
         assert_eq!(
             refused.code(),
             ErrorCode::PermissionDenied,
-            "{} is refused to a device",
+            "{} is refused to an unbounded device",
             method.as_str()
         );
+        let message = refused.to_string();
         assert!(
-            refused.to_string().contains(method.as_str())
-                && refused
-                    .to_string()
-                    .contains("does not yet establish a paired device's authority"),
+            message.contains(method.as_str())
+                && message.contains(expected_resource)
+                && message.contains("unbounded grant cannot authorise a host-local path"),
             "the refusal names the method and why: {refused}"
         );
     }
@@ -554,6 +558,328 @@ async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authori
         .await
         .expect("project.list is served to the device");
     assert_eq!(listed.projects.len(), 2);
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42 and KR-REQ-23.43: A device with a bounded grant can perform the five project mutations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_with_bounded_grant_can_perform_the_five_project_mutations() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let mut proposal = net_support::proposal(PROJECT_RIGHTS);
+    proposal.environment_selector = kr_protocol::grant::EnvironmentSelector::These {
+        environment_ids: [host.environment_id].into_iter().collect(),
+    };
+    let record = net_support::pair_with(&host, &device, &owner, proposal).await;
+    let session = net_support::connect(&host, &device, &record).await;
+    let source = repository(host.work(), "source");
+
+    // 1. project.adopt
+    let adopted: ProjectAdoptResult = typed(
+        &remote_mutation(
+            &session,
+            host.environment_id,
+            Method::ProjectAdopt,
+            &ParamsValue::from_typed(&ProjectAdoptParams {
+                destination: destination(&host, "source"),
+                label: "source".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            })
+            .expect("encodes"),
+        )
+        .await
+        .expect("project.adopt succeeds for bounded device"),
+    );
+    let project = adopted.project.project_repository_id;
+
+    // 2. project.init
+    let initialised: ProjectInitResult = typed(
+        &remote_mutation(
+            &session,
+            host.environment_id,
+            Method::ProjectInit,
+            &ParamsValue::from_typed(&ProjectInitParams {
+                destination: destination(&host, "fresh"),
+                label: "fresh".to_owned(),
+                initial_branch: Nullable::some("main".to_owned()),
+            })
+            .expect("encodes"),
+        )
+        .await
+        .expect("project.init succeeds for bounded device"),
+    );
+    assert_eq!(initialised.operation.state, OperationState::Completed);
+
+    // 3. project.clone
+    let cloned: ProjectCloneResult = typed(
+        &remote_mutation(
+            &session,
+            host.environment_id,
+            Method::ProjectClone,
+            &ParamsValue::from_typed(&ProjectCloneParams {
+                destination: destination(&host, "cloned"),
+                label: "cloned".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            })
+            .expect("encodes"),
+        )
+        .await
+        .expect("project.clone succeeds for bounded device"),
+    );
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+
+    // 4. workspace.create
+    let created: WorkspaceCreateResult = typed(
+        &remote_mutation(
+            &session,
+            host.environment_id,
+            Method::WorkspaceCreate,
+            &ParamsValue::from_typed(&workspace_params(&host, project, "review")).expect("encodes"),
+        )
+        .await
+        .expect("workspace.create succeeds for bounded device"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace");
+
+    // 5. workspace.remove
+    let removed: WorkspaceRemoveResult = typed(
+        &remote_mutation(
+            &session,
+            host.environment_id,
+            Method::WorkspaceRemove,
+            &ParamsValue::from_typed(&WorkspaceRemoveParams {
+                workspace_id: workspace.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            })
+            .expect("encodes"),
+        )
+        .await
+        .expect("workspace.remove succeeds for bounded device"),
+    );
+    assert!(removed.working_files_removed);
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42 and KR-REQ-23.43: A device with a grant for another environment or session sees narrowed lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let _source = repository(host.work(), "source");
+
+    let adopted: ProjectAdoptResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::ProjectAdopt,
+            &ProjectAdoptParams {
+                destination: destination(&host, "source"),
+                label: "source".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+        )
+        .await
+        .expect("project.adopt succeeds"),
+    );
+    let project = adopted.project.project_repository_id;
+
+    let created: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::WorkspaceCreate,
+            &workspace_params(&host, project, "review"),
+        )
+        .await
+        .expect("workspace.create succeeds"),
+    );
+    let workspace = created.workspace.0.expect("workspace");
+
+    let admitted_session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+    host.controller()
+        .project()
+        .service()
+        .bind_session(workspace.workspace_id, admitted_session, true)
+        .expect("binds session");
+
+    // Grant bounded to a different environment and a different session
+    let other_env = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([99; 16]));
+    let other_session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([98; 16]));
+    let device = net_support::Device::create().await;
+    let mut proposal = net_support::proposal(PROJECT_RIGHTS);
+    proposal.environment_selector = kr_protocol::grant::EnvironmentSelector::These {
+        environment_ids: [other_env].into_iter().collect(),
+    };
+    proposal.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [other_session].into_iter().collect(),
+    };
+    let record = net_support::pair_with(&host, &device, &owner, proposal).await;
+    let session = net_support::connect(&host, &device, &record).await;
+
+    // The device asking for an unadmitted environment is refused PermissionDenied
+    let refused_plist = session
+        .read::<_, ProjectListResult>(
+            Method::ProjectList,
+            &ProjectListParams {
+                environment_id: host.environment_id,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_plist.code(), ErrorCode::PermissionDenied);
+    assert!(refused_plist.to_string().contains("does not cover this environment"));
+
+    let refused_wlist = session
+        .read::<_, WorkspaceListResult>(
+            Method::WorkspaceList,
+            &WorkspaceListParams {
+                environment_id: host.environment_id,
+                project_repository_id: Nullable::null(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_wlist.code(), ErrorCode::PermissionDenied);
+    assert!(refused_wlist.to_string().contains("does not cover this environment"));
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42 and KR-REQ-23.43: A device with an admitted environment but unadmitted session sees the workspace but narrowed bound sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_with_admitted_environment_and_unadmitted_session_sees_narrowed_bound_sessions() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let _source = repository(host.work(), "source");
+
+    let adopted: ProjectAdoptResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::ProjectAdopt,
+            &ProjectAdoptParams {
+                destination: destination(&host, "source"),
+                label: "source".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+        )
+        .await
+        .expect("project.adopt succeeds"),
+    );
+    let project = adopted.project.project_repository_id;
+
+    let created: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::WorkspaceCreate,
+            &workspace_params(&host, project, "review"),
+        )
+        .await
+        .expect("workspace.create succeeds"),
+    );
+    let workspace = created.workspace.0.expect("workspace");
+
+    let bound_session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+    host.controller()
+        .project()
+        .service()
+        .bind_session(workspace.workspace_id, bound_session, true)
+        .expect("binds session");
+
+    // Grant admitting host.environment_id but a different session
+    let other_session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([98; 16]));
+    let device = net_support::Device::create().await;
+    let mut proposal = net_support::proposal(PROJECT_RIGHTS);
+    proposal.environment_selector = kr_protocol::grant::EnvironmentSelector::These {
+        environment_ids: [host.environment_id].into_iter().collect(),
+    };
+    proposal.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [other_session].into_iter().collect(),
+    };
+    let record = net_support::pair_with(&host, &device, &owner, proposal).await;
+    let session = net_support::connect(&host, &device, &record).await;
+
+    let list: ProjectListResult = session
+        .read(
+            Method::ProjectList,
+            &ProjectListParams {
+                environment_id: host.environment_id,
+            },
+        )
+        .await
+        .expect("reads");
+    assert_eq!(list.projects.len(), 1);
+
+    let ws_list: WorkspaceListResult = session
+        .read(
+            Method::WorkspaceList,
+            &WorkspaceListParams {
+                environment_id: host.environment_id,
+                project_repository_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reads");
+    assert_eq!(ws_list.workspaces.len(), 1);
+    assert!(
+        ws_list.workspaces[0].bound_sessions.is_empty(),
+        "unadmitted bound session is narrowed away"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// A grant without session.view cannot list projects or workspaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_without_session_view_is_refused_project_and_workspace_lists() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, session) =
+        net_support::paired_device(&host, &owner, &[ActionRight::ProjectCreate]).await;
+
+    let refused_plist = session
+        .read::<_, ProjectListResult>(
+            Method::ProjectList,
+            &ProjectListParams {
+                environment_id: host.environment_id,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_plist.code(), ErrorCode::PermissionDenied);
+    assert!(refused_plist.to_string().contains(ActionRight::SessionView.as_str()));
+
+    let refused_wlist = session
+        .read::<_, WorkspaceListResult>(
+            Method::WorkspaceList,
+            &WorkspaceListParams {
+                environment_id: host.environment_id,
+                project_repository_id: Nullable::null(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_wlist.code(), ErrorCode::PermissionDenied);
+    assert!(refused_wlist.to_string().contains(ActionRight::SessionView.as_str()));
 
     session.close();
     host.stop().await;

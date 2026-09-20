@@ -418,6 +418,38 @@ impl OpenedRepository {
         };
         Ok((revision, reference))
     }
+
+    /// Performs a reference update via `update-ref` with expected old value.
+    ///
+    /// The write is bounded by a write grant for the repository's Git common directory
+    /// (`git_dir_path`) and nothing wider: the working tree is not writable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitFailed`] when the reference cannot be updated or the old value
+    /// does not match.
+    pub fn update_ref(
+        &self,
+        profile: &RestrictedProfile,
+        reference: &str,
+        new_oid: &str,
+        old_oid: &str,
+        no_deref: bool,
+    ) -> Result<()> {
+        let mut arguments: Vec<&OsStr> = vec![OsStr::new("update-ref")];
+        if no_deref {
+            arguments.push(OsStr::new("--no-deref"));
+        }
+        arguments.push(OsStr::new(reference));
+        arguments.push(OsStr::new(new_oid));
+        arguments.push(OsStr::new(old_oid));
+        let request = GitRequest::write(&self.git_dir_path, &arguments)
+            .with_drivers(self.audit.drivers.clone())
+            .expecting(self.identity.git_dir);
+        let output = profile.run(&request)?;
+        output.require_success()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -26,8 +26,9 @@ use kr_project::workspace::{PreviewRequest, survey};
 use kr_protocol::project::{AdoptionFlow, ProjectAdoptParams, WorkspaceKind};
 
 use support::{
-    Fixture, action, actor, destination, include_everything, installed_broker, ordinary_repository,
-    pipe_nothing_writes_to, planted_repository, restricted_profile_fixture, write,
+    Fixture, action, actor, destination, git_raw, include_everything, installed_broker,
+    ordinary_repository, pipe_nothing_writes_to, planted_repository, restricted_profile_fixture,
+    write,
 };
 
 #[test]
@@ -277,7 +278,6 @@ fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
         "gc",
         "prune",
         "filter-branch",
-        "update-ref",
         "branch",
         "rm",
         "mv",
@@ -331,6 +331,80 @@ fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
         let arguments = [OsStr::new(permitted)];
         check_arguments(&arguments)
             .unwrap_or_else(|error| panic!("{permitted} is one this service runs: {error}"));
+    }
+    // update-ref is permitted only in its expected-old-value form.
+    check_arguments(&[
+        OsStr::new("update-ref"),
+        OsStr::new("refs/heads/main"),
+        OsStr::new("0123456789abcdef0123456789abcdef01234567"),
+        OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+    ])
+    .expect("update-ref with expected old value is permitted");
+    check_arguments(&[
+        OsStr::new("update-ref"),
+        OsStr::new("--no-deref"),
+        OsStr::new("refs/heads/main"),
+        OsStr::new("0123456789abcdef0123456789abcdef01234567"),
+        OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+    ])
+    .expect("update-ref with --no-deref is permitted");
+
+    for (refused, reason) in [
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("-d"),
+                OsStr::new("refs/heads/main"),
+            ],
+            "deletes a reference",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("--delete"),
+                OsStr::new("refs/heads/main"),
+            ],
+            "deletes a reference",
+        ),
+        (
+            vec![OsStr::new("update-ref"), OsStr::new("--stdin")],
+            "reads updates from standard input",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new("newoid"),
+            ],
+            "requires an expected old value",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("-c"),
+                OsStr::new("core.pager=sh"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new("new"),
+                OsStr::new("old"),
+            ],
+            "not an argument this service passes",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("--force"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new("new"),
+                OsStr::new("old"),
+            ],
+            "not an argument this service passes",
+        ),
+    ] {
+        let err = check_arguments(&refused).expect_err("refused");
+        assert!(
+            err.to_string().contains(reason),
+            "{err} should contain {reason}"
+        );
     }
     // An empty template is the one this host already points at, so it is allowed through.
     let arguments = [OsStr::new("clone"), OsStr::new("--template=")];
@@ -1168,3 +1242,43 @@ fn a_planted_marker_records_under_the_environment_git_gives_it() {
         "a helper that ran leaves its name behind, whatever its environment held"
     );
 }
+
+#[test]
+fn reference_update_with_expected_old_value_performs_compare_and_swap_bounded_to_git_dir() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "cas");
+    let profile = fixture.service().profile();
+    let repository = OpenedRepository::open(profile, fixture.environment_id(), &path)
+        .expect("the repository opens");
+    let (head_first, _) = repository.head(profile).expect("first head");
+    let oid_first = head_first.expect("commit exists");
+
+    write(&path, "extra.txt", "second commit\n");
+    git_raw(&path, ["add", "extra.txt"]);
+    git_raw(&path, ["commit", "-m", "second"]);
+
+    let (head_second, _) = repository.head(profile).expect("second head");
+    let oid_second = head_second.expect("second commit exists");
+    assert_ne!(oid_first, oid_second);
+
+    // Mismatched old value fails CAS
+    let failure = repository.update_ref(
+        profile,
+        "refs/heads/main",
+        &oid_first,
+        "0000000000000000000000000000000000000000",
+        false,
+    );
+    assert!(failure.is_err(), "mismatched old value fails CAS");
+
+    // Correct old value updates ref via CAS
+    repository
+        .update_ref(profile, "refs/heads/main", &oid_first, &oid_second, false)
+        .expect("CAS succeeds");
+    let (head_after, _) = repository.head(profile).expect("head after CAS");
+    assert_eq!(head_after.as_deref(), Some(oid_first.as_str()));
+
+    // Working tree is untouched (extra.txt is still there)
+    assert!(path.join("extra.txt").exists());
+}
+

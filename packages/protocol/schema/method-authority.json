@@ -2665,7 +2665,16 @@
       ],
       "method": "project.list",
       "name": "project.list",
-      "required_rights": [],
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
       "resource_selectors": [
         "environment",
         "project"
@@ -2834,7 +2843,16 @@
       ],
       "method": "workspace.list",
       "name": "workspace.list",
-      "required_rights": [],
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
       "resource_selectors": [
         "environment",
         "workspace"

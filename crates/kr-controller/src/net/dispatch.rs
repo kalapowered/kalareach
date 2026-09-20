@@ -47,6 +47,7 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::grant::EnvironmentSelector;
 use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, RequestId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -587,10 +588,16 @@ impl RemoteConnection {
             // environment selector and the rights the registry lists are the whole of what
             // narrows them, and the service answers a device exactly as it answers this user's
             // own client.
-            Method::ProjectList
-            | Method::ProjectRead
-            | Method::WorkspaceList
-            | Method::WorkspaceRead => self.controller.read_method(&actor_id, request).await,
+            Method::ProjectList | Method::WorkspaceList => {
+                let answer = self.controller.read_method(&actor_id, request).await;
+                self.narrow(answer)
+            }
+            Method::ProjectRead | Method::WorkspaceRead => {
+                self.controller.read_method(&actor_id, request).await
+            }
+            Method::DiffRead | Method::ChangesetRead => {
+                self.controller.read_method(&actor_id, request).await
+            }
             // The daemon answers these itself, and what it answers with is narrowed to the grant:
             // a list is every session this actor may observe, not every session this host runs.
             Method::SessionList | Method::SessionRead => {
@@ -687,6 +694,13 @@ impl RemoteConnection {
             held = self
                 .controller
                 .project
+                .retained(&actor_id, mutation, entry.method)
+                .await;
+        }
+        if held.is_none() && crate::changeset::ChangeSetModule::serves(entry.method) {
+            held = self
+                .controller
+                .changesets()
                 .retained(&actor_id, mutation, entry.method)
                 .await;
         }
@@ -868,9 +882,7 @@ impl RemoteConnection {
             // worker proxy, and the admission travels with them so the service can ask about it
             // again after the waiting it does of its own.
             _ if crate::project::ProjectModule::serves(entry.method) => {
-                // Five of these name a destination or a source that this host cannot yet check a
-                // device's authority over. Until it can, they are not served to one.
-                if let Err(error) = resource_authority(entry.method) {
+                if let Err(error) = self.check_project_authority(entry.method, mutation) {
                     return failure(mutation.request_id, error);
                 }
                 // A project mutation claims its action identity the way every other mutation
@@ -907,6 +919,25 @@ impl RemoteConnection {
                     }),
                     // The effect is still running, so a wait that ended says the outcome is not
                     // known rather than that the action failed.
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
+            }
+            _ if crate::changeset::ChangeSetModule::serves(entry.method) => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let effect = tokio::spawn(async move {
+                    controller
+                        .changesets()
+                        .write_frame(&actor_id, &mutation, method)
+                        .await
+                });
+                match tokio::time::timeout(EFFECT_WAIT, effect).await {
+                    Ok(Ok(outcome)) => outcome,
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
@@ -1005,27 +1036,72 @@ impl RemoteConnection {
         else {
             return answer;
         };
-        let Ok(listed) = value.to_typed::<SessionListResult>() else {
-            return self.narrow_read(request_id, value);
-        };
-        let selector = &self.device.grant.session_selector;
-        let narrowed = SessionListResult {
-            sessions: listed
-                .sessions
-                .into_iter()
-                .filter(|summary| selector.admits(summary.session_id))
-                .collect(),
-        };
-        match ParamsValue::from_typed(&narrowed) {
-            Ok(value) => ControlFrame::Response(Response {
-                request_id,
-                outcome: Outcome::Ok(value),
-            }),
-            Err(error) => failure(
-                request_id,
-                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
-            ),
+        if let Ok(listed) = value.to_typed::<SessionListResult>() {
+            let selector = &self.device.grant.session_selector;
+            let narrowed = SessionListResult {
+                sessions: listed
+                    .sessions
+                    .into_iter()
+                    .filter(|summary| selector.admits(summary.session_id))
+                    .collect(),
+            };
+            return match ParamsValue::from_typed(&narrowed) {
+                Ok(value) => ControlFrame::Response(Response {
+                    request_id,
+                    outcome: Outcome::Ok(value),
+                }),
+                Err(error) => failure(
+                    request_id,
+                    ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
+                ),
+            };
         }
+        if let Ok(listed) = value.to_typed::<kr_protocol::project::ProjectListResult>() {
+            let selector = &self.device.grant.environment_selector;
+            let narrowed = kr_protocol::project::ProjectListResult {
+                projects: listed
+                    .projects
+                    .into_iter()
+                    .filter(|summary| selector.admits(summary.environment_id))
+                    .collect(),
+            };
+            return match ParamsValue::from_typed(&narrowed) {
+                Ok(value) => ControlFrame::Response(Response {
+                    request_id,
+                    outcome: Outcome::Ok(value),
+                }),
+                Err(error) => failure(
+                    request_id,
+                    ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
+                ),
+            };
+        }
+        if let Ok(listed) = value.to_typed::<kr_protocol::project::WorkspaceListResult>() {
+            let env_selector = &self.device.grant.environment_selector;
+            let session_selector = &self.device.grant.session_selector;
+            let narrowed = kr_protocol::project::WorkspaceListResult {
+                workspaces: listed
+                    .workspaces
+                    .into_iter()
+                    .filter(|summary| env_selector.admits(summary.environment_id))
+                    .map(|mut summary| {
+                        summary.bound_sessions.retain(|s| session_selector.admits(*s));
+                        summary
+                    })
+                    .collect(),
+            };
+            return match ParamsValue::from_typed(&narrowed) {
+                Ok(value) => ControlFrame::Response(Response {
+                    request_id,
+                    outcome: Outcome::Ok(value),
+                }),
+                Err(error) => failure(
+                    request_id,
+                    ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
+                ),
+            };
+        }
+        self.narrow_read(request_id, value)
     }
 
     /// Removes from a session read the content this device's grant does not reach.
@@ -1595,6 +1671,10 @@ impl RemoteConnection {
             crate::project::ProjectModule::check_subject(entry.method, mutation)
                 .map_err(|error| error.to_protocol_error())?;
         }
+        if crate::changeset::ChangeSetModule::serves(entry.method) {
+            crate::changeset::ChangeSetModule::check_subject(entry.method, mutation)
+                .map_err(|error| error.to_protocol_error())?;
+        }
         // A voice mutation's subject is this host. A voice session is not a shell session, so the
         // target names none, and the session a delegation acts on travels in the parameters where
         // the coordinator checks it against what that voice session may reach. Its own subject
@@ -1857,44 +1937,153 @@ impl RemoteConnection {
             },
         }
     }
-}
 
-/// Refuses a project mutation whose destination or source this host cannot authorise for a device.
-///
-/// Section 14 requires an authorised destination handle for a creation, and section 23's rows
-/// require a destination and remote-credential policy for one and source and destination grants
-/// for a working copy. The project service has neither: it resolves the absolute parent directory
-/// the request names with this host's own filesystem authority, and it bounds the repository a
-/// working copy is taken from by nothing but the environment. For a caller on the machine's own
-/// socket that is the user's own authority over the user's own filesystem. For a paired device it
-/// is not, and the grant's action right would be the whole of the restriction: `project.create`
-/// would reach every directory this host can open, and `workspace.manage` every repository the
-/// environment holds.
-///
-/// So this host refuses those five rather than acting on a destination or a source nobody
-/// authorised it to reach. The reads, and cancelling work the caller itself started, are
-/// unaffected. The refusal is lifted when the project service bounds a destination and a source by
-/// the grant that asked.
-fn resource_authority(method: Method) -> std::result::Result<(), ProtocolError> {
-    let names = match method {
-        Method::ProjectInit | Method::ProjectClone | Method::ProjectAdopt => {
-            "the directory it creates a repository in"
+    /// Checks destination and source authority for paired-device project mutations against the grant.
+    fn check_project_authority(
+        &self,
+        method: Method,
+        mutation: &MutationRequest,
+    ) -> std::result::Result<(), ProtocolError> {
+        let names = match method {
+            Method::ProjectInit | Method::ProjectClone | Method::ProjectAdopt => {
+                "the directory it creates a repository in"
+            }
+            Method::WorkspaceCreate => "the repository it takes a working copy from",
+            Method::WorkspaceRemove => "the working copy it removes",
+            _ => return Ok(()),
+        };
+        let selector = &self.device.grant.environment_selector;
+        match selector {
+            EnvironmentSelector::Any => Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                format!(
+                    "{} names {}, and this device's grant does not bound destinations to specific environments: an unbounded grant cannot authorise a host-local path",
+                    method.as_str(),
+                    names
+                ),
+            )),
+            EnvironmentSelector::These { environment_ids } => {
+                match method {
+                    Method::ProjectInit => {
+                        let params = mutation
+                            .params
+                            .to_typed::<kr_protocol::project::ProjectInitParams>()
+                            .map_err(|error| {
+                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+                            })?;
+                        if !environment_ids.contains(&params.destination.environment_id) {
+                            return Err(ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                format!(
+                                    "{} destination environment {} is not admitted by grant",
+                                    method.as_str(),
+                                    params.destination.environment_id
+                                ),
+                            ));
+                        }
+                    }
+                    Method::ProjectClone => {
+                        let params = mutation
+                            .params
+                            .to_typed::<kr_protocol::project::ProjectCloneParams>()
+                            .map_err(|error| {
+                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+                            })?;
+                        if !environment_ids.contains(&params.destination.environment_id) {
+                            return Err(ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                format!(
+                                    "{} destination environment {} is not admitted by grant",
+                                    method.as_str(),
+                                    params.destination.environment_id
+                                ),
+                            ));
+                        }
+                    }
+                    Method::ProjectAdopt => {
+                        let params = mutation
+                            .params
+                            .to_typed::<kr_protocol::project::ProjectAdoptParams>()
+                            .map_err(|error| {
+                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+                            })?;
+                        if !environment_ids.contains(&params.destination.environment_id) {
+                            return Err(ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                format!(
+                                    "{} destination environment {} is not admitted by grant",
+                                    method.as_str(),
+                                    params.destination.environment_id
+                                ),
+                            ));
+                        }
+                    }
+                    Method::WorkspaceCreate => {
+                        let params = mutation
+                            .params
+                            .to_typed::<kr_protocol::project::WorkspaceCreateParams>()
+                            .map_err(|error| {
+                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+                            })?;
+                        if let Some(destination) = params.destination.as_ref() {
+                            if !environment_ids.contains(&destination.environment_id) {
+                                return Err(ProtocolError::new(
+                                    ErrorCode::PermissionDenied,
+                                    format!(
+                                        "{} destination environment {} is not admitted by grant",
+                                        method.as_str(),
+                                        destination.environment_id
+                                    ),
+                                ));
+                            }
+                        }
+                        if let Ok(read) = self.controller.project.service().project_read(
+                            &kr_protocol::project::ProjectReadParams {
+                                project_repository_id: params.project_repository_id,
+                            },
+                        ) {
+                            if !environment_ids.contains(&read.project.environment_id) {
+                                return Err(ProtocolError::new(
+                                    ErrorCode::PermissionDenied,
+                                    format!(
+                                        "{} repository environment {} is not admitted by grant",
+                                        method.as_str(),
+                                        read.project.environment_id
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    Method::WorkspaceRemove => {
+                        let params = mutation
+                            .params
+                            .to_typed::<kr_protocol::project::WorkspaceRemoveParams>()
+                            .map_err(|error| {
+                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+                            })?;
+                        if let Ok(read) = self.controller.project.service().workspace_read(
+                            &kr_protocol::project::WorkspaceReadParams {
+                                workspace_id: params.workspace_id,
+                            },
+                        ) {
+                            if !environment_ids.contains(&read.workspace.environment_id) {
+                                return Err(ProtocolError::new(
+                                    ErrorCode::PermissionDenied,
+                                    format!(
+                                        "{} workspace environment {} is not admitted by grant",
+                                        method.as_str(),
+                                        read.workspace.environment_id
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
         }
-        Method::WorkspaceCreate => "the repository it takes a working copy from",
-        Method::WorkspaceRemove => "the working copy it removes",
-        _ => return Ok(()),
-    };
-    Err(ProtocolError::new(
-        ErrorCode::PermissionDenied,
-        format!(
-            "{} names {}, and this host does not yet establish a paired device's authority over \
-             one: the project service resolves it with the host's own authority and checks \
-             nothing else against the device. Until it does, this host serves the repository and \
-             workspace reads to a device and not this.",
-            method.as_str(),
-            names
-        ),
-    ))
+    }
 }
 
 /// Returns whether one request claims or adds a geometry claim.

@@ -933,7 +933,7 @@ methods! {
 
     // ----- Project repositories -------------------------------------------------------------
     ProjectList = "project.list", ProjectRepositories,
-    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [],
+    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
     selectors: [Environment, Project],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
@@ -975,7 +975,7 @@ methods! {
 
     // ----- Workspaces -----------------------------------------------------------------------
     WorkspaceList = "workspace.list", Workspaces,
-    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [],
+    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
     selectors: [Environment, Workspace],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
