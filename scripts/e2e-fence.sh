@@ -52,6 +52,14 @@ fi
 export KR_SHELL_PREFIX="$packages"
 export KR_SHELL_PACKAGES="$packages"
 
+if [ -n "${KR_SHELL_STACKS:-}" ]; then
+  stacks="$KR_SHELL_STACKS"
+elif [ "$(uname -s)" = "Darwin" ]; then
+  stacks="$HOME/Library/Caches/kalareach/shell-stacks"
+else
+  stacks="${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shell-stacks"
+fi
+
 echo "kalareach shell-integration qualification"
 echo "  commit: $(git rev-parse HEAD)"
 echo "  host: $(uname -sr) $(uname -m)"
@@ -234,53 +242,128 @@ print("" if document is None else document)
 ' "$1" "$2"
 }
 
+# The session's own home, so nothing this run does reaches the person's own startup files. The
+# customisation is one of the pinned set, installed the way its own documentation says to; the
+# marked entry is added by the product's own installer rather than by this script.
+session_home="$run_root/home"
+mkdir -p "$session_home/.config"
+# The customisation this session runs, from the index the fetcher wrote.
+starship_root="$(/usr/bin/env python3 -c '
+import json, sys
+index = json.load(open(sys.argv[1]))
+for entry in index["stacks"]:
+    if entry["id"] == "starship" and entry["status"] == "installed":
+        print(entry["root"] or "")
+        break
+' "$stacks/index.json" 2>/dev/null || true)"
+if [ -z "$starship_root" ]; then
+  fail "the customisation this session runs is not installed"
+fi
+cp "$root/tests/shells/zsh/starship/home/starship.toml" "$session_home/.config/starship.toml"
+cat > "$session_home/.zshrc" <<ZSHRC
+# The person's own configuration, with a customisation from the pinned set.
+print -r -- user-top >> "$session_home/order"
+HISTFILE=
+setopt no_beep
+bindkey '^D' delete-char
+export STARSHIP_CONFIG="$session_home/.config/starship.toml"
+export STARSHIP_CACHE="$session_home/.cache/starship"
+eval "\$("$starship_root/starship" init zsh)"
+print -r -- stack >> "$session_home/order"
+kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=\$#BUFFER }
+zle -N kr-user-widget
+bindkey '^[q' kr-user-widget
+print -r -- user-bottom >> "$session_home/order"
+ZSHRC
+
 managed_shell="$packages/zsh/$(cat "$packages/zsh/current")/bin/zsh"
-if "$kr" new --invisible --shell-mode managed --shell "$managed_shell" --cwd "$run_root/cwd" \
+if ! HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
+    "$kr" shell install --json >"$artifacts/fence-shell-install.json" 2>&1; then
+  cat "$artifacts/fence-shell-install.json"
+  fail "the marked startup entry could not be installed"
+fi
+if grep -qi "kalareach shell integration" "$session_home/.zshrc"; then
+  echo "  ok: the marked entry is in the session's own startup file"
+else
+  fail "the marked entry is not in the startup file the session will read"
+fi
+
+if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
+    "$kr" new --invisible --shell-mode managed --cwd "$run_root/cwd" \
     --json >"$artifacts/fence-create.json" 2>"$run_root/create.err"; then
   display="$(read_json "$artifacts/fence-create.json" display_number)"
-  mode="$(read_json "$artifacts/fence-create.json" session.shell_mode)"
-  if [ "$mode" = "managed" ]; then
-    echo "  ok: session $display runs the managed package"
-  else
-    fail "the session the daemon made reports shell_mode=$mode"
-  fi
+  mode="$(read_json "$artifacts/fence-create.json" shell_mode)"
+  require "$mode" "managed" "the session the daemon made runs the managed package"
 
-  # What the session says about itself, through the daemon that made it.
-  if "$kr" status "$display" --json >"$artifacts/fence-status.json" 2>&1; then
-    status_mode="$(read_json "$artifacts/fence-status.json" shell_mode)"
-    require "$status_mode" "managed" "the session reports the managed mode it was created in"
+  # The root integration qualified: the worker reports the session rather than closing it, which
+  # is what it does when the packaged shell's hooks do not activate.
+  if HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-status.json" 2>&1; then
+    require "$(read_json "$artifacts/fence-status.json" shell_mode)" "managed" \
+      "the session reports the managed mode it was created in"
+    require "$(read_json "$artifacts/fence-status.json" shell)" "$managed_shell" \
+      "the session runs the package the installation resolves"
   else
     fail "the daemon could not report on the session it made"
   fi
 
-  # The session is closed through the daemon, and the daemon is asked again: a session that did
-  # not go is a session this run left behind.
-  if ! "$kr" close "$display" >"$run_root/close.log" 2>&1; then
+  # The person's own startup ran inside that session, in its own order, with the customisation.
+  for _ in $(seq 1 100); do [ -s "$session_home/order" ] && break; sleep 0.2; done
+  cp "$session_home/order" "$artifacts/fence-session-order.txt" 2>/dev/null || true
+  require "$(tr '\n' ' ' < "$session_home/order" 2>/dev/null | sed 's/ *$//')" \
+    "user-top stack user-bottom" \
+    "the session's shell ran the person's startup, and the customisation, in its own order"
+
+  # A second package installed while that session runs. The pointer is what a new session
+  # resolves; the one already running keeps what it started.
+  second="$(ls "$packages/zsh" | grep -v '^current$' | grep -v "^$(cat "$packages/zsh/current")$" | head -1)"
+  if [ -n "$second" ]; then
+    first_identity="$(cat "$packages/zsh/current")"
+    printf '%s' "$second" > "$packages/zsh/current"
+    if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$packages/zsh/$second/bin/zsh" \
+        "$kr" new --invisible --shell-mode managed --cwd "$run_root/cwd" \
+        --json >"$artifacts/fence-create-2.json" 2>&1; then
+      second_display="$(read_json "$artifacts/fence-create-2.json" display_number)"
+      HOME="$session_home" "$kr" status "$second_display" --json >"$artifacts/fence-status-2.json" 2>&1 || true
+      require "$(read_json "$artifacts/fence-status-2.json" shell)" \
+        "$packages/zsh/$second/bin/zsh" \
+        "a session made after the update runs the package the installation now resolves"
+      HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-status-1.json" 2>&1 || true
+      require "$(read_json "$artifacts/fence-status-1.json" shell)" "$managed_shell" \
+        "the session that was already running keeps the package it started"
+      HOME="$session_home" "$kr" close "$second_display" >/dev/null 2>&1 || true
+    else
+      sed 's/^/    /' "$artifacts/fence-create-2.json"
+      fail "a second managed session could not be created"
+    fi
+    printf '%s' "$first_identity" > "$packages/zsh/current"
+  else
+    echo "  note: this installation holds one zsh build, so no update is demonstrated here"
+  fi
+
+  # The session is closed through the daemon, and the daemon is asked again: it keeps a closed
+  # session's record and answers for it, so the close is what the record says.
+  if ! HOME="$session_home" "$kr" close "$display" >"$run_root/close.log" 2>&1; then
     cat "$run_root/close.log"
     fail "the daemon could not close the session it made"
   fi
-  # The daemon keeps a closed session's record and answers for it, so what says the close
-  # happened is the state in that record rather than the question failing.
-  if "$kr" status "$display" --json >"$artifacts/fence-closed.json" 2>&1; then
-    require "$(read_json "$artifacts/fence-closed.json" state)" "closed" \
-      "the session the daemon closed reports itself closed"
-  else
-    fail "the daemon could not report on the session it closed"
-  fi
+  # Closure is a sequence, so the record is asked again until it settles.
+  closed_state=""
+  for _ in $(seq 1 100); do
+    HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-closed.json" 2>&1 || break
+    closed_state="$(read_json "$artifacts/fence-closed.json" state)"
+    [ "$closed_state" = "closed" ] && break
+    sleep 0.3
+  done
+  require "$closed_state" "closed" "the session the daemon closed reports itself closed"
+
+  echo "  the gesture, the fenced launch and the takeover are driven against these same packages"
+  echo "  by the corpus below, over the published bridge contract: the command line offers no"
+  echo "  verb for a keystroke or a launch, so this stage drives what it can reach."
 else
-  # A refusal that names another shell's record is a condition of this installation rather than of
-  # the package this run qualified: a daemon that cannot read one shell's record refuses the whole
-  # installation, and the record it cannot read is the one the editor package writes for an editor
-  # that lives outside it. It is reported with the answer the daemon gave, and the packages this
-  # run built are qualified below either way. Any other refusal is this run's.
-  refusal="$(read_json "$artifacts/fence-create.json" code)"
-  detail="$(read_json "$artifacts/fence-create.json" message)"
   # What the daemon printed while it was refusing, and what the worker it launched said for
   # itself: an answer that only says something did not happen in time carries no reason, and the
   # reason is in the worker's own diagnostics.
   cp "$run_root/controller.log" "$artifacts/fence-controller.log" 2>/dev/null || true
-  # The worker writes its own last word as it goes, which can be a moment after the daemon has
-  # answered the caller.
   sleep 3
   worker_said=""
   for diagnostics in "$run_root"/s/environments/*/jobs/*.diagnostics; do
@@ -289,26 +372,9 @@ else
     worker_said="$(cat "$diagnostics")"
   done
   echo "  the daemon refused a managed session:"
-  echo "    ${detail:-$(cat "$run_root/create.err")}"
+  echo "    $(read_json "$artifacts/fence-create.json" message)"
   [ -n "$worker_said" ] && echo "    the worker said: $worker_said"
-  if [ "$refusal" = "SHELL_INTEGRATION_UNSUPPORTED" ] && \
-     [ "${detail#*"$packages/powershell/"}" != "$detail" ] && \
-     [ "${detail#*names paths outside the package it is in}" != "$detail" ]; then
-    echo "    the package this run asked for is $managed_shell, and the record the daemon could"
-    echo "    not read is another shell's: an installation is read as a whole here, so one"
-    echo "    unreadable record refuses every shell in it."
-    incomplete=1
-  elif [ "${worker_said#*the root integration did not qualify}" != "$worker_said" ]; then
-    # The packaged shell started and never activated its hooks, because this stage puts no
-    # guarded startup entry in the home the session's shell reads. Writing one, and driving the
-    # operations that follow it, is what this stage is still to gain; the person's own startup
-    # files are not this run's to write into.
-    echo "    the shell this session started read a home with no guarded startup entry in it, so"
-    echo "    its hooks never activated. This stage does not yet install one."
-    incomplete=1
-  else
-    fail "a managed session could not be created"
-  fi
+  fail "a managed session could not be created"
 fi
 
 echo

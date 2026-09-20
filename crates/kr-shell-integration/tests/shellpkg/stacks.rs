@@ -531,6 +531,51 @@ fn default_entry_path(kind: ShellKind) -> &'static str {
     }
 }
 
+/// What the installed record says the package is, as a worker that launched it would read it.
+fn declared_package(
+    package: &Package,
+) -> kr_shell_integration::contract::transport::PackageDeclaration {
+    use kr_shell_integration::contract::transport::{
+        ModuleEntry, PackageDeclaration, PatchRevision,
+    };
+
+    let shell = &package.record["shell"];
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
+    PackageDeclaration {
+        kind: package.kind,
+        executable: package.executable.display().to_string(),
+        upstream_version: text(&shell["upstream_version"]),
+        editor_abi: text(&shell["editor_abi"]),
+        integration_version: text(&shell["integration_version"]),
+        patches: shell["patches"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|patch| PatchRevision {
+                        name: text(&patch["name"]),
+                        upstream_revision: text(&patch["upstream_revision"]),
+                        revision: text(&patch["revision"]),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        modules: shell["modules"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|module| ModuleEntry {
+                        name: text(&module["name"]),
+                        search_path: text(&module["search_path"]),
+                        editor_abi: text(&module["editor_abi"]),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 /// The marked block the package publishes, exactly as it publishes it.
 fn package_entry(package: &Package) -> String {
     std::fs::read_to_string(&package.startup_entry)
@@ -731,6 +776,11 @@ impl Session {
             root_process: hello.shell_process.clone(),
             supported_editor_abis: vec![hello.shell.editor_abi.clone()],
             supported_integration_versions: vec![hello.shell.integration_version.clone()],
+            // This harness is the worker's side of one session and it launched the package it is
+            // driving, so the declaration the shell makes is compared against the record that
+            // build wrote beside the binary, which is what a worker does with a package it
+            // started.
+            launched_package: Some(declared_package(package)),
             already_registered: false,
             gesture: kr_shell_integration::contract::events::EofGesture::default(),
         };
