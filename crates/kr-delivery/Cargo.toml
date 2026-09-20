@@ -1,0 +1,36 @@
+[package]
+name = "kr-delivery"
+description = "The KalaReach delivery producer: the environment delivery journal, notification previews, the push outbox and external notification destinations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Base64url is how a sealed preview reaches the gateway, and the encoded length is the figure
+# section 16's payload bound is measured on.
+base64.workspace = true
+kr-attention.workspace = true
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+# The history filter and the privacy contract both live in the worker crate: this producer is a
+# consumer of both rather than the owner of either.
+kr-worker.workspace = true
+# The delivery journal is an environment store of its own, beside the registry and the session
+# journals, so that a notification and the attempt that carried it are in one file and one backup.
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+# The gateway speaks JSON, and the payload bound is measured on the request body a host will send.
+serde_json.workspace = true
+thiserror.workspace = true
+# A notification identifier is a random 128-bit value with no meaning in it.
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

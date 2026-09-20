@@ -4156,6 +4156,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-delivery"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kr-attention",
+ "kr-cbor",
+ "kr-crypto",
+ "kr-protocol",
+ "kr-worker",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "kr-describe"
 version = "0.1.0"
 dependencies = [

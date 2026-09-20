@@ -9,6 +9,7 @@ members = [
     "crates/kr-client",
     "crates/kr-controller",
     "crates/kr-crypto",
+    "crates/kr-delivery",
     "crates/kr-describe",
     "crates/kr-ipc",
     "crates/kr-pairing",
@@ -69,6 +70,7 @@ kr-cli = { path = "crates/kr-cli", version = "=0.1.0" }
 kr-client = { path = "crates/kr-client", version = "=0.1.0", default-features = false }
 kr-controller = { path = "crates/kr-controller", version = "=0.1.0" }
 kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
+kr-delivery = { path = "crates/kr-delivery", version = "=0.1.0" }
 kr-describe = { path = "crates/kr-describe", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }
 kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
