@@ -102,9 +102,10 @@ impl DesktopVoiceCall {
             return Err(CommandError::refused("the call has already been stopped"));
         }
 
-        let mut lock = self.offer_sdp.lock().map_err(|_| {
-            CommandError::local_failure("internal state lock poisoned")
-        })?;
+        let mut lock = self
+            .offer_sdp
+            .lock()
+            .map_err(|_| CommandError::local_failure("internal state lock poisoned"))?;
 
         if let Some(ref existing) = *lock {
             return Ok(existing.clone());
@@ -138,9 +139,10 @@ impl DesktopVoiceCall {
     /// Returns an error if the answer cannot be parsed or applied, if the session has expired,
     /// or if the call has been stopped.
     pub async fn accept(&self, answer_sdp: &str) -> Result<()> {
-        let mut device = self.audio_device.lock().map_err(|_| {
-            CommandError::local_failure("internal audio device lock poisoned")
-        })?;
+        let mut device = self
+            .audio_device
+            .lock()
+            .map_err(|_| CommandError::local_failure("internal audio device lock poisoned"))?;
 
         if self.is_stopped.load(Ordering::SeqCst) {
             return Err(CommandError::refused("the call has already been stopped"));
@@ -170,9 +172,10 @@ impl DesktopVoiceCall {
             .map_err(|error| CommandError::invalid(format!("invalid SDP answer: {error}")))?;
 
         {
-            let mut lock = self.answer_sdp.lock().map_err(|_| {
-                CommandError::local_failure("internal state lock poisoned")
-            })?;
+            let mut lock = self
+                .answer_sdp
+                .lock()
+                .map_err(|_| CommandError::local_failure("internal state lock poisoned"))?;
             *lock = Some(answer_sdp.to_owned());
         }
 
@@ -242,12 +245,9 @@ impl DesktopVoiceCall {
     /// Records that the first remote audio packet has arrived (KR-PERF-010).
     pub fn record_first_audio(&self) {
         let elapsed = self.start_time.elapsed().as_millis() as u64;
-        let _ = self.first_audio_ms.compare_exchange(
-            0,
-            elapsed,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        );
+        let _ =
+            self.first_audio_ms
+                .compare_exchange(0, elapsed, Ordering::SeqCst, Ordering::Relaxed);
     }
 
     /// Milliseconds to first remote audio, or None if no audio received yet.

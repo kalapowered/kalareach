@@ -16,8 +16,8 @@
 //!    via `voice.delegate`, never to the broker.
 
 use kr_client::services::voice::{
-    read_control_event, VoiceCommand, VoiceContextFrame, VoiceControlEvent,
-    VOICE_CONTEXT_BYTES, VOICE_CONTROL_FRAME_BYTES,
+    VOICE_CONTEXT_BYTES, VOICE_CONTROL_FRAME_BYTES, VoiceCommand, VoiceContextFrame,
+    VoiceControlEvent, read_control_event,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,9 @@ pub fn validate_context_frame(
     content: Option<String>,
 ) -> Result<VoiceContextFrame> {
     if id.trim().is_empty() || id.len() > 128 {
-        return Err(CommandError::invalid("context request requires a valid identifier"));
+        return Err(CommandError::invalid(
+            "context request requires a valid identifier",
+        ));
     }
 
     if let Some(ref text) = content {
@@ -70,8 +72,9 @@ pub fn validate_context_frame(
     let frame = VoiceContextFrame::new(id, command, delegation_id, content)
         .map_err(|error| CommandError::invalid(error.to_string()))?;
 
-    let serialized = serde_json::to_string(&frame)
-        .map_err(|error| CommandError::local_failure(format!("failed to serialize frame: {error}")))?;
+    let serialized = serde_json::to_string(&frame).map_err(|error| {
+        CommandError::local_failure(format!("failed to serialize frame: {error}"))
+    })?;
 
     if serialized.len() > VOICE_CONTROL_FRAME_BYTES {
         return Err(CommandError::invalid(format!(
@@ -114,7 +117,10 @@ impl ControlSocketHandler {
         let event = read_control_event(value)?;
 
         match &event {
-            VoiceControlEvent::Ready { call_id, delegations } => {
+            VoiceControlEvent::Ready {
+                call_id,
+                delegations,
+            } => {
                 self.call_id = Some(call_id.clone());
                 self.known_delegations = delegations.clone();
             }
@@ -124,7 +130,9 @@ impl ControlSocketHandler {
             VoiceControlEvent::Usage { seconds, .. } => {
                 self.metered_seconds = *seconds;
             }
-            VoiceControlEvent::Closed { reason, seconds, .. } => {
+            VoiceControlEvent::Closed {
+                reason, seconds, ..
+            } => {
                 self.is_closed = true;
                 self.close_reason = Some(reason.clone());
                 self.metered_seconds = *seconds;
@@ -171,30 +179,17 @@ mod tests {
 
         // Oversized content (> 500 bytes) is refused.
         let overlong = "x".repeat(VOICE_CONTEXT_BYTES + 1);
-        let invalid = validate_context_frame(
-            "req_2",
-            VoiceCommand::Thinking,
-            None,
-            Some(overlong),
-        );
+        let invalid = validate_context_frame("req_2", VoiceCommand::Thinking, None, Some(overlong));
         assert!(invalid.is_err());
 
         // Mute carrying text is refused (only Instructions, Thinking, Commentary carry text).
-        let mute_with_text = validate_context_frame(
-            "req_3",
-            VoiceCommand::Mute,
-            None,
-            Some("text".to_owned()),
-        );
+        let mute_with_text =
+            validate_context_frame("req_3", VoiceCommand::Mute, None, Some("text".to_owned()));
         assert!(mute_with_text.is_err());
 
         // Instructions without text is refused.
-        let empty_instructions = validate_context_frame(
-            "req_4",
-            VoiceCommand::Instructions,
-            None,
-            None,
-        );
+        let empty_instructions =
+            validate_context_frame("req_4", VoiceCommand::Instructions, None, None);
         assert!(empty_instructions.is_err());
     }
 
@@ -220,7 +215,10 @@ mod tests {
             "note": VOICE_ADMISSION_NOTE
         });
         let ev = handler.handle_event(&admitted_val);
-        assert!(matches!(ev, Some(VoiceControlEvent::ContextAdmitted { .. })));
+        assert!(matches!(
+            ev,
+            Some(VoiceControlEvent::ContextAdmitted { .. })
+        ));
 
         // Unknown event type is parsed as Unknown and dropped safely without panicking.
         let unknown_val = json!({

@@ -22,7 +22,7 @@ pub use buffer::PcmRingBuffer;
 pub use call::DesktopVoiceCall;
 pub use ceremony::{confirm_voice_action, sign_voice_confirmation};
 pub use codec::OpusCodec;
-pub use control::{validate_context_frame, ControlSocketHandler, VoiceHeartbeatFrame};
+pub use control::{ControlSocketHandler, VoiceHeartbeatFrame, validate_context_frame};
 pub use device::AudioDevice;
 
 use std::sync::{Arc, Mutex, OnceLock};

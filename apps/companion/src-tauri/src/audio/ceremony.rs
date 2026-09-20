@@ -50,8 +50,9 @@ pub fn sign_voice_confirmation(
     authorisation_key: &AuthorisationKeyPair,
     request: &VoiceConfirmationRequest,
 ) -> Result<VoiceConfirmationProof> {
-    kr_voice::confirm::sign_confirmation(authorisation_key, request)
-        .map_err(|error| CommandError::local_failure(format!("failed to sign confirmation: {error}")))
+    kr_voice::confirm::sign_confirmation(authorisation_key, request).map_err(|error| {
+        CommandError::local_failure(format!("failed to sign confirmation: {error}"))
+    })
 }
 
 #[cfg(test)]
@@ -61,7 +62,7 @@ mod tests {
     use kr_protocol::ids::{ActionId, DeviceId, SessionId, VoiceSessionId};
     use kr_protocol::scalars::{Digest256, Nullable, Uuid};
     use kr_protocol::voice::{VoiceAction, VoiceActionPlan, VoiceRefusal};
-    use kr_voice::confirm::{issue_confirmation, verify_confirmation, ConfirmationLedger};
+    use kr_voice::confirm::{ConfirmationLedger, issue_confirmation, verify_confirmation};
 
     fn test_device_id(seed: u8) -> DeviceId {
         DeviceId::new(Uuid::from_bytes([seed; 16]))
@@ -95,14 +96,8 @@ mod tests {
         let host_device = test_device_id(1);
         let client_device = test_device_id(2);
 
-        let request = issue_confirmation(
-            &plan,
-            action_id,
-            host_device,
-            client_device,
-            now_ms,
-        )
-        .expect("challenge");
+        let request = issue_confirmation(&plan, action_id, host_device, client_device, now_ms)
+            .expect("challenge");
 
         let proof = sign_voice_confirmation(&key, &request).expect("proof");
 
@@ -156,14 +151,8 @@ mod tests {
         let host_device = test_device_id(1);
         let client_device = test_device_id(2);
 
-        let request = issue_confirmation(
-            &plan_a,
-            action_id,
-            host_device,
-            client_device,
-            now_ms,
-        )
-        .expect("challenge for plan A");
+        let request = issue_confirmation(&plan_a, action_id, host_device, client_device, now_ms)
+            .expect("challenge for plan A");
 
         let proof = sign_voice_confirmation(&key, &request).expect("proof for plan A");
 
@@ -197,14 +186,8 @@ mod tests {
         let host_device = test_device_id(1);
         let client_device = test_device_id(2);
 
-        let request = issue_confirmation(
-            &plan,
-            action_id,
-            host_device,
-            client_device,
-            now_ms,
-        )
-        .expect("challenge");
+        let request = issue_confirmation(&plan, action_id, host_device, client_device, now_ms)
+            .expect("challenge");
 
         // An imposter signing the challenge (such as a simulated confirmation from provider text)
         let imposter_proof = sign_voice_confirmation(&imposter_key, &request).expect("proof");

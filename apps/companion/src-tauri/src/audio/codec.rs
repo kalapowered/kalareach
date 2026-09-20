@@ -31,10 +31,12 @@ impl OpusCodec {
     ///
     /// Returns an error if libopus fails to initialise with the specified parameters.
     pub fn new() -> Result<Self> {
-        let encoder = opus::Encoder::new(SAMPLE_RATE, CHANNELS, opus::Application::Voip)
-            .map_err(|error| CommandError::local_failure(format!("opus encoder failed: {error}")))?;
-        let decoder = opus::Decoder::new(SAMPLE_RATE, CHANNELS)
-            .map_err(|error| CommandError::local_failure(format!("opus decoder failed: {error}")))?;
+        let encoder = opus::Encoder::new(SAMPLE_RATE, CHANNELS, opus::Application::Voip).map_err(
+            |error| CommandError::local_failure(format!("opus encoder failed: {error}")),
+        )?;
+        let decoder = opus::Decoder::new(SAMPLE_RATE, CHANNELS).map_err(|error| {
+            CommandError::local_failure(format!("opus decoder failed: {error}"))
+        })?;
 
         Ok(Self {
             encoder,
@@ -103,7 +105,9 @@ mod tests {
         assert!(!encoded.is_empty());
 
         let mut pcm_out = vec![0i16; SAMPLES_PER_FRAME];
-        let decoded_len = codec.decode(&encoded, &mut pcm_out).expect("decode succeeds");
+        let decoded_len = codec
+            .decode(&encoded, &mut pcm_out)
+            .expect("decode succeeds");
         assert_eq!(decoded_len, SAMPLES_PER_FRAME);
     }
 
@@ -114,7 +118,9 @@ mod tests {
         let pcm_in = vec![500i16; SAMPLES_PER_FRAME];
         let encoded = codec.encode(&pcm_in).expect("encode succeeds");
         let mut pcm_out = vec![0i16; SAMPLES_PER_FRAME];
-        codec.decode(&encoded, &mut pcm_out).expect("decode succeeds");
+        codec
+            .decode(&encoded, &mut pcm_out)
+            .expect("decode succeeds");
 
         // Now run PLC for a lost packet.
         let mut plc_out = vec![0i16; SAMPLES_PER_FRAME];

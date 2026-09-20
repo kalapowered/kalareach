@@ -53,8 +53,8 @@ impl AudioDevice {
     where
         F: FnMut(&[i16]) + Send + 'static,
     {
-        use coreaudio::audio_unit::render_callback::data::Interleaved;
         use coreaudio::audio_unit::render_callback::Args;
+        use coreaudio::audio_unit::render_callback::data::Interleaved;
         use coreaudio::audio_unit::types::IOType;
         use coreaudio::audio_unit::{AudioUnit, Element, Scope, StreamFormat};
 
