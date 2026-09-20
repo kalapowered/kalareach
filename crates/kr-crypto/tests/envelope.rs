@@ -19,8 +19,8 @@ use kr_protocol::ids::{
     RevocationRequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::mailbox::{
-    EnvelopePlaintext, EnvelopeVersion, ForwardedAuthority, MailboxPayloadType, SealedEnvelope,
-    mailbox_size_bucket,
+    EnvelopePlaintext, EnvelopeVersion, ForwardedAuthority, ForwardedAuthorityKind,
+    MailboxPayloadType, SealedEnvelope, mailbox_size_bucket,
 };
 use kr_protocol::pairing::{
     AuthorityRevisionRecord, KeyPurpose, REVOCATION_DOMAIN, RevocationRequest, RevocationTarget,
@@ -32,39 +32,69 @@ use kr_protocol::scalars::{
 const NOW_MS: u64 = 1_000;
 const EXPIRES_MS: u64 = 61_000;
 
-/// What a host has recorded about the issuers and grants it can check an object against.
+/// The device that issues the revocation requests in this suite.
+const OWNER_DEVICE: [u8; 16] = [6; 16];
+/// The device that issues the authority revision records in this suite.
+const HOST_DEVICE: [u8; 16] = [7; 16];
+
+fn owner_device() -> DeviceId {
+    DeviceId::new(Uuid::from_bytes(OWNER_DEVICE))
+}
+
+fn host_device() -> DeviceId {
+    DeviceId::new(Uuid::from_bytes(HOST_DEVICE))
+}
+
+/// What a reader has recorded about the issuers and grants it can check an object against.
 ///
 /// It answers from what it was told, never from an envelope. That is the whole of the seam: a
-/// production host answers the same two questions from its durable grant store.
+/// production host answers the same two questions from its paired-device directory and its grant
+/// directory.
 #[derive(Debug, Default)]
 struct HostAuthority {
-    issuers: BTreeMap<KeyId, AuthorisationKey>,
-    grants: BTreeSet<(GrantId, KeyId)>,
+    issuers: BTreeMap<(DeviceId, ForwardedAuthorityKind), AuthorisationKey>,
+    grants: BTreeSet<(GrantId, DeviceId)>,
 }
 
 impl HostAuthority {
-    fn record_issuer(&mut self, issuer: &AuthorisationKeyPair) {
-        self.issuers.insert(issuer.key_id(), *issuer.public());
+    fn record_issuer(
+        &mut self,
+        device_id: DeviceId,
+        kind: ForwardedAuthorityKind,
+        issuer: &AuthorisationKeyPair,
+    ) {
+        self.issuers.insert((device_id, kind), *issuer.public());
     }
 
-    /// Records a key under an identifier that is not its own, which nothing legitimate does.
-    fn misfile(&mut self, under: KeyId, key: AuthorisationKey) {
-        self.issuers.insert(under, key);
-    }
-
-    fn record_grant(&mut self, grant_id: GrantId, issuer: &AuthorisationKeyPair) {
-        self.grants.insert((grant_id, issuer.key_id()));
+    fn record_grant(&mut self, grant_id: GrantId, device_id: DeviceId) {
+        self.grants.insert((grant_id, device_id));
     }
 }
 
 impl AuthorityDirectory for HostAuthority {
-    fn issuer_key(&self, issuer_key_id: KeyId) -> Option<AuthorisationKey> {
-        self.issuers.get(&issuer_key_id).copied()
+    fn issuer_key(
+        &self,
+        issuer: DeviceId,
+        kind: ForwardedAuthorityKind,
+    ) -> Option<AuthorisationKey> {
+        self.issuers.get(&(issuer, kind)).copied()
     }
 
-    fn grant_is_held(&self, grant_id: GrantId, issuer_key_id: KeyId) -> bool {
-        self.grants.contains(&(grant_id, issuer_key_id))
+    fn grant_is_held(&self, grant_id: GrantId, issuer: DeviceId) -> bool {
+        self.grants.contains(&(grant_id, issuer))
     }
+}
+
+/// A reader that records `issuer` as the owner device's revocation issuer and holds `grant_id`.
+fn reader_recording(issuer: &AuthorisationKeyPair, grant_id: GrantId) -> HostAuthority {
+    let mut host = HostAuthority::default();
+    host.record_issuer(
+        owner_device(),
+        ForwardedAuthorityKind::RevocationRequest,
+        issuer,
+    );
+    host.record_grant(grant_id, owner_device());
+    host
 }
 
 fn plaintext(
@@ -121,8 +151,8 @@ fn signed_revocation(issuer: &AuthorisationKeyPair, grant_id: GrantId) -> Forwar
     grant_ids.insert(grant_id);
     let mut request = RevocationRequest {
         request_id: RevocationRequestId::new(Uuid::from_bytes([5; 16])),
-        issuer_device_id: DeviceId::new(Uuid::from_bytes([6; 16])),
-        host_device_id: DeviceId::new(Uuid::from_bytes([7; 16])),
+        issuer_device_id: owner_device(),
+        host_device_id: host_device(),
         target: RevocationTarget::Grants { grant_ids },
         issued_at_ms: TimestampMs::new(NOW_MS),
         issuer_key_id: issuer.key_id(),
@@ -135,6 +165,29 @@ fn signed_revocation(issuer: &AuthorisationKeyPair, grant_id: GrantId) -> Forwar
     .expect("a transcript");
     request.signature = sign::sign(issuer, &transcript).expect("a signature");
     ForwardedAuthority::RevocationRequest(request)
+}
+
+/// Signs an ordered authority revision the way the host that issues it does.
+fn signed_revision(
+    issuer: &AuthorisationKeyPair,
+    host_device_id: DeviceId,
+) -> AuthorityRevisionRecord {
+    let mut record = AuthorityRevisionRecord {
+        host_device_id,
+        authority_revision: AuthorityRevision::new(4),
+        previous_revision: AuthorityRevision::new(3),
+        applied_requests: CanonicalSet::new(),
+        issued_at_ms: TimestampMs::new(NOW_MS),
+        host_key_id: issuer.key_id(),
+        signature: Signature64::from_bytes([0; 64]),
+    };
+    let transcript = SigningTranscript::from_canonical_bytes(
+        kr_protocol::pairing::AUTHORITY_REVISION_DOMAIN,
+        record.signing_input().expect("canonical bytes"),
+    )
+    .expect("a transcript");
+    record.signature = sign::sign(issuer, &transcript).expect("a signature");
+    record
 }
 
 /// An envelope carrying a forwarded authority object, referencing `grant_id`.
@@ -317,9 +370,7 @@ fn an_authority_bearing_payload_is_accepted_only_on_its_issuers_own_signature() 
     let object = signed_revocation(&issuer, grant_id);
     let (_, sealed) = authority_envelope(&sender, &recipient, &object, Some(grant_id));
 
-    let mut host = HostAuthority::default();
-    host.record_issuer(&issuer);
-    host.record_grant(grant_id, &issuer);
+    let host = reader_recording(&issuer, grant_id);
 
     let mut verified = None;
     let opened = open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
@@ -352,9 +403,7 @@ fn an_unsigned_authority_payload_inside_an_otherwise_valid_envelope_is_rejected(
     let unsigned = ForwardedAuthority::RevocationRequest(request);
     let (_, sealed) = authority_envelope(&sender, &recipient, &unsigned, Some(grant_id));
 
-    let mut host = HostAuthority::default();
-    host.record_issuer(&issuer);
-    host.record_grant(grant_id, &issuer);
+    let host = reader_recording(&issuer, grant_id);
 
     assert!(
         matches!(
@@ -392,28 +441,106 @@ fn an_object_signed_by_an_issuer_this_host_cannot_check_is_refused() {
 }
 
 #[test]
-fn a_directory_that_answers_with_another_key_cannot_make_a_signature_verify() {
+fn a_key_recorded_for_another_device_or_another_role_does_not_sign_for_this_one() {
     let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
     let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
-    let issuer = AuthorisationKeyPair::generate().expect("a keypair");
+    let owner = AuthorisationKeyPair::generate().expect("a keypair");
+    let grant_id = GrantId::new(Uuid::from_bytes([1; 16]));
+
+    let object = signed_revocation(&owner, grant_id);
+    let (_, sealed) = authority_envelope(&sender, &recipient, &object, Some(grant_id));
+
+    // The reader records this very key, and the signature over these very bytes is genuine. What
+    // it records the key as is another device's revocation issuer, so resolving the device the
+    // object names answers with nothing.
+    let mut elsewhere = HostAuthority::default();
+    elsewhere.record_issuer(
+        host_device(),
+        ForwardedAuthorityKind::RevocationRequest,
+        &owner,
+    );
+    elsewhere.record_grant(grant_id, owner_device());
+    assert!(matches!(
+        open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
+            verify_authority_payload(&elsewhere, payload).map(|_| ())
+        }),
+        Err(CryptoError::Authentication { .. })
+    ));
+
+    // Recorded for the right device in the wrong role is the same answer: only the target host
+    // issues an ordered revision, and this key is the owner's.
+    let mut wrong_role = HostAuthority::default();
+    wrong_role.record_issuer(
+        owner_device(),
+        ForwardedAuthorityKind::AuthorityRevision,
+        &owner,
+    );
+    wrong_role.record_grant(grant_id, owner_device());
+    assert!(matches!(
+        open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
+            verify_authority_payload(&wrong_role, payload).map(|_| ())
+        }),
+        Err(CryptoError::Authentication { .. })
+    ));
+}
+
+#[test]
+fn an_object_that_names_a_key_the_reader_does_not_record_for_that_device_is_refused() {
+    let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let owner = AuthorisationKeyPair::generate().expect("a keypair");
     let other = AuthorisationKeyPair::generate().expect("a keypair");
     let grant_id = GrantId::new(Uuid::from_bytes([1; 16]));
 
-    let object = signed_revocation(&issuer, grant_id);
+    // A revocation request signed by `other`, naming the owner device. The reader resolves the
+    // owner's own key, whose identifier is not the one the object carries, so the substitution is
+    // caught before any signature is checked.
+    let ForwardedAuthority::RevocationRequest(mut request) = signed_revocation(&other, grant_id)
+    else {
+        unreachable!("the helper builds a revocation request")
+    };
+    request.issuer_device_id = owner_device();
+    let object = ForwardedAuthority::RevocationRequest(request);
     let (_, sealed) = authority_envelope(&sender, &recipient, &object, Some(grant_id));
 
-    let mut host = HostAuthority::default();
-    host.misfile(issuer.key_id(), *other.public());
-    host.record_grant(grant_id, &issuer);
-
+    let host = reader_recording(&owner, grant_id);
     assert!(matches!(
         open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
             verify_authority_payload(&host, payload).map(|_| ())
         }),
         Err(CryptoError::BindingMismatch {
-            what: "the issuer key an authority directory answered with"
+            what: "the issuer key identifier a forwarded authority object names"
         })
     ));
+}
+
+#[test]
+fn a_revision_record_that_names_another_host_is_not_accepted_under_this_ones_key() {
+    let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let owner = AuthorisationKeyPair::generate().expect("a keypair");
+
+    // The owner's key is one the reader records, as the owner device's revocation issuer. It signs
+    // an ordered revision naming the owner device as the host. Only the target host issues one, and
+    // the reader records no revision issuer for that device.
+    let object = ForwardedAuthority::AuthorityRevision(signed_revision(&owner, owner_device()));
+    let (_, sealed) = authority_envelope(&sender, &recipient, &object, None);
+
+    let mut host = HostAuthority::default();
+    host.record_issuer(
+        owner_device(),
+        ForwardedAuthorityKind::RevocationRequest,
+        &owner,
+    );
+    assert!(
+        matches!(
+            open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
+                verify_authority_payload(&host, payload).map(|_| ())
+            }),
+            Err(CryptoError::Authentication { .. })
+        ),
+        "a recorded owner key does not issue a host's ordered revision"
+    );
 }
 
 #[test]
@@ -428,8 +555,12 @@ fn a_grant_reference_names_authority_this_host_holds_rather_than_one_the_envelop
     let (_, sealed) = authority_envelope(&sender, &recipient, &object, Some(asserted));
 
     let mut host = HostAuthority::default();
-    host.record_issuer(&issuer);
-    host.record_grant(held, &issuer);
+    host.record_issuer(
+        owner_device(),
+        ForwardedAuthorityKind::RevocationRequest,
+        &issuer,
+    );
+    host.record_grant(held, owner_device());
 
     assert!(
         matches!(
@@ -458,15 +589,19 @@ fn a_grant_this_host_holds_under_another_issuer_does_not_answer_for_this_one() {
     let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
     let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
     let issuer = AuthorisationKeyPair::generate().expect("a keypair");
-    let elsewhere = AuthorisationKeyPair::generate().expect("a keypair");
+    let elsewhere = host_device();
     let grant_id = GrantId::new(Uuid::from_bytes([1; 16]));
 
     let object = signed_revocation(&issuer, grant_id);
     let (_, sealed) = authority_envelope(&sender, &recipient, &object, Some(grant_id));
 
     let mut host = HostAuthority::default();
-    host.record_issuer(&issuer);
-    host.record_grant(grant_id, &elsewhere);
+    host.record_issuer(
+        owner_device(),
+        ForwardedAuthorityKind::RevocationRequest,
+        &issuer,
+    );
+    host.record_grant(grant_id, elsewhere);
 
     assert!(matches!(
         open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
@@ -496,9 +631,7 @@ fn a_payload_that_carries_no_authority_is_never_checked_as_authority() {
     smuggled.grant_id = Nullable::some(grant_id);
     let sealed = seal_envelope(&sender, recipient.public(), &smuggled).expect("sealed");
 
-    let mut host = HostAuthority::default();
-    host.record_issuer(&issuer);
-    host.record_grant(grant_id, &issuer);
+    let host = reader_recording(&issuer, grant_id);
 
     let opened = open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |_| {
         unreachable!("a sync change carries no authority")
@@ -515,29 +648,18 @@ fn a_payload_that_carries_no_authority_is_never_checked_as_authority() {
 #[test]
 fn a_host_revision_record_is_verified_under_the_host_key_the_reader_holds() {
     let host_key = AuthorisationKeyPair::generate().expect("a keypair");
-    let mut record = AuthorityRevisionRecord {
-        host_device_id: DeviceId::new(Uuid::from_bytes([8; 16])),
-        authority_revision: AuthorityRevision::new(4),
-        previous_revision: AuthorityRevision::new(3),
-        applied_requests: CanonicalSet::new(),
-        issued_at_ms: TimestampMs::new(NOW_MS),
-        host_key_id: host_key.key_id(),
-        signature: Signature64::from_bytes([0; 64]),
-    };
-    let transcript = SigningTranscript::from_canonical_bytes(
-        kr_protocol::pairing::AUTHORITY_REVISION_DOMAIN,
-        record.signing_input().expect("canonical bytes"),
-    )
-    .expect("a transcript");
-    record.signature = sign::sign(&host_key, &transcript).expect("a signature");
-    let object = ForwardedAuthority::AuthorityRevision(record);
+    let object = ForwardedAuthority::AuthorityRevision(signed_revision(&host_key, host_device()));
 
     let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
     let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
     let (_, sealed) = authority_envelope(&sender, &recipient, &object, None);
 
     let mut reader = HostAuthority::default();
-    reader.record_issuer(&host_key);
+    reader.record_issuer(
+        host_device(),
+        ForwardedAuthorityKind::AuthorityRevision,
+        &host_key,
+    );
     let mut verified = None;
     open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
         verified = Some(verify_authority_payload(&reader, payload)?);
@@ -545,6 +667,99 @@ fn a_host_revision_record_is_verified_under_the_host_key_the_reader_holds() {
     })
     .expect("the record verifies");
     assert_eq!(verified, Some(object));
+}
+
+/// One forwarded revocation request with its signature left out, in the tagged shape the union
+/// travels as.
+#[derive(serde::Serialize)]
+struct UnsignedRevocation {
+    revocation_request: UnsignedRequest,
+}
+
+/// A revocation request's fields without the signature, which nothing legitimate produces.
+#[derive(serde::Serialize)]
+struct UnsignedRequest {
+    request_id: RevocationRequestId,
+    issuer_device_id: DeviceId,
+    host_device_id: DeviceId,
+    target: RevocationTarget,
+    issued_at_ms: TimestampMs,
+    issuer_key_id: KeyId,
+}
+
+#[test]
+fn an_authority_object_with_no_signature_field_is_not_one_this_build_reads() {
+    // The unsigned case a reader actually meets is a field that is not there. The signed objects of
+    // this protocol declare every field and refuse an unknown one, so a payload that leaves the
+    // signature out never becomes a `ForwardedAuthority` at all: it stops at the decoder, before
+    // any key is resolved.
+    let issuer = AuthorisationKeyPair::generate().expect("a keypair");
+    let grant_id = GrantId::new(Uuid::from_bytes([1; 16]));
+    let mut grant_ids = CanonicalSet::new();
+    grant_ids.insert(grant_id);
+    let canonical = kr_cbor::to_canonical_vec(&UnsignedRevocation {
+        revocation_request: UnsignedRequest {
+            request_id: RevocationRequestId::new(Uuid::from_bytes([5; 16])),
+            issuer_device_id: owner_device(),
+            host_device_id: host_device(),
+            target: RevocationTarget::Grants { grant_ids },
+            issued_at_ms: TimestampMs::new(NOW_MS),
+            issuer_key_id: issuer.key_id(),
+        },
+    })
+    .expect("canonical bytes");
+
+    let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let mut plaintext = plaintext(
+        &sender,
+        &recipient,
+        MailboxPayloadType::SignedAuthorityObject,
+        canonical,
+    );
+    plaintext.grant_id = Nullable::some(grant_id);
+    let sealed = seal_envelope(&sender, recipient.public(), &plaintext).expect("sealed");
+
+    let host = reader_recording(&issuer, grant_id);
+    assert!(matches!(
+        open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
+            verify_authority_payload(&host, payload).map(|_| ())
+        }),
+        Err(CryptoError::Encoding(_))
+    ));
+}
+
+#[test]
+fn an_envelope_version_this_build_does_not_publish_is_not_decoded() {
+    // `EnvelopeVersion` is a closed set and `EnvelopePlaintext` refuses an unknown field, so a
+    // plaintext naming another version, or carrying one more field, is not an envelope this build
+    // reads. The check is on the decoder because that is where it happens: the box authenticates
+    // whatever was sealed, and what makes those bytes an envelope is this decoding.
+    let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let canonical =
+        kr_cbor::to_canonical_vec(&fully_populated(&sender, &recipient)).expect("canonical bytes");
+    assert!(
+        kr_cbor::from_canonical_slice::<EnvelopePlaintext>(&canonical, &kr_cbor::Limits::DEFAULT)
+            .is_ok()
+    );
+
+    let mut document: serde_json::Value = serde_json::from_slice(
+        &serde_json::to_vec(&fully_populated(&sender, &recipient)).expect("a value"),
+    )
+    .expect("a value");
+    document["version"] = serde_json::Value::String("kr-mailbox/2".to_owned());
+    assert!(
+        serde_json::from_value::<EnvelopePlaintext>(document.clone()).is_err(),
+        "a version this build does not publish is refused"
+    );
+
+    document["version"] = serde_json::Value::String("kr-mailbox/1".to_owned());
+    document["extra"] = serde_json::Value::Bool(true);
+    assert!(
+        serde_json::from_value::<EnvelopePlaintext>(document).is_err(),
+        "a field this build does not declare is refused"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -670,8 +885,8 @@ fn a_routing_record_cannot_introduce_a_sender_key() {
     let impostor = StoredEnvelopeKeyPair::generate().expect("a keypair");
     let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
 
-    // The impostor seals a well-formed envelope and writes the paired sender's identifier into
-    // every place a name appears, inside the encryption and outside it.
+    // The impostor seals a well-formed envelope of its own and then writes the paired sender's
+    // identifier into the routing record, which is the one field a service can rewrite.
     let mut claimed = plaintext(
         &impostor,
         &recipient,
@@ -729,8 +944,9 @@ fn a_delivered_item_whose_shape_is_not_one_the_rules_produce_is_refused_before_a
         })
     ));
 
-    // A lifetime past section 9's day is refused on the same rule, which is what stops an item
-    // outliving the replay record that would catch it a second time.
+    // A lifetime past section 9's day is refused on the same rule. It is the service's own
+    // admission rule, applied here too so a recipient does not accept an item the service should
+    // never have stored.
     let mut long_lived = plaintext.clone();
     long_lived.expires_at_ms = TimestampMs::new(NOW_MS + 48 * 60 * 60 * 1000);
     let sealed_long = seal_envelope(&sender, recipient.public(), &long_lived).expect("sealed");
@@ -834,8 +1050,6 @@ fn the_committed_authority_vector_opens_and_verifies_under_the_issuer_it_names()
     let expected: ForwardedAuthority =
         serde_json::from_value(section["object_json"].clone()).expect("a forwarded object");
 
-    let mut host = HostAuthority::default();
-    host.record_issuer(&issuer);
     let ForwardedAuthority::RevocationRequest(request) = &expected else {
         unreachable!("the vector publishes a revocation request")
     };
@@ -846,7 +1060,16 @@ fn the_committed_authority_vector_opens_and_verifies_under_the_issuer_it_names()
         .iter()
         .next()
         .expect("the vector revokes one grant");
-    host.record_grant(grant_id, &issuer);
+
+    // The reader records the vector's issuer as the revocation issuer of the device the object
+    // names, which is the only pairing under which that signature means anything.
+    let mut host = HostAuthority::default();
+    host.record_issuer(
+        request.issuer_device_id,
+        ForwardedAuthorityKind::RevocationRequest,
+        &issuer,
+    );
+    host.record_grant(grant_id, request.issuer_device_id);
 
     let mut verified = None;
     let opened = open_envelope(
@@ -874,4 +1097,98 @@ fn the_committed_authority_vector_opens_and_verifies_under_the_issuer_it_names()
         hex::encode(request.signing_input().expect("canonical bytes")),
         section["signing_input_hex"].as_str().expect("a hex string"),
     );
+}
+
+// ---------------------------------------------------------------------------
+// The two halves together: a delivered item that carries authority
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_delivered_authority_object_is_refused_until_the_reader_records_its_issuer_and_then_accepted_once()
+ {
+    let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let issuer = AuthorisationKeyPair::generate().expect("a keypair");
+    let grant_id = GrantId::new(Uuid::from_bytes([1; 16]));
+
+    let object = signed_revocation(&issuer, grant_id);
+    let (_, sealed) = authority_envelope(&sender, &recipient, &object, Some(grant_id));
+    let senders = paired_with(&sender);
+    let mut ledger = ReplayLedger::new();
+
+    // The reader has not learnt this issuer yet. The item is refused, and the replay identifier is
+    // not spent: this is the transient case the ordering exists for.
+    let unknowing = HostAuthority::default();
+    assert!(matches!(
+        open_delivered_envelope(
+            &recipient,
+            &senders,
+            &mut ledger,
+            &sealed,
+            NOW_MS,
+            |payload| { verify_authority_payload(&unknowing, payload).map(|_| ()) }
+        ),
+        Err(CryptoError::Authentication { .. })
+    ));
+    assert!(
+        ledger.is_empty(),
+        "a refused item spends no replay identifier"
+    );
+
+    // A signature that does not verify is refused the same way, and also spends nothing.
+    let ForwardedAuthority::RevocationRequest(mut tampered) = object.clone() else {
+        unreachable!("the helper builds a revocation request")
+    };
+    tampered.issued_at_ms = TimestampMs::new(NOW_MS + 1);
+    let (_, resealed) = authority_envelope(
+        &sender,
+        &recipient,
+        &ForwardedAuthority::RevocationRequest(tampered),
+        Some(grant_id),
+    );
+    let host = reader_recording(&issuer, grant_id);
+    assert!(matches!(
+        open_delivered_envelope(
+            &recipient,
+            &senders,
+            &mut ledger,
+            &resealed,
+            NOW_MS,
+            |payload| { verify_authority_payload(&host, payload).map(|_| ()) }
+        ),
+        Err(CryptoError::Authentication { .. })
+    ));
+    assert!(ledger.is_empty());
+
+    // Once the reader records the issuer, the item is accepted exactly once.
+    let mut verified = None;
+    open_delivered_envelope(
+        &recipient,
+        &senders,
+        &mut ledger,
+        &sealed,
+        NOW_MS,
+        |payload| {
+            verified = Some(verify_authority_payload(&host, payload)?);
+            Ok(())
+        },
+    )
+    .expect("the item is accepted");
+    assert_eq!(verified, Some(object));
+    assert_eq!(ledger.len(), 1);
+
+    // The second delivery stops at the replay identifier, before the item is decrypted again.
+    assert!(matches!(
+        open_delivered_envelope(
+            &recipient,
+            &senders,
+            &mut ledger,
+            &sealed,
+            NOW_MS,
+            |payload| { verify_authority_payload(&host, payload).map(|_| ()) }
+        ),
+        Err(CryptoError::BindingMismatch {
+            what: "a replayed envelope identifier"
+        })
+    ));
 }

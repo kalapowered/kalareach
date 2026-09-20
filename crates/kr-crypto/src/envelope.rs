@@ -133,7 +133,15 @@ pub(crate) fn pad_to_bucket(encoded: &mut [u8]) -> Result<(Vec<u8>, u64)> {
     padded.extend_from_slice(encoded);
     sodium::memzero(encoded);
     padded.resize(bucket as usize, 0);
-    let padded_len = sodium::pad(&mut padded, content_len as usize, granularity as usize)?;
+    let padded_len = match sodium::pad(&mut padded, content_len as usize, granularity as usize) {
+        Ok(padded_len) => padded_len,
+        Err(error) => {
+            // The buffer already holds the plaintext, so a failure here clears it rather than
+            // dropping an ordinary `Vec` with the content still in it.
+            sodium::memzero(&mut padded);
+            return Err(error);
+        }
+    };
     if padded_len as u64 != bucket {
         sodium::memzero(&mut padded);
         return Err(CryptoError::BindingMismatch {
@@ -306,6 +314,16 @@ impl ReplayLedger {
     /// Drops the identifiers whose retention has ended at `now_ms`.
     pub fn expire(&mut self, now_ms: u64) {
         self.retained.retain(|_, until| *until > now_ms);
+    }
+
+    /// Returns true when this identifier has already been accepted.
+    ///
+    /// A read. It answers about the identifier alone, so a caller can refuse a redelivery before
+    /// spending the work of opening it; what decides acceptance is still [`Self::admit`], on the
+    /// identifier the box authenticated.
+    #[must_use]
+    pub fn contains(&self, envelope_id: EnvelopeId) -> bool {
+        self.retained.contains_key(&envelope_id)
     }
 
     /// Returns how many identifiers are retained.

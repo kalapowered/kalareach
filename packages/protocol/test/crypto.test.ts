@@ -168,6 +168,44 @@ describe('envelope vectors', () => {
     expect(bytesToHex(encodeCanonical(value))).toBe(document.key_wrap.canonical_hex)
   })
 
+  it('verifies the forwarded authority object under the issuer key it names', () => {
+    const section = document.authority_object
+    // The signature covers the domain-separated transcript the object itself publishes, and the
+    // issuer key is named by its identifier rather than carried by the envelope. Recomputing the
+    // transcript here is what says the Rust side signed what it claims to have signed.
+    const signingInputBytes = hexToBytes(section.signing_input_hex)
+    const transcript = decodeCanonical(signingInputBytes)
+    expect(transcript.kind).toBe('array')
+    if (transcript.kind !== 'array') throw new Error('unreachable')
+    expect(transcript.items[0]).toEqual(krText(section.signing_domain))
+    expect(bytesToHex(encodeCanonical(transcript))).toBe(section.signing_input_hex)
+
+    const publicKey = ed25519PublicKey(hexToBytes(section.issuer.public_key_hex))
+    const signature = fromBase64url(section.object_json.revocation_request.signature)
+    expect(verify(null, Buffer.from(signingInputBytes), publicKey, Buffer.from(signature))).toBe(
+      true
+    )
+
+    // A single flipped byte of the transcript is refused, so the check is the signature's and not
+    // the encoding's.
+    const altered = new Uint8Array(signingInputBytes)
+    altered[altered.length - 1] ^= 0x01
+    expect(verify(null, Buffer.from(altered), publicKey, Buffer.from(signature))).toBe(false)
+
+    // The envelope's payload is the object's canonical encoding and nothing else, which is what
+    // makes the envelope a delivery rather than an authorisation.
+    const payload = hexToBytes(section.payload_canonical_hex)
+    const object = decodeCanonical(payload)
+    expect(object.kind).toBe('map')
+    expect(bytesToHex(encodeCanonical(object))).toBe(section.payload_canonical_hex)
+    expect(section.envelope.plaintext_json.payload).toBe(
+      Buffer.from(payload).toString('base64url')
+    )
+    expect(section.envelope.plaintext_json.payload_type).toBe('signed_authority_object')
+    // A payload that carries authority is never coalesced, so it names no thread.
+    expect(section.envelope.plaintext_json.thread_id).toBeNull()
+  })
+
   it('applies the published size bucket rule', () => {
     const kib = 1024
     const granularity = (plaintext: number): number =>

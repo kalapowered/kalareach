@@ -3,9 +3,15 @@
 //! Section 20: *decrypt only against previously paired sender keys*. A mailbox item arrives with a
 //! routing record the service wrote, and that record names a sender. The record is untrusted, so
 //! the name is used for one thing only: to **look up** a key this device already holds.
-//! [`PairedSenders`] is that set, and [`open_delivered_envelope`] is the only entry point that
-//! takes a delivered item, so a caller cannot reach an envelope's payload by handing the opener a
-//! key the envelope itself supplied.
+//! [`PairedSenders`] is that set, and [`open_delivered_envelope`] is the entry point a service's
+//! delivery goes through, so nothing an envelope carries can introduce the key it is opened
+//! against.
+//!
+//! [`super::open_envelope`] stays public beneath it, for a caller that already knows which key it
+//! means: the vector generator opens a published envelope, and a host that has selected a sender
+//! some other way opens with it directly. That caller takes on the two duties this entry point
+//! discharges, selecting the sender from what it has paired with and recording the replay
+//! identifier.
 //!
 //! The order is the contract:
 //!
@@ -44,7 +50,9 @@ impl PairedSenders {
     /// Records a paired device's stored-envelope key, returning the key it replaced.
     ///
     /// The identifier is derived here. A caller that supplied one could file a key under another
-    /// key's name, and every lookup after that would answer with the wrong key.
+    /// key's name, and every lookup after that would answer with the wrong key. What the caller
+    /// still vouches for is the pairing itself: this set holds the keys it is given, and section 10
+    /// is what puts a key in a caller's hands.
     pub fn pair(&mut self, key: StoredEnvelopeKey) -> Option<StoredEnvelopeKey> {
         let id = key_id(KeyPurpose::StoredEnvelope, key.as_bytes());
         self.by_key_id.insert(id, key)
@@ -96,6 +104,8 @@ impl PairedSenders {
 ///
 /// `verify_payload` carries the issuer's own verification for an authority-bearing payload, exactly
 /// as [`super::open_envelope`] requires. [`super::verify_authority_payload`] is what a host passes.
+/// It verifies and applies nothing: a refused item can be delivered again, so anything the callback
+/// did would be done again with it.
 ///
 /// # Errors
 ///
@@ -124,6 +134,17 @@ where
             what: "the shape of a delivered envelope",
         })?;
 
+    // A redelivery of something already accepted is refused here, on the identifier the record
+    // claims, so a service that offers one back does not cost a decryption and a signature check
+    // every time. The claim is untrusted and this is only an early exit: what settles acceptance
+    // is the admission at the end, on the identifier the box authenticated. A record that claimed
+    // a spent identifier falsely is refused, which is a service suppressing its own item.
+    if ledger.contains(sealed_envelope.routing.envelope_id) {
+        return Err(CryptoError::BindingMismatch {
+            what: "a replayed envelope identifier",
+        });
+    }
+
     // The routing record is untrusted, so the sender it names selects a key rather than supplying
     // one. A name this device has no key for is where an unpaired sender stops, before any
     // decryption is attempted.
@@ -136,9 +157,9 @@ where
 
     let plaintext = open_envelope(recipient, sender, sealed_envelope, now_ms, verify_payload)?;
 
-    // Last, because an envelope refused for a reason that may pass — an issuer key this host has
-    // not learnt yet — must still be openable when it does. An envelope that was accepted is one
-    // that will never be accepted again.
+    // Last, because an envelope refused for a reason that may pass, such as an issuer key this
+    // host has not learnt yet, must still be openable when it does. An envelope that was accepted
+    // is one that will never be accepted again.
     ledger.admit(&plaintext, now_ms)?;
     Ok(plaintext)
 }

@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use kr_cbor::CborError;
 
-use crate::ids::{EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId};
+use crate::ids::{
+    DeviceId, EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId,
+};
 use crate::pairing::{AuthorityRevisionRecord, RevocationRequest};
 use crate::scalars::{
     Bytes, Digest256, KeyId, Nonce192, Nullable, Signature64, StoredEnvelopeKey, TimestampMs, U64,
@@ -135,11 +137,67 @@ pub enum ForwardedAuthority {
     AuthorityRevision(AuthorityRevisionRecord),
 }
 
+/// Which kind of authority object a forwarded payload carries.
+///
+/// The two are issued by different devices in different roles: a paired owner publishes a
+/// revocation request, and only the target host issues an ordered authority revision. A reader
+/// resolves an issuer by device **and** by kind for that reason, so a key it records for one role
+/// cannot sign for the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ForwardedAuthorityKind {
+    /// A remote owner's signed revocation request.
+    RevocationRequest,
+    /// One ordered authority revision a host issued.
+    AuthorityRevision,
+}
+
+impl ForwardedAuthorityKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 2] = [Self::RevocationRequest, Self::AuthorityRevision];
+
+    /// Returns the stable name this kind is reported under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RevocationRequest => "revocation_request",
+            Self::AuthorityRevision => "authority_revision",
+        }
+    }
+}
+
+impl core::fmt::Display for ForwardedAuthorityKind {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl ForwardedAuthority {
+    /// Returns which kind of authority object this is.
+    #[must_use]
+    pub const fn kind(&self) -> ForwardedAuthorityKind {
+        match self {
+            Self::RevocationRequest(_) => ForwardedAuthorityKind::RevocationRequest,
+            Self::AuthorityRevision(_) => ForwardedAuthorityKind::AuthorityRevision,
+        }
+    }
+
+    /// Returns the device the object says issued it.
+    ///
+    /// This is the name a reader resolves a key through. Naming a device does not establish that
+    /// it issued anything: the key the reader records for that device, in that role, is what the
+    /// signature has to verify under, and the identifier the object carries has to be that key's.
+    #[must_use]
+    pub const fn issuer_device_id(&self) -> DeviceId {
+        match self {
+            Self::RevocationRequest(request) => request.issuer_device_id,
+            Self::AuthorityRevision(record) => record.host_device_id,
+        }
+    }
+
     /// Returns the key identifier of the issuer whose signature covers this object.
     ///
-    /// It is a name, not a key. What it names is resolved against the reader's own authority
-    /// records; an object that names a key the reader does not hold is refused rather than trusted.
+    /// It is a name, not a key. What it names is checked against the key the reader records for
+    /// [`Self::issuer_device_id`]; an object naming any other key is refused rather than trusted.
     #[must_use]
     pub const fn issuer_key_id(&self) -> KeyId {
         match self {
