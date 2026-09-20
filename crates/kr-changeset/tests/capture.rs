@@ -2489,3 +2489,60 @@ fn two_views_of_one_target() {
         }
     }
 }
+
+/// KR-REQ-14.33 and D-098a: where a filesystem folds case, `.GIT` **is** the entry Git reads.
+///
+/// The name a listing returns and the entry Git reads are not the same string. A reference file
+/// written as `.GIT` inside a repository's own data is what Git opens as `.git` on a filesystem
+/// that folds case, and it names where another repository keeps its data — a directory of this
+/// tree. So the scan asks the directory whether it holds one rather than comparing the name it
+/// was listed under.
+#[test]
+fn a_reference_file_under_a_folded_name_is_still_read() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "folded-name-tree");
+    let inside = path.join(".git/checkout");
+    std::fs::create_dir_all(&inside).expect("a tree inside the data");
+    std::fs::write(inside.join(".GIT"), b"gitdir: ../../vendor/repo-data\n")
+        .expect("the reference under the other spelling");
+    if std::fs::create_dir(inside.join(".git")).is_ok() {
+        println!(
+            "not exercised: this filesystem keeps `.git` and `.GIT` apart, so this file is \
+                  not the entry Git reads"
+        );
+        return;
+    }
+    write(&path, "vendor/repo-data/HEAD", "ref: refs/heads/main\n");
+    write(
+        &path,
+        "vendor/repo-data/config",
+        "[remote \"origin\"]\n\turl = https://user:a-secret-token@example.invalid/x.git\n",
+    );
+
+    let workspace = fixture.workspace("folded-name-tree");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.starts_with("vendor/repo-data")),
+        "what the reference names is not in the version: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        record
+            .exclusions
+            .iter()
+            .any(|entry| entry.path.starts_with("vendor/repo-data")),
+        "and it is named where it was found: {:?}",
+        record.exclusions
+    );
+}

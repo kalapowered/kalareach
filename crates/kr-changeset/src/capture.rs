@@ -1299,7 +1299,7 @@ fn nested_repositories<'a>(
             &mut inspected,
             &mut budget,
             0,
-            0,
+            1,
         )?;
     }
     // What this walk has already looked through for the repositories inside it, which is its own
@@ -1439,7 +1439,18 @@ fn nested_data(
     let beside = match data.probe(&common) {
         // It keeps everything in one place.
         Err(kr_transfer::Escape::NotFound { .. }) => None,
-        Ok(_) => resolve_target(clone_stack(&stack)?, directory, &data, &common, tree)?,
+        Ok(_) => {
+            // A reference of its own, charged and checked like every other: where a repository
+            // keeps what its worktrees share is another name, and another place to go and look.
+            if hops + 1 > MAX_REFERENCE_HOPS {
+                return Err(unplaceable_because(
+                    directory,
+                    "following where these repositories say their own data is went further than \
+                     this host follows",
+                ));
+            }
+            resolve_target(clone_stack(&stack)?, directory, &data, &common, tree)?
+        }
         Err(_) => return Err(unplaceable(directory)),
     };
     // The chain that reached the data is what the scan stands on, with the mount-confined handle
@@ -1958,6 +1969,50 @@ fn administrative_descendants(
             return Ok(());
         }
     }
+    // Whether the directory this scan is standing in is **another repository's tree**, kept
+    // inside this one's data. Where that repository keeps its own data is a name this scan would
+    // otherwise never read, and it can reach an ordinary directory of the working tree: excluding
+    // the data this `.git` sits inside says nothing about that directory, whose bytes a capture
+    // would take and an apply would write over. So it is placed here, by the same descent that
+    // places one found in the working tree (D-098a).
+    //
+    // Asked of the directory rather than read off the listing, because the entry Git reads and
+    // the name a listing returns are not the same string: a filesystem that folds case reaches
+    // this entry through `.GIT` as well, and comparing the name a listing gave would miss it.
+    {
+        let holder = stack
+            .last()
+            .ok_or_else(|| unreadable_data("this host could not read what is in it".to_owned()))?;
+        let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
+        match holder.probe(&administrative) {
+            Ok(kind) => {
+                let kind = match kind {
+                    ObjectKind::Directory => ObjectKind::Directory,
+                    _ => ObjectKind::File,
+                };
+                into.insert(identity_of(holder));
+                let from = clone_stack(stack.as_slice())?;
+                nested_data(
+                    tree,
+                    where_it_is,
+                    holder,
+                    kind,
+                    from,
+                    into,
+                    inspected,
+                    budget,
+                    hops + 1,
+                )?;
+            }
+            // Ordinary data of the repository this scan belongs to.
+            Err(kr_transfer::Escape::NotFound { .. }) => {}
+            Err(_) => {
+                return Err(unreadable_data(
+                    "this host could not say whether it holds another repository's tree".to_owned(),
+                ));
+            }
+        }
+    }
     let entries = {
         let directory = stack
             .last()
@@ -1990,36 +2045,6 @@ fn administrative_descendants(
                  directory's content this repository's own data under another path",
                 kr_project::git::redact(&name)
             )));
-        }
-        // A `.git` here says the directory this scan is standing in is another repository's tree,
-        // kept inside this one's data. Where **that** repository keeps its own data is a name
-        // this scan would otherwise never read, and it can reach an ordinary directory of the
-        // working tree: excluding the data this `.git` sits inside says nothing about that
-        // directory, whose bytes a capture would take and an apply would write over. So it is
-        // placed here, by the same descent that places one found in the working tree (D-098a).
-        if name == grant::ADMINISTRATIVE_DIRECTORY {
-            let kind = if kind.is_dir() {
-                ObjectKind::Directory
-            } else {
-                ObjectKind::File
-            };
-            let holder = stack.last().ok_or_else(|| {
-                unreadable_data("this host could not read what is in it".to_owned())
-            })?;
-            into.insert(identity_of(holder));
-            let from = clone_stack(stack.as_slice())?;
-            nested_data(
-                tree,
-                where_it_is,
-                holder,
-                kind,
-                from,
-                into,
-                inspected,
-                budget,
-                hops + 1,
-            )?;
-            continue;
         }
         if kind.is_file() {
             // A plain file, opened rather than taken on trust. A file mounted here is a second
