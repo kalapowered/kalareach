@@ -133,6 +133,9 @@ rustls = { version = "=0.23.45", default-features = false, features = ["logging"
 anyhow = "=1.0.104"
 # Apple's blocks, which the user-verification ceremony's completion handler is one of.
 block2 = "=0.6.2"
+coreaudio-rs = { version = "=0.14.2", default-features = false, features = ["audio_unit"] }
+opus = "=0.4.0"
+opusic-sys = "=0.7.5"
 rmcp = { version = "=3.4.0", default-features = false, features = ["macros", "schemars", "server", "transport-io"] }
 rusqlite = "=0.40.2"
 rustix = "=1.1.4"
@@ -167,6 +170,7 @@ tokio-util = "=0.7.18"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
 url = "=2.5.8"
+webrtc = { version = "=0.21.0", default-features = false, features = ["runtime-tokio", "crypto-ring"] }
 # The one outbound HTTP request this product makes from a client: an image a person explicitly
 # imported. Blocking, rustls-backed and used with an explicit response-size limit.
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "_ring"] }

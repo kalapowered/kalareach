@@ -87,6 +87,12 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("pairing_scan", None),
     ("pairing_verify_owner", None),
     ("pair_status", Some(Method::PairStatus)),
+    // Voice.
+    ("voice_start", Some(Method::VoiceStart)),
+    ("voice_stop", Some(Method::VoiceStop)),
+    ("voice_grant", Some(Method::VoiceGrant)),
+    ("voice_delegate", Some(Method::VoiceDelegate)),
+    ("voice_context", Some(Method::VoiceContext)),
     // The application's own boundary.
     ("open_external", None),
     ("import_remote_image", None),
@@ -139,6 +145,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         pairing_scan,
         pairing_verify_owner,
         pair_status,
+        voice_start,
+        voice_stop,
+        voice_grant,
+        voice_delegate,
+        voice_context,
         open_external,
         import_remote_image,
         choose_export_destination,
@@ -409,6 +420,27 @@ mutate_command!(
 mutate_command!(
     /// Cancels a pending action.
     action_cancel, Method::ActionCancel, kr_protocol::receipt::ActionCancelParams
+);
+mutate_command!(
+    /// Starts a voice session.
+    voice_start, Method::VoiceStart, kr_protocol::voice::VoiceStartParams
+);
+mutate_command!(
+    /// Stops a voice session.
+    voice_stop, Method::VoiceStop, kr_protocol::voice::VoiceStopParams
+);
+mutate_command!(
+    /// Creates or updates a voice grant.
+    voice_grant, Method::VoiceGrant, kr_protocol::voice::VoiceGrantParams
+);
+mutate_command!(
+    /// Submits a voice delegation.
+    voice_delegate, Method::VoiceDelegate, kr_protocol::voice::VoiceDelegateParams
+);
+read_command!(
+    /// Reads the selected voice context.
+    voice_context, Method::VoiceContext,
+    kr_protocol::voice::VoiceContextParams => kr_protocol::voice::VoiceContextResult
 );
 
 /// Sends one dropped file to the host, and answers with the verified attachment handle.
@@ -762,7 +794,6 @@ mod tests {
             "session.rename",
             "project.clone",
             "workflow.run",
-            "voice.start",
             "device.revoke",
             "plugin.install",
             "plugin.grant",
