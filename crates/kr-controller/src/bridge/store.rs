@@ -49,18 +49,7 @@ struct Observation {
 /// one says nothing about another, so every answer is recorded against the instance the bridge was
 /// opened for. The number is this host's own and is handed out once per enrolment, starting at one,
 /// so a record written by another build carries none of these and matches nothing.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnrolmentInstance(u64);
 
 /// What one opened bridge established about an environment's own local channel.
