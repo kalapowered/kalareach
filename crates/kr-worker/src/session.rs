@@ -1650,14 +1650,29 @@ impl Session {
     ///
     /// This is the delivery half of section 12's fan-out. The broker decides what happened and in
     /// what order; this hands that to the views attached to the session the instance belongs to,
-    /// one event each, in the order it is called. It carries no output, so it costs no subscriber
-    /// its queue and never touches the output stream.
+    /// one event each, in the order it is called. The event is charged against each subscriber's
+    /// queue budget so a stalled view resynchronises rather than holding native traffic.
     pub fn publish_agent_resource(&mut self, event: &kr_protocol::projection::AgentResourceEvent) {
+        let cost = crate::snapshot::wire::measure(event).map_or(256, |cost| cost.bytes);
+        let oldest = self.history.oldest_retained_cursor();
+        let cursor = self.history.next_cursor();
         for attachment_id in self.hub.subscribers() {
-            self.hub.publish_event(
-                attachment_id,
-                crate::output::OutputDelivery::AgentResource(Box::new(event.clone())),
-            );
+            if self
+                .hub
+                .publish_agent_resource(attachment_id, cursor, event.clone(), cost, oldest)
+            {
+                self.projections.forget(attachment_id);
+            }
+        }
+    }
+
+    /// Tells every attached view to resynchronise.
+    pub fn resync_all_views(&mut self, reason: kr_protocol::recovery::ResyncReason) {
+        let oldest = self.history.oldest_retained_cursor();
+        let cursor = self.history.next_cursor();
+        self.hub.require_resync_all(reason, cursor, oldest);
+        for id in self.hub.subscribers() {
+            self.projections.forget(id);
         }
     }
 

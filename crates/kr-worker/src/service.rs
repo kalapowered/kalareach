@@ -1015,10 +1015,8 @@ impl WorkerService {
                             // no output, so it neither advances the output stream nor waits behind
                             // one: the fence the client's keystrokes waited for is not a question
                             // about the screen.
-                            // A resolution of this session's agent. It carries no output, so it
-                            // neither advances the output stream nor waits behind one: what
-                            // changed is a pending resource rather than the screen.
-                            OutputDelivery::AgentResource(event) => {
+                            // A resolution of this session's agent.
+                            OutputDelivery::AgentResource { event, .. } => {
                                 let Some(notification) = notification(
                                     &stream_id,
                                     sequence,

@@ -63,9 +63,14 @@ pub enum OutputDelivery {
     EditorBusy(Box<kr_protocol::root::EditorBusyEvent>),
     /// One committed broker transition, for a view that observes this session's agent.
     ///
-    /// It carries no output, so it costs the subscriber's queue nothing and never advances the
-    /// output stream: what changed is a pending resource, not the screen.
-    AgentResource(Box<kr_protocol::projection::AgentResourceEvent>),
+    /// It is charged against the subscriber's queue bound so that a stalled view cannot
+    /// accumulate unlimited events.
+    AgentResource {
+        /// The event that announces what changed about the resource.
+        event: Box<kr_protocol::projection::AgentResourceEvent>,
+        /// How many bytes this event counts against the subscriber's queue limit.
+        bytes: usize,
+    },
     /// The subscriber must discard its partial state and install a fresh snapshot.
     Resync(ResyncRequired),
     /// The attachment was detached. Nothing more will arrive on this stream.
@@ -78,8 +83,8 @@ impl OutputDelivery {
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
-            Self::Projection { bytes, .. } => *bytes,
-            Self::AgentResource(_) | Self::EditorBusy(_) | Self::Resync(_) | Self::Detached => 0,
+            Self::Projection { bytes, .. } | Self::AgentResource { bytes, .. } => *bytes,
+            Self::EditorBusy(_) | Self::Resync(_) | Self::Detached => 0,
         }
     }
 
@@ -425,6 +430,55 @@ impl OutputHub {
         false
     }
 
+    /// Delivers one agent resource event to one subscriber.
+    ///
+    /// The event is charged against the subscriber's send queue limit. Returns whether the
+    /// subscriber was told to resynchronise because its queue exceeded the limit.
+    pub fn publish_agent_resource(
+        &mut self,
+        attachment_id: AttachmentId,
+        cursor: u64,
+        event: kr_protocol::projection::AgentResourceEvent,
+        cost: usize,
+        oldest_retained_cursor: u64,
+    ) -> bool {
+        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
+            return false;
+        };
+        if subscriber.resynchronising {
+            return false;
+        }
+        let queued = subscriber.queued.load(Ordering::Acquire);
+        if queued.saturating_add(cost) > subscriber.limit {
+            subscriber.resynchronising = true;
+            let marker = ResyncRequired {
+                reason: ResyncReason::SendQueueFull,
+                cursor: U64::new(cursor),
+                oldest_retained_cursor: U64::new(oldest_retained_cursor),
+            };
+            if subscriber
+                .sender
+                .send(OutputDelivery::Resync(marker))
+                .is_err()
+            {
+                self.subscribers.remove(&attachment_id);
+            }
+            return true;
+        }
+        subscriber.queued.fetch_add(cost, Ordering::AcqRel);
+        if subscriber
+            .sender
+            .send(OutputDelivery::AgentResource {
+                event: Box::new(event),
+                bytes: cost,
+            })
+            .is_err()
+        {
+            self.subscribers.remove(&attachment_id);
+        }
+        false
+    }
+
     fn deliver_one(
         &mut self,
         attachment_id: AttachmentId,
@@ -486,6 +540,25 @@ impl OutputHub {
             // The same accounting rule as an overflow. Bytes already queued still belong to the
             // subscriber and it releases them as it reads; zeroing the counter here would make
             // every one of those releases subtract from nothing.
+            subscriber.resynchronising = true;
+            let _ = subscriber
+                .sender
+                .send(OutputDelivery::Resync(ResyncRequired {
+                    reason,
+                    cursor: U64::new(cursor),
+                    oldest_retained_cursor: U64::new(oldest_retained_cursor),
+                }));
+        }
+    }
+
+    /// Tells every subscriber to resynchronise.
+    pub fn require_resync_all(
+        &mut self,
+        reason: ResyncReason,
+        cursor: u64,
+        oldest_retained_cursor: u64,
+    ) {
+        for subscriber in self.subscribers.values_mut() {
             subscriber.resynchronising = true;
             let _ = subscriber
                 .sender
@@ -596,5 +669,60 @@ mod tests {
             staying.recv().await.expect("a delivery"),
             OutputDelivery::Bytes { .. }
         ));
+    }
+
+    fn test_agent_event() -> kr_protocol::projection::AgentResourceEvent {
+        kr_protocol::projection::AgentResourceEvent {
+            session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([1; 16])),
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                Uuid::from_bytes([2; 16]),
+            ),
+            resource_id: kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([3; 16])),
+            state: kr_protocol::gateway::PendingState::Pending,
+            durability: kr_protocol::session::Durability::Durable,
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            sequence: U64::new(1),
+            event_id: Uuid::from_bytes([4; 16]),
+            parent_sequence: kr_protocol::scalars::Nullable(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_resource_events_are_charged_against_the_queue_and_resynchronise_a_slow_subscriber()
+     {
+        let mut hub = OutputHub::new();
+        let mut slow = hub.subscribe(identifier(1), 100, Presentation::Direct);
+        let mut quick = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+
+        let event = test_agent_event();
+        // First event charges 60 bytes, fits within slow's limit of 100.
+        assert!(!hub.publish_agent_resource(identifier(1), 1, event.clone(), 60, 0));
+        assert!(!hub.publish_agent_resource(identifier(2), 1, event.clone(), 60, 0));
+
+        // Quick subscriber drains and marks written.
+        let delivery = quick.recv().await.expect("a delivery");
+        assert_eq!(delivery.len(), 60);
+        quick.written(delivery.len());
+        assert_eq!(quick.queued_bytes(), 0);
+
+        // Second event of 60 bytes exceeds slow's limit (60 + 60 = 120 > 100).
+        assert!(hub.publish_agent_resource(identifier(1), 2, event.clone(), 60, 0));
+        assert!(hub.is_resynchronising(identifier(1)));
+
+        // Quick subscriber receives the second event without being blocked.
+        assert!(!hub.publish_agent_resource(identifier(2), 2, event.clone(), 60, 0));
+        let second_delivery = quick.recv().await.expect("quick receives second");
+        assert_eq!(second_delivery.len(), 60);
+
+        // Slow subscriber receives the first event, then Resync, and nothing after.
+        let first = slow.recv().await.expect("slow receives first");
+        assert_eq!(first.len(), 60);
+        match slow.recv().await.expect("slow receives resync") {
+            OutputDelivery::Resync(marker) => {
+                assert_eq!(marker.reason, ResyncReason::SendQueueFull);
+                assert_eq!(marker.cursor.get(), 2);
+            }
+            other => panic!("expected resync, got {other:?}"),
+        }
     }
 }
