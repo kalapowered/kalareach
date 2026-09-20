@@ -1159,11 +1159,17 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
         Err(SyncError::Fenced { generation: 7 })
     ));
 
-    let cancelled = two.cancel_undispatched(7).expect("cancelled");
+    let cancelled = two
+        .cancel_undispatched(7, TimestampMs::new(NOW + 2))
+        .await
+        .expect("cancelled");
     assert_eq!(cancelled.in_flight, 0);
     assert!(two.store().staged().expect("staged").is_empty());
 
-    let removed = two.remove_retained(7).expect("removed");
+    let removed = two
+        .remove_retained(7, TimestampMs::new(NOW + 2))
+        .await
+        .expect("removed");
     assert!(removed.records > 0);
     assert!(removed.bytes > 0);
     // What it reported removed is gone, which is what makes the figures worth reading.
@@ -1201,7 +1207,10 @@ async fn pinned_labels_stay_on_the_device_and_are_left_out_of_what_is_published_
         .store()
         .pin_label("one", TimestampMs::new(NOW))
         .expect("pinned");
-    client.remove_retained(3).expect("removed");
+    client
+        .remove_retained(3, TimestampMs::new(NOW))
+        .await
+        .expect("removed");
     assert_eq!(
         client.store().pinned_labels().expect("labels").len(),
         1,
@@ -1254,7 +1263,10 @@ async fn a_result_produced_under_an_earlier_generation_is_not_published() {
 
     // Privacy mode is enabled while it is in flight, which is the case section 24 names.
     client.fence(5).expect("fenced");
-    let cancelled = client.cancel_undispatched(5).expect("cancelled");
+    let cancelled = client
+        .cancel_undispatched(5, TimestampMs::new(NOW + 1))
+        .await
+        .expect("cancelled");
     assert_eq!(
         cancelled.undispatched, 0,
         "work that has left cannot be taken back"
@@ -1338,7 +1350,8 @@ async fn a_publication_whose_caller_walked_away_stays_work_this_device_cannot_ac
     assert!(staged.items[0].dispatched);
     assert_eq!(
         client
-            .cancel_undispatched(0)
+            .cancel_undispatched(0, TimestampMs::new(NOW + 1))
+            .await
             .expect("cancelled")
             .undispatched,
         0,
@@ -1416,10 +1429,17 @@ async fn a_cleanup_keeps_the_record_of_work_that_had_already_left() {
     // nothing is outstanding while a write it sent has no answer.
     client.fence(4).expect("fenced");
     assert_eq!(
-        client.cancel_undispatched(4).expect("cancelled").in_flight,
+        client
+            .cancel_undispatched(4, TimestampMs::new(NOW + 1))
+            .await
+            .expect("cancelled")
+            .in_flight,
         1
     );
-    client.remove_retained(4).expect("removed");
+    client
+        .remove_retained(4, TimestampMs::new(NOW + 1))
+        .await
+        .expect("removed");
     assert_eq!(
         client.outstanding().expect("a count"),
         1,
@@ -1497,7 +1517,11 @@ async fn outstanding_reaches_nought_only_once_a_dispatched_publication_has_settl
     );
     // A cancellation reports what is still out, which is nothing once it has settled.
     assert_eq!(
-        client.cancel_undispatched(1).expect("cancelled").in_flight,
+        client
+            .cancel_undispatched(1, TimestampMs::new(NOW))
+            .await
+            .expect("cancelled")
+            .in_flight,
         0
     );
 }
@@ -1520,7 +1544,10 @@ async fn what_has_already_left_is_shown_rather_than_claimed_to_be_erased() {
         .expect("published");
 
     client.fence(2).expect("fenced");
-    client.remove_retained(2).expect("removed");
+    client
+        .remove_retained(2, TimestampMs::new(NOW))
+        .await
+        .expect("removed");
 
     let exported = client.exported().expect("exported");
     assert_eq!(exported.len(), 1);
@@ -1597,14 +1624,14 @@ async fn a_cleanup_that_a_later_generation_overtook_is_refused() {
         .expect("published");
 
     assert!(matches!(
-        client.cancel_undispatched(5),
+        client.cancel_undispatched(5, TimestampMs::new(NOW)).await,
         Err(SyncError::LateResult {
             produced_under: 5,
             current: 6
         })
     ));
     assert!(matches!(
-        client.remove_retained(5),
+        client.remove_retained(5, TimestampMs::new(NOW)).await,
         Err(SyncError::LateResult {
             produced_under: 5,
             current: 6

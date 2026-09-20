@@ -8,6 +8,7 @@
 //! | Conflict copies | What the service held when a write of this device's lost | Removed. It is content another device produced. |
 //! | Checkpoints | Where each object reached on the service | Removed. It is production state, not content, and losing it costs a comparison. |
 //! | Publications | That this device published a collection at a generation, and when | **Kept.** It is the only account of what left, and section 24 shows what left rather than pretending it did not. |
+//! | Unanswered dispatches | That this device sent a write the service holds no receipt for | **Kept.** It carries no content, and it is the only account of a write whose outcome nothing can establish. |
 //! | Pinned labels | The labels a person pinned | **Kept**, and excluded from what is published while privacy mode is on. |
 //!
 //! # One store, one lock
@@ -44,6 +45,8 @@ const STAGED_EXTENSION: &str = "staged";
 const CONFLICT_EXTENSION: &str = "conflict";
 /// The extension of the record that this device published a collection.
 const PUBLICATION_EXTENSION: &str = "published";
+/// The extension of the record of a dispatch the service holds no receipt for.
+const UNANSWERED_EXTENSION: &str = "unanswered";
 /// The extension of a file being written, which is not yet a file.
 const PARTIAL_EXTENSION: &str = "partial";
 /// The name of the store's lock.
@@ -165,6 +168,30 @@ pub struct Publication {
     pub generation: U64,
     /// When this device last published it.
     pub published_at_ms: TimestampMs,
+}
+
+/// That this device sent one write the service holds no receipt for.
+///
+/// It carries no content: which object the write was about, what kind it was, and when this device
+/// let it go. A receipt is what settles a dispatch, and a service that holds none for a request
+/// either never received it or has passed section 9's thirty-day retention; neither establishes
+/// that the write did not land. So the work is discarded under the late-result rule, because a
+/// barrier nothing can lift is not a barrier, and this record keeps the one thing the discard must
+/// not throw away: that the ciphertext left this device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unanswered {
+    /// The request this device sent.
+    pub work_id: Uuid,
+    /// The object it would have published.
+    pub object_id: SyncObjectId,
+    /// What kind of object it was.
+    pub kind: SyncObjectKind,
+    /// When this device let the content go.
+    ///
+    /// Null for a record whose staged file named no instant, which is a device that stopped
+    /// between marking the work dispatched and writing that mark.
+    pub dispatched_at_ms: Nullable<TimestampMs>,
 }
 
 /// The privacy state this device records, durably.
@@ -412,6 +439,17 @@ impl<T> Listing<T> {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+}
+
+/// Every account of what has left this device, read together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhatLeft {
+    /// The collections this device published, and the generation each reached.
+    pub publications: Listing<Publication>,
+    /// The work this device staged, whose dispatched records are writes with no settled outcome.
+    pub staged: Listing<Staged>,
+    /// The dispatches the service holds no receipt for.
+    pub unanswered: Listing<Unanswered>,
 }
 
 /// This device's own synchronisation state, on this device's disk.
@@ -804,6 +842,64 @@ impl SyncStore {
         outcome
     }
 
+    /// Discards one dispatched request the service holds no receipt for.
+    ///
+    /// Only when privacy mode has moved past the generation the work was admitted under. That is
+    /// the late-result rule: the cleanup has already decided that nothing produced under the older
+    /// generation may be published, so a request nothing can account for is work this device will
+    /// never apply an answer to, and holding the barrier open for it would make the cleanup
+    /// incompletable rather than honest. Under the generation in force the work stays where it is,
+    /// because the next reconciliation may still find a receipt for it.
+    ///
+    /// Reading the privacy record and removing the staged file are one hold, so a fence landing
+    /// alongside cannot make this discard work the generation now in force admitted.
+    ///
+    /// The account of what left is kept: an [`Unanswered`] record replaces the staged file, and it
+    /// carries no ciphertext.
+    ///
+    /// Returns true when the record was discarded, false when the work was never sent, when the
+    /// generation that admitted it is still the one in force, or when something had already
+    /// settled it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a record cannot be read, written or removed.
+    pub fn discard_unanswered(&self, staged: &Staged) -> Result<bool> {
+        let path = self.named(staged.work_id, STAGED_EXTENSION);
+        let guard = self.lock()?;
+        let outcome = (|| {
+            // A record that is gone is work something else has already settled, so this discard is
+            // a discard of nothing. The record on disk decides, not the copy the caller holds.
+            let Some(held) = self.read_optional::<Staged>(&path)? else {
+                return Ok(false);
+            };
+            // Work that was never sent is [`Self::take_back_undispatched`]'s, and nothing left the
+            // device under it. Writing an account of a departure that never happened would be as
+            // wrong as losing one that did.
+            if !held.dispatched {
+                return Ok(false);
+            }
+            let privacy = self.read_privacy()?;
+            if privacy.generation.get() <= held.produced_under.get() {
+                return Ok(false);
+            }
+            let record = Unanswered {
+                work_id: held.work_id,
+                object_id: held.object_id,
+                kind: held.kind,
+                dispatched_at_ms: held.dispatched_at_ms,
+            };
+            let bytes = kr_cbor::to_canonical_vec(&record)?;
+            // The account is durable before the work is discarded. The other order would lose what
+            // left this device if the store stopped between the two writes.
+            self.write_bytes(&self.named(held.work_id, UNANSWERED_EXTENSION), &bytes)?;
+            self.remove_file(&path)?;
+            Ok(true)
+        })();
+        drop(guard);
+        outcome
+    }
+
     /// Returns how much dispatched work has no settled outcome.
     ///
     /// A record this build cannot read counts too. A store cannot say that nothing is outstanding
@@ -833,6 +929,11 @@ impl SyncStore {
     /// request that had no answer can still be accepted afterwards. Retiring one on the strength of
     /// the other would be claiming knowledge this contract cannot give.
     ///
+    /// An answer to work a reconciliation discarded corrects the account of what left rather than
+    /// changing nothing: the generation that admitted it has been fenced either way, so nothing is
+    /// published, but an accepted write becomes a publication record instead of a dispatch nothing
+    /// could account for.
+    ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when a record cannot be written or removed.
@@ -848,7 +949,7 @@ impl SyncStore {
             // Settling twice would write an effect twice. A record that is gone is work something
             // else has already settled, so this answer is an answer about nothing.
             if self.read_optional::<Staged>(&path)?.is_none() {
-                return Ok(Settlement::AlreadySettled);
+                return self.settle_discarded(staged, outcome, now);
             }
             let privacy = self.read_privacy()?;
             let in_force = privacy.generation.get() == staged.produced_under.get();
@@ -884,6 +985,45 @@ impl SyncStore {
         })();
         drop(guard);
         settled
+    }
+
+    /// Settles an answer to work a reconciliation had already discarded.
+    ///
+    /// A discard happens when the service holds no receipt for a request and privacy mode has
+    /// fenced the generation that admitted it. An answer arriving afterwards is that receipt
+    /// reaching this device late: it settles nothing that could be published, because the
+    /// generation is gone, but it does say what became of content that left. So an accepted write
+    /// is recorded as a publication and the record of a dispatch nothing could account for goes,
+    /// and a refusal takes that record away without leaving one: a refused comparison proves the
+    /// service kept nothing from the write.
+    ///
+    /// Work that nothing discarded and nothing settled leaves no record of either kind, and this
+    /// answer is an answer about nothing.
+    ///
+    /// The caller holds the lock.
+    fn settle_discarded(
+        &self,
+        staged: &Staged,
+        outcome: Outcome,
+        now: TimestampMs,
+    ) -> Result<Settlement> {
+        let discarded = self.named(staged.work_id, UNANSWERED_EXTENSION);
+        if self.read_optional::<Unanswered>(&discarded)?.is_none() {
+            return Ok(Settlement::AlreadySettled);
+        }
+        if let Outcome::Accepted { generation } = outcome {
+            self.write_publication(&Publication {
+                object_id: staged.object_id,
+                kind: staged.kind,
+                generation,
+                published_at_ms: now,
+            })?;
+        }
+        self.remove_file(&discarded)?;
+        Ok(Settlement::Discarded {
+            produced_under: staged.produced_under.get(),
+            current: self.read_privacy()?.generation.get(),
+        })
     }
 
     /// Applies what a fetch brought down, under the late-result rule, in one step.
@@ -1041,19 +1181,28 @@ impl SyncStore {
         Ok(true)
     }
 
-    /// Returns what this device has published, oldest first.
+    /// Returns every account of what has left this device, under one hold of the lock.
+    ///
+    /// Under one hold because a reconciliation moves a record from one list to another: it settles
+    /// a dispatch or discards one nothing can account for, and a reader that took the lists
+    /// separately could look at the staged work before that move and at the rest after it, and see
+    /// the record in neither.
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the directory cannot be read.
-    pub fn what_left(&self) -> Result<(Listing<Publication>, Listing<Staged>)> {
+    pub fn what_left(&self) -> Result<WhatLeft> {
         let guard = self.lock()?;
         let outcome = (|| {
             let mut publications = self.read_all::<Publication>(PUBLICATION_EXTENSION)?;
             publications
                 .items
                 .sort_by_key(|record| record.published_at_ms.get());
-            Ok((publications, self.read_all::<Staged>(STAGED_EXTENSION)?))
+            Ok(WhatLeft {
+                publications,
+                staged: self.read_all::<Staged>(STAGED_EXTENSION)?,
+                unanswered: self.read_all::<Unanswered>(UNANSWERED_EXTENSION)?,
+            })
         })();
         drop(guard);
         outcome
@@ -1141,8 +1290,9 @@ impl SyncStore {
     ///
     /// The figure is what this call actually removed, counted from the files it deleted, so a
     /// report cannot claim a removal that did not happen. What stays is named rather than left out:
-    /// the pinned labels, the objects this device holds, and the record of what has already been
-    /// published.
+    /// the pinned labels, the objects this device holds, the record of what has already been
+    /// published and the record of a dispatch nothing could account for. The last two carry no
+    /// content and are the only account of what left.
     ///
     /// # Errors
     ///

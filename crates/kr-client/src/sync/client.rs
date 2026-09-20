@@ -26,13 +26,16 @@
 //! content, reconciles in-flight work before reporting complete and publishes no late
 //! old-generation result. The methods below are those operations, in the host's own vocabulary and
 //! taking the host's generation as a plain number, because a client never depends on a host crate.
-//! Their semantics are the host's contract exactly:
+//! The two cleanup steps reconcile before they measure, so what they report as still in flight is
+//! what the service could not account for rather than everything whose answer went missing. Their
+//! semantics are the host's contract exactly:
 //!
 //! | This client | The host's subsystem contract |
 //! | --- | --- |
 //! | [`SyncClient::fence`] | stop every content-bearing queue, at once |
 //! | [`SyncClient::cancel_undispatched`] | take back what was admitted and never dispatched |
 //! | [`SyncClient::remove_retained`] | remove the retained local content |
+//! | [`SyncClient::reconcile_unsettled`] | reconcile the work that was dispatched, before reporting |
 //! | [`SyncClient::outstanding`] | how much dispatched work has no settled outcome |
 //! | [`SyncClient::kept`] | what is kept, explicitly |
 //! | [`SyncClient::exported`] | what already left, which is shown rather than erased |
@@ -54,7 +57,7 @@ use super::store::{
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
-use crate::services::SyncBackupService;
+use crate::services::{SyncBackupService, SyncRequestStatus};
 
 /// What became of a publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +146,35 @@ pub struct Fenced {
     pub items: u64,
 }
 
+/// What one reconciliation of dispatched work established.
+///
+/// Every figure is counted from what the service answered about a request, never inferred from
+/// what the object holds now. The last is read from the store afterwards, so it counts a record
+/// this build cannot open as well: section 24 completes a cleanup when nothing is outstanding, and
+/// a record that cannot be read is not one that can be called nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// How many dispatched requests the service accounted for, applied or refused.
+    pub settled: u64,
+    /// How many were discarded because the service holds no receipt for them and privacy mode has
+    /// moved past the generation that admitted them.
+    pub discarded: u64,
+    /// How many this pass established no outcome for.
+    ///
+    /// A service that could not be asked and a request it holds no receipt for under the
+    /// generation in force are both this: the work stays counted, and the next reconciliation asks
+    /// again.
+    pub unresolved: u64,
+    /// How many refusals were settled without bringing down the content the service holds.
+    ///
+    /// The refusal is settled either way, because the service proved this write stored nothing.
+    /// What is missing is the copy section 20 keeps for the person to choose from, and a later
+    /// fetch or publication brings it down.
+    pub copies_not_taken: u64,
+    /// What still counts as outstanding, read from the store when the pass had finished.
+    pub unsettled: u64,
+}
+
 /// What one cancellation did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cancelled {
@@ -218,6 +250,57 @@ pub struct SyncClient {
     service: Arc<dyn SyncBackupService>,
     sealer: Arc<dyn DraftSealer>,
     store: SyncStore,
+    /// The requests this process has a call out for.
+    ///
+    /// A receipt is written when the service commits the write, so asking about a request that has
+    /// not arrived yet is asking about nothing: the answer is that no receipt exists, which is
+    /// exactly what a request that never arrived looks like. A device knows the difference for its
+    /// own calls and nothing else does, so [`SyncClient::reconcile_unsettled`] leaves these
+    /// counted rather than deciding about them.
+    ///
+    /// Memory rather than a file, deliberately. A process that stopped has no call out, so a
+    /// restart starts with none and every dispatched record it finds is one it may ask about.
+    in_flight: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+}
+
+/// Marks one request as having a call out, for as long as this value lives.
+///
+/// It is dropped on the way out of a publication whichever way it leaves, including a caller that
+/// abandoned the call at its await: a dropped future drops its own locals.
+struct CallOut<'a> {
+    requests: &'a std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+    request_id: Uuid,
+}
+
+impl<'a> CallOut<'a> {
+    fn mark(
+        requests: &'a std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+        request_id: Uuid,
+    ) -> Self {
+        held(requests).insert(request_id);
+        Self {
+            requests,
+            request_id,
+        }
+    }
+}
+
+impl Drop for CallOut<'_> {
+    fn drop(&mut self) {
+        held(self.requests).remove(&self.request_id);
+    }
+}
+
+/// Takes the set of requests with a call out, through a panic that left it poisoned.
+///
+/// A poisoned set is still a set of identifiers, and refusing to read it would turn one failed
+/// publication into a client that can no longer tell an in-flight request from a lost one.
+fn held(
+    requests: &std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<Uuid>> {
+    requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl SyncClient {
@@ -236,6 +319,7 @@ impl SyncClient {
             service,
             sealer,
             store,
+            in_flight: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -318,6 +402,10 @@ impl SyncClient {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = sync_collection(staged.kind, object_id);
 
+        // Marked before the record says it was dispatched, so a reconciliation running alongside
+        // never sees a dispatched record this process is about to have a call out for and takes it
+        // for one the service never received.
+        let _call = CallOut::mark(&self.in_flight, staged.work_id);
         // Written before the call leaves, and refused if a fence landed since admission: work that
         // has not gone is work the fence still reaches, and it is taken back rather than sent.
         self.store.mark_dispatched(staged.work_id, object_id, now)?;
@@ -371,45 +459,58 @@ impl SyncClient {
                         current,
                     });
                 }
-                let (generation, other) = self.fetch_current(&staged, &collection).await?;
-                let copy = self.copy_of(
-                    object_id,
-                    staged.revision,
-                    Nullable::some(staged.expected_generation),
-                    U64::new(generation),
-                    &other,
-                    now,
-                )?;
-                match self.store.apply_fetch(
-                    staged.produced_under.get(),
-                    Some(&copy),
-                    object_id,
-                    SyncCheckpoint {
-                        generation: U64::new(generation),
-                        // The generation is this device's to remember; the revision beside it is
-                        // not, because the revision that came down is the other device's.
-                        published_revision: Nullable::null(),
-                    },
-                )? {
-                    Settlement::Published | Settlement::AlreadySettled => {
-                        Ok(Published::Conflicted {
-                            copy: copy.conflict_id,
-                            other_revision: other.revision,
-                            generation,
-                        })
-                    }
-                    Settlement::Discarded {
-                        produced_under,
-                        current,
-                    } => Ok(Published::Discarded {
-                        produced_under,
-                        current,
-                    }),
-                }
+                self.keep_what_the_service_holds(&staged, &collection, now)
+                    .await
             }
             // Anything else leaves the outcome open. The staged record stays where it counts as
             // outstanding rather than being retired on a guess about whether the write landed.
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Brings down what the service holds after a refusal, and keeps it beside this device's own.
+    ///
+    /// The refusal is already settled when this runs: section 20 keeps the other content for the
+    /// person to choose from, and a fetch this device cannot make costs that copy rather than the
+    /// knowledge that the write stored nothing.
+    async fn keep_what_the_service_holds(
+        &self,
+        staged: &super::Staged,
+        collection: &str,
+        now: TimestampMs,
+    ) -> Result<Published> {
+        let (generation, other) = self.fetch_current(staged, collection).await?;
+        let copy = self.copy_of(
+            staged.object_id,
+            staged.revision,
+            Nullable::some(staged.expected_generation),
+            U64::new(generation),
+            &other,
+            now,
+        )?;
+        match self.store.apply_fetch(
+            staged.produced_under.get(),
+            Some(&copy),
+            staged.object_id,
+            SyncCheckpoint {
+                generation: U64::new(generation),
+                // The generation is this device's to remember; the revision beside it is not,
+                // because the revision that came down is the other device's.
+                published_revision: Nullable::null(),
+            },
+        )? {
+            Settlement::Published | Settlement::AlreadySettled => Ok(Published::Conflicted {
+                copy: copy.conflict_id,
+                other_revision: other.revision,
+                generation,
+            }),
+            Settlement::Discarded {
+                produced_under,
+                current,
+            } => Ok(Published::Discarded {
+                produced_under,
+                current,
+            }),
         }
     }
 
@@ -614,20 +715,127 @@ impl SyncClient {
         })
     }
 
-    /// Takes back the publications that were admitted and never dispatched.
+    /// Asks the service what became of every dispatch this device has no answer for.
     ///
-    /// Work that has been dispatched cannot be taken back, so it is counted instead: it is what the
-    /// late-result rule exists for, and reconciliation is not complete while any of it is
-    /// outstanding. The record this device wrote before the call left says which is which, and
-    /// reading it and removing it is one step, so a publication dispatching itself alongside this
-    /// cannot have its record taken away.
+    /// A publication is about an object and its answer is a generation, so a device that lost one
+    /// cannot learn anything from what the object holds afterwards: that is a fact about the
+    /// object and not about any one write of it. What it can ask about is the request. Every
+    /// dispatch carries the staged work's own identity, the service records the reply it gave that
+    /// identity, and this asks for it back.
+    ///
+    /// Each answer settles the request it is about and nothing else:
+    ///
+    /// - **applied** settles it as an accepted write, which records the publication and, under the
+    ///   generation in force, moves the checkpoint;
+    /// - **refused** settles it as a write that stored nothing, and brings down what the service
+    ///   holds instead, beside this device's own content;
+    /// - **no receipt** settles nothing on its own. Under the generation in force the work stays
+    ///   where it is, because a receipt may yet be found. Under a generation privacy mode has
+    ///   moved past, the work is discarded: no answer to it may be published any more, so a
+    ///   barrier held open for it could never be lifted. What left this device is still recorded,
+    ///   because a service holding no receipt does not establish that nothing arrived.
+    ///
+    /// Nothing is retried. Section 23 permits an automatic retry only for an idempotent read or a
+    /// request whose receipt proves no dispatch, and a request the service knows nothing about
+    /// proves neither.
+    ///
+    /// A service that cannot be asked leaves the work counted rather than failing the pass, which
+    /// is what lets a privacy cleanup report what is still outstanding instead of refusing to
+    /// report at all.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when a staged file cannot be read or removed.
-    pub fn cancel_undispatched(&self, generation: u64) -> Result<Cancelled> {
+    /// Returns [`SyncError::Storage`] when the staged records cannot be read or a settlement
+    /// cannot be written.
+    pub async fn reconcile_unsettled(&self, now: TimestampMs) -> Result<Reconciled> {
+        let mut report = Reconciled::default();
+        for staged in self
+            .store
+            .staged()?
+            .items
+            .into_iter()
+            .filter(|item| item.dispatched)
+        {
+            // A request this process is still waiting on is not one to decide about: the service
+            // has no receipt for a write it has not committed, which is what a request that never
+            // arrived looks like as well.
+            if held(&self.in_flight).contains(&staged.work_id) {
+                report.unresolved = report.unresolved.saturating_add(1);
+                continue;
+            }
+            let collection = sync_collection(staged.kind, staged.object_id);
+            let Ok(status) = self
+                .service
+                .request_status(&collection, staged.work_id)
+                .await
+            else {
+                report.unresolved = report.unresolved.saturating_add(1);
+                continue;
+            };
+            match status {
+                SyncRequestStatus::Applied { generation } => {
+                    self.store.settle(
+                        &staged,
+                        Outcome::Accepted {
+                            generation: U64::new(generation),
+                        },
+                        now,
+                    )?;
+                    report.settled = report.settled.saturating_add(1);
+                }
+                SyncRequestStatus::Refused => {
+                    let settled = self.store.settle(&staged, Outcome::Refused, now)?;
+                    report.settled = report.settled.saturating_add(1);
+                    // The copy belongs to the generation that admitted the work. A settlement the
+                    // late-result rule discarded may keep none, because a copy is retained content
+                    // and the cleanup that opened this generation has already removed it.
+                    if settled == Settlement::Published
+                        && self
+                            .keep_what_the_service_holds(&staged, &collection, now)
+                            .await
+                            .is_err()
+                    {
+                        report.copies_not_taken = report.copies_not_taken.saturating_add(1);
+                    }
+                }
+                SyncRequestStatus::Unknown => {
+                    if self.store.discard_unanswered(&staged)? {
+                        report.discarded = report.discarded.saturating_add(1);
+                    } else {
+                        report.unresolved = report.unresolved.saturating_add(1);
+                    }
+                }
+            }
+        }
+        report.unsettled = self.store.unsettled()?;
+        Ok(report)
+    }
+
+    /// Takes back the publications that were admitted and never dispatched.
+    ///
+    /// Work that has been dispatched cannot be taken back, so it is reconciled first and whatever
+    /// is still unaccounted for is counted: that is what the late-result rule exists for, and
+    /// cleanup is not complete while any of it is outstanding. The record this device wrote before
+    /// the call left says which is which, and reading it and removing it is one step, so a
+    /// publication dispatching itself alongside this cannot have its record taken away.
+    ///
+    /// The generation is moved forward before the reconciliation, so work admitted under an
+    /// earlier one is seen by it as work no answer may be published for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a staged file cannot be read or removed, and
+    /// [`SyncError::LateResult`] when a later generation has overtaken this cleanup.
+    pub async fn cancel_undispatched(
+        &self,
+        generation: u64,
+        now: TimestampMs,
+    ) -> Result<Cancelled> {
         self.own_generation(generation)?;
+        // Before the service is asked, so a cleanup a later generation has overtaken is refused
+        // without sending anything.
         let undispatched = self.store.take_back_undispatched(generation)?;
+        self.reconcile_unsettled(now).await?;
         Ok(Cancelled {
             undispatched,
             in_flight: self.store.unsettled()?,
@@ -639,9 +847,13 @@ impl SyncClient {
     /// The figures are what was actually removed, counted from the files that were deleted. What
     /// stays is in [`Self::kept`], named rather than left out.
     ///
-    /// Work that has been dispatched is not removed. Its record is what says it may be out there,
-    /// and deleting it would make [`Self::outstanding`] reach nought while the write was still
-    /// unaccounted for. Its result is refused by the generation rule instead of applied.
+    /// Work that has been dispatched is reconciled rather than removed. Its record is what says it
+    /// may be out there, and deleting it unreconciled would make [`Self::outstanding`] reach
+    /// nought while the write was still unaccounted for. What the service accounts for is settled,
+    /// what it holds no receipt for is discarded under the late-result rule with the account of
+    /// what left kept, and the rest stays counted. A record a reconciliation settled is not in
+    /// these figures: settling work is not removing retained content, and
+    /// [`Self::reconcile_unsettled`] is what reports it.
     ///
     /// A cleanup that has been overtaken by a later generation is refused rather than carried out,
     /// so it cannot reach the copies, the notes or the work that the generation now in force
@@ -649,10 +861,15 @@ impl SyncClient {
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when a file cannot be removed.
-    pub fn remove_retained(&self, generation: u64) -> Result<Removed> {
+    /// Returns [`SyncError::Storage`] when a file cannot be removed, and [`SyncError::LateResult`]
+    /// when a later generation has overtaken this cleanup.
+    pub async fn remove_retained(&self, generation: u64, now: TimestampMs) -> Result<Removed> {
         self.own_generation(generation)?;
+        // The local removal first, so a cleanup a later generation has overtaken is refused
+        // without sending anything. The reconciliation then settles what was dispatched, which is
+        // what lets the ciphertext of a request nothing can account for go as well.
         let (bytes, records) = self.store.remove_content(generation)?;
+        self.reconcile_unsettled(now).await?;
         Ok(Removed { bytes, records })
     }
 
@@ -674,13 +891,12 @@ impl SyncClient {
     /// cannot read counts too, because a record it could not open is not a record it can say was
     /// nothing.
     ///
-    /// **A dispatch whose answer was lost stays counted, and this contract cannot settle it.** A
-    /// service takes a comparison and answers with a generation; there is no way to ask afterwards
-    /// what became of one particular request, and the value the service holds later is a fact about
-    /// the object rather than about any one write of it. A device that lost an answer therefore
-    /// cannot establish whether its write landed, and this client says so rather than deciding.
-    /// [`Self::exported`] lists such work as content sent without an answer, which is what section
-    /// 24 asks of anything that may already have left.
+    /// It counts what is recorded, and it asks nobody: [`Self::reconcile_unsettled`] is what turns
+    /// a dispatch with no answer into a settled one, and the privacy steps run it before they
+    /// measure. A dispatch whose answer was lost therefore stays counted until something asks the
+    /// service about it, and one the service holds no receipt for stays counted until privacy mode
+    /// moves past the generation that admitted it. [`Self::exported`] lists both as content sent
+    /// without an answer, which is what section 24 asks of anything that may already have left.
     ///
     /// # Errors
     ///
@@ -709,26 +925,35 @@ impl SyncClient {
                       synchronised while privacy mode is on",
             });
         }
-        let publications = self.store.publications()?;
-        if !publications.is_empty() {
+        // Every account under one hold, because a reconciliation moves a record from one of these
+        // lists to another and a report that read them separately could name neither.
+        let left = self.store.what_left()?;
+        if !left.publications.is_empty() {
             kept.push(KeptExplicitly {
                 what: "the record of what this device published",
                 why: "it carries no content, and it is the only account of what has already left; \
                       deleting it would hide what privacy mode cannot undo",
             });
         }
-        if !publications.unreadable.is_empty() {
+        if !left.publications.unreadable.is_empty() {
             kept.push(KeptExplicitly {
                 what: "a record of a publication this build cannot read",
                 why: "it is kept rather than deleted, and what left under it cannot be listed, so \
                       the account of what has left is incomplete",
             });
         }
-        if !self.store.staged()?.unreadable.is_empty() {
+        if !left.staged.unreadable.is_empty() {
             kept.push(KeptExplicitly {
                 what: "a record of admitted work this build cannot read",
                 why: "it is kept rather than deleted, and it counts as outstanding, because a \
                       record that cannot be opened is not one that can be called nothing",
+            });
+        }
+        if !left.unanswered.is_empty() {
+            kept.push(KeptExplicitly {
+                what: "the record of a write the service never accounted for",
+                why: "it carries no content, and it is the only account of content that left this \
+                      device under a request nothing can establish the outcome of",
             });
         }
         Ok(kept)
@@ -743,7 +968,8 @@ impl SyncClient {
     ///
     /// Returns [`SyncError::Storage`] when the publication records cannot be read.
     pub fn exported(&self) -> Result<Vec<Exported>> {
-        let (publications, staged) = self.store.what_left()?;
+        let left = self.store.what_left()?;
+        let (publications, staged, unanswered) = (left.publications, left.staged, left.unanswered);
         let mut exported: Vec<Exported> = publications
             .items
             .into_iter()
@@ -779,7 +1005,25 @@ impl SyncClient {
                 deletable: false,
             });
         }
-        for path in staged.unreadable {
+        // A dispatch the service holds no receipt for. The work is gone, because no answer to it
+        // may be published any more, and this is what the discard kept: the ciphertext left, and a
+        // service holding no receipt is not a service saying nothing arrived.
+        for record in unanswered.items {
+            exported.push(Exported {
+                kind: format!("synchronised {}, sent without an answer", record.kind),
+                reference: format!(
+                    "{}, which the service holds no receipt for",
+                    sync_collection(record.kind, record.object_id)
+                ),
+                left_at_ms: record
+                    .dispatched_at_ms
+                    .as_ref()
+                    .copied()
+                    .unwrap_or_else(|| TimestampMs::new(0)),
+                deletable: false,
+            });
+        }
+        for path in staged.unreadable.into_iter().chain(unanswered.unreadable) {
             exported.push(Exported {
                 kind: "work sent without an answer, which this device cannot describe".to_owned(),
                 reference: format!(

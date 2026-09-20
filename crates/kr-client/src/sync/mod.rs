@@ -41,7 +41,7 @@
 //!
 //! | Module | What it holds |
 //! | --- | --- |
-//! | [`store`] | This device's own sync state on disk: staged ciphertext, checkpoints, conflict copies, pinned labels and the record of what has left |
+//! | [`store`] | This device's own sync state on disk: staged ciphertext, checkpoints, conflict copies, pinned labels and the records of what has left |
 //! | [`client`] | The compare-and-swap client, and the privacy operations the host drives it through |
 //! | [`keys`] | The key a collection is sealed under, where a device keeps it, and the sealing itself |
 
@@ -57,13 +57,13 @@ use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 pub use client::{
-    Cancelled, Exported, Fenced, KeptExplicitly, Published, Removed, Restored, Resumed, SyncClient,
-    fresh_object_id, fresh_revision,
+    Cancelled, Exported, Fenced, KeptExplicitly, Published, Reconciled, Removed, Restored, Resumed,
+    SyncClient, fresh_object_id, fresh_revision,
 };
 pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
 pub use store::{
     ConflictCopy, Listing, Outcome, PinnedLabel, PrivacyRecord, Publication, Result, Settlement,
-    Staged, SyncCheckpoint, SyncError, SyncStore,
+    Staged, SyncCheckpoint, SyncError, SyncStore, Unanswered, WhatLeft,
 };
 
 /// What section 18 bullet 5 offers, part by part.
