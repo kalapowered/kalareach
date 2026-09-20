@@ -568,6 +568,49 @@ async fn a_closed_session_target_returns_session_closed_when_targeted_by_bridge(
     stub.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journal_left_behind_by_a_live_session_is_not_read_as_a_closure() {
+    // A worker writes a session's journal while that session is running, so the file says a session
+    // ran here and nothing about whether it ended. Answering `SESSION_CLOSED` from the file alone
+    // would tell a caller that a live session had finished.
+    let tree = kr_ipc::testing::TempHost::create();
+    let environment = tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let journal = environment.journal_database(session_id);
+    std::fs::create_dir_all(journal.parent().expect("a journals directory"))
+        .expect("the journals directory");
+    std::fs::write(&journal, b"a journal this run left behind").expect("a journal file");
+
+    // The destination's daemon knows no such session: it has no closure record for it.
+    let stub = stub_controller(
+        endpoint,
+        tree.environment_id(),
+        Err(ProtocolError::new(
+            ErrorCode::UnknownSession,
+            "this host has no session by that identity",
+        )),
+    )
+    .await;
+
+    let mut helper = Helper::start(&tree);
+    helper.write(&BridgeFrame::Hello(Box::new(BridgeHello {
+        protocol_version: PROTOCOL_VERSION,
+        build_id: BuildId::new("kr/test").expect("a build"),
+        origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+        origin_ingress: ActorIngress::LocalIpc,
+        already_bridged: false,
+        target: BridgeTarget::Session { session_id },
+    })));
+    let (code, diagnostics) = helper.finish();
+    assert_ne!(code, Some(0), "the helper ends rather than serving");
+    assert!(
+        !diagnostics.contains("that session is closed"),
+        "the file alone is not a closure: {diagnostics}"
+    );
+    stub.abort();
+}
+
 #[test]
 fn a_helper_exits_without_hanging_when_input_remains_open_after_refusal() {
     let tree = kr_ipc::testing::TempHost::create();

@@ -325,33 +325,37 @@ fn refuse(output: &mut impl Write, refusal: Refusal) -> Result<()> {
     Err(CliError::Refused(error))
 }
 
-/// Queries the destination environment's controller or records to check whether a session has closed.
+/// Asks the destination environment whether one session has closed.
+///
+/// Section 3: an old closed session still answers `SESSION_CLOSED`. The only thing that establishes
+/// that is the destination's own retained closure record, which its control daemon answers with, so
+/// this asks the daemon and reports what it said.
+///
+/// What is deliberately not evidence is a file on disk. A worker writes a journal for a session
+/// while that session is live, so a journal that exists says a session ran here and nothing about
+/// whether it ended. Treating one as closure would answer `SESSION_CLOSED` for a session that is
+/// still running, which is worse than saying the session is not known: a daemon that cannot be
+/// reached has not told this helper anything, and the caller is told exactly that.
 async fn is_destination_session_closed(
     paths: &kr_ipc::paths::EnvironmentPaths,
     session_id: kr_protocol::ids::SessionId,
 ) -> bool {
-    if let Ok(mut client) = resolve::open_controller(paths, crate::build_id()).await {
-        let params = kr_protocol::session::SessionReadParams { session_id };
-        match client
-            .request(kr_protocol::method::Method::SessionRead, &params)
-            .await
-        {
-            Ok(Ok(payload)) => {
-                if let Ok(result) = payload.to_typed::<kr_protocol::session::SessionReadResult>() {
-                    return result.session.closure.is_present();
-                }
-            }
-            Ok(Err(error)) if error.code == ErrorCode::SessionClosed => {
-                return true;
-            }
-            _ => {}
-        }
+    let Ok(mut client) = resolve::open_controller(paths, crate::build_id()).await else {
+        return false;
+    };
+    let params = kr_protocol::session::SessionReadParams { session_id };
+    match client
+        .request(kr_protocol::method::Method::SessionRead, &params)
+        .await
+    {
+        // The record the daemon holds carries the closure when there is one.
+        Ok(Ok(payload)) => payload
+            .to_typed::<kr_protocol::session::SessionReadResult>()
+            .is_ok_and(|result| result.session.closure.is_present()),
+        // Or the daemon answers the read with the closure itself.
+        Ok(Err(error)) => error.code == ErrorCode::SessionClosed,
+        Err(_) => false,
     }
-    // Check if the session's journal database exists on disk (indicating a past session that ran here)
-    if paths.journal_database(session_id).is_file() {
-        return true;
-    }
-    false
 }
 
 /// The operating-system user this helper runs as, as the destination names it.
