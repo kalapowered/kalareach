@@ -48,7 +48,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use kr_protocol::ids::{GrantId, InstallationId, NotificationId, PushSenderRecordId, SessionId};
+use kr_protocol::ids::{
+    EnvelopeId, GrantId, InstallationId, NotificationId, PushSenderRecordId, SessionId,
+};
 use kr_protocol::push::{PushSuppression, PushSuppressionReason};
 use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
 
@@ -525,6 +527,19 @@ pub struct ClaimedDelivery {
     pub next: crate::push::NextAction,
     /// The bytes to send.
     pub content: Vec<u8>,
+}
+
+/// An encrypted overflow object staged during production to commit with the delivery transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedObject {
+    /// The object's envelope identifier.
+    pub envelope_id: EnvelopeId,
+    /// The destination this object was sealed for.
+    pub destination_id: DestinationId,
+    /// The sealed bytes.
+    pub sealed: Vec<u8>,
+    /// When the object expires, matching the notification.
+    pub expires_at_ms: TimestampMs,
 }
 
 /// What asking for one due delivery produced.
@@ -1124,6 +1139,7 @@ impl DeliveryJournal {
         event: &EventKey,
         records: &[DeliveryRecord],
         spent: &[(DestinationId, StoredBudget)],
+        objects: &[StagedObject],
     ) -> Result<bool> {
         let transaction = self
             .connection
@@ -1162,6 +1178,21 @@ impl DeliveryJournal {
         }
         for (destination, budget) in spent {
             record_budget_in(&transaction, destination, budget)?;
+        }
+        for object in objects {
+            transaction.execute(
+                "INSERT INTO delivery_objects (envelope_id, destination_id, sealed, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (envelope_id) DO UPDATE SET
+                     sealed = excluded.sealed,
+                     expires_at_ms = excluded.expires_at_ms",
+                params![
+                    object.envelope_id.to_string(),
+                    object.destination_id.as_str(),
+                    object.sealed,
+                    as_i64(object.expires_at_ms.get()),
+                ],
+            )?;
         }
         transaction.execute(
             "UPDATE delivery_events SET produced = 1, decision = ?2 WHERE event_key = ?1",
@@ -2983,7 +3014,7 @@ mod tests {
             "the cleanup decided it rather than leaving it to be produced later"
         );
         assert!(
-            !journal.produce(&event(1), &[], &[]).expect("a decision"),
+            !journal.produce(&event(1), &[], &[], &[]).expect("a decision"),
             "an event the cleanup decided produces nothing afterwards"
         );
     }
@@ -2999,7 +3030,7 @@ mod tests {
         journal.fence(1).expect("a fence");
         journal.lift_fence(1).expect("the fence lifts");
         let error = journal
-            .produce(&event(1), &[], &[])
+            .produce(&event(1), &[], &[], &[])
             .expect_err("an old notice is not produced under a new generation");
         assert!(matches!(
             error,
@@ -3416,7 +3447,7 @@ mod tests {
         assert_eq!(pending.len(), 1, "the event is waiting to be produced from");
         assert_eq!(pending[0].notice, b"a notice");
         journal
-            .produce(&event(1), &[delivery(9, event(1), "hook")], &[])
+            .produce(&event(1), &[delivery(9, event(1), "hook")], &[], &[])
             .expect("produced");
         assert!(
             journal.pending_events(10).expect("a read").is_empty(),
@@ -3432,12 +3463,12 @@ mod tests {
             .expect("a page");
         assert!(
             journal
-                .produce(&event(1), &[delivery(9, event(1), "hook")], &[])
+                .produce(&event(1), &[delivery(9, event(1), "hook")], &[], &[])
                 .expect("produced")
         );
         assert!(
             !journal
-                .produce(&event(1), &[delivery(8, event(1), "hook")], &[])
+                .produce(&event(1), &[delivery(8, event(1), "hook")], &[], &[])
                 .expect("a second pass"),
             "the event's own flag is what makes producing idempotent"
         );
@@ -3463,6 +3494,7 @@ mod tests {
                 &event(1),
                 &[delivery(9, event(1), "hook")],
                 &[(DestinationId::new("hook").expect("an identifier"), spent)],
+                &[],
             )
             .expect("produced");
         assert_eq!(
@@ -3496,7 +3528,8 @@ mod tests {
                 .produce(
                     &event(1),
                     &[unknown],
-                    &[(DestinationId::new("hook").expect("an identifier"), spent)]
+                    &[(DestinationId::new("hook").expect("an identifier"), spent)],
+                    &[],
                 )
                 .is_err()
         );

@@ -91,6 +91,15 @@ pub enum DeliveryError {
 /// What this crate returns.
 pub type Result<T> = std::result::Result<T, DeliveryError>;
 
+impl DeliveryError {
+    /// True when this error represents a transient storage or source disruption
+    /// rather than a permanent refusal of the notification.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::JournalUnavailable(_) | Self::Source(_))
+    }
+}
+
 impl From<rusqlite::Error> for DeliveryError {
     fn from(error: rusqlite::Error) -> Self {
         Self::JournalUnavailable(error.to_string())

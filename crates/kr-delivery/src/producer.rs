@@ -41,7 +41,8 @@ use crate::destination::{DeliveryRule, Destination, DestinationId, DestinationRe
 use crate::error::{DeliveryError, Result};
 use crate::external::{self, ContentLine, ExternalMessage};
 use crate::journal::{
-    DeliveryJournal, DeliveryRecord, DeliveryState, EventKey, EventSource, TakenEvent,
+    DeliveryJournal, DeliveryRecord, DeliveryState, EventKey, EventSource, StagedObject,
+    StoredBudget, TakenEvent,
 };
 use crate::preview::{self, PreviewBody, PreviewTarget};
 use crate::push::{self, MAX_EXPIRY_AHEAD_MS};
@@ -512,18 +513,21 @@ impl Producer {
         let mut produced = Produced::default();
         let mut records = Vec::new();
         let mut spent = Vec::new();
+        let mut staged_objects = Vec::new();
         for destination in destinations {
             if !destination.enabled {
                 continue;
             }
             let outcome = match &destination.destination {
-                Destination::Push(_) => self.build_push(notice, destination, generation, now_ms),
+                Destination::Push(_) => self
+                    .build_push(notice, destination, generation, now_ms)
+                    .map(|(record, budget, staged)| (record, budget, staged)),
                 Destination::External(_) => self
                     .build_external(notice, destination, authority, lines, generation, now_ms)
-                    .map(|record| (record, None)),
+                    .map(|record| (record, None, None)),
             };
             match outcome {
-                Ok((record, budget)) => {
+                Ok((record, budget, staged)) => {
                     if record.state == DeliveryState::Collapsed {
                         produced.collapsed += 1;
                     } else {
@@ -533,17 +537,44 @@ impl Producer {
                     if let Some(budget) = budget {
                         spent.push((destination.id.clone(), budget));
                     }
+                    if let Some(staged) = staged {
+                        staged_objects.push(staged);
+                    }
                 }
-                Err(error) => produced
-                    .refused
-                    .push((destination.id.clone(), error.to_string())),
+                Err(error) if error.is_transient() => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    produced.refused.push((destination.id.clone(), detail.clone()));
+                    records.push(DeliveryRecord {
+                        notification_id: preview::fresh_notification_id(),
+                        event: notice.event.clone(),
+                        destination_id: destination.id.clone(),
+                        state: DeliveryState::Refused,
+                        privacy_generation: generation,
+                        destination_digest: destination.binding_digest(),
+                        authority_digest: String::new(),
+                        content: None,
+                        payload_bytes: 0,
+                        expires_at_ms: notice.expires_at_ms,
+                        admitted_at_ms: TimestampMs::new(now_ms),
+                        attempts: 0,
+                        suppression: None,
+                        detail: Some(detail),
+                        dispatched: false,
+                    });
+                }
             }
         }
-        // One transaction: every notification this event produced, what they spent, and the
-        // event's own completion. A crash before it leaves the event unproduced, so the recovery
-        // pass produces from it again and nothing has been charged for a notification nobody
-        // admitted.
-        if !self.journal.produce(&notice.event, &records, &spent)? {
+        // One transaction: every notification this event produced, what they spent, any staged
+        // overflow objects, and the event's own completion. A crash before it leaves the event
+        // unproduced, so the recovery pass produces from it again and nothing has been charged
+        // for a notification nobody admitted.
+        if !self
+            .journal
+            .produce(&notice.event, &records, &spent, &staged_objects)?
+        {
             return Ok(Produced {
                 events_taken: 0,
                 admitted: 0,
@@ -576,7 +607,7 @@ impl Producer {
                 // so this is a store written before that rule or one whose notice privacy mode
                 // removed. Either way there is nothing to build, and marking it produced is what
                 // takes it out of the recovery pass.
-                self.journal.produce(&pending.key, &[], &[])?;
+                self.journal.produce(&pending.key, &[], &[], &[])?;
                 continue;
             }
             let Ok(production) = kr_cbor::from_canonical_slice::<Production>(
@@ -594,7 +625,7 @@ impl Producer {
             let produced = match self.produce(&notice, destinations, authority, &lines, now_ms) {
                 Ok(produced) => produced,
                 Err(DeliveryError::Expiry(_)) => {
-                    self.journal.produce(&pending.key, &[], &[])?;
+                    self.journal.produce(&pending.key, &[], &[], &[])?;
                     total
                         .refused
                         .push((DestinationId::new("-")?, pending.key.stored()));
@@ -615,7 +646,7 @@ impl Producer {
         destination: &DestinationRecord,
         generation: u64,
         now_ms: u64,
-    ) -> Result<(DeliveryRecord, Option<crate::journal::StoredBudget>)> {
+    ) -> Result<(DeliveryRecord, Option<StoredBudget>, Option<StagedObject>)> {
         let push = destination
             .as_push()
             .ok_or_else(|| DeliveryError::NoDestination(destination.id.to_string()))?
@@ -661,6 +692,7 @@ impl Producer {
                         dispatched: false,
                     },
                     Some(budget.stored()),
+                    None,
                 ));
             }
             Admission::OpenUpdate {
@@ -675,7 +707,7 @@ impl Producer {
         } else {
             notice.alert
         };
-        let request =
+        let (request, staged) =
             self.build_request(notice, &push, &destination.id, identifier, alert, now_ms)?;
         let content = preview::encode_request(&request)?;
         let payload_bytes = preview::provider_payload_bytes(&request)?;
@@ -698,6 +730,7 @@ impl Producer {
                 dispatched: false,
             },
             Some(budget.stored()),
+            staged,
         ))
     }
 
@@ -713,7 +746,7 @@ impl Producer {
         notification_id: NotificationId,
         alert: PushAlert,
         now_ms: u64,
-    ) -> Result<PushDeliveryRequest> {
+    ) -> Result<(PushDeliveryRequest, Option<StagedObject>)> {
         let collapse = collapse_id(&self.collapse_secret, &notice.collapse_group);
         let hints = PushPlatformHints {
             alert,
@@ -733,7 +766,7 @@ impl Producer {
             // while the generic alert remains. There is no preview and no key here at all.
             let request = skeleton(Nullable::null());
             preview::check_payload_bound(&request)?;
-            return Ok(request);
+            return Ok((request, None));
         }
 
         let body = PreviewBody {
@@ -768,7 +801,7 @@ impl Producer {
             Ok(request)
         });
         match first {
-            Ok(request) => Ok(request),
+            Ok(request) => Ok((request, None)),
             Err(DeliveryError::PreviewTooLarge { .. } | DeliveryError::PayloadTooLarge { .. }) => {
                 // The detail stays on this host, encrypted, and the preview carries a reference to
                 // it. It is not trimmed, and no ratio is applied to guess what would have fitted.
@@ -808,12 +841,12 @@ impl Producer {
                         payload: kr_protocol::scalars::Bytes::new(body.canonical_bytes()?),
                     },
                 )?;
-                self.journal.keep_object(
-                    detail_id,
-                    destination_id,
-                    &kr_cbor::to_canonical_vec(&detail)?,
-                    notice.expires_at_ms,
-                )?;
+                let staged = StagedObject {
+                    envelope_id: detail_id,
+                    destination_id: destination_id.clone(),
+                    sealed: kr_cbor::to_canonical_vec(&detail)?,
+                    expires_at_ms: notice.expires_at_ms,
+                };
                 let sealed = preview::seal_preview(
                     &self.preview_key,
                     &target,
@@ -824,7 +857,7 @@ impl Producer {
                 )?;
                 let request = skeleton(Nullable::some(sealed.envelope));
                 preview::check_payload_bound(&request)?;
-                Ok(request)
+                Ok((request, Some(staged)))
             }
             Err(other) => Err(other),
         }
@@ -1381,7 +1414,9 @@ mod tests {
             .expect("a decision");
         assert_eq!(produced.admitted, 0);
         assert_eq!(produced.refused.len(), 1);
-        assert!(producer.journal().deliveries().expect("a read").is_empty());
+        let deliveries = producer.journal().deliveries().expect("a read");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].state, DeliveryState::Refused);
     }
 
     #[test]
@@ -1689,6 +1724,49 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_notification_commits_its_encrypted_object_in_the_production_transaction() {
+        let mut producer = producer();
+        let device_mailbox =
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair");
+        let (destination, device_preview, _) =
+            push_destination_with_keys("phone", true, Some(device_mailbox));
+        producer
+            .journal_mut()
+            .configure_destination(&destination)
+            .expect("a destination");
+        let mut notice = notice(1_000);
+        notice.summary = "y".repeat(1_400);
+        take_the_event(&mut producer, &notice);
+        producer
+            .produce(
+                &notice,
+                std::slice::from_ref(&destination),
+                &Everything(BTreeSet::new()),
+                &[],
+                1_000,
+            )
+            .expect("produced");
+        let record = producer.journal().deliveries().expect("a read").remove(0);
+        let request: kr_protocol::push::PushDeliveryRequest =
+            serde_json::from_slice(&record.content.expect("content")).expect("request");
+        let sealed = request.preview.as_ref().expect("a preview envelope");
+        let opened = preview::open_preview(
+            &device_preview,
+            producer.preview_public(),
+            sealed,
+            1_000,
+        )
+        .expect("opened preview");
+        let detail_id = opened.detail_object.as_ref().expect("detail envelope id");
+        let object_bytes = producer
+            .journal()
+            .object(*detail_id)
+            .expect("read object")
+            .expect("object exists in database");
+        assert!(!object_bytes.is_empty());
+    }
+
+    #[test]
     fn a_destination_with_no_encrypted_object_refuses_an_oversized_notification() {
         let mut producer = producer();
         let (destination, _, _) = push_destination_with_keys("phone", true, None);
@@ -1714,7 +1792,16 @@ mod tests {
             produced.refused[0].1.contains("encrypted object"),
             "the refusal says what is missing rather than trimming the text"
         );
-        assert!(producer.journal().deliveries().expect("a read").is_empty());
+        let deliveries = producer.journal().deliveries().expect("a read");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].state, DeliveryState::Refused);
+        assert!(
+            deliveries[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("encrypted object")
+        );
     }
 
     #[test]
