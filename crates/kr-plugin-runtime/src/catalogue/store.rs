@@ -203,10 +203,30 @@ impl Store {
         self.root.join("payloads").join(digest.to_string())
     }
 
-    /// Returns true when the payload is already cached here.
-    #[must_use]
-    pub fn has_payload(&self, digest: PayloadDigest) -> bool {
-        self.payload_path(digest).is_file()
+    /// Returns true when the payload cached here is the payload the digest names.
+    ///
+    /// A file of the right name is not the same thing as the right bytes: a truncated or altered
+    /// object left by an interrupted write would otherwise pass for a fetch nobody has to make
+    /// again, and a mirror would call itself complete while holding rubbish. The declared length
+    /// is checked first, so the common case costs one `stat`, and the bytes are hashed only when
+    /// that length matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the file is there and cannot be read.
+    pub fn holds_payload(&self, digest: PayloadDigest, length: u64) -> CatalogueResult<bool> {
+        let path = self.payload_path(digest);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() != length => return Ok(false),
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(CatalogueError::storage(&path, &source)),
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(PayloadDigest::of(&bytes) == digest),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(CatalogueError::storage(&path, &source)),
+        }
     }
 
     /// Returns true when the package is already activated here.
@@ -898,8 +918,11 @@ mod tests {
         store
             .reclaim(24, &mut ledger, &protected, "component.wasm")
             .expect("the spare payload is evicted");
-        assert!(store.has_payload(live), "a live-bound payload is kept");
-        assert!(!store.has_payload(spare));
+        assert!(
+            store.holds_payload(live, 4).expect("a readable store"),
+            "a live-bound payload is kept"
+        );
+        assert!(!store.holds_payload(spare, 5).expect("a readable store"));
 
         // Nothing unprotected is left, so the refusal names the resource rather than taking the
         // live-bound payload.
@@ -910,7 +933,29 @@ mod tests {
         let message = refusal.to_string();
         assert!(message.contains("payload_cache_bytes"), "{message}");
         assert!(message.contains("never evicted"), "{message}");
-        assert!(store.has_payload(live));
+        assert!(store.holds_payload(live, 4).expect("a readable store"));
+    }
+
+    #[test]
+    fn a_cached_object_that_lost_its_bytes_is_not_held() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"component");
+        store
+            .cache_payload(digest, b"component")
+            .expect("cacheable");
+        assert!(
+            store
+                .holds_payload(digest, 9)
+                .expect("a readable store, and the bytes it named"),
+        );
+
+        // The same name, the wrong length: an interrupted write leaves exactly this.
+        std::fs::write(store.payload_path(digest), b"compon").expect("a truncated object");
+        assert!(!store.holds_payload(digest, 9).expect("a readable store"));
+
+        // The right length and the wrong bytes costs a hash to catch, and is caught.
+        std::fs::write(store.payload_path(digest), b"comPonent").expect("an altered object");
+        assert!(!store.holds_payload(digest, 9).expect("a readable store"));
     }
 
     #[test]

@@ -878,6 +878,63 @@ async fn kr_req_11_06_the_full_offline_mirror_setting_fetches_every_payload() {
 }
 
 #[tokio::test]
+async fn kr_req_11_06_a_corrupt_cached_payload_is_fetched_again_and_never_counts_as_mirrored() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.full_offline_mirror = true;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        budgets,
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation");
+
+    let index = catalogue.index(&repository()).expect("an activated index");
+    let entry = index.entries.first().expect("one indexed package").clone();
+    let payload = entry.payloads.first().expect("one payload").clone();
+    let object = home
+        .path()
+        .join("catalogue")
+        .join(repository().as_str())
+        .join("payloads")
+        .join(payload.digest.to_string());
+    let cached = std::fs::read(&object).expect("a mirrored payload");
+
+    // An interrupted write leaves the content hash's own name with the wrong bytes behind it.
+    std::fs::write(&object, &cached[..cached.len() / 2]).expect("a truncated object");
+    let outcome = catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation");
+    assert!(
+        outcome.mirrored_payloads >= 1,
+        "a corrupt object is fetched again rather than skipped: {}",
+        outcome.mirrored_payloads
+    );
+    assert_eq!(
+        std::fs::read(&object).expect("a repaired payload"),
+        cached,
+        "the mirror replaces the object with the bytes the generation names"
+    );
+
+    // With the object corrupt and the repository no longer able to supply it, the sync refuses
+    // rather than leaving a file of the right name in a set it calls complete.
+    std::fs::write(&object, &cached[..cached.len() / 2]).expect("a truncated object");
+    std::fs::remove_dir_all(generation.targets_dir().join("packages")).expect("removable packages");
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("an incomplete mirror");
+    assert_eq!(refusal.code(), ErrorCode::PackageUnavailableOffline);
+}
+
+#[tokio::test]
 async fn kr_req_11_06_a_mirror_past_its_budget_leaves_the_last_generation_usable() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
@@ -1390,7 +1447,14 @@ async fn kr_req_11_12_a_pinned_payload_is_never_evicted_to_finish_a_sync() {
         .reclaim(1024, &mut ledger, &protected, "component.wasm")
         .expect_err("nothing may be evicted");
     assert!(refusal.to_string().contains("never evicted"), "{refusal}");
-    assert!(store.has_payload(generation.manifest_digest()));
+    let manifest = generation.manifest_digest();
+    let length = store
+        .cached_payloads()
+        .expect("readable")
+        .get(&manifest)
+        .copied()
+        .expect("the pinned manifest is cached");
+    assert!(store.holds_payload(manifest, length).expect("readable"));
 }
 
 // ---------------------------------------------------------------------------------------------

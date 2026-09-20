@@ -935,7 +935,7 @@ impl Catalogue {
 
         let mut fetched = 0usize;
         for (digest, (target, length)) in &wanted {
-            if self.state(id)?.store.has_payload(*digest) {
+            if self.state(id)?.store.holds_payload(*digest, *length)? {
                 continue;
             }
             let bytes = verified
@@ -954,9 +954,11 @@ impl Catalogue {
             state.refresh_payload_ledger()?;
         }
 
-        // A mirror reports success only when the whole set is here.
-        for digest in &mirror_set {
-            if !self.state(id)?.store.has_payload(*digest) {
+        // A mirror reports success only when the whole set is here, in the bytes the generation
+        // names. An object whose contents no longer hash to its name is a gap in the mirror, not
+        // a payload, so it is reported the same way a missing one is.
+        for (digest, (_, length)) in &wanted {
+            if !self.state(id)?.store.holds_payload(*digest, *length)? {
                 return Err(CatalogueError::UnavailableOffline {
                     detail: format!(
                         "the full offline mirror is missing {digest}; the previous generation \
@@ -976,8 +978,14 @@ impl Catalogue {
         digest: PayloadDigest,
         reason: FetchReason,
     ) -> CatalogueResult<Vec<u8>> {
-        if let Ok(bytes) = self.state(id)?.store.read_payload(digest) {
-            return Ok(bytes);
+        // A cached object that is not cached, or whose bytes no longer hash to its name, is
+        // fetched again. A store that cannot be read is neither: it is a failure of this host's
+        // own disk, and reporting it as an absent payload would send a person looking at their
+        // repository instead of their filesystem.
+        match self.state(id)?.store.read_payload(digest) {
+            Ok(bytes) => return Ok(bytes),
+            Err(CatalogueError::UnavailableOffline { .. } | CatalogueError::Integrity { .. }) => {}
+            Err(other) => return Err(other),
         }
         let (enrolment, datastore, ledger, accepted) = {
             let state = self.state(id)?;
