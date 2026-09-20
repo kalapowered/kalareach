@@ -283,6 +283,53 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 1 describes the process bridge and enrolled environments: explicit enrolment of WSL,
+    // container, SSH or paired environments, removing an enrolled row, querying the cached
+    // inventory without starting anything, and an explicit refresh that can start a stopped
+    // environment when asked. Each carries its own exhaustive entry in the host-and-environment group.
+    let environments = [
+        (
+            "environment.enrol",
+            EffectClass::Write,
+            Some(ActionRight::HostManage),
+        ),
+        (
+            "environment.forget",
+            EffectClass::Write,
+            Some(ActionRight::HostManage),
+        ),
+        ("environment.inventory", EffectClass::Read, None),
+        (
+            "environment.refresh",
+            EffectClass::Write,
+            Some(ActionRight::HostManage),
+        ),
+    ];
+    for (name, effect, right) in environments {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::HostAndEnvironment,
+            "{name} is a host and environment method"
+        );
+        match right {
+            Some(right) => {
+                assert_eq!(
+                    entry.required_rights,
+                    &[RequiredRight::right(right)],
+                    "{name} requires host management"
+                );
+            }
+            None => {
+                assert!(
+                    entry.required_rights.is_empty(),
+                    "{name} requires no specific rights beyond local caller"
+                );
+            }
+        }
+    }
+
     // No method in the group may reach a right that changes code or Git state. Section 23's rule
     // for this row is "no code mutation", and this is where that stops being a convention.
     for entry in REGISTRY
@@ -311,7 +358,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
 
     assert_eq!(
         REGISTRY.len(),
-        required.len() + added.len() + attention.len(),
+        required.len() + added.len() + attention.len() + environments.len(),
         "the registry holds the required methods and the named additions"
     );
 }
