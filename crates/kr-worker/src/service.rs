@@ -67,6 +67,7 @@ use kr_protocol::projection::ProjectionEvent;
 
 use crate::output::OutputDelivery;
 use crate::runtime::SessionRuntime;
+use crate::session::DETACH_HINT;
 use crate::session::Session;
 
 /// How often the worker replaces a live connection's action window.
@@ -964,6 +965,7 @@ impl WorkerService {
                                     "session.detached",
                                     &kr_protocol::attachment::SessionDetachParams {
                                         attachment_id: Nullable::some(attachment_id),
+                                        line_token: Nullable::null(),
                                     },
                                 ) {
                                     let _ = write_frame(
@@ -3037,39 +3039,26 @@ impl WorkerService {
             // attachment of this session is still refused.
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
-                // A request that names nothing is about the caller's own context, and section 7
-                // gives that answer only inside it. Inside means what it means everywhere else in
-                // this worker: the calling process is in this session's boundary or descends from
-                // its root shell, which the kernel says and the caller does not. A window that is
-                // not in the session names the attachment it means.
+                // A request that names nothing presents the capability the line it runs from was
+                // given. That capability is the whole answer: one line, one token, minted where
+                // the acceptance was recorded and exported by the integration for that command
+                // alone. Nothing about the caller's own process is read, because nothing about a
+                // process says which line it belongs to: it can be started by an earlier line,
+                // resumed from the background, or left over from one that has finished.
                 let attachment_id = match params.attachment_id.0 {
                     Some(named) => named,
-                    None => {
-                        let source = Self::bind_source_in(session, state).map_err(|_| {
-                            WorkerError::AmbiguousDetach {
-                                detail: "this caller is not running inside the session, so \
-                                         the line it detaches is not one this session \
-                                         accepted from it; name the attachment to detach \
-                                         with --attachment"
-                                    .to_owned(),
-                            }
-                        })?;
-                        // And inside it, the line this session has a record of: the caller is in
-                        // the job the terminal has in the foreground, which is the job the root
-                        // shell made for the line it accepted. A caller the shell was told to run
-                        // in the background, or one left from a line that has since finished, is
-                        // some other line's, and the record is not about it.
-                        let pid = u32::try_from(source.process.pid.get()).unwrap_or(u32::MAX);
-                        if !session.runs_the_accepted_line(pid) {
+                    None => match params.line_token.0.as_deref() {
+                        Some(presented) => session.detach_for_token(presented)?,
+                        None => {
                             return Err(WorkerError::AmbiguousDetach {
-                                detail: "this caller is not the line the root shell accepted, \
-                                         so the attachment that line came from is not its own; \
-                                         name the attachment to detach with --attachment"
-                                    .to_owned(),
+                                detail: format!(
+                                    "this caller presented no capability for a line this session \
+                                     accepted, so the attachment it would detach is not \
+                                     established; {DETACH_HINT}"
+                                ),
                             });
                         }
-                        session.detach_origin()?
-                    }
+                    },
                 };
                 if session.attachment_capabilities(attachment_id).is_some() {
                     Ok(())

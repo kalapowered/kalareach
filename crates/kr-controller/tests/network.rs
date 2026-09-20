@@ -1931,6 +1931,7 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
             &ParamsValue::empty(),
             &kr_protocol::attachment::SessionDetachParams {
                 attachment_id: Nullable::some(local_attachment.attachment.attachment_id),
+                line_token: Nullable::null(),
             },
             DurationMs::new(120_000),
         )
@@ -1956,6 +1957,7 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
                 &ParamsValue::empty(),
                 &kr_protocol::attachment::SessionDetachParams {
                     attachment_id: Nullable::some(attached.watching),
+                    line_token: Nullable::null(),
                 },
                 DurationMs::new(120_000),
             )

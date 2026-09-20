@@ -272,6 +272,15 @@ pub struct FenceDriver {
     reader: Option<(PromptGeneration, ReaderRevision)>,
     /// Whether the last stimulus was one the machine ignored as belonging to something that ended.
     ignored: bool,
+    /// The capability the accepted line holds, and the attachment it names.
+    ///
+    /// One line, one token. It is minted where the acceptance is recorded, it goes to the bridge
+    /// in the answer to the event that recorded it, and it lasts exactly as long as that record
+    /// does: the next accepted line replaces it, and a line this host could not attribute leaves
+    /// none. It outlives the fence, because the line does: a client taking the keys while the
+    /// command runs invalidates the fence and changes nothing about which terminal that line was
+    /// typed in. Nothing about a caller's own process says which line it belongs to; this does.
+    line_token: Option<(String, AttachmentId)>,
     /// What the connection's own task waits on when the deadline or the queue may have moved.
     waker: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -313,6 +322,7 @@ impl FenceDriver {
             answering: None,
             reader: None,
             ignored: false,
+            line_token: None,
             waker: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -349,6 +359,25 @@ impl FenceDriver {
     #[must_use]
     pub fn held(&self) -> Vec<InputRef> {
         self.machine.held()
+    }
+
+    /// Returns the attachment one line's own capability names.
+    ///
+    /// The comparison takes the same time for every token of the same length, because a caller
+    /// that can ask repeatedly could otherwise learn one a byte at a time.
+    #[must_use]
+    pub fn detach_for_token(&self, presented: &str) -> Option<AttachmentId> {
+        let (minted, attachment_id) = self.line_token.as_ref()?;
+        if minted.len() != presented.len() {
+            return None;
+        }
+        let same = minted
+            .bytes()
+            .zip(presented.bytes())
+            .fold(0_u8, |difference, (minted, presented)| {
+                difference | (minted ^ presented)
+            });
+        (same == 0).then_some(*attachment_id)
     }
 
     /// Returns what a `kr detach` with no attachment identifier targets.
@@ -928,10 +957,21 @@ impl FenceDriver {
             Action::RefuseInterrupt(fault) => effects.interrupt_refused = Some(*fault),
             Action::RecordAcceptance(origin) => {
                 effects.acceptance = Some(origin.clone());
+                // A capability for this line and for no other. A line this host could not
+                // attribute gets none, because there is nothing for a token to name.
+                self.line_token = match &origin {
+                    AcceptedOrigin::Fenced { attachment_id, .. } => {
+                        Some((kr_ipc::new_uuid().to_string(), *attachment_id))
+                    }
+                    AcceptedOrigin::Mixed | AcceptedOrigin::Unverifiable => None,
+                };
                 self.answer(
                     &mut effects,
                     EventOutcome::CommandRecorded(RootCommandAcceptedResult {
                         origin: origin.clone(),
+                        detach_token: Nullable(
+                            self.line_token.as_ref().map(|(token, _)| token.clone()),
+                        ),
                         state,
                     }),
                 );

@@ -906,6 +906,17 @@ pub struct RootCommandAcceptedParams {
 pub struct RootCommandAcceptedResult {
     /// The origin the worker recorded, which is what a later unqualified detach resolves against.
     pub origin: AcceptedOrigin,
+    /// The capability this line's own execution presents to detach the attachment it came from.
+    ///
+    /// The integration exports it for the command it is about to run and for nothing else, and
+    /// `kr detach` with no attachment named presents it. It is how the worker knows which line a
+    /// caller belongs to: a line's own token names its own attachment, and no process this host
+    /// can see says the same thing, because a process can be started by an earlier line, resumed
+    /// from the background or left over from one that has already finished.
+    ///
+    /// Null where there is nothing to name: an origin this host could not attribute, and an older
+    /// worker that minted none.
+    pub detach_token: Nullable<String>,
     /// The state after acceptance.
     pub state: FenceState,
 }

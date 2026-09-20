@@ -178,6 +178,12 @@ pub struct SessionDetachParams {
     /// nothing gets that attachment or `AMBIGUOUS_ATTACHMENT`, never a guess and never whichever
     /// client happens to hold the input lease when the command runs.
     pub attachment_id: Nullable<AttachmentId>,
+    /// The capability the accepted line this caller runs from was given.
+    ///
+    /// Presented where no attachment is named: it says which line the caller belongs to, which no
+    /// reading of the caller's own process can. Null from a caller that was given none, and a
+    /// request that names neither is refused rather than attributed.
+    pub line_token: Nullable<String>,
 }
 
 /// The result of `session.detach`.

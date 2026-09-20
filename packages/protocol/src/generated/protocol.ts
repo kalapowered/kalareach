@@ -12677,6 +12677,19 @@ export interface RootCommandAcceptedParams {
  */
 export interface RootCommandAcceptedResult {
   /**
+   * The capability this line's own execution presents to detach the attachment it came from.
+   *
+   * The integration exports it for the command it is about to run and for nothing else, and
+   * `kr detach` with no attachment named presents it. It is how the worker knows which line a
+   * caller belongs to: a line's own token names its own attachment, and no process this host
+   * can see says the same thing, because a process can be started by an earlier line, resumed
+   * from the background or left over from one that has already finished.
+   *
+   * Null where there is nothing to name: an origin this host could not attribute, and an older
+   * worker that minted none.
+   */
+  detach_token: string | null
+  /**
    * The origin the worker recorded, which is what a later unqualified detach resolves against.
    */
   origin:
@@ -13792,6 +13805,14 @@ export interface SessionDetachParams {
    * client happens to hold the input lease when the command runs.
    */
   attachment_id: AttachmentId | null
+  /**
+   * The capability the accepted line this caller runs from was given.
+   *
+   * Presented where no attachment is named: it says which line the caller belongs to, which no
+   * reading of the caller's own process can. Null from a caller that was given none, and a
+   * request that names neither is refused rather than attributed.
+   */
+  line_token: string | null
 }
 /**
  * The result of `session.detach`.

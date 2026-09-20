@@ -295,10 +295,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                     text.parse()
                         .map_err(|_| CliError::Usage(format!("{text} is not an attachment")))?,
                 ),
-                // Nothing was named, so the session decides. It is the only party that knows
-                // which attachment the root editor accepted this command's own line from, and it
-                // answers `AMBIGUOUS_ATTACHMENT` rather than guessing when it cannot establish
-                // one or when this process is not running inside it.
+                // Nothing was named, so this command presents the capability the line it runs
+                // from was given and the session answers from that. A caller holding none gets
+                // `AMBIGUOUS_ATTACHMENT` with the instruction to name the attachment, never a
+                // guess made from what this process happens to look like.
                 None => None,
             };
             let result =

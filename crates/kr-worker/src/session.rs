@@ -46,6 +46,14 @@ use crate::output::{OutputHub, OutputStream};
 use crate::ownership::OwnedProcesses;
 use crate::pty::{Pty, RootShell, ShellCommand, ShellExit};
 
+/// What section 7 tells a caller whose attachment this host cannot name.
+pub const DETACH_HINT: &str = "Use kr detach --attachment <id> to detach";
+
+/// What a caller presenting no usable capability is told.
+const STALE_TOKEN: &str = "the capability this caller presented is not one this session's current \
+                           line holds, so the attachment it would detach is not established; \
+                           Use kr detach --attachment <id> to detach";
+
 /// How long an owned process group has to stop before it is forced.
 pub const GRACE_PERIOD: Duration = Duration::from_secs(5);
 
@@ -1543,71 +1551,43 @@ impl Session {
         })
     }
 
-    /// Returns whether one process is in the job this terminal has in the foreground.
-    ///
-    /// The foreground job is the one the root shell put the line it accepted into, and the one the
-    /// interrupt key would signal. A `kr detach` the person typed at the prompt leads it. One the
-    /// shell was told to run in the background, one left over from a line that has already
-    /// finished, and one started by something else inside the job do not, and the attachment this
-    /// session has a record of is not that caller's.
-    ///
-    /// Where the platform does not name a foreground job, and where the shell is running without
-    /// job control so that every line shares the shell's own group, there is no such job to be in.
-    /// A detach that names no attachment is refused there rather than attributed to whoever typed
-    /// last.
-    #[must_use]
-    pub fn runs_the_accepted_line(&self, pid: u32) -> bool {
-        let Some(group) = self
-            .pty
-            .foreground_group()
-            .and_then(|group| u32::try_from(group).ok())
-        else {
-            return false;
-        };
-        // A shell with job control off puts every child in its own group, so the terminal has the
-        // shell's group in the foreground whatever it is running and the reading says nothing
-        // about which line a caller belongs to. That is a binding this host does not have rather
-        // than one it can assume, and an unknown binding is refused.
-        let shell = self
-            .shell
-            .as_ref()
-            .and_then(RootShell::foreground_group)
-            .and_then(|group| u32::try_from(group).ok());
-        let root = self
-            .root_identity()
-            .and_then(|identity| u32::try_from(identity.pid.get()).ok());
-        if Some(group) == shell || Some(group) == root {
-            return false;
-        }
-        // And the caller leads that job rather than merely belonging to it. A shell makes the
-        // command it runs from a line the leader of the job it makes for that line, so a caller
-        // that leads the foreground job is the line the shell is running now. One that was
-        // started by something else in the job — a subshell, an earlier command in a list, a job
-        // the person has since brought back to the foreground with `fg` — belongs to a line that
-        // was accepted before this record was, and this record is not about it.
-        if group != pid {
-            return false;
-        }
-        kr_ipc::identity::processes_in_group(group).is_ok_and(|members| members.contains(&pid))
-    }
-
-    /// Returns the attachment a `session.detach` that named none is about.
-    ///
-    /// Section 7 gives `kr detach` no identifier inside its own context, and section 23's editor
-    /// fence is what makes that context a fact rather than a guess: the root integration records
-    /// which attachment's input, under which epoch, the accepted line came from, and a command
-    /// running from that line detaches its own terminal. The recorded origin is the whole answer,
-    /// and it is never whichever client holds the input lease by the time the command runs.
-    ///
-    /// Everything else is refused. A mixed or unverifiable context has a real answer this host
-    /// cannot name; a session with no recorded origin at all is one the caller is outside, and
-    /// section 7 requires an explicit selector there. One remaining terminal is not proof that it
-    /// is the one the command came from: an outside caller would otherwise disconnect somebody
-    /// else's window by naming the session alone.
+    /// Returns the attachment the capability one accepted line holds names.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::AmbiguousDetach`] when no single attachment can be named.
+    /// Returns [`WorkerError::AmbiguousDetach`] when the token is not this line's, when the line
+    /// it belonged to has gone, or when the attachment it named has already left.
+    pub fn detach_for_token(&self, presented: &str) -> Result<AttachmentId> {
+        let named = self
+            .fence
+            .as_ref()
+            .and_then(|driver| driver.detach_for_token(presented));
+        let Some(attachment_id) = named else {
+            return Err(WorkerError::AmbiguousDetach {
+                detail: STALE_TOKEN.to_owned(),
+            });
+        };
+        if self.attachments.get(attachment_id).is_none() {
+            return Err(WorkerError::AmbiguousDetach {
+                detail: format!(
+                    "the attachment this line was typed in has already left; {DETACH_HINT}"
+                ),
+            });
+        }
+        Ok(attachment_id)
+    }
+
+    /// Returns the attachment the root editor accepted the current line from.
+    ///
+    /// This is the record a line's own capability names. It is reported for diagnostics and read
+    /// by the suites; a detach resolves through [`Session::detach_for_token`], because holding
+    /// the capability is what says a caller belongs to that line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::AmbiguousDetach`] when no single attachment can be named: a mixed
+    /// or unverifiable context, a session whose root editor has accepted nothing, and an origin
+    /// whose terminal has already left.
     pub fn detach_origin(&self) -> Result<AttachmentId> {
         use kr_shell_integration::contract::fence::{AmbiguityReason, DetachTarget};
 

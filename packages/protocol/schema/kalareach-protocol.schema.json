@@ -16973,6 +16973,17 @@
       "additionalProperties": false,
       "description": "The result of `root.command.accepted`.",
       "properties": {
+        "detach_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The capability this line's own execution presents to detach the attachment it came from.\n\nThe integration exports it for the command it is about to run and for nothing else, and\n`kr detach` with no attachment named presents it. It is how the worker knows which line a\ncaller belongs to: a line's own token names its own attachment, and no process this host\ncan see says the same thing, because a process can be started by an earlier line, resumed\nfrom the background or left over from one that has already finished.\n\nNull where there is nothing to name: an origin this host could not attribute, and an older\nworker that minted none."
+        },
         "origin": {
           "$ref": "#/$defs/AcceptedOrigin",
           "description": "The origin the worker recorded, which is what a later unqualified detach resolves against."
@@ -16984,6 +16995,7 @@
       },
       "required": [
         "origin",
+        "detach_token",
         "state"
       ],
       "type": "object"
@@ -17913,10 +17925,22 @@
             }
           ],
           "description": "The attachment to remove. Null asks the host for the originating attachment.\n\nSection 7's `kr detach` takes no identifier inside its own context, and the host is the\nonly place that knows what that context is: the attachment whose input the root editor\naccepted the line under, recorded through the fence at acceptance. A caller that names\nnothing gets that attachment or `AMBIGUOUS_ATTACHMENT`, never a guess and never whichever\nclient happens to hold the input lease when the command runs."
+        },
+        "line_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The capability the accepted line this caller runs from was given.\n\nPresented where no attachment is named: it says which line the caller belongs to, which no\nreading of the caller's own process can. Null from a caller that was given none, and a\nrequest that names neither is refused rather than attributed."
         }
       },
       "required": [
-        "attachment_id"
+        "attachment_id",
+        "line_token"
       ],
       "type": "object"
     },

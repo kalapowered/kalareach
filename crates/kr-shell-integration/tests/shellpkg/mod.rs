@@ -624,6 +624,9 @@ impl Session {
             BridgeEvent::CommandAccepted(params) => {
                 Some(EventOutcome::CommandRecorded(RootCommandAcceptedResult {
                     origin: params.origin.clone(),
+                    // The capability a real worker mints for the line it has just recorded. This
+                    // harness stands in for the worker, so it mints one the same way.
+                    detach_token: Nullable::some(kr_ipc::new_uuid().to_string()),
                     state: FenceState::Fenced,
                 }))
             }

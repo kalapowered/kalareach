@@ -1951,6 +1951,47 @@ async fn a_profile_that_refuses_a_fenced_launch_installs_nothing() {
     wired.close().await;
 }
 
+/// Section 7's own instruction to a caller whose attachment this host cannot name.
+const DETACH_HINT: &str = "Use kr detach --attachment <id> to detach";
+
+/// Reads the capability the worker minted for the line it has just recorded.
+async fn recorded_token(wired: &mut Wired) -> Option<String> {
+    loop {
+        if let ToBridge::EventResult { result, .. } = wired.next().await
+            && let kr_shell_integration::contract::transport::EventOutcome::CommandRecorded(
+                recorded,
+            ) = *result
+        {
+            return recorded.detach_token.0;
+        }
+    }
+}
+
+/// Calls `session.detach` with whatever this caller holds.
+async fn detach(
+    client: &mut LocalClient,
+    wired: &Wired,
+    attachment_id: Nullable<AttachmentId>,
+    line_token: Nullable<String>,
+) -> std::result::Result<
+    kr_protocol::attachment::SessionDetachResult,
+    kr_protocol::error::ProtocolError,
+> {
+    client
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::attachment::SessionDetachParams {
+                attachment_id,
+                line_token,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|answered| answered.to_typed().expect("decodes"))
+}
+
 /// KR-REQ-07.84: `session.detach` with no attachment named resolves against the recorded origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_from() {
@@ -1973,17 +2014,7 @@ async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_f
         }))
         .await
         .expect("reports");
-    loop {
-        match wired.next().await {
-            ToBridge::EventResult { result, .. } => match *result {
-                kr_shell_integration::contract::transport::EventOutcome::CommandRecorded(_) => {
-                    break;
-                }
-                _ => continue,
-            },
-            _ => continue,
-        }
-    }
+    let token = recorded_token(&mut wired).await;
 
     // A second client takes the keys while the command from that line is still running, which is
     // exactly the case section 7 refuses to let decide a detach.
@@ -1991,59 +2022,44 @@ async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_f
     assert_ne!(later, typist);
     assert_eq!(wired.runtime.session().lease().holder.0, Some(later));
 
-    // The host's own answer is the attachment the editor accepted the line from, not the lease
-    // holder that took the keys after it.
-    assert_eq!(
-        wired
-            .runtime
-            .session()
-            .detach_origin()
-            .expect("an origin was recorded"),
-        typist
-    );
-
-    // Section 7 gives that answer inside the originating attachment's context. This client is a
-    // test process rather than a command the session's root shell ran, so it is outside it, and
-    // what it gets back is the instruction to name the attachment it means.
-    let refused = client
-        .mutate(
-            Method::SessionDetach,
-            ActionId::new(kr_ipc::new_uuid()),
-            wired.target(),
-            &kr_protocol::attachment::SessionDetachParams {
-                attachment_id: Nullable::null(),
-            },
-        )
+    // A caller holding no capability is told to name the attachment, whatever it looks like.
+    let refused = detach(&mut client, &wired, Nullable::null(), Nullable::null())
         .await
-        .expect("reaches the worker")
-        .expect_err("a caller outside the session names the attachment it means");
+        .expect_err("a caller with no capability names the attachment it means");
     assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
     assert!(
-        refused.message.contains("--attachment"),
-        "the refusal says what to do instead: {}",
+        refused.message.contains(DETACH_HINT),
+        "the refusal carries section 7's own instruction: {}",
         refused.message
     );
+
+    // And one holding a capability that is not this line's is told the same.
+    let refused = detach(
+        &mut client,
+        &wired,
+        Nullable::null(),
+        Nullable::some("not-a-token".to_owned()),
+    )
+    .await
+    .expect_err("a capability this line does not hold names nothing");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert!(refused.message.contains(DETACH_HINT));
     assert_eq!(
         wired.runtime.session().attachments().len(),
         2,
         "and nothing was detached"
     );
 
-    // Naming it is what a window outside the session does, and that still removes exactly it.
-    let detached: kr_protocol::attachment::SessionDetachResult = client
-        .mutate(
-            Method::SessionDetach,
-            ActionId::new(kr_ipc::new_uuid()),
-            wired.target(),
-            &kr_protocol::attachment::SessionDetachParams {
-                attachment_id: Nullable::some(typist),
-            },
-        )
-        .await
-        .expect("reaches the worker")
-        .expect("detaches")
-        .to_typed()
-        .expect("decodes");
+    // The line's own capability names the attachment that line was typed in, not the lease holder
+    // that took the keys after it.
+    let detached = detach(
+        &mut client,
+        &wired,
+        Nullable::null(),
+        Nullable::some(token.expect("a capability was minted for the line")),
+    )
+    .await
+    .expect("detaches");
     assert_eq!(detached.attachment_id, typist);
     assert!(
         wired
@@ -2053,6 +2069,86 @@ async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_f
             .is_none()
     );
     wired.close().await;
+}
+
+/// KR-REQ-07.84: a capability from an earlier line names nothing once another line is accepted.
+///
+/// This is every arrangement a shell's job control can make of two attachments, at the level that
+/// decides the answer. `(sleep 10; exec kr detach) &` from A followed by `fg %1` from B, a
+/// background job of A's calling detach while B's line runs, and either of those with `set +m` so
+/// that every child shares the shell's own process group: each one is a caller from A's line
+/// asking after another line has been accepted. No reading of such a caller's process tells it
+/// apart from the line running now — `exec` keeps the identifier, `fg` gives it the terminal, and
+/// without job control it has the shell's own group — and none of that has to be told apart: the
+/// capability A's line holds is not the one this session's current line holds, so it names
+/// nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_from_an_earlier_line_names_nothing_after_another_is_accepted() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+
+    // A types a line and is given a capability for it.
+    let typist = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    accept(&mut wired, &fence, typist).await;
+    let first = recorded_token(&mut wired)
+        .await
+        .expect("a capability for the line");
+
+    // The next line is accepted, whatever A left running behind it.
+    wired
+        .bridge
+        .send_event(BridgeEvent::CommandAccepted(RootCommandAcceptedParams {
+            session_id: wired.session_id,
+            fence_id: Nullable::some(fence.fence_id),
+            prompt_generation: PromptGeneration::new(2),
+            origin: AcceptedOrigin::Fenced {
+                attachment_id: typist,
+                input_epoch: fence.input_epoch,
+            },
+        }))
+        .await
+        .expect("reports");
+    assert!(
+        recorded_token(&mut wired).await.is_none(),
+        "a line this host cannot attribute holds no capability"
+    );
+
+    // And A's caller, however its shell arranged the process it runs in, names nothing.
+    let refused = detach(&mut client, &wired, Nullable::null(), Nullable::some(first))
+        .await
+        .expect_err("a capability from a line that has been replaced names nothing");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert!(refused.message.contains(DETACH_HINT));
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        1,
+        "and nothing was detached"
+    );
+    wired.close().await;
+}
+
+/// Records one accepted line for this attachment and waits for the machine to take it.
+async fn accept(
+    wired: &mut Wired,
+    fence: &kr_protocol::root::EditorFence,
+    attachment_id: AttachmentId,
+) {
+    wired
+        .bridge
+        .send_event(BridgeEvent::CommandAccepted(RootCommandAcceptedParams {
+            session_id: wired.session_id,
+            fence_id: Nullable::some(fence.fence_id),
+            prompt_generation: fence.prompt_generation,
+            origin: AcceptedOrigin::Fenced {
+                attachment_id,
+                input_epoch: fence.input_epoch,
+            },
+        }))
+        .await
+        .expect("reports");
 }
 
 /// KR-REQ-07.84: a mixed origin is refused rather than guessed at.
@@ -2113,18 +2209,10 @@ async fn a_detach_that_names_nothing_is_refused_when_the_origin_was_mixed() {
         "the refusal says why: {refused}"
     );
 
-    // And the method refuses it too, whichever side the caller is on.
-    let refused = client
-        .mutate(
-            Method::SessionDetach,
-            ActionId::new(kr_ipc::new_uuid()),
-            wired.target(),
-            &kr_protocol::attachment::SessionDetachParams {
-                attachment_id: Nullable::null(),
-            },
-        )
+    // And no capability was minted for it, so the method refuses it too.
+    assert!(recorded_token(&mut wired).await.is_none());
+    let refused = detach(&mut client, &wired, Nullable::null(), Nullable::null())
         .await
-        .expect("reaches the worker")
         .expect_err("a mixed context cannot name one attachment");
     assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
     assert_eq!(

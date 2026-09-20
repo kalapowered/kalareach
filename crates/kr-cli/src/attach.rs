@@ -473,11 +473,17 @@ pub fn guard_program() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("kr-attach-guard"))
 }
 
+/// The variable the integration exports for the command it is about to run.
+///
+/// One accepted line, one value, set by the shell's own bridge script for that command and for
+/// nothing else. It is how `kr detach` with no attachment named says which line it belongs to.
+pub const DETACH_TOKEN_VARIABLE: &str = "KR_DETACH_TOKEN";
+
 /// Detaches an attachment of a session.
 ///
-/// `None` asks the session for its own originating attachment, which is what `kr detach` inside a
-/// root shell means. The host answers that from the fence the root editor accepted the line under,
-/// or refuses with `AMBIGUOUS_ATTACHMENT`; this command never picks one itself.
+/// `None` presents the capability the line this process runs from was given, which is what
+/// `kr detach` inside a root shell means. The host answers from that capability alone, or refuses
+/// with `AMBIGUOUS_ATTACHMENT`; this command never picks an attachment itself.
 ///
 /// # Errors
 ///
@@ -493,6 +499,15 @@ pub async fn detach_attachment(
         target(descriptor),
         &SessionDetachParams {
             attachment_id: Nullable(attachment_id),
+            // The capability the line this process runs from was given, where there is one. It is
+            // what a request that names no attachment is answered from.
+            line_token: Nullable(
+                attachment_id
+                    .is_none()
+                    .then(|| std::env::var(DETACH_TOKEN_VARIABLE).ok())
+                    .flatten()
+                    .filter(|token| !token.is_empty()),
+            ),
         },
     )
     .await
