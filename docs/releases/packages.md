@@ -11,6 +11,9 @@ What these digests establish is byte integrity: that an archive is the one the r
 They are not signatures, and they say nothing about who published it. Release signing and its keys
 belong to the signed host and client packages, which are a separate release path.
 
+The Windows half of that path, and the identity behind every signature on it, is in
+[docs/releases/windows-signing.md](windows-signing.md).
+
 ## What a release carries
 
 | Asset | What it is |
