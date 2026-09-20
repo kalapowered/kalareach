@@ -271,6 +271,28 @@ fn take_and_produce(
         .expect("the producer")
 }
 
+/// Claims the first delivery the outbox offers, the way a pass does.
+fn claim_first(environment: &Environment, now_ms: u64) -> kr_delivery::journal::ClaimedDelivery {
+    environment
+        .module
+        .with(|producer| {
+            let selected = producer.journal().due(now_ms, 1).expect("a read");
+            let notification_id = selected
+                .first()
+                .expect("the outbox is offering one")
+                .notification_id;
+            match producer
+                .journal_mut()
+                .claim(notification_id, now_ms)
+                .expect("a claim")
+            {
+                kr_delivery::journal::Claim::Taken(claimed) => Ok(*claimed),
+                other => panic!("the delivery was not claimable: {other:?}"),
+            }
+        })
+        .expect("a claim")
+}
+
 fn held(expires_at_ms: u64) -> HeldCredentials {
     let credentials = HeldCredentials::new();
     credentials.hold(credential(expires_at_ms));
@@ -770,28 +792,8 @@ fn a_restart_records_what_was_in_flight_as_unknown_and_resumes_only_what_is_auth
         std::slice::from_ref(&destination),
         1,
     );
-    // An attempt that never came back: the record says in flight and this host stops.
-    environment
-        .module
-        .with(|producer| {
-            let delivery = producer.journal().due(NOW, 1).expect("a read").remove(0);
-            producer
-                .journal_mut()
-                .record_attempt(&kr_delivery::journal::Transition {
-                    notification_id: delivery.notification_id,
-                    attempt: 1,
-                    state: DeliveryState::InFlight,
-                    started_at_ms: TimestampMs::new(NOW),
-                    settled_at_ms: None,
-                    next_attempt_at_ms: None,
-                    detail: None,
-                    suppression: None,
-                    keep_content: true,
-                })
-                .expect("a transition");
-            Ok(())
-        })
-        .expect("a write");
+    // An attempt that never came back: the claim says in flight and this host stops.
+    claim_first(&environment, NOW);
 
     let reconciled = environment
         .module
@@ -828,27 +830,7 @@ fn a_restart_revokes_what_is_no_longer_authorised() {
         std::slice::from_ref(&destination),
         1,
     );
-    environment
-        .module
-        .with(|producer| {
-            let delivery = producer.journal().due(NOW, 1).expect("a read").remove(0);
-            producer
-                .journal_mut()
-                .record_attempt(&kr_delivery::journal::Transition {
-                    notification_id: delivery.notification_id,
-                    attempt: 1,
-                    state: DeliveryState::InFlight,
-                    started_at_ms: TimestampMs::new(NOW),
-                    settled_at_ms: None,
-                    next_attempt_at_ms: None,
-                    detail: None,
-                    suppression: None,
-                    keep_content: true,
-                })
-                .expect("a transition");
-            Ok(())
-        })
-        .expect("a write");
+    claim_first(&environment, NOW);
     environment
         .module
         .reconcile(
@@ -1112,12 +1094,16 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
     environment
         .module
         .with(|producer| {
-            let due = producer.journal().due(NOW, 1).expect("a read");
-            let sent = &due[0];
+            let selected = producer.journal().due(NOW, 1).expect("a read");
+            let sent = selected[0].notification_id;
+            assert!(matches!(
+                producer.journal_mut().claim(sent, NOW).expect("a claim"),
+                kr_delivery::journal::Claim::Taken(_)
+            ));
             producer
                 .journal_mut()
                 .record_attempt(&kr_delivery::journal::Transition {
-                    notification_id: sent.notification_id,
+                    notification_id: sent,
                     attempt: 1,
                     state: DeliveryState::Accepted,
                     started_at_ms: TimestampMs::new(NOW),
@@ -1128,21 +1114,14 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                     keep_content: false,
                 })
                 .expect("a transition");
-            let due = producer.journal().due(NOW, 1).expect("a read");
-            producer
-                .journal_mut()
-                .record_attempt(&kr_delivery::journal::Transition {
-                    notification_id: due[0].notification_id,
-                    attempt: 1,
-                    state: DeliveryState::InFlight,
-                    started_at_ms: TimestampMs::new(NOW),
-                    settled_at_ms: None,
-                    next_attempt_at_ms: None,
-                    detail: None,
-                    suppression: None,
-                    keep_content: true,
-                })
-                .expect("a transition");
+            let selected = producer.journal().due(NOW, 1).expect("a read");
+            assert!(matches!(
+                producer
+                    .journal_mut()
+                    .claim(selected[0].notification_id, NOW)
+                    .expect("a claim"),
+                kr_delivery::journal::Claim::Taken(_)
+            ));
             Ok(())
         })
         .expect("a write");

@@ -170,6 +170,19 @@ mod tests {
         EventSource::WorkerOutbox.consumer("session-1")
     }
 
+    /// Claims one delivery the way a pass does, so the record is really on the wire.
+    fn claim(journal: &mut DeliveryJournal, byte: u8, now_ms: u64) {
+        assert!(
+            matches!(
+                journal
+                    .claim(NotificationId::new(uuid(byte)), now_ms)
+                    .expect("a claim"),
+                crate::journal::Claim::Taken(_)
+            ),
+            "the delivery was claimable"
+        );
+    }
+
     fn journal_with_work() -> DeliveryJournal {
         let mut journal = DeliveryJournal::in_memory().expect("a journal");
         journal
@@ -261,19 +274,7 @@ mod tests {
     #[test]
     fn cleanup_is_not_complete_while_a_send_is_in_flight() {
         let mut journal = journal_with_work();
-        journal
-            .record_attempt(&Transition {
-                notification_id: NotificationId::new(uuid(11)),
-                attempt: 1,
-                state: DeliveryState::InFlight,
-                started_at_ms: TimestampMs::new(1_500),
-                settled_at_ms: None,
-                next_attempt_at_ms: None,
-                detail: None,
-                suppression: None,
-                keep_content: true,
-            })
-            .expect("a transition");
+        claim(&mut journal, 11, 1_500);
         let mut mode = PrivacyMode::new();
         mode.open_generation(TimestampMs::new(2_000));
         let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
@@ -305,6 +306,7 @@ mod tests {
     #[test]
     fn an_unknown_outcome_keeps_the_cleanup_reconciling() {
         let mut journal = journal_with_work();
+        claim(&mut journal, 11, 1_500);
         journal
             .record_attempt(&Transition {
                 notification_id: NotificationId::new(uuid(11)),
@@ -328,6 +330,7 @@ mod tests {
     #[test]
     fn what_has_already_left_is_shown_rather_than_claimed_to_be_erased() {
         let mut journal = journal_with_work();
+        claim(&mut journal, 11, 1_500);
         journal
             .record_attempt(&Transition {
                 notification_id: NotificationId::new(uuid(11)),

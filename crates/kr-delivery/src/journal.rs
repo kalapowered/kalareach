@@ -458,6 +458,80 @@ pub struct DueDelivery {
     pub content: Vec<u8>,
 }
 
+/// One delivery a pass has taken for itself, and nothing else can take.
+///
+/// It is the answer to [`DeliveryJournal::claim`], which is where the row became this caller's:
+/// the state, the fence, the generation, the due time and the expiry were all read in the same
+/// transaction that moved the row to [`DeliveryState::InFlight`] and took it out of the outbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedDelivery {
+    /// The delivery.
+    pub notification_id: NotificationId,
+    /// Where it is going.
+    pub destination_id: DestinationId,
+    /// The attempt this claim is, counting from one.
+    pub attempt: u64,
+    /// When it expires, in UTC milliseconds.
+    pub expires_at_ms: TimestampMs,
+    /// The privacy generation it was admitted under.
+    pub privacy_generation: u64,
+    /// The bytes to send.
+    pub content: Vec<u8>,
+}
+
+/// What asking for one due delivery produced.
+///
+/// A selection is a read and a claim is a write, and anything can happen between them: a privacy
+/// pass can fence the outbox, another pass can take the same row, the expiry can arrive. Every one
+/// of those is a refusal here rather than a send that should not have happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// The row is this caller's, and is on the wire until it records what happened.
+    Taken(Box<ClaimedDelivery>),
+    /// The expiry had passed, so the row was settled as expired instead of being sent.
+    Expired,
+    /// Nothing was claimed, and the reason is one a person reading the journal can act on.
+    Refused(ClaimRefusal),
+}
+
+/// Why a claim found nothing to take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// The delivery is not in this journal.
+    Missing,
+    /// Privacy mode has stopped this environment's outbox.
+    Fenced,
+    /// The record belongs to a privacy generation that is no longer in force.
+    WrongGeneration,
+    /// Something else moved the record since it was selected.
+    NotEligible,
+    /// The next attempt is not due yet.
+    NotDue,
+    /// The content is gone, so there is nothing left to present.
+    NoContent,
+}
+
+impl ClaimRefusal {
+    /// One line naming the refusal, for the journal and for a person reading it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "the delivery is no longer in this journal",
+            Self::Fenced => "privacy mode has stopped this environment's outbox",
+            Self::WrongGeneration => "the record belongs to a privacy generation that has passed",
+            Self::NotEligible => "another pass moved the record since it was selected",
+            Self::NotDue => "the next attempt is not due yet",
+            Self::NoContent => "the content this record held has been removed",
+        }
+    }
+}
+
+impl std::fmt::Display for ClaimRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Something that had already left this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportedDelivery {
@@ -1070,16 +1144,146 @@ impl DeliveryJournal {
         Ok(changed as u64)
     }
 
+    /// Takes one due delivery for this caller, in one transaction, or refuses it.
+    ///
+    /// A pass that selected a page and then sent from it would be sending from a read: privacy
+    /// mode can fence the outbox, another pass can take the same row, and the expiry can arrive,
+    /// all between the selection and the send. So the claim is the write that decides. It reads
+    /// the fence, the generation, the state, the due time, the expiry and the content **inside**
+    /// the transaction that moves the row to [`DeliveryState::InFlight`], counts the attempt and
+    /// takes the row out of the outbox. Nothing else can claim it afterwards, and a host that
+    /// stops with the row claimed finds an in-flight record with no outbox row, which is what
+    /// reconciliation is for.
+    ///
+    /// An expiry that has passed is settled here rather than sent: section 16 stops retrying at
+    /// expiry, and settling it in this transaction is what stops a caller acting on a stale clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the journal cannot be read or written.
+    pub fn claim(&mut self, notification_id: NotificationId, now_ms: u64) -> Result<Claim> {
+        let identifier = notification_id.to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (generation, fenced): (i64, i64) = transaction.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        type Row = (String, String, i64, i64, i64, Option<Vec<u8>>, Option<i64>);
+        let row: Option<Row> = transaction
+            .query_row(
+                "SELECT n.destination_id, n.state, n.attempts, n.expires_at_ms,
+                        n.privacy_generation, n.content, o.due_at_ms
+                   FROM delivery_notifications n
+                   LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
+                  WHERE n.notification_id = ?1",
+                params![identifier],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((destination, state, attempts, expires, record_generation, content, due_at)) = row
+        else {
+            return Ok(Claim::Refused(ClaimRefusal::Missing));
+        };
+        if fenced != 0 {
+            return Ok(Claim::Refused(ClaimRefusal::Fenced));
+        }
+        if record_generation != generation {
+            return Ok(Claim::Refused(ClaimRefusal::WrongGeneration));
+        }
+        let state = DeliveryState::from_stored(&state).ok_or(DeliveryError::JournalUnreadable(
+            "a stored delivery state is not one this build writes",
+        ))?;
+        if !matches!(state, DeliveryState::Admitted | DeliveryState::Retrying) {
+            return Ok(Claim::Refused(ClaimRefusal::NotEligible));
+        }
+        let Some(due_at) = due_at else {
+            return Ok(Claim::Refused(ClaimRefusal::NotEligible));
+        };
+        if as_u64(expires) <= now_ms {
+            // Section 16 stops at expiry. Settling it here, in the transaction that would
+            // otherwise have handed it to a sender, is what makes that true of a pass whose clock
+            // moved on while it was blocked.
+            settle_expiry_in(&transaction, &identifier, as_u64(attempts), now_ms)?;
+            transaction.commit()?;
+            return Ok(Claim::Expired);
+        }
+        if as_u64(due_at) > now_ms {
+            return Ok(Claim::Refused(ClaimRefusal::NotDue));
+        }
+        let Some(content) = content else {
+            return Ok(Claim::Refused(ClaimRefusal::NoContent));
+        };
+        let attempt = as_u64(attempts).saturating_add(1);
+        transaction.execute(
+            "UPDATE delivery_notifications SET state = 'in_flight', attempts = ?2
+              WHERE notification_id = ?1",
+            params![identifier, as_i64(attempt)],
+        )?;
+        transaction.execute(
+            "INSERT INTO delivery_attempts
+                 (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)
+             ON CONFLICT (notification_id, attempt) DO UPDATE SET started_at_ms = excluded.started_at_ms",
+            params![identifier, as_i64(attempt), as_i64(now_ms)],
+        )?;
+        // The outbox row goes with the claim. A row in the outbox is work nothing is doing; one
+        // that a pass is doing belongs to that pass until it records what happened.
+        transaction.execute(
+            "DELETE FROM delivery_outbox WHERE notification_id = ?1",
+            params![identifier],
+        )?;
+        transaction.commit()?;
+        Ok(Claim::Taken(Box::new(ClaimedDelivery {
+            notification_id,
+            destination_id: DestinationId::new(destination)?,
+            attempt,
+            expires_at_ms: TimestampMs::new(as_u64(expires)),
+            privacy_generation: as_u64(record_generation),
+            content,
+        })))
+    }
+
     /// Records one state transition, its attempt row and its outbox row together.
+    ///
+    /// The transition is refused unless the record is still the one the caller claimed: in flight
+    /// at exactly this attempt. Anything else is a settlement for work somebody else has already
+    /// moved on, and writing it would undo a cancellation or a reconciliation. `Ok(false)` says
+    /// so; it is not an error, because losing a race is an ordinary thing for a pass to do.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
-    pub fn record_attempt(&mut self, transition: &Transition) -> Result<()> {
+    pub fn record_attempt(&mut self, transition: &Transition) -> Result<bool> {
         let identifier = transition.notification_id.to_string();
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT state, attempts FROM delivery_notifications WHERE notification_id = ?1",
+                params![identifier],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match held {
+            Some((state, attempts))
+                if state == DeliveryState::InFlight.as_str()
+                    && as_u64(attempts) == transition.attempt => {}
+            _ => return Ok(false),
+        }
         transaction.execute(
             "INSERT INTO delivery_attempts
                  (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
@@ -1140,10 +1344,15 @@ impl DeliveryJournal {
             }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Returns the deliveries whose next attempt is due at `now_ms`, oldest first.
+    ///
+    /// This is a **selection**, and nothing is sent from a selection: [`DeliveryJournal::claim`]
+    /// is the write that decides, and it reads every one of these conditions again inside its own
+    /// transaction. What this read is for is choosing which records to try to claim, and for a
+    /// caller that wants to see what the outbox is holding.
     ///
     /// A fenced outbox returns nothing: privacy mode stops the queue reaching anything outside
     /// this host at once, and that is expressed by the read rather than by every caller
@@ -1959,6 +2168,41 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
     Ok(())
 }
 
+/// Settles one record as expired inside a transaction the caller owns.
+///
+/// It is the answer to a claim whose expiry has already passed: the record is finished, the outbox
+/// row goes and the bytes go with it, and the attempt row says which attempt found it too late.
+fn settle_expiry_in(
+    transaction: &rusqlite::Transaction<'_>,
+    identifier: &str,
+    attempts: u64,
+    now_ms: u64,
+) -> Result<()> {
+    const DETAIL: &str = "the notification expired before this attempt could be made";
+    let attempt = attempts.saturating_add(1);
+    transaction.execute(
+        "INSERT INTO delivery_attempts
+             (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
+         VALUES (?1, ?2, ?3, ?3, 'expired', ?4)
+         ON CONFLICT (notification_id, attempt) DO UPDATE SET
+             settled_at_ms = excluded.settled_at_ms,
+             outcome = excluded.outcome,
+             detail = excluded.detail",
+        params![identifier, as_i64(attempt), as_i64(now_ms), DETAIL],
+    )?;
+    transaction.execute(
+        "UPDATE delivery_notifications
+            SET state = 'expired', attempts = MAX(attempts, ?2), content = NULL, detail = ?3
+          WHERE notification_id = ?1",
+        params![identifier, as_i64(attempt), DETAIL],
+    )?;
+    transaction.execute(
+        "DELETE FROM delivery_outbox WHERE notification_id = ?1",
+        params![identifier],
+    )?;
+    Ok(())
+}
+
 /// Writes one destination's spent allowance inside a transaction the caller owns.
 fn record_budget_in(
     transaction: &rusqlite::Transaction<'_>,
@@ -2266,6 +2510,17 @@ mod tests {
         }
     }
 
+    /// Claims one delivery the way a pass does, and returns what it claimed.
+    fn claim(journal: &mut DeliveryJournal, byte: u8, now_ms: u64) -> ClaimedDelivery {
+        match journal
+            .claim(NotificationId::new(uuid(byte)), now_ms)
+            .expect("a claim")
+        {
+            Claim::Taken(claimed) => *claimed,
+            other => panic!("the delivery was not claimable: {other:?}"),
+        }
+    }
+
     fn journal() -> DeliveryJournal {
         let mut journal = DeliveryJournal::in_memory().expect("a journal");
         journal
@@ -2275,6 +2530,138 @@ mod tests {
             .configure_destination(&destination("hook"))
             .expect("a destination");
         journal
+    }
+
+    /// A selection is a read; a claim is the write that decides. Two passes that selected the same
+    /// row both ask, and exactly one of them gets it.
+    #[test]
+    fn one_delivery_is_claimed_once_however_many_passes_ask() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        assert_eq!(journal.due(2_000, 10).expect("a read").len(), 1);
+        let first = claim(&mut journal, 9, 2_000);
+        assert_eq!(first.attempt, 1);
+        assert_eq!(
+            journal
+                .claim(NotificationId::new(uuid(9)), 2_000)
+                .expect("a claim"),
+            Claim::Refused(ClaimRefusal::NotEligible),
+            "the second pass finds the row already on the wire"
+        );
+        assert!(
+            journal.due(2_000, 10).expect("a read").is_empty(),
+            "a claimed row is out of the outbox until it records what happened"
+        );
+    }
+
+    /// Privacy mode can fence the outbox between a selection and the send it was selected for.
+    /// The claim reads the fence in its own transaction, so the send never happens.
+    #[test]
+    fn a_claim_is_refused_after_a_fence_the_selection_did_not_see() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let selected = journal.due(2_000, 10).expect("a read");
+        assert_eq!(selected.len(), 1);
+        journal.fence(1).expect("a fence");
+        assert_eq!(
+            journal
+                .claim(selected[0].notification_id, 2_000)
+                .expect("a claim"),
+            Claim::Refused(ClaimRefusal::Fenced)
+        );
+    }
+
+    /// A record admitted under a generation that has passed is content the cleanup walked past,
+    /// and the claim refuses it whatever the selection held.
+    #[test]
+    fn a_claim_is_refused_for_a_generation_that_has_passed() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        journal.fence(1).expect("a fence");
+        journal.lift_fence(1).expect("the fence lifts");
+        assert_eq!(
+            journal
+                .claim(NotificationId::new(uuid(9)), 2_000)
+                .expect("a claim"),
+            Claim::Refused(ClaimRefusal::WrongGeneration)
+        );
+    }
+
+    /// A settlement is only ever for the attempt the caller claimed. Anything else is a
+    /// settlement for work somebody else moved, and writing it would undo their decision.
+    #[test]
+    fn a_settlement_for_an_attempt_this_caller_did_not_claim_is_refused() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        claim(&mut journal, 9, 2_000);
+        let settled = journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: 7,
+                state: DeliveryState::Accepted,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: None,
+                detail: Some("queued".to_owned()),
+                suppression: None,
+                keep_content: false,
+            })
+            .expect("a transition");
+        assert!(!settled, "the attempt number is not the claimed one");
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(9)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::InFlight
+        );
+    }
+
+    /// Section 16 stops at expiry. The claim is where the clock is read, so a pass whose own
+    /// clock moved on while it was blocked settles the row instead of sending it.
+    #[test]
+    fn a_claim_past_the_expiry_settles_the_record_rather_than_offering_it() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        assert_eq!(
+            journal
+                .claim(NotificationId::new(uuid(9)), 100_000)
+                .expect("a claim"),
+            Claim::Expired
+        );
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::Expired);
+        assert_eq!(record.content, None, "an expired record keeps no bytes");
+        assert!(journal.due(100_000, 10).expect("a read").is_empty());
     }
 
     #[test]
@@ -2367,19 +2754,22 @@ mod tests {
         journal
             .admit(&delivery(9, event(1), "hook"))
             .expect("admitted");
-        journal
-            .record_attempt(&Transition {
-                notification_id: NotificationId::new(uuid(9)),
-                attempt: 1,
-                state: DeliveryState::Retrying,
-                started_at_ms: TimestampMs::new(2_000),
-                settled_at_ms: Some(TimestampMs::new(2_010)),
-                next_attempt_at_ms: Some(TimestampMs::new(3_000)),
-                detail: Some("the provider was busy".to_owned()),
-                suppression: None,
-                keep_content: true,
-            })
-            .expect("a transition");
+        claim(&mut journal, 9, 2_000);
+        assert!(
+            journal
+                .record_attempt(&Transition {
+                    notification_id: NotificationId::new(uuid(9)),
+                    attempt: 1,
+                    state: DeliveryState::Retrying,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_010)),
+                    next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                    detail: Some("the provider was busy".to_owned()),
+                    suppression: None,
+                    keep_content: true,
+                })
+                .expect("a transition")
+        );
         let record = journal
             .delivery(NotificationId::new(uuid(9)))
             .expect("a read")
@@ -2406,6 +2796,7 @@ mod tests {
         journal
             .admit(&delivery(9, event(1), "hook"))
             .expect("admitted");
+        claim(&mut journal, 9, 2_000);
         journal
             .record_attempt(&Transition {
                 notification_id: NotificationId::new(uuid(9)),

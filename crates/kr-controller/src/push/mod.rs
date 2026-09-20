@@ -30,7 +30,9 @@ use kr_delivery::destination::{
     DeliveryRule, Destination, DestinationId, DestinationRecord, PreviewKeys, PushDestination,
 };
 use kr_delivery::external::ExternalSender;
-use kr_delivery::journal::{DeliveryJournal, DeliveryState, DueDelivery, Transition};
+use kr_delivery::journal::{
+    Claim, ClaimedDelivery, DeliveryJournal, DeliveryState, DueDelivery, Transition,
+};
 use kr_delivery::preview;
 use kr_delivery::producer::{Producer, RecipientAuthority};
 use kr_delivery::push::{NextAction, PushSender, SenderCredentials};
@@ -235,10 +237,15 @@ impl DeliveryModule {
 
     /// Drives one pass of the outbox.
     ///
-    /// Each due delivery is sent through the seam, and what the seam answers decides the record's
-    /// next state, its next attempt and whether the credential needs renewing. Nothing here
-    /// retries an unknown outcome: [`kr_delivery::push::decide`] settles it as unknown and the
-    /// outbox row goes.
+    /// Each due delivery is **claimed** first - one transaction that checks the fence, the
+    /// generation, the record's own state, the due time and the expiry, and moves the row to
+    /// in flight - and only a claimed row is sent. A selection followed by a send would be a send
+    /// decided by a read: a privacy pass could cancel the row in between, and two passes could
+    /// present one external message twice.
+    ///
+    /// What the seam answers then decides the record's next state, its next attempt and whether
+    /// the credential needs renewing. Nothing here retries an unknown outcome:
+    /// [`kr_delivery::push::decide`] settles it as unknown and the outbox row goes.
     ///
     /// Returns how many deliveries were attempted.
     ///
@@ -252,23 +259,35 @@ impl DeliveryModule {
         external: &dyn ExternalSender,
         now_ms: u64,
     ) -> Result<usize> {
-        let due: Vec<DueDelivery> = self.with(|producer| {
+        let selected: Vec<DueDelivery> = self.with(|producer| {
             producer
                 .journal()
                 .due(now_ms, MAX_PASS)
                 .map_err(unavailable)
         })?;
         let mut attempted = 0;
-        for delivery in due {
+        for selection in selected {
+            let claim = self.with(|producer| {
+                producer
+                    .journal_mut()
+                    .claim(selection.notification_id, now_ms)
+                    .map_err(unavailable)
+            })?;
+            let claimed = match claim {
+                Claim::Taken(claimed) => *claimed,
+                // Expired rows settled themselves inside the claim, and a refusal is a record
+                // something else moved: neither is this pass's work any more.
+                Claim::Expired | Claim::Refused(_) => continue,
+            };
             let record = self.with(|producer| {
                 producer
                     .journal()
-                    .destination(&delivery.destination_id)
+                    .destination(&claimed.destination_id)
                     .map_err(unavailable)
             })?;
             let Some(record) = record.filter(|record| record.enabled) else {
                 self.settle(
-                    &delivery,
+                    &claimed,
                     DeliveryState::Revoked,
                     "the destination is no longer configured or enabled",
                     now_ms,
@@ -277,9 +296,9 @@ impl DeliveryModule {
             };
             attempted += 1;
             if record.as_push().is_some() {
-                self.attempt_push(&delivery, &record, sender, credentials, now_ms)?;
+                self.attempt_push(&claimed, &record, sender, credentials, now_ms)?;
             } else {
-                self.attempt_external(&delivery, &record, external, now_ms)?;
+                self.attempt_external(&claimed, &record, external, now_ms)?;
             }
         }
         Ok(attempted)
@@ -287,7 +306,7 @@ impl DeliveryModule {
 
     fn settle(
         &self,
-        delivery: &DueDelivery,
+        delivery: &ClaimedDelivery,
         state: DeliveryState,
         detail: &str,
         now_ms: u64,
@@ -297,7 +316,7 @@ impl DeliveryModule {
                 .journal_mut()
                 .record_attempt(&Transition {
                     notification_id: delivery.notification_id,
-                    attempt: delivery.attempts.saturating_add(1),
+                    attempt: delivery.attempt,
                     state,
                     started_at_ms: TimestampMs::new(now_ms),
                     settled_at_ms: Some(TimestampMs::new(now_ms)),
@@ -306,13 +325,14 @@ impl DeliveryModule {
                     suppression: None,
                     keep_content: false,
                 })
-                .map_err(unavailable)
+                .map_err(unavailable)?;
+            Ok(())
         })
     }
 
     fn attempt_push(
         &self,
-        delivery: &DueDelivery,
+        delivery: &ClaimedDelivery,
         record: &DestinationRecord,
         sender: &dyn PushSender,
         credentials: &dyn SenderCredentials,
@@ -326,27 +346,10 @@ impl DeliveryModule {
                     detail: error.to_string(),
                 }
             })?;
-        let attempt = delivery.attempts.saturating_add(1);
-
-        // The attempt is recorded as on the wire **before** it is made, so a host that stops in
-        // the middle finds a record that says an attempt was in flight rather than one that says
-        // nothing happened.
-        self.with(|producer| {
-            producer
-                .journal_mut()
-                .record_attempt(&Transition {
-                    notification_id: delivery.notification_id,
-                    attempt,
-                    state: DeliveryState::InFlight,
-                    started_at_ms: TimestampMs::new(now_ms),
-                    settled_at_ms: None,
-                    next_attempt_at_ms: None,
-                    detail: None,
-                    suppression: None,
-                    keep_content: true,
-                })
-                .map_err(unavailable)
-        })?;
+        // The claim already recorded this attempt as on the wire, in the transaction that took the
+        // row: a host that stops in the middle finds a record that says an attempt was in flight
+        // rather than one that says nothing happened.
+        let attempt = delivery.attempt;
 
         let Some(mut credential) = credentials.current(push.sender_record_id) else {
             return self.settle(
@@ -393,36 +396,21 @@ impl DeliveryModule {
                     suppression: decision.suppression.clone(),
                     keep_content: !decision.state.is_settled(),
                 })
-                .map_err(unavailable)
+                .map_err(unavailable)?;
+            Ok(())
         })
     }
 
     fn attempt_external(
         &self,
-        delivery: &DueDelivery,
+        delivery: &ClaimedDelivery,
         record: &DestinationRecord,
         external: &dyn ExternalSender,
         now_ms: u64,
     ) -> Result<()> {
         let destination = record.as_external().expect("an external destination");
         let message = client::message_from(&delivery.content)?;
-        let attempt = delivery.attempts.saturating_add(1);
-        self.with(|producer| {
-            producer
-                .journal_mut()
-                .record_attempt(&Transition {
-                    notification_id: delivery.notification_id,
-                    attempt,
-                    state: DeliveryState::InFlight,
-                    started_at_ms: TimestampMs::new(now_ms),
-                    settled_at_ms: None,
-                    next_attempt_at_ms: None,
-                    detail: None,
-                    suppression: None,
-                    keep_content: true,
-                })
-                .map_err(unavailable)
-        })?;
+        let attempt = delivery.attempt;
         let outcome = external.send(destination, &message);
         let decision = kr_delivery::external::decide_external(
             &outcome,
@@ -446,7 +434,8 @@ impl DeliveryModule {
                     suppression: None,
                     keep_content: !decision.state.is_settled(),
                 })
-                .map_err(unavailable)
+                .map_err(unavailable)?;
+            Ok(())
         })
     }
 }
