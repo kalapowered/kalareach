@@ -56,18 +56,23 @@ const CANONICAL: Dimensions = Dimensions::new(80, 24);
 /// a session whose shell has gone is not what any of these tests is about.
 const WAITS: &str = "read -r _";
 
-/// A root program that reports its own size whenever the kernel says the window changed.
+/// A root program that reports its own size, whenever the kernel says the window changed and
+/// whenever it is asked.
 ///
-/// Nothing else distinguishes a bookkeeping change from a resize the application actually saw.
+/// Nothing else distinguishes a bookkeeping change from a resize the application actually saw. The
+/// answer on demand is what lets a test read the size the kernel is holding at a moment of its own
+/// choosing: a signal is not an event a terminal queues, and two resizes with nothing in between
+/// can reach an application as one report of wherever it ended up.
 ///
-/// A shell runs a trap between commands rather than inside one, so the loop at the end is how this
-/// application waits for a signal: its own pace, not a length of time any test here depends on.
-/// Every test waits for the report itself, however long the application takes to make it, and a
-/// loop over a blocked read is not the alternative - a read that fails once the session has closed
-/// its terminal would spin.
+/// A shell runs a trap between commands rather than inside one, so the loop is how this
+/// application waits for a signal or a line: its own pace, not a length of time any test here
+/// depends on. Every test waits for a report, however long the application takes over it. The
+/// sleep is what a read returning without a line falls back on - a signal interrupts the read, and
+/// so does the terminal going away at the end of a test - so neither spins.
 const REPORTS_ITS_SIZE: &str = "stty raw -echo; \
      trap 'printf kr-size:; stty size' WINCH; \
-     printf 'kr-ready.'; while :; do sleep 0.2; done";
+     printf 'kr-ready.'; \
+     while :; do if read -r _; then printf 'kr-now:'; stty size; else sleep 0.2; fi; done";
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -334,6 +339,21 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
         );
     }
 
+    // Now the application is asked what size it is running at, and it answers the session's own.
+    // Asking is what makes this an observation rather than a wait: a window signal is not an event
+    // a terminal queues, so two resizes with nothing in between can reach an application as one
+    // report of wherever it ended up, and a test that only read the reports could not tell a
+    // kernel that moved and came back from one that never moved. This answer is read from the
+    // kernel at a moment of the test's choosing, after everything the watcher did.
+    let mut keys = Typist::take(&runtime, session_id);
+    keys.release(&runtime);
+    produced(&runtime, b"kr-now:24 80\n").await;
+    assert!(
+        !carries(&retained(&runtime), b"kr-size:"),
+        "and it was never told about a size nobody owned: {}",
+        String::from_utf8_lossy(&retained(&runtime)).escape_debug()
+    );
+
     // The owner resizes, and the application is told.
     {
         let mut session = runtime.session();
@@ -344,24 +364,9 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
         assert_eq!(changed.epoch.get(), epoch + 1);
     }
     // The kernel moved with the bookkeeping, which is what the application reporting its own size
-    // says.
-    produced(&runtime, b"kr-size:30 100").await;
-
-    // And that report is the first the application has ever made, so neither the watcher's report
-    // of the size it is looking at nor its refused resize reached the kernel. Waiting a while
-    // after them and finding nothing would have proved that only for as long as the wait, and for
-    // less of it the busier the host; the owner's own report is a fence the application wrote, and
-    // everything it could have been told before it is in front of it.
-    let seen = retained(&runtime);
-    let first = seen
-        .windows(b"kr-size:".len())
-        .position(|window| window == b"kr-size:")
-        .expect("the application reported its size");
-    assert!(
-        seen[first..].starts_with(b"kr-size:30 100"),
-        "the application was never told about a size nobody owned: {}",
-        String::from_utf8_lossy(&seen[first..]).escape_debug()
-    );
+    // says. The marker carries the whole report, line ending and all, because a report of another
+    // size can begin with these digits.
+    produced(&runtime, b"kr-size:30 100\n").await;
 
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
@@ -549,7 +554,7 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
     }
     // The wait is the assertion: the successor's size is what the application was resized to, and
     // a host that resized it to anything else never satisfies it.
-    produced(&runtime, b"kr-size:30 100").await;
+    produced(&runtime, b"kr-size:30 100\n").await;
 
     // With every eligible claim gone the last geometry is retained rather than reset.
     {
@@ -641,7 +646,7 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     .await;
     expect_resynchronised(&mut phone, LIVENESS_DEADLINE, "and neither is the phone's").await;
     // The shell was resized rather than replaced: the same application reports the phone's size.
-    produced(&wired.runtime, b"kr-size:16 48").await;
+    produced(&wired.runtime, b"kr-size:16 48\n").await;
     assert!(
         !wired.runtime.session().lease().holder.is_present(),
         "moving the size is not taking the keys"
@@ -765,14 +770,14 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
     // starts at the same point in the session's output for all three. A length of time spent
     // draining instead would drain different amounts of it on a busy host, and the two terminals
     // of the session's own size would then be compared to each other from different places.
-    let mut keys = Typist::take(&wired);
-    keys.release(&wired);
+    let mut keys = Typist::take(&wired.runtime, wired.session_id);
+    keys.release(&wired.runtime);
     collect_until(&mut same, b"kr-set.").await;
     collect_until(&mut also_same, b"kr-set.").await;
     collect_rows_until(&mut narrow, "kr-set.").await;
 
     // Now the application draws, and each of them is read to the last thing it wrote.
-    keys.release(&wired);
+    keys.release(&wired.runtime);
     produced(&wired.runtime, b"kr-drawn.").await;
 
     let direct = collect_until(&mut same, b"kr-drawn.").await;
@@ -827,6 +832,10 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
     // row as the near marker they were written with. A reflowed row would have put one of them
     // inside the window on the row below.
     for (far, near) in [("kr-far-one", near_one), ("kr-far-two", near_two)] {
+        assert!(
+            !of(far).is_empty(),
+            "{far} reaches the projected client at all: {placed:?}"
+        );
         for (row, column) in of(far) {
             assert!(
                 column >= 40,
@@ -866,9 +875,9 @@ struct Typist {
 
 impl Typist {
     /// Attaches a terminal that may type, and takes the input lease for it.
-    fn take(wired: &Wired) -> Self {
-        let mut session = wired.runtime.session();
-        let mut params = terminal(wired.session_id, CANONICAL, false);
+    fn take(runtime: &SessionRuntime, session_id: SessionId) -> Self {
+        let mut session = runtime.session();
+        let mut params = terminal(session_id, CANONICAL, false);
         params.requested.insert(AttachmentCapability::Input);
         let attachment = AttachmentId::new(kr_ipc::new_uuid());
         session
@@ -889,9 +898,9 @@ impl Typist {
     }
 
     /// Releases the next step of an application that is waiting for a line.
-    fn release(&mut self, wired: &Wired) {
+    fn release(&mut self, runtime: &SessionRuntime) {
         {
-            let mut session = wired.runtime.session();
+            let mut session = runtime.session();
             session
                 .write_input(
                     self.attachment,
@@ -905,7 +914,7 @@ impl Typist {
         }
         self.sequence += 1;
         // Outside the session, because the batches go to the terminal while the session is held.
-        wired.runtime.flush_input();
+        runtime.flush_input();
     }
 }
 
