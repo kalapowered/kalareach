@@ -38,6 +38,10 @@ use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 use kr_worker::snapshot::PaletteChoice;
 
+mod common;
+
+use common::{LIVENESS_DEADLINE, carries, produced};
+
 /// The session's own size. An attachment of exactly this size takes the stream directly.
 const CANONICAL: (u64, u64) = (80, 24);
 
@@ -410,18 +414,6 @@ enum Event {
     Other(#[expect(dead_code, reason = "read through Debug when a test reports one")] String),
 }
 
-/// How long a wait for something to happen is given.
-///
-/// A liveness bound is not a measurement. Every wait in this file but one is for a condition the
-/// session itself reports - a screen installed, an update carrying a line, a presentation the host
-/// names, a byte in the retained stream - and this bound is what a test that never reaches its
-/// condition fails at, rather than hanging. It is the allowance chosen for that, far outside the
-/// range the slowest host this suite runs on reaches under the load of every other suite beside
-/// it. Nothing here samples what arrives inside a window, because a window that catches
-/// a delivery on an idle machine and misses it on a busy one proves nothing either way. The one
-/// exception is `HANDOFF_WINDOW`, which is about a product bound rather than about waiting.
-const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
-
 /// Section 8's live-forwarding handoff window, which an attachment mid-sequence outlives.
 ///
 /// This is the one wait in this file measured against the clock, because the product's own window
@@ -562,57 +554,6 @@ fn updated_text(events: &[Event]) -> Vec<String> {
         .collect()
 }
 
-/// Waits until `marker` is in the session's retained output.
-///
-/// The history and the canonical grid are two views of one stream, written under one lock in that
-/// order, so a marker visible here has already been through the engine: what follows can attach,
-/// subscribe or read a presentation and know what the session has seen. This is the ordinary way a
-/// test in this file waits for an application to have written something, because an application's
-/// own pace is the machine's business and never the test's.
-///
-/// A marker names what the *terminal* carried, which is not byte for byte what the application
-/// printed: the line discipline turns each line feed into a carriage return and a line feed, so a
-/// line the application ended with `\r\n` arrives as `\r\r\n` and one it ended with `\n` arrives
-/// as `\r\n`. A marker carries whichever of those the fixture produces, whole, because a marker
-/// stopping short of the line ending would be satisfied while a line feed that has still to scroll
-/// the grid is on its way.
-async fn produced(runtime: &SessionRuntime, marker: &[u8]) {
-    let started = tokio::time::Instant::now();
-    let deadline = started + LIVENESS_DEADLINE;
-    loop {
-        let seen = retained(runtime);
-        if carries(&seen, marker) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for {} in the session's retained output, which ends {}",
-            started.elapsed(),
-            String::from_utf8_lossy(marker).escape_debug(),
-            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Reads everything the session has retained of what the application wrote.
-fn retained(runtime: &SessionRuntime) -> Vec<u8> {
-    let session = runtime.session();
-    let mut seen = Vec::new();
-    let mut cursor = 0_u64;
-    loop {
-        let page = session
-            .history_page(cursor, 1024 * 1024)
-            .expect("reads the retained output");
-        if page.bytes.as_slice().is_empty() {
-            break;
-        }
-        seen.extend_from_slice(page.bytes.as_slice());
-        cursor = page.next_cursor.get();
-    }
-    seen
-}
-
 /// Subscribes again from a cursor, which is what a client does when it is told to resynchronise.
 async fn resubscribe(host: &Host, attached: &mut Attached, from: u64) -> EventsSubscribeResult {
     let mut streams = CanonicalSet::new();
@@ -633,13 +574,6 @@ async fn resubscribe(host: &Host, attached: &mut Attached, from: u64) -> EventsS
         .expect("the subscription succeeds")
         .to_typed()
         .expect("decodes")
-}
-
-/// Returns whether `haystack` carries `needle`.
-fn carries(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
 }
 
 /// Returns the bytes of a run of output batches, end to end.
