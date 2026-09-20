@@ -11,6 +11,7 @@ import type { ReactNode } from 'react'
 import { App } from '../App'
 import { MobileApp, type MobileBuild } from './MobileApp'
 import { detectSurface, isMobileSurface, type Surface } from './platform'
+import { VoiceRoute } from '../voice/VoiceRoute'
 
 /** Reads the surface from this device, with an override for a test that states one. */
 export function surfaceOf(search?: string): Surface {
@@ -30,5 +31,10 @@ export function Shell({
   readonly surface: Surface
   readonly build?: MobileBuild
 }): ReactNode {
+  const isVoice =
+    typeof window !== 'undefined' &&
+    (new URLSearchParams(window.location.search).get('tab') === 'voice' ||
+      new URLSearchParams(window.location.search).get('view') === 'voice')
+  if (isVoice) return <VoiceRoute surface={surface} />
   return isMobileSurface(surface) ? <MobileApp surface={surface} build={build} /> : <App />
 }
