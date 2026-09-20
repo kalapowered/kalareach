@@ -2791,10 +2791,15 @@ fn a_copy_of_one_finish_action_whose_upload_ended_reads_the_ending() {
     );
 
     // The claim carries that refusal, so the other copy of the action reads it rather than
-    // working one out again: the same code and the same words, off the record.
+    // working one out again. The kind of error says which of the two happened: a refusal read off
+    // the record is a retained one, and a refusal worked out again would not be.
     let repeat = harness
         .finish_as(transfer_id, &bytes, Some(&claim))
         .expect_err("the repeat reads the recorded refusal");
+    assert!(
+        matches!(repeat, kr_transfer::TransferError::Retained { .. }),
+        "the repeat is answered off the record: {repeat:?}"
+    );
     assert_eq!(repeat.code(), refusal.code());
     assert_eq!(repeat.to_string(), refusal.to_string());
 }
@@ -2861,6 +2866,10 @@ fn an_upload_that_ends_while_its_file_is_read_is_answered_by_the_ending() {
     let repeat = harness
         .finish_as(transfer_id, &bytes, Some(&claim))
         .expect_err("the repeat reads the recorded refusal");
+    assert!(
+        matches!(repeat, kr_transfer::TransferError::Retained { .. }),
+        "the repeat is answered off the record: {repeat:?}"
+    );
     assert_eq!(repeat.code(), refusal.code());
     assert_eq!(repeat.to_string(), refusal.to_string());
 }
