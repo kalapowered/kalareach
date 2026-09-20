@@ -97,7 +97,9 @@ impl EventSource {
     /// Reads a stored name back.
     #[must_use]
     pub fn from_stored(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|source| source.as_str() == value)
+        Self::ALL
+            .into_iter()
+            .find(|source| source.as_str() == value)
     }
 }
 
@@ -631,9 +633,10 @@ impl DeliveryJournal {
         let mut events = Vec::new();
         for row in rows {
             let (stored, source, cursor, session, recorded) = row?;
-            let source = EventSource::from_stored(&source).ok_or(
-                DeliveryError::JournalUnreadable("a stored event source is not one this build writes"),
-            )?;
+            let source =
+                EventSource::from_stored(&source).ok_or(DeliveryError::JournalUnreadable(
+                    "a stored event source is not one this build writes",
+                ))?;
             let identity = stored
                 .split_once(':')
                 .map(|(_, identity)| identity.to_owned())
@@ -816,13 +819,14 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (reason, into, count, next) = suppression_columns(record.suppression.as_ref());
         let written = transaction.execute(
             "INSERT INTO delivery_notifications
                  (notification_id, event_key, destination_id, state, privacy_generation,
                   content, payload_bytes, expires_at_ms, admitted_at_ms, attempts,
                   suppression_reason, suppression_into, suppression_count,
                   suppression_next_ms, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, NULL, NULL, NULL, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?13, ?14, ?10)",
             params![
                 record.notification_id.to_string(),
                 record.event.stored(),
@@ -834,6 +838,10 @@ impl DeliveryJournal {
                 as_i64(record.expires_at_ms.get()),
                 as_i64(record.admitted_at_ms.get()),
                 record.detail.as_deref(),
+                reason,
+                into,
+                count,
+                next,
             ],
         );
         match written {
@@ -890,18 +898,7 @@ impl DeliveryJournal {
                 transition.detail.as_deref(),
             ],
         )?;
-        let (reason, into, count, next) = match &transition.suppression {
-            Some(suppression) => (
-                Some(match suppression.reason {
-                    PushSuppressionReason::Burst => "burst",
-                    PushSuppressionReason::Sustained => "sustained",
-                }),
-                Some(suppression.collapsed_into.to_string()),
-                Some(as_i64(suppression.suppressed_count.get())),
-                Some(as_i64(suppression.next_update_at_ms.get())),
-            ),
-            None => (None, None, None, None),
-        };
+        let (reason, into, count, next) = suppression_columns(transition.suppression.as_ref());
         transaction.execute(
             "UPDATE delivery_notifications
                 SET state = ?2,
@@ -1000,9 +997,9 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
     pub fn delivery(&self, notification_id: NotificationId) -> Result<Option<DeliveryRecord>> {
-        let mut statement = self
-            .connection
-            .prepare(&format!("{NOTIFICATION_COLUMNS} WHERE notification_id = ?1"))?;
+        let mut statement = self.connection.prepare(&format!(
+            "{NOTIFICATION_COLUMNS} WHERE notification_id = ?1"
+        ))?;
         let record = statement
             .query_row(params![notification_id.to_string()], decode_delivery)
             .optional()?;
@@ -1073,11 +1070,9 @@ impl DeliveryJournal {
                 outcome: outcome
                     .as_deref()
                     .map(|stored| {
-                        DeliveryState::from_stored(stored).ok_or(
-                            DeliveryError::JournalUnreadable(
-                                "a stored outcome is not one this build writes",
-                            ),
-                        )
+                        DeliveryState::from_stored(stored).ok_or(DeliveryError::JournalUnreadable(
+                            "a stored outcome is not one this build writes",
+                        ))
                     })
                     .transpose()?,
                 detail,
@@ -1096,11 +1091,9 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn fence(&mut self, generation: u64) -> Result<(u64, u64)> {
-        let holding: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM delivery_outbox",
-            [],
-            |row| row.get(0),
-        )?;
+        let holding: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM delivery_outbox", [], |row| row.get(0))?;
         self.connection.execute(
             "UPDATE delivery_privacy SET generation = ?1, fenced = 1 WHERE id = 0",
             params![as_i64(generation)],
@@ -1268,9 +1261,10 @@ impl DeliveryJournal {
         let mut exported = Vec::new();
         for row in rows {
             let (identifier, destination, kind, state, left_at) = row?;
-            let kind = DestinationKind::from_stored(&kind).ok_or(
-                DeliveryError::JournalUnreadable("a stored destination kind is not one this build writes"),
-            )?;
+            let kind =
+                DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+                    "a stored destination kind is not one this build writes",
+                ))?;
             exported.push(ExportedDelivery {
                 kind: match kind {
                     DestinationKind::Push => "notification".to_owned(),
@@ -1657,7 +1651,9 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
         let suppression = match (reason, into, count, next) {
             (Some(reason), Some(into), Some(count), Some(next)) => Some(PushSuppression {
                 collapsed_into: into.parse().map_err(|_| {
-                    DeliveryError::JournalUnreadable("a stored collapse target is not an identifier")
+                    DeliveryError::JournalUnreadable(
+                        "a stored collapse target is not an identifier",
+                    )
                 })?,
                 next_update_at_ms: TimestampMs::new(as_u64(next)),
                 reason: match reason.as_str() {
@@ -1690,6 +1686,29 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
             detail,
         })
     })())
+}
+
+/// The four columns one suppression record is stored across.
+fn suppression_columns(
+    suppression: Option<&PushSuppression>,
+) -> (
+    Option<&'static str>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+) {
+    match suppression {
+        Some(suppression) => (
+            Some(match suppression.reason {
+                PushSuppressionReason::Burst => "burst",
+                PushSuppressionReason::Sustained => "sustained",
+            }),
+            Some(suppression.collapsed_into.to_string()),
+            Some(as_i64(suppression.suppressed_count.get())),
+            Some(as_i64(suppression.next_update_at_ms.get())),
+        ),
+        None => (None, None, None, None),
+    }
 }
 
 fn transaction_has_event(transaction: &rusqlite::Transaction<'_>, key: &EventKey) -> Result<bool> {
@@ -1933,7 +1952,9 @@ mod tests {
         journal
             .take_events(OUTBOX_CONSUMER, &[taken(1, 7)], 7)
             .expect("a page");
-        journal.admit(&delivery(9, event(1), "hook")).expect("admitted");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
         let record = journal
             .delivery(NotificationId::new(uuid(9)))
             .expect("a read")
@@ -2000,7 +2021,9 @@ mod tests {
         journal
             .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
             .expect("a page");
-        journal.admit(&delivery(9, event(1), "hook")).expect("admitted");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
         journal
             .record_attempt(&Transition {
                 notification_id: NotificationId::new(uuid(9)),
@@ -2037,7 +2060,9 @@ mod tests {
         journal
             .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
             .expect("a page");
-        journal.admit(&delivery(9, event(1), "hook")).expect("admitted");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
         journal
             .record_attempt(&Transition {
                 notification_id: NotificationId::new(uuid(9)),
@@ -2070,7 +2095,9 @@ mod tests {
         journal
             .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
             .expect("a page");
-        journal.admit(&delivery(9, event(1), "hook")).expect("admitted");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
         journal
             .admit(&delivery(8, event(1), "second"))
             .expect("admitted");
@@ -2096,7 +2123,9 @@ mod tests {
             journal
                 .take_events(OUTBOX_CONSUMER, &[taken(1, 4)], 4)
                 .expect("a page");
-            journal.admit(&delivery(9, event(1), "hook")).expect("admitted");
+            journal
+                .admit(&delivery(9, event(1), "hook"))
+                .expect("admitted");
             journal
                 .record_budget(
                     &DestinationId::new("hook").expect("an identifier"),
@@ -2143,7 +2172,9 @@ mod tests {
         journal
             .take_events(OUTBOX_CONSUMER, &[taken(1, 1)], 1)
             .expect("a page");
-        journal.admit(&delivery(9, event(1), "hook")).expect("admitted");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
         let (queues, items) = journal.fence(1).expect("a fence");
         assert_eq!((queues, items), (1, 1));
         assert!(

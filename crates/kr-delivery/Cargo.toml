@@ -12,6 +12,9 @@ publish.workspace = true
 # Base64url is how a sealed preview reaches the gateway, and the encoded length is the figure
 # section 16's payload bound is measured on.
 base64.workspace = true
+# A collapse identifier is a keyed digest of what the host groups by, so a provider that sees two
+# equal values learns that they group and nothing about what they group.
+hmac.workspace = true
 kr-attention.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
@@ -25,6 +28,7 @@ rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true
 # The gateway speaks JSON, and the payload bound is measured on the request body a host will send.
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 # A notification identifier is a random 128-bit value with no meaning in it.
 uuid.workspace = true
