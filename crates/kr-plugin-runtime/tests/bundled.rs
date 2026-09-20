@@ -5,24 +5,33 @@
 //! package activates atomically once all its payloads verify, and a payload that is not there
 //! answers `PACKAGE_UNAVAILABLE_OFFLINE` rather than a capability nobody could perform.
 //!
-//! # How this suite establishes that nothing reached the network
+//! # What this suite establishes about the network, and what it does not
 //!
-//! Not by observing that it did not need to. Two things together:
+//! Not that the code "did not happen to need" the network. Three things, each with its own limit.
 //!
-//! 1. **The run is made unable to.** The whole test binary is run a second time inside a kernel
-//!    denial of the network: on macOS `sandbox-exec -p '(version 1)(allow default)(deny
-//!    network*)'`, which refuses the socket outright, and on Linux `bwrap --unshare-net --dev-bind
-//!    / /`, which puts it in a network namespace with no interface and no route. Both are
-//!    unprivileged, and the acceptance evidence records one run of each beside the ordinary run.
+//! 1. **The run is made unable to reach it.** The whole test binary is run a second time inside a
+//!    kernel denial: on macOS `sandbox-exec -p '(version 1)(allow default)(deny network*)'`, which
+//!    refuses the socket outright, and on Linux `bwrap --unshare-net --dev-bind / /`, which puts
+//!    the process in a network namespace with no interface and no route. Both are unprivileged,
+//!    and the acceptance evidence records one run of each beside an ordinary run.
 //! 2. **The suite proves the denial rather than trusting the wrapper.** Those runs set
-//!    `KR_REQUIRE_NO_NETWORK=1`. Every case below that claims an offline result then opens one
-//!    outbound connection to a literal address before it does anything else and requires the
-//!    attempt to fail. A run under a wrapper that was not actually denying anything fails here
-//!    rather than passing quietly, and a run with no wrapper makes no offline claim at all.
+//!    `KR_REQUIRE_NO_NETWORK=1`. Every case that claims an offline result then opens two outbound
+//!    TCP connections to literal addresses and sends one datagram, before it does anything else,
+//!    and requires all three to fail. A wrapper that was not denying anything fails the suite here
+//!    instead of letting it pass quietly; with the variable unset the suite makes no offline claim
+//!    at all. The negative control for this is a run with the network available and the variable
+//!    set, which fails.
+//! 3. **The path under test has no way to reach it.** Activation is `kr_plugin_sdk::bundle`:
+//!    `cap_std` opens relative to one directory handle and `sha2` over the bytes. There is no
+//!    address, no client and no socket on it.
 //!
-//! What the activation itself can reach is narrower than either: `kr_plugin_sdk::bundle` opens
-//! every file relative to one `cap_std::fs::Dir` handle the caller supplies, and digests the bytes
-//! with `sha2`. There is no address, no client and no socket anywhere on that path.
+//! The limits, stated rather than glossed. The wrappers cut off the external IP network; neither
+//! forbids every socket operation, and `--dev-bind / /` leaves Unix sockets on the filesystem
+//! reachable. The probes are IPv4 and cover two destinations. A denial that the code under test
+//! caught and ignored would not show up here; a filter that killed the process on a socket call
+//! would catch that, and is not what these wrappers do. What is established is that the bundled
+//! package activates, and answers for what it does not carry, with the external network
+//! kernel-denied to the process doing it.
 
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -362,23 +371,82 @@ fn a_payload_that_leaves_the_package_directory_is_refused() {
 
     establish_that_nothing_reaches_the_network();
 
-    // A payload replaced by a link out of the bundle. Every file is opened relative to the bundle
-    // directory's own handle with links refused, so the open decides this rather than a comparison
-    // made before it, and there is no window between the two.
-    let (directory, bundle_root, lock_path) = copy_of_the_bundle();
-    let outside = directory.path().join("outside.md");
-    std::fs::write(&outside, b"somewhere else").expect("a writable file");
-    let payload = bundle_root.join("fixture/README.md");
-    std::fs::remove_file(&payload).expect("a removable payload");
-    symlink(&outside, &payload).expect("a link");
+    // A payload replaced by a link, in each of the four shapes a link can take. Every one carries
+    // the payload's own bytes at the other end where it can, so a reader that followed the link
+    // would find the right length and the right digest and pass. Only the refusal to follow makes
+    // these fail, which is what the case is about.
+    //
+    // The refusal also has to be the right kind. A link is something that is there and is not the
+    // payload, so it is a trust answer; reporting it as "unavailable offline" would tell a caller
+    // to wait for a repository that would never change it.
+    let bytes = std::fs::read(repository().join("bundled-plugins/fixture/README.md"))
+        .expect("the payload reads");
+    let fixtures =
+        std::fs::read(repository().join("bundled-plugins/fixture/fixtures/visibility.json"))
+            .expect("the payload reads");
 
-    let lock = BundleLock::read(&lock_path).expect("the copied lock reads");
-    let error = lock
-        .activate(&open_bundle(&bundle_root), &bundled_plugin())
-        .expect_err("a link is not a payload");
-    assert_eq!(error.code(), ErrorCode::RepositoryUntrusted);
+    for (what, arrange) in [
+        (
+            "a payload that is a link out of the bundle",
+            Box::new(move |root: &Path, outside: &Path| {
+                let target = outside.join("outside.md");
+                std::fs::write(&target, &bytes).expect("a writable file");
+                let payload = root.join("fixture/README.md");
+                std::fs::remove_file(&payload).expect("a removable payload");
+                symlink(&target, &payload).expect("a link");
+            }) as Box<dyn Fn(&Path, &Path)>,
+        ),
+        (
+            "a payload that is a link inside the package",
+            Box::new(|root: &Path, _outside: &Path| {
+                let payload = root.join("fixture/README.md");
+                let saved = root.join("fixture/saved.md");
+                std::fs::rename(&payload, &saved).expect("a movable payload");
+                symlink("saved.md", &payload).expect("a link");
+            }),
+        ),
+        (
+            "a directory on the way that is a link inside the package",
+            Box::new(|root: &Path, _outside: &Path| {
+                let directory = root.join("fixture/fixtures");
+                let saved = root.join("fixture/saved-fixtures");
+                std::fs::rename(&directory, &saved).expect("a movable directory");
+                symlink("saved-fixtures", &directory).expect("a link");
+            }),
+        ),
+        (
+            "a directory on the way that is a link to nothing",
+            Box::new(move |root: &Path, outside: &Path| {
+                // The link's target does not exist, which is the shape that could be mistaken for
+                // the payload simply being absent. It is not: something is there, and it is not a
+                // directory of this package.
+                let _ = &fixtures;
+                let _ = outside;
+                let directory = root.join("fixture/fixtures");
+                std::fs::remove_dir_all(&directory).expect("a removable directory");
+                symlink("nowhere", &directory).expect("a link");
+            }),
+        ),
+    ] {
+        let (directory, bundle_root, lock_path) = copy_of_the_bundle();
+        arrange(&bundle_root, directory.path());
 
-    // And the package directory itself, replaced by a link to somewhere that holds the same names.
+        let lock = BundleLock::read(&lock_path).expect("the copied lock reads");
+        let error = lock
+            .activate(&open_bundle(&bundle_root), &bundled_plugin())
+            .expect_err("a link is not a payload");
+        assert_eq!(
+            error.code(),
+            ErrorCode::RepositoryUntrusted,
+            "{what}: {error}"
+        );
+        assert!(
+            !error.to_string().contains("bytes and the lock declares"),
+            "{what} was refused by the open and not by a length: {error}"
+        );
+    }
+
+    // And the package directory itself, replaced by a link to the same package's own bytes.
     let (directory, bundle_root, lock_path) = copy_of_the_bundle();
     let elsewhere = directory.path().join("elsewhere");
     std::fs::rename(bundle_root.join("fixture"), &elsewhere).expect("a movable package");
@@ -388,6 +456,76 @@ fn a_payload_that_leaves_the_package_directory_is_refused() {
     let error = lock
         .activate(&open_bundle(&bundle_root), &bundled_plugin())
         .expect_err("a link is not a package directory");
+    assert_eq!(error.code(), ErrorCode::RepositoryUntrusted);
+}
+
+/// The lock is the one input here that no digest covers, so its own claims are bounded before a
+/// byte is opened.
+#[test]
+fn a_lock_that_claims_more_than_it_may_does_not_activate() {
+    establish_that_nothing_reaches_the_network();
+
+    // Two names that are one file on a case-folding volume. Without this check both entries would
+    // be verified against one file's bytes and counted twice towards a total that then added up.
+    let (_directory, bundle_root, lock_path) = copy_of_the_bundle();
+    let text = std::fs::read_to_string(&lock_path).expect("the lock reads");
+    let doubled = text.replacen(
+        "\"payloads\": [",
+        "\"payloads\": [{\"digest\": \
+         \"8696fa4d9de1f26d0b021aff9a30545d086a30fff8f6298ba7d84f13dbbfec8e\", \
+         \"path\": \"readme.md\", \"role\": \"asset\", \"size_bytes\": \"1288\"},",
+        1,
+    );
+    std::fs::write(&lock_path, &doubled).expect("a writable lock");
+    let lock = BundleLock::read(&lock_path).expect("the altered lock reads");
+    let error = lock
+        .activate(&open_bundle(&bundle_root), &bundled_plugin())
+        .expect_err("two names that are one file do not activate");
+    assert!(
+        error.to_string().contains("are one file"),
+        "the refusal is about the collision: {error}"
+    );
+
+    // A declared length no package may hold. The reader reserves against what a package may hold
+    // rather than against what the lock says, so this is refused rather than allocated.
+    let (_directory, bundle_root, lock_path) = copy_of_the_bundle();
+    let text = std::fs::read_to_string(&lock_path).expect("the lock reads");
+    std::fs::write(
+        &lock_path,
+        text.replace(
+            "\"size_bytes\": \"1288\"",
+            "\"size_bytes\": \"1099511627776\"",
+        ),
+    )
+    .expect("a writable lock");
+    let lock = BundleLock::read(&lock_path).expect("the altered lock reads");
+    let error = lock
+        .activate(&open_bundle(&bundle_root), &bundled_plugin())
+        .expect_err("a package does not hold a terabyte");
+    assert!(
+        error.to_string().contains("package limit"),
+        "the refusal is about the limit: {error}"
+    );
+    assert_eq!(error.code(), ErrorCode::RepositoryUntrusted);
+
+    // A role the manifest does not give that payload. The lock and the manifest are two documents
+    // about one package, and a caller that asked for the component would otherwise be told this
+    // package has one.
+    let (_directory, bundle_root, lock_path) = copy_of_the_bundle();
+    let text = std::fs::read_to_string(&lock_path).expect("the lock reads");
+    std::fs::write(
+        &lock_path,
+        text.replace("\"role\": \"presentation\"", "\"role\": \"component\""),
+    )
+    .expect("a writable lock");
+    let lock = BundleLock::read(&lock_path).expect("the altered lock reads");
+    let error = lock
+        .activate(&open_bundle(&bundle_root), &bundled_plugin())
+        .expect_err("the lock gives a payload a role the manifest does not");
+    assert!(
+        error.to_string().contains("presentation.json"),
+        "the refusal names the payload they disagree about: {error}"
+    );
     assert_eq!(error.code(), ErrorCode::RepositoryUntrusted);
 }
 

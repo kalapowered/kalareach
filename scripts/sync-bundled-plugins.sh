@@ -101,17 +101,21 @@ command -v python3 >/dev/null 2>&1 ||
 # past what the lock declared, so neither a substituted device nor a file that grew can be read
 # without bound.
 #
+# The third argument says what to make of an entry in the bundle directory that is not one of the
+# lock's packages. `strict` reports it, which is what a bundle at rest should never have; `lenient`
+# passes over it, which is what a run still holding its own private working directories needs.
+#
 # Nothing here opens a socket or looks at the plugin repository: the lock and the bytes beside it
 # are the whole input, which is what makes this the check a build with no network can run.
 check_bundle() {
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" "$3" <<'PY'
 import hashlib
 import json
 import os
 import stat
 import sys
 
-lock_path, bundle_root = sys.argv[1], sys.argv[2]
+lock_path, bundle_root, strictness = sys.argv[1], sys.argv[2], sys.argv[3]
 
 try:
     with open(lock_path, "rb") as handle:
@@ -199,7 +203,17 @@ try:
 except OSError as error:
     sys.exit(f"sync-bundled-plugins: {bundle_root} is not a readable directory: {error}")
 
+expected_packages = {package["directory"].split("/")[0] for package in lock["packages"]}
+
 try:
+    # A package the lock does not name is drift too: a host reads what is in this directory, not
+    # what the lock says should be.
+    if strictness == "strict":
+        with os.scandir(bundle_fd) as entries:
+            for entry in list(entries):
+                if entry.name not in expected_packages:
+                    problems.append(f"{entry.name} is in the bundle and not in the lock")
+
     for package in lock["packages"]:
         name = package["directory"]
         label = rejection(name)
@@ -342,7 +356,7 @@ rename_path() {
 if [ "$verify_only" = true ]; then
     [ -f "$lock_file" ] || fail "$lock_file is not there, so there is nothing to verify against"
     [ -d "$bundle_root" ] || fail "$bundle_root is not there, so there is nothing to verify"
-    check_bundle "$lock_file" "$bundle_root"
+    check_bundle "$lock_file" "$bundle_root" strict
     exit 0
 fi
 
@@ -383,7 +397,8 @@ git -C "$plugins" cat-file -e "$pinned_commit:$generation_path" 2>/dev/null ||
 publish_lock="$bundle_root/.sync.lock"
 held_lock=false
 stage_root="$bundle_root/.staging.$$"
-staging="$stage_root/$bundle_name"
+staged_bundle="$stage_root/bundle"
+staging="$staged_bundle/$bundle_name"
 export_root="$stage_root/checkout"
 generation="$export_root/$generation_path"
 plan="$stage_root/plan.tsv"
@@ -444,7 +459,7 @@ echo "$$ $(date '+%F %T')" >"$publish_lock/owner"
 
 mkdir "$stage_root"
 chmod 700 "$stage_root"
-mkdir "$staging" "$export_root"
+mkdir "$staged_bundle" "$staging" "$export_root"
 
 # The repository, taken out of the commit rather than read from the working tree: both the
 # generation and the source of the tool that verifies it. Everything after this reads only from
@@ -793,7 +808,7 @@ PY
 # What was written, measured rather than assumed: every digest and length recomputed from the
 # staged bytes, every path checked against the package contract, and anything the lock does not
 # account for reported. This is the check that catches an expansion nothing declared.
-check_bundle "$staged_lock" "$stage_root"
+check_bundle "$staged_lock" "$staged_bundle" strict
 
 # A signature proves who produced a package, not that the package is safe to keep. The validator is
 # the safety half, and it runs over the staged copy before it is published: the schema, the paths,
@@ -816,7 +831,7 @@ rename_path "$staged_lock" "$pending_lock"
 if [ -e "$published" ]; then
     [ -f "$lock_file" ] ||
         fail "$published is there and no lock describes it; move it aside to replace it"
-    check_bundle "$lock_file" "$bundle_root" >/dev/null 2>&1 ||
+    check_bundle "$lock_file" "$bundle_root" lenient >/dev/null 2>&1 ||
         fail "$published is not what $lock_file describes; move it aside to replace it"
     rename_path "$published" "$retiring"
 fi
@@ -826,5 +841,7 @@ if [ -d "$retiring" ]; then
     rm -rf "${retiring:?}"
 fi
 
-check_bundle "$lock_file" "$bundle_root"
+# Lenient, because this run's own private directories are still beside the package it published
+# and go with its exit. `--verify` is the strict reading, and continuous integration runs it.
+check_bundle "$lock_file" "$bundle_root" lenient
 echo "sync-bundled-plugins: $published is $plugin_id $package_version from $generation_path at $pinned_commit"

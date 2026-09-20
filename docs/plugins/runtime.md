@@ -470,20 +470,36 @@ reported that as "try again when you are online" would retry for ever.
 It is one package of one generation, frozen at the commit it was copied from. It is not a
 catalogue: nothing about it searches, fetches, updates or decides that a newer generation exists,
 and the generation it names does not become the host's enrolled repository. Its trust root is the
-development root the plugin repository publishes for exactly this purpose, so the signature over
-those bytes proves that the pipeline produced them and nothing about who may run them. The host
-still applies the package's capability requests, its grants and its ceiling before anything binds.
+development root the plugin repository publishes for exactly this purpose: a signature under that
+root says the bytes are the ones that root's keys signed, and says nothing about who may run them.
+The package's capability requests, its grants and its repository ceiling are applied to it exactly
+as they are to anything installed.
+
+Reading it needs no current metadata and no trusted clock, which is the point: a pinned package
+stays usable offline under the grants it already has, whatever has expired elsewhere. A new
+generation is a different matter and needs metadata that has not expired, which is the catalogue's
+concern rather than the bundle's.
 
 ### Changing what is bundled
 
 `scripts/sync-bundled-plugins.sh` makes the copy. It takes the plugin repository checkout and the
 commit to pin (the lock's own commit by default), exports that commit into a private directory of
 its own, verifies the chain there, resolves each payload by the digest the verified metadata pins,
-stages the package beside the published entry and publishes it with one rename. It refuses a
-checkout that is not at the pin, an unsafe path, a link, two names that are one file, a payload that
-is not the exact length the metadata pinned, and an entry already published that the lock on disk
-does not describe. It executes nothing out of the package.
+and stages the package beside the published entry. It refuses a checkout that is not at the pin, a
+link anywhere in the exported generation, an unsafe path, two names that are one file, a payload
+that is not the exact length the metadata pinned, and an entry already published that the lock on
+disk does not describe. It executes nothing out of the package, and it holds a directory lock so two
+runs cannot publish at once.
+
+Publishing is three renames: the published entry moves aside, the staged package takes its name, and
+the new lock replaces the old one. Each one is a rename, so the published name is a whole package
+before and after every step and never a mixture of two. It is not a single atomic replacement: POSIX
+has no directory swap, so between the first two renames the name is briefly absent. A run that stops
+there restores what was there; a run that stops between the second and the third leaves the new
+package, the previous one and the new lock all on disk and says where each is, because guessing
+which a person wanted would be worse than telling them.
 
 `scripts/sync-bundled-plugins.sh --verify` is the offline half: it recomputes every digest under
-`bundled-plugins/` against the lock and reports any drift. It reaches no network, builds nothing and
-needs no plugin repository, which is why it runs in continuous integration.
+`bundled-plugins/` against the lock and reports any drift, including a file, a directory or a whole
+package that is there and is not in the lock. It reaches no network, builds nothing and needs no
+plugin repository, which is why it runs in continuous integration.

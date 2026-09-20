@@ -47,8 +47,8 @@ use serde::{Deserialize, Serialize};
 use crate::digest::{ByteSize, PayloadDigest};
 use crate::identity::PluginIdentity;
 use crate::ids::{PluginId, PluginName, PublisherId, RepositoryGeneration};
-use crate::package::PRESENTATION_FILE;
-use crate::paths::PackagePath;
+use crate::package::{MAX_PACKAGE_BYTES, PRESENTATION_FILE};
+use crate::paths::{PackagePath, find_collisions};
 use crate::plugin::{PayloadRole, PluginManifest};
 use crate::presentation::PresentationManifest;
 use crate::version::{PackageVersion, VersionRange};
@@ -212,6 +212,32 @@ pub enum BundleError {
         /// The file the lock named.
         path: PackagePath,
     },
+    /// A file the lock names could not be read for want of a local resource.
+    #[error("{path} cannot be read here: {detail}")]
+    Resource {
+        /// The file the lock named.
+        path: PackagePath,
+        /// What the system said.
+        detail: String,
+    },
+    /// The lock declares more than one package may hold.
+    #[error("{path} declares {declared} bytes, over the {limit} byte package limit")]
+    Oversized {
+        /// The file the lock named.
+        path: PackagePath,
+        /// What the lock declared.
+        declared: u64,
+        /// What a package may hold.
+        limit: u64,
+    },
+    /// The lock names one file twice, or two names that are one file.
+    #[error("the lock names {first} and {second}, which are one file")]
+    Collision {
+        /// The path seen first.
+        first: PackagePath,
+        /// The path that collides with it.
+        second: PackagePath,
+    },
     /// A file the lock names is there and cannot be read as itself.
     #[error("{path} cannot be read: {detail}")]
     Unreadable {
@@ -267,16 +293,22 @@ impl BundleError {
     /// from, and the answer is that the package is unavailable rather than a capability that would
     /// fail the moment somebody used it. Anything else means something is there and is not what the
     /// lock names, which is a trust answer rather than a fetch answer: a link in place of a file, a
-    /// length that does not match, or bytes that are not the payload.
+    /// length that does not match, or bytes that are not the payload. A read this installation could
+    /// not make for want of a descriptor or memory is neither: it is a local resource that may be
+    /// there on the next attempt, and reporting it as untrusted would send a person looking for
+    /// tampering that never happened.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::NotBundled { .. } | Self::Absent { .. } => ErrorCode::PackageUnavailableOffline,
+            Self::Resource { .. } => ErrorCode::ResourceUnavailable,
             Self::Unreadable { .. }
             | Self::NotAFile { .. }
             | Self::Size { .. }
             | Self::Digest { .. }
             | Self::Expansion { .. }
+            | Self::Oversized { .. }
+            | Self::Collision { .. }
             | Self::Manifest { .. } => ErrorCode::RepositoryUntrusted,
         }
     }
@@ -373,12 +405,42 @@ impl BundledPackage {
         bundle: &Dir,
         generation: RepositoryGeneration,
     ) -> Result<ActivatedPackage, BundleError> {
+        // What the lock says, checked before anything is opened. A lock is the one input here that
+        // is not covered by a digest, so its own claims are bounded first: no file over what a
+        // package may hold, no name twice, and no two names that are one file on a case-folding
+        // volume. Without that last check two entries could be verified against one file's bytes
+        // and counted twice towards a total that then appeared to add up.
+        let declared = self.files();
+        for file in &declared {
+            if file.size_bytes.get() > MAX_PACKAGE_BYTES {
+                return Err(BundleError::Oversized {
+                    path: file.path.clone(),
+                    declared: file.size_bytes.get(),
+                    limit: MAX_PACKAGE_BYTES,
+                });
+            }
+        }
+        if self.total_size_bytes.get() > MAX_PACKAGE_BYTES {
+            return Err(BundleError::Oversized {
+                path: self.directory.clone(),
+                declared: self.total_size_bytes.get(),
+                limit: MAX_PACKAGE_BYTES,
+            });
+        }
+        let paths: Vec<PackagePath> = declared.iter().map(|file| file.path.clone()).collect();
+        if let Some(collision) = find_collisions(&paths).into_iter().next() {
+            return Err(BundleError::Collision {
+                first: collision.first,
+                second: collision.second,
+            });
+        }
+
         let directory = self.open_directory(bundle)?;
 
         let mut files: BTreeMap<PackagePath, Vec<u8>> = BTreeMap::new();
         let mut total: u64 = 0;
-        for file in self.files() {
-            let bytes = read_verified(&directory, &file)?;
+        for file in &declared {
+            let bytes = read_verified(&directory, file)?;
             total = total.saturating_add(bytes.len() as u64);
             files.insert(file.path.clone(), bytes);
         }
@@ -415,13 +477,9 @@ impl BundledPackage {
         files
     }
 
-    /// Opens the package's own directory, refusing a link in place of it.
+    /// Opens the package's own directory, refusing a link anywhere on the way to it.
     fn open_directory(&self, bundle: &Dir) -> Result<Dir, BundleError> {
-        use cap_fs_ext::DirExt as _;
-
-        bundle
-            .open_dir_nofollow(self.directory.as_str())
-            .map_err(|error| absence(&self.directory, &error))
+        descend(bundle, self.directory.segments(), &self.directory)
     }
 
     fn parse_manifest(
@@ -448,6 +506,12 @@ impl BundledPackage {
         if manifest.plugin_id() != self.plugin_id {
             disagreements.push(format!("its manifest says {}", manifest.plugin_id()));
         }
+        if manifest.publisher_id != self.publisher_id {
+            disagreements.push(format!("its publisher is {}", manifest.publisher_id));
+        }
+        if manifest.plugin_name != self.plugin_name {
+            disagreements.push(format!("its plugin name is {}", manifest.plugin_name));
+        }
         if manifest.version != self.version {
             disagreements.push(format!("its version is {}", manifest.version));
         }
@@ -465,7 +529,8 @@ impl BundledPackage {
             {
                 Some(bundled)
                     if bundled.digest == payload.digest
-                        && bundled.size_bytes == payload.size_bytes => {}
+                        && bundled.size_bytes == payload.size_bytes
+                        && bundled.role == payload.role => {}
                 Some(_) => disagreements.push(format!(
                     "the lock and the manifest disagree about {}",
                     payload.path
@@ -566,13 +631,21 @@ impl ActivatedPackage {
 
 /// Reads one file through the bundle's directory handle and checks it against the lock.
 ///
-/// The open refuses a link and does not wait: without `FollowSymlinks::No` a name replaced by a
-/// link would redirect the read, and without `O_NONBLOCK` a name replaced by a named pipe would
-/// hold it open until somebody wrote to it, which no declared length bounds. The handle's own
+/// Every component is opened relative to the one before it with links refused, so a link anywhere
+/// on the way to a payload stops the read rather than redirecting it. `cap_std` already keeps the
+/// resolution inside the handle it started from; this adds the second half of section 11's rule,
+/// which is that a package holds files and not links to them.
+///
+/// The file's own open does not wait: without `O_NONBLOCK` a name replaced by a named pipe would
+/// hold the read open until somebody wrote to it, which no declared length bounds. The handle's
 /// metadata then decides, and the read stops one byte past the declared length rather than
 /// trusting the length reported before it started.
 fn read_verified(directory: &Dir, file: &BundledFile) -> Result<Vec<u8>, BundleError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+
+    let mut segments: Vec<&str> = file.path.segments().collect();
+    let name = segments.pop().expect("a package path has a last segment");
+    let parent = descend(directory, segments.into_iter(), &file.path)?;
 
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
@@ -581,8 +654,8 @@ fn read_verified(directory: &Dir, file: &BundledFile) -> Result<Vec<u8>, BundleE
         use cap_std::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut handle = directory
-        .open_with(file.path.as_str(), &options)
+    let mut handle = parent
+        .open_with(name, &options)
         .map_err(|error| absence(&file.path, &error))?;
     let metadata = handle
         .metadata()
@@ -601,15 +674,15 @@ fn read_verified(directory: &Dir, file: &BundledFile) -> Result<Vec<u8>, BundleE
         });
     }
 
-    let mut bytes = Vec::with_capacity(usize::try_from(declared).unwrap_or(0));
+    // Reserved against what the lock declared and what one package may hold, whichever is smaller,
+    // so a lock that declares a size nothing on disk could satisfy cannot make this allocate it.
+    let reserve = usize::try_from(declared.min(MAX_PACKAGE_BYTES)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(reserve);
     handle
         .by_ref()
         .take(declared.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| BundleError::Unreadable {
-            path: file.path.clone(),
-            detail: error.to_string(),
-        })?;
+        .map_err(|error| absence(&file.path, &error))?;
     if bytes.len() as u64 != declared {
         return Err(BundleError::Size {
             path: file.path.clone(),
@@ -625,11 +698,29 @@ fn read_verified(directory: &Dir, file: &BundledFile) -> Result<Vec<u8>, BundleE
     Ok(bytes)
 }
 
+/// Opens each directory segment beneath `from`, refusing a link at any of them.
+fn descend<'a>(
+    from: &Dir,
+    segments: impl Iterator<Item = &'a str>,
+    path: &PackagePath,
+) -> Result<Dir, BundleError> {
+    use cap_fs_ext::DirExt as _;
+
+    let mut here = from.try_clone().map_err(|error| absence(path, &error))?;
+    for segment in segments {
+        here = here
+            .open_dir_nofollow(segment)
+            .map_err(|error| absence(path, &error))?;
+    }
+    Ok(here)
+}
+
 /// Turns a failed open into the right answer about it.
 ///
-/// A name that is not there is the offline case, and anything else that stops the open is not: a
-/// link in place of a file, a directory where a file belongs, or a permission the installation does
-/// not have are all things that are there and are not the payload.
+/// A name that is not there is the offline case. A descriptor or a page the system could not spare
+/// is a local shortage, which may be gone by the next attempt. Everything else is something that is
+/// there and is not the payload: a link in place of a file, a directory where a file belongs, or a
+/// permission this installation has not got.
 fn absence(path: &PackagePath, error: &std::io::Error) -> BundleError {
     if error.kind() == std::io::ErrorKind::NotFound {
         BundleError::Absent { path: path.clone() }
