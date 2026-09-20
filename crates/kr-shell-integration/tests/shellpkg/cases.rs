@@ -72,11 +72,13 @@ impl Session {
         self.fence_exchange_before(enter, fence, Instant::now() + REPLY)
     }
 
-    /// Runs one fence exchange the reader has until `deadline` to answer.
+    /// Runs one fence exchange, asked and answered by `deadline`.
     ///
     /// A caller that exchanges more than once while it waits for the reader's state to settle
     /// passes every exchange the same instant, so the settlement is bounded by that one instant
-    /// instead of by a reply window each time it asks.
+    /// instead of by a reply window each time it asks. The instant covers the whole exchange: the
+    /// endpoint's backpressure and the step the reader is given on the way out as well as the
+    /// wait for the answer.
     ///
     /// # Panics
     ///
@@ -88,14 +90,17 @@ impl Session {
         fence: FenceId,
         deadline: Instant,
     ) -> kr_protocol::root::FenceAcknowledgement {
-        let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
-            session_id: self.session_id,
-            fence_id: fence,
-            prompt_generation: enter.prompt_generation,
-            reader_revision: enter.reader_revision,
-            deadline_ms: FENCE_EXCHANGE_TIMEOUT,
-            cause: FenceCause::EditorEntry,
-        }));
+        let id = self.ask_before(
+            WorkerRequest::Fence(RootEditorFenceParams {
+                session_id: self.session_id,
+                fence_id: fence,
+                prompt_generation: enter.prompt_generation,
+                reader_revision: enter.reader_revision,
+                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                cause: FenceCause::EditorEntry,
+            }),
+            deadline,
+        );
         match self.answer_before(id, deadline) {
             BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
                 acknowledgement

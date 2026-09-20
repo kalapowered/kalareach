@@ -48,6 +48,9 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 /// different failure from one that does not answer.
 pub const REPLY: Duration = Duration::from_secs(20);
 
+/// How long the step given to an editor that only reaches its queue when the reader steps lasts.
+pub const STEP: Duration = Duration::from_millis(60);
+
 /// The environment variable that turns a missing package into a failure rather than a skip.
 pub const REQUIRE: &str = "KR_REQUIRE_SHELL_PACKAGES";
 
@@ -272,7 +275,9 @@ pub struct Session {
     closed: bool,
     pending: Vec<u8>,
     events: VecDeque<(RequestId, BridgeEvent)>,
-    answers: HashMap<RequestId, BridgeAnswer>,
+    /// Each answer the reader sent, with the instant it was taken off the endpoint: a wait under a
+    /// deadline accepts an answer that arrived inside its window, however late it notices it.
+    answers: HashMap<RequestId, (Instant, BridgeAnswer)>,
     next_request: u64,
     output: Arc<Mutex<Vec<u8>>>,
     stopped: Arc<AtomicBool>,
@@ -507,8 +512,21 @@ impl Session {
         self.write_frames(std::slice::from_ref(frame));
     }
 
+    /// Sends one frame the endpoint has until `deadline` to take.
+    pub fn write_frame_before(&mut self, frame: &BridgeFrame, deadline: Instant) {
+        self.write_frames_before(std::slice::from_ref(frame), deadline);
+    }
+
     /// Sends several frames in one write, so the reader takes them off the endpoint together.
     pub fn write_frames(&mut self, frames: &[BridgeFrame]) {
+        self.write_frames_before(frames, Instant::now() + REPLY);
+    }
+
+    /// Sends several frames in one write the endpoint has until `deadline` to take.
+    ///
+    /// A caller waiting for one condition under a deadline of its own passes it here, so neither
+    /// the endpoint's backpressure nor the step the editor is given afterwards outlasts it.
+    pub fn write_frames_before(&mut self, frames: &[BridgeFrame], deadline: Instant) {
         assert!(!self.closed, "the endpoint has been closed");
         let mut bytes = Vec::new();
         for frame in frames {
@@ -525,22 +543,22 @@ impl Session {
             );
             bytes.extend_from_slice(&body);
         }
-        let deadline = Instant::now() + REPLY;
         let mut written = 0;
         while written < bytes.len() {
             match self.stream.write(&bytes[written..]) {
                 Ok(0) => panic!("the bridge closed the endpoint"),
                 Ok(count) => written += count,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "the bridge stopped reading");
-                    std::thread::sleep(Duration::from_millis(2));
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    assert!(!left.is_zero(), "the bridge stopped reading");
+                    std::thread::sleep(left.min(Duration::from_millis(2)));
                 }
                 Err(error) => panic!("writing to the bridge: {error}"),
             }
         }
         // An editor that reaches its own queue only when the reader steps is given that step here,
         // which is the one a person at the keyboard gives it by typing at all.
-        self.nudge();
+        self.nudge_before(deadline);
     }
 
     fn read_frame(&mut self, within: Duration) -> Option<BridgeFrame> {
@@ -588,21 +606,31 @@ impl Session {
     /// Reads whatever has arrived, sorting events from answers and acknowledging what the contract
     /// says needs no decision.
     fn pump(&mut self, within: Duration) {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
-            let Some(frame) = self.read_frame(Duration::from_millis(20)) else {
+        self.pump_before(within, Instant::now() + REPLY);
+    }
+
+    /// Reads for `within`, acknowledging what the contract says needs no decision, with every
+    /// write it makes on the way bounded by `deadline`.
+    fn pump_before(&mut self, within: Duration, deadline: Instant) {
+        let end = Instant::now() + within;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let Some(frame) = self.read_frame(left.min(Duration::from_millis(20))) else {
                 continue;
             };
             match frame {
                 BridgeFrame::Event { id, event } => {
                     let outcome = self.routine_answer(&event);
                     if let Some(result) = outcome {
-                        self.write_frame(&BridgeFrame::EventResult { id, result });
+                        self.write_frame_before(&BridgeFrame::EventResult { id, result }, deadline);
                     }
                     self.events.push_back((id, event));
                 }
                 BridgeFrame::Answer { id, answer } => {
-                    self.answers.insert(id, answer);
+                    self.answers.insert(id, (Instant::now(), answer));
                 }
                 other => panic!("a bridge sent {other:?}"),
             }
@@ -722,9 +750,14 @@ impl Session {
 
     /// Sends one request to the reader thread and returns its identifier.
     pub fn ask(&mut self, request: WorkerRequest) -> RequestId {
+        self.ask_before(request, Instant::now() + REPLY)
+    }
+
+    /// Sends one request the endpoint has until `deadline` to take, and returns its identifier.
+    pub fn ask_before(&mut self, request: WorkerRequest, deadline: Instant) -> RequestId {
         let id = RequestId::new(self.next_request);
         self.next_request += 1;
-        self.write_frame(&BridgeFrame::Request { id, request });
+        self.write_frame_before(&BridgeFrame::Request { id, request }, deadline);
         id
     }
 
@@ -734,6 +767,11 @@ impl Session {
     /// wrapper sits, and one whose binding moves the cursor and touches nothing else. A person at
     /// the keyboard gives the reader the same step by typing at all.
     pub fn nudge(&mut self) {
+        self.nudge_before(Instant::now() + STEP);
+    }
+
+    /// Gives the reader that step, and is over by `deadline` whatever happens.
+    fn nudge_before(&mut self, deadline: Instant) {
         // A key typed before the shell has a reader is not a step for it: it goes through the
         // terminal's own line discipline and waits there for the line it is part of.
         if !self.reading || !self.stepping || !dialect(self.package_kind).answers_at_the_next_step {
@@ -742,7 +780,8 @@ impl Session {
         self.type_bytes(&[0x06]);
         // The step is over before anything is asked of the reader: a key it has not taken yet is
         // input of the person's, and the contract puts that ahead of anything the worker asks for.
-        std::thread::sleep(Duration::from_millis(60));
+        // A caller waiting under a deadline of its own never waits past it for the step.
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(STEP));
     }
 
     /// Waits for the reader's answer to one request.
@@ -758,24 +797,32 @@ impl Session {
     ///
     /// A caller that asks the reader the same thing more than once for one condition gives every
     /// one of those waits the same instant, so the condition is bounded by that instant rather
-    /// than by a fresh reply window per request. The wait fails at the deadline and starts no
-    /// slice of the pump after it.
+    /// than by a fresh reply window per request. An answer counts by the instant it came off the
+    /// endpoint, so a slow notice does not fail a reader that answered in time, and an answer that
+    /// arrived after the deadline is a failure rather than a pass.
     ///
     /// # Panics
     ///
-    /// Panics when the reader has not answered by `deadline`.
+    /// Panics when the reader has not answered by `deadline`, and when what it sent arrived after
+    /// it.
     pub fn answer_before(&mut self, id: RequestId, deadline: Instant) -> BridgeAnswer {
         loop {
-            if let Some(answer) = self.answers.remove(&id) {
+            if let Some((arrived, answer)) = self.answers.remove(&id) {
+                assert!(
+                    arrived <= deadline,
+                    "the reader answered request {id:?} {:?} after the deadline of this wait\nterminal output:\n{}",
+                    arrived.saturating_duration_since(deadline),
+                    self.terminal_output()
+                );
                 return answer;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !left.is_zero(),
-                "the reader did not answer request {id:?} before its deadline\nterminal output:\n{}",
+                "the reader did not answer request {id:?} before the deadline of this wait\nterminal output:\n{}",
                 self.terminal_output()
             );
-            self.pump(left.min(Duration::from_millis(50)));
+            self.pump_before(left.min(Duration::from_millis(50)), deadline);
         }
     }
 
