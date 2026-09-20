@@ -982,9 +982,20 @@ async fn the_state_lives_in_the_session_s_journal_and_the_running_worker_is_its_
     // A whole-state write replaces everything and is made from the copy its owner holds, so this
     // session's worker is the one owner of the store in its journal for as long as it is running.
     // Anything else that opens that file is told so rather than being handed a state it would not
-    // be allowed to write back.
+    // be allowed to write back - and the worker's own process is what it is told about, because
+    // that is the process the claim names and the kernel says it is running.
     let reading = kr_worker::attention::reading(host.service.runtime().session().time());
-    let refused = kr_attention::Attention::beside(Some(&host.journal_path), reading);
+    let mine = kr_ipc::identity::current_process_start_identity().expect("the kernel answers");
+    let liveness =
+        |held: &kr_protocol::identity::ProcessStartIdentity| match kr_ipc::identity::process_state(
+            held,
+        ) {
+            kr_ipc::identity::ProcessState::Running => kr_attention::Liveness::Running,
+            kr_ipc::identity::ProcessState::Ended => kr_attention::Liveness::Ended,
+            kr_ipc::identity::ProcessState::Unknown { .. } => kr_attention::Liveness::Unknown,
+        };
+    let claimant = kr_attention::Claimant::new(mine, &liveness);
+    let refused = kr_attention::Attention::beside(Some(&host.journal_path), reading, &claimant);
     assert!(
         matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
         "the running worker holds its own store: {refused:?}"

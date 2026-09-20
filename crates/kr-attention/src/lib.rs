@@ -95,4 +95,5 @@ pub use crate::error::{Error, Result};
 pub use crate::event::{EventCursor, EventKind, SourceEvent};
 pub use crate::host::Attention;
 pub use crate::rule::{RULES, Rule};
+pub use crate::store::{Claimant, Liveness};
 pub use crate::time::HostReading;

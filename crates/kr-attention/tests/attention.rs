@@ -8,7 +8,7 @@ use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, SourceEvent
 use kr_attention::host::summary_of;
 use kr_attention::key::DERIVED_MARKER;
 use kr_attention::rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rule};
-use kr_attention::{Attention, Content, HostReading};
+use kr_attention::{Attention, Claimant, Content, HostReading, Liveness};
 use kr_protocol::attention::{
     AttentionItem, AttentionKey, AttentionLevel, AttentionReadParams, AttentionRouting,
     AttentionRule, AttentionSource, DEDUPLICATION_WINDOW_MS, IDLE_REMINDER_MS, LogViewState,
@@ -16,6 +16,7 @@ use kr_protocol::attention::{
     MAX_RETAINED_LOG_VIEWS, MAX_RETAINED_PENDING_INPUTS, MAX_REVIEW_SUBJECTS, NotificationState,
     QuietHours, ReviewState, ReviewSubject,
 };
+use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
     ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
 };
@@ -58,6 +59,40 @@ fn next_boot() -> kr_attention::time::BootMark {
 
 fn reading(continuous_ms: u64) -> HostReading {
     HostReading::new(boot(), continuous_ms, NOON + continuous_ms, true)
+}
+
+/// A process as the kernel would describe it, for a test that opens a store.
+fn process(number: u64) -> ProcessStartIdentity {
+    ProcessStartIdentity::new(number, ProcessStartSource::LinuxProcStat, 1_000 + number)
+}
+
+/// What a host that cannot ask about a process answers.
+///
+/// Most of these tests are not about liveness, and this is the answer that leaves the claim's own
+/// lease to decide, which is what the tests before this rule existed were written against.
+const UNKNOWN: &dyn Fn(&ProcessStartIdentity) -> Liveness = &unknown;
+
+fn unknown(_: &ProcessStartIdentity) -> Liveness {
+    Liveness::Unknown
+}
+
+/// What a host that can see a process has gone answers.
+const ENDED: &dyn Fn(&ProcessStartIdentity) -> Liveness = &ended;
+
+fn ended(_: &ProcessStartIdentity) -> Liveness {
+    Liveness::Ended
+}
+
+/// What a host that can see the process is still running answers.
+const RUNNING: &dyn Fn(&ProcessStartIdentity) -> Liveness = &running;
+
+fn running(_: &ProcessStartIdentity) -> Liveness {
+    Liveness::Running
+}
+
+/// The opener the tests that are not about ownership use.
+fn opener() -> Claimant<'static> {
+    Claimant::new(process(1), UNKNOWN)
 }
 
 /// Builds an event `at_ms` after noon, so every recorded moment and every reading are on one
@@ -220,7 +255,7 @@ fn notified(outcomes: &[Outcome]) -> Vec<&AttentionKey> {
 }
 
 fn engine() -> Attention {
-    Attention::in_memory(reading(0)).expect("an in-memory feature store")
+    Attention::in_memory(reading(0), &opener()).expect("an in-memory feature store")
 }
 
 fn whole_inbox(attention: &Attention) -> Vec<AttentionItem> {
@@ -1643,7 +1678,8 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
     let items;
     let states;
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .rebuild(&replayable_events(), reading(0))
             .expect("the store records the rebuild");
@@ -1665,7 +1701,8 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
         assert_eq!(attention.revision(&actor("local:501")), 2);
     }
 
-    let reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
+    let reopened =
+        Attention::open(&path, reading(10_000), &opener()).expect("the feature store reopens");
     assert_eq!(whole_inbox(&reopened), items);
     assert_eq!(review_states(&reopened, "local:501", session(1)), states);
     assert_eq!(
@@ -1690,7 +1727,8 @@ fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         // The producer vouched for the clock its record was stamped on, which is what lets the
         // interval be measured against a later reading rather than started again.
         attention
@@ -1716,7 +1754,8 @@ fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
     // The process restarted inside the same boot. The continuous clock did not restart with it,
     // so the failure has stood for exactly as long as that clock says.
     let after_restart = HostReading::new(boot(), ADAPTER_ESCALATION_MS, NOON + 1_000, true);
-    let mut reopened = Attention::open(&path, after_restart).expect("the feature store reopens");
+    let mut reopened =
+        Attention::open(&path, after_restart, &opener()).expect("the feature store reopens");
     let climbed = reopened
         .tick(after_restart)
         .expect("the store records the decision");
@@ -1741,8 +1780,9 @@ fn an_interval_is_never_measured_across_a_clock_somebody_can_set() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, true))
-            .expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, HostReading::new(boot(), 0, NOON, true), &opener())
+                .expect("the feature store opens");
         attention
             .apply(
                 &notice(1, 1_000, "build finished", false),
@@ -1755,7 +1795,8 @@ fn an_interval_is_never_measured_across_a_clock_somebody_can_set() {
     // The machine rebooted two seconds later and its wall clock was stepped an hour forward. Both
     // readings are trusted; neither says anything about the other.
     let stepped = HostReading::new(next_boot(), 12_000, NOON + 3_602_000, true);
-    let mut reopened = Attention::open(&path, stepped).expect("the feature store reopens");
+    let mut reopened =
+        Attention::open(&path, stepped, &opener()).expect("the feature store reopens");
     let repeated = reopened
         .apply(&notice(2, 2_000, "build finished", false), stepped)
         .expect("the store records the decision");
@@ -1775,7 +1816,8 @@ fn an_interval_is_never_measured_across_a_clock_somebody_can_set() {
 fn a_write_that_fails_leaves_the_engine_where_it_was() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
-    let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
     attention
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
@@ -1821,7 +1863,8 @@ fn a_stored_value_this_build_cannot_read_back_exactly_is_refused() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&turn_completed(1, 1_000, 1), reading(0))
             .expect("the store records the decision");
@@ -1834,7 +1877,7 @@ fn a_stored_value_this_build_cannot_read_back_exactly_is_refused() {
         .expect("the row is written");
     drop(connection);
     assert!(
-        Attention::open(&path, reading(0)).is_err(),
+        Attention::open(&path, reading(0), &opener()).is_err(),
         "a value that cannot come back as it went in is refused"
     );
 }
@@ -1854,7 +1897,8 @@ fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .acknowledge_visit(
                 &actor("local:501"),
@@ -1863,7 +1907,8 @@ fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
             )
             .expect("the store records the visit");
     }
-    let reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
+    let reopened =
+        Attention::open(&path, reading(10_000), &opener()).expect("the feature store reopens");
     let changed = reopened.changed_since(&actor("local:501"), 100, 0, Content::Whole);
     assert_eq!(changed.views.len(), 1);
     assert_eq!(changed.views[0].view.source_offset, U64::new(4_096));
@@ -1976,7 +2021,8 @@ fn a_decided_announcement_waits_to_be_taken_and_survives_a_restart() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&approval(1, 1_000, "req-1"), reading(0))
             .expect("the store records the decision");
@@ -1984,7 +2030,8 @@ fn a_decided_announcement_waits_to_be_taken_and_survives_a_restart() {
         assert!(whole_inbox(&attention)[0].awaiting_delivery);
     }
     // The host died before it sent anything. The decision is still there to be taken.
-    let mut reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
+    let mut reopened =
+        Attention::open(&path, reading(10_000), &opener()).expect("the feature store reopens");
     assert_eq!(reopened.awaiting_delivery(), 1);
     let taken = reopened.take_announcements();
     assert_eq!(taken.len(), 1);
@@ -2085,7 +2132,8 @@ fn a_replayed_occurrence_outside_the_window_is_decided_after_the_rebuild() {
     let path = directory.path().join("attention.db");
     let later = command(2, 120_000, "cargo test", 101);
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&command(1, 1_000, "cargo test", 101), reading(0))
             .expect("the store records the decision");
@@ -2102,7 +2150,7 @@ fn a_replayed_occurrence_outside_the_window_is_decided_after_the_rebuild() {
     // The host restarts and replays the retained events, which now include a later failure of the
     // same command. The rule announces once, so nothing but the new occurrence owes a decision.
     let now = reading(180_000);
-    let mut reopened = Attention::open(&path, now).expect("the feature store reopens");
+    let mut reopened = Attention::open(&path, now, &opener()).expect("the feature store reopens");
     reopened
         .rebuild(&[command(1, 1_000, "cargo test", 101), later], now)
         .expect("the store records the rebuild");
@@ -2554,14 +2602,16 @@ fn an_announcement_identity_keeps_going_forward_across_a_restart() {
     let path = directory.path().join("attention.db");
     let taken;
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&command(1, 1_000, "cargo test", 101), reading(0))
             .expect("the store records the decision");
         taken = attention.take_announcements();
         assert_eq!(taken.len(), 1);
     }
-    let mut reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
+    let mut reopened =
+        Attention::open(&path, reading(10_000), &opener()).expect("the feature store reopens");
     reopened
         .apply(&notice(1, 2_000, "build finished", false), reading(10_000))
         .expect("the store records the decision");
@@ -3171,12 +3221,14 @@ fn a_subject_recorded_after_a_reopen_takes_the_next_place_in_the_page() {
         )
     };
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&captured(1, 1), reading(0))
             .expect("the store records the decision");
     }
-    let mut reopened = Attention::open(&path, reading(1_000)).expect("the feature store reopens");
+    let mut reopened =
+        Attention::open(&path, reading(1_000), &opener()).expect("the feature store reopens");
     reopened
         .apply(&captured(2, 2), reading(1_000))
         .expect("the store records the decision");
@@ -3312,8 +3364,9 @@ fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_prov
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, 1_000, false))
-            .expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, HostReading::new(boot(), 0, 1_000, false), &opener())
+                .expect("the feature store opens");
         attention
             .apply(
                 &notice(1, 1_000, "build finished", false),
@@ -3323,8 +3376,12 @@ fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_prov
         assert_eq!(attention.awaiting_delivery(), 1, "it went out at once");
     }
     // Two seconds later on the machine's own clock, with the wall clock corrected and proved.
-    let mut reopened = Attention::open(&path, HostReading::new(boot(), 12_000, NOON, true))
-        .expect("the feature store reopens");
+    let mut reopened = Attention::open(
+        &path,
+        HostReading::new(boot(), 12_000, NOON, true),
+        &opener(),
+    )
+    .expect("the feature store reopens");
     let outcomes = reopened
         .tick(HostReading::new(boot(), 12_000, NOON, true))
         .expect("the store records the decision");
@@ -3355,8 +3412,9 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, 1_000, false))
-            .expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, HostReading::new(boot(), 0, 1_000, false), &opener())
+                .expect("the feature store opens");
         attention
             .apply(
                 &event(
@@ -3378,8 +3436,12 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
             .expect("the store records the decision");
     }
     // Two seconds of the machine's own clock later, with the wall clock corrected an hour ahead.
-    let mut reopened = Attention::open(&path, HostReading::new(boot(), 12_000, 3_603_000, true))
-        .expect("the feature store reopens");
+    let mut reopened = Attention::open(
+        &path,
+        HostReading::new(boot(), 12_000, 3_603_000, true),
+        &opener(),
+    )
+    .expect("the feature store reopens");
     let decided = reopened
         .tick(HostReading::new(boot(), 12_000, 3_603_000, true))
         .expect("the store records the decision");
@@ -3410,8 +3472,9 @@ fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, false))
-            .expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, HostReading::new(boot(), 0, NOON, false), &opener())
+                .expect("the feature store opens");
         attention
             .apply(
                 &adapter_failed(1, 0),
@@ -3421,8 +3484,12 @@ fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
         assert_eq!(whole_inbox(&attention)[0].level, AttentionLevel::Notable);
     }
     let later = NOON + 3_602_000;
-    let mut reopened = Attention::open(&path, HostReading::new(boot(), 12_000, later, true))
-        .expect("the store reopens");
+    let mut reopened = Attention::open(
+        &path,
+        HostReading::new(boot(), 12_000, later, true),
+        &opener(),
+    )
+    .expect("the store reopens");
     reopened
         .tick(HostReading::new(boot(), 12_000, later, true))
         .expect("the store records the decision");
@@ -3519,7 +3586,8 @@ fn a_store_that_holds_state_and_has_lost_its_key_secret_is_refused() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&approval(1, 1_000, "req-1"), reading(0))
             .expect("the store records the decision");
@@ -3532,7 +3600,7 @@ fn a_store_that_holds_state_and_has_lost_its_key_secret_is_refused() {
     }
     assert!(
         matches!(
-            Attention::open(&path, reading(1_000)),
+            Attention::open(&path, reading(1_000), &opener()),
             Err(kr_attention::Error::StoreUnreadable { .. })
         ),
         "a store that lost the secret its keys were derived under is refused"
@@ -3549,8 +3617,9 @@ fn an_interval_restarted_by_a_reboot_is_not_restarted_again_by_the_next_reopen()
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, true))
-            .expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, HostReading::new(boot(), 0, NOON, true), &opener())
+                .expect("the feature store opens");
         attention
             .apply(
                 &notice(1, 1_000, "build finished", false),
@@ -3562,14 +3631,15 @@ fn an_interval_restarted_by_a_reboot_is_not_restarted_again_by_the_next_reopen()
     // A reboot. The interval starts again, which is right, and the new start is written down.
     {
         let after_reboot = HostReading::new(next_boot(), 1_000, NOON + 60_000, true);
-        let mut reopened = Attention::open(&path, after_reboot).expect("the store reopens");
+        let mut reopened =
+            Attention::open(&path, after_reboot, &opener()).expect("the store reopens");
         reopened
             .tick(after_reboot.advanced(40_000))
             .expect("the store records the decision");
     }
     // A second reopen inside that same boot, forty seconds later. The window has run.
     let later = HostReading::new(next_boot(), 41_000, NOON + 101_000, true);
-    let mut again = Attention::open(&path, later).expect("the store reopens");
+    let mut again = Attention::open(&path, later, &opener()).expect("the store reopens");
     let repeated = again
         .apply(
             &notice(2, 2_000, "build finished", false),
@@ -3590,16 +3660,18 @@ fn a_wait_with_no_anchor_is_not_started_again_by_every_restart() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&pending_question(1, 0, question(9), true, 0), reading(0))
             .expect("the store records the decision");
     }
     // Four minutes of this boot's own clock, across two reopens of the store.
     {
-        let _ = Attention::open(&path, reading(120_000)).expect("the store reopens");
+        let _ = Attention::open(&path, reading(120_000), &opener()).expect("the store reopens");
     }
-    let mut reopened = Attention::open(&path, reading(240_000)).expect("the store reopens");
+    let mut reopened =
+        Attention::open(&path, reading(240_000), &opener()).expect("the store reopens");
     let owed = reopened
         .tick(reading(IDLE_REMINDER_MS + 1))
         .expect("the store records the decision");
@@ -3647,8 +3719,9 @@ fn an_interval_a_reopen_restarted_survives_a_reopen_that_changed_nothing_else() 
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, true))
-            .expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, HostReading::new(boot(), 0, NOON, true), &opener())
+                .expect("the feature store opens");
         attention
             .apply(
                 &notice(1, 1_000, "build finished", false),
@@ -3662,6 +3735,7 @@ fn an_interval_a_reopen_restarted_survives_a_reopen_that_changed_nothing_else() 
         let _ = Attention::open(
             &path,
             HostReading::new(next_boot(), 1_000, NOON + 60_000, true),
+            &opener(),
         )
         .expect("the store reopens");
     }
@@ -3669,6 +3743,7 @@ fn an_interval_a_reopen_restarted_survives_a_reopen_that_changed_nothing_else() 
     let mut again = Attention::open(
         &path,
         HostReading::new(next_boot(), 62_000, NOON + 121_000, true),
+        &opener(),
     )
     .expect("the store reopens");
     let repeated = again
@@ -3688,19 +3763,25 @@ fn a_wait_a_reopen_restarted_is_not_restarted_by_the_next_one() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
             .apply(&pending_question(1, 0, question(9), true, 0), reading(0))
             .expect("the store records the decision");
     }
     // A reboot, then two opens of the new boot with nothing else between them.
     {
-        let _ = Attention::open(&path, HostReading::new(next_boot(), 1_000, NOON, true))
-            .expect("the store reopens");
+        let _ = Attention::open(
+            &path,
+            HostReading::new(next_boot(), 1_000, NOON, true),
+            &opener(),
+        )
+        .expect("the store reopens");
     }
     let mut reopened = Attention::open(
         &path,
         HostReading::new(next_boot(), 1_000 + IDLE_REMINDER_MS + 1, NOON, true),
+        &opener(),
     )
     .expect("the store reopens");
     let owed = reopened
@@ -3724,7 +3805,7 @@ fn the_write_an_open_makes_does_not_replace_what_the_owner_before_it_committed()
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     let who = actor("device:phone");
-    let mut held = Attention::open(&path, reading(0)).expect("the feature store opens");
+    let mut held = Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
     held.apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     let key = held.key_for(AttentionRule::PendingApproval, "req-1");
@@ -3737,7 +3818,7 @@ fn the_write_an_open_makes_does_not_replace_what_the_owner_before_it_committed()
 
     // The next owner opens the same file. Its own opening write must not put back the state that
     // stood before the acknowledgement.
-    let second = Attention::open(&path, reading(2_000)).expect("the store reopens");
+    let second = Attention::open(&path, reading(2_000), &opener()).expect("the store reopens");
     assert_eq!(
         second.revision(&who),
         1,
@@ -3758,14 +3839,14 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     let who = actor("device:phone");
-    let mut held = Attention::open(&path, reading(0)).expect("the feature store opens");
+    let mut held = Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
     held.apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     let key = held.key_for(AttentionRule::PendingApproval, "req-1");
 
     // A second owner tries to read the state before the first one's next write lands. It never
     // gets that far.
-    let refused = Attention::open(&path, reading(1_000));
+    let refused = Attention::open(&path, reading(1_000), &opener());
     assert!(
         matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
         "a second owner is told the store is held: {refused:?}"
@@ -3774,7 +3855,7 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     // The first owner's work goes in while the second is still shut out.
     held.acknowledge(&who, std::slice::from_ref(&key), reading(2_000))
         .expect("the store records the acknowledgement");
-    let refused = Attention::open(&path, reading(3_000));
+    let refused = Attention::open(&path, reading(3_000), &opener());
     assert!(matches!(
         refused,
         Err(kr_attention::Error::StoreHeld { .. })
@@ -3782,7 +3863,7 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
 
     // Once the first owner lets go, the next one opens and finds everything it committed.
     drop(held);
-    let next = Attention::open(&path, reading(4_000)).expect("the store reopens");
+    let next = Attention::open(&path, reading(4_000), &opener()).expect("the store reopens");
     assert_eq!(next.revision(&who), 1);
     assert!(next.inbox(&who, false, Content::Whole).is_empty());
 }
@@ -3793,7 +3874,7 @@ fn one_database_is_one_owner_whatever_name_reaches_it() {
     // store, and the second owner is refused exactly as it would be under the first name.
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
-    let held = Attention::open(&path, reading(0)).expect("the feature store opens");
+    let held = Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
 
     // A symbolic link: another path, the same database.
     let alias = directory.path().join("alias.db");
@@ -3801,26 +3882,169 @@ fn one_database_is_one_owner_whatever_name_reaches_it() {
     std::os::unix::fs::symlink(&path, &alias).expect("the link is made");
     #[cfg(windows)]
     std::os::windows::fs::symlink_file(&path, &alias).expect("the link is made");
-    let refused = Attention::open(&alias, reading(1_000));
+    let refused = Attention::open(&alias, reading(1_000), &opener());
     assert!(
         matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
         "a link to the store is the store: {refused:?}"
     );
 
-    // A hard link beside it: two real names, one database, and no second owner either way. The
-    // claim is a row in the database, so the name that reached it is not what decides; SQLite
-    // also declines to open a second name for a database it is already journalling. Either answer
-    // is a refusal, and neither is a second owner.
-    #[cfg(unix)]
+    drop(held);
+    let _ = Attention::open(&alias, reading(3_000), &opener())
+        .expect("the store opens under either name");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_more_than_one_name_reaches_is_not_opened_at_all() {
+    // A hard link is a second real name for one file, and a database is journalled under the name
+    // it was opened by: two processes opening this file by one name each would keep two journals
+    // of it, see neither the other's claim nor the other's writes, and leave the file the loser.
+    // That is refused at the door, and the refusal says why rather than failing later on.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
     {
-        let second_name = directory.path().join("also.db");
-        std::fs::hard_link(&path, &second_name).expect("the link is made");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+        attention
+            .apply(&approval(1, 1_000, "req-1"), reading(0))
+            .expect("the store records the decision");
+    }
+
+    let second_name = directory.path().join("also.db");
+    std::fs::hard_link(&path, &second_name).expect("the link is made");
+    for name in [&path, &second_name] {
+        let refused = Attention::open(name, reading(1_000), &opener());
         assert!(
-            Attention::open(&second_name, reading(2_000)).is_err(),
-            "a second name for the store is not a second owner of it"
+            matches!(
+                refused,
+                Err(kr_attention::Error::StoreAliased { names }) if names == 2
+            ),
+            "neither name opens a file both of them reach: {refused:?}"
         );
     }
 
+    // Once there is one name again, the store opens, and everything it held is still there.
+    std::fs::remove_file(&second_name).expect("the link is removed");
+    let reopened = Attention::open(&path, reading(2_000), &opener())
+        .expect("the store opens under its one name");
+    assert_eq!(
+        reopened
+            .inbox(&actor("device:phone"), true, Content::Whole)
+            .len(),
+        1,
+        "the state a refusal protected is the state that comes back"
+    );
+}
+
+#[test]
+fn an_owner_that_is_running_keeps_its_store_however_long_it_has_been_idle() {
+    // A lease is for a claim nobody can ask about. A process the host can see running is holding
+    // its store whatever it has been doing, and taking it away at ten minutes would hand a second
+    // owner a state the first one is still writing to.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let held = Attention::open(&path, reading(0), &Claimant::new(process(1), UNKNOWN))
+        .expect("the feature store opens");
+
+    let long_after = reading(kr_attention::store::OWNER_LEASE_MS * 3);
+    let refused = Attention::open(&path, long_after, &Claimant::new(process(2), RUNNING));
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "the owner is running, so its store is not going anywhere: {refused:?}"
+    );
     drop(held);
-    let _ = Attention::open(&alias, reading(3_000)).expect("the store opens under either name");
+}
+
+#[test]
+fn a_store_whose_owner_has_gone_is_taken_at_once() {
+    // The other half of the same rule. A worker that was killed cannot release its claim, and the
+    // next one should not wait out a lease to find out what the kernel will tell it: that process
+    // is gone, and the store it left is the next owner's.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let who = actor("device:phone");
+    let mut killed = Attention::open(&path, reading(0), &Claimant::new(process(1), UNKNOWN))
+        .expect("the feature store opens");
+    killed
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    // Killed: no unwinding, no release, and the claim is left where it was.
+    std::mem::forget(killed);
+
+    let next = Attention::open(&path, reading(1_000), &Claimant::new(process(2), ENDED))
+        .expect("the store is taken from a process that has gone");
+    assert_eq!(
+        next.inbox(&who, true, Content::Whole).len(),
+        1,
+        "and everything the owner before it wrote down is there"
+    );
+}
+
+#[test]
+fn a_claim_nobody_can_ask_about_stands_until_its_lease_runs_out() {
+    // Where the platform will not say whether a process is alive, the claim's own lease decides.
+    // Reading a refused query as death would take a store out from under a process still writing
+    // to it, so the wait is what that uncertainty costs.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let killed = Attention::open(&path, reading(0), &Claimant::new(process(1), UNKNOWN))
+        .expect("the feature store opens");
+    std::mem::forget(killed);
+
+    let inside = kr_attention::store::OWNER_LEASE_MS - 1_000;
+    let refused = Attention::open(&path, reading(inside), &Claimant::new(process(2), UNKNOWN));
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "nobody can say the owner has gone, so its claim stands: {refused:?}"
+    );
+
+    let past = kr_attention::store::OWNER_LEASE_MS + 1_000;
+    let _ = Attention::open(&path, reading(past), &Claimant::new(process(2), UNKNOWN))
+        .expect("the lease has run out, so the store is taken");
+}
+
+#[test]
+fn an_owner_whose_store_was_taken_writes_nothing_more() {
+    // The state an owner holds is the state as it was before it lost the store. Writing that back
+    // would replace everything the owner that took it has done since, so the write is refused and
+    // the store is read again by whoever opens it next.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let who = actor("device:phone");
+    let mut first = Attention::open(&path, reading(0), &Claimant::new(process(1), UNKNOWN))
+        .expect("the feature store opens");
+    first
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    let key = first.key_for(AttentionRule::PendingApproval, "req-1");
+
+    // The second owner is told the first one's process has gone, and takes the store.
+    let mut second = Attention::open(&path, reading(1_000), &Claimant::new(process(2), ENDED))
+        .expect("the store is taken from a process that has gone");
+    second
+        .acknowledge(&who, std::slice::from_ref(&key), reading(2_000))
+        .expect("the store records the acknowledgement");
+
+    // The first owner is still holding its copy of the state, and is refused.
+    let refused = first.tick(reading(3_000));
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreTaken)),
+        "the store is not this owner's to write: {refused:?}"
+    );
+
+    // Letting go gives up its own claim and nothing else, so the second owner still holds the
+    // store and a third opener is still shut out.
+    drop(first);
+    let refused = Attention::open(&path, reading(4_000), &Claimant::new(process(3), RUNNING));
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "the owner that took the store still holds it: {refused:?}"
+    );
+
+    // And what the second owner committed is what the store holds.
+    drop(second);
+    let after = Attention::open(&path, reading(5_000), &Claimant::new(process(4), UNKNOWN))
+        .expect("the store reopens");
+    assert_eq!(after.revision(&who), 1);
+    assert!(after.inbox(&who, false, Content::Whole).is_empty());
 }

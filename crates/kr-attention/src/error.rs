@@ -35,7 +35,25 @@ pub enum Error {
     #[error("process {process} holds this attention feature store")]
     StoreHeld {
         /// The process whose claim stands.
-        process: u32,
+        process: u64,
+    },
+    /// The claim this owner writes under is no longer the one on the store.
+    ///
+    /// Its state is what it held before the store was taken, and writing that back would replace
+    /// whatever the owner that took it has done since. It writes no more, and the store is read
+    /// again by whoever opens it next.
+    #[error("this attention feature store is no longer this owner's to write")]
+    StoreTaken,
+    /// More than one name reaches the file this feature store is in.
+    ///
+    /// A database is journalled under the name it was opened by, so one file with two names can be
+    /// journalled twice over by two processes that never see each other's work.
+    #[error(
+        "{names} names reach this attention feature store's file, and one is the most it can have"
+    )]
+    StoreAliased {
+        /// How many names reach the file.
+        names: u64,
     },
     /// The feature store could not be read or written.
     #[error("the attention feature store is unavailable ({kind}): {detail}")]

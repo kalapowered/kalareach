@@ -45,7 +45,7 @@ use std::sync::Mutex;
 
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, SourceEvent};
 use kr_attention::time::BootMark;
-use kr_attention::{Attention as Engine, Content, HostReading, Outcome};
+use kr_attention::{Attention as Engine, Claimant, Content, HostReading, Liveness, Outcome};
 use kr_protocol::action::WallClockTrust;
 use kr_protocol::attention::{
     AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionQuietHoursParams,
@@ -133,6 +133,30 @@ fn storable(value: u64, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Names this worker and how it asks about a claim it finds on the store.
+///
+/// The process identity is the pair the kernel describes: the number and the start value that says
+/// this is the same process holding it. A worker that crashed left its claim behind, and the next
+/// one clears it the moment the kernel says that process has gone; where the kernel will not
+/// answer, the claim's own lease decides, and a claim whose process is still running is never
+/// taken.
+fn claim_check() -> Result<kr_protocol::identity::ProcessStartIdentity> {
+    kr_ipc::identity::current_process_start_identity().map_err(|error| {
+        WorkerError::JournalUnavailable {
+            detail: format!("this worker's process cannot be identified: {error}"),
+        }
+    })
+}
+
+/// Returns what the kernel says about the process a claim names.
+fn liveness(held: &kr_protocol::identity::ProcessStartIdentity) -> Liveness {
+    match kr_ipc::identity::process_state(held) {
+        kr_ipc::identity::ProcessState::Running => Liveness::Running,
+        kr_ipc::identity::ProcessState::Ended => Liveness::Ended,
+        kr_ipc::identity::ProcessState::Unknown { .. } => Liveness::Unknown,
+    }
+}
+
 fn translate(error: kr_attention::Error) -> WorkerError {
     match error {
         kr_attention::Error::UnknownReviewSubject { subject } => {
@@ -159,6 +183,14 @@ fn translate(error: kr_attention::Error) -> WorkerError {
         kr_attention::Error::StoreHeld { process } => WorkerError::JournalUnavailable {
             detail: format!("process {process} holds this session's attention store"),
         },
+        kr_attention::Error::StoreTaken => WorkerError::JournalUnavailable {
+            detail: "this session's attention store is no longer this worker's to write".to_owned(),
+        },
+        kr_attention::Error::StoreAliased { names } => WorkerError::JournalUnavailable {
+            detail: format!(
+                "{names} names reach this session's journal file, and one is the most it can have"
+            ),
+        },
         kr_attention::Error::TooManyActors { bound } => WorkerError::QuotaExceeded {
             detail: format!(
                 "this session's attention store holds {bound} actors, which is its bound"
@@ -178,10 +210,12 @@ impl Attention {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the store cannot be opened, read back or
-    /// written, and when another live owner already holds it: one session's worker is the one
-    /// owner of its own store, because every write replaces the whole of it.
+    /// written; when another live owner already holds it, because one session's worker is the one
+    /// owner of its own store and every write replaces the whole of it; and when more than one
+    /// name reaches the journal file, which is a file two processes could journal separately.
     pub fn open(journal_path: Option<&Path>, time: &TimeContract) -> Result<Self> {
-        let engine = Engine::beside(journal_path, reading(time)).map_err(translate)?;
+        let claimant = Claimant::new(claim_check()?, &liveness);
+        let engine = Engine::beside(journal_path, reading(time), &claimant).map_err(translate)?;
         Ok(Self {
             engine: Mutex::new(engine),
         })

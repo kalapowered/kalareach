@@ -53,14 +53,27 @@
 //! Every write here replaces the whole state, and it is made from the copy its owner has been
 //! holding, so two owners of one store would each replace the other's work with a picture of the
 //! world that predates it. There is one owner instead, and the claim is a **row in the store**:
-//! opening it reads that row and writes its own under the same transaction that reads the state,
-//! so every name for one database reaches one claim because there is nothing to key on but the
-//! database. A claim from a boot that has ended, or one this boot has not refreshed within
-//! [`OWNER_LEASE_MS`], is taken; anything else is a live owner and the second opener is told so
-//! with [`Error::StoreHeld`]. Nothing here takes a second handle on the file: on the Unix family,
+//! opening it reads that row before it reads anything else and writes its own under the same
+//! transaction, so there is nothing to key on but the database itself.
+//!
+//! A claim from a boot that has ended is taken at once, and so is one whose process the host can
+//! see has gone. [`OWNER_LEASE_MS`] decides only a claim whose holder cannot be asked about: ten
+//! minutes without a refresh and it is taken. A holder that is still running keeps its store
+//! however long it has been idle, and the opener that finds it is told so with
+//! [`Error::StoreHeld`].
+//!
+//! The claim is read again inside every write, under the transaction that write is made in, so an
+//! owner whose store was taken while it was away replaces nothing: it is told
+//! [`Error::StoreTaken`] and writes no more. Letting go removes that one row and nothing else, so
+//! a claim this owner no longer holds is not one it can release.
+//!
+//! Two things that rests on. Nothing here takes a second handle on the file: on the Unix family,
 //! closing any descriptor for a file drops every lock the process holds on it, so a handle opened
 //! beside SQLite's own would release the locks the receipt journal and the question ledger are
-//! holding on the same file.
+//! holding on the same file. And a file that more than one name reaches is refused outright with
+//! [`Error::StoreAliased`], because the write-ahead log SQLite keeps beside a database is named
+//! after the name the database was opened by: two processes opening one file by two names would
+//! journal it twice over, and neither would see the other's claim or the other's writes.
 //!
 //! # What a stored value may not do
 //!
@@ -78,6 +91,7 @@ use kr_protocol::attention::{
     ChangeSummary, LogViewState, NotificationState, QuietHours, ReviewSubject, SemanticChange,
     SemanticChangeKind,
 };
+use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{ActorId, AgentTurnId, ChangeSetId, QuestionId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -95,7 +109,7 @@ use crate::visit::{Omitted, Visit};
 /// by - so a row written under a different derivation would be read under a name that does not
 /// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
 /// each of its intervals is measured from, and a row that predates those columns carries none.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -115,8 +129,6 @@ pub struct StoredState {
     pub gaps: Vec<AttentionGap>,
     /// How many items the host has let go of to stay inside its bound.
     pub dropped: u64,
-    /// Who holds this store, when anybody does.
-    pub owner: Option<Owner>,
     /// The secret this store derives its item keys under.
     ///
     /// It is generated once, when a store first has state to write, and read back with the rest.
@@ -160,11 +172,11 @@ pub struct Store {
 /// the boot that process is running in, and the continuous reading it was last refreshed at, which
 /// is the only clock an interval may be measured on.
 ///
-/// A claim from another boot is stale by definition: that boot has ended and so has its process. A
-/// claim from this boot that has not been refreshed within the lease is stale too, because an
-/// owner that is running refreshes it on every write, and the host's own maintenance writes at
-/// least once a minute. Anything else is a live owner, and a second opener is told so.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A claim from another boot is stale by definition: that boot has ended and so has its process.
+/// A claim from this boot is weighed on what the host can see of the process that made it: one
+/// that has gone is stale at once, one that is running holds its store, and one the host cannot
+/// ask about stands until its lease runs out.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Owner {
     /// What tells this claim apart from every other, including another in the same process.
     ///
@@ -172,56 +184,140 @@ pub struct Owner {
     /// that died and whose number was given to another is not the owner that number names. This is
     /// random, and one value holds one of them for its life.
     pub claim: u64,
-    /// The process that holds the store, for a person reading the refusal.
-    pub process: u32,
+    /// The process that holds the store, as the kernel described it when the claim was made.
+    ///
+    /// The number alone would name whoever holds it now, which after a crash is an unrelated
+    /// program. The start value is what says this is the same process, and the pair is what the
+    /// host asks about.
+    pub process: ProcessStartIdentity,
     /// The boot that process is running in.
     pub boot: BootMark,
     /// The continuous reading the claim was last refreshed at, within that boot.
     pub refreshed_ms: u64,
 }
 
-/// How long a claim stands without being refreshed before another opener may take it.
+/// What the host can see of the process that made a claim.
 ///
-/// Ten minutes against a maintenance loop that writes every minute: long enough that an owner
-/// which is merely busy is never taken from, short enough that a process killed without unwinding
-/// does not hold a session's store until the machine restarts.
+/// The store holds no platform code of its own - it is a state machine over typed events - so the
+/// host that opens it answers this, and the store decides what the answer means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// That exact process is running.
+    Running,
+    /// It has gone, or its number now belongs to a different process.
+    Ended,
+    /// The platform would not say, so neither answer is established.
+    ///
+    /// This is not "gone". An opener that read a refused or failed query as death would take a
+    /// store out from under a process that was still writing to it.
+    Unknown,
+}
+
+/// Who is opening a store, and what it can find out about a claim already on it.
+pub struct Claimant<'a> {
+    process: ProcessStartIdentity,
+    liveness: &'a dyn Fn(&ProcessStartIdentity) -> Liveness,
+}
+
+impl<'a> Claimant<'a> {
+    /// Names the opening process and how a claim it finds is asked about.
+    ///
+    /// `liveness` is asked only about a claim made in this same boot, because a claim from any
+    /// other boot is stale whatever a process of that number is doing now.
+    #[must_use]
+    pub fn new(
+        process: ProcessStartIdentity,
+        liveness: &'a dyn Fn(&ProcessStartIdentity) -> Liveness,
+    ) -> Self {
+        Self { process, liveness }
+    }
+
+    /// Returns the opening process's identity.
+    #[must_use]
+    pub const fn process(&self) -> &ProcessStartIdentity {
+        &self.process
+    }
+
+    /// Returns what the host can see of the process `held` names.
+    #[must_use]
+    pub fn liveness_of(&self, held: &ProcessStartIdentity) -> Liveness {
+        (self.liveness)(held)
+    }
+}
+
+impl core::fmt::Debug for Claimant<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Claimant")
+            .field("process", &self.process)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How long a claim the host cannot ask about stands before another opener may take it.
+///
+/// Ten minutes against a maintenance loop that writes every minute. It decides nothing about a
+/// claim whose process the host can see: one that has gone is taken at once, however recently it
+/// wrote, and one that is running keeps its store however long it has been idle. This is for the
+/// claim in between, where the platform would not answer.
 pub const OWNER_LEASE_MS: u64 = 10 * 60_000;
 
 impl Owner {
-    /// Returns this process's claim at this reading.
+    /// Returns `process`'s claim at this reading.
     #[must_use]
-    pub fn here(claim: u64, reading: HostReading) -> Self {
+    pub const fn here(claim: u64, process: ProcessStartIdentity, reading: HostReading) -> Self {
         Self {
             claim,
-            process: std::process::id(),
+            process,
             boot: reading.boot,
             refreshed_ms: reading.continuous_ms,
         }
     }
 
-    /// Returns a claim no other owner holds.
+    /// Returns a claim drawn at random.
     ///
-    /// Sixty-three bits of it, because the store writes an integer it can read back exactly and a
-    /// row it could not is refused rather than stored. Sixty-three bits is not a number two owners
-    /// draw the same of.
+    /// Sixty-three bits of it: the store writes an integer it can read back exactly, so the top
+    /// bit is dropped rather than stored as a value that would come back negative. Every one of
+    /// the sixty-three is random - the fixed version and variant bits of the identifier they are
+    /// drawn from are left out - which makes two live owners drawing the same value about as
+    /// likely as the same second of a host's life happening twice. It is not a guarantee, and
+    /// nothing here treats it as one: a claim decides which owner a row belongs to, and the boot,
+    /// the process and the lease decide whether it still stands.
     #[must_use]
     pub fn fresh_claim() -> u64 {
+        // Bytes six and eight of a version-four identifier carry its version and variant, which
+        // are the same in every one of them. These eight do not.
         let bytes = *uuid::Uuid::new_v4().as_bytes();
-        let drawn = u64::from_be_bytes(bytes[..8].try_into().expect("eight of sixteen bytes"));
+        let drawn = u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[7], bytes[9],
+        ]);
         drawn >> 1
     }
 
-    /// Whether this claim still stands against `reading`, for an owner other than `claim`.
+    /// Whether this claim still stands against an opener whose own claim is `claim`.
     ///
-    /// A claim from a boot that has ended is not standing: that boot's processes are gone. One
-    /// from this boot stands until its lease runs out, which an owner that is running refreshes on
-    /// every write. **What this cannot ask** is whether a process on this boot is still alive, so
-    /// an owner that was killed without unwinding holds its store until the lease does run out.
+    /// A claim from a boot that has ended is not standing: that boot's processes are gone with it.
+    /// One from this boot is put to `liveness`, which is asked at most once: a process that has
+    /// gone leaves nothing standing however recently it wrote, one that is running holds its store
+    /// however long it has been idle, and one the host cannot ask about stands until
+    /// [`OWNER_LEASE_MS`] has run since its last refresh.
     #[must_use]
-    pub fn stands_against(&self, claim: u64, reading: HostReading) -> bool {
-        self.claim != claim
-            && self.boot == reading.boot
-            && reading.continuous_ms.saturating_sub(self.refreshed_ms) < OWNER_LEASE_MS
+    pub fn stands_against(
+        &self,
+        claim: u64,
+        reading: HostReading,
+        liveness: impl FnOnce(&ProcessStartIdentity) -> Liveness,
+    ) -> bool {
+        if self.claim == claim || self.boot != reading.boot {
+            return false;
+        }
+        match liveness(&self.process) {
+            Liveness::Running => true,
+            Liveness::Ended => false,
+            Liveness::Unknown => {
+                reading.continuous_ms.saturating_sub(self.refreshed_ms) < OWNER_LEASE_MS
+            }
+        }
     }
 }
 
@@ -255,6 +351,52 @@ fn resolve(path: &Path) -> Result<std::path::PathBuf> {
     Ok(std::fs::canonicalize(directory)
         .map_err(|error| unavailable(&error))?
         .join(name))
+}
+
+/// Refuses a database file that more than one name reaches.
+///
+/// SQLite names the write-ahead log it keeps beside a database, and the shared memory both are
+/// coordinated through, after the name the database was opened by. Two hard links to one file are
+/// two names, so two processes opening it by one each would journal the same file twice over:
+/// neither would see the other's claim, neither would see the other's writes, and the file would
+/// be the loser. A symbolic link is a different thing and is admitted: it is resolved before
+/// SQLite is given the path, so every symbolic link to a store reaches the one name it has.
+///
+/// The count is the file's own, read from its metadata rather than worked out by comparing names,
+/// and it is read without opening the file: on the Unix family, closing any descriptor for a file
+/// drops every lock the process holds on it, and the receipt journal and the question ledger hold
+/// locks on this one.
+fn one_name(file: &Path) -> Result<()> {
+    if let Some(names) = link_count(file)?
+        && names > 1
+    {
+        return Err(Error::StoreAliased { names });
+    }
+    Ok(())
+}
+
+/// Returns how many names reach `file`, where the platform says.
+#[cfg(unix)]
+fn link_count(file: &Path) -> Result<Option<u64>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let described = std::fs::metadata(file).map_err(|error| Error::StoreUnavailable {
+        kind: StoreFault::Other,
+        detail: format!("{} cannot be described: {error}", file.display()),
+    })?;
+    Ok(Some(described.nlink()))
+}
+
+/// Returns how many names reach `file`, where the platform says.
+///
+/// Windows keeps the count, but hands it out only through an open handle on the file, and this
+/// host opens no second handle on a database. So a Windows store is admitted on the name it was
+/// given, and what stands in for the count there is where the file is: the host keeps each
+/// session's store under a directory of its own making, so a second name for one is something
+/// somebody went and made.
+#[cfg(not(unix))]
+fn link_count(_file: &Path) -> Result<Option<u64>> {
+    Ok(None)
 }
 
 const SCHEMA: &str = "
@@ -305,7 +447,9 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS attention_owner (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         claim INTEGER NOT NULL,
-        process INTEGER NOT NULL,
+        pid INTEGER NOT NULL,
+        start_source TEXT NOT NULL,
+        start_value INTEGER NOT NULL,
         boot TEXT NOT NULL,
         refreshed_ms INTEGER NOT NULL
     );
@@ -398,14 +542,17 @@ const SCHEMA: &str = "
 ";
 
 /// Every table the state lives in, which one write replaces together.
-const TABLES: &[&str] = &[
+/// The tables the state lives in, which every write replaces and an empty store holds none of.
+///
+/// The claim is not one of them. It says who may write the state, not what the state is, and a
+/// store nobody has written yet is empty whether or not somebody is holding it open.
+const STATE_TABLES: &[&str] = &[
     "attention_consumed",
     "attention_gaps",
     "attention_items",
     "attention_actors",
     "attention_dropped",
     "attention_announcements",
-    "attention_owner",
     "attention_key_secret",
     "attention_item_acks",
     "attention_pending_inputs",
@@ -419,6 +566,29 @@ const TABLES: &[&str] = &[
     "attention_visits",
     "attention_log_views",
 ];
+
+/// Returns the stored form of where a process start value came from.
+///
+/// A start value means nothing without it: one platform counts clock ticks since the boot and
+/// another microseconds since the epoch, and a value read under the wrong one would say a process
+/// that is running is a different process.
+const fn source_text(source: ProcessStartSource) -> &'static str {
+    match source {
+        ProcessStartSource::LinuxProcStat => "linux_proc_stat",
+        ProcessStartSource::MacosProcBsdInfo => "macos_proc_bsd_info",
+        ProcessStartSource::WindowsProcessStartSeconds => "windows_process_start_seconds",
+    }
+}
+
+/// Reads back what [`source_text`] wrote, and refuses anything else.
+fn start_source(stored: &str) -> Result<ProcessStartSource> {
+    match stored {
+        "linux_proc_stat" => Ok(ProcessStartSource::LinuxProcStat),
+        "macos_proc_bsd_info" => Ok(ProcessStartSource::MacosProcBsdInfo),
+        "windows_process_start_seconds" => Ok(ProcessStartSource::WindowsProcessStartSeconds),
+        _ => Err(unreadable("owner process start source")),
+    }
+}
 
 fn unreadable(field: &'static str) -> Error {
     Error::StoreUnreadable { field }
@@ -467,15 +637,16 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreHeld`] when another live owner already holds this store,
+    /// Returns [`Error::StoreAliased`] when more than one name reaches the file,
     /// [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be created,
     /// and [`Error::StoreUnreadable`] when the file records a schema this build does not know.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         // The resolved path, never the name that reached here: SQLite reads a name beginning
         // `file:` as a URI and `:memory:` as a database of its own, and neither is the file this
         // store is meant to be. Who owns the store is a row inside it, not anything about a name.
-        let connection = Connection::open_with_flags(resolve(path.as_ref())?, FILE_ONLY)?;
-        Self::prepare(connection)
+        let resolved = resolve(path.as_ref())?;
+        let connection = Connection::open_with_flags(&resolved, FILE_ONLY)?;
+        Self::prepare(connection, Some(&resolved))
     }
 
     /// Opens the store inside the worker's private journal, or in memory when there is none.
@@ -485,7 +656,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreHeld`] when another live owner already holds this store,
+    /// Returns [`Error::StoreAliased`] when more than one name reaches the file,
     /// [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be created,
     /// and [`Error::StoreUnreadable`] when the file records a schema this build does not know.
     pub fn beside(path: Option<&Path>) -> Result<Self> {
@@ -502,14 +673,19 @@ impl Store {
     /// Returns [`Error::StoreUnavailable`] when the schema cannot be created.
     pub fn in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory()?;
-        Self::prepare(connection)
+        Self::prepare(connection, None)
     }
 
-    fn prepare(connection: Connection) -> Result<Self> {
+    fn prepare(connection: Connection, file: Option<&Path>) -> Result<Self> {
         // The store shares its file with the receipt journal and the question ledger, so a write
         // can find another of them holding it. The wait is bounded: past it the caller is told the
         // store is unavailable rather than left blocked.
         connection.busy_timeout(BUSY_TIMEOUT)?;
+        // Before the write-ahead log exists, because it is the write-ahead log that a second name
+        // for this file would split in two.
+        if let Some(file) = file {
+            one_name(file)?;
+        }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -592,22 +768,6 @@ impl Store {
             None if Self::is_empty(connection)? => crate::key::KeySecret::fresh(),
             None => return Err(unreadable("key secret")),
         };
-        let owner: Option<(i64, i64, String, i64)> = connection
-            .query_row(
-                "SELECT claim, process, boot, refreshed_ms FROM attention_owner WHERE id = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        let owner = match owner {
-            Some((claim, process, boot, refreshed)) => Some(Owner {
-                claim: as_u64(claim, "owner claim")?,
-                process: u32::try_from(process).map_err(|_| unreadable("owner process"))?,
-                boot: BootMark::from_hex(&boot).ok_or_else(|| unreadable("owner boot"))?,
-                refreshed_ms: as_u64(refreshed, "owner lease")?,
-            }),
-            None => None,
-        };
         let announcement: Option<i64> = connection
             .query_row(
                 "SELECT next FROM attention_announcements WHERE id = 0",
@@ -626,7 +786,6 @@ impl Store {
                 None => 0,
             },
             keys,
-            owner,
             next_announcement: match announcement {
                 Some(value) => as_u64(value, "announcement counter")?,
                 None => 0,
@@ -650,7 +809,7 @@ impl Store {
     /// answers about what is there now rather than about what was ever written: a store whose rows
     /// have all been removed is empty, and nothing in it needs a secret to name.
     fn is_empty(connection: &Connection) -> Result<bool> {
-        for table in TABLES {
+        for table in STATE_TABLES {
             let held: i64 = connection.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
                 [],
@@ -663,52 +822,119 @@ impl Store {
         Ok(true)
     }
 
-    /// Reads the state back, hands it to `settle`, and writes what comes back, with nothing able
-    /// to come between the three.
+    /// Takes the store, reads its state, hands that to `settle`, and writes what comes back, with
+    /// nothing able to come between any of it.
     ///
-    /// This is what a session opening its store does. Re-anchoring an interval reads the state and
-    /// writes it again, and a whole-state write replaces everything: another connection that
-    /// committed between the read and the write would have its work replaced by the older state
-    /// this one had read. So the write lock is taken before the read rather than at the write,
-    /// which is the whole of the difference. It is held for one read and one write and then
+    /// This is what a session opening its store does. The claim on the store is read first, and
+    /// `take` says whether this opener may have it: an opener that may not is refused here, before
+    /// a single row of a state it would not be allowed to write has been read. Re-anchoring an
+    /// interval then reads the state and writes it again, and a whole-state write replaces
+    /// everything, so another connection that committed between the read and the write would have
+    /// its work replaced by the older state this one had read. That is why the write lock is taken
+    /// before the read rather than at the write. It is held for one read and one write and then
     /// released, so the other owners of tables in the same file are not kept out.
     ///
     /// # Errors
     ///
-    /// Returns whatever `settle` returns, [`Error::StoreUnavailable`] when the transaction cannot
-    /// be taken or committed, and [`Error::StoreUnreadable`] for a value this build cannot read
-    /// back or write down. Nothing is left half written.
+    /// Returns whatever `take` or `settle` returns, [`Error::StoreUnavailable`] when the
+    /// transaction cannot be taken or committed, and [`Error::StoreUnreadable`] for a value this
+    /// build cannot read back or write down. Nothing is left half written.
     pub fn recover<T>(
         &mut self,
+        take: impl FnOnce(Option<Owner>) -> Result<Owner>,
         settle: impl FnOnce(StoredState) -> Result<(StoredState, T)>,
     ) -> Result<T> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mine = take(Self::load_owner(&transaction)?)?;
         let stored = Self::load_from(&transaction)?;
         let (state, answer) = settle(stored)?;
-        Self::save_into(&transaction, &state)?;
+        Self::save_into(&transaction, &state, &mine)?;
         transaction.commit()?;
         Ok(answer)
     }
 
-    /// Replaces the stored state with `state`, in one transaction.
+    /// Replaces the stored state with `state`, under `owner`'s claim, in one transaction.
+    ///
+    /// The claim is read inside that transaction and has to be the one on the store. An owner
+    /// whose store was taken while it was away writes nothing: what it holds is the state from
+    /// before, and putting that back would undo everything the owner that took it has done.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreUnavailable`] when the transaction cannot be committed and
+    /// Returns [`Error::StoreTaken`] when the claim on the store is not this one's,
+    /// [`Error::StoreUnavailable`] when the transaction cannot be committed and
     /// [`Error::StoreUnreadable`] when a value cannot be stored without changing it. Nothing is
     /// left half written: the store is either at the previous state or at this one.
-    pub fn save(&mut self, state: &StoredState) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        Self::save_into(&transaction, state)?;
+    pub fn write(&mut self, owner: &Owner, state: &StoredState) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held = Self::load_owner(&transaction)?;
+        if held.is_none_or(|held| held.claim != owner.claim) {
+            return Err(Error::StoreTaken);
+        }
+        Self::save_into(&transaction, state, owner)?;
         transaction.commit()?;
         Ok(())
     }
 
-    /// Writes the whole state through a transaction the caller owns.
-    fn save_into(transaction: &Connection, state: &StoredState) -> Result<()> {
-        for table in TABLES {
+    /// Gives up `claim`, so the next opener waits for nothing.
+    ///
+    /// Only that claim: a row this owner no longer holds belongs to whoever took the store, and
+    /// removing it would let a third opener in while the second is still writing. The state is not
+    /// touched, because the state is not this owner's to restate on the way out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StoreUnavailable`] when the row cannot be removed, which leaves the claim
+    /// for its lease to release.
+    pub fn release(&mut self, claim: u64) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM attention_owner WHERE id = 0 AND claim = ?1",
+            params![as_i64(claim, "owner claim")?],
+        )?;
+        Ok(())
+    }
+
+    /// Reads the claim on the store, when there is one.
+    fn load_owner(connection: &Connection) -> Result<Option<Owner>> {
+        let row: Option<(i64, i64, String, i64, String, i64)> = connection
+            .query_row(
+                "SELECT claim, pid, start_source, start_value, boot, refreshed_ms
+                 FROM attention_owner WHERE id = 0",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((claim, pid, source, start, boot, refreshed)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(Owner {
+            claim: as_u64(claim, "owner claim")?,
+            process: ProcessStartIdentity::new(
+                as_u64(pid, "owner process")?,
+                start_source(&source)?,
+                as_u64(start, "owner process start")?,
+            ),
+            boot: BootMark::from_hex(&boot).ok_or_else(|| unreadable("owner boot"))?,
+            refreshed_ms: as_u64(refreshed, "owner lease")?,
+        }))
+    }
+
+    /// Writes the whole state through a transaction the caller owns, under `owner`'s claim.
+    fn save_into(transaction: &Connection, state: &StoredState, owner: &Owner) -> Result<()> {
+        for table in STATE_TABLES {
             transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
         for (source, sequence) in &state.consumed {
@@ -782,18 +1008,22 @@ impl Store {
             "INSERT INTO attention_dropped (id, items) VALUES (0, ?1)",
             params![as_i64(state.dropped, "dropped count")?],
         )?;
-        if let Some(owner) = state.owner {
-            transaction.execute(
-                "INSERT INTO attention_owner (id, claim, process, boot, refreshed_ms)
-                 VALUES (0, ?1, ?2, ?3, ?4)",
-                params![
-                    as_i64(owner.claim, "owner claim")?,
-                    i64::from(owner.process),
-                    owner.boot.to_hex(),
-                    as_i64(owner.refreshed_ms, "owner lease")?
-                ],
-            )?;
-        }
+        // The claim, written under the same transaction as the state it admits. A write that did
+        // not carry it forward would leave the store looking unheld to the next opener while this
+        // owner was still writing to it.
+        transaction.execute(
+            "INSERT OR REPLACE INTO attention_owner
+                 (id, claim, pid, start_source, start_value, boot, refreshed_ms)
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                as_i64(owner.claim, "owner claim")?,
+                as_i64(owner.process.pid.get(), "owner process")?,
+                source_text(owner.process.source),
+                as_i64(owner.process.start_value.get(), "owner process start")?,
+                owner.boot.to_hex(),
+                as_i64(owner.refreshed_ms, "owner lease")?
+            ],
+        )?;
         transaction.execute(
             "INSERT INTO attention_key_secret (id, secret) VALUES (0, ?1)",
             params![state.keys.as_bytes().as_slice()],

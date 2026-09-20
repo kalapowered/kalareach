@@ -1361,14 +1361,28 @@ right, and the store is where they live.
 One session's worker is the one owner of its own attention store, for as long as it is running.
 Every write replaces the whole state and is made from the copy its owner is holding, so two owners
 would each replace the other's work with a picture of the world that predates it. The claim is a
-row inside the store: opening it reads that row and writes its own under the same transaction that
-reads the state, so whatever name reached the database reaches the one claim, and anything else
-that opens it is told who holds it rather than handed a state it would not be allowed to write
-back. Letting the store go releases the claim at once. An owner that ends without letting go - one
-that was killed, or a machine that stopped - leaves the claim behind, and what releases that one is
-its lease: a claim from a boot that has ended is not standing, and one from this boot stands for
-ten minutes unrefreshed, against an owner that refreshes it on every write and a maintenance loop
-that writes at least once a minute.
+row inside the store: opening it reads that row first of all, and writes its own under the same
+transaction, so whatever name reached the database reaches the one claim, and an opener that may
+not have it is told who holds it before a row of the state has been read. Every write reads the
+claim again, inside the transaction it writes in, so an owner whose store was taken while it was
+away replaces nothing: it is told the store is no longer its to write, and whoever opens the store
+next reads it fresh.
+
+Letting the store go removes that one claim and nothing else - not the state, and not a claim
+somebody else now holds - and the next opener waits for nothing. An owner that ends without letting
+go, one that was killed or a machine that stopped, leaves its claim behind, and the next opener is
+what clears it. A claim from a boot that has ended is not standing, because that boot's processes
+are gone with it. A claim from this boot is weighed on the process it names: the worker records the
+pair the kernel describes, its number and the start value that tells it apart from whoever holds
+that number next, so a claim whose process has gone is taken the moment the next worker asks. Where
+the platform will not answer, the claim's own lease decides instead, and it stands for ten minutes
+unrefreshed against an owner that refreshes it on every write and a maintenance loop that writes at
+least once a minute. A process the kernel says is running keeps its store however long it has been
+idle.
+
+A database is journalled under the name it was opened by, so one file that two names reach can be
+journalled twice over by two processes that never see each other's work. The store refuses such a
+file outright, where the platform counts a file's names, and says how many reach it.
 
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same

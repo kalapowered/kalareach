@@ -46,7 +46,7 @@ use crate::engine::{Announcement, Content, Engine, Outcome, Restored};
 use crate::error::Result;
 use crate::event::{EventKind, SourceEvent};
 use crate::review::Reviews;
-use crate::store::{Owner, Store, StoredState};
+use crate::store::{Claimant, Owner, Store, StoredState};
 use crate::time::HostReading;
 use crate::visit::{Changed, Visit, Visits};
 
@@ -68,8 +68,9 @@ pub struct Attention {
     ///
     /// Every write replaces the whole state and is made from the copy this value holds, so two
     /// owners would each replace the other's work with a picture of the world that predates it.
-    /// The claim is a row in the store, taken as it is opened, and a second opener that finds a
-    /// live one is told so rather than handed a state it may not write back.
+    /// The claim is a row in the store, taken as it is opened, and an opener that finds a standing
+    /// one is told so rather than handed a state it may not write back. It is read again inside
+    /// every write, so this value replaces nothing after the store has been taken from it.
     owner: Owner,
     /// The last reading this value was given, which is what refreshes the claim.
     ///
@@ -85,11 +86,16 @@ impl Attention {
     /// # Errors
     ///
     /// Returns [`crate::Error::StoreHeld`] when another live owner already holds the store,
+    /// [`crate::Error::StoreAliased`] when more than one name reaches its file,
     /// [`crate::Error::StoreUnavailable`] when it cannot be opened, read or written back, and
     /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read. Opening
     /// writes, because what it read back may have had to be re-anchored.
-    pub fn open(path: impl AsRef<Path>, reading: HostReading) -> Result<Self> {
-        Self::from_store(Store::open(path)?, reading)
+    pub fn open(
+        path: impl AsRef<Path>,
+        reading: HostReading,
+        claimant: &Claimant<'_>,
+    ) -> Result<Self> {
+        Self::from_store(Store::open(path)?, reading, claimant)
     }
 
     /// Opens the store inside the worker's private journal, or in memory when there is none.
@@ -97,48 +103,63 @@ impl Attention {
     /// # Errors
     ///
     /// Returns [`crate::Error::StoreHeld`] when another live owner already holds the store,
+    /// [`crate::Error::StoreAliased`] when more than one name reaches its file,
     /// [`crate::Error::StoreUnavailable`] when it cannot be opened, read or written back, and
     /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read. Opening
     /// writes, because what it read back may have had to be re-anchored.
-    pub fn beside(path: Option<&Path>, reading: HostReading) -> Result<Self> {
-        Self::from_store(Store::beside(path)?, reading)
+    pub fn beside(
+        path: Option<&Path>,
+        reading: HostReading,
+        claimant: &Claimant<'_>,
+    ) -> Result<Self> {
+        Self::from_store(Store::beside(path)?, reading, claimant)
     }
 
     /// Opens a store that lives only as long as this value.
     ///
     /// Nothing it holds outlives the drop, so its opening write is a write to memory and the
-    /// intervals it re-anchors are re-anchored for this value alone.
+    /// intervals it re-anchors are re-anchored for this value alone. It takes the claim its own
+    /// writes are made under like any other store, because nothing about the state depends on
+    /// where the state is kept; there is simply nobody else who could be holding it.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::StoreUnavailable`] when the schema cannot be created or the state
     /// this open re-anchored cannot be written back.
-    pub fn in_memory(reading: HostReading) -> Result<Self> {
-        Self::from_store(Store::in_memory()?, reading)
+    pub fn in_memory(reading: HostReading, claimant: &Claimant<'_>) -> Result<Self> {
+        Self::from_store(Store::in_memory()?, reading, claimant)
     }
 
-    fn from_store(mut store: Store, reading: HostReading) -> Result<Self> {
-        // The read, the re-anchoring and the write that records it are one transaction, and its
-        // write lock is taken before the read. A whole-state write replaces everything, so another
-        // connection that committed between the two would have its work replaced by the older
-        // state this one had read.
+    fn from_store(mut store: Store, reading: HostReading, claimant: &Claimant<'_>) -> Result<Self> {
+        // The claim, the read, the re-anchoring and the write that records it are one transaction,
+        // and its write lock is taken before any of them. A whole-state write replaces everything,
+        // so another connection that committed between the read and the write would have its work
+        // replaced by the older state this one had read.
         let claim = Owner::fresh_claim();
-        let owner = Owner::here(claim, reading);
-        let state = store.recover(|stored| {
-            // The claim is read and written under the transaction that reads the state, so no
-            // opener can come between the two. A claim from a boot that has ended, or one this
-            // boot has not refreshed within its lease, is taken; a live one is told about.
-            if let Some(held) = stored.owner
-                && held.stands_against(claim, reading)
-            {
-                return Err(crate::Error::StoreHeld {
-                    process: held.process,
-                });
-            }
-            let state = Self::restore(stored, reading);
-            let written = snapshot(&state, Some(owner));
-            Ok((written, state))
-        })?;
+        let owner = Owner::here(claim, claimant.process().clone(), reading);
+        let taken = owner.clone();
+        let state = store.recover(
+            // The claim on the store is read first and answered before a row of the state is read,
+            // so an opener that may not have it is refused rather than handed a state it would not
+            // be allowed to write back.
+            |held| match held {
+                Some(held)
+                    if held.stands_against(claim, reading, |process| {
+                        claimant.liveness_of(process)
+                    }) =>
+                {
+                    Err(crate::Error::StoreHeld {
+                        process: held.process.pid.get(),
+                    })
+                }
+                _ => Ok(taken),
+            },
+            |stored| {
+                let state = Self::restore(stored, reading);
+                let written = snapshot(&state);
+                Ok((written, state))
+            },
+        )?;
         Ok(Self {
             state,
             store,
@@ -208,7 +229,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written. Nothing the
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write. Nothing the
     /// event would have changed is kept, and nothing is announced: a decision this host could not
     /// record is one it would make again at its next start.
     pub fn apply(&mut self, event: &SourceEvent, reading: HostReading) -> Result<Vec<Outcome>> {
@@ -221,15 +243,17 @@ impl Attention {
         })
     }
 
-    /// Lets the store go, so the next owner does not wait out a lease nobody is holding.
+    /// Lets the store go, so the next owner does not wait for a claim nobody is holding.
     ///
-    /// An owner that ends without this - killed, or its process gone - leaves its claim behind,
-    /// and the lease is what releases that one. This is the ordinary way, and it is immediate.
+    /// It removes this owner's claim and nothing else: not the state, which belongs to the store
+    /// rather than to whoever was last writing it, and not another owner's claim, which is not
+    /// this one's to give up. An owner that ends without this - killed, or its process gone -
+    /// leaves its claim behind, and the next opener is the one that clears it: it can see the
+    /// process is gone, or, where it cannot be asked, the lease runs out.
     fn release(&mut self) {
-        // Best effort: a store that cannot be written now is one whose claim the lease releases
-        // instead, and there is nobody left to tell.
-        let released = snapshot(&self.state, None);
-        let _ = self.store.save(&released);
+        // Best effort: a store that cannot be written now is one whose claim the next opener
+        // clears instead, and there is nobody left to tell.
+        let _ = self.store.release(self.owner.claim);
     }
 
     /// Returns the key one rule and one subject land on in this session's store.
@@ -259,7 +283,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn tick(&mut self, reading: HostReading) -> Result<Vec<Outcome>> {
         self.latest = reading;
 
@@ -274,7 +299,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn note_gap(
         &mut self,
         source: AttentionSource,
@@ -292,7 +318,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn start_from(&mut self, source: AttentionSource, sequence: u64) -> Result<()> {
         self.commit(|state| {
             state.engine.start_from(source, sequence);
@@ -368,8 +395,9 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, in which case
-    /// nothing is forgotten and the same announcements are offered again.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, or
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write. In either
+    /// case nothing is forgotten and the same announcements are offered again.
     pub fn settle_announcements(&mut self, settled: &[(AttentionKey, u64)]) -> Result<()> {
         self.commit(|state| state.engine.settle_announcements(settled))
     }
@@ -397,7 +425,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn acknowledge(
         &mut self,
         actor: &ActorId,
@@ -426,7 +455,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn set_quiet_hours(&mut self, quiet: Option<QuietHours>) -> Result<()> {
         self.commit(|state| state.engine.set_quiet_hours(quiet))
     }
@@ -443,7 +473,8 @@ impl Attention {
     ///
     /// Returns [`crate::Error::UnknownReviewSubject`] or [`crate::Error::UnknownReviewVersion`]
     /// when the acknowledgement names something the host does not hold, and
-    /// [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn acknowledge_review(
         &mut self,
         actor: &ActorId,
@@ -482,7 +513,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn acknowledge_visit(
         &mut self,
         actor: &ActorId,
@@ -512,7 +544,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn summarise(&mut self, summary: ChangeSummary) -> Result<()> {
         self.commit(|state| state.visits.summarise(summary))
     }
@@ -580,7 +613,8 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's to write.
     pub fn rebuild(
         &mut self,
         events: &[SourceEvent],
@@ -612,9 +646,10 @@ impl Attention {
         let mut candidate = self.state.clone();
         let answer = change(&mut candidate)?;
         // Every write refreshes the claim, which is what tells a later opener this owner is still
-        // here.
-        self.owner = Owner::here(self.owner.claim, self.latest);
-        self.store.save(&snapshot(&candidate, Some(self.owner)))?;
+        // here, and every write is refused unless the claim on the store is still this one's.
+        let refreshed = Owner::here(self.owner.claim, self.owner.process.clone(), self.latest);
+        self.store.write(&refreshed, &snapshot(&candidate))?;
+        self.owner = refreshed;
         self.state = candidate;
         Ok(answer)
     }
@@ -826,7 +861,7 @@ impl Drop for Attention {
 }
 
 /// Returns everything the feature store writes down.
-fn snapshot(state: &State, owner: Option<Owner>) -> StoredState {
+fn snapshot(state: &State) -> StoredState {
     StoredState {
         items: state.engine.items().cloned().collect(),
         item_acks: state.engine.all_acknowledgements().clone(),
@@ -834,7 +869,6 @@ fn snapshot(state: &State, owner: Option<Owner>) -> StoredState {
         consumed: state.engine.all_consumed().clone(),
         gaps: state.engine.gaps().to_vec(),
         dropped: state.engine.dropped(),
-        owner,
         next_announcement: state.engine.next_announcement(),
         keys: state.engine.key_secret(),
         pending_inputs: state.engine.pending_inputs().clone(),
