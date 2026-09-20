@@ -839,7 +839,13 @@ impl Session {
             "the editor drew nothing for a key typed at its prompt:\n{}",
             self.terminal_output()
         );
+        let clear_start = self.written();
         self.clear_line();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.written() == clear_start && Instant::now() < deadline {
+            self.pump(Duration::from_millis(10));
+        }
+        self.quiet_for(Duration::from_millis(250), Duration::from_secs(5));
     }
 
     /// Presses the key the case's own binding is on and waits for what that binding writes.
