@@ -145,6 +145,8 @@ pub struct ClientIntent {
 pub enum TransitionCause {
     /// The request was recorded, which is where a resource begins.
     Recorded,
+    /// A decoder's verified interpretation made it answerable.
+    Interpreted,
     /// A rich client claimed it, or gave the claim back.
     RichClaim,
     /// An answer left this host for it.
@@ -163,6 +165,7 @@ impl TransitionCause {
     /// Every cause, in declaration order.
     pub const ALL: &'static [Self] = &[
         Self::Recorded,
+        Self::Interpreted,
         Self::RichClaim,
         Self::Dispatched,
         Self::RichAnswer,
@@ -176,6 +179,7 @@ impl TransitionCause {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Recorded => "recorded",
+            Self::Interpreted => "interpreted",
             Self::RichClaim => "rich_claim",
             Self::Dispatched => "dispatched",
             Self::RichAnswer => "rich_answer",
@@ -734,6 +738,7 @@ impl Ledger {
         entry: &DecoderLedgerEntry,
         resource: &PendingResource,
         now: TimestampMs,
+        event: &TransitionEvent,
     ) -> Result<bool> {
         let transaction = self.connection.transaction().map_err(BrokerError::ledger)?;
         let consumed = transaction
@@ -793,6 +798,7 @@ impl Ledger {
                 ),
             });
         }
+        write_event(&transaction, event)?;
         transaction.commit().map_err(BrokerError::ledger)?;
         Ok(true)
     }
@@ -1714,6 +1720,7 @@ mod tests {
             &entry(1),
             &absent,
             TimestampMs::new(12),
+            &event(97, &absent),
         );
         assert!(failed.is_err());
         assert!(
@@ -1733,6 +1740,7 @@ mod tests {
                 &entry(1),
                 &recorded,
                 TimestampMs::new(13),
+                &event(94, &recorded),
             )
             .expect("the retry succeeds because the transaction went back whole");
         assert!(
@@ -1776,6 +1784,7 @@ mod tests {
                 &entry(1),
                 &pending,
                 TimestampMs::new(11),
+                &event(95, &pending),
             )
             .expect("admitted");
         let claimed = resource(7, "11", PendingState::Claimed);
@@ -1810,8 +1819,9 @@ mod tests {
         assert!(stale.is_err());
         assert_eq!(
             ledger.events_after(0).expect("the outbox reads").len(),
-            3,
-            "the record, the claim and the resolution, and nothing for the refused settle"
+            4,
+            "the record, the interpretation, the claim and the resolution, and nothing for the \
+             refused settle"
         );
         assert_eq!(
             ledger
@@ -1840,6 +1850,7 @@ mod tests {
                     &entry(1),
                     &opaque,
                     TimestampMs::new(11),
+                    &event(96, &opaque),
                 )
                 .expect("admitted");
             ledger
@@ -1883,6 +1894,7 @@ mod tests {
                 &entry(1),
                 &pending,
                 TimestampMs::new(11),
+                &event(95, &pending),
             )
             .expect("admitted");
         ledger

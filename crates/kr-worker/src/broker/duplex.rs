@@ -430,10 +430,18 @@ async fn drain<W: AsyncWrite + Unpin>(
             // Admission closed, and everything that was queued before it has been written.
             break;
         };
-        let length = body.len();
-        let delivery = write_frame(&mut writer, &body).await;
-        queued.fetch_sub(length, Ordering::Release);
-        finish(report, after, delivery);
+        // The frame in flight is held by a guard, so the bytes it reserved are released and its
+        // own work runs whether this writer finishes the frame, is dropped mid-frame, or unwinds
+        // through a panic in some earlier frame's work.
+        let mut flight = InFlight {
+            length: body.len(),
+            queued: Arc::clone(&queued),
+            report: Some(report),
+            after,
+            progress: Arc::new(AtomicUsize::new(0)),
+        };
+        let delivery = write_frame(&mut writer, &body, &flight.progress).await;
+        flight.settle(delivery);
         if delivery != Delivery::Transmitted {
             // A connection with a half-written frame on it is one nothing can go on using: the
             // peer has seen a fragment and nothing can say what it made of it. So admission ends
@@ -458,32 +466,77 @@ async fn drain<W: AsyncWrite + Unpin>(
         } = outbound
         {
             queued.fetch_sub(body.len(), Ordering::Release);
-            finish(report, after, Delivery::Unsent);
+            let _ = report.send(Delivery::Unsent);
+            if let Some(after) = after {
+                after.run(Delivery::Unsent);
+            }
         }
     }
 }
 
-/// Tells one frame's sender what happened and runs the work that waited on it.
-fn finish(
-    report: tokio::sync::oneshot::Sender<Delivery>,
+/// One frame the writer is part way through, and everything owed for it.
+///
+/// It exists so that none of what is owed depends on the writer reaching the end of the frame.
+/// Dropping it, which is what a cancelled or unwinding writer does, releases the bytes and settles
+/// the frame from how much of it actually went.
+struct InFlight {
+    length: usize,
+    queued: Arc<AtomicUsize>,
+    report: Option<tokio::sync::oneshot::Sender<Delivery>>,
     after: Option<Completion>,
-    delivery: Delivery,
-) {
-    let _ = report.send(delivery);
-    if let Some(after) = after {
-        after.run(delivery);
+    progress: Arc<AtomicUsize>,
+}
+
+impl InFlight {
+    /// Settles this frame for what the writer established.
+    fn settle(&mut self, delivery: Delivery) {
+        self.finish(delivery);
+    }
+
+    fn finish(&mut self, delivery: Delivery) {
+        if let Some(report) = self.report.take() {
+            self.queued.fetch_sub(self.length, Ordering::Release);
+            let _ = report.send(delivery);
+            if let Some(after) = self.after.take() {
+                after.run(delivery);
+            }
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // What the writer got through before it was taken away. Bytes the peer has seen are not
+        // bytes that never went, so this is `Partial` and not `Unsent`: nothing about a frame the
+        // peer saw part of can be replayed.
+        let delivery = if self.progress.load(Ordering::Acquire) == 0 {
+            Delivery::Unsent
+        } else {
+            Delivery::Partial
+        };
+        self.finish(delivery);
     }
 }
 
 /// Writes one whole frame within the deadline, and says how much of it went.
-async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Delivery {
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+    progress: &AtomicUsize,
+) -> Delivery {
     let deadline = tokio::time::Instant::now() + WRITE_DEADLINE;
     let mut written = 0;
     while written < body.len() {
         let attempt = tokio::time::timeout_at(deadline, writer.write(&body[written..])).await;
         match attempt {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(bytes)) => written += bytes,
+            Ok(Ok(bytes)) => {
+                written += bytes;
+                // Recorded where a cancellation cannot take it with the stack. A writer that is
+                // dropped mid-frame has still put those bytes in front of the peer, and the work
+                // that settles the frame has to know that rather than assume nothing went.
+                progress.store(written, Ordering::Release);
+            }
         }
     }
     if written == 0 {

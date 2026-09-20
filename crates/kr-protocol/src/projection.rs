@@ -727,6 +727,38 @@ pub const PROJECTION_ROWS_EVENT: &str = "session.projection.rows";
 /// The event type of a projection delta.
 pub const PROJECTION_DELTA_EVENT: &str = "session.projection.delta";
 
+/// The event type one settled agent resource is published under.
+pub const AGENT_RESOURCE_EVENT: &str = "session.agent.resource";
+
+/// One committed broker transition, as an attached view is told about it.
+///
+/// Section 12 fans resolutions out to every authorised observer and section 24 makes the
+/// transition and its event one record. This is the shape that record takes on the way to a view:
+/// what changed, what it became, and where the change sits in the broker's own ordered stream, so
+/// a view that missed one can see that it did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResourceEvent {
+    /// The session the instance belongs to.
+    pub session_id: crate::ids::SessionId,
+    /// The instance whose resource changed.
+    pub application_instance_id: crate::ids::ApplicationInstanceId,
+    /// The resource.
+    pub resource_id: crate::ids::PendingResourceId,
+    /// What it became.
+    pub state: crate::gateway::PendingState,
+    /// Whether its history is durable or lived through an evidence gap.
+    pub durability: crate::session::Durability,
+    /// The binding revision in force when it changed.
+    pub binding_revision: crate::ids::AgentBindingRevision,
+    /// This event's position in the broker's ordered stream of transitions.
+    pub sequence: U64,
+    /// The event itself, which never changes and never repeats.
+    pub event_id: crate::scalars::Uuid,
+    /// The previous event about this same resource, where there is one.
+    pub parent_sequence: Nullable<U64>,
+}
+
 /// One thing a projected attachment is sent, in the order the session produced it.
 ///
 /// The order is the contract: a reset, then a snapshot, then its pages, then deltas from the

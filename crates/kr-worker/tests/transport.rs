@@ -1175,14 +1175,17 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
 
     let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
     let (client_reads, client_writes) = tokio::io::split(client_here);
-    let attached = tokio::time::timeout(
+    let mut attached = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         gateway.accept(client_reads, client_writes),
     )
     .await
     .expect("the forwarder reaches the endpoint")
     .expect("it is authenticated and admitted");
-    let mut observations = attached.observations;
+    let mut observations = attached
+        .observations
+        .take()
+        .expect("the composition subscribed this connection");
     let mut client = tokio::io::BufReader::new(client_there);
 
     // The upstream speaks through the forwarder's own standard input, which is what a launched
@@ -2841,4 +2844,107 @@ fn sleeper() -> tokio::process::Child {
         .current_dir(std::env::temp_dir())
         .spawn()
         .expect("the process starts")
+}
+
+/// KR-REQ-12.11 and KR-REQ-12.13: a committed transition reaches the views attached to the session.
+///
+/// This is the production delivery, not a test reading a subscription. The composition subscribes
+/// the connection, the broker publishes each transition where it commits it, and the session
+/// pipeline hands every one to the views that are attached. What this asserts is that a view is
+/// told, in the order the broker committed, and told what the event actually was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let observations = served.observations;
+    let owner = Arc::clone(&served.owner);
+    let mut client = tokio::io::BufReader::new(served.client);
+
+    // The session pipeline, standing in for the one a worker runs: it takes the transitions this
+    // connection observes and publishes each to the views attached to the session.
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let carrying = {
+        let delivered = Arc::clone(&delivered);
+        let mut observations = observations;
+        tokio::spawn(async move {
+            while let Some(transition) = observations.next().await {
+                delivered.lock().expect("the record is not poisoned").push(
+                    kr_protocol::projection::AgentResourceEvent {
+                        session_id: session(),
+                        application_instance_id: transition.application_instance_id,
+                        resource_id: transition.resource_id,
+                        state: transition.state,
+                        durability: transition.durability,
+                        binding_revision: transition.binding_revision,
+                        sequence: U64::new(transition.sequence),
+                        event_id: transition.event_id,
+                        parent_sequence: Nullable(transition.parent_sequence.map(U64::new)),
+                    },
+                );
+            }
+        })
+    };
+
+    owner
+        .from_upstream(
+            br#"{"id":81,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut client).await;
+    owner
+        .from_client(
+            br#"{"id":81,"result":{"outcome":"allow"}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the person answers");
+    let resource = broker
+        .pending_resources()
+        .into_iter()
+        .next()
+        .expect("the resource is held");
+    settled_within(
+        &broker,
+        resource.resource_id,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .expect("the answer settles it");
+
+    let seen = loop {
+        let held = delivered
+            .lock()
+            .expect("the record is not poisoned")
+            .clone();
+        if held.iter().any(|event| event.state.is_terminal()) {
+            break held;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(
+        seen.windows(2)
+            .all(|pair| pair[0].sequence.get() < pair[1].sequence.get()),
+        "the views are told in the order the broker committed: {:?}",
+        seen.iter()
+            .map(|event| event.sequence.get())
+            .collect::<Vec<_>>()
+    );
+    let settled = seen.last().expect("a last event");
+    assert_eq!(settled.resource_id, resource.resource_id);
+    assert_eq!(settled.state, PendingState::Resolved);
+    assert_eq!(settled.session_id, session());
+    assert_eq!(
+        settled.durability,
+        kr_protocol::session::Durability::Durable,
+        "and what it says about the record is what the record is"
+    );
+    assert!(
+        settled.parent_sequence.0.is_some(),
+        "a settlement names the event before it"
+    );
+
+    carrying.abort();
+    served.drained.abort();
 }

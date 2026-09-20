@@ -3201,9 +3201,14 @@ happened at all.
 
 Publication happens where the transition is committed, so every authorised observer is told in the
 order the transitions committed in, and a connection observes the instance it was opened against
-and nothing else. An observer that has stopped reading is withdrawn rather than grown. What carries
-these events beyond the gateway's own connections is a consumer reading the outbox, which is not
-yet built.
+and nothing else. An observer that has stopped reading is withdrawn rather than grown.
+
+Those transitions reach the people watching. The connection's subscription is read by the session
+it belongs to, and each transition is delivered to every attached view as its own event, in the
+order the broker committed it: what changed, what it became, whether its record is durable, the
+binding revision it changed under, its place in the broker's stream and the event before it. It
+carries no output, so it costs no view its queue and never touches the screen. A consumer that
+wants to replay what it missed reads the outbox rather than the live stream.
 
 ## Volatile-native mode
 

@@ -1015,6 +1015,28 @@ impl WorkerService {
                             // no output, so it neither advances the output stream nor waits behind
                             // one: the fence the client's keystrokes waited for is not a question
                             // about the screen.
+                            // A resolution of this session's agent. It carries no output, so it
+                            // neither advances the output stream nor waits behind one: what
+                            // changed is a pending resource rather than the screen.
+                            OutputDelivery::AgentResource(event) => {
+                                let Some(notification) = notification(
+                                    &stream_id,
+                                    sequence,
+                                    kr_protocol::projection::AGENT_RESOURCE_EVENT,
+                                    &*event,
+                                ) else {
+                                    continue;
+                                };
+                                sequence += 1;
+                                write_frame(
+                                    &delivery_writable,
+                                    &sender,
+                                    &notification,
+                                    &delivery_withdrawn,
+                                    true,
+                                )
+                                .await
+                            }
                             OutputDelivery::EditorBusy(event) => {
                                 let Some(notification) = notification(
                                     &stream_id,

@@ -220,6 +220,37 @@ async fn stop_what_ended(
     )
 }
 
+/// Carries every transition this connection observes to the views attached to a session.
+///
+/// It is the production consumer of the broker's own published transitions: the broker commits
+/// them in order and publishes them in that order, and this reads that one stream and hands each
+/// one to the session pipeline, which delivers it to every attached view. It ends when the
+/// subscription is withdrawn, which is what teardown does.
+pub async fn deliver_to_views(
+    mut observations: Observations,
+    session_id: kr_protocol::ids::SessionId,
+    runtime: Arc<crate::runtime::SessionRuntime>,
+) {
+    while let Some(transition) = observations.next().await {
+        let event = kr_protocol::projection::AgentResourceEvent {
+            session_id,
+            application_instance_id: transition.application_instance_id,
+            resource_id: transition.resource_id,
+            state: transition.state,
+            durability: transition.durability,
+            binding_revision: transition.binding_revision,
+            sequence: kr_protocol::scalars::U64::new(transition.sequence),
+            event_id: transition.event_id,
+            parent_sequence: kr_protocol::scalars::Nullable(
+                transition
+                    .parent_sequence
+                    .map(kr_protocol::scalars::U64::new),
+            ),
+        };
+        runtime.session().publish_agent_resource(&event);
+    }
+}
+
 /// One connection this host admitted, served by its own supervised owner.
 #[derive(Debug)]
 pub struct Attached {
@@ -228,7 +259,7 @@ pub struct Attached {
     /// The owner that reads both ends.
     pub owner: Arc<Duplex>,
     /// Where this connection's authorised observer reads resolutions.
-    pub observations: Observations,
+    pub observations: Option<Observations>,
     /// The supervision of the native terminal, where this host started one.
     ///
     /// It is already running and it outlives this connection. Closing the attachment does not end
@@ -240,6 +271,33 @@ pub struct Attached {
 }
 
 impl Attached {
+    /// Starts the delivery of this connection's observed transitions to a session's attached views.
+    ///
+    /// The subscription is taken out of the attachment, so it is consumed once: either a caller
+    /// delivers it to views or it reads it itself, never both.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] when this attachment's subscription has already
+    /// been taken.
+    pub fn deliver_to_views(
+        &mut self,
+        session_id: kr_protocol::ids::SessionId,
+        runtime: Arc<crate::runtime::SessionRuntime>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let observations =
+            self.observations
+                .take()
+                .ok_or_else(|| BrokerError::PreconditionFailed {
+                    detail: "this attachment's transitions are already being read".to_owned(),
+                })?;
+        Ok(tokio::spawn(deliver_to_views(
+            observations,
+            session_id,
+            runtime,
+        )))
+    }
+
     /// Waits for the connection to end and says why it did.
     ///
     /// What it says is about the socket. The terminal is watched separately and goes on being
@@ -683,7 +741,7 @@ impl NativeGateway {
         Ok(Attached {
             connection,
             owner,
-            observations,
+            observations: Some(observations),
             terminal,
             served,
         })

@@ -1568,15 +1568,25 @@ impl Broker {
             interpretation_verified: true,
             ..pending
         };
+        // A recorded request becoming an answerable approval is a durable change of that resource,
+        // so its own event goes in the same transaction as the change.
+        let event = state.next_transition_event(
+            &interpreted,
+            now,
+            crate::broker::ledger::TransitionCause::Interpreted,
+            None,
+        );
         let admitted =
             state
                 .ledger
-                .admit_resource(handle, binding_id, &entry, &interpreted, now)?;
+                .admit_resource(handle, binding_id, &entry, &interpreted, now, &event)?;
         if !admitted {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!("source event {handle} has already produced an interpretation"),
             });
         }
+        state.remember(&event);
+        state.publish(&interpreted, &event);
         state
             .arbitration
             .set_interpretation(resource_id, interpreted.clone(), binding_id)?;

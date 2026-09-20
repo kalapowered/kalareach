@@ -1646,6 +1646,26 @@ impl Session {
     /// # Errors
     ///
     /// Returns an error when the attachment is unknown.
+    /// Tells every attached view about one committed broker transition.
+    ///
+    /// This is the delivery half of section 12's fan-out. The broker decides what happened and in
+    /// what order; this hands that to the views attached to the session the instance belongs to,
+    /// one event each, in the order it is called. It carries no output, so it costs no subscriber
+    /// its queue and never touches the output stream.
+    pub fn publish_agent_resource(&mut self, event: &kr_protocol::projection::AgentResourceEvent) {
+        for attachment_id in self.hub.subscribers() {
+            self.hub.publish_event(
+                attachment_id,
+                crate::output::OutputDelivery::AgentResource(Box::new(event.clone())),
+            );
+        }
+    }
+
+    /// Removes an attachment, releasing whatever it held.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown.
     pub fn detach(&mut self, attachment_id: AttachmentId) -> Result<SessionDetachResult> {
         self.content_scopes.remove(&attachment_id);
         // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste

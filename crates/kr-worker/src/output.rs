@@ -61,6 +61,11 @@ pub enum OutputDelivery {
     /// It carries no output, so it costs the subscriber's queue nothing: what it reports is the
     /// lease change that stands and the bytes that were released in their original order.
     EditorBusy(Box<kr_protocol::root::EditorBusyEvent>),
+    /// One committed broker transition, for a view that observes this session's agent.
+    ///
+    /// It carries no output, so it costs the subscriber's queue nothing and never advances the
+    /// output stream: what changed is a pending resource, not the screen.
+    AgentResource(Box<kr_protocol::projection::AgentResourceEvent>),
     /// The subscriber must discard its partial state and install a fresh snapshot.
     Resync(ResyncRequired),
     /// The attachment was detached. Nothing more will arrive on this stream.
@@ -74,7 +79,7 @@ impl OutputDelivery {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
             Self::Projection { bytes, .. } => *bytes,
-            Self::EditorBusy(_) | Self::Resync(_) | Self::Detached => 0,
+            Self::AgentResource(_) | Self::EditorBusy(_) | Self::Resync(_) | Self::Detached => 0,
         }
     }
 
