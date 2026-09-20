@@ -82,9 +82,10 @@ included, is `REPOSITORY_UNTRUSTED`. A read the machine could not make for want 
 memory is neither, and is `RESOURCE_UNAVAILABLE`: sending a person to look for tampering that never
 happened is its own kind of wrong answer.
 
-The bundle holds one directory per package, directly under `bundled-plugins/`. A file, a directory
-or a whole package that is there and is not in the lock is drift, and the check that reads the lock
-reports it.
+The bundle holds one directory per package, directly under `bundled-plugins/`. Activating a package
+reads the files the lock names and no others, so a file, a directory or a whole package that is
+there and is not in the lock is found by the check over the whole bundle,
+`scripts/sync-bundled-plugins.sh --verify`, rather than by activation.
 
 What the bundle is not: a catalogue, an enrolled repository, or a grant. It carries one generation,
 frozen at the commit it was copied from, and the package's capability requests, grants and

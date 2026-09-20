@@ -497,12 +497,17 @@ before and after every step and never a mixture of two. It is not a single atomi
 has no directory swap, so between the first two renames the name is absent.
 
 What an interruption leaves depends on what kind it was. A failure, a `SIGINT` or a `SIGTERM` runs
-the script's own cleanup, which puts the previous package back when nothing was published, and
-otherwise leaves the new package, the previous one and the new lock all on disk and prints where
-each is, because guessing which a person wanted would be worse than telling them. A `SIGKILL`, a
-power cut or a full disk runs nothing: what is on disk then is whichever renames had happened, and
-`--verify` is how to find out which. The dotted directories beside the published entry are what a
-run left behind, and the lock is what says which package is the right one.
+the script's own cleanup. If nothing was published, it puts the previous package back and drops the
+new lock. If the package was published and the lock was not, it leaves the new package, the previous
+one and the new lock all on disk and prints where each is, because guessing which a person wanted
+would be worse than telling them. Once the lock is installed the previous package is no longer
+anything, and cleanup removes it.
+
+A `SIGKILL` or a power cut runs nothing, and cleanup can itself fail on a full disk. What is on disk
+then is whichever renames had happened, under names that say what they are: a `.retiring.` directory
+is the package that was published before, and a dotted pending lock beside `bundled-plugins.lock` is
+the one that was about to replace it. `--verify` says whether the package and the lock agree, which
+is the question worth answering; it does not replay what the run was doing.
 
 `scripts/sync-bundled-plugins.sh --verify` is the offline half: it recomputes every digest under
 `bundled-plugins/` against the lock and reports any drift, including a file, a directory or a whole

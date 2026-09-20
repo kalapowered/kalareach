@@ -767,11 +767,25 @@ fn is_resource_shortage(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::OutOfMemory {
         return true;
     }
+    let Some(raw) = error.raw_os_error() else {
+        return false;
+    };
     #[cfg(unix)]
-    if let Some(raw) = error.raw_os_error() {
-        return matches!(raw, libc::EMFILE | libc::ENFILE | libc::ENOMEM);
+    {
+        matches!(raw, libc::EMFILE | libc::ENFILE | libc::ENOMEM)
     }
-    false
+    #[cfg(windows)]
+    {
+        // ERROR_TOO_MANY_OPEN_FILES, ERROR_NOT_ENOUGH_MEMORY and ERROR_OUTOFMEMORY. Named by their
+        // numbers rather than by a constant, because this crate links no Windows bindings and
+        // three numbers are not worth one.
+        matches!(raw, 4 | 8 | 14)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = raw;
+        false
+    }
 }
 
 /// Returns the first pair of paths that cannot both exist, including two directory spellings.
@@ -908,6 +922,15 @@ mod tests {
             absence(&path, &refused).code(),
             ErrorCode::RepositoryUntrusted
         );
+
+        // A full descriptor table, as the system itself reports it rather than as a kind the
+        // standard library happens to have a name for.
+        #[cfg(unix)]
+        let full = std::io::Error::from_raw_os_error(libc::EMFILE);
+        #[cfg(windows)]
+        let full = std::io::Error::from_raw_os_error(4);
+        #[cfg(any(unix, windows))]
+        assert_eq!(absence(&path, &full).code(), ErrorCode::ResourceUnavailable);
     }
 
     #[test]
