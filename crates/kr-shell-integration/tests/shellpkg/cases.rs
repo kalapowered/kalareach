@@ -623,6 +623,12 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             "{} ended the shell",
             drive.exclusion.as_str()
         );
+        // Silence is not the whole answer: a gesture nothing recorded would also be a gesture that
+        // never arrived. So the line is ended and the reader is asked for a fence at the prompt
+        // that comes back, which only a reader that is still this session's own reader can give.
+        session.type_bytes(b"\r");
+        let index = u8::try_from(driven.len()).expect("one fence for each exclusion");
+        let (_, _fence) = session.fenced_prompt(6 + index);
         driven.push(drive.exclusion);
     }
 
