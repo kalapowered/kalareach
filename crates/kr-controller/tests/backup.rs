@@ -1342,3 +1342,92 @@ fn a_late_upload_acknowledgement_while_fenced_does_not_enqueue_publication() {
         .expect("outbox after release");
     assert!(outbox_after.is_empty());
 }
+
+#[test]
+fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and_completes_reconciliation()
+ {
+    let mut environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let admitted = environment
+        .service()
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            PrivacyGeneration::new(0),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+
+    // The upload outbox entry is dispatched to the service.
+    environment
+        .service()
+        .note_dispatched(admitted.sequence)
+        .expect("dispatched");
+
+    // Privacy mode is enabled: fence is recorded and undispatched work cancelled.
+    let _fenced = environment.service.fence(PrivacyGeneration::new(1));
+    let cancelled = environment
+        .service
+        .cancel_undispatched(PrivacyGeneration::new(1));
+    assert_eq!(cancelled.in_flight, 1);
+
+    // Privacy mode is reconciling because work is in flight.
+    {
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
+    }
+
+    // Privacy mode is turned off before the in-flight upload completes.
+    environment.service().release_fence().expect("release");
+    assert!(environment.service().fenced_at().expect("read").is_none());
+
+    // The in-flight upload completes now, after privacy mode has stopped.
+    let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+    environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            objects[0].object_id(),
+            TimestampMs::new(6_000),
+        )
+        .expect("upload noted");
+    let complete = environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            manifest_id,
+            TimestampMs::new(6_001),
+        )
+        .expect("manifest upload noted");
+    assert!(complete);
+
+    // No publish step is enqueued: the generation was cancelled when privacy mode was enabled.
+    let outbox = environment.service().outbox().expect("outbox");
+    assert!(
+        outbox.is_empty(),
+        "no publish step may be enqueued for a generation cancelled by privacy mode: {outbox:?}"
+    );
+
+    // Reconciliation is now complete.
+    {
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+    }
+
+    // The generation remains Cancelled.
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("read")
+        .expect("record");
+    assert_eq!(record.state, GenerationState::Cancelled);
+}

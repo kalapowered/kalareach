@@ -347,6 +347,27 @@ impl BundleStore {
         destination: RecoveryContext,
         now_ms: TimestampMs,
     ) -> Result<Migrated> {
+        // A kit's origins share one locator, so the updated kit can name only the destination: an
+        // origin left in it would point at a bundle this migration did not move. That makes a kit
+        // naming several origins impossible to migrate one service at a time without losing the
+        // others, so it is refused rather than silently reduced. Per-origin locators are what a
+        // multiple-service migration needs, and this build does not have them.
+        if kit.service_origins.len() > 1 {
+            return Err(RecoveryError::MigrationWouldLoseAnOrigin {
+                origins: kit.service_origins.len(),
+            });
+        }
+        if !kit
+            .service_origins
+            .iter()
+            .any(|origin| origin == &self.context.service_origin)
+        {
+            return Err(RecoveryError::UnknownServiceOrigin);
+        }
+        if kit.bundle_locator != self.context.bundle_locator {
+            return Err(RecoveryError::BundleNotAuthentic);
+        }
+
         // The bundle being moved has to be the one this store last authenticated. Migrating a
         // snapshot from before somebody else's write would move an older writer set and older
         // checkpoints to the new location and point the updated kit at them.
@@ -371,16 +392,6 @@ impl BundleStore {
             return Err(RecoveryError::BundleNotAuthentic);
         }
 
-        // A kit's origins share one locator, so the updated kit can name only the destination: an
-        // origin left in it would point at a bundle this migration did not move. That makes a kit
-        // naming several origins impossible to migrate one service at a time without losing the
-        // others, so it is refused rather than silently reduced. Per-origin locators are what a
-        // multiple-service migration needs, and this build does not have them.
-        if kit.service_origins.len() > 1 {
-            return Err(RecoveryError::MigrationWouldLoseAnOrigin {
-                origins: kit.service_origins.len(),
-            });
-        }
         let origins = vec![destination.service_origin.clone()];
         let updated_kit =
             kr_crypto::kdf::RecoverySeed::to_kit(seed, origins, destination.bundle_locator.clone());

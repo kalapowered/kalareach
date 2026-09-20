@@ -552,7 +552,25 @@ impl BackupStore {
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        let complete = outstanding == 0 && !GenerationState::parse(&state)?.is_settled();
+        let gen_state = GenerationState::parse(&state)?;
+        if gen_state == GenerationState::Cancelled && outstanding == 0 {
+            // This generation was cancelled (e.g. by privacy mode) while uploads were in flight.
+            // Now that the last upload has completed, clean up any remaining outbox entries
+            // so outstanding() reconciliation completes.
+            transaction
+                .execute(
+                    "DELETE FROM outbox
+                     WHERE archive_id = ?1 AND backup_generation = ?2",
+                    params![
+                        archive_id.get().as_bytes().as_slice(),
+                        i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            transaction.commit().map_err(ControllerError::registry)?;
+            return Ok(true);
+        }
+        let complete = outstanding == 0 && !gen_state.is_settled();
         if complete {
             let fenced_at: Option<i64> = transaction
                 .query_row(
@@ -1206,31 +1224,24 @@ impl BackupStore {
                     params![i64::try_from(entry.sequence).unwrap_or(i64::MAX)],
                 )
                 .map_err(ControllerError::registry)?;
-            // A generation with nothing dispatched is cancelled outright. One that also has
-            // dispatched work keeps its state until that work is reconciled.
-            let still_dispatched = entries.iter().any(|other| {
-                other.dispatched
-                    && other.archive_id == entry.archive_id
-                    && other.backup_generation == entry.backup_generation
-            });
-            if !still_dispatched {
-                transaction
-                    .execute(
-                        "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
-                         WHERE archive_id = ?1 AND backup_generation = ?2 AND state IN (?6, ?7)",
-                        params![
-                            entry.archive_id.get().as_bytes().as_slice(),
-                            i64::try_from(entry.backup_generation.get()).unwrap_or(i64::MAX),
-                            GenerationState::Cancelled.as_str(),
-                            millis(now_ms),
-                            detail,
-                            GenerationState::Staging.as_str(),
-                            GenerationState::Uploading.as_str(),
-                        ],
-                    )
-                    .map_err(ControllerError::registry)?;
-            }
         }
+        // Every generation that was staging or uploading is cancelled by privacy mode.
+        // If it still has dispatched work in flight, the dispatched outbox entries are
+        // preserved so PrivacyMode::reconcile() tracks them until completion, but the
+        // generation itself is marked Cancelled so no publication can ever be enqueued.
+        transaction
+            .execute(
+                "UPDATE generations SET state = ?1, settled_at_ms = ?2, detail = ?3
+                 WHERE state IN (?4, ?5)",
+                params![
+                    GenerationState::Cancelled.as_str(),
+                    millis(now_ms),
+                    detail,
+                    GenerationState::Staging.as_str(),
+                    GenerationState::Uploading.as_str(),
+                ],
+            )
+            .map_err(ControllerError::registry)?;
         transaction.commit().map_err(ControllerError::registry)?;
         Ok((taken_back.len() as u64, dispatched))
     }
