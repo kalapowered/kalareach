@@ -66,6 +66,8 @@ pub struct InstalledStack {
     pub executable: Option<String>,
     pub url: Option<String>,
     pub sha256: Option<String>,
+    /// A digest of the installed tree, taken when it was unpacked and checked on every run since.
+    pub tree_sha256: Option<String>,
     pub reason: Option<String>,
 }
 

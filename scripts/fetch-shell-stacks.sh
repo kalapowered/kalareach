@@ -111,6 +111,35 @@ for stack in lock["stacks"]:
 PYTHON
 )"
 
+# A digest of an installed tree, over every path in it. The pinned digest says what was unpacked;
+# this says that what was unpacked is still what is there, which is the part a run that unpacked
+# nothing would otherwise take on trust.
+tree_digest() {
+    /usr/bin/env python3 -c '
+import hashlib, os, sys
+
+root = sys.argv[1]
+digest = hashlib.sha256()
+for base, directories, files in os.walk(root):
+    directories.sort()
+    linked = [name for name in directories if os.path.islink(os.path.join(base, name))]
+    for name in sorted(files + linked):
+        path = os.path.join(base, name)
+        digest.update(os.path.relpath(path, root).encode("utf-8"))
+        digest.update(b"\0")
+        if os.path.islink(path):
+            digest.update(b"l")
+            digest.update(os.readlink(path).encode("utf-8"))
+        else:
+            digest.update(b"x" if os.access(path, os.X_OK) else b"-")
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(block)
+        digest.update(b"\0")
+print(digest.hexdigest())
+' "$1"
+}
+
 records=()
 
 record() {
@@ -140,9 +169,12 @@ while IFS=$'\t' read -r id version role program entry url sha strip; do
     if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] && [ -d "$target" ] \
        && { [ -z "$entry" ] || [ -e "$target/$entry" ]; } \
        && { [ -z "$program" ] || [ -x "$target/$program" ]; }; then
-        echo "  $id $version: installed"
-        record "$id" "$version" "installed" "$target" "$executable" "$url" "$sha" ""
-        continue
+        if [ -f "$target.tree" ] && [ "$(tree_digest "$target")" = "$(cat "$target.tree")" ]; then
+            echo "  $id $version: installed"
+            record "$id" "$version" "installed" "$target" "$executable" "$url" "$sha" ""
+            continue
+        fi
+        echo "  $id $version: what is installed is not what was unpacked here, so it is unpacked again"
     fi
 
     if [ "$check_only" -eq 1 ]; then
@@ -210,6 +242,7 @@ while IFS=$'\t' read -r id version role program entry url sha strip; do
     rm -rf "${target:?}"
     mv "$work/tree" "$target"
     printf '%s' "$sha" > "$stamp"
+    tree_digest "$target" > "$target.tree"
     rm -rf "${work:?}"
     echo "    installed at $target"
     record "$id" "$version" "installed" "$target" "$executable" "$url" "$sha" ""
@@ -232,6 +265,13 @@ for line in open(collected, encoding="utf-8").read().splitlines():
     if not line.strip():
         continue
     id_, version, status, root, executable, url, sha, reason = line.split("\t")
+    tree = None
+    if root:
+        try:
+            with open(root + ".tree", encoding="utf-8") as handle:
+                tree = handle.read().strip() or None
+        except OSError:
+            tree = None
     entries.append(
         {
             "id": id_,
@@ -241,6 +281,7 @@ for line in open(collected, encoding="utf-8").read().splitlines():
             "executable": executable or None,
             "url": url or None,
             "sha256": sha or None,
+            "tree_sha256": tree,
             "reason": reason or None,
         }
     )

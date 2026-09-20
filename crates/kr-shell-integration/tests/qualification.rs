@@ -389,6 +389,31 @@ fn the_stacks_installed_here_are_the_ones_the_corpus_pins() {
                     stack.id
                 );
             }
+            // The archive's digest says which bytes were unpacked here. This says that what was
+            // unpacked is still what is there: the fetcher takes it over every path in the tree
+            // when it unpacks, and checks it against the tree on every run afterwards, so a run
+            // that unpacked nothing has still read what it is about to qualify against.
+            let recorded = stack.tree_sha256.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "{} is recorded as installed with no digest of its tree; run \
+                     scripts/fetch-shell-stacks.sh",
+                    stack.id
+                )
+            });
+            let taken = std::fs::read_to_string(format!("{}.tree", root.display())).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "{} kept no digest of the tree it unpacked: {error}",
+                        stack.id
+                    )
+                },
+            );
+            assert_eq!(
+                recorded,
+                taken.trim(),
+                "{} is recorded under a digest that is not the one beside its tree",
+                stack.id
+            );
         }
     }
 }
