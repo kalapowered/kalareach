@@ -1426,7 +1426,10 @@ Reconciliation runs before anything can add to the store. It looks at settled ge
 reasons. **Cancelled work this host still holds ciphertext for is a removal it owes**, and the
 obligation is written down before anything else is: a stop between the cancellation and the removal
 leaves the staged copies here with nothing else to say so, and an obligation recorded afterwards is
-one that stop would lose. **A settled generation whose outbox is not empty** is what a cancellation
+one that stop would lose. A store that will not record it leaves the settlement undone as well, so
+the outbox entry that was counting the cleanup stays where it is and the next reconciliation tries
+again; what must never happen is a store saying nothing is outstanding over a disk that still holds
+the ciphertext. **A settled generation whose outbox is not empty** is what a cancellation
 over work that had already left this host leaves behind, and that wait ends at the restart: nothing
 in the new process can receive the old one's answers, so a dispatched publication makes the outcome
 **unknown** and anything else is **cleared** with the state it settled in, rather than holding
