@@ -51,7 +51,9 @@ keep="${KR_WSL_KEEP:-0}"
 
 passed=0
 fail() {
-  echo "FAIL: $*"
+  # Standard error, so that a check inside a command substitution still says what went wrong
+  # rather than handing its message to the variable being assigned.
+  echo "FAIL: $*" >&2
   exit 1
 }
 pass() {
@@ -152,10 +154,15 @@ if [ "${#distributions[@]}" -lt 2 ]; then
     "$(cygpath -w "$tarball" 2>/dev/null || echo "$tarball")" --version 2 >/dev/null 2>&1 ||
     fail "the second distribution could not be imported"
   made_distribution="$second_name"
+  # The one this run made, by the name it gave it. Reading a position out of the listing again
+  # would take whichever name the registry happens to put second.
+  second="$second_name"
   mapfile -t distributions < <(registered)
+else
+  second="${distributions[1]}"
 fi
 [ "${#distributions[@]}" -ge 2 ] || fail "this acceptance needs two distributions"
-second="${distributions[1]}"
+[ "$first" != "$second" ] || fail "the two distributions this acceptance needs are the same one"
 pass "two distributions are registered: $first and $second"
 
 # ---------------------------------------------------------------------------------------------
@@ -246,44 +253,82 @@ inside() {
 # One line of JSON with the spaces taken out, so an assertion can name a whole key path.
 compact() { tr -d ' \n\r'; }
 
+# The first value one named string key carries in a compacted document, or nothing. These are this
+# product's own documents and the key is named in full, so the match is exact; and finding nothing
+# is not a failure here, because the check that follows says what was missing.
+json_string() {
+  awk -v key="\"$1\":\"" '
+    {
+      start = index($0, key)
+      if (start == 0) { exit }
+      rest = substr($0, start + length(key))
+      end = index(rest, "\"")
+      if (end == 0) { exit }
+      print substr(rest, 1, end - 1)
+      exit
+    }'
+}
+
 for distribution in "$first" "$second"; do
   build_inside "$distribution"
   start_daemon_inside "$distribution"
 done
 pass "each distribution built and started its own KalaReach with no native Windows installation"
 
-# Linux paths and process identifiers stay inside the distribution.
+# Linux paths, binaries and process identifiers stay inside the distribution. Each assertion below
+# names the process it is about and reads that process's own Linux paths out of /proc.
+installed_dir="$(dirname "$helper_path")"
 for distribution in "$first" "$second"; do
-  helper_dir="$(inside "$distribution" "'$helper_path' doctor --json" | tr -d '\n')"
-  echo "  $distribution doctor: ${helper_dir:0:120}"
-  linux_pid="$(inside "$distribution" 'cat /tmp/kr-acc-controller.pid')"
-  [[ "$linux_pid" =~ ^[0-9]+$ ]] ||
+  # The daemon: the Linux binary this run installed in this distribution, running as the Linux user
+  # the enrolment names.
+  daemon_pid="$(inside "$distribution" 'cat /tmp/kr-acc-controller.pid')"
+  [[ "$daemon_pid" =~ ^[0-9]+$ ]] ||
     fail "$distribution did not report a Linux process identifier for its daemon"
-  # That identifier names a process inside the distribution alone. Windows knows nothing of it.
-  if tasklist //FI "PID eq $linux_pid" 2>/dev/null | grep -qi "kr-controller"; then
-    fail "a Linux process identifier resolved to a Windows process, so the identifier spaces are shared"
-  fi
-  # A session of the distribution's own: its worker is a Linux process with Linux paths, and
-  # nothing on the Windows side takes part in it.
+  daemon_exe="$(inside "$distribution" "readlink -f /proc/$daemon_pid/exe | head -n 1")"
+  [ "$daemon_exe" = "$installed_dir/kr-controller" ] ||
+    fail "$distribution's daemon $daemon_pid runs $daemon_exe, not the $installed_dir/kr-controller installed in it"
+  daemon_user="$(inside "$distribution" "stat -c %U /proc/$daemon_pid | head -n 1")"
+  [ "$daemon_user" = "$linux_user" ] ||
+    fail "$distribution's daemon runs as $daemon_user and the enrolment names $linux_user"
+  daemon_root="$(inside "$distribution" "readlink /proc/$daemon_pid/root | head -n 1")"
+  [ "$daemon_root" = "/" ] ||
+    fail "$distribution's daemon has root $daemon_root rather than this distribution's own"
+
+  # A session of the distribution's own, named by the identifier the create answered with.
   session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)"
-  case "$session" in
-    *'"session_id":"'*) : ;;
-    *) fail "$distribution could not create a session of its own: $session" ;;
-  esac
+  created="$(printf '%s' "$session" | json_string session_id)"
+  [ -n "$created" ] ||
+    fail "$distribution could not create a session of its own: $session"
+  echo "  $distribution created session $created"
   listed="$(inside "$distribution" "'$helper_path' --json list" | compact)"
   case "$listed" in
-    *'"session_id":"'*) : ;;
-    *) fail "$distribution does not list the session it created: $listed" ;;
+    *"\"session_id\":\"$created\""*) : ;;
+    *) fail "$distribution does not list $created, the session it created: $listed" ;;
   esac
-  worker_pid="$(inside "$distribution" 'pgrep -n kr-worker || true')"
+
+  # The worker serving it: this distribution's own Linux process, running the binary installed
+  # here, as the same Linux user, with this distribution's filesystem as its root. Nothing on the
+  # Windows side takes part in it, and nothing it opens comes through /mnt.
+  worker_pid="$(inside "$distribution" 'pgrep -n -x kr-worker | head -n 1')"
   [[ "$worker_pid" =~ ^[0-9]+$ ]] ||
-    fail "$distribution runs no worker for the session it created"
-  created="$(printf '%s' "$session" | grep -o '"session_id":"[0-9a-f-]*"' | head -n 1 | cut -d'"' -f4)"
-  [ -n "$created" ] || fail "$distribution did not name the session it created"
+    fail "$distribution runs no worker for session $created"
+  worker_exe="$(inside "$distribution" "readlink -f /proc/$worker_pid/exe | head -n 1")"
+  [ "$worker_exe" = "$installed_dir/kr-worker" ] ||
+    fail "$distribution's worker $worker_pid runs $worker_exe, not the $installed_dir/kr-worker installed in it"
+  worker_user="$(inside "$distribution" "stat -c %U /proc/$worker_pid | head -n 1")"
+  [ "$worker_user" = "$linux_user" ] ||
+    fail "$distribution's worker runs as $worker_user and the enrolment names $linux_user"
+  worker_root="$(inside "$distribution" "readlink /proc/$worker_pid/root | head -n 1")"
+  [ "$worker_root" = "/" ] ||
+    fail "$distribution's worker has root $worker_root rather than this distribution's own"
+  crossing="$(inside "$distribution" "ls -l /proc/$worker_pid/fd | grep -c ' /mnt/' | head -n 1")"
+  [ "$crossing" = "0" ] ||
+    fail "$distribution's worker has $crossing open files under /mnt, so it reaches out of the distribution"
+
   inside "$distribution" "'$helper_path' close $created" >/dev/null ||
-    fail "$distribution could not close the session it created"
+    fail "$distribution could not close session $created"
 done
-pass "Linux paths, binaries and process identifiers stay local to each distribution"
+pass "each distribution's daemon and worker are its own Linux processes, binaries, users and paths"
 
 # ---------------------------------------------------------------------------------------------
 step "4. Windows reaches each distribution through the process bridge"
@@ -322,14 +367,15 @@ done
 pass "a Windows control daemon is running for this acceptance"
 
 enrol_distribution() {
-  local distribution="$1" label="$2"
+  local distribution="$1" label="$2" answer identity
   "$kr_exe" --json bridge enrol --access wsl --label "$label" --target "$distribution" \
     --user "$linux_user" --helper "$helper_path" --probe >"$run_dir/enrol-$label.json" 2>&1 ||
     fail "enrolling $distribution failed: $(cat "$run_dir/enrol-$label.json")"
-  python -c "import json,sys;print(json.load(open(sys.argv[1]))['row']['enrolment']['environment_id'])" \
-    "$run_dir/enrol-$label.json" 2>/dev/null ||
-    python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['row']['enrolment']['environment_id'])" \
-      "$run_dir/enrol-$label.json"
+  answer="$(compact <"$run_dir/enrol-$label.json")"
+  identity="$(printf '%s' "$answer" | json_string environment_id)"
+  [ -n "$identity" ] ||
+    fail "enrolling $distribution recorded no environment identity: $answer"
+  printf '%s' "$identity"
 }
 
 first_id="$(enrol_distribution "$first" "first")"
@@ -348,8 +394,7 @@ for pair in "$first:$first_id" "$second:$second_id"; do
   recorded="${pair##*:}"
   doctor="$(inside "$distribution" "'$helper_path' --json doctor" | compact)" ||
     fail "$distribution could not report on itself"
-  reported="$(printf '%s' "$doctor" | grep -o '"environment_id":"[0-9a-f-]*"' | head -n 1 |
-    cut -d'"' -f4)"
+  reported="$(printf '%s' "$doctor" | json_string environment_id)"
   [ -n "$reported" ] ||
     fail "$distribution named no environment of its own: $doctor"
   [ "$reported" = "$recorded" ] ||
@@ -444,7 +489,9 @@ pass "the bridge reaches the distribution that was started again"
 # ---------------------------------------------------------------------------------------------
 step "6. NAT and mirrored networking"
 
-wslconfig_path="${USERPROFILE:-/c/Users/Administrator}/.wslconfig"
+# USERPROFILE is a Windows path. The redirection below is this shell's, so it needs the form this
+# shell opens files by.
+wslconfig_path="$(cygpath -u "${USERPROFILE:?the Windows profile directory}")/.wslconfig"
 wslconfig_saved="$run_dir/wslconfig.saved"
 if [ -f "$wslconfig_path" ]; then
   wslconfig_existed=1
