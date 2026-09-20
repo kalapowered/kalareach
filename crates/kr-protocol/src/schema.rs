@@ -56,7 +56,10 @@ use crate::error::ProtocolError;
 use crate::frame::StreamHeader;
 use crate::grant::Grant;
 use crate::hello::{ActionWindow, ClientOffer, ConnectReply, HelloReply, HostSelection};
-use crate::hostinfo::{EnvironmentListResult, HostDoctorResult, HostInfoResult};
+use crate::hostinfo::{
+    EffectiveConfiguration, EnvironmentListResult, HostDoctorResult, HostInfoResult, SupportBundle,
+    configuration::ConfigurationDocument, configuration::ExecutionSnapshot,
+};
 use crate::ids;
 use crate::ids::SessionRef;
 use crate::input::{
@@ -240,6 +243,10 @@ pub fn protocol_schema() -> Value {
         "expiration_tombstone" => ExpirationTombstone,
         "fence_evidence" => FenceEvidence,
         "fenced_action" => FencedAction,
+        "configuration_document" => ConfigurationDocument,
+        "effective_configuration" => EffectiveConfiguration,
+        "execution_snapshot" => ExecutionSnapshot,
+        "support_bundle" => SupportBundle,
         "environment_list_result" => EnvironmentListResult,
         "events_snapshot_params" => EventsSnapshotParams,
         "events_snapshot_result" => EventsSnapshotResult,

@@ -12,7 +12,7 @@ use kr_protocol::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesResult,
     SleepInhibitionState,
 };
-use kr_protocol::hostinfo::{HostDoctorResult, HostInfoResult};
+use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::session::{SessionState, SessionSummary};
 use serde_json::{Value, json};
 
@@ -297,39 +297,6 @@ pub fn desktop_line(summary: &SessionSummary) -> String {
             summary.worker_profile.as_str()
         ),
     }
-}
-
-/// Renders diagnostics.
-#[must_use]
-pub fn doctor(result: &HostDoctorResult) -> Value {
-    json!({
-        "healthy": result.healthy,
-        "checks": result.checks.iter().map(|check| json!({
-            "id": check.id,
-            "title": check.title,
-            "status": check.status.as_str(),
-            "detail": check.detail,
-            "remedy": check.remedy.as_ref().cloned(),
-        })).collect::<Vec<_>>(),
-    })
-}
-
-/// Renders diagnostics as lines for a person.
-#[must_use]
-pub fn doctor_lines(result: &HostDoctorResult) -> String {
-    let mut text = String::new();
-    for check in &result.checks {
-        text.push_str(&format!(
-            "{:<10} {}\n           {}\n",
-            check.status.as_str(),
-            check.title,
-            check.detail
-        ));
-        if let Some(remedy) = check.remedy.as_ref() {
-            text.push_str(&format!("           {remedy}\n"));
-        }
-    }
-    text
 }
 
 #[cfg(test)]

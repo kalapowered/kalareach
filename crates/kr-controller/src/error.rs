@@ -28,6 +28,12 @@ pub enum ControllerError {
         /// The configured limit.
         limit: u64,
     },
+    /// A configuration edit was refused.
+    ///
+    /// An edit is validated before a revision is applied, so this is what a caller is told
+    /// instead of a document that was written and then found to be wrong.
+    #[error("this configuration edit was refused: {0}")]
+    Configuration(String),
     /// A worker could not be started.
     #[error("could not start a worker: {detail}")]
     Supervision {
@@ -181,7 +187,7 @@ impl ControllerError {
             Self::SessionClosed { .. } => ErrorCode::SessionClosed,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::NotListed { .. } | Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
-            Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            Self::InvalidArgument(_) | Self::Configuration(_) => ErrorCode::InvalidArgument,
             Self::Uncertain { .. } => ErrorCode::OutcomeUnknown,
             Self::ClockUntrusted { .. } => ErrorCode::ClockUntrusted,
             Self::Refused { code, .. } => *code,

@@ -43,6 +43,12 @@
 //! assertion while verified foreground work or pending requests exist, and releases it when that
 //! ends. [`SleepInhibitionState`] is what host status and `kr status` report, including the reason
 //! an assertion is held and the mechanism holding it.
+//!
+//! The choice itself is one section of the versioned per-user host configuration document, whose
+//! schema, precedence and validated edits are in [`crate::hostinfo::configuration`]. Only the
+//! value type is here: where it is kept, how a document at an unknown version is treated and how
+//! far a request or a profile can override it are the same questions for every ordinary
+//! preference, and they are answered once rather than once per setting.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -785,65 +791,6 @@ impl SleepInhibitionState {
 /// once, through setup or through the command line, and the control daemon reads it. Its format
 /// has one definition, here, because both the daemon that reads it and the command that writes it
 /// have to agree about what a file that says nothing means — and what it means is off.
-pub mod setting {
-    use super::SleepInhibitionSetting;
-
-    /// The file the setting is kept in, inside the environment's own state directory.
-    pub const FILE_NAME: &str = "power.json";
-
-    /// The key the setting is written under.
-    pub const KEY: &str = "sleep_inhibition";
-
-    /// The key the document's own version is written under.
-    pub const VERSION_KEY: &str = "version";
-
-    /// The version this build writes and reads.
-    ///
-    /// A document that declares a version this build does not know is left alone and read as off.
-    /// Guessing at a newer document's meaning is how a host ends up holding an assertion its owner
-    /// did not ask for.
-    pub const VERSION: u64 = 1;
-
-    /// The longest setting file this host reads.
-    ///
-    /// The document holds one choice. A file larger than this is not one of ours, and reading it
-    /// would be reading something else.
-    pub const MAX_LEN: u64 = 4_096;
-
-    /// Returns the setting a file's contents ask for.
-    ///
-    /// Anything this build does not recognise reads as off: a document it cannot parse, a version
-    /// it does not know, a value outside the three choices. An unrecognised file is not consent:
-    /// the setting exists because the owner chose it, so the absence of a choice this build
-    /// understands is the absence of the setting.
-    #[must_use]
-    pub fn parse(contents: &[u8]) -> SleepInhibitionSetting {
-        let Ok(document) = serde_json::from_slice::<serde_json::Value>(contents) else {
-            return SleepInhibitionSetting::Off;
-        };
-        // A document with no version is this version: the first one, which wrote none.
-        let version = document
-            .get(VERSION_KEY)
-            .map_or(Some(VERSION), serde_json::Value::as_u64);
-        if version != Some(VERSION) {
-            return SleepInhibitionSetting::Off;
-        }
-        document
-            .get(KEY)
-            .and_then(serde_json::Value::as_str)
-            .and_then(SleepInhibitionSetting::from_wire)
-            .unwrap_or(SleepInhibitionSetting::Off)
-    }
-
-    /// Returns the file contents that record one setting.
-    #[must_use]
-    pub fn document(setting: SleepInhibitionSetting) -> String {
-        format!(
-            "{{\n  \"{VERSION_KEY}\": {VERSION},\n  \"{KEY}\": \"{}\"\n}}\n",
-            setting.as_str()
-        )
-    }
-}
 
 /// Whether a per-user service survives the user logging out, on this platform.
 ///
@@ -1024,33 +971,41 @@ mod tests {
     }
 
     #[test]
-    fn a_setting_file_round_trips_and_anything_else_reads_as_off() {
+    fn the_setting_is_a_section_of_the_configuration_document_and_anything_else_reads_as_off() {
+        use crate::hostinfo::configuration;
+
         for chosen in [
             SleepInhibitionSetting::Off,
             SleepInhibitionSetting::MainsOnly,
             SleepInhibitionSetting::BatteryToo,
         ] {
-            let document = setting::document(chosen);
-            assert_eq!(setting::parse(document.as_bytes()), chosen);
+            let mut document = configuration::ConfigurationDocument::empty();
+            document.preferences.sleep_inhibition = Nullable::some(chosen);
+            let text = configuration::contents(&document);
+            let loaded = configuration::load(Some(text.as_bytes()));
+            assert_eq!(
+                loaded
+                    .preferences()
+                    .and_then(|set| set.sleep_inhibition.0)
+                    .unwrap_or(SleepInhibitionSetting::Off),
+                chosen
+            );
         }
-        assert_eq!(
-            setting::parse(b"{\"sleep_inhibition\": \"mains_only\"}"),
-            SleepInhibitionSetting::MainsOnly,
-            "a document from before the version key is this version"
-        );
         for damaged in [
             b"".as_slice(),
             b"not a document".as_slice(),
-            b"{}".as_slice(),
-            b"{\"sleep_inhibition\": \"always\"}".as_slice(),
-            b"{\"sleep_inhibition\": true}".as_slice(),
-            b"{\"version\": 2, \"sleep_inhibition\": \"battery_too\"}".as_slice(),
-            b"{\"version\": \"1\", \"sleep_inhibition\": \"battery_too\"}".as_slice(),
+            br#"{"preferences": {"sleep_inhibition": "always"}}"#.as_slice(),
+            br#"{"preferences": {"sleep_inhibition": true}}"#.as_slice(),
+            br#"{"version": 2, "preferences": {"sleep_inhibition": "battery_too"}}"#.as_slice(),
         ] {
+            let loaded = configuration::load(Some(damaged));
             assert_eq!(
-                setting::parse(damaged),
+                loaded
+                    .preferences()
+                    .and_then(|set| set.sleep_inhibition.0)
+                    .unwrap_or(SleepInhibitionSetting::Off),
                 SleepInhibitionSetting::Off,
-                "a file this build does not recognise is not consent"
+                "a document this build does not recognise is not consent"
             );
         }
     }

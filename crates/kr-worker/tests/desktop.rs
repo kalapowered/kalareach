@@ -27,7 +27,7 @@ use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::desktop::{
     CapabilityEvidenceSource, CapabilityState, ContainerEnvironment, DesktopAvailability,
     DesktopSessionKind, DisplayServer, InhibitionReason, LogoutPersistence, PowerSource,
-    SleepInhibitionSetting, capabilities, setting,
+    SleepInhibitionSetting, capabilities,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::hostinfo::HostInfoResult;
@@ -63,6 +63,18 @@ fn start_outside_the_workspace() {
 }
 
 /// A host tree on the internal disk, with the worker beside it.
+/// The configuration document that records one sleep policy.
+///
+/// The setting is a section of the versioned per-user host configuration rather than a document of
+/// its own, so a test that wants the host to have chosen one writes the whole document.
+fn power_document(setting: SleepInhibitionSetting) -> String {
+    use kr_protocol::hostinfo::configuration;
+
+    let mut document = configuration::ConfigurationDocument::empty();
+    document.preferences.sleep_inhibition = kr_protocol::scalars::Nullable::some(setting);
+    configuration::contents(&document)
+}
+
 struct Host {
     temp: kr_ipc::testing::TempHost,
     worker: PathBuf,
@@ -1596,14 +1608,14 @@ async fn the_power_setting_is_off_until_chosen_and_host_status_reports_it() {
         info.power.describe()
     );
     assert!(
-        !host.paths().state_dir().join(setting::FILE_NAME).exists(),
-        "no setting file is created by starting a host"
+        !kr_worker::config::document_path(&host.paths()).exists(),
+        "no configuration document is created by starting a host"
     );
 
     // The owner's explicit choice, written the way the command writes it.
     kr_ipc::paths::write_owner_only_file(
-        &host.paths().state_dir().join(setting::FILE_NAME),
-        setting::document(SleepInhibitionSetting::MainsOnly).as_bytes(),
+        &kr_worker::config::document_path(&host.paths()),
+        power_document(SleepInhibitionSetting::MainsOnly).as_bytes(),
     )
     .expect("writes the setting");
     let info: HostInfoResult = client
@@ -1626,8 +1638,8 @@ async fn the_power_setting_is_off_until_chosen_and_host_status_reports_it() {
 
     // Turning it off again releases whatever was held and says the policy is unchanged.
     kr_ipc::paths::write_owner_only_file(
-        &host.paths().state_dir().join(setting::FILE_NAME),
-        setting::document(SleepInhibitionSetting::Off).as_bytes(),
+        &kr_worker::config::document_path(&host.paths()),
+        power_document(SleepInhibitionSetting::Off).as_bytes(),
     )
     .expect("writes the setting");
     let info: HostInfoResult = client
@@ -1813,11 +1825,7 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
         "a host with no chosen setting inhibits nothing"
     );
     assert!(
-        !host
-            .environment()
-            .state_dir()
-            .join(setting::FILE_NAME)
-            .exists(),
-        "and no file was written to say otherwise"
+        !kr_worker::config::document_path(&host.environment()).exists(),
+        "and no document was written to say otherwise"
     );
 }

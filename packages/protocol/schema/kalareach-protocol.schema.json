@@ -2950,6 +2950,54 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "CeilingValue": {
+      "additionalProperties": false,
+      "description": "One ceiling, with what was configured and what it actually came out as.\n\nA ceiling is an intersection. `configured` is what this host's configuration asked for and\n`value` is what survived the intersection with authority, the organisation's restrictions, the\ngrant and the hard resource limit; `narrowed_by` names what did the narrowing when they differ.\nA configured value that was more permissive than the intersection is refused rather than\napplied, and `refused` says so.",
+      "properties": {
+        "configured": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the configuration asked for, when it asked for anything."
+        },
+        "key": {
+          "description": "The key.",
+          "type": "string"
+        },
+        "narrowed_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What narrowed the configured value, when something did."
+        },
+        "refused": {
+          "description": "True when the configured value was more permissive and was refused.",
+          "type": "boolean"
+        },
+        "value": {
+          "description": "What is in force.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "configured",
+        "value",
+        "narrowed_by",
+        "refused"
+      ],
+      "type": "object"
+    },
     "CellBlink": {
       "description": "Whether and how a run of cells blinks.",
       "oneOf": [
@@ -4243,6 +4291,124 @@
       ],
       "type": "object"
     },
+    "ConfigurationCeilings": {
+      "additionalProperties": false,
+      "description": "The ceilings this host configures.\n\nEvery one of them narrows. A configured value above what authority, an organisation\nrestriction, a grant or a hard resource limit already allows is rejected rather than\napplied, which is section 26's second paragraph and why these are not in\n[`PreferenceSet`].",
+      "properties": {
+        "enrolment": {
+          "$ref": "#/$defs/EnrolmentBudgets",
+          "default": {
+            "cached_payload_bytes": 1073741824,
+            "full_offline_mirror": false,
+            "metadata_bytes": 67108864,
+            "metadata_entries": 100000
+          },
+          "description": "The repository enrolment budgets section 11 calls configuration."
+        },
+        "grant_rights": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The rights a grant may carry on this host, as the stable action-right strings.\n\nAbsent leaves the grant's own intersection untouched. Present narrows it: a right not\nin this list is not available on this host however a grant was issued."
+        },
+        "session_limit": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The most sessions this host admits, when the owner sets one below the built-in limit."
+        }
+      },
+      "type": "object"
+    },
+    "ConfigurationDocument": {
+      "additionalProperties": false,
+      "description": "One versioned per-user host configuration document.",
+      "properties": {
+        "ceilings": {
+          "$ref": "#/$defs/ConfigurationCeilings",
+          "default": {
+            "enrolment": {
+              "cached_payload_bytes": 1073741824,
+              "full_offline_mirror": false,
+              "metadata_bytes": 67108864,
+              "metadata_entries": 100000
+            },
+            "grant_rights": null,
+            "session_limit": null
+          },
+          "description": "The ceilings this host configures. They intersect; they never raise anything."
+        },
+        "default_profile": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The profile selected when a request and the allowlist name none."
+        },
+        "preferences": {
+          "$ref": "#/$defs/PreferenceSet",
+          "default": {
+            "shell_mode": null,
+            "sleep_inhibition": null,
+            "worker_profile": null
+          },
+          "description": "The ordinary preferences that apply when no profile is selected."
+        },
+        "profiles": {
+          "additionalProperties": {
+            "$ref": "#/$defs/PreferenceSet"
+          },
+          "default": {},
+          "description": "Named profiles, each a set of the same preferences.",
+          "type": "object"
+        },
+        "revision": {
+          "default": 0,
+          "description": "The revision this host applied. It rises by one with every validated edit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "secrets": {
+          "default": [],
+          "description": "Named secure-store references. Never a secret value: this schema has no field one fits\nin, which is what section 26's \"named secure-store references, never config exports\"\nlooks like when it is enforced rather than promised.",
+          "items": {
+            "$ref": "#/$defs/SecretReference"
+          },
+          "type": "array"
+        },
+        "version": {
+          "default": 1,
+          "description": "The schema version this document is written against.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ConfirmationChannel": {
       "description": "How an owner confirmation reached the host.\n\nNoninteractive confirmation from a session, plugin or contact-tool channel is rejected: an\nagent's process label, operating-system peer credentials, terminal output or a newly created\ninvitation context is not a confirmation.",
       "oneOf": [
@@ -4418,6 +4584,31 @@
           "type": "string"
         }
       ]
+    },
+    "ContentExport": {
+      "additionalProperties": false,
+      "description": "What a content-bearing diagnostic export will include.\n\nSection 26 makes this an explicit user selection, so it exists only when the person asked for\nit and it names what it will contain before anything is written.",
+      "properties": {
+        "entries": {
+          "description": "The entries the archive carries because of that choice.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "includes": {
+          "description": "What the person chose, in the words the command printed to them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "includes",
+        "entries"
+      ],
+      "type": "object"
     },
     "ContentOrigin": {
       "description": "Where one captured path's content came from.",
@@ -6173,7 +6364,7 @@
       "description": "One diagnostic check.",
       "properties": {
         "detail": {
-          "description": "A plain description of the finding. Credentials are redacted.",
+          "description": "A plain description of the finding, with credentials redacted.\n\nRedacted by [`HostDoctorResult::new`] rather than by whoever wrote the sentence. A check's\ndetail is built from paths, command lines and errors from libraries, and any of those can\ncarry a token that the person writing the check never thought about.",
           "type": "string"
         },
         "id": {
@@ -6189,7 +6380,7 @@
               "type": "null"
             }
           ],
-          "description": "What the user should do, when the check did not pass."
+          "description": "What the user should do, when the check did not pass. Redacted the same way."
         },
         "status": {
           "$ref": "#/$defs/DoctorStatus",
@@ -6233,6 +6424,55 @@
           "type": "string"
         }
       ]
+    },
+    "DocumentState": {
+      "description": "Which of the five conditions a configuration document is in.",
+      "oneOf": [
+        {
+          "const": "absent",
+          "description": "No document. Every preference is the product default, which is the ordinary first run.",
+          "type": "string"
+        },
+        {
+          "const": "loaded",
+          "description": "A document this build wrote or understands.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_version",
+          "description": "A document declaring a version this build does not know. It is left alone and nothing\nis read out of it.",
+          "type": "string"
+        },
+        {
+          "const": "unreadable",
+          "description": "A document this host could not read: a link, another user's file, or one larger than\n[`MAX_LEN`].",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "A document at this version whose contents are not valid against the schema.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentStatus": {
+      "additionalProperties": false,
+      "description": "What a configuration document turned out to be, and what a person is told about it.",
+      "properties": {
+        "detail": {
+          "description": "A sentence naming what was found.",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/DocumentState",
+          "description": "The condition."
+        }
+      },
+      "required": [
+        "state",
+        "detail"
+      ],
+      "type": "object"
     },
     "DownloadBeginParams": {
       "additionalProperties": false,
@@ -7017,6 +7257,151 @@
         }
       ]
     },
+    "EffectiveConfiguration": {
+      "additionalProperties": false,
+      "description": "What this host's configuration currently resolves to, and where every part of it came from.",
+      "properties": {
+        "ceilings": {
+          "description": "Every ceiling, with what narrowed it.",
+          "items": {
+            "$ref": "#/$defs/CeilingValue"
+          },
+          "type": "array"
+        },
+        "document": {
+          "description": "Where the configuration document is.",
+          "type": "string"
+        },
+        "overrides": {
+          "description": "The documented environment overrides.",
+          "items": {
+            "$ref": "#/$defs/OverrideReport"
+          },
+          "type": "array"
+        },
+        "precedence": {
+          "description": "The precedence ladder, highest first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision this host has applied."
+        },
+        "runtime_directory": {
+          "description": "The runtime directory this platform uses.",
+          "type": "string"
+        },
+        "schema_version": {
+          "$ref": "#/$defs/U64",
+          "description": "The schema version this build reads and writes."
+        },
+        "secrets": {
+          "description": "The secure-store references this configuration names. Names only, never values.",
+          "items": {
+            "$ref": "#/$defs/SecretReference"
+          },
+          "type": "array"
+        },
+        "stale_documents": {
+          "description": "Documents found beside the configuration that this build no longer reads.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "state_directory": {
+          "description": "The state directory this platform uses.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/DocumentStatus",
+          "description": "What that document turned out to be."
+        },
+        "values": {
+          "description": "Every ordinary preference, with its source.",
+          "items": {
+            "$ref": "#/$defs/EffectiveValue"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "revision",
+        "document",
+        "status",
+        "runtime_directory",
+        "state_directory",
+        "precedence",
+        "overrides",
+        "values",
+        "ceilings",
+        "secrets",
+        "stale_documents"
+      ],
+      "type": "object"
+    },
+    "EffectiveValue": {
+      "additionalProperties": false,
+      "description": "One effective configuration value, with where it came from.",
+      "properties": {
+        "about": {
+          "description": "What it decides.",
+          "type": "string"
+        },
+        "effect": {
+          "$ref": "#/$defs/ValueEffect",
+          "description": "Whether it applies immediately or only to sessions created afterwards."
+        },
+        "key": {
+          "description": "The key, as the configuration document spells it.",
+          "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The profile's name or the document's path, when the rung had one."
+        },
+        "source": {
+          "$ref": "#/$defs/ValueSource",
+          "description": "The rung of the precedence ladder it came from."
+        },
+        "value": {
+          "description": "The value in force, in its stable spelling.",
+          "type": "string"
+        },
+        "variable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The allowlisted environment variable that supplied it, when one did."
+        }
+      },
+      "required": [
+        "key",
+        "about",
+        "value",
+        "source",
+        "origin",
+        "variable",
+        "effect"
+      ],
+      "type": "object"
+    },
     "EncryptedObjectRef": {
       "additionalProperties": false,
       "description": "A reference to one encrypted object.",
@@ -7046,6 +7431,39 @@
       "description": "A 32-byte iroh endpoint public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
+    },
+    "EnrolmentBudgets": {
+      "additionalProperties": false,
+      "description": "The repository enrolment budgets, checked before a fetch and during processing.\n\nSection 11 sets each default and says a larger full mirror needs an explicit setting. The\ncatalogue client reads them through this host's configuration rather than carrying its own\ncopy, so one document answers \"what may a repository cost here\".",
+      "properties": {
+        "cached_payload_bytes": {
+          "default": 1073741824,
+          "description": "The cached payload budget per repository, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "full_offline_mirror": {
+          "default": false,
+          "description": "Whether this host keeps a full offline mirror, which is the explicit setting a payload\nbudget above the default needs.",
+          "type": "boolean"
+        },
+        "metadata_bytes": {
+          "default": 67108864,
+          "description": "The metadata budget per repository, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "metadata_entries": {
+          "default": 100000,
+          "description": "The metadata budget per repository, in entries.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "EnvelopeId": {
       "description": "One stored mailbox envelope: 128 random bits.",
@@ -7976,6 +8394,28 @@
         "exit_status",
         "stopped",
         "detail"
+      ],
+      "type": "object"
+    },
+    "ExecutionSnapshot": {
+      "additionalProperties": false,
+      "description": "The creator's shell environment, recorded as an execution snapshot.\n\nSection 26 is explicit that this is \"a distinct execution snapshot, not control\nconfiguration\". It is what the session's own processes run with; nothing this host decides\nis taken from it. [`ExecutionSnapshot::variables`] holds names only, because a bundle or a\ndiagnostic that carried the values would be exporting whatever the person had exported.",
+      "properties": {
+        "variables": {
+          "description": "The variable names the creator's shell had, in order, with nothing that names a\ncredential.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "withheld": {
+          "$ref": "#/$defs/U64",
+          "description": "How many names were left out because they name a credential."
+        }
+      },
+      "required": [
+        "variables",
+        "withheld"
       ],
       "type": "object"
     },
@@ -9275,6 +9715,10 @@
           },
           "type": "array"
         },
+        "configuration": {
+          "$ref": "#/$defs/EffectiveConfiguration",
+          "description": "What this host's configuration currently resolves to.\n\nSection 26 asks `kr doctor` to report the schema, the locations and each effective value\nwith its source, so the host answers with them rather than leaving a command to read the\ndocument a second time and reach its own conclusion about the platform's defaults."
+        },
         "healthy": {
           "description": "True when no check failed.",
           "type": "boolean"
@@ -9282,7 +9726,8 @@
       },
       "required": [
         "checks",
-        "healthy"
+        "healthy",
+        "configuration"
       ],
       "type": "object"
     },
@@ -10609,7 +11054,7 @@
       "type": "object"
     },
     "LogoutPersistence": {
-      "description": "Whether a per-user service survives the user logging out, on this platform.\n\nThe answer is a platform fact, not a preference, and it is reported rather than assumed. Setup\nenables persistence only through an explicit choice, and only where the service configuration\nqualifies for it.",
+      "description": "The host power setting as it is kept on disk.\n\nThe setting is per-user host configuration rather than a wire message: the owner chooses it\nonce, through setup or through the command line, and the control daemon reads it. Its format\nhas one definition, here, because both the daemon that reads it and the command that writes it\nhave to agree about what a file that says nothing means — and what it means is off.\nWhether a per-user service survives the user logging out, on this platform.\n\nThe answer is a platform fact, not a preference, and it is reported rather than assumed. Setup\nenables persistence only through an explicit choice, and only where the service configuration\nqualifies for it.",
       "oneOf": [
         {
           "const": "ends_at_logout",
@@ -12724,6 +13169,40 @@
       ],
       "type": "object"
     },
+    "OverrideReport": {
+      "additionalProperties": false,
+      "description": "One documented environment override, and whether it is set here.",
+      "properties": {
+        "position": {
+          "$ref": "#/$defs/ValueSource",
+          "description": "The rung it acts at."
+        },
+        "preference": {
+          "description": "The preference it supplies.",
+          "type": "string"
+        },
+        "set": {
+          "description": "Whether this host has it set.",
+          "type": "boolean"
+        },
+        "variable": {
+          "description": "The variable.",
+          "type": "string"
+        },
+        "why": {
+          "description": "Why it acts there.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "variable",
+        "preference",
+        "position",
+        "why",
+        "set"
+      ],
+      "type": "object"
+    },
     "OwnerConfirmationProof": {
       "additionalProperties": false,
       "description": "An owner's answer to a confirmation challenge.\n\nThe verification ceremony itself is platform code; this object records its result and binds it\nto the exact challenge. The host's acceptance record keeps the user-presence evidence and the\nchallenge-consumption transition together.",
@@ -13829,6 +14308,49 @@
           "type": "string"
         }
       ]
+    },
+    "PreferenceSet": {
+      "additionalProperties": false,
+      "description": "The ordinary preferences, each absent unless this document chooses it.",
+      "properties": {
+        "shell_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShellMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The shell mode a session is created with when the request does not choose one."
+        },
+        "sleep_inhibition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SleepInhibitionSetting"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether this host keeps itself awake for work it has admitted, and on which power\nsource."
+        },
+        "worker_profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerProfile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The execution context a session is created in when the request does not choose one."
+        }
+      },
+      "type": "object"
     },
     "Presentation": {
       "description": "How a new session is presented locally.\n\nThe three are mutually exclusive. `attach` is the default when standard input and output are\nterminals; otherwise the caller states one.",
@@ -17381,6 +17903,25 @@
       ],
       "type": "object"
     },
+    "RedactedError": {
+      "additionalProperties": false,
+      "description": "One error a support bundle carries, already redacted.",
+      "properties": {
+        "component": {
+          "description": "What produced it.",
+          "type": "string"
+        },
+        "message": {
+          "description": "What it said, with anything credential-shaped replaced.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "message"
+      ],
+      "type": "object"
+    },
     "ReferenceOutcome": {
       "additionalProperties": false,
       "description": "What became of a versioned Git reference.",
@@ -19881,6 +20422,30 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "SecretReference": {
+      "additionalProperties": false,
+      "description": "A named reference to something in a secure store.\n\nThe name, the store and the item. No value, and no field a value fits in.",
+      "properties": {
+        "item": {
+          "description": "Its name inside that store.",
+          "type": "string"
+        },
+        "name": {
+          "description": "What this configuration calls it.",
+          "type": "string"
+        },
+        "store": {
+          "description": "The secure store it lives in.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "store",
+        "item"
+      ],
+      "type": "object"
+    },
     "SemanticChange": {
       "additionalProperties": false,
       "description": "One semantic change in the changed-since-last-visit view.",
@@ -21325,6 +21890,25 @@
       ],
       "type": "object"
     },
+    "SoftwareComponent": {
+      "additionalProperties": false,
+      "description": "One component's version, for a support bundle.",
+      "properties": {
+        "component": {
+          "description": "What it is.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Which version of it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "version"
+      ],
+      "type": "object"
+    },
     "SourceConsistency": {
       "description": "How consistent the source of one capture was.\n\nThere is no default and no fourth member that means \"probably fine\". A live multi-file capture\nis [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what\nsection 14 means by never advertising a point-in-time snapshot without one.",
       "oneOf": [
@@ -21500,6 +22084,66 @@
         "session_id",
         "attachment_id",
         "transfer_id"
+      ],
+      "type": "object"
+    },
+    "SupportBundle": {
+      "additionalProperties": false,
+      "description": "A support bundle: software versions, capabilities and redacted errors.\n\nSection 26 says what one shows, and the word that carries the weight is \"redacted\".\n[`SupportBundle::new`] redacts everything it is given, so a bundle cannot carry a credential\nbecause a caller forgot. Terminal content, prompts, attachment filenames and anything else\ncontent-bearing are not here at all: they arrive only through [`ContentExport`], which exists\nonly when the person explicitly selected it.",
+      "properties": {
+        "capabilities": {
+          "description": "What this host can currently do, as the shared section 11 evidence.",
+          "items": {
+            "$ref": "#/$defs/CapabilityRecord"
+          },
+          "type": "array"
+        },
+        "configuration": {
+          "$ref": "#/$defs/EffectiveConfiguration",
+          "description": "What this host's configuration resolves to."
+        },
+        "content": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContentExport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The content-bearing export, when the person explicitly selected one."
+        },
+        "doctor": {
+          "$ref": "#/$defs/HostDoctorResult",
+          "description": "What the diagnostics found."
+        },
+        "errors": {
+          "description": "The errors this host has to report, redacted.",
+          "items": {
+            "$ref": "#/$defs/RedactedError"
+          },
+          "type": "array"
+        },
+        "generated_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was made."
+        },
+        "software": {
+          "description": "The software this host is running.",
+          "items": {
+            "$ref": "#/$defs/SoftwareComponent"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "generated_at_ms",
+        "software",
+        "capabilities",
+        "doctor",
+        "configuration",
+        "errors",
+        "content"
       ],
       "type": "object"
     },
@@ -22434,6 +23078,46 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "ValueEffect": {
+      "description": "Whether a new value applies at once or only to sessions created afterwards.",
+      "oneOf": [
+        {
+          "const": "immediately",
+          "description": "The host acts on it the next time it asks itself the question.",
+          "type": "string"
+        },
+        {
+          "const": "new_sessions_only",
+          "description": "A running session keeps what it was created with; the new value applies to sessions\ncreated afterwards. Nothing migrates a worker.",
+          "type": "string"
+        }
+      ]
+    },
+    "ValueSource": {
+      "description": "Which rung of the precedence ladder an effective value came from.",
+      "oneOf": [
+        {
+          "const": "request",
+          "description": "An explicit request or a command-line option.",
+          "type": "string"
+        },
+        {
+          "const": "profile",
+          "description": "The selected session or environment profile.",
+          "type": "string"
+        },
+        {
+          "const": "host_configuration",
+          "description": "The per-user host configuration document.",
+          "type": "string"
+        },
+        {
+          "const": "default",
+          "description": "The product default.",
+          "type": "string"
+        }
+      ]
     },
     "VerifiedApprovalAnswer": {
       "additionalProperties": false,
@@ -24793,6 +25477,9 @@
     "closure_record": {
       "$ref": "#/$defs/ClosureRecord"
     },
+    "configuration_document": {
+      "$ref": "#/$defs/ConfigurationDocument"
+    },
     "connect_reply": {
       "$ref": "#/$defs/ConnectReply"
     },
@@ -24880,6 +25567,9 @@
     "draft_update_result": {
       "$ref": "#/$defs/DraftUpdateResult"
     },
+    "effective_configuration": {
+      "$ref": "#/$defs/EffectiveConfiguration"
+    },
     "envelope_plaintext": {
       "$ref": "#/$defs/EnvelopePlaintext"
     },
@@ -24906,6 +25596,9 @@
     },
     "evidence_reference": {
       "$ref": "#/$defs/EvidenceReference"
+    },
+    "execution_snapshot": {
+      "$ref": "#/$defs/ExecutionSnapshot"
     },
     "expiration_tombstone": {
       "$ref": "#/$defs/ExpirationTombstone"
@@ -25710,6 +26403,9 @@
     },
     "stream_header": {
       "$ref": "#/$defs/StreamHeader"
+    },
+    "support_bundle": {
+      "$ref": "#/$defs/SupportBundle"
     },
     "sync_conflict_copy": {
       "$ref": "#/$defs/SyncConflictCopy"

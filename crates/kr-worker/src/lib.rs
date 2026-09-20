@@ -36,6 +36,7 @@
 pub mod action;
 pub mod attachments;
 pub mod attention;
+pub mod config;
 pub mod desktop;
 pub mod environment;
 pub mod error;

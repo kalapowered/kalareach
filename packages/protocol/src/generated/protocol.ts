@@ -185,6 +185,17 @@ export type ChangeSetVersion = string
  */
 export type CapabilityId = string
 /**
+ * How the root shell is integrated.
+ */
+export type ShellMode = 'managed' | 'native_compat'
+/**
+ * The owner's sleep-inhibition choice.
+ *
+ * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
+ * well is a second, separate choice.
+ */
+export type SleepInhibitionSetting = 'off' | 'mains_only' | 'battery_too'
+/**
  * The host's answer to a client proof.
  */
 export type ConnectReply =
@@ -1280,6 +1291,7 @@ export interface KalaReachProtocol {
   changeset_read_result?: ChangesetReadResult
   client_offer?: ClientOffer
   closure_record?: ClosureRecord
+  configuration_document?: ConfigurationDocument
   connect_reply?: ConnectReply
   control_frame?: ControlFrame
   controller_connection_role?: ControllerConnectionRole
@@ -1309,6 +1321,7 @@ export interface KalaReachProtocol {
   draft_record?: DraftRecord2
   draft_update_params?: DraftUpdateParams
   draft_update_result?: DraftUpdateResult
+  effective_configuration?: EffectiveConfiguration
   envelope_plaintext?: EnvelopePlaintext
   environment_capabilities_params?: EnvironmentCapabilitiesParams
   environment_capabilities_result?: EnvironmentCapabilitiesResult
@@ -1318,6 +1331,7 @@ export interface KalaReachProtocol {
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
   evidence_reference?: EvidenceReference
+  execution_snapshot?: ExecutionSnapshot
   expiration_tombstone?: ExpirationTombstone
   fence_evidence?: FenceEvidence
   fenced_action?: FencedAction
@@ -1589,6 +1603,7 @@ export interface KalaReachProtocol {
   signed_relay_instance_registration?: SignedRelayInstanceRegistration
   sleep_inhibition_state?: SleepInhibitionState2
   stream_header?: StreamHeader
+  support_bundle?: SupportBundle
   sync_conflict_copy?: SyncConflictCopy
   sync_object_record?: SyncObjectRecord
   terminal_geometry_transfer_params?: TerminalGeometryTransferParams
@@ -4935,6 +4950,131 @@ export interface ProcessStartIdentity1 {
   start_value: string
 }
 /**
+ * One versioned per-user host configuration document.
+ */
+export interface ConfigurationDocument {
+  ceilings?: ConfigurationCeilings
+  /**
+   * The profile selected when a request and the allowlist name none.
+   */
+  default_profile?: string | null
+  preferences?: PreferenceSet
+  /**
+   * Named profiles, each a set of the same preferences.
+   */
+  profiles?: {
+    [k: string]: PreferenceSet1
+  }
+  /**
+   * The revision this host applied. It rises by one with every validated edit.
+   */
+  revision?: number
+  /**
+   * Named secure-store references. Never a secret value: this schema has no field one fits
+   * in, which is what section 26's "named secure-store references, never config exports"
+   * looks like when it is enforced rather than promised.
+   */
+  secrets?: SecretReference[]
+  /**
+   * The schema version this document is written against.
+   */
+  version?: number
+}
+/**
+ * The ceilings this host configures. They intersect; they never raise anything.
+ */
+export interface ConfigurationCeilings {
+  enrolment?: EnrolmentBudgets
+  /**
+   * The rights a grant may carry on this host, as the stable action-right strings.
+   *
+   * Absent leaves the grant's own intersection untouched. Present narrows it: a right not
+   * in this list is not available on this host however a grant was issued.
+   */
+  grant_rights?: string[] | null
+  /**
+   * The most sessions this host admits, when the owner sets one below the built-in limit.
+   */
+  session_limit?: number | null
+}
+/**
+ * The repository enrolment budgets section 11 calls configuration.
+ */
+export interface EnrolmentBudgets {
+  /**
+   * The cached payload budget per repository, in bytes.
+   */
+  cached_payload_bytes?: number
+  /**
+   * Whether this host keeps a full offline mirror, which is the explicit setting a payload
+   * budget above the default needs.
+   */
+  full_offline_mirror?: boolean
+  /**
+   * The metadata budget per repository, in bytes.
+   */
+  metadata_bytes?: number
+  /**
+   * The metadata budget per repository, in entries.
+   */
+  metadata_entries?: number
+}
+/**
+ * The ordinary preferences that apply when no profile is selected.
+ */
+export interface PreferenceSet {
+  /**
+   * The shell mode a session is created with when the request does not choose one.
+   */
+  shell_mode?: ShellMode | null
+  /**
+   * Whether this host keeps itself awake for work it has admitted, and on which power
+   * source.
+   */
+  sleep_inhibition?: SleepInhibitionSetting | null
+  /**
+   * The execution context a session is created in when the request does not choose one.
+   */
+  worker_profile?: WorkerProfile | null
+}
+/**
+ * The ordinary preferences, each absent unless this document chooses it.
+ */
+export interface PreferenceSet1 {
+  /**
+   * The shell mode a session is created with when the request does not choose one.
+   */
+  shell_mode?: ShellMode | null
+  /**
+   * Whether this host keeps itself awake for work it has admitted, and on which power
+   * source.
+   */
+  sleep_inhibition?: SleepInhibitionSetting | null
+  /**
+   * The execution context a session is created in when the request does not choose one.
+   */
+  worker_profile?: WorkerProfile | null
+}
+/**
+ * A named reference to something in a secure store.
+ *
+ * The name, the store and the item. No value, and no field a value fits in.
+ */
+export interface SecretReference {
+  /**
+   * Its name inside that store.
+   */
+  item: string
+  /**
+   * What this configuration calls it.
+   */
+  name: string
+  /**
+   * The secure store it lives in.
+   */
+  store: string
+}
+/**
  * What the host returns once both proofs verify.
  */
 export interface ConnectAccepted {
@@ -5493,7 +5633,7 @@ export interface SessionCreateParams {
    */
   shell: string | null
   /**
-   * The shell integration mode.
+   * How the root shell is integrated.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -7190,6 +7330,158 @@ export interface DraftRecord3 {
   updated_at_ms: string
 }
 /**
+ * What this host's configuration currently resolves to, and where every part of it came from.
+ */
+export interface EffectiveConfiguration {
+  /**
+   * Every ceiling, with what narrowed it.
+   */
+  ceilings: CeilingValue[]
+  /**
+   * Where the configuration document is.
+   */
+  document: string
+  /**
+   * The documented environment overrides.
+   */
+  overrides: OverrideReport[]
+  /**
+   * The precedence ladder, highest first.
+   */
+  precedence: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * The runtime directory this platform uses.
+   */
+  runtime_directory: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  schema_version: string
+  /**
+   * The secure-store references this configuration names. Names only, never values.
+   */
+  secrets: SecretReference[]
+  /**
+   * Documents found beside the configuration that this build no longer reads.
+   */
+  stale_documents: string[]
+  /**
+   * The state directory this platform uses.
+   */
+  state_directory: string
+  status: DocumentStatus
+  /**
+   * Every ordinary preference, with its source.
+   */
+  values: EffectiveValue[]
+}
+/**
+ * One ceiling, with what was configured and what it actually came out as.
+ *
+ * A ceiling is an intersection. `configured` is what this host's configuration asked for and
+ * `value` is what survived the intersection with authority, the organisation's restrictions, the
+ * grant and the hard resource limit; `narrowed_by` names what did the narrowing when they differ.
+ * A configured value that was more permissive than the intersection is refused rather than
+ * applied, and `refused` says so.
+ */
+export interface CeilingValue {
+  /**
+   * What the configuration asked for, when it asked for anything.
+   */
+  configured: string | null
+  /**
+   * The key.
+   */
+  key: string
+  /**
+   * What narrowed the configured value, when something did.
+   */
+  narrowed_by: string | null
+  /**
+   * True when the configured value was more permissive and was refused.
+   */
+  refused: boolean
+  /**
+   * What is in force.
+   */
+  value: string
+}
+/**
+ * One documented environment override, and whether it is set here.
+ */
+export interface OverrideReport {
+  /**
+   * The rung it acts at.
+   */
+  position: 'request' | 'profile' | 'host_configuration' | 'default'
+  /**
+   * The preference it supplies.
+   */
+  preference: string
+  /**
+   * Whether this host has it set.
+   */
+  set: boolean
+  /**
+   * The variable.
+   */
+  variable: string
+  /**
+   * Why it acts there.
+   */
+  why: string
+}
+/**
+ * What that document turned out to be.
+ */
+export interface DocumentStatus {
+  /**
+   * A sentence naming what was found.
+   */
+  detail: string
+  /**
+   * The condition.
+   */
+  state: 'absent' | 'loaded' | 'unknown_version' | 'unreadable' | 'invalid'
+}
+/**
+ * One effective configuration value, with where it came from.
+ */
+export interface EffectiveValue {
+  /**
+   * What it decides.
+   */
+  about: string
+  /**
+   * Whether it applies immediately or only to sessions created afterwards.
+   */
+  effect: 'immediately' | 'new_sessions_only'
+  /**
+   * The key, as the configuration document spells it.
+   */
+  key: string
+  /**
+   * The profile's name or the document's path, when the rung had one.
+   */
+  origin: string | null
+  /**
+   * The rung of the precedence ladder it came from.
+   */
+  source: 'request' | 'profile' | 'host_configuration' | 'default'
+  /**
+   * The value in force, in its stable spelling.
+   */
+  value: string
+  /**
+   * The allowlisted environment variable that supplied it, when one did.
+   */
+  variable: string | null
+}
+/**
  * The authenticated plaintext of one mailbox envelope.
  *
  * `crypto_box_easy` authenticates every field below for exactly one recipient. Authorisation-
@@ -7369,7 +7661,10 @@ export interface SleepInhibitionState {
    */
   sessions_with_work: string
   /**
-   * The owner's choice.
+   * The owner's sleep-inhibition choice.
+   *
+   * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
+   * well is a second, separate choice.
    */
   setting: 'off' | 'mains_only' | 'battery_too'
   /**
@@ -7545,8 +7840,7 @@ export interface SessionSummary {
    */
   session_id: string
   /**
-   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
-   * reported.
+   * How the root shell is integrated.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -7682,6 +7976,25 @@ export interface HistoryGap {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   to_cursor: string
+}
+/**
+ * The creator's shell environment, recorded as an execution snapshot.
+ *
+ * Section 26 is explicit that this is "a distinct execution snapshot, not control
+ * configuration". It is what the session's own processes run with; nothing this host decides
+ * is taken from it. [`ExecutionSnapshot::variables`] holds names only, because a bundle or a
+ * diagnostic that carried the values would be exporting whatever the person had exported.
+ */
+export interface ExecutionSnapshot {
+  /**
+   * The variable names the creator's shell had, in order, with nothing that names a
+   * credential.
+   */
+  variables: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  withheld: string
 }
 /**
  * The record an expired object leaves behind.
@@ -8596,6 +8909,7 @@ export interface HostDoctorResult {
    * Every check, in the order they ran.
    */
   checks: DoctorCheck[]
+  configuration: EffectiveConfiguration1
   /**
    * True when no check failed.
    */
@@ -8606,7 +8920,11 @@ export interface HostDoctorResult {
  */
 export interface DoctorCheck {
   /**
-   * A plain description of the finding. Credentials are redacted.
+   * A plain description of the finding, with credentials redacted.
+   *
+   * Redacted by [`HostDoctorResult::new`] rather than by whoever wrote the sentence. A check's
+   * detail is built from paths, command lines and errors from libraries, and any of those can
+   * carry a token that the person writing the check never thought about.
    */
   detail: string
   /**
@@ -8614,7 +8932,7 @@ export interface DoctorCheck {
    */
   id: string
   /**
-   * What the user should do, when the check did not pass.
+   * What the user should do, when the check did not pass. Redacted the same way.
    */
   remedy: string | null
   /**
@@ -8625,6 +8943,60 @@ export interface DoctorCheck {
    * What it examines.
    */
   title: string
+}
+/**
+ * What this host's configuration currently resolves to.
+ *
+ * Section 26 asks `kr doctor` to report the schema, the locations and each effective value
+ * with its source, so the host answers with them rather than leaving a command to read the
+ * document a second time and reach its own conclusion about the platform's defaults.
+ */
+export interface EffectiveConfiguration1 {
+  /**
+   * Every ceiling, with what narrowed it.
+   */
+  ceilings: CeilingValue[]
+  /**
+   * Where the configuration document is.
+   */
+  document: string
+  /**
+   * The documented environment overrides.
+   */
+  overrides: OverrideReport[]
+  /**
+   * The precedence ladder, highest first.
+   */
+  precedence: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * The runtime directory this platform uses.
+   */
+  runtime_directory: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  schema_version: string
+  /**
+   * The secure-store references this configuration names. Names only, never values.
+   */
+  secrets: SecretReference[]
+  /**
+   * Documents found beside the configuration that this build no longer reads.
+   */
+  stale_documents: string[]
+  /**
+   * The state directory this platform uses.
+   */
+  state_directory: string
+  status: DocumentStatus
+  /**
+   * Every ordinary preference, with its source.
+   */
+  values: EffectiveValue[]
 }
 /**
  * The result of `host.info`.
@@ -8713,7 +9085,10 @@ export interface SleepInhibitionState1 {
    */
   sessions_with_work: string
   /**
-   * The owner's choice.
+   * The owner's sleep-inhibition choice.
+   *
+   * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
+   * well is a second, separate choice.
    */
   setting: 'off' | 'mains_only' | 'battery_too'
   /**
@@ -15288,7 +15663,7 @@ export interface SessionCreateParams1 {
    */
   shell: string | null
   /**
-   * The shell integration mode.
+   * How the root shell is integrated.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -15376,8 +15751,7 @@ export interface SessionSummary1 {
    */
   session_id: string
   /**
-   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
-   * reported.
+   * How the root shell is integrated.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -15659,8 +16033,7 @@ export interface SessionSummary2 {
    */
   session_id: string
   /**
-   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
-   * reported.
+   * How the root shell is integrated.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -15800,8 +16173,7 @@ export interface SessionSummary3 {
    */
   session_id: string
   /**
-   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
-   * reported.
+   * How the root shell is integrated.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -16307,7 +16679,10 @@ export interface SleepInhibitionState2 {
    */
   sessions_with_work: string
   /**
-   * The owner's choice.
+   * The owner's sleep-inhibition choice.
+   *
+   * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
+   * well is a second, separate choice.
    */
   setting: 'off' | 'mains_only' | 'battery_too'
   /**
@@ -16357,6 +16732,145 @@ export interface StreamResource {
    * The transfer, for attachment chunk streams.
    */
   transfer_id: TransferId | null
+}
+/**
+ * A support bundle: software versions, capabilities and redacted errors.
+ *
+ * Section 26 says what one shows, and the word that carries the weight is "redacted".
+ * [`SupportBundle::new`] redacts everything it is given, so a bundle cannot carry a credential
+ * because a caller forgot. Terminal content, prompts, attachment filenames and anything else
+ * content-bearing are not here at all: they arrive only through [`ContentExport`], which exists
+ * only when the person explicitly selected it.
+ */
+export interface SupportBundle {
+  /**
+   * What this host can currently do, as the shared section 11 evidence.
+   */
+  capabilities: CapabilityRecord[]
+  configuration: EffectiveConfiguration2
+  /**
+   * The content-bearing export, when the person explicitly selected one.
+   */
+  content: ContentExport | null
+  doctor: HostDoctorResult1
+  /**
+   * The errors this host has to report, redacted.
+   */
+  errors: RedactedError[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  generated_at_ms: string
+  /**
+   * The software this host is running.
+   */
+  software: SoftwareComponent[]
+}
+/**
+ * What this host's configuration resolves to.
+ */
+export interface EffectiveConfiguration2 {
+  /**
+   * Every ceiling, with what narrowed it.
+   */
+  ceilings: CeilingValue[]
+  /**
+   * Where the configuration document is.
+   */
+  document: string
+  /**
+   * The documented environment overrides.
+   */
+  overrides: OverrideReport[]
+  /**
+   * The precedence ladder, highest first.
+   */
+  precedence: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * The runtime directory this platform uses.
+   */
+  runtime_directory: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  schema_version: string
+  /**
+   * The secure-store references this configuration names. Names only, never values.
+   */
+  secrets: SecretReference[]
+  /**
+   * Documents found beside the configuration that this build no longer reads.
+   */
+  stale_documents: string[]
+  /**
+   * The state directory this platform uses.
+   */
+  state_directory: string
+  status: DocumentStatus
+  /**
+   * Every ordinary preference, with its source.
+   */
+  values: EffectiveValue[]
+}
+/**
+ * What a content-bearing diagnostic export will include.
+ *
+ * Section 26 makes this an explicit user selection, so it exists only when the person asked for
+ * it and it names what it will contain before anything is written.
+ */
+export interface ContentExport {
+  /**
+   * The entries the archive carries because of that choice.
+   */
+  entries: string[]
+  /**
+   * What the person chose, in the words the command printed to them.
+   */
+  includes: string[]
+}
+/**
+ * What the diagnostics found.
+ */
+export interface HostDoctorResult1 {
+  /**
+   * Every check, in the order they ran.
+   */
+  checks: DoctorCheck[]
+  configuration: EffectiveConfiguration1
+  /**
+   * True when no check failed.
+   */
+  healthy: boolean
+}
+/**
+ * One error a support bundle carries, already redacted.
+ */
+export interface RedactedError {
+  /**
+   * What produced it.
+   */
+  component: string
+  /**
+   * What it said, with anything credential-shaped replaced.
+   */
+  message: string
+}
+/**
+ * One component's version, for a support bundle.
+ */
+export interface SoftwareComponent {
+  /**
+   * What it is.
+   */
+  component: string
+  /**
+   * Which version of it.
+   */
+  version: string
 }
 /**
  * A write that lost its comparison, kept for the person to choose from.

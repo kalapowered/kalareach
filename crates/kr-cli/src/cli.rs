@@ -4,6 +4,8 @@
 //! the definitions here: a literal `--` ends KalaReach option parsing, and no shell command or path
 //! is ever assembled by interpolating text.
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 /// The KalaReach command line.
@@ -458,9 +460,18 @@ pub struct StatusArguments {
 /// `kr doctor`.
 #[derive(Debug, Args)]
 pub struct DoctorArguments {
-    /// Reserved for a future individual repair. Diagnostics are read-only by default.
+    /// Print every check's evidence, including the checks that passed. Without it, only a check
+    /// that did not pass shows its evidence.
     #[arg(long)]
     pub verbose: bool,
+    /// Write a support bundle to this path: software versions, capabilities, the diagnostics and
+    /// redacted errors, as one archive.
+    #[arg(long, value_name = "PATH")]
+    pub bundle: Option<PathBuf>,
+    /// Add the content-bearing diagnostic export to the bundle. The command prints what it will
+    /// contain before it writes anything.
+    #[arg(long, requires = "bundle")]
+    pub include_content: bool,
 }
 
 impl Execution {

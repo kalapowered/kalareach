@@ -28,6 +28,7 @@ pub mod attach;
 pub mod cli;
 pub mod contact;
 pub mod create;
+pub mod doctor;
 pub mod error;
 pub mod platform;
 pub mod question;

@@ -293,6 +293,13 @@ pub struct Controller {
     /// calls rather than answers, so what belongs to the daemon is the accounting: what was
     /// admitted, what is staged, what has been dispatched and what became of it.
     backup: Arc<crate::backup::BackupService>,
+    /// The catalogue's evidence about itself, once a catalogue has registered some.
+    ///
+    /// Section 11 gives `kr doctor`, launch buttons and disabled-action UI one shared capability
+    /// evidence to read, and this is where the catalogue's half of it arrives. It is empty on a
+    /// host that has never synchronised a catalogue, and the diagnostic says so rather than
+    /// claiming anything about a catalogue this host does not have.
+    catalogue_evidence: Option<Arc<dyn crate::config::catalogue::CatalogueEvidence>>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -550,6 +557,7 @@ impl Controller {
             secret_store: setup.secret_store,
             generation,
             paths: setup.paths,
+            catalogue_evidence: None,
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -4382,95 +4390,155 @@ impl Controller {
         })
     }
 
+    /// Reads this environment's configuration.
+    ///
+    /// One reader, so the value a check reports and the value the host acts on cannot be two
+    /// different readings of the same document.
+    #[must_use]
+    pub fn configuration(&self) -> kr_worker::config::Resolver {
+        crate::config::open(&self.paths)
+    }
+
+    /// Returns what this host's configuration currently resolves to.
+    #[must_use]
+    pub async fn effective_configuration(&self) -> kr_protocol::hostinfo::EffectiveConfiguration {
+        crate::config::effective(
+            &self.configuration(),
+            crate::config::HardLimits::default(),
+            self.default_profile().await,
+            kr_protocol::session::ShellMode::NativeCompat,
+        )
+    }
+
+    /// Applies one validated configuration edit and does what the change owes.
+    ///
+    /// A change that affects authority fences dispatch *before* this returns, which is section
+    /// 26's "changes affecting authority fence dispatch before acknowledgement": the caller is
+    /// told the change is in force only once work admitted under the old authority can no longer
+    /// be dispatched. Nothing migrates a worker: a running session keeps the profile it was
+    /// created in, and the evidence taken under the old one is invalidated rather than reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the edit is refused or the fence cannot be raised.
+    pub async fn apply_configuration(
+        self: &Arc<Self>,
+        change: &kr_protocol::hostinfo::configuration::Change,
+    ) -> Result<crate::config::Applied> {
+        let applied = crate::config::apply(&self.paths, change)?;
+        if applied.fences_dispatch {
+            self.revoke_authority().await?;
+        }
+        Ok(applied)
+    }
+
     async fn host_doctor(self: &Arc<Self>) -> Result<ParamsValue> {
         let mut checks = Vec::new();
-        checks.push(DoctorCheck {
-            id: "runtime-directory".to_owned(),
-            title: "The runtime directory is owner-only".to_owned(),
-            status: DoctorStatus::Ok,
-            detail: self.paths.runtime_dir().display().to_string(),
-            remedy: Nullable::null(),
-        });
-        checks.push(DoctorCheck {
-            id: "supervisor".to_owned(),
-            title: "Workers outlive this daemon".to_owned(),
-            status: DoctorStatus::Ok,
-            detail: self.supervisor.describe(),
-            remedy: Nullable::null(),
-        });
+        checks.push(DoctorCheck::new(
+            "runtime-directory",
+            "The runtime directory is owner-only",
+            DoctorStatus::Ok,
+            self.paths.runtime_dir().display().to_string(),
+            None,
+        ));
+        checks.push(DoctorCheck::new(
+            "supervisor",
+            "Workers outlive this daemon",
+            DoctorStatus::Ok,
+            self.supervisor.describe(),
+            None,
+        ));
         let directory = self.directory.lock().await;
         let quarantined = directory.quarantined.len();
         let verified = directory.verified.len();
         drop(directory);
-        checks.push(DoctorCheck {
-            id: "workers".to_owned(),
-            title: "Every published descriptor answered its challenge".to_owned(),
-            status: if quarantined == 0 {
+        checks.push(DoctorCheck::new(
+            "workers",
+            "Every published descriptor answered its challenge",
+            if quarantined == 0 {
                 DoctorStatus::Ok
             } else {
                 DoctorStatus::Warning
             },
-            detail: format!("{verified} verified, {quarantined} quarantined"),
-            remedy: Nullable(
-                (quarantined > 0).then(|| {
-                    "A quarantined descriptor is never used. Remove it once its session is known to be gone."
-                        .to_owned()
-                }),
-            ),
-        });
+            format!("{verified} verified, {quarantined} quarantined"),
+            (quarantined > 0).then(|| {
+                "A quarantined descriptor is never used. Remove it once its session is known to \
+                 be gone."
+                    .to_owned()
+            }),
+        ));
         let power = self.power_state().await;
-        checks.push(DoctorCheck {
-            id: "sleep-setting".to_owned(),
-            title: "This host's sleep policy is the owner's choice".to_owned(),
-            status: DoctorStatus::Ok,
-            detail: format!(
-                "{} (setting read from {})",
+        let resolved = self.configuration().sleep_inhibition(None);
+        checks.push(DoctorCheck::new(
+            "sleep-setting",
+            "This host's sleep policy is the owner's choice",
+            DoctorStatus::Ok,
+            format!(
+                "{} (from {}{})",
                 power.describe(),
-                self.paths
-                    .state_dir()
-                    .join(kr_protocol::desktop::setting::FILE_NAME)
-                    .display()
+                resolved.source.describe(),
+                resolved
+                    .origin
+                    .as_deref()
+                    .map(|origin| format!(", {origin}"))
+                    .unwrap_or_default()
             ),
-            remedy: Nullable(
-                (power.setting == kr_protocol::desktop::SleepInhibitionSetting::Off).then(|| {
-                    "kr host power --set mains_only keeps this host awake for work it has \
-                     admitted, while it is on mains power."
-                        .to_owned()
-                }),
-            ),
-        });
+            (power.setting == kr_protocol::desktop::SleepInhibitionSetting::Off).then(|| {
+                "kr host power --set mains_only keeps this host awake for work it has admitted, \
+                 while it is on mains power."
+                    .to_owned()
+            }),
+        ));
         for entry in crate::desktop::persistence(&self.supervisor.describe()) {
-            checks.push(DoctorCheck {
-                id: format!("logout-{}", entry.profile.as_str()),
-                title: format!("What a logout does to a {} session", entry.profile.as_str()),
-                status: DoctorStatus::Ok,
-                detail: format!(
+            checks.push(DoctorCheck::new(
+                format!("logout-{}", entry.profile.as_str()),
+                format!("What a logout does to a {} session", entry.profile.as_str()),
+                DoctorStatus::Ok,
+                format!(
                     "{} through {}: {}",
                     entry.persistence.as_str(),
                     entry.mechanism,
                     entry.detail
                 ),
-                remedy: Nullable::null(),
-            });
+                None,
+            ));
         }
         let pending = self.revision_pending().await?;
-        checks.push(DoctorCheck {
-            id: "authority-revision".to_owned(),
-            title: "Every worker holds this environment's authority revision".to_owned(),
-            status: if pending.is_empty() {
+        checks.push(DoctorCheck::new(
+            "authority-revision",
+            "Every worker holds this environment's authority revision",
+            if pending.is_empty() {
                 DoctorStatus::Ok
             } else {
                 DoctorStatus::Warning
             },
-            detail: format!("{} of {} pending", pending.len(), verified),
-            remedy: Nullable((!pending.is_empty()).then(|| {
+            format!("{} of {} pending", pending.len(), verified),
+            (!pending.is_empty()).then(|| {
                 "A revocation is complete for a worker once it acknowledges the revision or is \
                  confirmed ended."
                     .to_owned()
-            })),
-        });
-        let healthy = checks.iter().all(|check| !check.status.is_failure());
-        encode(&HostDoctorResult { checks, healthy })
+            }),
+        ));
+        // The configuration, its precedence, its overrides and its ceilings. After the checks
+        // above because those are about whether this host is working; these are about what it is
+        // working from.
+        let effective = self.effective_configuration().await;
+        checks.extend(crate::config::checks(&effective));
+        checks.push(DoctorCheck::new(
+            "configuration-secrets",
+            "Secrets are named references, never configuration exports",
+            DoctorStatus::Ok,
+            crate::config::secret_line(&effective),
+            None,
+        ));
+        // The shared section 11 capability evidence a catalogue contributes. `NotApplicable` with
+        // the reason stated while nothing has synchronised one, rather than a claim about a
+        // catalogue this host does not have.
+        checks.push(crate::config::catalogue::check(
+            self.catalogue_evidence.as_deref(),
+            crate::config::catalogue::budgets(&self.configuration().ceilings()),
+        ));
+        encode(&HostDoctorResult::new(checks, effective))
     }
 
     async fn session_list(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {

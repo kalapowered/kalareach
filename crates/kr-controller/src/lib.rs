@@ -34,6 +34,7 @@ pub mod archive;
 pub mod authority;
 pub mod backup;
 pub mod changeset;
+pub mod config;
 pub mod desktop;
 pub mod directory;
 pub mod error;

@@ -59,12 +59,13 @@ use std::sync::Arc;
 
 use kr_protocol::desktop::{
     InhibitionMechanism, InhibitionReason, PowerSource, SleepInhibitionSetting,
-    SleepInhibitionState, setting,
+    SleepInhibitionState,
 };
+use kr_protocol::hostinfo::configuration::Change;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 
-use crate::error::{ControllerError, Result};
+use crate::error::Result;
 
 /// How long a facility is given to exit after its input ends.
 pub const RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -119,29 +120,28 @@ impl Demand {
 
 /// Reads this environment's power setting.
 ///
-/// An absent file, an unreadable file and a file this build does not understand all read as off.
-/// The setting is the owner's explicit choice, so the absence of one is never taken for consent.
+/// One section of the versioned per-user host configuration document, resolved through the same
+/// precedence function as every other ordinary preference. An absent document, an unreadable one
+/// and one at a version this build does not know all read as off: the setting is the owner's
+/// explicit choice, so the absence of one is never taken for consent.
 #[must_use]
 pub fn read(paths: &kr_ipc::paths::EnvironmentPaths) -> SleepInhibitionSetting {
-    let path = paths.state_dir().join(setting::FILE_NAME);
-    match kr_ipc::paths::read_owner_only_file(&path, setting::MAX_LEN) {
-        Ok(Some(bytes)) => setting::parse(&bytes),
-        _ => SleepInhibitionSetting::Off,
-    }
+    crate::config::sleep_inhibition(paths)
 }
 
 /// Writes this environment's power setting.
 ///
+/// Through the validated edit, so the choice is checked against the schema before a revision is
+/// applied and a document this build must not rewrite is refused rather than replaced.
+///
 /// # Errors
 ///
-/// Returns an error when the state directory cannot be written.
+/// Returns an error when the edit is refused or the state directory cannot be written.
 pub fn write(
     paths: &kr_ipc::paths::EnvironmentPaths,
     chosen: SleepInhibitionSetting,
 ) -> Result<()> {
-    let path = paths.state_dir().join(setting::FILE_NAME);
-    kr_ipc::paths::write_owner_only_file(&path, setting::document(chosen).as_bytes())
-        .map_err(ControllerError::Ipc)
+    crate::config::apply(paths, &Change::SleepInhibition(chosen)).map(|_| ())
 }
 
 /// Returns which facility this host holds a sleep assertion with.
@@ -826,9 +826,10 @@ mod tests {
             write(&paths, setting).expect("the setting is written");
             assert_eq!(read(&paths), setting);
         }
+        let document = kr_worker::config::document_path(&paths);
         kr_ipc::paths::write_owner_only_file(
-            &paths.state_dir().join(setting::FILE_NAME),
-            b"{\"sleep_inhibition\": \"always\"}",
+            &document,
+            br#"{"version": 1, "preferences": {"sleep_inhibition": "always"}}"#,
         )
         .expect("writes");
         assert_eq!(
@@ -836,11 +837,7 @@ mod tests {
             SleepInhibitionSetting::Off,
             "a setting this build does not understand is not consent to anything"
         );
-        kr_ipc::paths::write_owner_only_file(
-            &paths.state_dir().join(setting::FILE_NAME),
-            b"not a document",
-        )
-        .expect("writes");
+        kr_ipc::paths::write_owner_only_file(&document, b"not a document").expect("writes");
         assert_eq!(read(&paths), SleepInhibitionSetting::Off);
     }
 
