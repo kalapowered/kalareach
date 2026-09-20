@@ -20,11 +20,12 @@ use kr_describe::context::{ContextBinding, ContextSignal};
 use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment};
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::metrics::{Distribution, LatencyLedger, PUBLISHED_SESSION_COUNTS};
+use kr_describe::priority::Cancellation;
 use kr_describe::profile::catalogue::{Catalogue, MetGates};
 use kr_describe::profile::{Asset, ModelProfile};
 use kr_describe::queue::Priority;
 use kr_describe::resource::{ResourceSettings, platform};
-use kr_describe::runtime::InferenceRuntime;
+use kr_describe::runtime::LoadOutcome;
 use kr_describe::service::{DescriptionService, HostPlacement, RuntimeFactory, Tick};
 use kr_describe::store::DescriptionStore;
 use kr_describe::time::Reading;
@@ -171,8 +172,19 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
 
     let baseline_rss = process_rss_bytes();
     let cold = Instant::now();
-    let runtime = kr_describe::llama::LlamaRuntime::load(profile, &weights)
-        .map_err(|error| error.to_string())?;
+    let budgets = Budgets::DEFAULTS;
+    let initial_cancellation = Cancellation::new();
+    let load_outcome = kr_describe::llama::LlamaRuntime::load(
+        profile,
+        &weights,
+        &initial_cancellation,
+        budgets.execution_deadline_ms,
+    )
+    .map_err(|error| error.to_string())?;
+    let runtime = match load_outcome {
+        LoadOutcome::Loaded(runtime) => runtime,
+        other => return Err(format!("model load did not succeed: {other:?}")),
+    };
     let load_ms = cold.elapsed().as_millis() as u64;
     let loaded_rss = process_rss_bytes();
     println!("cold_start_load_ms: {load_ms} [{machine}]");
@@ -190,7 +202,6 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             .unwrap_or_default()
     );
 
-    let budgets = Budgets::DEFAULTS;
     let declared: ResidentCost = profile.execution().resident_estimate;
     println!(
         "declared_resident_bytes: {} (weights {}, beyond the weights {}) [{machine}]",
@@ -218,14 +229,17 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
 
     // One service, one runtime, the real weights. The runtime is moved into the factory, so the
     // first mapping takes it and a second would be a fault rather than a second set of weights.
-    let held = std::cell::RefCell::new(Some(Box::new(runtime) as Box<dyn InferenceRuntime>));
-    let factory: RuntimeFactory = Box::new(move |_profile: &ModelProfile| {
-        held.borrow_mut()
-            .take()
-            .ok_or_else(|| kr_describe::DescribeError::Runtime {
-                detail: "this benchmark maps one model once".to_owned(),
-            })
-    });
+    let held = std::cell::RefCell::new(Some(runtime));
+    let factory: RuntimeFactory = Box::new(
+        move |_profile: &ModelProfile, _cancellation: &Cancellation, _deadline_ms: u64| {
+            held.borrow_mut()
+                .take()
+                .map(LoadOutcome::Loaded)
+                .ok_or_else(|| kr_describe::DescribeError::Runtime {
+                    detail: "this benchmark maps one model once".to_owned(),
+                })
+        },
+    );
     let mut service = DescriptionService::new(
         HostPlacement {
             environment: ExecutionEnvironment::new(
@@ -387,11 +401,13 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             ..ResourceSettings::default()
         },
         DescriptionStore::in_memory().map_err(|error| error.to_string())?,
-        Box::new(|_profile: &ModelProfile| {
-            Err(kr_describe::DescribeError::Runtime {
-                detail: "the paused case never maps a model".to_owned(),
-            })
-        }),
+        Box::new(
+            |_profile: &ModelProfile, _cancellation: &Cancellation, _deadline_ms: u64| {
+                Err(kr_describe::DescribeError::Runtime {
+                    detail: "the paused case never maps a model".to_owned(),
+                })
+            },
+        ),
     );
     let session_id = SessionId::new(Uuid::from_bytes([11; 16]));
     strict.session_opened(session_id, SessionEpoch::V1, ContextBinding::new("bench"));

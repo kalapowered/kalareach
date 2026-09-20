@@ -24,7 +24,6 @@
 //! the model again. There is no path in this module that ends a worker or a session.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
 
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_worker::privacy::PrivacyGeneration;
@@ -41,7 +40,7 @@ use crate::metadata::{
 };
 use crate::metrics::LatencyLedger;
 use crate::output::{Expectation, ProducedUnder, Rejection, prompt, validate};
-use crate::priority::Applied;
+use crate::priority::{Applied, Cancellation};
 use crate::privacy::{CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, RunningJob};
 use crate::profile::catalogue::{Catalogue, MetGates, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
@@ -49,9 +48,9 @@ use crate::queue::{Enqueued, Freshness, NothingToDequeue, Priority, Scheduler, S
 use crate::resource::{
     HostConditions, PauseReason, ResourcePolicy, ResourceSettings, ResourceState,
 };
-use crate::runtime::{GenerationRequest, InferenceRuntime, Produced};
+use crate::runtime::{GenerationRequest, InferenceRuntime, LoadOutcome, Produced};
 use crate::store::DescriptionStore;
-use crate::time::Reading;
+use crate::time::{JobClock, Reading};
 
 /// How long a host with no sessions keeps the model mapped.
 pub const IDLE_UNLOAD_MS: u64 = 15 * 60 * 1000;
@@ -62,7 +61,7 @@ pub const IDLE_UNLOAD_MS: u64 = 15 * 60 * 1000;
 /// exactly one, and neither needs anything else from the other. A build with no inference runtime
 /// compiled in supplies a factory that refuses, which is a host with deterministic titles and no
 /// model - a supported configuration rather than a broken one.
-pub type RuntimeFactory = Box<dyn FnMut(&ModelProfile) -> Result<Box<dyn InferenceRuntime>>>;
+pub type RuntimeFactory = Box<dyn FnMut(&ModelProfile, &Cancellation, u64) -> Result<LoadOutcome>>;
 
 /// How the downloading of a selected profile's assets is going.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +173,14 @@ pub enum Tick {
     },
 }
 
+/// What mapping or loading a profile produced.
+#[derive(Debug)]
+enum EnsureMappedOutcome {
+    Mapped,
+    Cancelled,
+    DeadlineExceeded,
+}
+
 /// Where a description service runs.
 ///
 /// The three facts travel together because no one of them decides anything on its own: the
@@ -218,6 +225,7 @@ pub struct DescriptionService {
     inference_restarts: u64,
     progress: DownloadProgress,
     settings: ResourceSettings,
+    job_clock: JobClock,
 }
 
 impl std::fmt::Debug for DescriptionService {
@@ -285,6 +293,7 @@ impl DescriptionService {
             inference_restarts: 0,
             progress: DownloadProgress::NotStarted,
             settings,
+            job_clock: JobClock::monotonic(),
         }
     }
 
@@ -348,6 +357,17 @@ impl DescriptionService {
     #[must_use]
     pub const fn running_job(&self) -> &RunningJob {
         &self.running
+    }
+
+    /// Returns the clock used to measure the execution deadline.
+    #[must_use]
+    pub const fn job_clock(&self) -> &JobClock {
+        &self.job_clock
+    }
+
+    /// Sets the clock used to measure the execution deadline, which a test drives by hand.
+    pub fn set_job_clock(&mut self, clock: JobClock) {
+        self.job_clock = clock;
     }
 
     /// Returns what cleanup privacy mode is still owed.
@@ -760,18 +780,55 @@ impl DescriptionService {
         // The deadline starts here, at dequeue, which is what section 22 says. Loading a model is
         // inside it: a job that spent twenty seconds waiting for weights has ten left, not another
         // thirty.
-        let dequeued = Instant::now();
+        let dequeued_ms = self.job_clock.now_ms();
         let queue_wait_ms = now.since_ms(job.queued_at_ms);
         if self.fence.is_fenced(&session_id) {
             return Ok(Tick::Fenced);
         }
         let budgets = self.policy.budgets();
-        if let Err(error) = self.ensure_mapped(&profile, now) {
-            return Ok(Tick::InferenceFailed {
-                session_id,
-                detail: error.to_string(),
-            });
+
+        // Start tracking running job and in-flight work before loading, so a fence raised during
+        // load cancels the load token.
+        let cancellation = self.running.started(session_id);
+        self.in_flight.dispatched(session_id);
+
+        let elapsed_before_load = self.job_clock.now_ms().saturating_sub(dequeued_ms);
+        let remaining_before_load = budgets
+            .execution_deadline_ms
+            .saturating_sub(elapsed_before_load);
+        if elapsed_before_load >= budgets.execution_deadline_ms || remaining_before_load == 0 {
+            self.running.finished();
+            self.in_flight.reconciled(&session_id);
+            return Ok(Tick::DeadlineExceeded { session_id });
         }
+        if cancellation.is_cancelled() {
+            self.running.finished();
+            self.in_flight.reconciled(&session_id);
+            return Ok(Tick::Cancelled { session_id });
+        }
+
+        match self.ensure_mapped(&profile, &cancellation, remaining_before_load, now) {
+            Ok(EnsureMappedOutcome::Mapped) => {}
+            Ok(EnsureMappedOutcome::Cancelled) => {
+                self.running.finished();
+                self.in_flight.reconciled(&session_id);
+                return Ok(Tick::Cancelled { session_id });
+            }
+            Ok(EnsureMappedOutcome::DeadlineExceeded) => {
+                self.running.finished();
+                self.in_flight.reconciled(&session_id);
+                return Ok(Tick::DeadlineExceeded { session_id });
+            }
+            Err(error) => {
+                self.running.finished();
+                self.in_flight.reconciled(&session_id);
+                return Ok(Tick::InferenceFailed {
+                    session_id,
+                    detail: error.to_string(),
+                });
+            }
+        }
+
         let generation = self.privacy_generation(&session_id);
         let produced_under = ProducedUnder {
             session_epoch: job.context.session_epoch(),
@@ -782,10 +839,21 @@ impl DescriptionService {
             profile_revision: profile.revision(),
             generation,
         };
+        let elapsed_before_gen = self.job_clock.now_ms().saturating_sub(dequeued_ms);
         let remaining_ms = budgets
             .execution_deadline_ms
-            .saturating_sub(elapsed_ms(dequeued));
-        let cancellation = self.running.started(session_id);
+            .saturating_sub(elapsed_before_gen);
+        if elapsed_before_gen >= budgets.execution_deadline_ms || remaining_ms == 0 {
+            self.running.finished();
+            self.in_flight.reconciled(&session_id);
+            return Ok(Tick::DeadlineExceeded { session_id });
+        }
+        if cancellation.is_cancelled() {
+            self.running.finished();
+            self.in_flight.reconciled(&session_id);
+            return Ok(Tick::Cancelled { session_id });
+        }
+
         let request = GenerationRequest {
             prompt: prompt(&job.context),
             grammar: crate::output::DESCRIPTION_GRAMMAR,
@@ -801,9 +869,9 @@ impl DescriptionService {
             cpu_threads: budgets.cpu_threads.min(profile.execution().cpu_threads),
             sampler: *profile.sampler(),
             deadline_ms: remaining_ms,
-            cancellation,
+            cancellation: cancellation.clone(),
         };
-        self.in_flight.dispatched(session_id);
+
         let produced = self.runtime.as_mut().map_or_else(
             || {
                 Err(DescribeError::Runtime {
@@ -812,7 +880,7 @@ impl DescriptionService {
             },
             |runtime| runtime.generate(&request),
         );
-        let execution_ms = elapsed_ms(dequeued);
+        let execution_ms = self.job_clock.now_ms().saturating_sub(dequeued_ms);
         self.running.finished();
         self.in_flight.reconciled(&session_id);
         self.scheduler.record_service(execution_ms.max(1));
@@ -831,8 +899,11 @@ impl DescriptionService {
         };
         // The deadline again, over the whole job rather than over the runtime's own view of it:
         // a load that ran long leaves a result nobody asked for by the time it arrives.
-        if elapsed_ms(dequeued) > budgets.execution_deadline_ms {
+        if execution_ms > budgets.execution_deadline_ms {
             return Ok(Tick::DeadlineExceeded { session_id });
+        }
+        if cancellation.is_cancelled() {
+            return Ok(Tick::Cancelled { session_id });
         }
         // The fence again, now that the runtime has answered. A session made private while its job
         // was running has a result produced under the generation before the enabling, and section
@@ -873,21 +944,23 @@ impl DescriptionService {
             generation: self.privacy_generation(&session_id),
             name_pinned: self.store.pinned(&session_id)?.is_some(),
         };
-        let published = match validate(&bytes, &produced_under, &expectation) {
-            Ok(description) => {
-                self.store
-                    .publish(&session_id, &description, now.wall_ms().get())?;
-                self.scheduler.record_success(&session_id, now);
-                Tick::Published {
+        let description = match validate(&bytes, &produced_under, &expectation) {
+            Ok(description) => description,
+            Err(rejection) => {
+                return Ok(Tick::Rejected {
                     session_id,
-                    queue_wait_ms,
-                    execution_ms,
-                }
+                    rejection,
+                });
             }
-            Err(rejection) => Tick::Rejected {
-                session_id,
-                rejection,
-            },
+        };
+
+        self.store
+            .publish(&session_id, &description, now.wall_ms().get())?;
+        self.scheduler.record_success(&session_id, now);
+        let published = Tick::Published {
+            session_id,
+            queue_wait_ms,
+            execution_ms,
         };
         // The ceiling is a process figure, so it is checked against the process rather than against
         // the profile's estimate. A run that has grown past it unloads: section 22's budget is a
@@ -908,14 +981,20 @@ impl DescriptionService {
     ///
     /// The runtime is built *before* the mapping is recorded, so a load that fails leaves no record
     /// of a model this host does not have.
-    fn ensure_mapped(&mut self, profile: &ModelProfile, now: Reading) -> Result<()> {
+    fn ensure_mapped(
+        &mut self,
+        profile: &ModelProfile,
+        cancellation: &Cancellation,
+        remaining_ms: u64,
+        now: Reading,
+    ) -> Result<EnsureMappedOutcome> {
         if self.runtime.as_ref().is_some_and(|runtime| {
             let handle = runtime.handle();
             handle.profile_id == profile.profile_id()
                 && handle.profile_revision == profile.revision()
         }) && self.is_mapped()
         {
-            return Ok(());
+            return Ok(EnsureMappedOutcome::Mapped);
         }
         // Release before loading. Section 22 states that order, and it is what keeps the process
         // ceiling a ceiling: two sets of weights resident at once would exceed it for as long as
@@ -936,7 +1015,12 @@ impl DescriptionService {
             &self.met,
             &self.target,
         )?;
-        let runtime = (self.factory)(profile)?;
+        let outcome = (self.factory)(profile, cancellation, remaining_ms)?;
+        let runtime = match outcome {
+            LoadOutcome::Loaded(runtime) => runtime,
+            LoadOutcome::Cancelled => return Ok(EnsureMappedOutcome::Cancelled),
+            LoadOutcome::DeadlineExceeded => return Ok(EnsureMappedOutcome::DeadlineExceeded),
+        };
         // And what came back is the profile that was asked for. A runtime that loaded something
         // else would have every description attributed to a model this host is not running.
         let handle = runtime.handle();
@@ -962,7 +1046,7 @@ impl DescriptionService {
             now.wall_ms(),
         )?;
         self.runtime = Some(runtime);
-        Ok(())
+        Ok(EnsureMappedOutcome::Mapped)
     }
 
     /// Returns whether a result produced under a profile revision is still current.
@@ -977,14 +1061,6 @@ impl DescriptionService {
     pub const fn met_gates(&self) -> &MetGates {
         &self.met
     }
-}
-
-/// Returns how long has passed since a mark, in milliseconds.
-///
-/// This is the one clock this crate reads, and it reads it to measure work it has just done rather
-/// than to decide anything. Every policy decision still comes from a [`Reading`] the caller gives.
-fn elapsed_ms(since: Instant) -> u64 {
-    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Returns this process's resident set, when this platform will say.

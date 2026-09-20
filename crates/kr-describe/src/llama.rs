@@ -49,9 +49,9 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::budget::ResidentCost;
 use crate::error::{DescribeError, Result};
-use crate::priority::{Applied, background_current_thread};
+use crate::priority::{Applied, Cancellation, background_current_thread};
 use crate::profile::ModelProfile;
-use crate::runtime::{GenerationRequest, InferenceRuntime, Produced, RuntimeHandle};
+use crate::runtime::{GenerationRequest, InferenceRuntime, LoadOutcome, Produced, RuntimeHandle};
 
 /// How many tokens one decode batch carries.
 const BATCH_TOKENS: usize = 512;
@@ -99,35 +99,76 @@ pub struct LlamaRuntime {
 }
 
 impl LlamaRuntime {
-    /// Loads a profile's weights from a verified file.
+    /// Loads a profile's weights from a verified file, observing cancellation and deadline.
     ///
     /// The caller has already verified the file against the profile's recorded size and digest;
     /// this refuses a profile whose execution settings are not the CPU-only ones, which is the
-    /// second of the two places zero GPU layers is enforced.
+    /// second of the two places zero GPU layers is enforced. If the cancellation token fires or
+    /// the deadline is exceeded, loading aborts or the loaded model is dropped immediately.
     ///
     /// # Errors
     ///
     /// Returns [`DescribeError::ProfileRefused`] when the profile is not CPU-only and
     /// [`DescribeError::Runtime`] when the library cannot start or the file cannot be loaded.
-    pub fn load(profile: &ModelProfile, weights: &Path) -> Result<Self> {
+    pub fn load(
+        profile: &ModelProfile,
+        weights: &Path,
+        cancellation: &Cancellation,
+        deadline_ms: u64,
+    ) -> Result<LoadOutcome> {
         if profile.execution().gpu_layers != 0 {
             return Err(DescribeError::ProfileRefused {
                 profile: profile.profile_id().to_owned(),
                 why: "GPU layers, where this runtime offloads none",
             });
         }
+        if cancellation.is_cancelled() {
+            return Ok(LoadOutcome::Cancelled);
+        }
+        if deadline_ms == 0 {
+            return Ok(LoadOutcome::DeadlineExceeded);
+        }
         let backend = backend()?;
         // The thread that loads the weights is the thread that runs them, so the background class
         // is applied here rather than per request: applying it per request would leave the caller's
         // thread demoted afterwards, and applying it nowhere would leave the class a claim.
         let priority = background_current_thread();
-        let parameters = LlamaModelParams::default().with_n_gpu_layers(0);
-        let model = LlamaModel::load_from_file(backend, weights, &parameters).map_err(|error| {
-            DescribeError::Runtime {
-                detail: format!("{} could not be loaded: {error}", weights.display()),
+        let cancellation_cb = cancellation.clone();
+        let started = Instant::now();
+        let parameters = LlamaModelParams::default()
+            .with_n_gpu_layers(0)
+            .with_progress_callback(move |_progress| {
+                if cancellation_cb.is_cancelled() {
+                    return false;
+                }
+                if started.elapsed().as_millis() as u64 >= deadline_ms {
+                    return false;
+                }
+                true
+            });
+        let model = match LlamaModel::load_from_file(backend, weights, &parameters) {
+            Ok(model) => model,
+            Err(error) => {
+                if cancellation.is_cancelled() {
+                    return Ok(LoadOutcome::Cancelled);
+                }
+                if started.elapsed().as_millis() as u64 >= deadline_ms {
+                    return Ok(LoadOutcome::DeadlineExceeded);
+                }
+                return Err(DescribeError::Runtime {
+                    detail: format!("{} could not be loaded: {error}", weights.display()),
+                });
             }
-        })?;
-        Ok(Self {
+        };
+        if cancellation.is_cancelled() {
+            drop(model);
+            return Ok(LoadOutcome::Cancelled);
+        }
+        if started.elapsed().as_millis() as u64 >= deadline_ms {
+            drop(model);
+            return Ok(LoadOutcome::DeadlineExceeded);
+        }
+        Ok(LoadOutcome::Loaded(Box::new(Self {
             handle: RuntimeHandle {
                 profile_id: profile.profile_id().to_owned(),
                 profile_revision: profile.revision(),
@@ -137,7 +178,7 @@ impl LlamaRuntime {
             context_tokens: profile.execution().context_tokens,
             weights_path: weights.to_path_buf(),
             priority,
-        })
+        })))
     }
 
     /// Returns the file this model was loaded from.

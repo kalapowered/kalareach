@@ -210,7 +210,9 @@ metadata — there is no window in which a generated title is still shown — an
 captured for it, so a change made while it was private cannot reach a job after privacy ends. A job
 that was already running is counted as in flight, and the cleanup does not report complete until it
 has finished or until a removal this host could not make has been made. Its answer, when it arrives,
-is refused: the fence is read again before anything is published.
+is refused: publication happens under the same lock that raises the fence, re-checking the fence,
+the cancellation token and the whole-job deadline inside it, so a fence raised from another thread or a
+token that fired between generation and publication publishes nothing.
 
 Descriptions are produced, stored and shown on this host. None of them is uploaded, so there is no
 copy elsewhere for privacy mode to offer a separate deletion of.
@@ -220,8 +222,10 @@ copy elsewhere for privacy mode to offer a separate deletion of.
 The model stays mapped while there is work and sessions to justify it, and a host with no sessions
 at all unloads after fifteen minutes.
 
-A load or inference failure the runtime reports releases the model and nothing else; a cancellation
-and a passed deadline release nothing and simply publish nothing. The store, the pins, the provenance, every session
+The model factory takes the job's cancellation token and remaining execution deadline. A load that is
+cancelled or exceeds the deadline is aborted and any loaded memory is released immediately; the llama.cpp
+binding aborts via its load progress callback. A load or inference failure releases the model and nothing else;
+a cancellation and a passed deadline simply publish nothing. The store, the pins, the provenance, every session
 and every deterministic title survive untouched, and the next tick maps the model again. The job
 that was running is not retried; the session's next meaningful change queues another.
 

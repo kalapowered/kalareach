@@ -57,6 +57,17 @@ pub enum Produced {
     DeadlineExceeded,
 }
 
+/// What loading a model produced.
+#[derive(Debug)]
+pub enum LoadOutcome {
+    /// The model was loaded and is ready for inference.
+    Loaded(Box<dyn InferenceRuntime>),
+    /// Loading was cancelled before completion.
+    Cancelled,
+    /// Loading exceeded the execution deadline.
+    DeadlineExceeded,
+}
+
 /// What a runtime says it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeHandle {
@@ -124,6 +135,18 @@ pub enum Behaviour {
         /// What it says.
         detail: String,
     },
+    /// Take this long to load, so a test can drive the load deadline.
+    SlowLoad {
+        /// How long the load says it took.
+        duration_ms: u64,
+    },
+    /// Fail during load, as a missing or corrupt weights file would.
+    FailsLoad {
+        /// What it says.
+        detail: String,
+    },
+    /// Cancel the job during load.
+    CancelDuringLoad,
 }
 
 /// A behaviour two owners share: whatever sets it, and the runtime that reads it.

@@ -35,7 +35,8 @@ use kr_describe::resource::{
     HostConditions, PauseReason, PowerSource, ResourceSettings, ThermalState,
 };
 use kr_describe::runtime::{
-    Behaviour, GenerationRequest, InferenceRuntime, Produced, SharedBehaviour, StubRuntime,
+    Behaviour, GenerationRequest, InferenceRuntime, LoadOutcome, Produced, SharedBehaviour,
+    StubRuntime,
 };
 use kr_describe::service::{
     DescriptionService, DownloadProgress, HostPlacement, IDLE_UNLOAD_MS, RuntimeFactory, Tick,
@@ -55,9 +56,29 @@ use support::{
 /// A factory over the deterministic runtime, with a handle on what it produces next.
 fn stub_factory(behaviour: &SharedBehaviour) -> RuntimeFactory {
     let behaviour = behaviour.clone();
-    Box::new(move |profile: &ModelProfile| {
-        Ok(Box::new(StubRuntime::sharing(profile, behaviour.clone())) as Box<dyn InferenceRuntime>)
-    })
+    Box::new(
+        move |profile: &ModelProfile, cancellation: &Cancellation, deadline_ms: u64| {
+            let b = behaviour.get();
+            if let Behaviour::FailsLoad { detail } = &b {
+                return Err(kr_describe::DescribeError::Runtime {
+                    detail: detail.clone(),
+                });
+            }
+            if matches!(b, Behaviour::CancelDuringLoad) || cancellation.is_cancelled() {
+                cancellation.cancel();
+                return Ok(LoadOutcome::Cancelled);
+            }
+            if let Behaviour::SlowLoad { duration_ms } = b
+                && duration_ms > deadline_ms
+            {
+                return Ok(LoadOutcome::DeadlineExceeded);
+            }
+            Ok(LoadOutcome::Loaded(
+                Box::new(StubRuntime::sharing(profile, behaviour.clone()))
+                    as Box<dyn InferenceRuntime>,
+            ))
+        },
+    )
 }
 
 /// A service over one environment, with settings a test chooses.
@@ -300,6 +321,52 @@ fn a_job_that_passes_its_deadline_publishes_nothing() {
     // The job waits five minutes in the queue and is still given its whole deadline afterwards.
     let tick = service.tick(&roomy(), at(300_000)).expect("a tick");
     assert!(matches!(tick, Tick::DeadlineExceeded { .. }), "{tick:?}");
+}
+
+/// KR-REQ-22.11: a model load that passes its execution deadline is abandoned and publishes nothing.
+#[test]
+fn a_model_load_that_passes_its_deadline_is_abandoned_and_publishes_nothing() {
+    let behaviour = SharedBehaviour::new();
+    behaviour.set(Behaviour::SlowLoad {
+        duration_ms: 31_000,
+    });
+    let mut service = service(&behaviour);
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let tick = service.tick(&roomy(), at(0)).expect("a tick");
+    assert!(
+        matches!(tick, Tick::DeadlineExceeded { session_id } if session_id == session(1)),
+        "{tick:?}"
+    );
+    assert!(!service.is_mapped());
+    assert!(service.store().generated(&session(1)).unwrap().is_none());
+}
+
+/// KR-REQ-22.11: a model load that is cancelled is abandoned and publishes nothing.
+#[test]
+fn a_model_load_that_is_cancelled_is_abandoned_and_publishes_nothing() {
+    let behaviour = SharedBehaviour::new();
+    behaviour.set(Behaviour::CancelDuringLoad);
+    let mut service = service(&behaviour);
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let tick = service.tick(&roomy(), at(0)).expect("a tick");
+    assert!(
+        matches!(tick, Tick::Cancelled { session_id } if session_id == session(1)),
+        "{tick:?}"
+    );
+    assert!(!service.is_mapped());
+    assert!(service.store().generated(&session(1)).unwrap().is_none());
 }
 
 /// KR-PERF-009: the paused case is driven on a host that is otherwise admitting inference.
