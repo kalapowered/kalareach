@@ -228,7 +228,7 @@ if "$kr" new --invisible --shell-mode managed --shell "$managed_shell" --cwd "$r
 
   # What the session says about itself, through the daemon that made it.
   if "$kr" status "$display" --json >"$artifacts/fence-status.json" 2>&1; then
-    status_mode="$(read_json "$artifacts/fence-status.json" session.shell_mode)"
+    status_mode="$(read_json "$artifacts/fence-status.json" shell_mode)"
     require "$status_mode" "managed" "the session reports the managed mode it was created in"
   else
     fail "the daemon could not report on the session it made"
@@ -240,10 +240,13 @@ if "$kr" new --invisible --shell-mode managed --shell "$managed_shell" --cwd "$r
     cat "$run_root/close.log"
     fail "the daemon could not close the session it made"
   fi
-  if "$kr" status "$display" --json >/dev/null 2>&1; then
-    fail "the session is still there after it was closed"
+  # The daemon keeps a closed session's record and answers for it, so what says the close
+  # happened is the state in that record rather than the question failing.
+  if "$kr" status "$display" --json >"$artifacts/fence-closed.json" 2>&1; then
+    require "$(read_json "$artifacts/fence-closed.json" state)" "closed" \
+      "the session the daemon closed reports itself closed"
   else
-    echo "  ok: the session closed and the daemon no longer has it"
+    fail "the daemon could not report on the session it closed"
   fi
 else
   # A refusal that names another shell's record is a condition of this installation rather than of
