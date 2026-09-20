@@ -742,7 +742,11 @@ async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
         .await
         .unwrap_err();
     assert_eq!(refused_plist.code(), ErrorCode::PermissionDenied);
-    assert!(refused_plist.to_string().contains("does not cover this environment"));
+    assert!(
+        refused_plist
+            .to_string()
+            .contains("does not cover this environment")
+    );
 
     let refused_wlist = session
         .read::<_, WorkspaceListResult>(
@@ -755,7 +759,11 @@ async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
         .await
         .unwrap_err();
     assert_eq!(refused_wlist.code(), ErrorCode::PermissionDenied);
-    assert!(refused_wlist.to_string().contains("does not cover this environment"));
+    assert!(
+        refused_wlist
+            .to_string()
+            .contains("does not cover this environment")
+    );
 
     session.close();
     host.stop().await;
@@ -866,7 +874,11 @@ async fn a_device_without_session_view_is_refused_project_and_workspace_lists() 
         .await
         .unwrap_err();
     assert_eq!(refused_plist.code(), ErrorCode::PermissionDenied);
-    assert!(refused_plist.to_string().contains(ActionRight::SessionView.as_str()));
+    assert!(
+        refused_plist
+            .to_string()
+            .contains(ActionRight::SessionView.as_str())
+    );
 
     let refused_wlist = session
         .read::<_, WorkspaceListResult>(
@@ -879,7 +891,11 @@ async fn a_device_without_session_view_is_refused_project_and_workspace_lists() 
         .await
         .unwrap_err();
     assert_eq!(refused_wlist.code(), ErrorCode::PermissionDenied);
-    assert!(refused_wlist.to_string().contains(ActionRight::SessionView.as_str()));
+    assert!(
+        refused_wlist
+            .to_string()
+            .contains(ActionRight::SessionView.as_str())
+    );
 
     session.close();
     host.stop().await;

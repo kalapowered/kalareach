@@ -1085,7 +1085,9 @@ impl RemoteConnection {
                     .into_iter()
                     .filter(|summary| env_selector.admits(summary.environment_id))
                     .map(|mut summary| {
-                        summary.bound_sessions.retain(|s| session_selector.admits(*s));
+                        summary
+                            .bound_sessions
+                            .retain(|s| session_selector.admits(*s));
                         summary
                     })
                     .collect(),

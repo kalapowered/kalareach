@@ -1281,4 +1281,3 @@ fn reference_update_with_expected_old_value_performs_compare_and_swap_bounded_to
     // Working tree is untouched (extra.txt is still there)
     assert!(path.join("extra.txt").exists());
 }
-
