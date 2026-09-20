@@ -118,6 +118,70 @@ pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> 
     }
 }
 
+/// Names the enrolment budgets in `budgets` that differ from the schema default.
+///
+/// An enrolment section may name one budget and leave the rest out, and `serde` fills the rest
+/// with the default before this crate ever sees them, so the section alone does not say which
+/// numbers a person chose. What differs from the default does, and it is the same answer for the
+/// purpose a report has: a budget that matches the default is in force because it is the default,
+/// whether the document spelled it out or said nothing about it.
+#[must_use]
+pub fn supplied_budgets(budgets: &EnrolmentBudgets) -> Vec<&'static str> {
+    let default = EnrolmentBudgets::default();
+    let mut named = Vec::new();
+    for (name, chosen, fallback) in [
+        (
+            "metadata_bytes",
+            budgets.metadata_bytes,
+            default.metadata_bytes,
+        ),
+        (
+            "metadata_entries",
+            budgets.metadata_entries,
+            default.metadata_entries,
+        ),
+        (
+            "retained_generations",
+            budgets.retained_generations,
+            default.retained_generations,
+        ),
+        (
+            "cached_payload_bytes",
+            budgets.cached_payload_bytes,
+            default.cached_payload_bytes,
+        ),
+        (
+            "package_bytes",
+            budgets.package_bytes,
+            default.package_bytes,
+        ),
+        ("object_count", budgets.object_count, default.object_count),
+        (
+            "expanded_pack_bytes",
+            budgets.expanded_pack_bytes,
+            default.expanded_pack_bytes,
+        ),
+        (
+            "transfer_bytes",
+            budgets.transfer_bytes,
+            default.transfer_bytes,
+        ),
+        (
+            "compilation_ms",
+            budgets.compilation_ms,
+            default.compilation_ms,
+        ),
+    ] {
+        if chosen != fallback {
+            named.push(name);
+        }
+    }
+    if budgets.full_offline_mirror != default.full_offline_mirror {
+        named.push("full_offline_mirror");
+    }
+    named
+}
+
 /// Returns the configured grant-rights ceiling, when the document sets one.
 ///
 /// A right this build does not know is dropped rather than refused. Validation has already

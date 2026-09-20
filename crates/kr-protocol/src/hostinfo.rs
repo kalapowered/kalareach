@@ -329,6 +329,10 @@ impl EffectiveConfiguration {
                 .map(|ceiling| CeilingValue {
                     configured: Nullable(ceiling.configured.0.as_deref().map(redaction::redact)),
                     value: redaction::redact(&ceiling.value),
+                    // The origin is the document's own path, which a person chose and may have
+                    // spelled with something this boundary exists to keep out of an export.
+                    origin: Nullable(ceiling.origin.0.as_deref().map(redaction::redact)),
+                    narrowed_by: Nullable(ceiling.narrowed_by.0.as_deref().map(redaction::redact)),
                     ..ceiling
                 })
                 .collect(),
@@ -458,29 +462,7 @@ impl SupportBundle {
         Self {
             generated_at_ms,
             software,
-            // A capability record's user-facing sentence is written by whatever probed the
-            // capability, and a probe that named a command line or a path is how a credential
-            // would arrive here. It goes through the same boundary as everything else.
-            capabilities: capabilities
-                .into_iter()
-                .map(|record| crate::desktop::CapabilityRecord {
-                    disabled_reason: Nullable(
-                        record.disabled_reason.0.as_deref().map(redaction::redact),
-                    ),
-                    // The identity is the binary a probe found and the version it reported, both
-                    // of which come from outside this host.
-                    identity: crate::desktop::CapabilityIdentity {
-                        binary: Nullable(
-                            record.identity.binary.0.as_deref().map(redaction::redact),
-                        ),
-                        version: Nullable(
-                            record.identity.version.0.as_deref().map(redaction::redact),
-                        ),
-                        ..record.identity
-                    },
-                    ..record
-                })
-                .collect(),
+            capabilities: redaction::capability_records(capabilities),
             doctor: HostDoctorResult::new(doctor.checks, doctor.configuration),
             configuration: configuration.redacted(),
             errors: errors
@@ -520,7 +502,7 @@ impl SupportBundle {
 ///   "version": 1,
 ///   "revision": 3,
 ///   "preferences": { "sleep_inhibition": "mains_only" },
-///   "profiles": { "review": { "shell_mode": "native_compat" } },
+///   "profiles": { "review": { "worker_profile": "headless_user" } },
 ///   "default_profile": null,
 ///   "ceilings": { "session_limit": 16 },
 ///   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }]
@@ -644,9 +626,55 @@ pub mod configuration {
     }
 
     /// Reads a configuration file, bounded by `limit` bytes.
+    ///
+    /// One handle, opened once and then checked and read: a path inspected and then read again by
+    /// name is two files whenever something replaces it in between. The handle is opened without
+    /// following a link and without waiting for a writer, so a symbolic link left where the
+    /// document belongs is refused rather than followed and a named pipe with the right name
+    /// cannot hold this host's startup open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the file exists but is not one this host wrote, or is larger than
+    /// `limit`.
     pub fn read_file(path: &std::path::Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
         use std::io::Read as _;
 
+        #[cfg(unix)]
+        let file = {
+            use rustix::fs::{Mode, OFlags};
+
+            match rustix::fs::open(
+                path,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(file) => std::fs::File::from(file),
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
+                    return Err("configuration file must not be a symbolic link".to_owned());
+                }
+                Err(error) => return Err(std::io::Error::from(error).to_string()),
+            }
+        };
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            // Open the name itself rather than whatever it points at, so a junction or a symbolic
+            // link put where the document belongs is rejected below instead of followed.
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -672,6 +700,15 @@ pub mod configuration {
         #[cfg(not(unix))]
         {
             let metadata = file.metadata().map_err(|error| error.to_string())?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err("configuration file must not be a link or a junction".to_owned());
+                }
+            }
             if !metadata.is_file() {
                 return Err("configuration file must be a regular file".to_owned());
             }
@@ -861,7 +898,7 @@ pub mod configuration {
     }
 
     impl ConfigurationCeilings {
-        /// Returns the enrolment budgets in force, defaulting to section 11's values.
+        /// Returns the enrolment budgets in force, defaulting to [`EnrolmentBudgets::default`].
         #[must_use]
         pub fn enrolment_budgets(&self) -> EnrolmentBudgets {
             self.enrolment.0.unwrap_or_default()
@@ -870,9 +907,12 @@ pub mod configuration {
 
     /// The repository enrolment budgets, checked before a fetch and during processing.
     ///
-    /// Section 11 sets each default and says a larger full mirror needs an explicit setting. The
-    /// catalogue client reads them through this host's configuration rather than carrying its own
-    /// copy, so one document answers "what may a repository cost here".
+    /// Section 11 names the budgets and gives three of the numbers: 64 MiB of metadata, 100,000
+    /// metadata entries and a 1 GiB cached payload, above which a full mirror needs an explicit
+    /// setting. The rest of the defaults are this build's own, chosen to be the smallest that
+    /// still work, and an owner may raise any of them. The catalogue client reads them through
+    /// this host's configuration rather than carrying its own copy, so one document answers "what
+    /// may a repository cost here".
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields, default)]
     pub struct EnrolmentBudgets {
@@ -900,8 +940,8 @@ pub mod configuration {
     }
 
     impl Default for EnrolmentBudgets {
-        /// Section 11's own numbers, which are what a repository costs here until an owner says
-        /// otherwise.
+        /// What a repository may cost here until an owner says otherwise: section 11's three
+        /// numbers, and this build's own for the budgets it names without one.
         fn default() -> Self {
             Self {
                 metadata_bytes: DEFAULT_METADATA_BYTES,
@@ -1142,8 +1182,13 @@ pub mod configuration {
                 document.profiles.len()
             ));
         }
+        // Every rejected value is taken through the redaction boundary before it is repeated. A
+        // problem list is an error message, and an error message travels into a diagnostic, a
+        // support bundle and a terminal: a document that spelled a credential into a name it
+        // should not have must not have it copied out again on the way to being refused.
         for name in document.profiles.keys() {
             if name.is_empty() || name.len() > MAX_NAME_LEN {
+                let name = super::redaction::redact(name);
                 problems.push(format!(
                     "profile name {name:?} must be between 1 and {MAX_NAME_LEN} characters"
                 ));
@@ -1152,6 +1197,7 @@ pub mod configuration {
         if let Some(selected) = document.default_profile.as_ref()
             && !document.profiles.contains_key(selected)
         {
+            let selected = super::redaction::redact(selected);
             problems.push(format!(
                 "default_profile {selected:?} names no profile in this document"
             ));
@@ -1164,6 +1210,7 @@ pub mod configuration {
         if let Some(rights) = document.ceilings.grant_rights.as_ref() {
             for right in rights {
                 if crate::rights::ActionRight::from_wire(right).is_none() {
+                    let right = super::redaction::redact(right);
                     problems.push(format!("{right:?} is not an action right"));
                 }
             }
@@ -1890,13 +1937,18 @@ pub mod configuration {
     /// exceptions to it are written down: `kr doctor` prints this list, so what a person is told
     /// about this host matches what this host actually does.
     ///
-    /// Two kinds are here. The platform directory variables are how the operating system itself
+    /// Three kinds are here. The platform directory variables are how the operating system itself
     /// names its conventional locations, and reading them is what "native OS-appropriate
-    /// locations" means rather than an exception to it. The network selections are the ones that
-    /// do reach a provider origin and, in one case, the owner signer; they belong in the
+    /// locations" means rather than an exception to it. The session variables are how the
+    /// platform describes the login this host is running in, which is a reading of the
+    /// environment rather than a choice about it. The network selections are the ones that do
+    /// reach a provider origin and, in one case, the owner signer; they belong in the
     /// configuration document and in the pairing record, and until they are there this host says
     /// so out loud.
-    pub const UNGOVERNED: [UngovernedVariable; 16] = [
+    ///
+    /// The list is the whole of what this build reads from its own environment outside
+    /// [`ALLOWLIST`]. A name that is in neither table changes nothing here.
+    pub const UNGOVERNED: [UngovernedVariable; 22] = [
         UngovernedVariable {
             variable: "TMPDIR",
             selects: "the platform's per-user temporary directory, which is the macOS runtime root",
@@ -1913,8 +1965,38 @@ pub mod configuration {
             reaches_authority: false,
         },
         UngovernedVariable {
+            variable: "XDG_CONFIG_HOME",
+            selects: "the platform's per-user configuration directory on Linux",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
             variable: "HOME",
-            selects: "the account's home directory, from which both default roots are derived",
+            selects: "the account's home directory, from which every default root is derived",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "PATH",
+            selects: "where a capability probe looks for the tools it reports on",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "DISPLAY",
+            selects: "the X display a desktop reading describes",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "XAUTHORITY",
+            selects: "the X authority file a desktop reading describes",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "XDG_SESSION_ID",
+            selects: "the login session a desktop reading describes on Linux",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "SESSIONNAME",
+            selects: "the login session a desktop reading describes on Windows",
             reaches_authority: false,
         },
         UngovernedVariable {
@@ -2052,9 +2134,11 @@ pub mod redaction {
     /// Components that make a *key* public rather than secret.
     ///
     /// A public key is something a diagnostic exists to print: redacting it would lose the one
-    /// identifier a person needs to compare two hosts, and it protects nothing. The exception
-    /// applies only when `key` was the word that made the name secret, so `public_api_token` is
-    /// still a token and `public_key` is still a public key.
+    /// identifier a person needs to compare two hosts, and it protects nothing. The exception is
+    /// deliberately narrow. It applies only when `key` was the word that made the name secret
+    /// *and* the rest of the name says nothing else, so `public_key`, `pub_key` and
+    /// `key_fingerprint` are printed while `public_api_token` is still a token and
+    /// `public_access_key` is still an access key.
     const PUBLIC_COMPONENTS: &[&str] = &["public", "pub", "fingerprint"];
 
     /// The secret-naming components a [`PUBLIC_COMPONENTS`] word may excuse.
@@ -2097,39 +2181,106 @@ pub mod redaction {
         redact_opaque_runs(&userinfo)
     }
 
+    /// Returns capability evidence with every free-text field taken through [`redact`].
+    ///
+    /// The one place capability records cross a boundary in a redacted form. A record's sentence
+    /// is written by whatever probed the capability, and the identity is the binary that probe
+    /// found on `PATH` and the version that binary printed: all three come from outside this
+    /// host, and all three travel in diagnostics, in a support bundle and in the answer a paired
+    /// device gets. The evidence this host keeps for itself is never changed by this, because a
+    /// redacted path is no longer a path it can compare.
+    #[must_use]
+    pub fn capability_records(
+        records: Vec<crate::desktop::CapabilityRecord>,
+    ) -> Vec<crate::desktop::CapabilityRecord> {
+        records
+            .into_iter()
+            .map(|record| crate::desktop::CapabilityRecord {
+                disabled_reason: crate::scalars::Nullable(
+                    record.disabled_reason.0.as_deref().map(redact),
+                ),
+                identity: crate::desktop::CapabilityIdentity {
+                    binary: crate::scalars::Nullable(
+                        record.identity.binary.0.as_deref().map(redact),
+                    ),
+                    version: crate::scalars::Nullable(
+                        record.identity.version.0.as_deref().map(redact),
+                    ),
+                    ..record.identity
+                },
+                ..record
+            })
+            .collect()
+    }
+
     /// Replaces the value after a standalone authorization scheme word.
     ///
     /// `Bearer <token>` carries a credential with nothing naming it: the scheme word is the name.
     /// It appears that way in a copied header, in a curl command line and in a library's own error
     /// message.
+    ///
+    /// The scheme word is matched without regard to case, because HTTP does not define one and
+    /// every library spells it differently, and it may be followed by any run of spaces or tabs,
+    /// because a copied header is not always one space wide. It must stand as its own word: a
+    /// name that merely ends in the letters of a scheme is not a scheme.
     fn redact_schemes(text: &str) -> String {
+        // ASCII case folding leaves every byte offset where it was, so a match found in the
+        // folded copy indexes the original.
+        let folded = text.to_ascii_lowercase();
         let mut out = String::with_capacity(text.len());
-        for (index, line) in text.split_inclusive(['\n', '\r']).enumerate() {
-            let _ = index;
-            let mut rest = line;
-            let mut wrote = String::new();
-            while let Some((scheme, at)) = SCHEMES
+        let mut at = 0;
+        while at < text.len() {
+            let Some((found, length)) = SCHEMES
                 .iter()
-                .filter_map(|scheme| rest.find(&format!("{scheme} ")).map(|at| (*scheme, at)))
-                .min_by_key(|(_, at)| *at)
+                .filter_map(|scheme| {
+                    folded[at..]
+                        .find(&scheme.to_ascii_lowercase())
+                        .map(|offset| (at + offset, scheme.len()))
+                })
+                .min_by_key(|(offset, _)| *offset)
+            else {
+                break;
+            };
+            let after = found + length;
+            let own_word = text[..found]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_ascii_alphanumeric());
+            let spacing = text[after..]
+                .find(|character: char| !matches!(character, ' ' | '\t'))
+                .unwrap_or(text.len() - after);
+            let value_start = after + spacing;
+            let value_end = text[value_start..]
+                .find(char::is_whitespace)
+                .map_or(text.len(), |offset| value_start + offset);
+            if own_word
+                && spacing > 0
+                && value_end > value_start
+                && carries_a_value(&text[value_start..value_end])
             {
-                let value_start = at + scheme.len() + 1;
-                let value_end = rest[value_start..]
-                    .find(|character: char| character.is_whitespace())
-                    .map_or(rest.len(), |offset| value_start + offset);
-                if value_end > value_start {
-                    wrote.push_str(&rest[..value_start]);
-                    wrote.push_str(MARKER);
-                    rest = &rest[value_end..];
-                } else {
-                    wrote.push_str(&rest[..value_start]);
-                    rest = &rest[value_start..];
-                }
+                out.push_str(&text[at..value_start]);
+                out.push_str(MARKER);
+                at = value_end;
+            } else {
+                out.push_str(&text[at..after]);
+                at = after;
             }
-            wrote.push_str(rest);
-            out.push_str(&wrote);
         }
+        out.push_str(&text[at..]);
         out
+    }
+
+    /// Whether what follows a scheme word could be the credential rather than the next word.
+    ///
+    /// Three of the four scheme words are also ordinary English, and matching them without regard
+    /// to case makes "the package digest is ..." look like a credential called `is`. A generated
+    /// credential is either long or carries something other than lower-case letters, and a word in
+    /// a sentence is neither, so this keeps the rule useful without it eating prose.
+    fn carries_a_value(value: &str) -> bool {
+        value.chars().count() >= 8
+            || !value
+                .chars()
+                .all(|character| character.is_ascii_lowercase())
     }
 
     /// Returns true when `name` is a name whose value is a credential.
@@ -2153,9 +2304,15 @@ pub mod redaction {
         let public = components
             .iter()
             .any(|component| PUBLIC_COMPONENTS.contains(&component.as_str()));
-        // A public word excuses a key and nothing else: a name that also says token, secret or
-        // password is one whatever else is in front of it.
-        !(public && naming.iter().all(|word| PUBLIC_EXCUSES.contains(word)))
+        // A public word excuses a key and nothing else, and only in a name that says nothing
+        // else: `public_key` is a public key, `public_access_key` is an access key somebody
+        // called public, and a name that also says token, secret or password is a secret whatever
+        // is in front of it.
+        let says_nothing_else = components.iter().all(|component| {
+            PUBLIC_COMPONENTS.contains(&component.as_str())
+                || PUBLIC_EXCUSES.contains(&component.as_str())
+        });
+        !(public && says_nothing_else && naming.iter().all(|word| PUBLIC_EXCUSES.contains(word)))
     }
 
     /// Splits a name into its lowercase components, on its own separators and on case changes.
@@ -2257,22 +2414,45 @@ pub mod redaction {
     ///
     /// A quoted value ends at its closing quote, and a backslash inside one escapes whatever
     /// follows, so a password containing an escaped quote is not cut in half and left exposed.
+    ///
+    /// A quote that is itself escaped opens a value too. `password=\"two words\"` is how a string
+    /// that already had quotes arrives once something has printed it inside another string, which
+    /// is what a rejected value looks like in a parser's own error message; read as unquoted it
+    /// would stop at the space and leave the second word where it was.
     fn value_span(text: &[char], mut start: usize, whole_line: bool) -> (usize, usize) {
         while start < text.len() && (text[start] == ' ' || text[start] == '\t') {
             start += 1;
         }
-        let quote = match text.get(start) {
-            Some('"') => Some('"'),
-            Some('\'') => Some('\''),
-            _ => None,
+        let (quote, escaped) = match (text.get(start), text.get(start + 1)) {
+            (Some('"'), _) => (Some('"'), false),
+            (Some('\''), _) => (Some('\''), false),
+            (Some('\\'), Some(&opener @ ('"' | '\''))) => (Some(opener), true),
+            _ => (None, false),
         };
         if quote.is_some() {
-            start += 1;
+            start += if escaped { 2 } else { 1 };
         }
         let mut end = start;
         while end < text.len() {
             let character = text[end];
             if let Some(quote) = quote {
+                if escaped {
+                    if character == '\\' {
+                        match text.get(end + 1) {
+                            Some(&next) if next == quote => break,
+                            Some(_) => {
+                                end = (end + 2).min(text.len());
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                    if character == '\n' || character == '\r' {
+                        break;
+                    }
+                    end += 1;
+                    continue;
+                }
                 if character == '\\' {
                     end = (end + 2).min(text.len());
                     continue;
@@ -2474,10 +2654,149 @@ mod tests {
             "session_limit=16",
             "keyboard: unavailable",
             "public_key=7f3ab99c",
+            "key_fingerprint=7f3ab99c",
             "monkeys: 4",
         ] {
             assert_eq!(redaction::redact(kept), kept, "{kept} says nothing secret");
         }
+    }
+
+    /// KR-REQ-26.44: a scheme word is a scheme however the library that printed it spelled it.
+    #[test]
+    fn an_authorization_scheme_is_recognised_in_every_spelling() {
+        for text in [
+            "Bearer hunter2",
+            "bearer hunter2",
+            "BEARER hunter2",
+            "Bearer  hunter2",
+            "Bearer\thunter2",
+            "basic hunter2",
+            "the call sent token hunter2 and was refused",
+        ] {
+            let redacted = redaction::redact(text);
+            assert!(!redacted.contains("hunter2"), "{text} -> {redacted}");
+        }
+        // The scheme has to be its own word: a name that merely ends in one is not a scheme, and
+        // a scheme with nothing after it has no value to take.
+        for kept in ["subscriber hunter2", "Bearer", "Bearer "] {
+            assert_eq!(redaction::redact(kept), kept, "{kept} names no credential");
+        }
+    }
+
+    /// KR-REQ-26.44: a public word excuses a key, and only a name that says nothing else.
+    #[test]
+    fn a_public_word_excuses_a_key_and_nothing_else() {
+        for (text, gone) in [
+            ("public_access_key=hunter2", "hunter2"),
+            ("public_api_token=hunter2", "hunter2"),
+            ("pub_session_key=hunter2", "hunter2"),
+        ] {
+            let redacted = redaction::redact(text);
+            assert!(!redacted.contains(gone), "{text} -> {redacted}");
+        }
+    }
+
+    /// KR-REQ-26.44: a value a document is refused for is not repeated on the way out.
+    #[test]
+    fn a_rejected_value_is_redacted_before_it_is_repeated() {
+        let loaded = configuration::load(None);
+        let refused = configuration::edit(
+            &loaded,
+            &Change::GrantRights(Some(vec![r#"password="two words""#.to_owned()])),
+        )
+        .expect_err("a right this build does not know");
+        let message = format!("{refused}");
+        assert!(
+            !message.contains("two words"),
+            "the refusal says which value it refused without repeating it: {message}"
+        );
+        assert!(
+            message.contains("not an action right"),
+            "and still says why: {message}"
+        );
+    }
+
+    /// KR-REQ-26.44: capability evidence is redacted wherever it leaves this host.
+    #[test]
+    fn capability_evidence_is_redacted_where_it_leaves_this_host() {
+        let record = crate::desktop::CapabilityRecord {
+            capability: crate::ids::CapabilityId::new("tool.probe".to_owned())
+                .expect("a capability name"),
+            version: U64::new(1),
+            subject: crate::desktop::CapabilitySubject {
+                environment_id: crate::ids::EnvironmentId::new(crate::scalars::Uuid::from_bytes(
+                    [0; 16],
+                )),
+                desktop_session_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application: Nullable::null(),
+                terminal: Nullable::null(),
+            },
+            revision: crate::ids::CapabilityRevision::new(3),
+            state: crate::desktop::CapabilityState::MissingInstallation,
+            evidence_source: crate::desktop::CapabilityEvidenceSource::DisclosedProbe,
+            identity: crate::desktop::CapabilityIdentity {
+                binary: Nullable::some("/opt/tools/token=A1b2C3d4E5f6G7h8I9j0/probe".to_owned()),
+                version: Nullable::some("probe 1.0 (key=A1b2C3d4E5f6G7h8I9j0)".to_owned()),
+                ..crate::desktop::CapabilityIdentity::none()
+            },
+            invalidation: Vec::new(),
+            disabled_reason: Nullable::some("refused: Bearer A1b2C3d4E5f6G7h8I9j0".to_owned()),
+            observed_at_ms: TimestampMs::new(0),
+        };
+        let redacted = redaction::capability_records(vec![record.clone()]);
+        let one = redacted.first().expect("one record");
+        for text in [
+            one.identity.binary.0.clone().unwrap_or_default(),
+            one.identity.version.0.clone().unwrap_or_default(),
+            one.disabled_reason.0.clone().unwrap_or_default(),
+        ] {
+            assert!(!text.contains("A1b2C3d4E5f6"), "{text}");
+        }
+        assert_eq!(
+            one.capability, record.capability,
+            "the record is still the record it was"
+        );
+    }
+
+    /// KR-REQ-26.44: a ceiling's own provenance goes through the boundary with its value.
+    #[test]
+    fn a_ceiling_origin_never_reaches_the_wire() {
+        let mut configuration = EffectiveConfiguration::unread();
+        configuration.ceilings.push(CeilingValue {
+            key: "session_limit".to_owned(),
+            configured: Nullable::some("16".to_owned()),
+            value: "16".to_owned(),
+            source: ValueSource::HostConfiguration,
+            origin: Nullable::some(
+                "/home/example/token=A1b2C3d4E5f6G7h8I9j0/config.json".to_owned(),
+            ),
+            effect: configuration::ValueEffect::Immediately,
+            narrowed_by: Nullable::some("password=A1b2C3d4E5f6G7h8I9j0 said so".to_owned()),
+            refused: false,
+        });
+        let result = HostDoctorResult::new(Vec::new(), configuration);
+        let ceiling = result.configuration.ceilings.first().expect("the ceiling");
+        assert!(
+            !ceiling
+                .origin
+                .0
+                .clone()
+                .unwrap_or_default()
+                .contains("A1b2C3d4E5f6"),
+            "{:?}",
+            ceiling.origin
+        );
+        assert!(
+            !ceiling
+                .narrowed_by
+                .0
+                .clone()
+                .unwrap_or_default()
+                .contains("A1b2C3d4E5f6"),
+            "{:?}",
+            ceiling.narrowed_by
+        );
     }
 
     /// KR-REQ-26.44: an exported configuration goes through the same boundary as a check.

@@ -5001,9 +5001,12 @@ export interface ConfigurationCeilings {
 /**
  * The repository enrolment budgets, checked before a fetch and during processing.
  *
- * Section 11 sets each default and says a larger full mirror needs an explicit setting. The
- * catalogue client reads them through this host's configuration rather than carrying its own
- * copy, so one document answers "what may a repository cost here".
+ * Section 11 names the budgets and gives three of the numbers: 64 MiB of metadata, 100,000
+ * metadata entries and a 1 GiB cached payload, above which a full mirror needs an explicit
+ * setting. The rest of the defaults are this build's own, chosen to be the smallest that
+ * still work, and an owner may raise any of them. The catalogue client reads them through
+ * this host's configuration rather than carrying its own copy, so one document answers "what
+ * may a repository cost here".
  */
 export interface EnrolmentBudgets {
   /**

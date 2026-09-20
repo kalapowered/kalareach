@@ -546,3 +546,85 @@ async fn a_configured_execution_context_is_the_one_a_session_is_created_in() {
     session.close();
     host.stop().await;
 }
+
+/// KR-REQ-26.15, KR-REQ-26.16: a document edited underneath this host is accepted before it is
+/// reported, so a ceiling a diagnostic prints is a ceiling admission is enforcing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_edited_underneath_this_host_is_accepted_before_it_is_reported() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+
+    controller
+        .apply_configuration(&Change::SessionLimit(Some(9)))
+        .await
+        .expect("the owner's ceiling");
+
+    // A person editing their own configuration file, with no daemon involved: a new revision and
+    // a lower number, written the way the host writes it.
+    let document = kr_worker::config::document_path(controller.paths());
+    let contents = std::fs::read_to_string(&document).expect("the document this host wrote");
+    let mut edited: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
+    let revision = edited["revision"].as_u64().expect("a revision") + 1;
+    edited["revision"] = serde_json::json!(revision);
+    edited["ceilings"]["session_limit"] = serde_json::json!(4);
+    kr_ipc::paths::write_owner_only_file(
+        &document,
+        serde_json::to_string(&edited).expect("JSON").as_bytes(),
+    )
+    .expect("the edited document");
+
+    let effective = controller.effective_configuration().await;
+    assert_eq!(
+        effective.revision.get(),
+        revision,
+        "the report names the revision this host accepted"
+    );
+    let ceiling = effective
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "session_limit")
+        .expect("the session ceiling");
+    assert_eq!(ceiling.value, "4", "and the ceiling it now holds");
+
+    let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("host.info is served to the device"),
+    );
+    assert_eq!(
+        info.session_limit.get(),
+        4,
+        "admission enforces exactly what the report printed"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-26.16: a change affecting authority is not acknowledged while a worker still holds work
+/// admitted under the authority it withdrew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+
+    // No worker is running here, so every barrier holds and the change completes. The assertion
+    // is that completion is what the barrier says rather than what the write said.
+    let applied = controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect("a change that fences dispatch");
+    assert!(applied.fences_dispatch, "the change affects authority");
+    assert!(
+        applied.barrier_holds && applied.pending_workers == 0,
+        "and it is acknowledged only because every barrier held: {applied:?}"
+    );
+
+    host.stop().await;
+}

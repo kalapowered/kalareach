@@ -61,8 +61,14 @@ one.
 
 ## Configuration
 
-One versioned document per user, per environment, in that environment's own state directory:
-`config.json`, beside the registry. It is the only configuration file this host reads.
+One versioned document per user, per environment: `config.json`, in the location the platform keeps
+configuration in. On Linux that is `$XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json`,
+or `~/.config/kalareach/...` when the variable is unset, which keeps configuration out of the state
+tree the way the desktop conventions ask. On macOS and Windows it is the environment's own state
+directory, which is where those platforms keep a per-user application's settings. An environment
+whose state directory was chosen explicitly, with `KR_STATE_DIR`, keeps its document inside that
+directory on every platform, so an isolated installation stays isolated. It is the only
+configuration file this host reads.
 
 ```json
 {
@@ -99,10 +105,12 @@ One versioned document per user, per environment, in that environment's own stat
 | owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
 | unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
 
-Editing is validated before a revision is applied, and one writer edits at a time: a writer takes
-`.config.lock` beside the document, reads, validates, checks that the document is still what it was,
-writes, and releases the lock. A lock left behind by a process that ended without releasing it is
-taken over after thirty seconds.
+Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
+operating-system lock on `.config.lock` beside the document, reads, validates, checks that the
+document is still what it was and still says what it said, writes, puts the change where the things
+it restricts read it, and releases the lock. The lock lives in the open file handle, so a process
+that ends without releasing it releases it anyway and nothing has to guess from a timestamp whether
+a holder is still alive.
 
 A change that would affect authority fences dispatch before the change is acknowledged, so work
 admitted under the old authority cannot be dispatched by the time the caller is told the change is
@@ -142,15 +150,18 @@ No other inherited variable takes part in the precedence. No entry in that table
 organisation restriction, a grant ceiling, a hard resource limit or a provider origin, and none can:
 each entry has to name an ordinary preference, and those are not.
 
-Two other groups of variables this build reads are outside the precedence, and `kr doctor` lists
-both rather than leaving the sentence above to be read as more than it says.
+Three other groups of variables this build reads are outside the precedence, and `kr doctor` lists
+all of them rather than leaving the sentence above to be read as more than it says.
 
 | Group | Variables | What they select |
 | --- | --- | --- |
-| platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
+| platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
+| session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME` | what the platform says about the login this host is running in and where a capability probe looks for the tools it reports on |
 | network selections | `KR_NETWORK`, `KR_NETWORK_BIND`, `KR_NETWORK_RELAYS`, `KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`, `KR_NETWORK_DNS_ORIGIN`, `KR_NETWORK_RELAY_CA`, `KR_NETWORK_RELAY_ONLY`, `KR_NETWORK_LOCAL_DISCOVERY`, `KR_NETWORK_MAINLINE`, `KR_NETWORK_OWNER_KEY` | whether and how this daemon joins a network |
 
-Five of the network selections reach a provider origin or the owner signing key. `kr doctor` warns
+Six of the network selections reach a provider origin, a trust decision or the owner signing key:
+`KR_NETWORK_RELAYS`, `KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`,
+`KR_NETWORK_DNS_ORIGIN`, `KR_NETWORK_RELAY_CA` and `KR_NETWORK_OWNER_KEY`. `kr doctor` warns
 whenever one of those is set on this host and names what it selects, because a provider origin and
 an owner signer belong in this host's configuration and in its pairing record rather than in the
 environment a process happened to inherit.

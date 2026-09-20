@@ -213,16 +213,19 @@ pub fn effective(
         None
     };
 
-    let enrolment_source = if ceilings.enrolment.is_present() {
+    // An enrolment section may name one budget and leave the other nine to the schema default, so
+    // "the document supplied this" is per budget rather than per section. A budget that matches
+    // the default is reported as the default, whether the document spelled it out or said nothing
+    // about it, because both leave the same number in force from the same place.
+    let configured_budgets = enrolment.configured.unwrap_or_default();
+    let default_budgets = configuration::EnrolmentBudgets::default();
+    let supplied_budgets = configured_budgets != default_budgets;
+    let enrolment_source = if supplied_budgets {
         configuration::ValueSource::HostConfiguration
     } else {
         configuration::ValueSource::Default
     };
-    let enrolment_origin = if ceilings.enrolment.is_present() {
-        Some(doc_path.clone())
-    } else {
-        None
-    };
+    let enrolment_origin = supplied_budgets.then(|| doc_path.clone());
 
     let rights_source = if ceilings.grant_rights.is_present() {
         configuration::ValueSource::HostConfiguration
@@ -263,7 +266,7 @@ pub fn effective(
                 enrolment_origin,
                 configuration::ValueEffect::Immediately,
                 |budgets| {
-                    format!(
+                    let mut line = format!(
                         "{} metadata bytes, {} entries, {} generations retained, {} cached payload \
                          bytes, {} per package, {} objects, {} expanded, {} per transfer, {} ms to \
                          compile{}",
@@ -281,7 +284,16 @@ pub fn effective(
                         } else {
                             ""
                         }
-                    )
+                    );
+                    // Which of the ten this host's configuration chose, so one budget raised in a
+                    // document cannot read as ten budgets the owner set.
+                    let supplied = ceilings::supplied_budgets(budgets);
+                    if supplied.is_empty() {
+                        line.push_str("; every budget is the default");
+                    } else {
+                        line.push_str(&format!("; configured here: {}", supplied.join(", ")));
+                    }
+                    line
                 },
             ),
             kr_protocol::hostinfo::CeilingValue {

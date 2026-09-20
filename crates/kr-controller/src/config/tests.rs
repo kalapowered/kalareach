@@ -663,3 +663,67 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
     assert!(!decided.permitted.rights.contains(&ActionRight::HostManage));
     assert!(decided.refused_rights.contains(&ActionRight::HostManage));
 }
+
+/// KR-REQ-01.23: an enrolment section that names one budget is one budget the owner configured,
+/// not ten.
+#[test]
+fn each_enrolment_budget_keeps_whether_it_was_configured_or_defaulted() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+
+    let report = effective(
+        &open(&environment),
+        HardLimits::default(),
+        WorkerProfile::HeadlessUser,
+    );
+    let enrolment = report
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "enrolment")
+        .expect("the enrolment ceiling");
+    assert_eq!(
+        enrolment.source,
+        configuration::ValueSource::Default,
+        "a host that configured nothing reports the defaults as defaults"
+    );
+    assert!(
+        enrolment.origin.0.is_none(),
+        "and names no document as their origin: {:?}",
+        enrolment.origin
+    );
+
+    // One budget raised, the other nine left out of the document entirely.
+    let raised = EnrolmentBudgets {
+        retained_generations: 5,
+        ..EnrolmentBudgets::default()
+    };
+    edit_once(&environment, &Change::Enrolment(raised)).expect("the owner's budget");
+
+    let report = effective(
+        &open(&environment),
+        HardLimits::default(),
+        WorkerProfile::HeadlessUser,
+    );
+    let enrolment = report
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "enrolment")
+        .expect("the enrolment ceiling");
+    assert_eq!(
+        enrolment.source,
+        configuration::ValueSource::HostConfiguration,
+        "the section the owner wrote is the host's configuration"
+    );
+    assert!(
+        enrolment
+            .value
+            .contains("configured here: retained_generations"),
+        "and the report names the one budget they chose: {}",
+        enrolment.value
+    );
+    assert_eq!(
+        ceilings::supplied_budgets(&raised),
+        vec!["retained_generations"],
+        "the rest are the schema's own numbers"
+    );
+}

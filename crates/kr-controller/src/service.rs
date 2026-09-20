@@ -300,6 +300,14 @@ pub struct Controller {
     /// host that has never synchronised a catalogue, and the diagnostic says so rather than
     /// claiming anything about a catalogue this host does not have.
     catalogue_evidence: Option<Arc<dyn crate::config::catalogue::CatalogueEvidence>>,
+    /// The configuration revision whose effects this daemon has put into force.
+    ///
+    /// A document is a file a person may also edit by hand, and its effects live outside it: the
+    /// session number admission enforces is in the registry, not in the document. This is what
+    /// keeps the two the same fact. Every revision is accepted through one path, in order, and a
+    /// revision below this one applies nothing, so a document restored from a backup underneath a
+    /// running host cannot put an old ceiling back.
+    accepted_configuration: Mutex<u64>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -482,14 +490,17 @@ impl Controller {
         // becomes the number admission enforces. Only when the document actually names one: a
         // document that says nothing, and one this build cannot read, must not lift a restriction
         // the owner accepted through some other path.
+        let startup_configuration = crate::config::open(&setup.paths);
+        let accepted_configuration = startup_configuration.revision();
         if let Some(limit) = crate::config::configured_session_limit(
-            &crate::config::open(&setup.paths),
+            &startup_configuration,
             crate::config::HardLimits {
                 sessions_per_environment: None,
             },
         ) {
             registry.set_session_limit(limit)?;
         }
+        drop(startup_configuration);
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let boot = setup.boot_identity.clone();
@@ -556,11 +567,7 @@ impl Controller {
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
-        let mut initial_desktop = crate::desktop::current(boot.clone());
-        let platform_profile = crate::desktop::default_profile(&initial_desktop);
-        initial_desktop.worker_profile = crate::config::open(&paths)
-            .worker_profile(None, platform_profile)
-            .value;
+        let initial_desktop = resolved_desktop(&paths, &boot);
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -575,6 +582,7 @@ impl Controller {
             generation,
             paths: setup.paths,
             catalogue_evidence: None,
+            accepted_configuration: Mutex::new(accepted_configuration),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -3983,10 +3991,7 @@ impl Controller {
     async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
         let mut reading = self.desktop.lock().await;
         if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
-            let mut context = crate::desktop::current(self.boot_identity.clone());
-            let platform = crate::desktop::default_profile(&context);
-            context.worker_profile = self.configuration().worker_profile(None, platform).value;
-            reading.context = context;
+            reading.context = resolved_desktop(&self.paths, &self.boot_identity);
             reading.read_at = std::time::Instant::now();
         }
         (reading.context.clone(), reading.revision)
@@ -4310,7 +4315,12 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
-        let desktop = self.capability_report().await?;
+        let mut desktop = self.capability_report().await?;
+        // The records leave this host here, so they cross the same redaction boundary the
+        // diagnostics and the support bundle do. A probe names the binary it found on `PATH` and
+        // repeats what that binary printed; the evidence this host keeps for its own comparisons
+        // is untouched, because a redacted path is no longer a path it can compare.
+        desktop.records = kr_protocol::hostinfo::redaction::capability_records(desktop.records);
         encode(&EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             // The same answer `host.info` gives: what this host creates a session in when the
@@ -4423,13 +4433,56 @@ impl Controller {
     }
 
     /// Returns what this host's configuration currently resolves to.
-    #[must_use]
+    ///
+    /// The document's effects are put into force first, so a report can never describe a ceiling
+    /// that admission is not enforcing. A document edited outside this daemon therefore takes
+    /// effect the next time anything asks this question, at the revision this host accepted it
+    /// under, rather than at the next restart.
     pub async fn effective_configuration(&self) -> kr_protocol::hostinfo::EffectiveConfiguration {
+        // The report is built whatever the effects did. A registry this host cannot write is
+        // already a failed diagnostic of its own, and answering nothing would take away the one
+        // report a person has to find out why.
+        let _ = self.accept_configuration().await;
         crate::config::effective(
             &self.configuration(),
             crate::config::HardLimits::default(),
             crate::desktop::default_profile(&self.desktop().await.0),
         )
+    }
+
+    /// Puts the current configuration document's effects into force, and returns the revision.
+    ///
+    /// The one ordered path, and the whole of the ordering is this lock: it is taken *before* the
+    /// document is read, so an edit applying its own effects and a reader accepting what it found
+    /// cannot interleave, and whichever of them runs last is the one that read the document that
+    /// is actually on disk. A revision already accepted has nothing left to put anywhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an effect could not be applied.
+    async fn accept_configuration(&self) -> Result<u64> {
+        let mut accepted = self.accepted_configuration.lock().await;
+        let resolver = self.configuration();
+        let revision = resolver.revision();
+        if revision == *accepted {
+            return Ok(revision);
+        }
+        self.apply_effects(&resolver).await?;
+        *accepted = revision;
+        Ok(revision)
+    }
+
+    /// Puts one reading of the document's ceilings where the things they restrict read them.
+    ///
+    /// Only what the document actually names. A document that says nothing about the session
+    /// number, and one this build cannot read, leaves the number admission already enforces
+    /// exactly as it is: a restriction the owner accepted must not be lifted because a later build
+    /// could not read the file it was in.
+    async fn apply_effects(&self, resolver: &kr_worker::config::Resolver) -> Result<()> {
+        if let Some(limit) = crate::config::configured_session_limit(resolver, self.hard_limits()) {
+            self.registry.lock().await.set_session_limit(limit)?;
+        }
+        Ok(())
     }
 
     /// Applies one validated configuration edit and does what the change owes.
@@ -4448,14 +4501,12 @@ impl Controller {
         change: &kr_protocol::hostinfo::configuration::Change,
     ) -> Result<crate::config::Applied> {
         let edit = crate::config::apply(&self.paths, change, self.hard_limits())?;
-        // Inside the lock. What the new document says goes where the thing it restricts actually
-        // reads it before another writer can prepare an edit of its own, so a slower older edit
-        // cannot put its number back after a newer one has landed.
-        if let Some(limit) =
-            crate::config::configured_session_limit(&self.configuration(), self.hard_limits())
-        {
-            self.registry.lock().await.set_session_limit(limit)?;
-        } else if matches!(
+        // Inside the lock, and through the same ordered path every other revision takes. What the
+        // new document says goes where the thing it restricts actually reads it before another
+        // writer can prepare an edit of its own, so a slower older edit cannot put its number back
+        // after a newer one has landed.
+        let mut accepted = self.accepted_configuration.lock().await;
+        if matches!(
             change,
             kr_protocol::hostinfo::configuration::Change::SessionLimit(None)
         ) {
@@ -4464,7 +4515,11 @@ impl Controller {
             self.registry.lock().await.set_session_limit(
                 kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64,
             )?;
+        } else {
+            self.apply_effects(&self.configuration()).await?;
         }
+        *accepted = edit.applied.revision;
+        drop(accepted);
         let mut applied = edit.applied.clone();
         if applied.fences_dispatch {
             // Before the caller is told the change is in force. The barrier travels with the
@@ -4475,6 +4530,25 @@ impl Controller {
             applied.pending_workers = barrier.pending().len() as u64;
             applied.barrier_holds = barrier.holds();
             applied.authority_revision = Some(barrier.authority_revision);
+            if !barrier.holds() {
+                // Section 26 says a change affecting authority fences dispatch *before* it is
+                // acknowledged. A worker that has not acknowledged its fence still holds work
+                // admitted under the authority this change withdrew, so the revision is recorded
+                // and the caller is told what is outstanding rather than told it is done.
+                let pending = barrier
+                    .pending()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                drop(edit);
+                return Err(ControllerError::Configuration(format!(
+                    "revision {} is written and dispatch is fenced, but {} of this host's workers \
+                     have not acknowledged the fence yet ({pending}); the change is in force for \
+                     dispatch once they do",
+                    applied.revision, applied.pending_workers
+                )));
+            }
         }
         if applied
             .invalidated
@@ -4485,7 +4559,14 @@ impl Controller {
                 .checked_sub(DESKTOP_REREAD_INTERVAL)
                 .unwrap_or_else(std::time::Instant::now);
             drop(reading);
-            let _ = self.capability_report().await;
+            // The evidence taken under the old profile is replaced here, under the same lock the
+            // edit holds, and a failure to record the revision it changed to is this call's
+            // failure. Returning success would publish records under a revision that no longer
+            // describes them, which is the one thing a revision exists to prevent.
+            let report = self.capability_report().await;
+            drop(edit);
+            report?;
+            return Ok(applied);
         }
         drop(edit);
         Ok(applied)
@@ -6353,6 +6434,27 @@ const fn forwarded_to_worker(method: Method) -> bool {
 /// record that is there and cannot be read says nothing at all, and `None` is that: this host then
 /// serves revision zero, which claims nothing, rather than starting again from one and handing out
 /// a revision it may already have used.
+/// Reads the desktop this host has, in the execution context its configuration resolves to.
+///
+/// The platform reading comes first, because what the platform offers is what decides the default
+/// this configuration may then override. When the resolved context is not the one the reading was
+/// taken in, the reading is taken again in that context instead of having its label changed: a
+/// headless context has no desktop session, no display server and no graphical access, and
+/// evidence that said `headless_user` while still carrying a desktop's identity would describe a
+/// worker nobody can create here.
+fn resolved_desktop(paths: &EnvironmentPaths, boot: &BootIdentity) -> DesktopContext {
+    let physical = crate::desktop::current(boot.clone());
+    let platform = crate::desktop::default_profile(&physical);
+    let resolved = crate::config::open(paths)
+        .worker_profile(None, platform)
+        .value;
+    if resolved == physical.worker_profile {
+        physical
+    } else {
+        kr_worker::desktop::context(resolved, boot.clone())
+    }
+}
+
 fn capability_revision(paths: &EnvironmentPaths) -> Option<CapabilityRevision> {
     let path = paths.state_dir().join(CAPABILITY_REVISION_FILE);
     match kr_ipc::paths::read_owner_only_file(&path, CAPABILITY_REVISION_LIMIT) {
