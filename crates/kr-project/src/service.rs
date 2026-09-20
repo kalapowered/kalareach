@@ -2386,12 +2386,18 @@ impl ProjectService {
     /// on them.
     ///
     /// The change-set store counts what holds a version and removes it in one transaction, so
-    /// nothing recorded in between is lost. A pin is not in that store, and reading it first would
-    /// leave the window this closes: a pin recorded between the reading and the removal would be a
-    /// pin the removal never saw. Here the reading and the caller's own transaction are inside one
-    /// hold on this journal, and [`Self::retain`] takes that same lock, so a pin either lands
-    /// before the reading and is counted or waits until the removal has happened and is refused by
-    /// the workspace state.
+    /// nothing recorded in between is lost. A pin is not in that store, and reading the pins and
+    /// then removing the version would leave a window between the two: a pin recorded in there
+    /// would be a pin the removal never saw. Here the reading and the caller's own transaction
+    /// happen inside one hold on this journal, and [`Self::retain`] takes that same lock, so a pin
+    /// is either recorded before the reading, where it is counted, or after the caller's
+    /// transaction has finished.
+    ///
+    /// What that establishes is exclusion, and it is worth saying what it does not: this journal
+    /// knows nothing about versions, so a pin recorded after a version was deleted is still
+    /// recorded. A caller that must not record one against a version that is gone checks that for
+    /// itself, inside a hold on this journal, so that its check and its write cannot be separated
+    /// either.
     ///
     /// **The lock order is this journal first, the caller's store inside it.** A caller that
     /// already holds its own store's lock does not call this: the pin's own path takes them the

@@ -1436,9 +1436,13 @@ recorded immediately before the write.
 
 What a device is additionally held to is its grant: `project.create` for initialising, cloning and
 adopting, `workspace.manage` for creating and removing a working copy, and `session.view` for the
-four reads. A read is narrowed to what the grant admits rather than refused: two grants over one
-host list different repositories and different working copies, and a working copy's bound sessions
-are narrowed the same way.
+two listings. A listing is narrowed to what the grant admits rather than refused: two grants over
+one host list different repositories and different working copies, and a working copy's bound
+sessions are narrowed the same way. `project.read` and `workspace.read` name one subject and
+require no right of their own, so they are refused outright for a subject in an environment the
+grant does not cover — a narrowed listing is not a way to find an identifier an unnarrowed read
+would then answer for — and the session content they carry is narrowed exactly as the listings'
+is.
 
 **Five of the mutations name a place on this host's filesystem**, and for those the action right is
 not the whole of the restriction. `project.init`, `project.clone` and `project.adopt` carry the
@@ -1484,8 +1488,9 @@ opening a repository and surveying it, and taking the journal's lock all happen 
 answer, and a revocation or an expiry completing in there would otherwise reach an action that then
 begins. Inside the transaction there is nothing left to wait for: the journal is held, the check is
 answered, and the first durable write follows with nothing awaited between them. An action refused
-there never claimed its action either, so a repeat under the same identifier is a fresh request
-rather than a retry of something half performed. Section 9 asks for authority and expiry to be
+there claims nothing in the project journal, so there is no half-performed effect to reconcile; the
+daemon records the refusal against the action identifier, and a repeat of that identifier is
+answered with it rather than performed. Section 9 asks for authority and expiry to be
 revalidated immediately before the effect, and that is where they are.
 
 ## What the host owes the transport

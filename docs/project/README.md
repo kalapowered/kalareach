@@ -815,7 +815,7 @@ work is the one a caller gets by asking for it plainly.
 | Class | What it is |
 | --- | --- |
 | `proposal` | Two immutable versions and no write to any working tree: what the destination holds now, and what it would hold. A person decides |
-| `versioned_reference` | Reference compare-and-swap. The apply reads the reference and compares it with the value the request expects; a value that differs is `DRAFT_CONFLICT`, and nothing is written. The move is the expected-old-value update described under the restricted profile above, performed under a write grant for the repository's Git common directory and nothing wider. It does **not** atomically update a dirty working tree: what moves is the reference, and a tree with uncommitted work in it is unchanged by one. The apply returns the comparison and that statement; the reference is moved by the service that owns the repository |
+| `versioned_reference` | Reference compare-and-swap. The apply reads the reference and compares it with the value the request expects; a value that differs is `DRAFT_CONFLICT`, and nothing is written. The move is the expected-old-value update described under the restricted profile above, performed under a write grant for the repository's Git common directory and nothing wider. It does **not** atomically update a dirty working tree: what moves is the reference, and a tree with uncommitted work in it is unchanged by one. The apply returns the comparison and that statement rather than moving the reference itself; the update is performed by the project service, whose restricted profile runs it |
 | `shared_existing` | The user's own working tree, written in place. Best-effort conflict detection, not universal no-clobber compare-and-swap |
 
 An apply carries **operations**, not only content: a path the version holds is installed, and a
@@ -996,12 +996,13 @@ transaction, that those versions are still there — so a holder recorded while 
 deciding is either counted or refused, and never left pointing at something that is gone.
 
 The project service's pin lives in another store, and the two stores do not share a transaction.
-What joins them is the project journal itself: the pins against one change set are read with that
-journal **held**, and the caller's own removal happens inside that hold. Recording a pin takes the
-same lock, so a pin either lands before the reading and is counted, or waits until the removal has
-finished. The pins are found by the change set they name rather than through the workspace that
-holds them, so the reading does not depend on knowing which workspaces to ask about: recording one
-pin twice is one pin, and two pins whose reasons read alike are two pins.
+What the project service offers instead is a **guarded reading**: the pins against one change set
+are read with the project journal held, and whatever the caller does with them happens inside that
+hold. Recording a pin takes the same lock, so a pin is either recorded before the reading, where it
+is counted, or after the caller has finished. The pins are found by the change set they name rather
+than through the workspace that holds them, so the reading does not depend on knowing which
+workspaces to ask about: recording one pin twice is one pin, and two pins whose reasons read alike
+are two pins.
 
 ### Authority, and where it is decided
 
