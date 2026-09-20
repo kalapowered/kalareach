@@ -2152,6 +2152,114 @@ fn duplex_over_pipes(
     (owner, upstream_there, client_there, writes)
 }
 
+/// KR-REQ-11.32 and KR-REQ-09: a full byte queue refuses in place, and the connection says so.
+///
+/// The bound on what one end holds is in bytes, and the frame that meets it is the frame this host
+/// has already taken off the socket. Two things follow and both are tested here. What was admitted
+/// before the bound still goes: drainage returns before the write deadline and every one of those
+/// frames reaches the upstream, in order, with nothing answered back to the terminal for them.
+/// And the frame the bound refuses is not quietly dropped: the connection that took it ends,
+/// because there is no identifier this host could answer every refusal under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection_that_took_it() {
+    let broker = broker();
+    // A pipe that takes almost nothing, so what is queued stays queued.
+    let (owner, mut upstream, mut client, writes) = duplex_over_pipes(&broker, 64);
+    let drained = tokio::spawn(writes);
+
+    // Frames large enough that a handful of them passes the byte bound.
+    let padding = "x".repeat(64 * 1024);
+    let mut admitted = Vec::new();
+    let mut refused = None;
+    for id in 0..64_u32 {
+        let frame =
+            format!(r#"{{"id":{id},"method":"session/update","params":{{"pad":"{padding}"}}}}"#);
+        match owner
+            .from_client(frame.as_bytes(), TimestampMs::new(2))
+            .await
+        {
+            Ok(_) => admitted.push(id),
+            Err(error) => {
+                refused = Some((id, frame, error));
+                break;
+            }
+        }
+    }
+    let (refused_id, refused_frame, refusal) = refused.expect("the byte bound refuses a frame");
+    assert!(
+        !admitted.is_empty(),
+        "the bound is reached by what was queued, not by the first frame"
+    );
+    assert!(
+        owner.queued_to_upstream() <= kr_worker::broker::MAX_QUEUED_BYTES,
+        "nothing beyond the bound was taken"
+    );
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable,
+        "and the refusal says the connection could not carry it"
+    );
+
+    // Drainage returns. Everything admitted before the bound goes, in the order it was admitted.
+    let mut reader = tokio::io::BufReader::new(&mut upstream);
+    let mut arrived = Vec::new();
+    while arrived.len() < admitted.len() {
+        let line = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_line_from(&mut reader),
+        )
+        .await
+        .expect("the queued frames go once the peer reads again");
+        let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a frame");
+        arrived.push(body);
+    }
+    assert_eq!(
+        arrived.len(),
+        admitted.len(),
+        "every frame admitted before the bound reached the upstream"
+    );
+
+    // And nothing was answered back to the terminal for a frame that went: one outcome each.
+    let answered = read_available(&mut client).await;
+    for id in &admitted {
+        assert!(
+            !answered.contains(&format!("\"id\":{id},\"error\"")),
+            "a frame that reached the upstream is not also refused to the terminal: {id}"
+        );
+    }
+
+    // The refused frame, read off the socket by the connection's own reader, ends the connection.
+    let (mut feeding, fed) = tokio::io::duplex(1 << 20);
+    let serving = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move { owner.serve(fed, false).await })
+    };
+    let _ = refused_id;
+    feeding
+        .write_all(format!("{refused_frame}\n").as_bytes())
+        .await
+        .expect("the terminal writes the frame this host cannot carry");
+    tokio::time::timeout(std::time::Duration::from_secs(20), serving)
+        .await
+        .expect("the reader ends rather than dropping the frame it took")
+        .expect("its task is joined");
+    assert!(
+        owner.stopping(),
+        "a frame that was taken and could not be carried ends the connection"
+    );
+
+    drained.abort();
+}
+
+/// Reads one line from a buffered reader, for a test that follows a stream of frames.
+async fn next_line_from<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> String {
+    let mut line = String::new();
+    tokio::io::AsyncBufReadExt::read_line(reader, &mut line)
+        .await
+        .expect("the stream is readable");
+    line
+}
+
 /// KR-REQ-12.13 and KR-REQ-09: the client's own requests are bounded, given up on a deadline, and
 /// cleared when the connection ends.
 ///
@@ -4091,6 +4199,247 @@ async fn kr_req_12_11_an_overflowed_observer_replays_what_its_queue_lost() {
     }
 
     carrying.abort();
+    served.drained.abort();
+}
+
+/// KR-REQ-12.11 and section 12: what was announced and never recorded is reported as a gap.
+///
+/// A stretch the journal could not take is published and not written, so no replay can return it.
+/// An observer that overflows inside such a stretch therefore cannot be made whole by the outbox,
+/// and the one thing it must not do is hand the views a shorter history that looks complete. It
+/// tells them to start again instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_to_start_again() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let owner = Arc::clone(&served.owner);
+    let mut upstream_client = tokio::io::BufReader::new(served.client);
+
+    let host = kr_ipc::testing::TempHost::create();
+    let (runtime, mut stream) = session_runtime_and_stream(session(), &host).await;
+
+    // One recorded transition, then a journal that cannot be written.
+    owner
+        .from_upstream(
+            br#"{"id":700,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut upstream_client).await;
+    broker
+        .enter_volatile("the journal could not be written", TimestampMs::new(3))
+        .expect("the gateway enters volatile-native mode");
+
+    // More transitions than the observation queue holds, with nothing reading it. None of them is
+    // recorded, so none of them can be replayed.
+    for index in 0..(kr_worker::broker::MAX_QUEUED_OBSERVATIONS + 8) {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":{},"method":"session/request_permission","params":{{}}}}"#,
+                    700 + index + 1
+                )
+                .as_bytes(),
+                TimestampMs::new(4),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut upstream_client).await;
+    }
+    assert_eq!(
+        outbox(&broker).len(),
+        1,
+        "only the transition from before the fault was recorded"
+    );
+
+    let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
+        served.observations,
+        Arc::clone(&broker),
+        session(),
+        Arc::clone(&runtime),
+    ));
+
+    let mut told_to_start_again = None;
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await
+    {
+        match delivery {
+            kr_worker::output::OutputDelivery::AgentResource { bytes, .. } => {
+                stream.written(bytes);
+            }
+            kr_worker::output::OutputDelivery::Resync(marker) => {
+                told_to_start_again = Some(marker);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let marker = told_to_start_again.expect("the views are told the recovery could not cover it");
+    assert_eq!(
+        marker.reason,
+        kr_protocol::recovery::ResyncReason::AgentStreamGap,
+        "and they are told why: what was lost was never written down"
+    );
+
+    carrying.abort();
+    served.drained.abort();
+}
+
+/// KR-REQ-12.11: delivery that has ended still hands over what it was holding, and takes no queue.
+///
+/// Teardown and a queue that filled are different endings, and the difference decides two things.
+/// What the connection produced before it ended is still the session's to deliver, so it is
+/// recovered before delivery stops. And nothing may take a queue for a connection that has gone:
+/// one that did would be a queue nothing produces into and nothing closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_delivery_recovers_before_it_ends_and_takes_no_queue_after_teardown() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let owner = Arc::clone(&served.owner);
+    let mut upstream_client = tokio::io::BufReader::new(served.client);
+
+    let host = kr_ipc::testing::TempHost::create();
+    let (runtime, mut stream) = session_runtime_and_stream(session(), &host).await;
+
+    for index in 0..(kr_worker::broker::MAX_QUEUED_OBSERVATIONS + 4) {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":{},"method":"session/request_permission","params":{{}}}}"#,
+                    600 + index
+                )
+                .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut upstream_client).await;
+    }
+    let resource = broker
+        .pending_resources()
+        .into_iter()
+        .next_back()
+        .expect("a resource is held");
+    broker
+        .upstream_resolved(&resource.request, TimestampMs::new(3))
+        .expect("the upstream withdraws its own request");
+    let settlement = outbox(&broker)
+        .into_iter()
+        .rfind(|event| event.resource_id == resource.resource_id)
+        .expect("the settlement is recorded");
+
+    // The connection is torn down before anything reads the queue.
+    broker.observatory().withdraw(GatewayConnectionId::new(1));
+
+    let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
+        served.observations,
+        Arc::clone(&broker),
+        session(),
+        Arc::clone(&runtime),
+    ));
+
+    let mut seen = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await
+    {
+        if let kr_worker::output::OutputDelivery::AgentResource { event, bytes } = delivery {
+            stream.written(bytes);
+            let settled = event.event_id == settlement.event_id;
+            seen.push(*event);
+            if settled {
+                break;
+            }
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|event| event.event_id == settlement.event_id),
+        "the settlement reached the views although the connection had ended"
+    );
+
+    // And delivery ends of its own accord rather than waiting on a queue it took for a connection
+    // that has gone.
+    tokio::time::timeout(std::time::Duration::from_secs(20), carrying)
+        .await
+        .expect("delivery ends after teardown")
+        .expect("without panicking");
+    assert!(
+        !broker
+            .observatory()
+            .is_watching(GatewayConnectionId::new(1)),
+        "and no queue was registered for the connection that was torn down"
+    );
+
+    served.drained.abort();
+}
+
+/// KR-REQ-12.11 and section 9: a backlog larger than one page recovers in pages.
+///
+/// A recovery that read the whole backlog at once would allocate it at once and hold the broker
+/// for as long as the read took. Both bounds are the point: the page is bounded, and what the
+/// broker is doing for everyone else goes on between pages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_backlog_larger_than_one_page_recovers_in_pages() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let owner = Arc::clone(&served.owner);
+    let mut upstream_client = tokio::io::BufReader::new(served.client);
+
+    for index in 0..(kr_worker::broker::MAX_REPLAY_EVENTS + 4) {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":{},"method":"session/request_permission","params":{{}}}}"#,
+                    5000 + index
+                )
+                .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut upstream_client).await;
+    }
+
+    let first = broker
+        .replay_after(broker.stream_start())
+        .expect("the outbox reads");
+    assert_eq!(
+        first.events.len(),
+        kr_worker::broker::MAX_REPLAY_EVENTS,
+        "a page is bounded by what it carries"
+    );
+    assert!(first.more, "and it says the backlog continues");
+
+    // Between the pages the broker is free: native traffic is served rather than queued behind
+    // one observer's recovery.
+    owner
+        .from_upstream(
+            br#"{"id":5999,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("native traffic continues between the pages of a recovery");
+    let _ = next_line(&mut upstream_client).await;
+
+    let second = broker.replay_after(first.cursor).expect("the outbox reads");
+    assert!(
+        !second.events.is_empty(),
+        "the next page continues from where the first ended"
+    );
+    assert!(
+        second.events[0].sequence > first.cursor.sequence,
+        "and it starts after it, without repeating"
+    );
+    assert!(
+        second
+            .events
+            .iter()
+            .any(|event| event.causal_root.ends_with(":5999")),
+        "including what was committed while the recovery was between pages"
+    );
+
     served.drained.abort();
 }
 

@@ -1134,6 +1134,12 @@ impl Observatory {
         }
     }
 
+    /// Returns whether one connection has a place in this registry.
+    #[must_use]
+    pub fn is_watching(&self, connection: GatewayConnectionId) -> bool {
+        self.held().contains_key(&connection)
+    }
+
     fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<GatewayConnectionId, Watcher>> {
         self.watching
             .lock()
@@ -2460,9 +2466,11 @@ mod tests {
 
     /// Everything admitted before a close is written; nothing admitted after it exists.
     ///
-    /// Frames are queued while the end closes. Deterministically forces both boundary cases:
-    /// frames admitted before the close and frames refused after the close. Byte accounting
-    /// settles to zero once the writer finishes.
+    /// The interesting frames are the ones admitted *while* the end is closing, so the close runs
+    /// beside a burst of admissions rather than between two of them. Whatever the interleaving,
+    /// one rule has to hold: a frame the sink accepted reaches the peer and a frame it refused
+    /// never existed. The two deterministic cases are kept around the race, so the test proves
+    /// both boundaries as well as the overlap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_frame_admitted_as_the_end_closes_is_written_and_a_refused_one_is_not() {
         let (writer, reader) = tokio::io::duplex(1 << 20);
@@ -2475,70 +2483,56 @@ mod tests {
         let driving = tokio::spawn(writes);
         let sink = Arc::new(sink);
 
-        let barrier_before_close = Arc::new(tokio::sync::Barrier::new(2));
-        let barrier_after_close = Arc::new(tokio::sync::Barrier::new(2));
+        // Before the close, with nothing racing: every one of these is admitted.
+        let mut outcomes: Vec<(u32, bool)> = Vec::new();
+        for id in 0..8_u32 {
+            let admitted = sink.queue(format!("{{\"id\":{id}}}").as_bytes()).is_ok();
+            assert!(admitted, "a frame queued before the close is admitted");
+            outcomes.push((id, admitted));
+        }
 
+        // The overlap: admissions and the close start together and run against each other.
+        let start = Arc::new(tokio::sync::Barrier::new(2));
         let admitting = {
             let sink = Arc::clone(&sink);
-            let b1 = Arc::clone(&barrier_before_close);
-            let b2 = Arc::clone(&barrier_after_close);
+            let start = Arc::clone(&start);
             tokio::spawn(async move {
-                let mut admitted = Vec::new();
-                let mut refused = Vec::new();
-                // 1. Boundary case 1: frames before close are all admitted.
-                for id in 0..16_u32 {
-                    let frame = format!("{{\"id\":{id}}}");
-                    assert!(
-                        sink.queue(frame.as_bytes()).is_ok(),
-                        "frame before close must be admitted"
-                    );
-                    admitted.push(id);
+                start.wait().await;
+                let mut raced = Vec::new();
+                for id in 8..40_u32 {
+                    let admitted = sink.queue(format!("{{\"id\":{id}}}").as_bytes()).is_ok();
+                    raced.push((id, admitted));
+                    tokio::task::yield_now().await;
                 }
-                // Coordinate with closing task: frames 0..16 are queued.
-                b1.wait().await;
-                // Wait until closing task has closed the sink.
-                b2.wait().await;
-                // 2. Boundary case 2: frames after close are all refused.
-                for id in 16..32_u32 {
-                    let frame = format!("{{\"id\":{id}}}");
-                    assert!(
-                        sink.queue(frame.as_bytes()).is_err(),
-                        "frame after close must be refused"
-                    );
-                    refused.push(id);
-                }
-                (admitted, refused)
+                raced
             })
         };
         let closing = {
             let sink = Arc::clone(&sink);
-            let b1 = Arc::clone(&barrier_before_close);
-            let b2 = Arc::clone(&barrier_after_close);
+            let start = Arc::clone(&start);
             tokio::spawn(async move {
-                b1.wait().await;
+                start.wait().await;
                 sink.close();
-                b2.wait().await;
             })
         };
-        let (admitted, refused) = admitting.await.expect("the admitting task finished");
+        outcomes.extend(admitting.await.expect("the admitting task finished"));
         closing.await.expect("the closing task finished");
-        assert_eq!(
-            admitted.len(),
-            16,
-            "exactly 16 frames admitted before close"
-        );
-        assert_eq!(refused.len(), 16, "exactly 16 frames refused after close");
+
+        // After the close has certainly happened: every one of these is refused.
+        for id in 40..48_u32 {
+            let admitted = sink.queue(format!("{{\"id\":{id}}}").as_bytes()).is_ok();
+            assert!(!admitted, "a frame queued after the close is refused");
+            outcomes.push((id, admitted));
+        }
 
         tokio::time::timeout(std::time::Duration::from_secs(10), driving)
             .await
             .expect("the writer ends at the close")
             .expect("its task is joined");
-
-        // Byte accounting settles to zero.
         assert_eq!(
             sink.queued_bytes(),
             0,
-            "byte accounting must settle to 0 after writer drains admitted frames"
+            "and every reservation is given back once the writer has finished"
         );
 
         let mut written = String::new();
@@ -2546,54 +2540,81 @@ mod tests {
         tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut written)
             .await
             .expect("what went is readable");
-        let lines: Vec<&str> = written.lines().filter(|line| !line.is_empty()).collect();
+        let lines = written.lines().filter(|line| !line.is_empty()).count();
+        let admitted = outcomes.iter().filter(|(_, ok)| *ok).count();
         assert_eq!(
-            lines.len(),
-            admitted.len(),
-            "every frame admitted before the close went, and nothing else did"
+            lines, admitted,
+            "exactly the admitted frames went, and nothing else did"
         );
-        for id in &admitted {
-            assert!(
-                written.contains(&format!("{{\"id\":{id}}}")),
-                "an admitted frame reached the peer: {id}"
-            );
-        }
-        for id in &refused {
-            assert!(
-                !written.contains(&format!("{{\"id\":{id}}}")),
-                "a refused frame never existed: {id}"
+        for (id, ok) in &outcomes {
+            let frame = format!("{{\"id\":{id}}}");
+            assert_eq!(
+                written.contains(&frame),
+                *ok,
+                "frame {id} was {} and {} the peer",
+                if *ok { "admitted" } else { "refused" },
+                if *ok {
+                    "must reach"
+                } else {
+                    "must never reach"
+                }
             );
         }
     }
 
-    /// A frame the peer never reads leaves the write deadline, not an unbounded wait.
-    #[tokio::test(start_paused = true)]
-    async fn a_peer_that_never_reads_leaves_a_partial_delivery() {
-        // A pipe of eight bytes with nothing reading it takes the first bytes and then blocks.
-        let (writer, reader) = tokio::io::duplex(8);
-        let (sink, writes) = sink(
-            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
-            writer,
-            stopping(),
-            no_peer(),
-        );
-        let driving = tokio::spawn(writes);
-        let queued = sink.queue(&vec![b'y'; 4096]).expect("it is queued");
-        let delivery = queued.delivered().await;
-        assert_eq!(
-            delivery,
-            Delivery::Partial,
-            "some of it went into the pipe and the rest never will"
-        );
-        assert!(delivery.refusal().is_some(), "and that is not a success");
-        drop(reader);
-        driving.abort();
+    /// A writer that carries part of a frame and then stops, so a partial write is a fact.
+    struct StallingWriter {
+        allowance: usize,
+        carried: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
-    /// Cancellation of the writer loop unconditionally cleans up remaining queue bytes and closes peer.
+    impl tokio::io::AsyncWrite for StallingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.allowance == 0 {
+                return std::task::Poll::Pending;
+            }
+            let carried = buf.len().min(self.allowance);
+            self.allowance -= carried;
+            if self.allowance == 0
+                && let Some(signal) = self.carried.take()
+            {
+                let _ = signal.send(());
+            }
+            std::task::Poll::Ready(Ok(carried))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A writer cancelled mid-frame reports what actually went, and gives everything else back.
+    ///
+    /// The frame under the writer has been partly carried before the cancellation, which is the
+    /// case a caller cannot be told anything comfortable about: it is neither sent nor unsent, and
+    /// saying "unsent" would be a claim the peer never saw bytes it may well have seen. So the
+    /// transmission is confirmed first and `Partial` is then required, not merely allowed.
     #[tokio::test]
     async fn cancellation_during_partial_write_cleans_up_queue_and_peer() {
-        let (writer, _reader) = tokio::io::duplex(8);
+        let (carried, confirmed) = tokio::sync::oneshot::channel();
+        let writer = StallingWriter {
+            allowance: 64,
+            carried: Some(carried),
+        };
         let peer_ends = Arc::new(std::sync::OnceLock::new());
         let (other_sink, _other_writes) = sink(
             Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
@@ -2615,36 +2636,38 @@ mod tests {
         );
         let driving = tokio::spawn(writes);
 
-        // First frame: 4096 bytes. Fills the 8-byte duplex pipe and blocks.
-        let q1 = sink.queue(&vec![b'a'; 4096]).expect("queued first");
-        // Second and third frames queued behind it.
-        let q2 = sink.queue(b"{\"id\":2}\n").expect("queued second");
-        let q3 = sink.queue(b"{\"id\":3}\n").expect("queued third");
-
+        // A frame larger than what the peer will take before it stops.
+        let carried_frame = sink.queue(&vec![b'a'; 4096]).expect("queued first");
+        let behind_one = sink.queue(b"{\"id\":2}\n").expect("queued second");
+        let behind_two = sink.queue(b"{\"id\":3}\n").expect("queued third");
         assert!(sink.queued_bytes() > 0);
 
-        // Allow the writer task to start and begin partial write.
-        tokio::task::yield_now().await;
-
-        // Cancel the writer loop.
+        // Part of the first frame is on the wire. Only now is the writer cancelled.
+        tokio::time::timeout(std::time::Duration::from_secs(5), confirmed)
+            .await
+            .expect("the writer carries part of the frame")
+            .expect("the signal arrives");
         driving.abort();
         let _ = driving.await;
 
-        // InFlight / QueuedFrame drop guarantees:
-        // 1) First frame resolves to Partial or Unsent.
-        let d1 = q1.delivered().await;
-        assert!(matches!(d1, Delivery::Partial | Delivery::Unsent));
-
-        // 2) Queued frames behind it resolve to Unsent.
-        assert_eq!(q2.delivered().await, Delivery::Unsent);
-        assert_eq!(q3.delivered().await, Delivery::Unsent);
-
-        // 3) Byte reservations are completely refunded.
-        assert_eq!(sink.queued_bytes(), 0);
-
-        // 4) Admission is closed on both ends.
+        assert_eq!(
+            carried_frame.delivered().await,
+            Delivery::Partial,
+            "some of it went and the rest never will, and the caller is told exactly that"
+        );
+        assert_eq!(
+            behind_one.delivered().await,
+            Delivery::Unsent,
+            "a frame behind it never went at all"
+        );
+        assert_eq!(behind_two.delivered().await, Delivery::Unsent);
+        assert_eq!(
+            sink.queued_bytes(),
+            0,
+            "and every reservation the cancelled writer held is given back"
+        );
         assert!(sink.is_closed());
-        assert!(other_sink.is_closed());
+        assert!(other_sink.is_closed(), "the peer is closed with it");
     }
 
     struct BlockingFlushWriter {
