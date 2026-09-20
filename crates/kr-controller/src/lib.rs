@@ -15,6 +15,7 @@
 //! | [`archive`] | Closed and crashed sessions: their history, final receipts and retained references, served with no worker |
 //! | [`backup`] | The environment's backup generations, their staged ciphertext, their outbox and what a restore may put back |
 //! | [`authority`] | The dispatch lease, the revocation barrier and the generation both are bound to |
+//! | [`bridge`] | The enrolled environments this host reaches, and the local process bridge that reaches them |
 //! | [`desktop`] | Which profile a session gets, what logout does to it, and the host power setting |
 //! | [`registry`] | Reservations, display-number allocation, worker records and closure tombstones |
 //! | [`singleton`] | The per-environment lock and the persistent generation |
@@ -33,6 +34,7 @@ pub mod agent_tools;
 pub mod archive;
 pub mod authority;
 pub mod backup;
+pub mod bridge;
 pub mod changeset;
 pub mod config;
 pub mod desktop;

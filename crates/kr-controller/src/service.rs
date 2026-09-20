@@ -2961,6 +2961,17 @@ impl Controller {
                 }
                 let _: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
             }
+            // An enrolment, a removal and a refresh all act on this host's own record of the
+            // environments it reaches, not on a session. A request that named a session here
+            // would be asking for a record scoped to something the record does not have.
+            Method::EnvironmentEnrol | Method::EnvironmentForget | Method::EnvironmentRefresh => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "an enrolled environment belongs to this host, not to one session"
+                            .to_owned(),
+                    ));
+                }
+            }
             _ if crate::voice::VoiceModule::serves(method) => {
                 crate::voice::VoiceModule::check_subject(method, mutation)?;
             }
@@ -3461,6 +3472,7 @@ impl Controller {
                 self.environment_capabilities(&request.params, owner).await
             }
             Method::EnvironmentList => self.environment_list().await,
+            Method::EnvironmentInventory => self.environment_inventory(&request.params).await,
             Method::HostDoctor => self.host_doctor(owner).await,
             Method::SessionList => self.session_list(&request.params).await,
             Method::SessionRead => self.session_read(&request.params).await,
@@ -3701,6 +3713,9 @@ impl Controller {
             Method::GrantCreate | Method::GrantRevoke | Method::DeviceRevoke => {
                 self.authority_change(actor_id, mutation, method, carried)
                     .await
+            }
+            Method::EnvironmentEnrol | Method::EnvironmentForget | Method::EnvironmentRefresh => {
+                self.environment_record(mutation, method).await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
@@ -4981,6 +4996,89 @@ impl Controller {
             detail = detail.stated(", ").withheld(ContentClass::Name, origin);
         }
         detail.stated(")")
+    }
+
+    /// Answers `environment.inventory` from this host's cache.
+    ///
+    /// Section 3: a listing reports what was last observed and starts nothing. Nothing here takes
+    /// an observer, so nothing here could ask the platform even by mistake.
+    async fn environment_inventory(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::identity::EnvironmentInventoryParams = parse(params)?;
+        let state_dir = self.paths.state_dir().to_path_buf();
+        let now_ms = wall_clock_ms();
+        let access = params.access.as_ref().copied();
+        let rows = tokio::task::spawn_blocking(move || {
+            crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                Ok(store.list(access, now_ms))
+            })
+        })
+        .await
+        .map_err(|error| ControllerError::supervision(error.to_string()))??;
+        encode(&kr_protocol::identity::EnvironmentInventoryResult { rows })
+    }
+
+    /// Answers the three mutations that change this host's enrolled environments.
+    ///
+    /// Only a refresh reaches the platform, and only when the request asked it to start the
+    /// environment it selected. Enrolling and forgetting change the record and nothing else.
+    async fn environment_record(
+        &self,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<ParamsValue> {
+        use kr_protocol::identity::{
+            EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentForgetParams,
+            EnvironmentForgetResult, EnvironmentRefreshParams, EnvironmentRefreshResult,
+        };
+
+        let state_dir = self.paths.state_dir().to_path_buf();
+        let now_ms = wall_clock_ms();
+        match method {
+            Method::EnvironmentEnrol => {
+                let params: EnvironmentEnrolParams = parse(&mutation.params)?;
+                let row = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        store.enrol(params.enrolment, now_ms)
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                encode(&EnvironmentEnrolResult { row })
+            }
+            Method::EnvironmentForget => {
+                let params: EnvironmentForgetParams = parse(&mutation.params)?;
+                let forgotten = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        store.forget(params.environment_id)
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                encode(&EnvironmentForgetResult { forgotten })
+            }
+            Method::EnvironmentRefresh => {
+                let params: EnvironmentRefreshParams = parse(&mutation.params)?;
+                // The platform command is a blocking one, and it is run on a blocking thread so a
+                // distribution that takes seconds to start does not hold this runtime.
+                let (row, started) = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        store.refresh(
+                            params.environment_id,
+                            params.start,
+                            &crate::bridge::platform::PlatformObserver,
+                            now_ms,
+                        )
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                encode(&EnvironmentRefreshResult { row, started })
+            }
+            other => Err(ControllerError::InvalidArgument(format!(
+                "{} is not an environment record this daemon changes",
+                other.as_str()
+            ))),
+        }
     }
 
     async fn host_doctor(self: &Arc<Self>, owner: bool) -> Result<ParamsValue> {
