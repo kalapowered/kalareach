@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use kr_automation::{
-    ActionOutcome, MockActionRunner, WorkflowEngine, WorkflowStore,
-    create_workflow_definition,
+    ActionOutcome, MockActionRunner, WorkflowEngine, WorkflowStore, create_workflow_definition,
 };
 use kr_protocol::automation::{
     EdgeCondition, NodeStatus, WorkflowEdge, WorkflowNode, WorkflowRunStatus,
@@ -30,9 +29,24 @@ async fn topological_execution_respects_dependencies() {
     let runner = Arc::new(MockActionRunner::new());
 
     // Register success for all nodes
-    runner.set_outcome("step1", ActionOutcome::Success { output: "{}".to_owned() });
-    runner.set_outcome("step2", ActionOutcome::Success { output: "{}".to_owned() });
-    runner.set_outcome("step3", ActionOutcome::Success { output: "{}".to_owned() });
+    runner.set_outcome(
+        "step1",
+        ActionOutcome::Success {
+            output: "{}".to_owned(),
+        },
+    );
+    runner.set_outcome(
+        "step2",
+        ActionOutcome::Success {
+            output: "{}".to_owned(),
+        },
+    );
+    runner.set_outcome(
+        "step3",
+        ActionOutcome::Success {
+            output: "{}".to_owned(),
+        },
+    );
 
     let engine = WorkflowEngine::new(store.clone(), runner);
 
@@ -84,7 +98,10 @@ async fn topological_execution_respects_dependencies() {
         .commit_trigger_and_run(run_id, &def, "evt-1", &causal_ctx, 1000)
         .unwrap();
 
-    let status = engine.execute_run(run_id, &def, &causal_ctx, 1000).await.unwrap();
+    let status = engine
+        .execute_run(run_id, &def, &causal_ctx, 1000)
+        .await
+        .unwrap();
     assert_eq!(status, WorkflowRunStatus::Completed);
 
     let receipts = store.list_node_receipts(run_id).unwrap();
@@ -100,11 +117,26 @@ async fn edge_condition_branching_success_and_failure() {
     let runner = Arc::new(MockActionRunner::new());
 
     // step1 fails
-    runner.set_outcome("step1", ActionOutcome::Failed { error: "tests failed".to_owned() });
+    runner.set_outcome(
+        "step1",
+        ActionOutcome::Failed {
+            error: "tests failed".to_owned(),
+        },
+    );
     // on_failure succeeds
-    runner.set_outcome("on_failure", ActionOutcome::Success { output: "{}".to_owned() });
+    runner.set_outcome(
+        "on_failure",
+        ActionOutcome::Success {
+            output: "{}".to_owned(),
+        },
+    );
     // on_success should NOT run
-    runner.set_outcome("on_success", ActionOutcome::Success { output: "{}".to_owned() });
+    runner.set_outcome(
+        "on_success",
+        ActionOutcome::Success {
+            output: "{}".to_owned(),
+        },
+    );
 
     let engine = WorkflowEngine::new(store.clone(), runner);
 
@@ -156,7 +188,10 @@ async fn edge_condition_branching_success_and_failure() {
         .commit_trigger_and_run(run_id, &def, "evt-2", &causal_ctx, 1000)
         .unwrap();
 
-    let status = engine.execute_run(run_id, &def, &causal_ctx, 1000).await.unwrap();
+    let status = engine
+        .execute_run(run_id, &def, &causal_ctx, 1000)
+        .await
+        .unwrap();
     assert_eq!(status, WorkflowRunStatus::Failed);
 
     let receipts = store.list_node_receipts(run_id).unwrap();
@@ -181,7 +216,12 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
             detail: "process was terminated by SIGKILL before receipt".to_owned(),
         },
     );
-    runner.set_outcome("step2", ActionOutcome::Success { output: "{}".to_owned() });
+    runner.set_outcome(
+        "step2",
+        ActionOutcome::Success {
+            output: "{}".to_owned(),
+        },
+    );
 
     let engine = WorkflowEngine::new(store.clone(), runner);
 
@@ -220,7 +260,10 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
         .commit_trigger_and_run(run_id, &def, "evt-3", &causal_ctx, 1000)
         .unwrap();
 
-    let status = engine.execute_run(run_id, &def, &causal_ctx, 1000).await.unwrap();
+    let status = engine
+        .execute_run(run_id, &def, &causal_ctx, 1000)
+        .await
+        .unwrap();
     // Run status must be Paused because step2 was paused for review
     assert_eq!(status, WorkflowRunStatus::Paused);
 

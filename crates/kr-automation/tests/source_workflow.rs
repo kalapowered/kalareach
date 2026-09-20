@@ -135,7 +135,8 @@ where
 #[test]
 fn source_workflow_binds_evidence_to_exact_immutable_version() {
     let host = TempHost::create();
-    let project = Arc::new(ProjectService::open(&host.environment()).expect("project service opens"));
+    let project =
+        Arc::new(ProjectService::open(&host.environment()).expect("project service opens"));
     let changesets = ChangeSetService::open(&host.environment(), Arc::clone(&project))
         .expect("changeset service opens");
 
@@ -266,8 +267,14 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
         .evidence(version1.change_set_id, version1.version)
         .unwrap();
     assert_eq!(ev2.len(), 2);
-    assert!(ev2.iter().any(|e| e.kind == EvidenceKind::TestResult && e.detail.contains("passed: true")));
-    assert!(ev2.iter().any(|e| e.kind == EvidenceKind::ReviewAcknowledgement && e.detail.contains("LGTM")));
+    assert!(
+        ev2.iter()
+            .any(|e| e.kind == EvidenceKind::TestResult && e.detail.contains("passed: true"))
+    );
+    assert!(
+        ev2.iter()
+            .any(|e| e.kind == EvidenceKind::ReviewAcknowledgement && e.detail.contains("LGTM"))
+    );
 
     // 3. Mutate workspace further and capture version 2
     std::fs::write(repo_dir.join("file.txt"), "hello world further modified\n").unwrap();

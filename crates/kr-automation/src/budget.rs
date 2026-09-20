@@ -104,10 +104,7 @@ impl CausalBudget {
             let _ = self.exhaust("depth limit exceeded", now_ms);
             return Err(AutomationError::CausalLimitExhausted {
                 root: self.causal_root_id,
-                reason: format!(
-                    "depth {} exceeds limit {}",
-                    requested_depth, self.max_depth
-                ),
+                reason: format!("depth {} exceeds limit {}", requested_depth, self.max_depth),
             });
         }
 
@@ -116,7 +113,11 @@ impl CausalBudget {
             let _ = self.exhaust("total runs limit exceeded", now_ms);
             return Err(AutomationError::CausalLimitExhausted {
                 root: self.causal_root_id,
-                reason: format!("runs {} exceeds limit {}", self.total_runs + 1, self.max_runs),
+                reason: format!(
+                    "runs {} exceeds limit {}",
+                    self.total_runs + 1,
+                    self.max_runs
+                ),
             });
         }
 
@@ -197,9 +198,8 @@ impl CausalBudget {
         if !self.attention_emitted {
             self.attention_emitted = true;
             let plugin_str = format!("causal_limit.{}", self.causal_root_id);
-            let plugin_id = PluginId::new(plugin_str).unwrap_or_else(|_| {
-                PluginId::new("causal_limit").expect("static identifier")
-            });
+            let plugin_id = PluginId::new(plugin_str)
+                .unwrap_or_else(|_| PluginId::new("causal_limit").expect("static identifier"));
 
             Some(SourceEvent::new(
                 EventCursor::new(AttentionSource::Semantic, 1),

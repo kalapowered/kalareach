@@ -320,11 +320,7 @@ impl WorkflowStore {
     }
 
     /// Loads or creates a causal budget for a causal root.
-    pub fn get_or_create_budget(
-        &self,
-        root_id: CausalRootId,
-        now_ms: u64,
-    ) -> Result<CausalBudget> {
+    pub fn get_or_create_budget(&self, root_id: CausalRootId, now_ms: u64) -> Result<CausalBudget> {
         let conn = self.conn.lock().unwrap();
         if let Some(budget) = Self::load_budget_tx(&conn, root_id)? {
             Ok(budget)
@@ -482,7 +478,10 @@ impl WorkflowStore {
         Self::save_budget_tx(&tx, &budget)?;
 
         // 5. Insert run record
-        let parent_run_id = causal_ctx.parent.as_ref().map(|p| p.parent_run_id.to_string());
+        let parent_run_id = causal_ctx
+            .parent
+            .as_ref()
+            .map(|p| p.parent_run_id.to_string());
         let parent_node_id = causal_ctx.parent.as_ref().map(|p| p.parent_node_id.clone());
         let deadline_ms = now_ms.saturating_add(definition.deadlines.run_deadline_ms.get());
 
@@ -545,7 +544,11 @@ impl WorkflowStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2 WHERE run_id = ?3",
-            params![status.as_str(), ended_at_ms.map(|v| v as i64), run_id.to_string()],
+            params![
+                status.as_str(),
+                ended_at_ms.map(|v| v as i64),
+                run_id.to_string()
+            ],
         )?;
         Ok(())
     }
@@ -669,9 +672,7 @@ impl WorkflowStore {
             "SELECT outbox_id, event_type, payload_json FROM outbox_events
              WHERE settled_at_ms IS NULL ORDER BY outbox_id ASC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         let mut result = Vec::new();
         for r in rows {
             result.push(r?);
@@ -695,8 +696,8 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_protocol::scalars::Uuid;
     use crate::definition::create_workflow_definition;
+    use kr_protocol::scalars::Uuid;
 
     fn test_wf_id(v: u8) -> WorkflowId {
         WorkflowId::new(Uuid::from_bytes([v; 16]))

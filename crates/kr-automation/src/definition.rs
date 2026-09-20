@@ -41,10 +41,7 @@ pub const REGISTERED_ACTION_KINDS: &[&str] = &[
 ///    such as `{{`, `}}`, `${`, `$(`, `<%`, or `eval(`.
 /// 4. Shell command requirements: any `shell_command` node requires a declared execution
 ///    environment and an explicit broad shell grant (`terminal.input`).
-pub fn validate_definition(
-    definition: &WorkflowDefinition,
-    grant: Option<&Grant>,
-) -> Result<()> {
+pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant>) -> Result<()> {
     // Basic identifier and field checks
     if definition.name.trim().is_empty() {
         return Err(AutomationError::InvalidArgument(
@@ -129,9 +126,8 @@ pub fn validate_definition(
 
 /// Checks that a string contains no arbitrary template code or script interpolation.
 fn check_no_template_syntax(node_id: &str, params: &str) -> Result<()> {
-    const FORBIDDEN_PATTERNS: &[&str] = &[
-        "{{", "}}", "${", "$(", "<%", "%>", "eval(", "exec(", "`",
-    ];
+    const FORBIDDEN_PATTERNS: &[&str] =
+        &["{{", "}}", "${", "$(", "<%", "%>", "eval(", "exec(", "`"];
 
     for pattern in FORBIDDEN_PATTERNS {
         if params.contains(pattern) {

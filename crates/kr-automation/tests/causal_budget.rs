@@ -119,7 +119,10 @@ fn budget_persists_across_store_reopen() {
     // Reopen store from same database file
     {
         let store = WorkflowStore::open(tmp_dir.path()).unwrap();
-        let budget = store.get_budget(root_id).unwrap().expect("budget must exist");
+        let budget = store
+            .get_budget(root_id)
+            .unwrap()
+            .expect("budget must exist");
         assert_eq!(budget.total_actions, 2);
         assert!(!budget.exhausted);
     }

@@ -12,9 +12,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use kr_protocol::automation::{
-    WorkflowEnableParams, WorkflowEnableResult, WorkflowInstallParams,
-    WorkflowInstallResult, WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams,
-    WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
+    WorkflowEnableParams, WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult,
+    WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult,
+    WorkflowRunParams, WorkflowRunResult,
 };
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{CausalRootId, WorkflowRunId, WorkspaceId};
@@ -38,7 +38,10 @@ pub struct AutomationService {
 
 impl AutomationService {
     /// Opens the automation service with a database in the specified directory.
-    pub fn open(runtime_dir: impl AsRef<Path>, runner: Option<Arc<dyn ActionRunner>>) -> Result<Self> {
+    pub fn open(
+        runtime_dir: impl AsRef<Path>,
+        runner: Option<Arc<dyn ActionRunner>>,
+    ) -> Result<Self> {
         let store = Arc::new(WorkflowStore::open(runtime_dir)?);
         let action_runner = runner.unwrap_or_else(|| Arc::new(MockActionRunner::new()));
         let engine = Arc::new(WorkflowEngine::new(Arc::clone(&store), action_runner));
@@ -150,11 +153,7 @@ impl AutomationService {
     }
 
     /// Pauses an installed workflow revision (`workflow.pause`).
-    pub fn pause(
-        &self,
-        params: &WorkflowPauseParams,
-        _now_ms: u64,
-    ) -> Result<WorkflowPauseResult> {
+    pub fn pause(&self, params: &WorkflowPauseParams, _now_ms: u64) -> Result<WorkflowPauseResult> {
         let def = self
             .store
             .get_definition(params.workflow_id, params.revision.get())?
@@ -209,7 +208,10 @@ impl AutomationService {
         let causal_ctx = match params.causal_parent.as_ref() {
             Some(parent_ref) => {
                 // Descendant trigger
-                let mut ctx = CausalContext::from_existing_root(parent_ref.causal_root_id, params.workflow_id);
+                let mut ctx = CausalContext::from_existing_root(
+                    parent_ref.causal_root_id,
+                    params.workflow_id,
+                );
                 ctx.depth = parent_ref.depth.get() + 1;
                 ctx.parent = Some(parent_ref.clone());
 
@@ -217,7 +219,10 @@ impl AutomationService {
                 // Check if any ancestor was this workflow
                 // The parent run can be queried to verify ancestor chain
                 let runs = self.store.list_runs(Some(params.workflow_id))?;
-                if runs.iter().any(|r| r.causal_root_id == parent_ref.causal_root_id) {
+                if runs
+                    .iter()
+                    .any(|r| r.causal_root_id == parent_ref.causal_root_id)
+                {
                     return Err(AutomationError::SelfRetriggerRejected {
                         workflow_id: params.workflow_id,
                         root: parent_ref.causal_root_id,

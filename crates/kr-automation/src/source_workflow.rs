@@ -56,10 +56,16 @@ impl QuiescenceManager {
     }
 
     /// Obtains an enforceable quiescence reservation on a workspace.
-    pub fn reserve(&self, workspace_id: WorkspaceId, timeout_ms: u64, now_ms: u64) -> Result<QuiescenceReservation> {
+    pub fn reserve(
+        &self,
+        workspace_id: WorkspaceId,
+        timeout_ms: u64,
+        now_ms: u64,
+    ) -> Result<QuiescenceReservation> {
         let mut lock = self.reservations.lock().unwrap();
         if let Some(existing) = lock.get_mut(&workspace_id)
-            && existing.active && now_ms < existing.expires_at_ms
+            && existing.active
+            && now_ms < existing.expires_at_ms
         {
             return Err(AutomationError::PermissionDenied(format!(
                 "workspace {workspace_id} is already reserved for quiescence until {}",
@@ -182,7 +188,11 @@ impl SourceWorkflowCoordinator {
                 turn_id,
                 version: version.version.get(),
                 change_set: Some((version.change_set_id, version.version.get())),
-                summary: format!("review completed for version {}: {}", version.version.get(), review_outcome),
+                summary: format!(
+                    "review completed for version {}: {}",
+                    version.version.get(),
+                    review_outcome
+                ),
             },
         );
 

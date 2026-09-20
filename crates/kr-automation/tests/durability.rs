@@ -1,8 +1,6 @@
 //! Tests for SQLite persistence across drop/reopen and trigger deduplication key semantics.
 
-use kr_automation::{
-    CausalContext, WorkflowStore, create_workflow_definition,
-};
+use kr_automation::{CausalContext, WorkflowStore, create_workflow_definition};
 use kr_protocol::automation::{NodeStatus, WorkflowNode, WorkflowRunStatus};
 use kr_protocol::ids::{GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, Uuid};
@@ -38,14 +36,7 @@ fn sqlite_persistence_survives_drop_and_reopen() {
             declared_environment: Nullable::null(),
         };
 
-        let def = create_workflow_definition(
-            wf_id,
-            1,
-            "durable-wf",
-            grant_id,
-            vec![n1],
-            vec![],
-        );
+        let def = create_workflow_definition(wf_id, 1, "durable-wf", grant_id, vec![n1], vec![]);
         store.save_definition(&def, 1000).unwrap();
 
         let causal_ctx = CausalContext::new_root(wf_id);
@@ -112,14 +103,7 @@ fn deduplication_key_prevents_duplicate_runs() {
     let wf_id = test_wf_id(2);
     let grant_id = test_grant_id(1);
 
-    let def = create_workflow_definition(
-        wf_id,
-        1,
-        "dedup-wf",
-        grant_id,
-        vec![],
-        vec![],
-    );
+    let def = create_workflow_definition(wf_id, 1, "dedup-wf", grant_id, vec![], vec![]);
     store.save_definition(&def, 1000).unwrap();
 
     let run1 = test_run_id(10);

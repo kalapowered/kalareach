@@ -42,11 +42,15 @@ pub mod store;
 pub use crate::admission::AdmissionController;
 pub use crate::budget::CausalBudget;
 pub use crate::causal::CausalContext;
-pub use crate::definition::{REGISTERED_ACTION_KINDS, create_workflow_definition, validate_definition};
+pub use crate::definition::{
+    REGISTERED_ACTION_KINDS, create_workflow_definition, validate_definition,
+};
 pub use crate::engine::{ActionOutcome, ActionRunner, MockActionRunner, WorkflowEngine};
 pub use crate::error::{AutomationError, Result};
 pub use crate::service::AutomationService;
-pub use crate::source_workflow::{QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator};
+pub use crate::source_workflow::{
+    QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator,
+};
 pub use crate::store::WorkflowStore;
 
 pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {
@@ -56,4 +60,3 @@ pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {
 pub(crate) fn parse_uuid(s: &str) -> std::result::Result<kr_protocol::scalars::Uuid, uuid::Error> {
     uuid::Uuid::parse_str(s).map(|u| kr_protocol::scalars::Uuid::from_bytes(u.into_bytes()))
 }
-

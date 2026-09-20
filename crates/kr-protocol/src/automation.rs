@@ -507,7 +507,10 @@ mod tests {
     #[test]
     fn edge_condition_round_trips() {
         for condition in EdgeCondition::ALL {
-            assert_eq!(EdgeCondition::from_wire(condition.as_str()), Some(*condition));
+            assert_eq!(
+                EdgeCondition::from_wire(condition.as_str()),
+                Some(*condition)
+            );
         }
     }
 

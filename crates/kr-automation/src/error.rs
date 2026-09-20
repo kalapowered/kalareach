@@ -28,7 +28,9 @@ pub enum AutomationError {
     },
 
     /// A shell command node was specified without the required broad shell grant.
-    #[error("shell command node requires an explicit broad shell grant and declared environment: {detail}")]
+    #[error(
+        "shell command node requires an explicit broad shell grant and declared environment: {detail}"
+    )]
     ShellGrantRequired {
         /// Explanation of missing grant or environment.
         detail: String,
@@ -71,7 +73,9 @@ pub enum AutomationError {
     },
 
     /// A workflow attempted to retrigger on its own descendants by default.
-    #[error("workflow {workflow_id} attempted to retrigger on its own causal descendant under root {root}")]
+    #[error(
+        "workflow {workflow_id} attempted to retrigger on its own causal descendant under root {root}"
+    )]
     SelfRetriggerRejected {
         /// The workflow ID.
         workflow_id: WorkflowId,
@@ -177,7 +181,9 @@ impl From<AutomationError> for ProtocolError {
                 found,
             } => Self::new(
                 ErrorCode::DraftConflict,
-                format!("revision mismatch for workflow {workflow_id}: expected {expected}, found {found}"),
+                format!(
+                    "revision mismatch for workflow {workflow_id}: expected {expected}, found {found}"
+                ),
             ),
             AutomationError::WorkflowDisabled(id) => Self::new(
                 ErrorCode::PluginDisabled,
@@ -193,7 +199,9 @@ impl From<AutomationError> for ProtocolError {
             ),
             AutomationError::SelfRetriggerRejected { workflow_id, root } => Self::new(
                 ErrorCode::CausalLimit,
-                format!("workflow {workflow_id} cannot retrigger on own descendant under root {root}"),
+                format!(
+                    "workflow {workflow_id} cannot retrigger on own descendant under root {root}"
+                ),
             ),
             AutomationError::DuplicateTrigger {
                 workflow_id,
@@ -201,7 +209,9 @@ impl From<AutomationError> for ProtocolError {
                 event_id,
             } => Self::new(
                 ErrorCode::IdConflict,
-                format!("duplicate trigger for workflow {workflow_id} rev {revision} event {event_id}"),
+                format!(
+                    "duplicate trigger for workflow {workflow_id} rev {revision} event {event_id}"
+                ),
             ),
             AutomationError::ConcurrencyLimitExceeded { workflow_id, limit } => Self::new(
                 ErrorCode::RateLimited,

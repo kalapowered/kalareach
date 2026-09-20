@@ -113,7 +113,10 @@ impl AdmissionController {
 
         // Record admission
         self.host_dispatches.push(now_ms);
-        self.grant_dispatches.entry(grant_id).or_default().push(now_ms);
+        self.grant_dispatches
+            .entry(grant_id)
+            .or_default()
+            .push(now_ms);
         *self.active_runs.entry(workflow_id).or_default() += 1;
 
         Ok(())
@@ -152,7 +155,9 @@ mod tests {
         }
 
         // 5th run is rejected
-        let err = admission.admit_run(wf, grant, 1000, None, None).unwrap_err();
+        let err = admission
+            .admit_run(wf, grant, 1000, None, None)
+            .unwrap_err();
         assert!(matches!(
             err,
             AutomationError::ConcurrencyLimitExceeded { limit: 4, .. }

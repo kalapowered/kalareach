@@ -2,9 +2,7 @@
 //! and template rejection.
 
 use kr_automation::{create_workflow_definition, validate_definition};
-use kr_protocol::automation::{
-    EdgeCondition, WorkflowEdge, WorkflowNode,
-};
+use kr_protocol::automation::{EdgeCondition, WorkflowEdge, WorkflowNode};
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{AuthorityRevision, DeviceId, EnvironmentId, GrantId, WorkflowId};
 use kr_protocol::rights::ActionRight;

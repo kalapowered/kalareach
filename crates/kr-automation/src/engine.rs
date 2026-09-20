@@ -152,13 +152,19 @@ impl WorkflowEngine {
                 }
 
                 // Check dependencies
-                let incoming = in_edges.get(node.node_id.as_str()).cloned().unwrap_or_default();
+                let incoming = in_edges
+                    .get(node.node_id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
                 let mut can_run = true;
                 let mut must_pause_for_review = false;
 
                 if !incoming.is_empty() {
                     for (parent_id, condition) in incoming {
-                        let parent_status = node_statuses.get(parent_id).copied().unwrap_or(NodeStatus::Pending);
+                        let parent_status = node_statuses
+                            .get(parent_id)
+                            .copied()
+                            .unwrap_or(NodeStatus::Pending);
                         match parent_status {
                             NodeStatus::Pending | NodeStatus::Running => {
                                 // Dependency not yet settled
@@ -220,7 +226,11 @@ impl WorkflowEngine {
                             Some(&err.to_string()),
                             Some(now_ms),
                         )?;
-                        self.store.update_run_status(run_id, WorkflowRunStatus::Paused, Some(now_ms))?;
+                        self.store.update_run_status(
+                            run_id,
+                            WorkflowRunStatus::Paused,
+                            Some(now_ms),
+                        )?;
                         return Ok(WorkflowRunStatus::Paused);
                     }
                     self.store.save_budget(&budget)?;
@@ -296,7 +306,10 @@ impl WorkflowEngine {
         }
 
         // Check if any node is paused or unknown
-        if node_statuses.values().any(|&s| s == NodeStatus::Paused || s == NodeStatus::Unknown) {
+        if node_statuses
+            .values()
+            .any(|&s| s == NodeStatus::Paused || s == NodeStatus::Unknown)
+        {
             run_status = WorkflowRunStatus::Paused;
         } else if node_statuses.values().any(|&s| s == NodeStatus::Failed) {
             run_status = WorkflowRunStatus::Failed;
@@ -381,7 +394,10 @@ mod tests {
             .commit_trigger_and_run(run_id, &def, "evt-1", &causal, 1000)
             .unwrap();
 
-        let status = engine.execute_run(run_id, &def, &causal, 1000).await.unwrap();
+        let status = engine
+            .execute_run(run_id, &def, &causal, 1000)
+            .await
+            .unwrap();
         assert_eq!(status, WorkflowRunStatus::Completed);
 
         let receipts = store.list_node_receipts(run_id).unwrap();
@@ -434,7 +450,10 @@ mod tests {
             .commit_trigger_and_run(run_id, &def, "evt-1", &causal, 1000)
             .unwrap();
 
-        let status = engine.execute_run(run_id, &def, &causal, 1000).await.unwrap();
+        let status = engine
+            .execute_run(run_id, &def, &causal, 1000)
+            .await
+            .unwrap();
         assert_eq!(status, WorkflowRunStatus::Paused);
 
         let receipts = store.list_node_receipts(run_id).unwrap();
