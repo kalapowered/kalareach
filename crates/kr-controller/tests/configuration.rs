@@ -24,6 +24,7 @@ use kr_protocol::hostinfo::configuration::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::Nullable;
 use net_support::Host;
 
 /// A grant that sees a session and nothing more, which is all the host's own reads need.
@@ -229,7 +230,11 @@ async fn a_more_permissive_configured_ceiling_is_refused_rather_than_applied() {
     let environment = host.tree().environment();
 
     let mut document = ConfigurationDocument::empty();
-    document.ceilings.enrolment.cached_payload_bytes = 8 * 1024 * 1024 * 1024;
+    document.ceilings.enrolment =
+        Nullable::some(kr_protocol::hostinfo::configuration::EnrolmentBudgets {
+            cached_payload_bytes: 8 * 1024 * 1024 * 1024,
+            ..Default::default()
+        });
     let asked = ceilings::enrolment(&document.ceilings);
     assert!(
         asked.refused,

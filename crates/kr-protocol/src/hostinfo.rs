@@ -240,6 +240,12 @@ pub struct CeilingValue {
     pub configured: Nullable<String>,
     /// What is in force.
     pub value: String,
+    /// The rung of the precedence ladder it came from.
+    pub source: configuration::ValueSource,
+    /// The document's path, when the rung had one.
+    pub origin: Nullable<String>,
+    /// Whether it applies immediately or only to sessions created afterwards.
+    pub effect: configuration::ValueEffect,
     /// What narrowed the configured value, when something did.
     pub narrowed_by: Nullable<String>,
     /// True when the configured value was more permissive and was refused.
@@ -567,6 +573,123 @@ pub mod configuration {
     /// The configuration document, in the environment's own state directory.
     pub const FILE_NAME: &str = "config.json";
 
+    /// Returns the short prefix for an environment id.
+    #[must_use]
+    pub fn short_prefix(environment_id: crate::ids::EnvironmentId) -> String {
+        let bytes = environment_id.get();
+        let bytes = bytes.as_bytes();
+        let mut prefix = String::with_capacity(8);
+        for byte in &bytes[..4] {
+            use std::fmt::Write as _;
+            let _ = write!(&mut prefix, "{byte:02x}");
+        }
+        prefix
+    }
+
+    /// Returns where this environment's configuration document is.
+    #[must_use]
+    pub fn document_path(
+        state_dir: &std::path::Path,
+        state_root: &std::path::Path,
+        environment_id: crate::ids::EnvironmentId,
+    ) -> std::path::PathBuf {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            if is_normal_linux_install(state_root) {
+                if let Some(config_root) = linux_config_root() {
+                    let prefix = short_prefix(environment_id);
+                    return config_root
+                        .join("environments")
+                        .join(prefix)
+                        .join(FILE_NAME);
+                }
+            }
+        }
+        let _ = (state_root, environment_id);
+        state_dir.join(FILE_NAME)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_config_root() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("XDG_CONFIG_HOME") {
+            if !value.is_empty() {
+                return Some(std::path::PathBuf::from(value).join("kalareach"));
+            }
+        }
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| {
+                std::path::PathBuf::from(home)
+                    .join(".config")
+                    .join("kalareach")
+            })
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn is_normal_linux_install(state_root: &std::path::Path) -> bool {
+        if std::env::var_os("KR_STATE_DIR").is_some() {
+            return false;
+        }
+        let expected = if let Some(value) = std::env::var_os("XDG_STATE_HOME") {
+            std::path::PathBuf::from(value).join("kalareach")
+        } else if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("kalareach")
+        } else {
+            return false;
+        };
+        state_root == expected
+    }
+
+    /// Reads a configuration file, bounded by `limit` bytes.
+    pub fn read_file(path: &std::path::Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read as _;
+
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if metadata.uid() != rustix::process::getuid().as_raw() {
+                return Err("configuration file is not owned by this user".to_owned());
+            }
+            if metadata.mode() & 0o077 != 0 {
+                return Err("configuration file has permissions wider than owner-only".to_owned());
+            }
+            if !metadata.is_file() {
+                return Err("configuration file must be a regular file".to_owned());
+            }
+            if metadata.len() > limit {
+                return Err(format!("this file is larger than the {limit} byte bound"));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if !metadata.is_file() {
+                return Err("configuration file must be a regular file".to_owned());
+            }
+            if metadata.len() > limit {
+                return Err(format!("this file is larger than the {limit} byte bound"));
+            }
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("this file is larger than the {limit} byte bound"));
+        }
+        Ok(Some(bytes))
+    }
+
     /// The version this build writes and reads.
     pub const VERSION: u64 = 1;
 
@@ -723,17 +846,25 @@ pub mod configuration {
         /// in this list is not available on this host however a grant was issued.
         pub grant_rights: Nullable<Vec<String>>,
         /// The repository enrolment budgets section 11 calls configuration.
-        pub enrolment: EnrolmentBudgets,
+        pub enrolment: Nullable<EnrolmentBudgets>,
     }
 
     impl Default for ConfigurationCeilings {
-        /// No configured ceiling, and section 11's own enrolment budgets.
+        /// No configured ceiling.
         fn default() -> Self {
             Self {
                 session_limit: Nullable::null(),
                 grant_rights: Nullable::null(),
-                enrolment: EnrolmentBudgets::default(),
+                enrolment: Nullable::null(),
             }
+        }
+    }
+
+    impl ConfigurationCeilings {
+        /// Returns the enrolment budgets in force, defaulting to section 11's values.
+        #[must_use]
+        pub fn enrolment_budgets(&self) -> EnrolmentBudgets {
+            self.enrolment.0.unwrap_or_default()
         }
     }
 
@@ -1037,31 +1168,32 @@ pub mod configuration {
                 }
             }
         }
-        let budgets = &document.ceilings.enrolment;
-        for (field, value) in [
-            ("metadata_bytes", budgets.metadata_bytes),
-            ("metadata_entries", budgets.metadata_entries),
-            ("retained_generations", budgets.retained_generations),
-            ("cached_payload_bytes", budgets.cached_payload_bytes),
-            ("package_bytes", budgets.package_bytes),
-            ("object_count", budgets.object_count),
-            ("expanded_pack_bytes", budgets.expanded_pack_bytes),
-            ("transfer_bytes", budgets.transfer_bytes),
-            ("compilation_ms", budgets.compilation_ms),
-        ] {
-            if value == 0 {
+        if let Some(budgets) = document.ceilings.enrolment.0.as_ref() {
+            for (field, value) in [
+                ("metadata_bytes", budgets.metadata_bytes),
+                ("metadata_entries", budgets.metadata_entries),
+                ("retained_generations", budgets.retained_generations),
+                ("cached_payload_bytes", budgets.cached_payload_bytes),
+                ("package_bytes", budgets.package_bytes),
+                ("object_count", budgets.object_count),
+                ("expanded_pack_bytes", budgets.expanded_pack_bytes),
+                ("transfer_bytes", budgets.transfer_bytes),
+                ("compilation_ms", budgets.compilation_ms),
+            ] {
+                if value == 0 {
+                    problems.push(format!(
+                        "an enrolment budget of zero for {field} would enrol no repository"
+                    ));
+                }
+            }
+            if budgets.cached_payload_bytes > DEFAULT_CACHED_PAYLOAD_BYTES
+                && !budgets.full_offline_mirror
+            {
                 problems.push(format!(
-                    "an enrolment budget of zero for {field} would enrol no repository"
+                    "a cached payload budget above {DEFAULT_CACHED_PAYLOAD_BYTES} bytes is a full \
+                     mirror and needs full_offline_mirror set explicitly"
                 ));
             }
-        }
-        if budgets.cached_payload_bytes > DEFAULT_CACHED_PAYLOAD_BYTES
-            && !budgets.full_offline_mirror
-        {
-            problems.push(format!(
-                "a cached payload budget above {DEFAULT_CACHED_PAYLOAD_BYTES} bytes is a full \
-                 mirror and needs full_offline_mirror set explicitly"
-            ));
         }
         if document.secrets.len() > MAX_SECRETS {
             problems.push(format!(
@@ -1253,7 +1385,9 @@ pub mod configuration {
                     unique
                 }));
             }
-            Change::Enrolment(budgets) => document.ceilings.enrolment = *budgets,
+            Change::Enrolment(budgets) => {
+                document.ceilings.enrolment = Nullable::some(*budgets);
+            }
         }
         document.version = VERSION;
         document.revision = based_on + 1;
@@ -1315,46 +1449,29 @@ pub mod configuration {
     /// the window in which two writers are inside them at once.
     pub const LOCK_NAME: &str = ".config.lock";
 
-    /// How long a lock is honoured before it is treated as one its holder did not live to release.
+    /// The lock, held through an open file handle for as long as this value lives.
     ///
-    /// An edit is a validation, a comparison and a rename: milliseconds. A lock older than this
-    /// was left by a process that ended without releasing it, and honouring it for ever would make
-    /// one interrupted command the end of configuration on this host.
-    pub const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
-
-    /// The lock, held for as long as this value lives.
+    /// The lock file remains in place. Process termination or dropping this value releases the
+    /// kernel file lock immediately without an unlink-and-recreate race.
     #[derive(Debug)]
     pub struct EditLock {
+        _file: std::fs::File,
         path: std::path::PathBuf,
-        /// What the file this lock created was, so releasing it cannot remove a different one.
-        ///
-        /// A holder that was paused past [`LOCK_PATIENCE`] and woke up after its lock had been
-        /// taken over would otherwise remove the *new* holder's file on the way out, and the two
-        /// would then both believe they held the lock.
-        identity: Option<u64>,
     }
 
-    impl Drop for EditLock {
-        fn drop(&mut self) {
-            // Released whichever way the edit ended, including a refusal, and only when the file
-            // there is still the one this lock created.
-            if lock_identity(&self.path) == self.identity {
-                let _ = std::fs::remove_file(&self.path);
-            }
+    impl EditLock {
+        /// Returns the path to the lock file.
+        #[must_use]
+        pub fn path(&self) -> &std::path::Path {
+            &self.path
         }
     }
 
     /// Takes the configuration lock in `state_directory`.
     ///
-    /// Exclusive creation is the whole of the ordinary case: the filesystem decides which of two
-    /// writers created the file, and the other is told to try again.
-    ///
-    /// A lock left by a process that ended without releasing it would otherwise stop every later
-    /// edit, so one older than [`LOCK_PATIENCE`] is taken over. The takeover is itself exclusive:
-    /// a contender first creates `<lock>.takeover`, which only one of them can do, so two
-    /// contenders cannot each remove the other's replacement. The holder's own release checks that
-    /// the file is still the one it created, so a holder that was paused through its own takeover
-    /// removes nothing.
+    /// Uses an operating-system file lock held through an open handle (`flock` on Unix, exclusive
+    /// share mode on Windows). The lock file stays in place; exiting releases ownership without
+    /// race conditions.
     ///
     /// # Errors
     ///
@@ -1362,37 +1479,7 @@ pub mod configuration {
     /// cannot be taken at all.
     pub fn lock(state_directory: &std::path::Path) -> Result<EditLock, String> {
         let path = state_directory.join(LOCK_NAME);
-        match take_lock(&path) {
-            Ok(held) => Ok(held),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !is_stale(&path) {
-                    return Err(busy(state_directory, &path));
-                }
-                // One contender at a time performs a takeover. Whoever creates this file does it;
-                // everyone else is told the lock is busy and tries again.
-                let takeover = path.with_extension("takeover");
-                let claim = match take_lock(&takeover) {
-                    Ok(claim) => claim,
-                    Err(_) => return Err(busy(state_directory, &path)),
-                };
-                // Checked once more inside the takeover: the holder may have released it between
-                // the check above and this line, in which case there is nothing to take over.
-                if !is_stale(&path) {
-                    drop(claim);
-                    return Err(busy(state_directory, &path));
-                }
-                let _ = std::fs::remove_file(&path);
-                let held = take_lock(&path).map_err(|error| {
-                    format!("this host could not take {}: {error}", path.display())
-                });
-                drop(claim);
-                held
-            }
-            Err(error) => Err(format!(
-                "this host could not take {}: {error}",
-                path.display()
-            )),
-        }
+        take_lock(state_directory, &path)
     }
 
     /// The sentence a caller reports when the lock is held.
@@ -1404,46 +1491,84 @@ pub mod configuration {
         )
     }
 
-    /// Whether the lock at `path` was left by a holder that is no longer editing.
-    fn is_stale(path: &std::path::Path) -> bool {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|since| since.elapsed().is_ok_and(|age| age >= LOCK_PATIENCE))
-    }
-
-    /// What the file at `path` is, as a number two holders cannot share.
-    ///
-    /// The inode on Unix. Windows has no equally cheap answer through the standard library, so a
-    /// release there removes the lock unconditionally; the takeover above is still exclusive, and
-    /// what remains is the narrow case of a holder paused through its own takeover.
     #[cfg(unix)]
-    fn lock_identity(path: &std::path::Path) -> Option<u64> {
-        use std::os::unix::fs::MetadataExt as _;
+    fn take_lock(
+        state_directory: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Result<EditLock, String> {
+        use rustix::fs::{FlockOperation, flock};
+        use std::os::unix::fs::OpenOptionsExt as _;
 
-        std::fs::metadata(path).ok().map(|metadata| metadata.ino())
-    }
-
-    /// What the file at `path` is, where the platform does not answer cheaply.
-    #[cfg(not(unix))]
-    fn lock_identity(_path: &std::path::Path) -> Option<u64> {
-        None
-    }
-
-    /// Creates a lock file, failing when it is already there.
-    fn take_lock(path: &std::path::Path) -> std::io::Result<EditLock> {
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-
-            options.mode(0o600);
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600);
+        let file = options
+            .open(path)
+            .map_err(|error| format!("this host could not open {}: {error}", path.display()))?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(EditLock {
+                _file: file,
+                path: path.to_path_buf(),
+            }),
+            Err(error)
+                if error == rustix::io::Errno::WOULDBLOCK || error == rustix::io::Errno::AGAIN =>
+            {
+                Err(busy(state_directory, path))
+            }
+            Err(error) => Err(format!(
+                "this host could not lock {}: {error}",
+                path.display()
+            )),
         }
-        options.open(path)?;
-        Ok(EditLock {
-            identity: lock_identity(path),
-            path: path.to_path_buf(),
-        })
+    }
+
+    #[cfg(not(unix))]
+    fn take_lock(
+        state_directory: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Result<EditLock, String> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const NO_SHARING: u32 = 0;
+
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(NO_SHARING);
+            match options.open(path) {
+                Ok(file) => Ok(EditLock {
+                    _file: file,
+                    path: path.to_path_buf(),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Err(busy(state_directory, path))
+                }
+                Err(error) => Err(format!(
+                    "this host could not open {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            let file = options
+                .open(path)
+                .map_err(|error| format!("this host could not open {}: {error}", path.display()))?;
+            Ok(EditLock {
+                _file: file,
+                path: path.to_path_buf(),
+            })
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2469,8 +2594,14 @@ mod tests {
         let loaded = configuration::load(None);
         assert_eq!(loaded.status.state, DocumentState::Absent);
         assert_eq!(loaded.revision(), 0);
-        assert_eq!(loaded.ceilings().enrolment.metadata_bytes, 64 * 1024 * 1024);
-        assert_eq!(loaded.ceilings().enrolment.metadata_entries, 100_000);
+        assert_eq!(
+            loaded.ceilings().enrolment_budgets().metadata_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            loaded.ceilings().enrolment_budgets().metadata_entries,
+            100_000
+        );
     }
 
     /// KR-REQ-26.16: an edit is validated before a revision is applied.

@@ -2965,6 +2965,10 @@
           ],
           "description": "What the configuration asked for, when it asked for anything."
         },
+        "effect": {
+          "$ref": "#/$defs/ValueEffect",
+          "description": "Whether it applies immediately or only to sessions created afterwards."
+        },
         "key": {
           "description": "The key.",
           "type": "string"
@@ -2980,9 +2984,24 @@
           ],
           "description": "What narrowed the configured value, when something did."
         },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The document's path, when the rung had one."
+        },
         "refused": {
           "description": "True when the configured value was more permissive and was refused.",
           "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/ValueSource",
+          "description": "The rung of the precedence ladder it came from."
         },
         "value": {
           "description": "What is in force.",
@@ -2993,6 +3012,9 @@
         "key",
         "configured",
         "value",
+        "source",
+        "origin",
+        "effect",
         "narrowed_by",
         "refused"
       ],
@@ -4296,19 +4318,15 @@
       "description": "The ceilings this host configures.\n\nEvery one of them narrows. A configured value above what authority, an organisation\nrestriction, a grant or a hard resource limit already allows is rejected rather than\napplied, which is section 26's second paragraph and why these are not in\n[`PreferenceSet`].",
       "properties": {
         "enrolment": {
-          "$ref": "#/$defs/EnrolmentBudgets",
-          "default": {
-            "cached_payload_bytes": 1073741824,
-            "compilation_ms": 60000,
-            "expanded_pack_bytes": 536870912,
-            "full_offline_mirror": false,
-            "metadata_bytes": 67108864,
-            "metadata_entries": 100000,
-            "object_count": 100000,
-            "package_bytes": 268435456,
-            "retained_generations": 2,
-            "transfer_bytes": 2147483648
-          },
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EnrolmentBudgets"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
           "description": "The repository enrolment budgets section 11 calls configuration."
         },
         "grant_rights": {
@@ -4350,18 +4368,7 @@
         "ceilings": {
           "$ref": "#/$defs/ConfigurationCeilings",
           "default": {
-            "enrolment": {
-              "cached_payload_bytes": 1073741824,
-              "compilation_ms": 60000,
-              "expanded_pack_bytes": 536870912,
-              "full_offline_mirror": false,
-              "metadata_bytes": 67108864,
-              "metadata_entries": 100000,
-              "object_count": 100000,
-              "package_bytes": 268435456,
-              "retained_generations": 2,
-              "transfer_bytes": 2147483648
-            },
+            "enrolment": null,
             "grant_rights": null,
             "session_limit": null
           },

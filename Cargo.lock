@@ -4294,6 +4294,7 @@ dependencies = [
  "base64 0.23.1",
  "hex",
  "kr-cbor",
+ "rustix",
  "schemars 1.2.2",
  "serde",
  "serde_json",

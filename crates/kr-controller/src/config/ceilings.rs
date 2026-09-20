@@ -87,8 +87,15 @@ pub fn session_limit(ceilings: &ConfigurationCeilings, limits: HardLimits) -> Ce
 /// request is refused.
 #[must_use]
 pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> {
-    let configured = ceilings.enrolment;
     let default = EnrolmentBudgets::default();
+    let Some(configured) = ceilings.enrolment.0 else {
+        return Ceiling {
+            configured: None,
+            value: default,
+            narrowed_by: None,
+            refused: false,
+        };
+    };
     if configured.cached_payload_bytes > default.cached_payload_bytes
         && !configured.full_offline_mirror
     {
@@ -154,6 +161,12 @@ pub fn decide_with_ceiling(
             refused_rights: CanonicalSet::new(),
         });
     };
+    // Intersect the grant with current policy first, so diagnostics reflect the combination
+    // of policy and ceiling restrictions rather than comparing against unconstrained grant actions.
+    let now_ms = policy.settled_now(request.now_ms);
+    let policy_intersection = policy.intersect(grant, &request, now_ms)?;
+    let policy_rights = policy_intersection.rights;
+
     // The ceiling is applied to the grant *before* the decision, never to its result. A method
     // whose required right this host's configuration has removed has to be refused, and a decision
     // taken against the unnarrowed grant would already have permitted it: emptying the answer
@@ -168,18 +181,17 @@ pub fn decide_with_ceiling(
             .collect(),
         ..grant.clone()
     };
-    let removed: CanonicalSet<ActionRight> = grant
-        .actions
+    let removed: CanonicalSet<ActionRight> = policy_rights
         .iter()
         .copied()
         .filter(|right| !ceiling.contains(right))
         .collect();
-    // What the ceiling named and the grant does not carry. Reported, never granted: a ceiling is a
-    // maximum, and naming a right the grant never had adds nothing.
+    // What the ceiling named and the grant does not carry under policy. Reported, never granted:
+    // a ceiling is a maximum, and naming a right the grant and policy never had adds nothing.
     let refused_rights: CanonicalSet<ActionRight> = ceiling
         .iter()
         .copied()
-        .filter(|right| !grant.actions.contains(right))
+        .filter(|right| !policy_rights.contains(right))
         .collect();
     Ok(Decided {
         permitted: decide(&narrowed, record, policy, request)?,
@@ -200,11 +212,21 @@ pub struct Decided {
 }
 
 /// Renders one ceiling for the effective-value report.
-pub fn report<T>(key: &str, ceiling: &Ceiling<T>, render: impl Fn(&T) -> String) -> CeilingValue {
+pub fn report<T>(
+    key: &str,
+    ceiling: &Ceiling<T>,
+    source: kr_protocol::hostinfo::configuration::ValueSource,
+    origin: Option<String>,
+    effect: kr_protocol::hostinfo::configuration::ValueEffect,
+    render: impl Fn(&T) -> String,
+) -> CeilingValue {
     CeilingValue {
         key: key.to_owned(),
         configured: Nullable(ceiling.configured.as_ref().map(&render)),
         value: render(&ceiling.value),
+        source,
+        origin: Nullable(origin),
+        effect,
         narrowed_by: Nullable(ceiling.narrowed_by.clone()),
         refused: ceiling.refused,
     }

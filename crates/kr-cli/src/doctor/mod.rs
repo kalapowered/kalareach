@@ -161,10 +161,17 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
             .as_ref()
             .map(|why| format!(" ({why})"))
             .unwrap_or_default();
+        let origin = ceiling
+            .origin
+            .as_ref()
+            .map(|path| format!(" ({path})"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  {} ceiling {}{}{narrowed}",
+            "  {} ceiling {} from {}{origin}, applies {}{}{narrowed}",
             ceiling.key,
             ceiling.value,
+            ceiling.source.as_str(),
+            ceiling.effect.as_str(),
             if ceiling.refused {
                 ", the configured value was more permissive and was refused"
             } else {

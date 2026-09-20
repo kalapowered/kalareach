@@ -3978,7 +3978,10 @@ impl Controller {
     async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
         let mut reading = self.desktop.lock().await;
         if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
-            reading.context = crate::desktop::current(self.boot_identity.clone());
+            let mut context = crate::desktop::current(self.boot_identity.clone());
+            let platform = crate::desktop::default_profile(&context);
+            context.worker_profile = self.configuration().worker_profile(None, platform).value;
+            reading.context = context;
             reading.read_at = std::time::Instant::now();
         }
         (reading.context.clone(), reading.revision)
@@ -4045,16 +4048,7 @@ impl Controller {
 
     /// Returns the execution profile this host creates sessions with when a request chooses none.
     pub async fn default_profile(&self) -> WorkerProfile {
-        // The platform's answer is the bottom rung. What this host creates sessions in is what the
-        // precedence resolves to, so a configured execution context reaches session creation
-        // rather than only the report about it: `kr new` without a flag takes this host's default,
-        // and this is that default.
-        self.configuration()
-            .worker_profile(
-                None,
-                crate::desktop::default_profile(&self.desktop().await.0),
-            )
-            .value
+        self.desktop().await.0.worker_profile
     }
 
     /// Returns what this host's sleep inhibition is doing, taking or releasing the assertion.
@@ -4476,6 +4470,17 @@ impl Controller {
             applied.pending_workers = barrier.pending().len() as u64;
             applied.barrier_holds = barrier.holds();
             applied.authority_revision = Some(barrier.authority_revision);
+        }
+        if applied
+            .invalidated
+            .contains(&kr_protocol::desktop::CapabilityInvalidation::WorkerProfile)
+        {
+            let mut reading = self.desktop.lock().await;
+            reading.read_at = std::time::Instant::now()
+                .checked_sub(DESKTOP_REREAD_INTERVAL)
+                .unwrap_or_else(std::time::Instant::now);
+            drop(reading);
+            let _ = self.capability_report().await;
         }
         drop(edit);
         Ok(applied)

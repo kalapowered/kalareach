@@ -32,7 +32,11 @@ use kr_protocol::scalars::Nullable;
 /// Returns where this environment's configuration document is.
 #[must_use]
 pub fn document_path(paths: &EnvironmentPaths) -> PathBuf {
-    paths.state_dir().join(configuration::FILE_NAME)
+    configuration::document_path(
+        paths.state_dir(),
+        paths.state_root(),
+        paths.environment_id(),
+    )
 }
 
 /// Reads this environment's configuration document.
@@ -43,9 +47,9 @@ pub fn document_path(paths: &EnvironmentPaths) -> PathBuf {
 #[must_use]
 pub fn load(paths: &EnvironmentPaths) -> Loaded {
     let path = document_path(paths);
-    match kr_ipc::paths::read_owner_only_file(&path, configuration::MAX_LEN) {
+    match configuration::read_file(&path, configuration::MAX_LEN) {
         Ok(bytes) => configuration::load(bytes.as_deref()),
-        Err(error) => configuration::unreadable(&error.to_string()),
+        Err(error) => configuration::unreadable(&error),
     }
 }
 
@@ -170,7 +174,7 @@ impl Resolver {
     /// document answers what a repository may cost on this host.
     #[must_use]
     pub fn enrolment_budgets(&self) -> EnrolmentBudgets {
-        self.loaded.ceilings().enrolment
+        self.loaded.ceilings().enrolment_budgets()
     }
 
     /// Returns the profile that contributes to the middle rung, when one does.

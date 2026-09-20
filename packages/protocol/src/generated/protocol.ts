@@ -4979,7 +4979,10 @@ export interface ConfigurationDocument {
  * The ceilings this host configures. They intersect; they never raise anything.
  */
 export interface ConfigurationCeilings {
-  enrolment?: EnrolmentBudgets
+  /**
+   * The repository enrolment budgets section 11 calls configuration.
+   */
+  enrolment?: EnrolmentBudgets | null
   /**
    * The rights a grant may carry on this host, as the stable action-right strings.
    *
@@ -4996,7 +4999,11 @@ export interface ConfigurationCeilings {
   session_limit?: number | null
 }
 /**
- * The repository enrolment budgets section 11 calls configuration.
+ * The repository enrolment budgets, checked before a fetch and during processing.
+ *
+ * Section 11 sets each default and says a larger full mirror needs an explicit setting. The
+ * catalogue client reads them through this host's configuration rather than carrying its own
+ * copy, so one document answers "what may a repository cost here".
  */
 export interface EnrolmentBudgets {
   /**
@@ -7408,6 +7415,10 @@ export interface CeilingValue {
    */
   configured: string | null
   /**
+   * Whether it applies immediately or only to sessions created afterwards.
+   */
+  effect: 'immediately' | 'new_sessions_only'
+  /**
    * The key.
    */
   key: string
@@ -7416,9 +7427,17 @@ export interface CeilingValue {
    */
   narrowed_by: string | null
   /**
+   * The document's path, when the rung had one.
+   */
+  origin: string | null
+  /**
    * True when the configured value was more permissive and was refused.
    */
   refused: boolean
+  /**
+   * The rung of the precedence ladder it came from.
+   */
+  source: 'request' | 'profile' | 'host_configuration' | 'default'
   /**
    * What is in force.
    */

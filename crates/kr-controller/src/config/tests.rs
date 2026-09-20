@@ -204,7 +204,7 @@ fn an_enrolment_budget_above_the_default_needs_the_explicit_setting() {
         ..EnrolmentBudgets::default()
     };
     let asked = ConfigurationCeilings {
-        enrolment: budgets,
+        enrolment: Nullable::some(budgets),
         ..ConfigurationCeilings::default()
     };
     let ceiling = ceilings::enrolment(&asked);
@@ -221,7 +221,7 @@ fn an_enrolment_budget_above_the_default_needs_the_explicit_setting() {
 
     budgets.full_offline_mirror = true;
     let chosen = ConfigurationCeilings {
-        enrolment: budgets,
+        enrolment: Nullable::some(budgets),
         ..ConfigurationCeilings::default()
     };
     let ceiling = ceilings::enrolment(&chosen);
@@ -462,11 +462,11 @@ fn a_second_writer_is_refused_while_the_first_holds_the_lock() {
     )
     .expect("the lock is free again");
     assert!(
-        !environment
+        environment
             .state_dir()
             .join(kr_protocol::hostinfo::configuration::LOCK_NAME)
             .exists(),
-        "and an edit leaves no lock behind"
+        "the lock file remains in place and is free to acquire"
     );
 }
 

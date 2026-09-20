@@ -162,11 +162,12 @@ fn write(paths: &EnvironmentPaths, edited: &Edited) -> Result<()> {
     // second writer may have applied its own edit, and writing over it would lose a choice
     // somebody made rather than change one.
     configuration::still_current(edited, &kr_worker::config::load(paths)).map_err(refused)?;
-    kr_ipc::paths::write_owner_only_file(
-        &kr_worker::config::document_path(paths),
-        edited.contents.as_bytes(),
-    )
-    .map_err(ControllerError::Ipc)
+    let path = kr_worker::config::document_path(paths);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    kr_ipc::paths::write_owner_only_file(&path, edited.contents.as_bytes())
+        .map_err(ControllerError::Ipc)
 }
 
 /// Turns a refusal into this crate's error.
@@ -199,6 +200,40 @@ pub fn effective(
     let sessions = ceilings::session_limit(&ceilings, limits);
     let enrolment = ceilings::enrolment(&ceilings);
     let rights = ceilings::configured_rights(&ceilings);
+
+    let doc_path = resolver.document().display().to_string();
+    let session_source = if ceilings.session_limit.is_present() {
+        configuration::ValueSource::HostConfiguration
+    } else {
+        configuration::ValueSource::Default
+    };
+    let session_origin = if ceilings.session_limit.is_present() {
+        Some(doc_path.clone())
+    } else {
+        None
+    };
+
+    let enrolment_source = if ceilings.enrolment.is_present() {
+        configuration::ValueSource::HostConfiguration
+    } else {
+        configuration::ValueSource::Default
+    };
+    let enrolment_origin = if ceilings.enrolment.is_present() {
+        Some(doc_path.clone())
+    } else {
+        None
+    };
+
+    let rights_source = if ceilings.grant_rights.is_present() {
+        configuration::ValueSource::HostConfiguration
+    } else {
+        configuration::ValueSource::Default
+    };
+    let rights_origin = if ceilings.grant_rights.is_present() {
+        Some(doc_path)
+    } else {
+        None
+    };
     EffectiveConfiguration {
         schema_version: U64::new(configuration::VERSION),
         revision: U64::new(resolver.revision()),
@@ -213,28 +248,42 @@ pub fn effective(
         overrides: resolver.overrides(),
         values,
         ceilings: vec![
-            ceilings::report("session_limit", &sessions, u64::to_string),
-            ceilings::report("enrolment", &enrolment, |budgets| {
-                format!(
-                    "{} metadata bytes, {} entries, {} generations retained, {} cached payload \
-                     bytes, {} per package, {} objects, {} expanded, {} per transfer, {} ms to \
-                     compile{}",
-                    budgets.metadata_bytes,
-                    budgets.metadata_entries,
-                    budgets.retained_generations,
-                    budgets.cached_payload_bytes,
-                    budgets.package_bytes,
-                    budgets.object_count,
-                    budgets.expanded_pack_bytes,
-                    budgets.transfer_bytes,
-                    budgets.compilation_ms,
-                    if budgets.full_offline_mirror {
-                        ", full offline mirror"
-                    } else {
-                        ""
-                    }
-                )
-            }),
+            ceilings::report(
+                "session_limit",
+                &sessions,
+                session_source,
+                session_origin,
+                configuration::ValueEffect::Immediately,
+                u64::to_string,
+            ),
+            ceilings::report(
+                "enrolment",
+                &enrolment,
+                enrolment_source,
+                enrolment_origin,
+                configuration::ValueEffect::Immediately,
+                |budgets| {
+                    format!(
+                        "{} metadata bytes, {} entries, {} generations retained, {} cached payload \
+                         bytes, {} per package, {} objects, {} expanded, {} per transfer, {} ms to \
+                         compile{}",
+                        budgets.metadata_bytes,
+                        budgets.metadata_entries,
+                        budgets.retained_generations,
+                        budgets.cached_payload_bytes,
+                        budgets.package_bytes,
+                        budgets.object_count,
+                        budgets.expanded_pack_bytes,
+                        budgets.transfer_bytes,
+                        budgets.compilation_ms,
+                        if budgets.full_offline_mirror {
+                            ", full offline mirror"
+                        } else {
+                            ""
+                        }
+                    )
+                },
+            ),
             kr_protocol::hostinfo::CeilingValue {
                 key: "grant_rights".to_owned(),
                 configured: kr_protocol::scalars::Nullable(rights.as_ref().map(|rights| {
@@ -254,6 +303,9 @@ pub fn effective(
                             .join(", ")
                     },
                 ),
+                source: rights_source,
+                origin: kr_protocol::scalars::Nullable(rights_origin),
+                effect: configuration::ValueEffect::Immediately,
                 narrowed_by: kr_protocol::scalars::Nullable(rights.as_ref().map(|_| {
                     "the grant and the host policy are intersected first; this ceiling only \
                      removes rights"

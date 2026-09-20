@@ -19,15 +19,20 @@ use crate::error::{CliError, Result};
 /// Returns where this environment's configuration document is.
 #[must_use]
 pub fn document_path(paths: &EnvironmentPaths) -> PathBuf {
-    paths.state_dir().join(configuration::FILE_NAME)
+    configuration::document_path(
+        paths.state_dir(),
+        paths.state_root(),
+        paths.environment_id(),
+    )
 }
 
 /// Reads this environment's configuration document, bounded and owner-only.
 #[must_use]
 pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
-    match kr_ipc::paths::read_owner_only_file(&document_path(paths), configuration::MAX_LEN) {
+    let path = document_path(paths);
+    match configuration::read_file(&path, configuration::MAX_LEN) {
         Ok(bytes) => configuration::load(bytes.as_deref()),
-        Err(error) => configuration::unreadable(&error.to_string()),
+        Err(error) => configuration::unreadable(&error),
     }
 }
 
@@ -49,7 +54,11 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
         .map_err(|refused| CliError::Usage(refused.to_string()))?;
     configuration::still_current(&edited, &load(paths))
         .map_err(|refused| CliError::Usage(refused.to_string()))?;
-    kr_ipc::paths::write_owner_only_file(&document_path(paths), edited.contents.as_bytes())
+    let path = document_path(paths);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    kr_ipc::paths::write_owner_only_file(&path, edited.contents.as_bytes())
         .map_err(CliError::Ipc)?;
     drop(held);
     Ok(edited.revision)
