@@ -4272,6 +4272,25 @@ fn an_owner_whose_store_was_taken_answers_nothing_more() {
         ),
         "and offers no announcement about a condition somebody else may have resolved"
     );
+    assert!(
+        matches!(
+            first.read(&who, &page(), reading(3_000), Content::Whole),
+            Err(kr_attention::Error::StoreTaken)
+        ),
+        "a page of that inbox is the same stale answer, and is refused too"
+    );
+    assert!(matches!(
+        first.review_states(&who, session(1), None, MAX_REVIEW_SUBJECTS),
+        Err(kr_attention::Error::StoreTaken)
+    ));
+    assert!(
+        matches!(first.check_store(), Err(kr_attention::Error::StoreTaken)),
+        "and it says so when it is asked outright, which is what a host asks before it dispatches"
+    );
+    assert!(matches!(
+        first.check_actor(&who),
+        Err(kr_attention::Error::StoreTaken)
+    ));
 
     // Letting go gives up its own claim and nothing else, so the second owner still holds the
     // store and a third opener is still shut out.

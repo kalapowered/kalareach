@@ -325,6 +325,20 @@ impl Attention {
             .map_err(translate)
     }
 
+    /// Answers whether this worker still holds its session's store, without changing anything.
+    ///
+    /// A store it no longer holds records nothing whatever it is asked to record, so asking here
+    /// makes that a rejection of the action rather than a failure inside the effect, which settles
+    /// as an outcome nobody can establish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached, and when the
+    /// store is no longer this worker's.
+    pub fn check_store(&self) -> Result<()> {
+        self.locked()?.check_store().map_err(translate)
+    }
+
     /// Refuses, before anything is dispatched, an actor this session's store cannot admit.
     ///
     /// The store bounds how many actors it holds on admission rather than on eviction, so nothing

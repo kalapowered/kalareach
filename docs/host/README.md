@@ -1384,15 +1384,20 @@ idle.
 
 A database is journalled under the name it was opened by, so one file that two names reach can be
 journalled twice over by two processes that never see each other's work. The store refuses such a
-file outright and says how many names reach it, on the platforms that count them, which is the Unix
-family. Windows counts a file's names as well but hands the count out only through an open handle
-on the file, and this host opens no second handle on a database, so what stands in for it there is
-where the store is: under a directory this host makes for the session, where a second name is
-something somebody went and made.
+file outright and says how many names reach it. The count is of the file the store has open rather
+than of whatever a name reaches now: on Windows it comes from the store's own handle on the file,
+and on the Unix family, where nothing safe describes an open file, the name is described without
+opening it - a second descriptor there would drop every lock this process holds on the file,
+including the receipt journal's - and the store then asks its own database whether the file it has
+open is still the one that name reaches. Those are two answers rather than one, so a name swapped
+between them is not ruled out; what is ruled out is every ordinary second name. A host that cannot
+answer at all is refused rather than admitted.
 
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same
-answer.
+answer. The exception is the store being taken: that value holds a state that is no longer the
+store's, so it answers nothing more and the session's worker opens the store again rather than
+retrying against it.
 
 A decided announcement stays written down until a delivery consumer says it has taken durable
 responsibility for it. Taking one is two steps for that reason: the host offers what is outstanding

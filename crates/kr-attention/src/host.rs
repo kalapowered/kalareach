@@ -12,6 +12,11 @@
 //! consumed cursor in memory, and a retry then skips the event it never recorded and announces
 //! nothing at all.
 //!
+//! One failure is not like that. [`crate::Error::StoreTaken`] says the store is no longer this
+//! value's, so what it holds is the state as it was before somebody else took it: retrying against
+//! it would decide against a session it no longer has. It answers nothing after that, and the
+//! store is opened again instead.
+//!
 //! What this does not cover is the step after: a host that is handed an announcement and then dies
 //! before sending it. Closing that needs a delivery outbox with its own receipts, which section 24
 //! gives to the delivery journal rather than to the feature store.
@@ -393,7 +398,9 @@ impl Attention {
     ///
     /// Returns [`crate::Error::UnknownContinuation`] when the key a page continues after is no
     /// longer in this actor's inbox. Starting again at the beginning would repeat items the
-    /// client has already been given, and it could not tell that from a valid continuation.
+    /// client has already been given, and it could not tell that from a valid continuation. And
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
     pub fn read(
         &self,
         actor: &ActorId,
@@ -401,6 +408,7 @@ impl Attention {
         reading: HostReading,
         content: Content,
     ) -> Result<AttentionReadResult> {
+        self.live()?;
         let all = self
             .state
             .engine
@@ -466,6 +474,19 @@ impl Attention {
         Ok(self.state.engine.awaiting_delivery())
     }
 
+    /// Answers whether this value still holds its store, without changing anything.
+    ///
+    /// A host asks before it dispatches an action, so a store this worker no longer holds is a
+    /// refusal of the action rather than an outcome nobody can establish: the effect would fail
+    /// whatever it was asked to record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when somebody else has taken the store.
+    pub fn check_store(&self) -> Result<()> {
+        self.live()
+    }
+
     /// Answers whether this store would admit one actor, without changing anything.
     ///
     /// The bound is on admission rather than on eviction: nothing anybody has acknowledged is
@@ -474,8 +495,11 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::TooManyActors`] when this actor is new and the bound is reached.
+    /// Returns [`crate::Error::TooManyActors`] when this actor is new and the bound is reached, and
+    /// [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
     pub fn check_actor(&self, actor: &ActorId) -> Result<()> {
+        self.live()?;
         admit(&self.state, actor)
     }
 
@@ -664,7 +688,8 @@ impl Attention {
     /// # Errors
     ///
     /// Returns [`crate::Error::UnknownContinuation`] when `after` names a subject this session no
-    /// longer holds.
+    /// longer holds, and [`crate::Error::StoreTaken`] when the store is no longer this owner's,
+    /// because what this value holds is then the state as it was before somebody else took it.
     pub fn review_states(
         &self,
         actor: &ActorId,
@@ -672,6 +697,7 @@ impl Attention {
         after: Option<&ReviewSubject>,
         max: u64,
     ) -> Result<(Vec<ReviewState>, bool)> {
+        self.live()?;
         self.state
             .reviews
             .states_page(actor, session_id, after, max)

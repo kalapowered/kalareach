@@ -953,6 +953,87 @@ async fn a_value_the_store_could_not_write_down_as_it_was_given_is_refused_befor
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
+async fn an_action_the_store_can_no_longer_record_is_refused_rather_than_left_unknown() {
+    // A worker that lost its store records nothing whatever it is asked to record. Answering that
+    // inside the effect would settle every one of these as an outcome nobody can establish, so the
+    // worker asks before it dispatches and the client gets a rejection it can act on.
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let window = window(&client);
+    observe(&host, 1, approval("req-1"));
+
+    // The store is taken from the running worker: this opener is told the process that claimed it
+    // has gone, which is what a worker that had crashed would leave behind.
+    let reading = kr_worker::attention::reading(host.service.runtime().session().time());
+    let gone = |_: &kr_protocol::identity::ProcessStartIdentity| kr_attention::Liveness::Ended;
+    let taker = kr_attention::Claimant::new(
+        kr_ipc::identity::current_process_start_identity().expect("the kernel answers"),
+        &gone,
+    );
+    let _taken = kr_attention::Attention::beside(Some(&host.journal_path), reading, &taker)
+        .expect("the store is taken from a process this opener is told has gone");
+
+    let window_params = |host: &Host| {
+        typed(&kr_protocol::attention::AttentionQuietHoursParams {
+            session_id: host.session_id,
+            quiet_hours: Nullable(Some(QuietHours {
+                start_minute: U64::new(60),
+                end_minute: U64::new(120),
+                zone: Nullable::some("Africa/Johannesburg".to_owned()),
+            })),
+        })
+    };
+
+    // The first one is where the worker finds out: it could not have known before it tried, so the
+    // write fails inside the effect and the outcome is recorded as one nobody can establish.
+    let discovering = mutation(
+        &window,
+        &host,
+        Method::AttentionQuietHours,
+        window_params(&host),
+    );
+    let answer = send_mutation(&mut client, discovering).await;
+    assert!(
+        matches!(answer, Outcome::Error(ref error) if error.code == ErrorCode::StorageUnavailable),
+        "a store this worker no longer holds records no quiet-hours window: {answer:?}"
+    );
+
+    // The next one it does know about, so it never reaches the effect. A different subject,
+    // because an action whose outcome nobody could establish is the one thing the caller has to
+    // settle before it asks about that subject again.
+    let refused = mutation(
+        &window,
+        &host,
+        Method::VisitAcknowledge,
+        typed(&VisitAcknowledgeParams {
+            session_id: host.session_id,
+            acknowledged_cursor: U64::new(0),
+            views: Vec::new(),
+        }),
+    );
+    let action_id = refused.action_id;
+    let answer = send_mutation(&mut client, refused).await;
+    let Outcome::Error(error) = answer else {
+        panic!("a store this worker knows it no longer holds records nothing at all");
+    };
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
+
+    let read: kr_protocol::receipt::ActionReadResult = ok(send_request(
+        &mut client,
+        request(
+            Method::ActionRead,
+            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+        ),
+    )
+    .await);
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Rejected,
+        "and it is a rejection rather than an outcome nobody can establish"
+    );
+}
+
+#[tokio::test]
 async fn the_state_lives_in_the_session_s_journal_and_the_running_worker_is_its_one_owner() {
     let host = host().await;
     let mut client = cli(&host).await;

@@ -25,11 +25,21 @@ thiserror.workspace = true
 # workspace's random source, and two of them are what the secret is built from.
 uuid.workspace = true
 
+# A database is journalled under the name it was opened by, so the store asks the file SQLite has
+# open how many names reach it. On this platform that answer comes from the handle SQLite already
+# holds, which is the one handle anything here has on the file.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 # The rollback test holds a write lock on the store from outside, so the engine's own write is
 # refused for a reason the test controls rather than one the filesystem happens to give it.
 rusqlite = { workspace = true, features = ["bundled"] }
 tempfile.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

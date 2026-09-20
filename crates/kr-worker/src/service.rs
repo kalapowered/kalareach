@@ -3184,6 +3184,18 @@ impl WorkerService {
         ) {
             session.require_live()?;
         }
+        // Whether this worker still holds its session's attention store. Every one of these
+        // records something in it, so a store it no longer holds refuses the action here rather
+        // than failing inside the effect and settling as an outcome nobody can establish.
+        if matches!(
+            method,
+            Method::AttentionAcknowledge
+                | Method::AttentionQuietHours
+                | Method::ReviewAcknowledge
+                | Method::VisitAcknowledge
+        ) {
+            self.attention.check_store()?;
+        }
         match method {
             Method::SessionAttach => {
                 let params: SessionAttachParams = parse(&mutation.params)?;

@@ -367,18 +367,7 @@ fn resolve(path: &Path) -> Result<std::path::PathBuf> {
         .join(name))
 }
 
-/// What one look at a name says: which file it reaches, and how many names reach that file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileMark {
-    /// The device the file is on.
-    device: u64,
-    /// The file, within that device.
-    inode: u64,
-    /// How many names reach it.
-    names: u64,
-}
-
-/// Refuses a database file that more than one name reaches, and says which file this name reached.
+/// Refuses a database file that more than one name reaches.
 ///
 /// SQLite names the write-ahead log it keeps beside a database, and the shared memory both are
 /// coordinated through, after the name the database was opened by. Two hard links to one file are
@@ -387,60 +376,152 @@ struct FileMark {
 /// be the loser. A symbolic link is a different thing and is admitted: it is resolved before
 /// SQLite is given the path, so every symbolic link to a store reaches the one name it has.
 ///
-/// The count is the file's own rather than a comparison of names, and it is read without opening
-/// the file: on the Unix family, closing any descriptor for a file drops every lock the process
-/// holds on it, and the receipt journal and the question ledger hold locks on this one.
+/// The count is of **the file SQLite has open**, not of whatever a name reaches now. On the Unix
+/// family that takes two answers, because nothing safe here describes an open file: the name is
+/// described without opening it - a second descriptor would drop every lock this process holds on
+/// the file, the receipt journal's and the question ledger's included - and SQLite is then asked
+/// whether the file it has open is still the one that name reaches. On Windows the answer comes
+/// from SQLite's own handle, so there is one answer and no name in it at all.
 ///
-/// **What this cannot do.** It describes the file a name reaches rather than the file SQLite has
-/// open, because nothing this crate can safely call will describe that one. So it is done twice,
-/// once before the database is opened and once after, and a name that reached two different files
-/// across the two is refused: what is left is an actor that can move files under this host inside
-/// its own runtime directory, which is the owner. Where the platform does not report the count at
-/// all, there is nothing to compare.
-fn one_name(file: &Path) -> Result<Option<FileMark>> {
-    let mark = describe(file)?;
-    if let Some(mark) = mark
-        && mark.names > 1
-    {
-        return Err(Error::StoreAliased { names: mark.names });
+/// A platform that will not answer is refused rather than admitted: a store nobody can say is
+/// singly named is one two processes may be journalling.
+fn one_name(connection: &Connection, file: &Path) -> Result<()> {
+    let names = link_count(connection, file)?;
+    if names > 1 {
+        return Err(Error::StoreAliased { names });
     }
-    Ok(mark)
+    Ok(())
 }
 
-/// Returns what this name reaches, where the platform says, and nothing where it does not.
-///
-/// A name that reaches nothing at all is not a failure: a store is created by opening it.
+/// Returns how many names reach the file this connection has open.
 #[cfg(unix)]
-fn describe(file: &Path) -> Result<Option<FileMark>> {
+fn link_count(connection: &Connection, file: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
 
-    let described = match std::fs::metadata(file) {
-        Ok(described) => described,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Error::StoreUnavailable {
-                kind: StoreFault::Other,
-                detail: format!("{} cannot be described: {error}", file.display()),
-            });
-        }
-    };
-    Ok(Some(FileMark {
-        device: described.dev(),
-        inode: described.ino(),
-        names: described.nlink(),
-    }))
+    let described = std::fs::metadata(file).map_err(|error| Error::StoreUnavailable {
+        kind: StoreFault::Other,
+        detail: format!("{} cannot be described: {error}", file.display()),
+    })?;
+    // The count belongs to whatever that name reaches. This is what binds it to the file SQLite
+    // has open: SQLite compares its own open file with the one at the name it opened, and says
+    // whether they are still the same file.
+    if moved(connection)? {
+        return Err(Error::StoreUnavailable {
+            kind: StoreFault::Other,
+            detail: format!(
+                "{} no longer reaches the file this store was opened on",
+                file.display()
+            ),
+        });
+    }
+    Ok(described.nlink())
 }
 
-/// Returns what this name reaches, where the platform says, and nothing where it does not.
+/// Asks SQLite whether the file it has open is still the one its name reaches.
+#[cfg(unix)]
+fn moved(connection: &Connection) -> Result<bool> {
+    let mut answer: std::ffi::c_int = 0;
+    let code = file_control(
+        connection,
+        rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+        &raw mut answer,
+    )?;
+    if code != rusqlite::ffi::SQLITE_OK {
+        return Err(Error::StoreUnavailable {
+            kind: StoreFault::Other,
+            detail: format!("this store cannot say whether its file has moved ({code})"),
+        });
+    }
+    Ok(answer != 0)
+}
+
+/// Returns how many names reach the file this connection has open.
 ///
-/// Windows keeps a file's name count, but hands it out only through an open handle on the file,
-/// and this host opens no second handle on a database. So a Windows store is admitted on the name
-/// it was given, and what stands in for the count there is where the file is: the host keeps each
-/// session's store under a directory of its own making, so a second name for one is something
-/// somebody went and made.
-#[cfg(not(unix))]
-fn describe(_file: &Path) -> Result<Option<FileMark>> {
-    Ok(None)
+/// Windows hands a file's name count out through a handle on the file, and SQLite's own handle is
+/// one: this asks for that, so nothing here opens the file a second time and no name comes into
+/// the answer at all.
+#[cfg(windows)]
+fn link_count(connection: &Connection, _file: &Path) -> Result<u64> {
+    #![expect(
+        unsafe_code,
+        reason = "this platform describes an open file only through its handle"
+    )]
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut handle: HANDLE = std::ptr::null_mut();
+    let code = file_control(
+        connection,
+        rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+        &raw mut handle,
+    )?;
+    if code != rusqlite::ffi::SQLITE_OK || handle.is_null() {
+        return Err(Error::StoreUnavailable {
+            kind: StoreFault::Other,
+            detail: format!("this store cannot describe the file it has open ({code})"),
+        });
+    }
+    // SAFETY: the structure is written whole by the call and read only after it reports success.
+    // The handle is SQLite's own, open for the life of this connection, and this borrows it: it is
+    // not closed here, which on this platform would be closing SQLite's file.
+    let mut described: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the call writes one structure of exactly this type through the pointer it is given,
+    // and has no other effect. The pointer is to a live local of that type.
+    let described = if unsafe { GetFileInformationByHandle(handle, &raw mut described) } == 0 {
+        None
+    } else {
+        Some(described)
+    };
+    let described = described.ok_or_else(|| Error::StoreUnavailable {
+        kind: StoreFault::Other,
+        detail: "this store cannot say how many names reach the file it has open".to_owned(),
+    })?;
+    Ok(u64::from(described.nNumberOfLinks))
+}
+
+/// Returns how many names reach the file this connection has open.
+///
+/// There is no answer on this platform, and a store nobody can say is singly named is one two
+/// processes may be journalling separately, so it is refused rather than admitted.
+#[cfg(not(any(unix, windows)))]
+fn link_count(_connection: &Connection, file: &Path) -> Result<u64> {
+    Err(Error::StoreUnavailable {
+        kind: StoreFault::Other,
+        detail: format!(
+            "this host cannot say how many names reach {}, so it will not journal it",
+            file.display()
+        ),
+    })
+}
+
+/// Asks the open database one question about the file underneath it.
+///
+/// The one place in this crate that calls a library without a safe interface. `rusqlite` offers no
+/// safe way to ask: the questions this needs answered are about the file SQLite has open, and the
+/// alternative - opening the file again to look at it - is the thing that must not happen, because
+/// on the Unix family closing any descriptor for a file drops every lock this process holds on it.
+#[cfg(any(unix, windows))]
+fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Result<i32> {
+    #![expect(
+        unsafe_code,
+        reason = "the file under an open database has no safe interface here"
+    )]
+
+    // SAFETY: the handle is borrowed for the call and not kept; the database it names is open for
+    // the life of `connection`. The call writes one value of the type this question is defined to
+    // answer with through the pointer it is given, which is to a live local of that type, and the
+    // caller passes the pointer and the question together.
+    Ok(unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            question,
+            answer.cast(),
+        )
+    })
 }
 
 const SCHEMA: &str = "
@@ -689,11 +770,8 @@ impl Store {
         // `file:` as a URI and `:memory:` as a database of its own, and neither is the file this
         // store is meant to be. Who owns the store is a row inside it, not anything about a name.
         let resolved = resolve(path.as_ref())?;
-        // Once before the open and once after: the second look is the one that has to hold, and
-        // the first is what says the file did not change under the open.
-        let before = one_name(&resolved)?;
         let connection = Connection::open_with_flags(&resolved, FILE_ONLY)?;
-        Self::prepare(connection, Some((resolved.as_path(), before)))
+        Self::prepare(connection, Some(resolved.as_path()))
     }
 
     /// Opens the store inside the worker's private journal, or in memory when there is none.
@@ -723,24 +801,16 @@ impl Store {
         Self::prepare(connection, None)
     }
 
-    fn prepare(connection: Connection, file: Option<(&Path, Option<FileMark>)>) -> Result<Self> {
+    fn prepare(connection: Connection, file: Option<&Path>) -> Result<Self> {
         // The store shares its file with the receipt journal and the question ledger, so a write
         // can find another of them holding it. The wait is bounded: past it the caller is told the
         // store is unavailable rather than left blocked.
         connection.busy_timeout(BUSY_TIMEOUT)?;
         // Before the write-ahead log exists, because it is the write-ahead log that a second name
-        // for this file would split in two.
-        if let Some((file, before)) = file {
-            let after = one_name(file)?;
-            if before.is_some_and(|before| Some(before) != after) {
-                return Err(Error::StoreUnavailable {
-                    kind: StoreFault::Other,
-                    detail: format!(
-                        "{} reached a different file while it was being opened",
-                        file.display()
-                    ),
-                });
-            }
+        // for this file would split in two, and before any claim, because a file this host will
+        // not journal is not one to take.
+        if let Some(file) = file {
+            one_name(&connection, file)?;
         }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
