@@ -2496,7 +2496,7 @@ fn a_version_number_is_never_reused() {
     assert_eq!(second.version.get(), 2);
     fixture
         .service()
-        .delete_version(second.change_set_id, second.version)
+        .delete_version(second.change_set_id, second.version, None)
         .expect("nothing holds it");
     write(&path, "README.md", "three\n");
     let third = fixture

@@ -883,9 +883,10 @@ impl ChangeSetService {
         action_id: kr_protocol::scalars::Uuid,
         method: &str,
         payload_digest: kr_protocol::scalars::Digest256,
+        admitted: Option<&dyn crate::store::StillAdmitted>,
     ) -> Result<bool> {
         self.locked()?
-            .claim_action(actor_id, action_id, method, payload_digest)
+            .claim_action(actor_id, action_id, method, payload_digest, admitted)
     }
 
     /// Settles one action this caller claimed.
@@ -1017,6 +1018,7 @@ impl ChangeSetService {
         &self,
         change_set_id: ChangeSetId,
         version: ChangeSetVersion,
+        admitted: Option<&dyn crate::store::StillAdmitted>,
     ) -> Result<()> {
         let pinned = self.pins(change_set_id)?;
         if !pinned.is_empty() {
@@ -1029,7 +1031,7 @@ impl ChangeSetService {
             });
         }
         self.locked()?
-            .delete_version_if_unheld(change_set_id, version)
+            .delete_version_if_unheld(change_set_id, version, admitted)
     }
 }
 

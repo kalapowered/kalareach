@@ -3657,17 +3657,37 @@ impl Controller {
                     error.to_string(),
                 );
             }
+            let Some(admitted_revision) = admitted else {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection",
+                );
+            };
+            // What the change-set service asks again **inside the transaction that commits the
+            // claim every one of its effects follows**: the connection this mutation arrived on,
+            // the authority revision it was admitted under, and the deadline this daemon
+            // accepted. Between this point and that transaction lie a blocking task and the
+            // journal's own lock, and authority can run out inside either.
+            let carried = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline: accepted.map(|accepted| accepted.deadline),
+            };
+            let controller = Arc::clone(self);
             let answered = self
                 .changesets
-                .write_frame(actor_id, mutation, method)
+                .write_frame(actor_id, mutation, method, move || {
+                    controller
+                        .check_registration(&carried)
+                        .map_err(|error| error.to_protocol_error())
+                })
                 .await;
             // The effect and its reply are separated by everything a blocking task waits for, and
             // a revocation can land in that interval. What this host must not do is **disclose**
             // an answer under authority that has since been withdrawn, so the check is made again
-            // here, where the reply is about to go out. What it does not undo is the effect: the
-            // admission the service's own transaction would have to carry is the host action
-            // contract's, and this service has the same gap the project and transfer services
-            // have.
+            // here, where the reply is about to go out.
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,

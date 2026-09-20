@@ -220,7 +220,7 @@ fn a_changed_materialisation_is_recorded_as_a_derived_version() {
     );
     let refusal = fixture
         .service()
-        .delete_version(tested.change_set_id, tested.version)
+        .delete_version(tested.change_set_id, tested.version, None)
         .expect_err("it is not deleted while the result names it");
     assert!(
         refusal.to_string().contains("result"),
@@ -331,7 +331,7 @@ fn a_version_is_not_deleted_while_anything_still_names_it() {
     );
     let refusal = fixture
         .service()
-        .delete_version(version.change_set_id, version.version)
+        .delete_version(version.change_set_id, version.version, None)
         .expect_err("a held version is not deleted");
     assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
     assert!(
@@ -366,7 +366,7 @@ fn a_version_is_not_deleted_while_anything_still_names_it() {
     assert!(
         fixture
             .service()
-            .delete_version(version.change_set_id, version.version)
+            .delete_version(version.change_set_id, version.version, None)
             .is_err(),
         "the acknowledgement still holds it"
     );
@@ -388,7 +388,7 @@ fn a_version_nothing_names_can_be_deleted() {
     let version = reference(&record);
     fixture
         .service()
-        .delete_version(version.change_set_id, version.version)
+        .delete_version(version.change_set_id, version.version, None)
         .expect("nothing names it, so it goes");
     let failure = fixture
         .service()
@@ -653,7 +653,7 @@ fn an_indeterminate_result_still_holds_the_version_it_ran_against() {
     assert!(
         fixture
             .service()
-            .delete_version(version.change_set_id, version.version)
+            .delete_version(version.change_set_id, version.version, None)
             .is_err(),
         "it is not deleted while that record names it"
     );

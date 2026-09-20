@@ -615,7 +615,7 @@ it actually was.
 | Class | What it rests on |
 | --- | --- |
 | `atomic_snapshot` | The base commit's **own tree**, walked from `<revision>^{tree}` through immutable tree objects and read blob by blob. The commit is immutable and so is everything under it, so the whole listing is one instant by construction. Nothing of the working tree is read |
-| `quiesced_capture` | A mechanism that holds a working tree still for the whole of a read. **This host produces no capture of this class**: see below |
+| `quiesced_capture` | A reservation over **this very working tree**, granted before the first reading and still holding after the last one. The interval the capture read across is one nothing was allowed to write to |
 | `per_file_capture` | Files read one at a time from a live tree, each one the same object of the same length written at the same instant after its read as before it, with the base revision, the index and the status unchanged at the end |
 
 No filesystem this service runs on offers an unprivileged atomic snapshot of a directory tree, so
@@ -624,13 +624,38 @@ a capture that cannot reach the one it asked for is refused rather than served a
 that name. A source that keeps changing is retried within a bound and then rejected with
 `SOURCE_CHANGED`.
 
-**Nothing here produces a quiesced capture.** A caller can declare that it quiesced its work, and
-that declaration is recorded on the version's own policy. What it does not do is change the class:
-this host can read which sessions and automation runs are bound to a workspace before and after a
-capture, and two such readings say nothing about the interval between them, while an editor outside
-KalaReach is outside what it can see at all. Calling that a quiesced capture would be the class in
-name and not in fact. It becomes reachable when something can hold the tree still for the read,
-which is a mechanism the workflow service owns rather than this one.
+**A quiesced capture is a reservation, and nothing else makes one.** A capture that is offered a
+quiescence authority asks it, before it reads anything, to hold the workspace still. The authority
+answers at once or refuses at once: it never waits, so a workspace that cannot be held now is
+captured as the weaker class this host can actually perform, and a caller that required the
+stronger one is refused rather than served a weaker one under that name.
+
+What the capture then does with the grant is what makes the class honest:
+
+* **It checks that the grant covers what it is reading.** A grant names the workspace and the
+  working tree it holds, the working tree by identity rather than by name, and a grant over
+  anything else is refused rather than read under.
+* **It watches the grant through the read**, at each point where the answer could have changed: the
+  grant's own identity, its deadline by this host's clock, and its own answer to whether it has
+  held without interruption. A grant that lapses is never trusted again, because a reservation
+  taken afresh is a different grant over a different interval.
+* **It contradicts the grant with what it sees.** A file that changed while a reservation was
+  supposed to be holding the tree still is this host's own evidence that nothing held it, and the
+  capture drops to the weaker class whatever the grant says.
+* **It gives the grant back** after the last reading, however the capture ended.
+
+The grant releases the workspace at its own deadline whatever the capture is doing, so a capture
+that stops without giving it back cannot hold a workspace for ever.
+
+Two things are recorded separately on the version's policy, because they are separate facts:
+`quiescence_declared` is what the caller said about its own work, which this host cannot check and
+which decides nothing, and `quiescence_held` is whether a reservation actually held the workspace
+for the whole read, which is what decides the class.
+
+The reservation mechanism itself belongs to the workflow service, which knows what is running
+against a workspace and can keep it off. What a reservation cannot promise is an editor outside
+KalaReach: an implementer that cannot exclude one refuses to grant rather than granting something
+it cannot honour.
 
 ### What a capture will not read
 
@@ -816,6 +841,17 @@ now stands.
 Nothing is removed to make room. A staging name that is already taken is a path this host reports
 and leaves exactly as it is.
 
+**A daemon that dies between staging a path and publishing it leaves the temporary behind**, and
+the journal is what makes that recoverable rather than a thing a person has to find. Before the
+name is created the journal records it beside the destination path; the moment the file exists the
+journal records **the object this host created**; and the record is cleared as soon as the
+temporary is published or taken away. So the next daemon, before it serves anything, looks at every
+temporary an interrupted apply still has recorded and takes away what is at the name **only while
+it is still that object**. Anything else there is somebody's file: this host removes nothing, and
+names the path in the apply's own answer so a person can look at it. A temporary the journal names
+with no object beside it is one this host died before it could show was its own, and it is left
+alone for the same reason.
+
 Permissions are the destination's own, put on the staged copy through the handle this host created
 it with, before the rename, so a file that was executable stays executable and one that was not
 does not become one. A destination whose permissions this host cannot read is a path it does not
@@ -881,6 +917,20 @@ transaction, that those versions are still there — so a holder recorded while 
 deciding is either counted or refused, and never left pointing at something that is gone. The
 project service's pin lives in another store and is checked first; a pin recorded between that
 check and the transaction is not covered, and that is written down rather than hidden.
+
+### Authority, and where it is decided
+
+Every change-set mutation takes a claim on its action before it acts: one action, one effect. What
+the store asks **inside the transaction that records that claim** is whether the authority the
+mutation arrived under is still in force. Between a request being admitted and the moment it acts
+lie a task to be scheduled, a blocking thread and this journal's own lock, and authority can run
+out inside any of them. Deciding it inside that transaction means a mutation whose authority went
+leaves no claim row: the next attempt finds nothing rather than a claim nobody can settle, and
+nothing was captured, materialised or written. A deletion asks the same question inside the
+transaction that counts every holder and removes the version.
+
+A repeat of an action never reaches that question, because the record of the first attempt answers
+it: a receipt stays readable after the window that admitted it has gone.
 
 ### Storage layout
 

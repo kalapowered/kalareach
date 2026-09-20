@@ -805,3 +805,117 @@ async fn a_preflight_conflict_through_the_daemon_records_nothing() {
     host.clients.abort();
     let _ = host.clients.await;
 }
+
+/// KR-REQ-23.44: a change-set mutation whose authority has gone leaves nothing behind.
+///
+/// The daemon's answer to "is this still admitted?" travels into the change-set store, which asks
+/// it inside the transaction that records the claim every effect of this service follows. So a
+/// first attempt whose authority ran out writes no claim row, and the very same action can still
+/// be performed once the authority holds.
+#[tokio::test]
+async fn a_change_set_mutation_whose_authority_has_gone_writes_nothing() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    repository(host.work(), "admission");
+
+    let adopted: ProjectAdoptResult = typed(
+        &control
+            .mutate(
+                Method::ProjectAdopt,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &ProjectAdoptParams {
+                    destination: host.destination("admission"),
+                    label: "admission".to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.adopt succeeds"),
+    );
+    let created: WorkspaceCreateResult = typed(
+        &control
+            .mutate(
+                Method::WorkspaceCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkspaceCreateParams {
+                    project_repository_id: adopted.project.project_repository_id,
+                    label: "the tree".to_owned(),
+                    kind: WorkspaceKind::SharedExisting,
+                    isolation: Nullable::null(),
+                    policy: include_everything(),
+                    base_revision: Nullable::null(),
+                    base_change_set_id: Nullable::null(),
+                    destination: Nullable::null(),
+                    preview_only: false,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.create succeeds"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+
+    // One capture, composed once and offered twice: first under an authority that has gone, then
+    // under one that holds. Composing it once is what makes the second attempt the **same**
+    // action rather than a new one.
+    let mutation = control
+        .compose(
+            Method::ChangesetCapture,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &ChangesetCaptureParams {
+                workspace_id: workspace,
+                change_set_id: Nullable::null(),
+                label: "the work".to_owned(),
+                policy: include_everything(),
+                grant: FileGrant::default(),
+                quiescence_declared: false,
+                required_consistency: Nullable::null(),
+                pin: false,
+                session_id: Nullable::null(),
+                workflow_run_id: Nullable::null(),
+                note: "a capture under an authority that has gone".to_owned(),
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let actor = kr_protocol::ids::ActorId::new("test-actor").expect("an actor identifier");
+
+    let refusal = host
+        .controller
+        .changesets()
+        .write(&actor, &mutation, Method::ChangesetCapture, || {
+            Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the authority this action was admitted under has been withdrawn",
+            ))
+        })
+        .await
+        .expect_err("a capture nothing admits is refused");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal.message.contains("has been withdrawn"),
+        "the daemon's own sentence reaches the caller: {}",
+        refusal.message
+    );
+
+    // Nothing was claimed and nothing was captured, so the same action performs cleanly now.
+    let captured: ChangesetCaptureResult = typed(
+        &host
+            .controller
+            .changesets()
+            .write(&actor, &mutation, Method::ChangesetCapture, || Ok(()))
+            .await
+            .expect("the same action runs once its authority holds"),
+    );
+    assert_eq!(captured.version.version.get(), 1);
+
+    host.clients.abort();
+}

@@ -171,6 +171,23 @@ pub struct ApplyRow {
     pub decided_at_ms: Option<TimestampMs>,
 }
 
+/// Whether the authority one mutation arrived under is still in force.
+///
+/// The daemon owns the answer and this store asks for it **inside the transaction that commits
+/// the effect**. Everything between a request being admitted and its effect can wait: a task to
+/// be scheduled, a blocking thread, this store's own lock. Authority that ran out in that
+/// interval must leave nothing behind, so a refusal here rolls the transaction back and there is
+/// no claim row and no state for a later attempt to find.
+pub trait StillAdmitted: Send + Sync {
+    /// Returns the refusal the daemon decided, when the authority this mutation arrived under has
+    /// gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the daemon answers a withdrawn authority with.
+    fn check(&self) -> Result<()>;
+}
+
 /// One temporary an apply has beside a destination path, while it is still there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedPath {
@@ -842,11 +859,18 @@ impl Store {
         &mut self,
         change_set_id: ChangeSetId,
         version: ChangeSetVersion,
+        admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
         let transaction = self
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        // The counting, the authority and the removal are one transaction: a deletion cannot
+        // commit under authority that ran out while it waited for this lock, and nothing can
+        // record a holder between the count and the removal.
+        if let Some(admitted) = admitted {
+            admitted.check()?;
+        }
         let held = Self::held_by(&transaction, change_set_id, version)?;
         if !held.is_empty() {
             return Err(ChangeSetError::WrongState {
@@ -1350,14 +1374,26 @@ impl Store {
     /// Returns [`ChangeSetError::IdConflict`] when the identifier was used for a different
     /// request, and [`ChangeSetError::StoreUnavailable`] when the write fails.
     pub fn claim_action(
-        &self,
+        &mut self,
         actor_id: &ActorId,
         action_id: Uuid,
         method: &str,
         payload_digest: Digest256,
+        admitted: Option<&dyn StillAdmitted>,
     ) -> Result<bool> {
-        let inserted = self
+        let transaction = self
             .connection
+            .transaction()
+            .map_err(ChangeSetError::store)?;
+        // The claim is what says this copy of this action is the one performing it, so it is the
+        // row every effect of this service follows. Asking here puts the authority check and the
+        // decision to act in one transaction: a mutation whose authority ran out while it waited
+        // for this lock leaves no claim behind, and the next attempt finds nothing to conflict
+        // with rather than a row nobody can settle.
+        if let Some(admitted) = admitted {
+            admitted.check()?;
+        }
+        let inserted = transaction
             .execute(
                 "INSERT INTO actions (actor_id, action_id, method, payload_digest, result,
                                       error_code, error_detail, recorded_at_ms)
@@ -1373,12 +1409,12 @@ impl Store {
             )
             .map_err(ChangeSetError::store)?;
         if inserted == 1 {
+            transaction.commit().map_err(ChangeSetError::store)?;
             return Ok(true);
         }
         // Somebody else holds it. The identifier is checked against what it was first used for,
         // so a different request under one identifier is a conflict rather than a second effect.
-        let stored: Option<(String, Vec<u8>)> = self
-            .connection
+        let stored: Option<(String, Vec<u8>)> = transaction
             .query_row(
                 "SELECT method, payload_digest FROM actions WHERE actor_id = ?1 AND action_id = ?2",
                 params![actor_id.as_str(), action_id.as_bytes().to_vec()],
@@ -1397,6 +1433,7 @@ impl Store {
                 method: stored_method.into(),
             });
         }
+        transaction.commit().map_err(ChangeSetError::store)?;
         Ok(false)
     }
 
@@ -2215,6 +2252,129 @@ mod tests {
             manifest: vec![4, 5, 6],
             captured_at_ms: TimestampMs::new(10 + version),
         }
+    }
+
+    /// An admission that answers whatever the test tells it to, and counts the questions.
+    #[derive(Debug)]
+    struct Authority {
+        admitted: std::sync::atomic::AtomicBool,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Authority {
+        fn new(admitted: bool) -> Self {
+            Self {
+                admitted: std::sync::atomic::AtomicBool::new(admitted),
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn withdraw(&self) {
+            self.admitted
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl StillAdmitted for Authority {
+        fn check(&self) -> Result<()> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.admitted.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            Err(ChangeSetError::NotAdmitted {
+                code: ErrorCode::PermissionDenied,
+                detail: "the authority this action was admitted under has been withdrawn".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn an_action_whose_authority_has_gone_leaves_no_claim_behind() {
+        // KR-REQ-23.44: the authority is decided **inside** the transaction that records the
+        // claim every effect of this service follows. A mutation whose authority ran out while it
+        // waited for this lock leaves nothing for a later attempt to find.
+        let mut store = store();
+        let actor = ActorId::new("an actor").expect("an actor identifier");
+        let action = kr_ipc::new_uuid();
+        let digest = crate::objects::digest_of(b"the request");
+        let authority = Authority::new(false);
+
+        let refusal = store
+            .claim_action(
+                &actor,
+                action,
+                "changeset.capture",
+                digest,
+                Some(&authority),
+            )
+            .expect_err("an action nothing admits is refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert_eq!(authority.asked(), 1);
+        assert!(
+            store
+                .retained_action(&actor, action, "changeset.capture", digest)
+                .expect("the record reads")
+                .is_none(),
+            "no claim row was committed, so the action is free to be performed again"
+        );
+
+        // And with the authority in force the very same call takes the claim.
+        let authority = Authority::new(true);
+        assert!(
+            store
+                .claim_action(
+                    &actor,
+                    action,
+                    "changeset.capture",
+                    digest,
+                    Some(&authority)
+                )
+                .expect("the claim is taken"),
+            "the same action under authority that holds is claimed"
+        );
+        // A second copy of the same action finds the claim rather than acting again.
+        assert!(
+            !store
+                .claim_action(
+                    &actor,
+                    action,
+                    "changeset.capture",
+                    digest,
+                    Some(&authority)
+                )
+                .expect("the second copy asks"),
+            "one action, one effect"
+        );
+    }
+
+    #[test]
+    fn a_deletion_whose_authority_has_gone_removes_nothing() {
+        // KR-REQ-23.44 and KR-REQ-14.36 together: the counting of every holder, the authority and
+        // the removal are one transaction, so a deletion cannot commit under authority that ran
+        // out while it waited for this lock.
+        let mut store = store();
+        let change_set_id = change_set(&store);
+        store
+            .insert_version(&version_row(change_set_id, 1), &[])
+            .expect("the version is recorded");
+        let authority = Authority::new(true);
+        authority.withdraw();
+
+        let refusal = store
+            .delete_version_if_unheld(change_set_id, ChangeSetVersion::new(1), Some(&authority))
+            .expect_err("a deletion nothing admits is refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(
+            store
+                .version(change_set_id, ChangeSetVersion::new(1))
+                .expect("the read runs")
+                .is_some(),
+            "the version is exactly where it was"
+        );
     }
 
     #[test]

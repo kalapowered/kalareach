@@ -53,6 +53,26 @@ use crate::error::{ControllerError, Result};
 /// What a change-set call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
+/// The daemon's answer to "is this mutation still admitted?", as the change-set store asks it.
+///
+/// The store asks inside the transaction that commits the claim every effect of this service
+/// follows, and inside the one that deletes a version. Everything between the envelope check and
+/// that transaction can wait — a task to be scheduled, a blocking thread, the journal's lock —
+/// and a mutation whose authority ran out in that interval must leave nothing behind.
+struct Admission<A>(A);
+
+impl<A> kr_changeset::store::StillAdmitted for Admission<A>
+where
+    A: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync,
+{
+    fn check(&self) -> kr_changeset::Result<()> {
+        (self.0)().map_err(|error| kr_changeset::ChangeSetError::NotAdmitted {
+            code: error.code,
+            detail: error.message.into(),
+        })
+    }
+}
+
 /// The change-set service, as the daemon holds it.
 #[derive(Debug)]
 pub struct ChangeSetModule {
@@ -198,15 +218,19 @@ impl ChangeSetModule {
 
     /// Serves one change-set mutation and returns the frame it answers with.
     #[must_use]
-    pub async fn write_frame(
+    pub async fn write_frame<A>(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> ControlFrame {
+        admission: A,
+    ) -> ControlFrame
+    where
+        A: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static,
+    {
         frame(
             mutation.request_id,
-            self.write(actor_id, mutation, method).await,
+            self.write(actor_id, mutation, method, admission).await,
         )
     }
 
@@ -250,12 +274,16 @@ impl ChangeSetModule {
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
-    pub async fn write(
+    pub async fn write<A>(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> Answer<ParamsValue> {
+        admission: A,
+    ) -> Answer<ParamsValue>
+    where
+        A: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static,
+    {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let service = Arc::clone(&self.service);
@@ -288,9 +316,14 @@ impl ChangeSetModule {
             // behind for the next attempt to find. So the preflight runs first, reading only, and
             // the claim is taken the instant it passes and before anything is written. A capture
             // and a materialisation have no such reading phase and claim straight away.
-            let deferred = DeferredClaim::new(&service, &actor, action_id, name, digest);
+            // The daemon's answer travels into the store, which asks it inside the transaction
+            // that commits the claim. A first admission that has lost its authority while it
+            // waited leaves no claim row, so the next attempt finds nothing rather than a claim
+            // nobody can settle. A retry never reaches here: the record above answered it.
+            let admitted = Admission(admission);
+            let deferred = DeferredClaim::new(&service, &actor, action_id, name, digest, &admitted);
             if !matches!(method, Method::DiffApply | Method::DiffRevert)
-                && !service.claim_action(&actor, action_id, name, digest)?
+                && !service.claim_action(&actor, action_id, name, digest, Some(&admitted))?
             {
                 // Another copy holds it. Either it has settled, in which case its reply is the
                 // answer, or it has not, in which case this host cannot say what became of the
@@ -467,6 +500,7 @@ struct DeferredClaim<'a> {
     action_id: kr_protocol::scalars::Uuid,
     method: &'a str,
     digest: kr_protocol::scalars::Digest256,
+    admitted: &'a dyn kr_changeset::store::StillAdmitted,
     state: std::cell::Cell<ClaimState>,
 }
 
@@ -488,6 +522,7 @@ impl<'a> DeferredClaim<'a> {
         action_id: kr_protocol::scalars::Uuid,
         method: &'a str,
         digest: kr_protocol::scalars::Digest256,
+        admitted: &'a dyn kr_changeset::store::StillAdmitted,
     ) -> Self {
         Self {
             service,
@@ -495,6 +530,7 @@ impl<'a> DeferredClaim<'a> {
             action_id,
             method,
             digest,
+            admitted,
             state: std::cell::Cell::new(ClaimState::Untried),
         }
     }
@@ -510,9 +546,13 @@ impl<'a> DeferredClaim<'a> {
 
 impl kr_changeset::apply::ActionClaim for DeferredClaim<'_> {
     fn claim(&self) -> kr_changeset::Result<bool> {
-        let held =
-            self.service
-                .claim_action(self.actor, self.action_id, self.method, self.digest)?;
+        let held = self.service.claim_action(
+            self.actor,
+            self.action_id,
+            self.method,
+            self.digest,
+            Some(self.admitted),
+        )?;
         self.state.set(if held {
             ClaimState::Taken
         } else {

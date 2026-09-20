@@ -90,6 +90,17 @@ pub enum ChangeSetError {
         /// What this host does not do, and what it established before saying so.
         detail: Diagnostic,
     },
+    /// The authority this mutation arrived under has gone, and the daemon's own code and
+    /// sentence are carried through.
+    ///
+    /// Decided inside the transaction that would have committed the effect, so a mutation whose
+    /// authority ran out while it waited for a lock leaves nothing behind.
+    NotAdmitted {
+        /// The code the daemon decided.
+        code: ErrorCode,
+        /// Its protected sentence.
+        detail: Diagnostic,
+    },
     /// The project service refused, and its own code and sentence are carried through.
     ///
     /// Reading a repository, resolving a workspace and every Git invocation belong to the project
@@ -121,6 +132,7 @@ impl ChangeSetError {
             Self::IdConflict { .. } => "IdConflict",
             Self::InvalidArgument(_) => "InvalidArgument",
             Self::Unsupported { .. } => "Unsupported",
+            Self::NotAdmitted { .. } => "NotAdmitted",
             Self::Project { .. } => "Project",
         }
     }
@@ -149,6 +161,7 @@ impl ChangeSetError {
             | Self::QuotaExceeded { detail }
             | Self::InvalidArgument(detail)
             | Self::Unsupported { detail }
+            | Self::NotAdmitted { detail, .. }
             | Self::Project { detail, .. } => detail.as_str().to_owned(),
         }
     }
@@ -186,7 +199,7 @@ impl ChangeSetError {
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::Unsupported { .. } => ErrorCode::UnsupportedCapability,
-            Self::Project { code, .. } => *code,
+            Self::NotAdmitted { code, .. } | Self::Project { code, .. } => *code,
         }
     }
 }

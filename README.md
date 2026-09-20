@@ -33,6 +33,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `shells/` | The managed shell packages: the reader patch sets, the bridge sources, the guarded startup entries and the build manifests |
 | `crates/kr-transfer` | The transfer service: uploads, verified downloads, handle-based filesystem authority and bounded previews |
 | `crates/kr-project` | The project service: repositories, workspaces, the restricted Git execution profile and staged publish |
+| `crates/kr-changeset` | The change-set service: immutable captured versions, their content store, independent materialisations and the apply outcome classes |
 | `skills/kalareach-contact` | The installable contact skill: what an agent reads, its tool reference and its installation manifest |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
