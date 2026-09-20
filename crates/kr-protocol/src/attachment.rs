@@ -183,7 +183,24 @@ pub struct SessionDetachParams {
     /// Presented where no attachment is named: it says which line the caller belongs to, which no
     /// reading of the caller's own process can. Null from a caller that was given none, and a
     /// request that names neither is refused rather than attributed.
+    ///
+    /// It is absent from the wire when there is none, so a request that names its attachment, or
+    /// one from a caller holding no capability, is byte for byte what a worker built before this
+    /// field expects. That matters because a worker is not replaced with the daemon and the
+    /// command-line tool beside it: an upgrade leaves every live session's worker running the
+    /// build that started it, and that build refuses a field it does not know. Absent is read
+    /// back as null, which is what a caller presenting nothing means, so a request from a build
+    /// before this field is answered exactly as one from a caller that holds none.
+    ///
+    /// Remove the default and the omission once no worker from a build before this field can
+    /// still be running, which is when every session that was live across the upgrade has closed.
+    #[serde(default, skip_serializing_if = "no_capability")]
     pub line_token: Nullable<String>,
+}
+
+/// Returns whether a detach presents no line capability.
+fn no_capability(line_token: &Nullable<String>) -> bool {
+    !line_token.is_present()
 }
 
 /// The result of `session.detach`.
@@ -316,5 +333,52 @@ mod tests {
     fn semantic_attachments_cannot_claim_geometry() {
         assert!(!AttachMode::Semantic.may_claim_geometry());
         assert!(AttachMode::Terminal.may_claim_geometry());
+    }
+
+    /// A detach that presents no capability is the request a worker built before it expects.
+    ///
+    /// Both directions of the upgrade window are here: what this build sends when there is no
+    /// capability carries no such field, and what a build before it sends is read back as the
+    /// caller presenting none.
+    #[test]
+    fn a_detach_with_no_capability_is_the_request_an_earlier_build_speaks() {
+        let attachment_id = AttachmentId::new(crate::scalars::Uuid::from_bytes([0xA7; 16]));
+        let named = SessionDetachParams {
+            attachment_id: Nullable::some(attachment_id),
+            line_token: Nullable::null(),
+        };
+        assert_eq!(
+            serde_json::to_value(&named).expect("encodes"),
+            serde_json::json!({ "attachment_id": attachment_id }),
+            "a request that names its attachment carries no capability field at all"
+        );
+
+        let presented = SessionDetachParams {
+            attachment_id: Nullable::null(),
+            line_token: Nullable::some("a-line-capability".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(&presented).expect("encodes"),
+            serde_json::json!({
+                "attachment_id": serde_json::Value::Null,
+                "line_token": "a-line-capability",
+            }),
+            "and one that presents a capability carries it"
+        );
+
+        let earlier: SessionDetachParams =
+            serde_json::from_value(serde_json::json!({ "attachment_id": attachment_id }))
+                .expect("a request from a build before the capability still reads");
+        assert_eq!(earlier.attachment_id, Nullable::some(attachment_id));
+        assert!(
+            !earlier.line_token.is_present(),
+            "a caller whose build has no capability presents none"
+        );
+
+        let unqualified: SessionDetachParams =
+            serde_json::from_value(serde_json::json!({ "attachment_id": serde_json::Value::Null }))
+                .expect("and so does one that named nothing");
+        assert!(!unqualified.attachment_id.is_present());
+        assert!(!unqualified.line_token.is_present());
     }
 }

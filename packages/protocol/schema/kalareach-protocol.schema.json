@@ -17935,12 +17935,11 @@
               "type": "null"
             }
           ],
-          "description": "The capability the accepted line this caller runs from was given.\n\nPresented where no attachment is named: it says which line the caller belongs to, which no\nreading of the caller's own process can. Null from a caller that was given none, and a\nrequest that names neither is refused rather than attributed."
+          "description": "The capability the accepted line this caller runs from was given.\n\nPresented where no attachment is named: it says which line the caller belongs to, which no\nreading of the caller's own process can. Null from a caller that was given none, and a\nrequest that names neither is refused rather than attributed.\n\nIt is absent from the wire when there is none, so a request that names its attachment, or\none from a caller holding no capability, is byte for byte what a worker built before this\nfield expects. That matters because a worker is not replaced with the daemon and the\ncommand-line tool beside it: an upgrade leaves every live session's worker running the\nbuild that started it, and that build refuses a field it does not know. Absent is read\nback as null, which is what a caller presenting nothing means, so a request from a build\nbefore this field is answered exactly as one from a caller that holds none.\n\nRemove the default and the omission once no worker from a build before this field can\nstill be running, which is when every session that was live across the upgrade has closed."
         }
       },
       "required": [
-        "attachment_id",
-        "line_token"
+        "attachment_id"
       ],
       "type": "object"
     },

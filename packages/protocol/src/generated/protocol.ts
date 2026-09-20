@@ -13811,8 +13811,19 @@ export interface SessionDetachParams {
    * Presented where no attachment is named: it says which line the caller belongs to, which no
    * reading of the caller's own process can. Null from a caller that was given none, and a
    * request that names neither is refused rather than attributed.
+   *
+   * It is absent from the wire when there is none, so a request that names its attachment, or
+   * one from a caller holding no capability, is byte for byte what a worker built before this
+   * field expects. That matters because a worker is not replaced with the daemon and the
+   * command-line tool beside it: an upgrade leaves every live session's worker running the
+   * build that started it, and that build refuses a field it does not know. Absent is read
+   * back as null, which is what a caller presenting nothing means, so a request from a build
+   * before this field is answered exactly as one from a caller that holds none.
+   *
+   * Remove the default and the omission once no worker from a build before this field can
+   * still be running, which is when every session that was live across the upgrade has closed.
    */
-  line_token: string | null
+  line_token?: string | null
 }
 /**
  * The result of `session.detach`.
