@@ -1277,7 +1277,9 @@ async fn a_fence_between_admission_and_dispatch_takes_the_work_back() {
         .expect("admitted");
     client.fence(9).expect("fenced");
     assert!(matches!(
-        client.store().mark_dispatched(staged.work_id, object_id),
+        client
+            .store()
+            .mark_dispatched(staged.work_id, object_id, TimestampMs::new(NOW)),
         Err(SyncError::Fenced { generation: 9 })
     ));
     assert!(client.store().staged().expect("staged").is_empty());

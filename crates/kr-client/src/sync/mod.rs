@@ -19,10 +19,11 @@
 //! [`kr_protocol::sync::SyncObjectKind`] is settings, drafts and a client's own position. The set
 //! is closed, and what it leaves out is as load bearing as what it holds: host grants and
 //! revocation state have one host authority, so no kind names them and restoring a synchronised
-//! object can never reach them. This client makes that structural. [`SyncBody`] has a variant for
-//! settings and one for a client's position and **no variant for anything else**, so there is no
-//! value this module can decode that carries authority, and nothing here holds a handle to any
-//! authority store.
+//! object can never reach them. This client makes that as structural as a client can. [`SyncBody`]
+//! has a variant for settings and one for a client's position and **no variant for anything else**,
+//! nothing here reads a setting as authority, and nothing here holds a handle to any authority
+//! store. A setting's value is text, a number or a switch, which narrows the shape and not the
+//! bytes.
 //!
 //! Drafts are synchronised as drafts, by [`crate::drafts::DraftSync`], which is the device's own
 //! draft store publishing its own records. A draft that arrived through this module would be a

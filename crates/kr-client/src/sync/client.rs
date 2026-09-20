@@ -305,9 +305,9 @@ impl SyncClient {
     /// read.
     ///
     /// An answer this device cannot make sense of leaves the work outstanding rather than throwing
-    /// it away: only an accepted write and a refused comparison say what became of it. A later
-    /// definite answer about the same object retires it, and what it may have sent is kept in the
-    /// account of what may have left.
+    /// it away: only an accepted write and a refused comparison say what became of a request, and
+    /// nothing else in this contract can. [`Self::exported`] lists such work as content sent
+    /// without an answer.
     ///
     /// # Errors
     ///
@@ -320,7 +320,7 @@ impl SyncClient {
 
         // Written before the call leaves, and refused if a fence landed since admission: work that
         // has not gone is work the fence still reaches, and it is taken back rather than sent.
-        self.store.mark_dispatched(staged.work_id, object_id)?;
+        self.store.mark_dispatched(staged.work_id, object_id, now)?;
         let answer = self
             .service
             .compare_exchange(
@@ -652,26 +652,20 @@ impl SyncClient {
         Ok(Removed { bytes, records })
     }
 
-    /// Establishes that a cleanup step still owns the generation it was asked to clean.
+    /// Moves the recorded generation forward for a cleanup step.
     ///
-    /// A step that was overtaken is refused rather than carried out. Two control steps can overlap,
-    /// and the later one has already decided what is retained; letting the earlier one finish would
-    /// delete work and copies that belong to the generation now in force.
+    /// Whether the step still owns that generation is decided inside the store, in the same hold
+    /// that does the deleting: a check out here could be overtaken between the answer and the
+    /// deletion it was meant to authorise.
     fn own_generation(&self, generation: u64) -> Result<()> {
-        let privacy = self.store.advance_privacy(generation)?;
-        if privacy.generation.get() > generation {
-            return Err(SyncError::LateResult {
-                produced_under: generation,
-                current: privacy.generation.get(),
-            });
-        }
+        self.store.advance_privacy(generation)?;
         Ok(())
     }
 
     /// Returns how much dispatched work has no settled outcome.
     ///
     /// A publication counts from the moment its record says it was sent until the service answers
-    /// about that object, so an abandoned call, a failed connection and a restart all leave it
+    /// about that request, so an abandoned call, a failed connection and a restart all leave it
     /// counted: none of them establishes that nothing left this device. A staged record this build
     /// cannot read counts too, because a record it could not open is not a record it can say was
     /// nothing.
@@ -745,7 +739,7 @@ impl SyncClient {
     ///
     /// Returns [`SyncError::Storage`] when the publication records cannot be read.
     pub fn exported(&self) -> Result<Vec<Exported>> {
-        let publications = self.store.publications()?;
+        let (publications, staged) = self.store.what_left()?;
         let mut exported: Vec<Exported> = publications
             .items
             .into_iter()
@@ -763,7 +757,6 @@ impl SyncClient {
         // A dispatch with no answer may have reached the service, and this contract gives no way
         // to ask. Saying so is the honest entry: the content was sent, and whether it was stored is
         // not something this device can find out.
-        let staged = self.store.staged()?;
         for record in staged.items.into_iter().filter(|item| item.dispatched) {
             exported.push(Exported {
                 kind: format!("synchronised {}, sent without an answer", record.kind),
@@ -772,9 +765,13 @@ impl SyncClient {
                     sync_collection(record.kind, record.object_id),
                     record.revision
                 ),
-                // When this device sent it. It does not say the service stored it, and nothing
-                // here can find that out.
-                left_at_ms: TimestampMs::new(record.produced_under.get()),
+                // When this device let the content go. It does not say the service stored it, and
+                // nothing here can find that out.
+                left_at_ms: record
+                    .dispatched_at_ms
+                    .as_ref()
+                    .copied()
+                    .unwrap_or_else(|| TimestampMs::new(0)),
                 deletable: false,
             });
         }

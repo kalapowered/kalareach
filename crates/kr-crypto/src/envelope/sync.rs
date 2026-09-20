@@ -9,13 +9,15 @@
 //!
 //! Nothing outside the ciphertext. The additional authenticated data is the format domain and that
 //! alone, so a ciphertext produced for one purpose cannot be opened as another. What identifies the
-//! object, its own identity and its revision, is inside the sealed plaintext, and the reader checks
-//! it there against what it asked for. That is the same rule the draft store keeps: the seal says
-//! the bytes came from a device that holds the key, not that they belong where they were found.
+//! object, its own identity and its kind, is inside the sealed plaintext, and the reader checks
+//! both there against the collection it asked for. Its revision travels with it so a reader can see
+//! whether the two devices hold the same content. That is the same rule the draft store keeps: the
+//! seal says the bytes came from a device that holds the key, not that they belong where they were
+//! found.
 //!
 //! Binding the requested collection into the additional data would be sound too, and would refuse
 //! a misplaced object one step earlier. It is not done here because the check the reader has to
-//! make either way is the one inside the plaintext: an object is its identity and its revision,
+//! make either way is the one inside the plaintext: an object is its identity and its kind,
 //! and a second statement of the same fact outside the encryption would be a second thing to keep
 //! in step.
 

@@ -65,6 +65,9 @@ const MAX_CONFLICT_COPY_BYTES: u64 = super::MAX_OBJECT_BYTES + CONFLICT_NOTE_BYT
 
 /// How many links the walk over a store's path follows before it gives up.
 ///
+/// The walk is Unix only, and so is this.
+#[cfg(unix)]
+///
 /// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
 /// lower, and refuses to open through a longer chain before the walk ever sees it.
 const MAX_PATH_LINKS: usize = 40;
@@ -104,6 +107,11 @@ pub struct Staged {
     /// A result carries it back, and the publication is accepted only when it is still the
     /// generation in force. An older one belongs to work privacy mode cancelled.
     pub produced_under: U64,
+    /// When this device sent it, when it has.
+    ///
+    /// Null while it is admitted and not sent. It says when this device let the content go, not
+    /// that the service stored it.
+    pub dispatched_at_ms: Nullable<TimestampMs>,
     /// Whether this work has been sent.
     ///
     /// Written durably **before** the call leaves, so a device that stops between the write and the
@@ -698,6 +706,7 @@ impl SyncStore {
                 expected_generation: note.map_or(U64::new(0), |note| note.generation),
                 produced_under: privacy.generation,
                 dispatched: false,
+                dispatched_at_ms: Nullable::null(),
                 ciphertext,
             };
             let bytes = kr_cbor::to_canonical_vec(&staged)?;
@@ -732,7 +741,12 @@ impl SyncStore {
     /// Returns [`SyncError::Fenced`] when privacy mode reached this work before it left,
     /// [`SyncError::Storage`] when the record cannot be read or written, and
     /// [`SyncError::Unknown`] when nothing is staged under that work identifier.
-    pub fn mark_dispatched(&self, work_id: Uuid, object_id: SyncObjectId) -> Result<()> {
+    pub fn mark_dispatched(
+        &self,
+        work_id: Uuid,
+        object_id: SyncObjectId,
+        now: TimestampMs,
+    ) -> Result<()> {
         let path = self.named(work_id, STAGED_EXTENSION);
         let guard = self.lock()?;
         let outcome = (|| {
@@ -755,6 +769,7 @@ impl SyncStore {
                 });
             }
             staged.dispatched = true;
+            staged.dispatched_at_ms = Nullable::some(now);
             let bytes = kr_cbor::to_canonical_vec(&staged)?;
             self.write_bytes(&path, &bytes)
         })();
@@ -773,6 +788,7 @@ impl SyncStore {
     pub fn take_back_undispatched(&self, generation: u64) -> Result<u64> {
         let guard = self.lock()?;
         let outcome = (|| {
+            self.owns_cleanup(generation)?;
             let mut taken = 0_u64;
             for item in self.read_all::<Staged>(STAGED_EXTENSION)?.items {
                 // Work admitted under a later generation belongs to a later cleanup, not this one.
@@ -905,18 +921,6 @@ impl SyncStore {
         applied
     }
 
-    /// Removes one piece of staged work, and makes its absence durable.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::Storage`] when it cannot be removed.
-    pub fn discard(&self, work_id: Uuid) -> Result<()> {
-        let guard = self.lock()?;
-        let outcome = self.remove_file(&self.named(work_id, STAGED_EXTENSION));
-        drop(guard);
-        outcome
-    }
-
     // -- conflict copies ----------------------------------------------------------------------
 
     /// Keeps a copy beside this device's own content, bounded by section 20's limit.
@@ -1042,6 +1046,24 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the directory cannot be read.
+    pub fn what_left(&self) -> Result<(Listing<Publication>, Listing<Staged>)> {
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let mut publications = self.read_all::<Publication>(PUBLICATION_EXTENSION)?;
+            publications
+                .items
+                .sort_by_key(|record| record.published_at_ms.get());
+            Ok((publications, self.read_all::<Staged>(STAGED_EXTENSION)?))
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Returns what this device has published, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the directory cannot be read.
     pub fn publications(&self) -> Result<Listing<Publication>> {
         let guard = self.lock()?;
         let outcome = self.read_all::<Publication>(PUBLICATION_EXTENSION);
@@ -1129,6 +1151,7 @@ impl SyncStore {
     pub fn remove_content(&self, generation: u64) -> Result<(u64, u64)> {
         let guard = self.lock()?;
         let outcome = (|| {
+            self.owns_cleanup(generation)?;
             let mut bytes = 0_u64;
             let mut records = 0_u64;
             let mut remove = |path: &Path| -> Result<()> {
@@ -1174,6 +1197,25 @@ impl SyncStore {
 
     fn lock(&self) -> Result<Lock> {
         Lock::take(&self.directory.join(LOCK_NAME))
+    }
+
+    /// Refuses a cleanup step that a later generation has overtaken.
+    ///
+    /// It is checked here, inside the hold that does the deleting, rather than before it: two
+    /// control steps can overlap, and the later one has already decided what is retained, so an
+    /// earlier step finishing afterwards would delete copies and notes that belong to the
+    /// generation now in force.
+    ///
+    /// The caller holds the lock.
+    fn owns_cleanup(&self, generation: u64) -> Result<()> {
+        let privacy = self.read_privacy()?;
+        if privacy.generation.get() > generation {
+            return Err(SyncError::LateResult {
+                produced_under: generation,
+                current: privacy.generation.get(),
+            });
+        }
+        Ok(())
     }
 
     /// Reads the privacy state, or the state of a device that has never enabled privacy mode.
@@ -1224,17 +1266,18 @@ impl SyncStore {
         path: &Path,
     ) -> Result<Option<T>> {
         let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
+            // The file holds a record in the clear, so the buffer is cleared when it goes out of
+            // scope rather than dropped as an ordinary vector.
+            Ok(bytes) => super::Zeroising(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(storage(path, error)),
         };
-        let value =
-            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).map_err(|error| {
-                SyncError::Corrupt {
-                    path: path.to_path_buf(),
-                    reason: error.to_string(),
-                }
-            })?;
+        let value = kr_cbor::from_canonical_slice(&bytes.0, &kr_cbor::Limits::DEFAULT).map_err(
+            |error| SyncError::Corrupt {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            },
+        )?;
         Ok(Some(value))
     }
 
@@ -1436,6 +1479,10 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
         level = path.parent();
     }
     for path in missing.iter().rev() {
+        #[cfg_attr(
+            not(unix),
+            expect(unused_mut, reason = "only Unix sets a mode on the builder")
+        )]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
