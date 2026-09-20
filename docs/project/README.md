@@ -657,14 +657,27 @@ removes is never opened at all:
    a credential, and its object database, which holds every version of every file in it.
 
    A link is not the only way a path reaches content the path does not name, so two more things are
-   refused. A directory on a **different mount** from the directory it was opened beneath is not
-   read: a mount over a name inside a tree holds another tree entirely, and the path that reaches
-   it crosses nothing. And a repository's own data is read through once, entry by entry: data that
-   holds a link, a mount, or anything that is not a plain file or a plain directory is data this
-   host does not capture around, because a link **out** of it makes a directory of the tree part of
-   that repository's own data under a path that crosses nothing either. Data deeper, or larger in
-   entries, than this host reads refuses on the same terms. Each of these says which directory it
-   found and why, and none of them is skipped.
+   refused. The first is a **mount**. Every name a capture resolves is walked one component at a
+   time, each directory is opened with the handle above it and then held as the directory the next
+   component is opened in, and each one is compared with the mount the working tree itself is on.
+   A directory somewhere else ends the capture, and so does the file a read returns if it is
+   somewhere else: a mount over a name holds another tree entirely, and the path that reaches it
+   crosses no link to get there. A path that becomes a mount after the capture looked at it refuses
+   the capture rather than being excluded and read around. Other readers of the same tree — a
+   download, a measurement, a copy of a workspace — ask for none of this, so a project with a
+   mounted directory in it is ordinary to them.
+
+   The second is a link **out** of a repository's own data. Every directory of that data is looked
+   inside once, entry by entry, and data that holds a link, a mount, or anything that is not a
+   plain file or a plain directory is data this host does not capture around: such a link makes a
+   directory of the tree part of that repository's own data under a path that crosses nothing
+   either. Data deeper, or with more entries, than this host reads refuses on the same terms,
+   naming the limit it reached. None of this is skipped, and the link and the mount are named where
+   they were found.
+
+   What is left is a *file* with two names: a hard link from a repository's own data to a file of
+   the tree is an alias no comparison of directories sees. A mount over a file is refused with the
+   rest; a second hard link is not.
 
    What this covers is what a capture reads: a repository in a directory no path of the capture
    goes near is one the capture does not reach either.

@@ -602,10 +602,11 @@ pub fn read_status(
     let entries = kr_project::workspace::parse_status(reported)?;
     let mut expanded = Vec::with_capacity(entries.len());
     let mut budget = MAX_WALK_ENTRIES;
+    let tree = confined_tree(repository)?;
     for entry in entries {
         if let Some(prefix) = entry.path.strip_suffix('/') {
             walk(
-                repository.work_tree(),
+                &tree,
                 prefix,
                 entry.class,
                 grant,
@@ -1153,7 +1154,7 @@ fn nested_repositories(
             at = parent;
         }
     }
-    let tree = repository.work_tree();
+    let tree = &confined_tree(repository)?;
     let mut budget = MAX_WALK_ENTRIES;
     let mut charge = |directory: &str| -> Result<()> {
         budget = budget
@@ -1227,6 +1228,7 @@ fn nested_repositories(
         // unconditionally: what decides anything later is whether a directory this capture opens
         // **is** it, and holding one that nothing reaches costs nothing.
         let held = AuthorisedDirectory::open_root(environment_id, path)
+            .and_then(AuthorisedDirectory::confined_to_one_mount)
             .map_err(|_| unplaceable("this repository's own data"))?;
         let identity = identity_of(&held);
         if identity == here {
@@ -1557,17 +1559,33 @@ fn resolve_target(
     Ok(Some(stack))
 }
 
-/// Returns a second authority over the same open directory.
+/// Returns this working tree's own handle with the capture's rule on it: one mount.
+///
+/// Everything a capture reads goes through this rather than through the repository's own handle.
+/// A mount is the one way a path reaches content the path does not name without crossing a link,
+/// and a capture that reads around one would put another tree's bytes under this repository's
+/// name. Other readers of the same tree — a download, a measurement, a copy — ask no such thing
+/// and are not confined, because an intentionally mounted directory of a project is ordinary to
+/// them.
+fn confined_tree(repository: &OpenedRepository) -> Result<AuthorisedDirectory> {
+    Ok(clone_of(repository.work_tree())?.confined_to_one_mount()?)
+}
+
+/// Returns a second authority over the same open directory, with the same rule on it.
 fn clone_of(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
     let handle = directory
         .handle()
         .try_clone()
         .map_err(ChangeSetError::storage)?;
-    Ok(AuthorisedDirectory::from_handle(
+    let held = AuthorisedDirectory::from_handle(
         directory.environment_id(),
         handle,
         directory.display_path().to_path_buf(),
-    )?)
+    )?;
+    if directory.mount().is_some() {
+        return Ok(held.confined_to_one_mount()?);
+    }
+    Ok(held)
 }
 
 /// The refusal for a nested repository whose own data this host could not place.
@@ -1913,7 +1931,7 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 .to_owned(),
         ));
     };
-    let tree = repository.work_tree();
+    let tree = confined_tree(repository)?;
     for attempt in 0..=MAX_PATH_RETRIES {
         let mut file = match tree.open_read(&name, ObjectPolicy::ReadableFile) {
             Ok(file) => file,
@@ -1922,6 +1940,19 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 error @ (kr_transfer::Escape::Link { .. } | kr_transfer::Escape::WrongKind { .. }),
             ) => {
                 return Ok(WorkingRead::Unsupported(error.to_string()));
+            }
+            // A mount where this path was an ordinary file or directory when the capture looked.
+            // It is not excluded and read around: what is under it is not what the tree's own
+            // path said a moment ago, and a capture that carried on would put another tree's
+            // bytes under this repository's name.
+            Err(error @ kr_transfer::Escape::CrossedMount { .. }) => {
+                return Err(ChangeSetError::Unsupported {
+                    detail: format!(
+                        "a path of this working tree is on a different mount from the tree \
+                         itself, which it was not when this capture looked at it: {error}"
+                    )
+                    .into(),
+                });
             }
             Err(error) => return Ok(WorkingRead::Unreadable(error.to_string())),
         };
@@ -2462,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_on_another_mount_is_not_opened_beneath_this_one() {
+    fn a_directory_on_another_mount_is_not_opened_beneath_a_confined_one() {
         // What the mount rule rests on, through the opener this capture actually uses: a boundary
         // this host has is refused, and an ordinary subdirectory beside it is not. Where the
         // platform offers no boundary to cross, the refusal is not exercised and this says so
@@ -2472,6 +2503,7 @@ mod tests {
         let state = host.environment().state_dir().to_path_buf();
         std::fs::create_dir_all(state.join("ordinary")).expect("a directory is made");
         let here = kr_transfer::AuthorisedDirectory::open_root(environment_id, &state)
+            .and_then(kr_transfer::AuthorisedDirectory::confined_to_one_mount)
             .expect("the directory opens");
         let ordinary = RelativeName::parse("ordinary").expect("a name");
         open_beneath(&here, &ordinary, "ordinary")
@@ -2480,7 +2512,9 @@ mod tests {
 
         // A mount every Unix host carries, asked for through the root that holds it.
         let root = std::path::Path::new("/");
-        let Ok(top) = kr_transfer::AuthorisedDirectory::open_root(environment_id, root) else {
+        let Ok(top) = kr_transfer::AuthorisedDirectory::open_root(environment_id, root)
+            .and_then(kr_transfer::AuthorisedDirectory::confined_to_one_mount)
+        else {
             println!("not exercised: this host would not open the root directory");
             return;
         };

@@ -32,6 +32,10 @@ rustix = { workspace = true, features = ["fs"] }
 cap-primitives = "=4.0.3"
 windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The mount race places and removes a bind mount inside a namespace of its own.
+rustix = { workspace = true, features = ["fs", "mount"] }
+
 [dev-dependencies]
 # The tests read a file identity the way the service does, through an opened directory.
 cap-fs-ext.workspace = true

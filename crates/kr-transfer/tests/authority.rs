@@ -640,8 +640,9 @@ fn a_name_that_resolves_through_another_mount_is_refused() {
     let root = tempfile::tempdir().expect("a temporary directory");
     std::fs::create_dir_all(root.path().join("src/inner")).expect("creates the tree");
     std::fs::write(root.path().join("src/inner/notes.txt"), b"inside").expect("writes a file");
-    let authority =
-        AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
+    let authority = AuthorisedDirectory::open_root(environment(), root.path())
+        .and_then(AuthorisedDirectory::confined_to_one_mount)
+        .expect("opens the authority, confined to one mount");
 
     // One mount, which is the ordinary case and stays ordinary.
     let inner = RelativeName::parse("src/inner").expect("a valid relative name");
@@ -656,24 +657,32 @@ fn a_name_that_resolves_through_another_mount_is_refused() {
         .open_read(&name, ObjectPolicy::ReadableFile)
         .expect("reads through directories on one mount");
 
-    // A boundary this host already carries, asked for through the directory that holds it. Where
-    // the platform has none to cross, this says so rather than reporting a case it did not run.
-    let Ok(top) = AuthorisedDirectory::open_root(environment(), Path::new("/")) else {
+    // A boundary this host already carries, asked for through the directory that holds it. Two
+    // filesystems is a boundary any host can see, so where there is one the refusal is required
+    // rather than hoped for; where the platform has none to cross, this says so.
+    let Ok(top) = AuthorisedDirectory::open_root(environment(), Path::new("/"))
+        .and_then(AuthorisedDirectory::confined_to_one_mount)
+    else {
         println!("not exercised: this platform would not open the root directory");
         return;
     };
-    let device = RelativeName::parse("dev").expect("a valid relative name");
-    match top.subdirectory(&device) {
-        Err(Escape::CrossedMount { .. }) => {}
-        Ok(_) => {
-            println!("not exercised: this host puts /dev on the mount that holds /");
-            return;
-        }
-        Err(other) => {
-            println!("not exercised: this host would not open /dev: {other}");
-            return;
-        }
+    let Ok(here) = std::fs::metadata("/") else {
+        println!("not exercised: this platform would not describe its root directory");
+        return;
+    };
+    let Ok(there) = std::fs::metadata("/dev") else {
+        println!("not exercised: this platform has no /dev to cross into");
+        return;
+    };
+    if device_of(&here) == device_of(&there) {
+        println!("not exercised: this host puts /dev on the filesystem that holds /");
+        return;
     }
+    let device = RelativeName::parse("dev").expect("a valid relative name");
+    assert!(
+        matches!(top.subdirectory(&device), Err(Escape::CrossedMount { .. })),
+        "a directory on another filesystem is refused, not opened"
+    );
     let beneath = RelativeName::parse("dev/null").expect("a valid relative name");
     assert!(
         matches!(
@@ -686,4 +695,144 @@ fn a_name_that_resolves_through_another_mount_is_refused() {
         matches!(top.probe(&beneath), Err(Escape::CrossedMount { .. })),
         "so does a question about what is under it"
     );
+
+    // And an authority that asked for none of this reads across the same boundary as before.
+    let ordinary =
+        AuthorisedDirectory::open_root(environment(), Path::new("/")).expect("opens the root");
+    ordinary
+        .subdirectory(&device)
+        .expect("an authority that is not confined resolves across a mount as it always did");
+}
+
+/// Returns the device an object is on, which is how this test knows a boundary exists at all.
+#[cfg(unix)]
+fn device_of(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.dev()
+}
+
+#[cfg(windows)]
+fn device_of(_metadata: &std::fs::Metadata) -> u64 {
+    0
+}
+
+/// KR-REQ-14.05: a mount placed while names are being resolved never reaches the tree it covers.
+///
+/// This is the case the descent exists for. A mount is not a link: nothing in the path says one is
+/// there, and a resolution that starts again after a check can cross one that appeared in between.
+/// The descent holds each directory it checked and opens the next component in it, so a mount that
+/// arrives after a directory was opened cannot redirect what is read from it, and one that is
+/// there when the directory is opened is refused by the mount comparison. Either way the bytes of
+/// the covering tree are never returned.
+///
+/// It needs a mount namespace this account owns. Where the host does not allow one, the case says
+/// it was not exercised rather than reporting a result it did not produce.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mount_placed_while_reads_resolve_never_reaches_the_other_tree() {
+    if std::env::var_os("KR_AUTHORITY_MOUNT_RACE").is_some() {
+        mount_race();
+        return;
+    }
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        println!("not exercised: this host does not give this account a mount namespace");
+        return;
+    }
+    let binary = std::env::current_exe().expect("the test binary");
+    let status = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--"])
+        .arg(binary)
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .arg("a_mount_placed_while_reads_resolve_never_reaches_the_other_tree")
+        .env("KR_AUTHORITY_MOUNT_RACE", "1")
+        .status()
+        .expect("the test binary runs inside a mount namespace");
+    assert!(
+        status.success(),
+        "the reads inside the mount namespace did not hold: {status}"
+    );
+}
+
+/// The half that runs inside the mount namespace.
+#[cfg(target_os = "linux")]
+fn mount_race() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(root.path().join("history")).expect("the tree's own directory");
+    std::fs::write(root.path().join("history/main"), b"inside").expect("the tree's own file");
+    std::fs::create_dir_all(root.path().join("elsewhere")).expect("the covering tree");
+    std::fs::write(root.path().join("elsewhere/main"), b"covering").expect("its own file");
+    let authority = AuthorisedDirectory::open_root(environment(), root.path())
+        .and_then(AuthorisedDirectory::confined_to_one_mount)
+        .expect("opens the authority, confined to one mount");
+    let name = RelativeName::parse("history/main").expect("a valid relative name");
+    let stop = AtomicBool::new(false);
+    let placed = AtomicUsize::new(0);
+
+    std::thread::scope(|threads| {
+        let mounter = threads.spawn(|| {
+            let onto = root.path().join("history");
+            let from = root.path().join("elsewhere");
+            for _ in 0..2_000 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if rustix::mount::mount_bind(&from, &onto).is_err() {
+                    break;
+                }
+                placed.fetch_add(1, Ordering::Relaxed);
+                if rustix::mount::unmount(&onto, rustix::mount::UnmountFlags::DETACH).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut read = 0_usize;
+        let mut refused = 0_usize;
+        for _ in 0..400 {
+            match authority.open_read(&name, ObjectPolicy::ReadableFile) {
+                Ok(mut file) => {
+                    use std::io::Read as _;
+                    let mut contents = String::new();
+                    file.handle_mut()
+                        .read_to_string(&mut contents)
+                        .expect("reads what was opened");
+                    assert_eq!(
+                        contents, "inside",
+                        "a read returned the bytes of the tree mounted over this one"
+                    );
+                    read += 1;
+                }
+                Err(escape) => {
+                    assert!(
+                        matches!(
+                            escape,
+                            Escape::CrossedMount { .. }
+                                | Escape::NotFound { .. }
+                                | Escape::Unopenable { .. }
+                                | Escape::Link { .. }
+                                | Escape::WrongKind { .. }
+                        ),
+                        "the refusal names what it found: {escape:?}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        mounter.join().expect("the mounter did not panic");
+        let mounts = placed.load(Ordering::Relaxed);
+        assert_eq!(read + refused, 400);
+        if mounts == 0 {
+            println!("not exercised: this namespace would not place a bind mount");
+        } else {
+            println!("{read} reads resolved, {refused} were refused, over {mounts} mounts");
+        }
+    });
 }

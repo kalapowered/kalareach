@@ -1423,7 +1423,11 @@ fn a_directory_already_excluded_is_still_looked_inside() {
     let path = ordinary_repository(fixture.work(), "excluded-and-unseen");
     // A repository's own data under an ordinary name, which is the outer capture's content.
     write(&path, "vendor/HEAD", "ref: refs/heads/main\n");
-    write(&path, "vendor/config", "[core]\n\trepositoryformatversion = 0\n");
+    write(
+        &path,
+        "vendor/config",
+        "[core]\n\trepositoryformatversion = 0\n",
+    );
     std::fs::create_dir_all(path.join("vendor/objects")).expect("its object directory");
     std::fs::create_dir_all(path.join("vendor/refs/heads")).expect("its reference directory");
     // A worktree of it, inside it, which discovery excludes before anything looks in it.
@@ -1481,9 +1485,16 @@ fn a_repository_whose_own_data_is_on_another_filesystem_is_captured() {
         use std::os::unix::fs::MetadataExt as _;
         let tree = std::fs::metadata(&path).expect("the tree").dev();
         let held = std::fs::metadata(&data).expect("its data").dev();
-        assert_ne!(tree, held, "the data is on another filesystem from the tree");
+        assert_ne!(
+            tree, held,
+            "the data is on another filesystem from the tree"
+        );
     }
-    write(&path, "README.md", "a repository whose data is somewhere else\n");
+    write(
+        &path,
+        "README.md",
+        "a repository whose data is somewhere else\n",
+    );
     git_raw(&path, ["add", "-A"]);
     git_raw(&path, ["commit", "-m", "the first commit"]);
 

@@ -15,25 +15,30 @@
 //!   alternate-data-stream colon, and no Windows reserved device name with or without an
 //!   extension. The same rules apply on every platform, so a name that one host accepts is a name
 //!   every host accepts.
-//! * **Every** open is made against the authorised directory's own handle, with the accumulated
-//!   path, never against the previous component's handle. That is what keeps the boundary the
-//!   platform enforces the *authorised* directory rather than whatever the walk last reached: a
-//!   directory moved out of the authorised tree between two components makes the next open fail,
-//!   because the accumulated path no longer resolves beneath the root.
-//! * Each prefix of the path is opened with the no-follow open before the object itself is, so a
-//!   component that is a symbolic link or a reparse point at the moment it is resolved fails the
-//!   lookup instead of redirecting it. The object itself is opened with the no-follow open too.
-//! * Every directory a name resolves through is on the **same mount** as the authorised directory
-//!   itself, and one that is not refuses the name. A link is not the only way a path reaches
-//!   content the path does not name: a directory mounted over a name inside the tree reaches
-//!   another tree entirely, and the path that gets there crosses nothing. A bind mount shares its
-//!   device with what it came from, so the device number alone does not see one and the mount the
-//!   handle was resolved through is asked for where the platform answers.
-//! * On Linux the underlying open is `openat2` with `RESOLVE_BENEATH`, which resolves the whole
-//!   accumulated path in one syscall; on other Unix systems it is a component-wise `openat` with
-//!   `O_NOFOLLOW` beneath the same start directory; on Windows it is a relative `NtCreateFile`.
+//! * A name is resolved **one component at a time, and the descent produces the object**. Each
+//!   component is opened with the no-follow open against the handle above it, checked as it is
+//!   opened, and then *kept open* as the directory the next component is opened in. The last
+//!   component is opened in the last directory the descent checked. Nothing resolves the whole
+//!   name again afterwards, because a second resolution is a second chance to land somewhere
+//!   else: what a check said about a directory is true of the directory the open then happened
+//!   in, which is the same object the handle holds.
+//! * A component that is a symbolic link or a reparse point at the moment it is resolved fails the
+//!   lookup instead of redirecting it, and so does the object itself. What a held handle costs is
+//!   stated below with the other residuals.
+//! * An authority can be **confined to one mount**, and one that is refuses every name that
+//!   resolves through, or ends on, a directory or file somewhere else. A link is not the only way
+//!   a path reaches content the path does not name: a directory mounted over a name inside the
+//!   tree reaches another tree entirely, and the path that gets there crosses nothing. A bind
+//!   mount shares its device with what it came from, so the device number alone does not see one,
+//!   and the mount the **handle** was resolved through is what is compared: the prefix opens, the
+//!   subdirectory that comes back, and the file a read returns, which is the handle the bytes come
+//!   from. A caller asks for that rule when what it reads has to be the tree it named and nothing
+//!   grafted into it; an authority that has not asked for it resolves as it always did.
+//! * Each step is one directory-relative open: `openat2` with `RESOLVE_BENEATH` on Linux,
+//!   `openat` with `O_NOFOLLOW` on the other Unix systems, a relative `NtCreateFile` on Windows.
 //!   [`cap_std`] owns those three implementations, which is why this module is the policy and not
-//!   the syscalls. On Windows this crate adds its own check for
+//!   the syscalls. Every platform takes the same descent. On Windows this crate adds its own check
+//!   for
 //!   `FILE_ATTRIBUTE_REPARSE_POINT`, because `cap_std`'s no-follow test recognises name-surrogate
 //!   reparse tags (junctions and symbolic links) and not every reparse point.
 //! * After the open, the object's stable filesystem identity (device and inode, or volume serial
@@ -53,13 +58,15 @@
 //!   process running as the same operating-system user can open and write a file this host has
 //!   authorised, and nothing here prevents that. Where immutability matters, as it does for a
 //!   download, the host stages its own copy instead of trusting an open handle.
-//! * A component replaced with a symbolic link *between* the prefix pass and the open of the
-//!   object beneath it can be traversed. The destination is still beneath the authorised
-//!   directory, because every open carries the boundary, so this is a link followed inside the
-//!   tree and never an escape.
-//! * On Linux each accumulated path is resolved in one syscall, so there is no window inside a
-//!   resolution. On the other platforms the resolution is component-wise beneath the start
-//!   directory, and [`cap_std`]'s own documentation is the authority on what that leaves open.
+//! * A directory moved out of the authorised tree *while* a name is being resolved through it is
+//!   still descended into, because the handle is what the descent holds and a handle keeps its
+//!   object wherever the name goes. That is the same rule the rest of this module is built on: the
+//!   grant follows the object, not the name. What it is not is an escape to somewhere a caller
+//!   never named, and it is the price of the leaf being the thing the descent checked.
+//! * A mount over a *file* is not seen. A confined authority compares the mount of every directory
+//!   it descends through and of the file a read returns, which covers a directory mounted into the
+//!   tree; a regular file with a second name, by a hard link or by a mount of its own, is an alias
+//!   this module does not decide.
 
 use std::path::{Path, PathBuf};
 
@@ -452,9 +459,9 @@ pub struct AuthorisedDirectory {
     environment_id: EnvironmentId,
     directory: Dir,
     identity: ObjectIdentity,
-    /// The mount the handle was resolved through, read when it was opened. Every name resolved
-    /// beneath this directory is compared with it.
-    mount: MountId,
+    /// The mount this authority is confined to, when a caller asked for that rule. Absent means
+    /// no name resolved beneath this directory is compared with a mount at all.
+    mount: Option<MountId>,
     /// The path the directory was opened from. Diagnostics only: the handle is the authority, and
     /// re-resolving this path would let a rename hand the grant to an unrelated tree.
     display: PathBuf,
@@ -498,14 +505,33 @@ impl AuthorisedDirectory {
         display: PathBuf,
     ) -> Result<Self, Escape> {
         let identity = directory_identity(&directory, &display)?;
-        let mount = mount_of(&directory, &display.display().to_string())?;
         Ok(Self {
             environment_id,
             directory,
             identity,
-            mount,
+            mount: None,
             display,
         })
+    }
+
+    /// Returns this authority with the one-mount rule on it, and every authority it hands out.
+    ///
+    /// What the rule is for: a mount is the other way a path reaches content the path does not
+    /// name, and unlike a link nothing in the path itself says so. A caller that has to read the
+    /// tree it named, rather than whatever has since been grafted into it, asks for this and gets
+    /// a refusal instead of the other tree's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::Unopenable`] when this host will not say which mount the directory was
+    /// resolved through. The rule is refused rather than approximated: a comparison that cannot
+    /// tell two mounts apart would answer every question with yes.
+    pub fn confined_to_one_mount(mut self) -> Result<Self, Escape> {
+        self.mount = Some(mount_of(
+            &self.directory,
+            &self.display.display().to_string(),
+        )?);
+        Ok(self)
     }
 
     /// Returns the environment this authority belongs to.
@@ -520,9 +546,9 @@ impl AuthorisedDirectory {
         self.identity
     }
 
-    /// Returns the mount the directory was resolved through when it was opened.
+    /// Returns the mount this authority is confined to, when it is confined to one.
     #[must_use]
-    pub const fn mount(&self) -> MountId {
+    pub const fn mount(&self) -> Option<MountId> {
         self.mount
     }
 
@@ -617,21 +643,17 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name breaks, or the open failure.
     pub fn subdirectory(&self, name: &RelativeName) -> Result<Self, Escape> {
-        self.check_prefixes(name, name.components().len())?;
-        let directory = open_directory(&self.directory, name.as_str())?;
+        let (above, leaf) = self.descend(name)?;
+        let directory = open_step(&above, &leaf, name.as_str())?;
         let mut display = self.display.clone();
         for component in name.components() {
             display.push(component);
         }
         let child = Self::from_handle(self.environment_id, directory, display)?;
         // The mount of what was opened, rather than of the prefix that was checked and let go: a
-        // name mounted over between the two resolutions is refused here.
-        if child.mount != self.mount {
-            return Err(Escape::CrossedMount {
-                component: name.as_str().to_owned(),
-            });
-        }
-        Ok(child)
+        // name mounted over between the two resolutions is refused here. The rule travels with the
+        // authority, so everything the caller reaches through this one carries it too.
+        self.confine_like_me(child, name.as_str())
     }
 
     /// Creates a subdirectory, owner-only, and opens it as an authority of its own.
@@ -669,7 +691,8 @@ impl AuthorisedDirectory {
         self.sync()?;
         let mut display = self.display.clone();
         display.push(component);
-        Self::from_handle(self.environment_id, child, display)
+        let child = Self::from_handle(self.environment_id, child, display)?;
+        self.confine_like_me(child, component)
     }
 
     /// Opens a descendant for reading, refusing every link on the way.
@@ -682,13 +705,23 @@ impl AuthorisedDirectory {
         name: &RelativeName,
         policy: ObjectPolicy,
     ) -> Result<AuthorisedFile, Escape> {
-        self.check_prefixes(name, name.components().len() - 1)?;
+        let (above, leaf) = self.descend(name)?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         no_wait(&mut options);
-        let file = open_object(&self.directory, name.as_str(), &options)?;
+        let file = open_object_as(&above, &leaf, name.as_str(), &options)?;
         let opened = AuthorisedFile::adopt(self.environment_id, file, name.as_str(), policy)?;
-        self.confirm_reachable(name, opened.identity())?;
+        // The handle the bytes will come from, on the mount this authority is confined to. A
+        // directory checked and then mounted over is not reachable from here, because the open
+        // above happened in the directory the descent is holding; what this catches is the last
+        // component itself being somewhere else.
+        if let Some(mount) = self.mount
+            && mount_of_file(opened.handle(), name.as_str())? != mount
+        {
+            return Err(Escape::CrossedMount {
+                component: name.as_str().to_owned(),
+            });
+        }
         Ok(opened)
     }
 
@@ -720,7 +753,6 @@ impl AuthorisedDirectory {
             name.as_str(),
             ObjectPolicy::HostOwnedFile,
         )?;
-        self.confirm_reachable(name, opened.identity())?;
         Ok(opened)
     }
 
@@ -742,7 +774,13 @@ impl AuthorisedDirectory {
             name.as_str(),
             ObjectPolicy::HostOwnedFile,
         )?;
-        self.confirm_reachable(name, opened.identity())?;
+        if let Some(mount) = self.mount
+            && mount_of_file(opened.handle(), name.as_str())? != mount
+        {
+            return Err(Escape::CrossedMount {
+                component: name.as_str().to_owned(),
+            });
+        }
         Ok(opened)
     }
 
@@ -756,8 +794,8 @@ impl AuthorisedDirectory {
     /// Returns [`Escape::NotFound`] when the name is absent, or the storage failure when the
     /// platform would not answer.
     pub fn probe(&self, name: &RelativeName) -> Result<ObjectKind, Escape> {
-        self.check_prefixes(name, name.components().len() - 1)?;
-        match self.directory.symlink_metadata(name.as_str()) {
+        let (above, leaf) = self.descend(name)?;
+        match above.symlink_metadata(&leaf) {
             Ok(metadata) => {
                 let kind = metadata.file_type();
                 Ok(if kind.is_symlink() {
@@ -773,7 +811,7 @@ impl AuthorisedDirectory {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Escape::NotFound {
                 component: name.as_str().to_owned(),
             }),
-            Err(error) => Err(classify(&self.directory, name.as_str(), &error)),
+            Err(error) => Err(named(classify(&above, &leaf, &error), name.as_str())),
         }
     }
 
@@ -914,73 +952,64 @@ impl AuthorisedDirectory {
         path
     }
 
-    /// Confirms that the object just opened is the one this authority reaches by that name.
+    /// Opens every component above the last one, keeping each handle as the next one's parent.
     ///
-    /// The open itself carries the platform's beneath-root boundary, which on Linux is one
-    /// `openat2(RESOLVE_BENEATH)` and closes the question outright. On the other platforms the
-    /// resolution is component-wise inside `cap_std`, and a directory relocated *during* it is a
-    /// window this module cannot enter. So the name is resolved a second time and the object
-    /// compared: two independent resolutions agreeing is what turns an undetected escape into a
-    /// refusal. A one-component name needs no resolution above it and the second look is a
-    /// formality; a multi-component name is where this earns its keep.
+    /// This is the whole of how a name is resolved here. Each step is opened with the no-follow
+    /// open against the handle above it, checked where the authority has something to check, and
+    /// then held: the directory that comes back is the directory the next component is opened in,
+    /// and for the last component it is the directory the caller's object is opened in. Nothing
+    /// resolves the name again afterwards, so nothing that was checked can be replaced by
+    /// something that was not between the check and the open.
     ///
-    /// What remains: a relocation undone between the two resolutions is not detectable from here,
-    /// which is the same class of residual as another writer to an authorised file.
-    fn confirm_reachable(
-        &self,
-        name: &RelativeName,
-        identity: ObjectIdentity,
-    ) -> Result<(), Escape> {
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        no_wait(&mut options);
-        let again = open_object(&self.directory, name.as_str(), &options)?;
-        let metadata = again.metadata().map_err(|error| Escape::Unopenable {
-            component: name.as_str().to_owned(),
-            detail: error.to_string(),
-        })?;
-        let found = ObjectIdentity {
-            device: metadata.dev(),
-            file_id: metadata.ino(),
+    /// What comes back is that last directory and the final component, unopened.
+    fn descend(&self, name: &RelativeName) -> Result<(Dir, String), Escape> {
+        let components = name.components();
+        let Some((leaf, above)) = components.split_last() else {
+            return Err(Escape::Empty);
         };
-        if found == identity {
-            Ok(())
-        } else {
-            Err(Escape::IdentityChanged {
-                detail: format!(
-                    "{} resolved to {identity} and then to {found}, so this authority does not                      reach one object by that name",
-                    name.as_str()
-                ),
-            })
+        check_component(leaf)?;
+        let mut here = self
+            .directory
+            .try_clone()
+            .map_err(|error| Escape::Unopenable {
+                component: self.display.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        let mut walked = String::new();
+        for component in above {
+            check_component(component)?;
+            if !walked.is_empty() {
+                walked.push('/');
+            }
+            walked.push_str(component);
+            let step = open_step(&here, component, &walked)?;
+            // And, where the caller asked for it, on the mount this authority is confined to. A
+            // directory mounted over a name inside the tree holds content the name never named,
+            // reached by a path that crosses no link, so a name that descends through one does
+            // not resolve at all.
+            if let Some(mount) = self.mount
+                && mount_of(&step, &walked)? != mount
+            {
+                return Err(Escape::CrossedMount { component: walked });
+            }
+            here = step;
         }
+        Ok((here, (*leaf).to_owned()))
     }
 
-    /// Opens the first `depth` prefixes of a name, each against this directory's own handle.
-    ///
-    /// Every open carries the boundary of *this* directory rather than of the previous component,
-    /// so a directory moved out of the authorised tree between two prefixes makes the next open
-    /// fail. Each open also refuses a link at its own position, which is the component-wise half
-    /// of the policy.
-    fn check_prefixes(&self, name: &RelativeName, depth: usize) -> Result<(), Escape> {
-        let components = name.components();
-        let mut prefix = String::new();
-        for component in components.iter().take(depth) {
-            check_component(component)?;
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(component);
-            let held = open_directory(&self.directory, &prefix)?;
-            // And on this authority's own mount. A directory mounted over a name inside the tree
-            // holds content the name never named, reached by a path that crosses no link, so a
-            // name that resolves through one does not resolve at all.
-            if mount_of(&held, &prefix)? != self.mount {
-                return Err(Escape::CrossedMount {
-                    component: prefix.clone(),
-                });
-            }
+    /// Gives an authority this one hands out the same mount rule, and refuses one somewhere else.
+    fn confine_like_me(&self, child: Self, what: &str) -> Result<Self, Escape> {
+        let Some(mount) = self.mount else {
+            return Ok(child);
+        };
+        let child = child.confined_to_one_mount()?;
+        if child.mount == Some(mount) {
+            Ok(child)
+        } else {
+            Err(Escape::CrossedMount {
+                component: what.to_owned(),
+            })
         }
-        Ok(())
     }
 }
 
@@ -1204,9 +1233,9 @@ fn directory_identity(directory: &Dir, what: &Path) -> Result<ObjectIdentity, Es
 /// carry it leaves the field the same for everything, and then the device is the whole comparison,
 /// which still tells one filesystem from another.
 #[cfg(target_os = "linux")]
-fn mount_of(directory: &Dir, what: &str) -> Result<MountId, Escape> {
+fn mount_of_handle(handle: impl std::os::fd::AsFd, what: &str) -> Result<MountId, Escape> {
     let stat = rustix::fs::statx(
-        directory,
+        handle,
         "",
         rustix::fs::AtFlags::EMPTY_PATH,
         rustix::fs::StatxFlags::MNT_ID,
@@ -1215,10 +1244,43 @@ fn mount_of(directory: &Dir, what: &str) -> Result<MountId, Escape> {
         component: what.to_owned(),
         detail: error.to_string(),
     })?;
-    Ok(MountId {
-        mount: stat.stx_mnt_id,
-        device: rustix::fs::makedev(stat.stx_dev_major, stat.stx_dev_minor),
-    })
+    mount_reported(
+        stat.stx_mask,
+        stat.stx_mnt_id,
+        rustix::fs::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+        what,
+    )
+}
+
+/// Turns what the kernel said it filled in into a mount, or into a refusal.
+///
+/// The kernel reports which fields it answered. One too old to carry the mount leaves this one
+/// out, and then every object answers the same and the comparison says yes to everything. A caller
+/// that asked to stay on one mount is told this host cannot tell, rather than being given a
+/// comparison that cannot fail.
+#[cfg(target_os = "linux")]
+fn mount_reported(mask: u32, mount: u64, device: u64, what: &str) -> Result<MountId, Escape> {
+    if mask & rustix::fs::StatxFlags::MNT_ID.bits() == 0 {
+        return Err(Escape::Unopenable {
+            component: what.to_owned(),
+            detail: "this host does not report which mount an object was resolved through, and \
+                     an authority confined to one mount cannot be established without it"
+                .to_owned(),
+        });
+    }
+    Ok(MountId { mount, device })
+}
+
+/// Returns the mount an open directory was resolved through.
+#[cfg(target_os = "linux")]
+fn mount_of(directory: &Dir, what: &str) -> Result<MountId, Escape> {
+    mount_of_handle(directory, what)
+}
+
+/// Returns the mount an open file was resolved through.
+#[cfg(target_os = "linux")]
+fn mount_of_file(file: &File, what: &str) -> Result<MountId, Escape> {
+    mount_of_handle(file, what)
 }
 
 /// Returns the device an open directory is on, which is what this platform says about mounts.
@@ -1234,6 +1296,59 @@ fn mount_of(directory: &Dir, what: &str) -> Result<MountId, Escape> {
         mount: 0,
         device: metadata.dev(),
     })
+}
+
+/// Returns the device an open file is on, which is what this platform says about mounts.
+#[cfg(not(target_os = "linux"))]
+fn mount_of_file(file: &File, what: &str) -> Result<MountId, Escape> {
+    let metadata = file.metadata().map_err(|error| Escape::Unopenable {
+        component: what.to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(MountId {
+        mount: 0,
+        device: metadata.dev(),
+    })
+}
+
+/// Opens one component of a descent, reporting it by the path walked so far.
+fn open_step(parent: &Dir, component: &str, walked: &str) -> Result<Dir, Escape> {
+    let opened = parent
+        .open_dir_nofollow(component)
+        .map_err(|error| named(classify(parent, component, &error), walked))?;
+    refuse_reparse_point(&opened, walked)?;
+    Ok(opened)
+}
+
+/// Opens one object in the directory a descent reached, reported by the name the caller gave.
+fn open_object_as(
+    parent: &Dir,
+    component: &str,
+    reported: &str,
+    options: &OpenOptions,
+) -> Result<File, Escape> {
+    let opened = parent
+        .open_with(component, options)
+        .map_err(|error| named(classify(parent, component, &error), reported))?;
+    refuse_reparse_file(&opened, reported)?;
+    Ok(opened)
+}
+
+/// Reports a refusal by the whole name the caller gave rather than by the component it reached.
+fn named(escape: Escape, reported: &str) -> Escape {
+    match escape {
+        Escape::Link { .. } => Escape::Link {
+            component: reported.to_owned(),
+        },
+        Escape::NotFound { .. } => Escape::NotFound {
+            component: reported.to_owned(),
+        },
+        Escape::Unopenable { detail, .. } => Escape::Unopenable {
+            component: reported.to_owned(),
+            detail,
+        },
+        other => other,
+    }
 }
 
 /// Opens one path beneath `directory`, refusing a link at its final component.
@@ -1900,5 +2015,30 @@ mod tests {
         let path = authority.host_path(&name("complete/payload.bin"));
         assert!(path.starts_with(root.path()));
         assert!(path.ends_with("complete/payload.bin"));
+    }
+
+    /// A host that will not say which mount an object was resolved through cannot be confined to
+    /// one, and says so instead of comparing something that cannot differ.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mount_the_kernel_did_not_report_is_a_refusal_rather_than_a_comparison() {
+        let reported = rustix::fs::StatxFlags::MNT_ID.bits();
+        let mount = mount_reported(reported, 42, 7, "a directory").expect("a reported mount");
+        assert_eq!(
+            mount,
+            mount_reported(reported, 42, 7, "the same directory").expect("the same answer"),
+            "one reported mount answers the same twice"
+        );
+        assert_ne!(
+            mount,
+            mount_reported(reported, 43, 7, "another directory").expect("another mount"),
+            "two mounts of one device are two mounts, which is what a bind mount is"
+        );
+        let refusal = mount_reported(0, 0, 7, "a directory")
+            .expect_err("a kernel that reported no mount is not a mount of its own");
+        assert!(
+            matches!(refusal, Escape::Unopenable { ref detail, .. } if detail.contains("does not report which mount")),
+            "the refusal says the host cannot tell: {refusal}"
+        );
     }
 }
