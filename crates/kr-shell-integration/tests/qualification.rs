@@ -108,6 +108,29 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
                 case.id
             );
         }
+        if case.supported {
+            for required in [
+                "identity",
+                "profile_order",
+                "user_bindings",
+                "gesture_detaches",
+            ] {
+                assert!(
+                    case.checks.iter().any(|check| check == required),
+                    "{} is a supported combination and does not claim {required}",
+                    case.id
+                );
+            }
+            // A case that names the plugin-stack row has to be about a customisation: one the
+            // pinned set carries, an ordinary distribution one, or a native module.
+            if case.covers.iter().any(|row| row == "KR-REQ-07.87") {
+                assert!(
+                    !case.requires.is_empty() || UNPINNED_STACKS.contains(&case.stack.as_str()),
+                    "{} claims the plugin-stack row and installs no customisation",
+                    case.id
+                );
+            }
+        }
         assert!(
             case.checks.contains(&"identity".to_owned()),
             "{} does not say which package it qualified",
@@ -717,40 +740,101 @@ fn the_package_is_the_one_the_record_names(
             case.id
         );
     }
-    let declared: Vec<String> = session
+    // Every field of every patch and every module, not the names alone: a patch whose revision
+    // moved, or a module whose search path did, is another package.
+    let declared: Vec<(String, String, String)> = session
         .hello
         .shell
         .patches
         .iter()
-        .map(|patch| patch.name.clone())
+        .map(|patch| {
+            (
+                patch.name.clone(),
+                patch.revision.clone(),
+                patch.upstream_revision.clone(),
+            )
+        })
         .collect();
-    assert_eq!(
-        declared,
-        package.patch_names(),
-        "{} declared patches the installed package does not record",
-        case.id
-    );
-    let modules: Vec<String> = session
-        .hello
-        .shell
-        .modules
-        .iter()
-        .map(|module| module.name.clone())
-        .collect();
-    let recorded: Vec<String> = record["modules"]
+    let recorded: Vec<(String, String, String)> = record["patches"]
         .as_array()
         .map(|entries| {
             entries
                 .iter()
-                .filter_map(|module| module["name"].as_str().map(str::to_owned))
+                .map(|patch| {
+                    (
+                        patch["name"].as_str().unwrap_or_default().to_owned(),
+                        patch["revision"].as_str().unwrap_or_default().to_owned(),
+                        patch["upstream_revision"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
     assert_eq!(
-        modules, recorded,
-        "{} declared a module tree the installed package does not record",
+        declared, recorded,
+        "{} declared patches the installed package does not record",
         case.id
     );
+    let modules: Vec<(String, String, String)> = session
+        .hello
+        .shell
+        .modules
+        .iter()
+        .map(|module| {
+            (
+                module.name.clone(),
+                module.search_path.clone(),
+                module.editor_abi.clone(),
+            )
+        })
+        .collect();
+    let recorded: Vec<(String, String, String)> = record["modules"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|module| {
+                    (
+                        module["name"].as_str().unwrap_or_default().to_owned(),
+                        module["search_path"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        module["editor_abi"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        modules.len(),
+        recorded.len(),
+        "{} declared a module tree of another size than the installed package records",
+        case.id
+    );
+    for (declared, recorded) in modules.iter().zip(recorded.iter()) {
+        assert_eq!(
+            (&declared.0, &declared.2),
+            (&recorded.0, &recorded.2),
+            "{} declared a module the installed package does not record",
+            case.id
+        );
+        // One package records where the shell searches and the module declares where it is, and
+        // the two are the same tree read from different ends. A module that moved out of the
+        // recorded tree fails here; which end of it a package names does not.
+        assert!(
+            declared.1.starts_with(recorded.1.as_str())
+                || recorded.1.starts_with(declared.1.as_str()),
+            "{}: {} is declared at {} and recorded under {}",
+            case.id,
+            declared.0,
+            declared.1,
+            recorded.1
+        );
+    }
 }
 
 /// A module this build cannot load, diagnosed rather than loaded silently.
