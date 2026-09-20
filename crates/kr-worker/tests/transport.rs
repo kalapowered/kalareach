@@ -4218,15 +4218,23 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
     let host = kr_ipc::testing::TempHost::create();
     let (runtime, mut stream) = session_runtime_and_stream(session(), &host).await;
 
-    // One recorded transition, then a journal that cannot be written.
-    owner
-        .from_upstream(
-            br#"{"id":700,"method":"session/request_permission","params":{}}"#,
-            TimestampMs::new(2),
-        )
-        .await
-        .expect("the request is carried");
-    let _ = next_line(&mut upstream_client).await;
+    // A recorded backlog larger than one replay page, so the recovery reads several pages and
+    // every one of them carries the same news.
+    for index in 0..(kr_worker::broker::MAX_REPLAY_EVENTS + 4) {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":{},"method":"session/request_permission","params":{{}}}}"#,
+                    2000 + index
+                )
+                .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut upstream_client).await;
+    }
+    // Then a journal that cannot be written.
     broker
         .enter_volatile("the journal could not be written", TimestampMs::new(3))
         .expect("the gateway enters volatile-native mode");
@@ -4249,8 +4257,8 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
     }
     assert_eq!(
         outbox(&broker).len(),
-        1,
-        "only the transition from before the fault was recorded"
+        kr_worker::broker::MAX_REPLAY_EVENTS + 4,
+        "only the transitions from before the fault were recorded"
     );
 
     let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
@@ -4260,27 +4268,42 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
         Arc::clone(&runtime),
     ));
 
-    let mut told_to_start_again = None;
+    let mut markers = Vec::new();
+    while markers.is_empty() {
+        match tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await {
+            Ok(Some(kr_worker::output::OutputDelivery::AgentResource { bytes, .. })) => {
+                stream.written(bytes);
+            }
+            Ok(Some(kr_worker::output::OutputDelivery::Resync(marker))) => markers.push(marker),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // And nothing more is said about it while the recovery finishes its remaining pages.
     while let Ok(Some(delivery)) =
-        tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await
+        tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv()).await
     {
         match delivery {
             kr_worker::output::OutputDelivery::AgentResource { bytes, .. } => {
                 stream.written(bytes);
             }
-            kr_worker::output::OutputDelivery::Resync(marker) => {
-                told_to_start_again = Some(marker);
-                break;
-            }
+            kr_worker::output::OutputDelivery::Resync(marker) => markers.push(marker),
             _ => {}
         }
     }
 
-    let marker = told_to_start_again.expect("the views are told the recovery could not cover it");
+    let marker = markers
+        .first()
+        .expect("the views are told the recovery could not cover it");
     assert_eq!(
         marker.reason,
         kr_protocol::recovery::ResyncReason::AgentStreamGap,
         "and they are told why: what was lost was never written down"
+    );
+    assert_eq!(
+        markers.len(),
+        1,
+        "one recovery is one piece of news, however many pages it reads"
     );
 
     carrying.abort();

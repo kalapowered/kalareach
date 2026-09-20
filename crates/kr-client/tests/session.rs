@@ -276,6 +276,11 @@ fn answer_read(request: &kr_protocol::envelope::Request) -> ParamsValue {
             from_cursor: U64::ZERO,
             oldest_retained_cursor: U64::ZERO,
             gap: Nullable::null(),
+            agent_resources: kr_protocol::projection::AgentResourceSnapshot {
+                stream_generation: U64::new(1),
+                cursor: U64::ZERO,
+                resources: Vec::new(),
+            },
         })
         .expect("a result");
     }

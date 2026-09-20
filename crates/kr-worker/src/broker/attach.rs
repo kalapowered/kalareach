@@ -383,6 +383,10 @@ async fn recover_views(
     session_id: kr_protocol::ids::SessionId,
     cursor: &mut crate::broker::ReplayCursor,
 ) {
+    // One recovery is one piece of news, however many pages it reads. Telling the views again for
+    // each page would queue a marker per page, and these markers cost a subscriber's queue
+    // nothing, so repeating them is the one thing that could grow a bounded queue without bound.
+    let mut told = false;
     loop {
         let replay = match broker.replay_after(*cursor) {
             Ok(replay) => replay,
@@ -390,13 +394,16 @@ async fn recover_views(
                 // The outbox cannot be read at all, so nothing here can establish what the views
                 // missed. They are told to install a fresh state rather than left with a partial
                 // one that looks whole.
-                runtime
-                    .session()
-                    .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
+                if !told {
+                    runtime
+                        .session()
+                        .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
+                }
                 return;
             }
         };
-        if replay.reset || replay.gap {
+        if (replay.reset || replay.gap) && !told {
+            told = true;
             runtime
                 .session()
                 .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
