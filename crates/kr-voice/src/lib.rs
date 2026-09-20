@@ -81,7 +81,7 @@ pub use crate::grant::{
     GrantBinding, VoiceGrantPlan, permits, permitted_actions, plan_voice_grant,
 };
 pub use crate::seams::{
-    ActionSubmitter, ContextItem, ContextRequest, ContextSource, GatheredContext, HostReceipt,
-    SelectedItem, VoiceAuthority, VoiceFuture, WithheldRun,
+    ActionSubmitter, Admission, ContextItem, ContextRequest, ContextSource, GatheredContext,
+    HostReceipt, SelectedItem, Unbounded, VoiceAuthority, VoiceFuture, WithheldRun,
 };
 pub use crate::session::{NewVoiceSession, VoiceSessionRecord, VoiceSessions};

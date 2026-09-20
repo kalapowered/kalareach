@@ -274,7 +274,7 @@ impl Host {
                 },
                 self.revision(),
                 2,
-                u64::MAX,
+                &kr_voice::Unbounded,
             )
             .await
             .expect("a standing voice grant")
@@ -295,7 +295,7 @@ impl Host {
                 },
                 self.revision(),
                 3,
-                u64::MAX,
+                &kr_voice::Unbounded,
             )
             .await
             .expect("a call");
@@ -485,7 +485,7 @@ async fn voice_needs_a_paired_device_and_a_voice_grant() {
             },
             host.revision(),
             3,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect_err("no voice grant, no call");

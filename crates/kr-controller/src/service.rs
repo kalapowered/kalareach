@@ -2401,18 +2401,16 @@ impl Controller {
         authority_revision: AuthorityRevision,
         accepted: kr_transport::window::AcceptedDeadline,
     ) -> Result<ParamsValue> {
-        // The deadline this mutation was admitted under, as a reading of the clock the coordinator
-        // can check. Everything after this waits — for the claim, for the coordinator's own lock,
-        // for the broker — and the write at the end of those waits is what has to be inside the
-        // lifetime the host accepted, not merely the dispatch that began it.
-        let admitted_until_ms = wall_clock_ms().saturating_add(
-            accepted
-                .deadline
-                .saturating_duration_since(self.clock.now())
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        );
+        // The deadline this mutation was admitted under, as a question the coordinator can ask
+        // rather than a figure it has to convert. Everything after this waits — for the claim, for
+        // the coordinator's own lock, for the store, for the broker — and the write at the end of
+        // those waits is what has to be inside the lifetime the host accepted, not merely the
+        // dispatch that began it. The reading is this daemon's own continuous clock, which is the
+        // clock the deadline is measured on and the one nothing outside this process can move.
+        let admission = AdmittedUntil {
+            controller: Arc::clone(self),
+            deadline: accepted.deadline,
+        };
         // A delegation is not deduplicated by its payload, and must not be: section 15 ¶8 binds a
         // confirmation to the request that asked for it, so the signed resubmission is the same
         // action identifier carrying a different payload, which is exactly what a payload digest
@@ -2427,7 +2425,7 @@ impl Controller {
                     method,
                     authority_revision,
                     wall_clock_ms(),
-                    admitted_until_ms,
+                    &admission,
                 )
                 .await;
         }
@@ -2448,7 +2446,7 @@ impl Controller {
                 method,
                 authority_revision,
                 wall_clock_ms(),
-                admitted_until_ms,
+                &admission,
             )
             .await?;
         self.retain_authority_change(actor_id, mutation, &result)?;
@@ -5696,6 +5694,31 @@ fn remaining_deadline(
     let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
     let remaining = deadline.saturating_duration_since(now);
     kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
+}
+
+/// The admission one voice mutation arrived under, as the coordinator asks about it.
+///
+/// The deadline is on this daemon's own continuous clock, which is what section 9 measures a
+/// mutation's lifetime on and the only clock nothing outside this process can move. The
+/// coordinator asks rather than converting, so no reading of the wall clock comes between the
+/// admission and the effect.
+struct AdmittedUntil {
+    controller: Arc<Controller>,
+    deadline: kr_transport::clock::ContinuousInstant,
+}
+
+impl std::fmt::Debug for AdmittedUntil {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmittedUntil")
+            .finish_non_exhaustive()
+    }
+}
+
+impl kr_voice::Admission for AdmittedUntil {
+    fn still_admitted(&self) -> bool {
+        self.controller.clock.now() < self.deadline
+    }
 }
 
 /// This machine's wall clock, in UTC milliseconds.

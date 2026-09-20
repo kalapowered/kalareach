@@ -774,7 +774,7 @@ async fn started(fixture: &Fixture, actions: Option<&[VoiceAction]>) -> VoiceSes
             &grant_params(actions),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -785,7 +785,7 @@ async fn started(fixture: &Fixture, actions: Option<&[VoiceAction]>) -> VoiceSes
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a call");
@@ -817,7 +817,7 @@ async fn the_default_voice_grant_permits_four_things_and_names_them() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -845,7 +845,7 @@ async fn the_default_voice_grant_permits_four_things_and_names_them() {
             &grant_params(Some(&[VoiceAction::Navigate, VoiceAction::ShellInput])),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a narrowed voice grant");
@@ -900,7 +900,7 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -910,7 +910,7 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a call");
@@ -932,7 +932,7 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -943,7 +943,7 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("an answer");
@@ -978,7 +978,7 @@ async fn a_replayed_answer_does_not_become_a_second_grant() {
             &start_params(),
             AuthorityRevision::new(1),
             10_100,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("an answer");
@@ -1017,7 +1017,7 @@ async fn a_replayed_answer_for_a_call_nothing_holds_is_closed() {
             &start_params(),
             AuthorityRevision::new(1),
             10_100,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("an answer");
@@ -1043,7 +1043,7 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -1059,7 +1059,7 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
                     &start_params(),
                     AuthorityRevision::new(1),
                     10_010,
-                    u64::MAX,
+                    &kr_voice::Unbounded,
                 )
                 .await
                 .expect("an answer")
@@ -1077,7 +1077,7 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
             &start_params(),
             AuthorityRevision::new(1),
             10_020,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("an answer");
@@ -1116,7 +1116,7 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -1133,7 +1133,7 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
                     &grant_params(Some(&[VoiceAction::Navigate])),
                     AuthorityRevision::new(1),
                     10_100,
-                    u64::MAX,
+                    &kr_voice::Unbounded,
                 )
                 .await
                 .expect("a narrower standing voice grant")
@@ -1151,7 +1151,7 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
                     &grant_params(Some(&[VoiceAction::Navigate, VoiceAction::Status])),
                     AuthorityRevision::new(1),
                     10_100,
-                    u64::MAX,
+                    &kr_voice::Unbounded,
                 )
                 .await
                 .expect("a wider standing voice grant")
@@ -1189,7 +1189,7 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -1204,7 +1204,7 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
                     &start_params(),
                     AuthorityRevision::new(1),
                     10_010,
-                    u64::MAX,
+                    &kr_voice::Unbounded,
                 )
                 .await
                 .expect("an answer")
@@ -1219,7 +1219,7 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
             &grant_params(Some(&[VoiceAction::Navigate])),
             AuthorityRevision::new(1),
             10_020,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a narrower standing voice grant");
@@ -1258,7 +1258,7 @@ async fn replacing_a_standing_grant_closes_the_calls_it_withdrew() {
             &grant_params(Some(&[VoiceAction::Navigate])),
             AuthorityRevision::new(1),
             10_200,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a narrower standing voice grant");
@@ -1285,7 +1285,7 @@ async fn a_replaced_standing_grant_is_withdrawn_with_the_calls_under_it() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant")
@@ -1296,7 +1296,7 @@ async fn a_replaced_standing_grant_is_withdrawn_with_the_calls_under_it() {
             &grant_params(Some(&[VoiceAction::Navigate])),
             AuthorityRevision::new(1),
             10_100,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a narrower standing voice grant")
@@ -1319,7 +1319,7 @@ async fn exhausted_capacity_reports_what_still_works() {
             &grant_params(None),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("a standing voice grant");
@@ -1330,7 +1330,7 @@ async fn exhausted_capacity_reports_what_still_works() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect("an answer");
@@ -1360,7 +1360,7 @@ async fn every_voice_method_needs_the_voice_grant() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
-            u64::MAX,
+            &kr_voice::Unbounded,
         )
         .await
         .expect_err("no voice grant, no call");

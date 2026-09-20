@@ -216,6 +216,31 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Admission                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/// Whether the admission a change arrived under still stands.
+///
+/// Section 9 gives every mutation a deadline the host accepted it under, measured on the host's
+/// own clock. An effect that happens after it is an effect nobody holds a window for. The
+/// coordinator cannot read that clock — it is the host's, and it is not the wall clock a voice
+/// deadline is written in — so it asks the host the question instead of converting the answer.
+pub trait Admission: Send + Sync + fmt::Debug {
+    /// Returns true while the change may still reach its effect.
+    fn still_admitted(&self) -> bool;
+}
+
+/// An admission that never runs out, for a caller with no window of its own.
+#[derive(Clone, Copy, Debug)]
+pub struct Unbounded;
+
+impl Admission for Unbounded {
+    fn still_admitted(&self) -> bool {
+        true
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Proposing                                                                   */
 /* -------------------------------------------------------------------------- */
 

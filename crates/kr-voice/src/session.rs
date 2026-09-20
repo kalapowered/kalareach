@@ -46,25 +46,63 @@ pub struct VoiceSessionRecord {
     pub started_at_ms: u64,
     /// When the call's own deadline falls, in UTC milliseconds.
     pub closes_at_ms: u64,
-    /// The delegations the provider has announced to this call, in the order they arrived.
+    /// The delegations submitted to this call, in the order they arrived, each with the action
+    /// identifier it arrived under.
     ///
     /// A delegation identifier is correlation data. An identifier nobody announced correlates with
-    /// nothing, which is why submitting one is refused rather than interpreted.
-    announced: Vec<VoiceDelegationId>,
+    /// nothing, which is why submitting one is refused rather than interpreted. The action
+    /// identifier is kept beside it because section 23 makes a delegation action-deduplicated and
+    /// its payload cannot be the key: a confirmation is bound to the request that asked for it, so
+    /// the signed resubmission is the same action carrying a different payload.
+    announced: Vec<Announced>,
+}
+
+/// One delegation this call has admitted, and the action identifier it arrived under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Announced {
+    /// The provider's identifier for the delegation.
+    pub delegation_id: VoiceDelegationId,
+    /// The action identifier the request carried.
+    pub action_id: kr_protocol::ids::ActionId,
 }
 
 impl VoiceSessionRecord {
-    /// Records a delegation the provider announced to this call.
-    pub fn announce(&mut self, delegation_id: VoiceDelegationId) {
-        if !self.announced.contains(&delegation_id) {
-            self.announced.push(delegation_id);
+    /// Records a delegation submitted to this call under one action identifier.
+    pub fn announce(
+        &mut self,
+        delegation_id: VoiceDelegationId,
+        action_id: kr_protocol::ids::ActionId,
+    ) {
+        if !self.announced(&delegation_id) {
+            self.announced.push(Announced {
+                delegation_id,
+                action_id,
+            });
         }
     }
 
-    /// Returns true when the provider announced this delegation to this call.
+    /// Returns true when this delegation has already been submitted to this call.
     #[must_use]
     pub fn announced(&self, delegation_id: &VoiceDelegationId) -> bool {
-        self.announced.contains(delegation_id)
+        self.announced
+            .iter()
+            .any(|held| &held.delegation_id == delegation_id)
+    }
+
+    /// The delegation one action identifier was used for in this call, when it was used.
+    ///
+    /// One identifier is one action: an identifier that already carried a delegation cannot carry
+    /// a different one, and the same pair returning is the signed resubmission of an action that
+    /// was waiting for its confirmation.
+    #[must_use]
+    pub fn action_used_for(
+        &self,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> Option<&VoiceDelegationId> {
+        self.announced
+            .iter()
+            .find(|held| held.action_id == action_id)
+            .map(|held| &held.delegation_id)
     }
 
     /// Takes one delegation back out of this call's announced set.
@@ -74,12 +112,13 @@ impl VoiceSessionRecord {
     /// the delegation where it was, or the same delegation carrying the proof would be refused as
     /// one that had already been submitted.
     pub fn forget(&mut self, delegation_id: &VoiceDelegationId) {
-        self.announced.retain(|held| held != delegation_id);
+        self.announced
+            .retain(|held| &held.delegation_id != delegation_id);
     }
 
-    /// The delegations announced so far, oldest first.
+    /// The delegations submitted so far, oldest first.
     #[must_use]
-    pub fn delegations(&self) -> &[VoiceDelegationId] {
+    pub fn delegations(&self) -> &[Announced] {
         &self.announced
     }
 
@@ -341,7 +380,10 @@ mod tests {
         sessions
             .of_device_mut(voice_session(1), device(2))
             .expect("the session")
-            .announce(announced.clone());
+            .announce(
+                announced.clone(),
+                kr_protocol::ids::ActionId::new(Uuid::from_bytes([7; 16])),
+            );
         let record = sessions
             .of_device(voice_session(1), device(2))
             .expect("the session");
