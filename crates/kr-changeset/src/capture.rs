@@ -1264,7 +1264,7 @@ fn nested_repositories<'a>(
             // the name as arithmetic.
             _ => {
                 let from = descend_to(tree, directory)?;
-                match resolve_target(from, directory, held, &administrative)? {
+                match resolve_target(from, directory, held, &administrative, tree)? {
                     Some(stack) => stack,
                     // Nothing is there, so there is nothing of it to capture either.
                     None => continue,
@@ -1284,7 +1284,7 @@ fn nested_repositories<'a>(
             Err(kr_transfer::Escape::NotFound { .. }) => {}
             Ok(_) => {
                 let from = clone_stack(&stack)?;
-                if let Some(elsewhere) = resolve_target(from, directory, data, &common)? {
+                if let Some(elsewhere) = resolve_target(from, directory, data, &common, tree)? {
                     let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
                     if elsewhere.len() == 1 {
                         return Err(unplaceable(directory));
@@ -1353,7 +1353,7 @@ fn administrative_directories(
             if std::path::Path::new(&target).is_absolute() {
                 from_root(&target, tree)?
             } else {
-                resolve_target(vec![clone_of(tree)?], ".git", tree, &administrative)?
+                resolve_target(vec![clone_of(tree)?], ".git", tree, &administrative, tree)?
                     .ok_or_else(|| unplaceable("this repository's own data"))?
             }
         }
@@ -1377,7 +1377,7 @@ fn administrative_directories(
             let reached = if std::path::Path::new(&target).is_absolute() {
                 from_root(&target, tree)?
             } else {
-                resolve_target(clone_stack(&stack)?, "commondir", own, &commondir)?
+                resolve_target(clone_stack(&stack)?, "commondir", own, &commondir, tree)?
                     .ok_or_else(|| unplaceable("this repository's own data"))?
             };
             let last = reached
@@ -1750,12 +1750,15 @@ fn clone_stack(stack: &[AuthorisedDirectory]) -> Result<Vec<AuthorisedDirectory>
 /// reaches. Each of those refuses the whole capture.
 ///
 /// What comes back is the whole descent, so a file **beside** what it found is resolved from there
-/// rather than from where this one started.
+/// rather than from where this one started. A descent that arrives at this working tree continues
+/// through the tree's own handle from that step on, so a name that walks out of the tree and back
+/// into it is still read as the tree's own.
 fn resolve_target(
     from: Vec<AuthorisedDirectory>,
     directory: &str,
     holder: &AuthorisedDirectory,
     file: &RelativeName,
+    tree: &AuthorisedDirectory,
 ) -> Result<Option<Vec<AuthorisedDirectory>>> {
     let target = read_target(directory, holder, file)?;
     if std::path::Path::new(&target).is_absolute() {
@@ -1785,7 +1788,14 @@ fn resolve_target(
                 }
                 let next =
                     open_beneath(here, &step, directory)?.map_err(|_| unplaceable(directory))?;
-                stack.push(next);
+                // A descent that arrives at this working tree continues as one of the tree's own,
+                // whatever it walked through to get here: from this step on every component is
+                // compared with the tree's mount, as a content read is.
+                if identity_of(&next) == identity_of(tree) {
+                    stack.push(clone_of(tree)?);
+                } else {
+                    stack.push(next);
+                }
             }
         }
     }
