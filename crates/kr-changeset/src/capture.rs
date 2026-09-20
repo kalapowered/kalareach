@@ -1229,11 +1229,19 @@ fn nested_repositories(
         // Outside this working tree or inside it, the object is the object, and it goes in
         // unconditionally: what decides anything later is whether a directory this capture opens
         // **is** it, and holding one that nothing reaches costs nothing.
-        let identity = administrative_identity(environment_id, path)?;
+        let held = AuthorisedDirectory::open_root(environment_id, path)
+            .map_err(|_| unplaceable("this repository's own data"))?;
+        let identity = identity_of(&held);
         if identity == here {
             return Err(unplaceable("this working tree"));
         }
         refused.insert(identity);
+        // And **everything under it**. A directory inside a repository's own data can be put in
+        // the tree under another name, by a link or by a mount, and then the bytes Git keeps there
+        // are reachable as ordinary content under a path that crosses neither. What answers that
+        // is the same thing that answers the rest: the object. So every directory beneath this one
+        // is asked what it is, and the capture compares what it opens with all of them.
+        administrative_descendants(&held, &mut refused, &mut budget)?;
     }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
@@ -1303,24 +1311,50 @@ fn nested_repositories(
     Ok(found)
 }
 
-/// Returns what one administrative directory Git reported **is**.
+/// Adds the identity of every directory beneath one administrative directory.
 ///
-/// Opened at the path Git named, as an authority of its own, exactly as the project service opens
-/// the repository's: no prefix is compared and no arithmetic is done, so a spelling a filesystem
-/// accepts under another case, a mount that puts the same directory in two places and a link Git
-/// followed all answer the one object. That object is what the exclusion set holds, and a
-/// directory this capture opens is compared with it whatever it is called there.
-///
-/// **Every** failure to open one refuses the capture, an absence included (D-087b): a repository
-/// whose own directory Git has just reported and this host cannot open is not one it can say
-/// anything about, least of all that a tree is free of its data.
-fn administrative_identity(
-    environment_id: kr_protocol::ids::EnvironmentId,
-    path: &std::path::Path,
-) -> Result<(u64, u64)> {
-    AuthorisedDirectory::open_root(environment_id, path)
-        .map(|held| identity_of(&held))
-        .map_err(|_| unplaceable("this repository's own data"))
+/// Bounded by the same budget the rest of the capture's directory reading is, and refusing rather
+/// than skipping whatever it could not read: a directory of a repository's own data that this host
+/// could not ask about is one it cannot say is not somewhere else in the tree as well.
+fn administrative_descendants(
+    directory: &AuthorisedDirectory,
+    into: &mut BTreeSet<(u64, u64)>,
+    budget: &mut usize,
+) -> Result<()> {
+    let entries = directory
+        .handle()
+        .entries()
+        .map_err(|_| unplaceable("this repository's own data"))?;
+    for entry in entries {
+        let entry = entry.map_err(|_| unplaceable("this repository's own data"))?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| unplaceable("this repository's own data"))?;
+        if !kind.is_dir() {
+            continue;
+        }
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| ChangeSetError::QuotaExceeded {
+                detail: format!(
+                    "this repository's own data holds more than {MAX_WALK_ENTRIES} directories, \
+                     which is more than this host reads to know what they are"
+                )
+                .into(),
+            })?;
+        let Ok(name) = entry.file_name().into_string() else {
+            return Err(unplaceable("this repository's own data"));
+        };
+        let name =
+            RelativeName::parse(&name).map_err(|_| unplaceable("this repository's own data"))?;
+        let held = directory
+            .subdirectory(&name)
+            .map_err(|_| unplaceable("this repository's own data"))?;
+        if into.insert(identity_of(&held)) {
+            administrative_descendants(&held, into, budget)?;
+        }
+    }
+    Ok(())
 }
 
 /// Opens one directory beneath another and refuses one that is **on a different mount** (D-087c).
@@ -1379,8 +1413,7 @@ fn mount_of(directory: &AuthorisedDirectory) -> Result<Mount> {
 /// Returns the device one open directory is on.
 #[cfg(not(target_os = "linux"))]
 fn mount_of(directory: &AuthorisedDirectory) -> Result<Mount> {
-    let identity = directory.identity();
-    Ok(identity.device)
+    Ok(directory.identity().device)
 }
 
 /// Returns the object one open directory is.
