@@ -123,7 +123,9 @@ the same compare-and-swap discipline and the same sealing seam.
 - A publication sends the object the store holds against the generation the note beside it names,
   which is never the object's own revision. A revision is a fresh 128-bit value for every write
   rather than a counter, so an object removed and written again never passes through a revision it
-  has already had.
+  has already had. The fence check, the object, its note and the sealing happen under one hold of
+  the store's lock, so the generation the work is admitted under is the one that was in force when
+  its ciphertext was made.
 - A refused comparison is an answer. What the service holds comes down as a `ConflictCopy` **beside**
   this device's own object, which is untouched, and the person chooses. Nothing here resolves a
   conflict, and nothing compares timestamps to do it: an object carries when it was written because
@@ -142,9 +144,16 @@ the same compare-and-swap discipline and the same sealing seam.
   store, so there is one way to write a draft on this device and nothing on either path submits
   one.
 - A note naming a generation a reset or replaced service no longer holds does not resolve itself.
-  The publication is refused and there is nothing to fetch; `SyncStore::forget_checkpoint` is the
-  explicit recovery, and nothing does it automatically, because a note that looks stale and is not
-  is a note whose object another device has just written.
+  `SyncStore::forget_checkpoint` is the explicit recovery, and nothing does it automatically,
+  because a note that looks stale and is not is a note whose object another device has just written.
+  A service that answers at a generation *below* the one the note names has provably gone back
+  behind it, and the refusal says so; one this device could not reach at all is reported as it came,
+  because absence and unreachability are not the same answer.
+- An answer this device cannot make sense of leaves the work outstanding. Only an accepted write
+  and a refused comparison say what became of a publication; anything else, including an abandoned
+  call and a restart, leaves a durable record saying it was sent. `SyncClient::reconcile` asks the
+  service what it holds now and settles each one, which is what lets `outstanding` reach nought
+  honestly.
 
 `sync::StorageFeature` names the three parts of what section 18 offers: encrypted settings sync,
 which is this module; optional history backups; and recovery material, which is what a restore
@@ -161,10 +170,10 @@ client never depends on a host crate:
 | --- | --- |
 | `fence` | Stops production at the generation. A publication after it is refused. |
 | `cancel_undispatched` | Discards the staged ciphertext that was admitted and never sent, and counts what had already been dispatched, which cannot be taken back. |
-| `remove_retained` | Removes the staged ciphertext, the conflict copies and the checkpoints, and reports the bytes and records it actually deleted. |
-| `outstanding` | How many publications are dispatched and unsettled. Cleanup is complete when it is nought. |
+| `remove_retained` | Removes the conflict copies, the checkpoints and the staged work that never left, and reports the bytes and records it actually deleted. Work already dispatched keeps its record, because that record is what says it may be out there. |
+| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and `reconcile` is what gets it there. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
-| `exported` | What has already left, shown rather than claimed to be erased. None of it is deletable from here: a compare-and-exchange store takes a replacement, not a deletion. |
+| `exported` | What has already left, shown rather than claimed to be erased, including a write the service accepted after the fence: suppressing a result does not undo an upload. None of it is deletable from here, because a compare-and-exchange store takes a replacement and not a deletion. |
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
 | `resume` | Turns production back on under a generation of its own. It reconstructs nothing that was omitted. |
 
@@ -231,4 +240,5 @@ service client unconditionally and get an honest answer rather than a silent def
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-20.13 | `crates/kr-client/tests/sync.rs`, for this row's client half: per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The service half is closed by the storage service's own suite |
+| §24 privacy | `crates/kr-client/tests/sync.rs` drives the fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, and reconciliation of work whose caller walked away. Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | `the_service_holds_ciphertext_in_a_declared_bucket_and_never_a_setting` and `the_feature_names_its_three_parts_and_which_of_them_is_optional` in `crates/kr-client/tests/sync.rs`, for the encrypted settings sync part only. The history backup and recovery material parts are the recovery module's, and nothing here performs either |

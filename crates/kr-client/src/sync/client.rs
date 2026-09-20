@@ -43,7 +43,6 @@
 //! again. It reconstructs nothing that was omitted while privacy mode was on.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{SyncConflictId, SyncObjectId, SyncRevisionId};
@@ -51,7 +50,8 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    ConflictCopy, Publication, Result, Staged, SyncCheckpoint, SyncError, SyncStore,
+    ConflictCopy, Outcome, PrivacyRecord, Result, Settlement, Staged, SyncCheckpoint, SyncError,
+    SyncStore,
 };
 use super::{SyncBody, SyncObject, SyncSettings, sync_collection};
 use crate::drafts::DraftSealer;
@@ -203,64 +203,22 @@ pub struct Resumed {
     pub generation: u64,
 }
 
-/// The privacy state a host drives, shared so it can be reached while a publication is out.
-///
-/// It is separate from the client's own fields and behind an [`Arc`] because that is the whole
-/// point: section 24 asks for privacy mode to be enabled *while* upload work is in flight, so the
-/// generation has to be changeable by a host holding this client while a call is awaiting an
-/// answer. A state a publication had exclusive use of would make the late-result rule a rule
-/// nothing could exercise.
-#[derive(Debug, Default)]
-struct PrivacyState {
-    /// The host's privacy generation now in force.
-    generation: AtomicU64,
-    /// Whether production is fenced.
-    fenced: AtomicBool,
-    /// How many publications are dispatched and unsettled.
-    in_flight: AtomicU64,
-}
-
-impl PrivacyState {
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-}
-
-/// One dispatched publication, counted until it is settled or this future is dropped.
-///
-/// A guard rather than a pair of statements: a publication whose future is dropped at an await has
-/// still left this device, and a count that only decremented on the way out would sit positive for
-/// ever with nothing able to settle it.
-#[derive(Debug)]
-struct InFlight(Arc<PrivacyState>);
-
-impl InFlight {
-    fn take(state: &Arc<PrivacyState>) -> Self {
-        state.in_flight.fetch_add(1, Ordering::AcqRel);
-        Self(Arc::clone(state))
-    }
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// One device's synchronised settings and position.
 ///
 /// It holds the service client, this device's sealing and the store. It holds no authority, no host
 /// connection and no draft store: publishing settings and applying what comes back need none of
 /// them, and a client that held one could reach further than section 20 lets a restore reach.
 ///
-/// Every method takes `&self`, so a host holds one of these behind an [`Arc`] and can fence it
-/// while a publication is still out.
+/// Every method takes `&self`, so a host holds one behind an [`Arc`] and can fence it while a
+/// publication is still out. **The store's lock is what makes that safe**, and it is why the
+/// privacy state lives in the store rather than in this value: admitting work, taking it back and
+/// settling it each decide against the generation and write under one hold, so a fence cannot land
+/// between a decision and what follows from it.
 #[derive(Debug)]
 pub struct SyncClient {
     service: Arc<dyn SyncBackupService>,
     sealer: Arc<dyn DraftSealer>,
     store: SyncStore,
-    privacy: Arc<PrivacyState>,
 }
 
 impl SyncClient {
@@ -269,49 +227,17 @@ impl SyncClient {
     /// The sealing seam is the one the draft store defines, because a device holds one key for what
     /// it puts on a synchronisation service and both halves put objects there. A second seam would
     /// be a second answer to the same question.
-    ///
-    /// Work this device dispatched and never settled is read back from the store, so a restart does
-    /// not report nothing outstanding when something may still be out there.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::Storage`] when the staged work cannot be read.
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         service: Arc<dyn SyncBackupService>,
         sealer: Arc<dyn DraftSealer>,
         store: SyncStore,
-    ) -> Result<Self> {
-        Self::restored(service, sealer, store, 0, false)
-    }
-
-    /// Builds one working under a privacy generation a restart read back.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::Storage`] when the staged work cannot be read.
-    pub fn restored(
-        service: Arc<dyn SyncBackupService>,
-        sealer: Arc<dyn DraftSealer>,
-        store: SyncStore,
-        generation: u64,
-        private: bool,
-    ) -> Result<Self> {
-        let unsettled = store
-            .staged()?
-            .items
-            .iter()
-            .filter(|staged| staged.dispatched)
-            .count() as u64;
-        Ok(Self {
+    ) -> Self {
+        Self {
             service,
             sealer,
             store,
-            privacy: Arc::new(PrivacyState {
-                generation: AtomicU64::new(generation),
-                fenced: AtomicBool::new(private),
-                in_flight: AtomicU64::new(unsettled),
-            }),
-        })
+        }
     }
 
     /// Returns the store this client keeps its state in.
@@ -320,16 +246,22 @@ impl SyncClient {
         &self.store
     }
 
-    /// Returns the privacy generation this client is working under.
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.privacy.generation()
+    /// Returns the privacy generation this device records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the record cannot be read.
+    pub fn generation(&self) -> Result<u64> {
+        Ok(self.store.privacy()?.generation.get())
     }
 
     /// Returns true when sync production is fenced.
-    #[must_use]
-    pub fn is_fenced(&self) -> bool {
-        self.privacy.fenced.load(Ordering::Acquire)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the record cannot be read.
+    pub fn is_fenced(&self) -> Result<bool> {
+        Ok(self.store.privacy()?.fenced)
     }
 
     // -- publishing ---------------------------------------------------------------------------
@@ -346,15 +278,18 @@ impl SyncClient {
     /// are retained locally unless the person clears them, and excluded from subsequent sync while
     /// private. The device's own copy is untouched either way, so turning privacy mode off does not
     /// have to reconstruct them.
-    #[must_use]
-    pub fn settings_to_publish(&self, settings: &SyncSettings) -> SyncSettings {
-        if self.is_fenced() {
-            SyncSettings {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the privacy record cannot be read.
+    pub fn settings_to_publish(&self, settings: &SyncSettings) -> Result<SyncSettings> {
+        if self.is_fenced()? {
+            Ok(SyncSettings {
                 values: settings.values.clone(),
                 pinned_labels: std::collections::BTreeSet::new(),
-            }
+            })
         } else {
-            settings.clone()
+            Ok(settings.clone())
         }
     }
 
@@ -365,30 +300,27 @@ impl SyncClient {
     /// edited a copy in memory would otherwise put content on the service that this device does not
     /// hold.
     ///
-    /// The object and its note are read together under one hold of the store's lock, so the
-    /// generation this sends against is the one that went with the revision it read. Read
-    /// separately, another writer could advance the object between them, and this one would send an
-    /// older revision against a newer generation and win a comparison it should lose.
+    /// The fence check, the object, its note and the sealing are one step under the store's lock,
+    /// so the generation this work is admitted under is the one that was in force when its
+    /// ciphertext was made, and the comparison it sends is the one that went with the revision it
+    /// read.
+    ///
+    /// An answer this device cannot make sense of leaves the work outstanding rather than throwing
+    /// it away: only an accepted write and a refused comparison say what became of it, and anything
+    /// else is reconciled by [`Self::reconcile`].
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::Unknown`] when this
-    /// device holds no such object, [`SyncError::StaleCheckpoint`] when the note names a generation
-    /// the service no longer holds, and the service's own refusal otherwise.
+    /// device holds no such object, [`SyncError::StaleCheckpoint`] when the service has gone back
+    /// behind the generation the note names, and the service's own refusal otherwise.
     pub async fn publish(&self, object_id: SyncObjectId, now: TimestampMs) -> Result<Published> {
-        if self.is_fenced() {
-            return Err(SyncError::Fenced {
-                generation: self.generation(),
-            });
-        }
-        let staged = self.admit(object_id)?;
-        let work_id = staged.work_id;
+        let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = sync_collection(staged.kind, object_id);
 
         // Written before the call leaves, so a device that stops here still knows this may have
         // reached the service and does not later take it back as undispatched work.
-        self.store.mark_dispatched(work_id, object_id)?;
-        let counted = InFlight::take(&self.privacy);
+        self.store.mark_dispatched(staged.work_id, object_id)?;
         let answer = self
             .service
             .compare_exchange(
@@ -398,144 +330,129 @@ impl SyncClient {
             )
             .await;
 
-        // Whether this device can say what became of the write. A refusal the policy table calls a
-        // stop is a refusal the service decided before writing; anything else leaves the outcome
-        // open, and the staged record stays where reconciliation can see it.
-        let settled = match &answer {
-            Ok(_) => true,
-            Err(error) => {
-                matches!(
-                    crate::retry::entry(error.code()).step,
-                    crate::retry::Step::Stop
-                )
+        let outcome = match answer {
+            Ok(generation) => Outcome::Accepted {
+                generation: U64::new(generation),
+            },
+            Err(error) if error.code() == ErrorCode::DraftConflict => {
+                // The service answered the comparison and refused it, which is the one refusal that
+                // says nothing was written. What it holds instead comes down beside this device's
+                // own content.
+                let (generation, other) = self.fetch_current(&staged, &collection).await?;
+                Outcome::Conflicted {
+                    copy: Box::new(self.copy_of(
+                        object_id,
+                        staged.revision,
+                        Nullable::some(staged.expected_generation),
+                        U64::new(generation),
+                        &other,
+                        now,
+                    )?),
+                    generation: U64::new(generation),
+                }
             }
+            // Anything else leaves the outcome open. The staged record stays where reconciliation
+            // can see it rather than being retired on a guess about whether the write landed.
+            Err(error) => return Err(error.into()),
         };
-        let outcome = self.settle(&staged, answer, now).await;
-        if settled {
-            self.store.discard(work_id)?;
+
+        Ok(match self.store.settle(&staged, &outcome, now)? {
+            Settlement::Published => match outcome {
+                Outcome::Accepted { generation } => Published::Accepted {
+                    generation: generation.get(),
+                },
+                Outcome::Conflicted { copy, generation } => Published::Conflicted {
+                    copy: copy.conflict_id,
+                    other_revision: copy.other.revision,
+                    generation: generation.get(),
+                },
+            },
+            Settlement::Discarded {
+                produced_under,
+                current,
+            } => Published::Discarded {
+                produced_under,
+                current,
+            },
+        })
+    }
+
+    /// Settles the dispatched work this device has no answer for.
+    ///
+    /// A publication whose call was abandoned, whose connection failed, or that a restart found
+    /// staged, may or may not have reached the service. This asks: the object the service holds now
+    /// carries this device's revision, or it does not, and either way the work is finished. It is
+    /// the reconciliation that lets [`Self::outstanding`] reach nought honestly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the service's refusal, and [`SyncError::Storage`] when a record cannot be read or
+    /// written. Work whose outcome is still unknown after this stays outstanding.
+    pub async fn reconcile(&self, now: TimestampMs) -> Result<Reconciled> {
+        let mut settled = 0_u64;
+        let mut unknown = 0_u64;
+        for staged in self.store.staged()?.items {
+            if !staged.dispatched {
+                continue;
+            }
+            let collection = sync_collection(staged.kind, staged.object_id);
+            let Ok((generation, ciphertext)) = self.service.fetch(&collection).await else {
+                unknown = unknown.saturating_add(1);
+                continue;
+            };
+            let Ok(held) = self.open_object(&collection, staged.object_id, &ciphertext) else {
+                unknown = unknown.saturating_add(1);
+                continue;
+            };
+            let outcome = if held.revision == staged.revision {
+                // This device's own write is what the service holds, so it landed.
+                Outcome::Accepted {
+                    generation: U64::new(generation),
+                }
+            } else {
+                // Somebody else's content is there. Whether this device's write landed and was
+                // replaced or never landed at all, what is on the service is not this device's, and
+                // the copy is what the person chooses from.
+                Outcome::Conflicted {
+                    copy: Box::new(self.copy_of(
+                        staged.object_id,
+                        staged.revision,
+                        Nullable::some(staged.expected_generation),
+                        U64::new(generation),
+                        &held,
+                        now,
+                    )?),
+                    generation: U64::new(generation),
+                }
+            };
+            self.store.settle(&staged, &outcome, now)?;
+            settled = settled.saturating_add(1);
         }
-        drop(counted);
-        outcome
+        Ok(Reconciled { settled, unknown })
     }
 
-    /// Stages one object for publication and records it as admitted.
-    ///
-    /// Sealing happens here, so the ciphertext that is compared against a generation is the
-    /// ciphertext that was admitted under this privacy generation.
-    fn admit(&self, object_id: SyncObjectId) -> Result<Staged> {
-        let (object, note) = self.store.object_and_checkpoint(object_id)?;
-        let object = object.ok_or(SyncError::Unknown { object_id })?;
-        let mut plaintext = kr_cbor::to_canonical_vec(&object)?;
-        let sealed = self.sealer.seal(&plaintext);
-        // The canonical encoding is this client's own buffer and it holds the settings in the
-        // clear, so it is cleared here rather than dropped.
-        kr_crypto::zeroise(&mut plaintext);
-        let ciphertext = sealed.map_err(Box::new)?;
-        let staged = Staged {
-            work_id: fresh_uuid().map_err(|error| SyncError::Corrupt {
-                path: self.store.directory().to_path_buf(),
-                reason: error.to_string(),
-            })?,
-            object_id,
-            kind: object.kind(),
-            revision: object.revision,
-            // Nothing there yet is generation nought, which is the comparison a first publication
-            // makes.
-            expected_generation: note.map_or(U64::new(0), |note| note.generation),
-            produced_under: U64::new(self.generation()),
-            dispatched: false,
-            ciphertext,
-        };
-        self.store.stage(&staged)?;
-        Ok(staged)
+    /// Seals one object, clearing the encoding it made on the way.
+    fn seal(&self, object: &SyncObject) -> Result<Vec<u8>> {
+        let plaintext = Zeroising(kr_cbor::to_canonical_vec(object)?);
+        self.sealer
+            .seal(&plaintext.0)
+            .map_err(|error| Box::new(error).into())
     }
 
-    /// Records what the service answered, under the late-result rule.
-    ///
-    /// The generation is read here rather than when the work was admitted, so a host that enabled
-    /// privacy mode while this publication was out is the generation this compares against.
-    async fn settle(
-        &self,
-        staged: &Staged,
-        answer: crate::Result<u64>,
-        now: TimestampMs,
-    ) -> Result<Published> {
-        if !self.accepts_result(staged.produced_under.get()) {
-            return Ok(Published::Discarded {
-                produced_under: staged.produced_under.get(),
-                current: self.generation(),
+    /// Fetches what the service holds now, diagnosing a service that has gone backwards.
+    async fn fetch_current(&self, staged: &Staged, collection: &str) -> Result<(u64, SyncObject)> {
+        let (generation, ciphertext) = self.service.fetch(collection).await?;
+        // A service that answers with a generation below the one this device's note names has gone
+        // back behind it, which is what a reset or a replaced service looks like from here. That is
+        // provable; a fetch this device could not make at all is not, so it is returned as it came.
+        if generation < staged.expected_generation.get() {
+            return Err(SyncError::StaleCheckpoint {
+                object_id: staged.object_id,
+                expected: staged.expected_generation.get(),
             });
         }
-        match answer {
-            Ok(accepted) => {
-                self.store.record_checkpoint(
-                    staged.object_id,
-                    SyncCheckpoint {
-                        generation: U64::new(accepted),
-                        published_revision: Nullable::some(staged.revision),
-                    },
-                )?;
-                self.store.record_publication(&Publication {
-                    object_id: staged.object_id,
-                    kind: staged.kind,
-                    generation: U64::new(accepted),
-                    published_at_ms: now,
-                })?;
-                Ok(Published::Accepted {
-                    generation: accepted,
-                })
-            }
-            Err(error) if error.code() == ErrorCode::DraftConflict => {
-                self.fetch_beside(staged, now).await
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Brings down what the service holds, beside this device's own object.
-    async fn fetch_beside(&self, staged: &Staged, now: TimestampMs) -> Result<Published> {
-        let collection = sync_collection(staged.kind, staged.object_id);
-        let (generation, ciphertext) = match self.service.fetch(&collection).await {
-            Ok(held) => held,
-            Err(error) => {
-                // The comparison was refused and there is nothing there to fetch. That is what a
-                // service that was reset or replaced looks like from here: the note names a
-                // generation nothing holds, and only an explicit step clears it.
-                return Err(if staged.expected_generation.get() > 0 {
-                    SyncError::StaleCheckpoint {
-                        object_id: staged.object_id,
-                        expected: staged.expected_generation.get(),
-                    }
-                } else {
-                    error.into()
-                });
-            }
-        };
-        let other = self.open_object(&collection, staged.object_id, &ciphertext)?;
-
-        let copy = self.keep_beside(
-            staged.object_id,
-            staged.revision,
-            Nullable::some(staged.expected_generation),
-            U64::new(generation),
-            &other,
-            now,
-        )?;
-        // The generation is this device's to remember; the revision beside it is not, because the
-        // revision that fetch carried is the other device's and nothing about this device's own
-        // follows from it.
-        self.store.record_checkpoint(
-            staged.object_id,
-            SyncCheckpoint {
-                generation: U64::new(generation),
-                published_revision: Nullable::null(),
-            },
-        )?;
-        Ok(Published::Conflicted {
-            copy,
-            other_revision: other.revision,
-            generation,
-        })
+        let other = self.open_object(collection, staged.object_id, &ciphertext)?;
+        Ok((generation, other))
     }
 
     /// Fetches one object and keeps what the service holds beside this device's own.
@@ -545,11 +462,15 @@ impl SyncClient {
     /// is what stops a reconnect putting another device's content where a person's own was.
     /// Applying a choice is the caller's own step, through [`SyncStore::put_object`].
     ///
+    /// It is refused while privacy mode is on, because a copy and a note are retained sync content
+    /// and recreating either after the cleanup would undo it.
+    ///
     /// # Errors
     ///
-    /// Returns the service's refusal, [`SyncError::NotThatObject`] when the object that came down
-    /// is not the one this collection was asked for, [`SyncError::DraftElsewhere`] when a draft is
-    /// asked for, and [`SyncError::Storage`] when the copy or the note cannot be written.
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, the service's refusal,
+    /// [`SyncError::NotThatObject`] when the object that came down is not the one this collection
+    /// was asked for, [`SyncError::DraftElsewhere`] when a draft is asked for, and
+    /// [`SyncError::Storage`] when the copy or the note cannot be written.
     pub async fn fetch(
         &self,
         kind: SyncObjectKind,
@@ -564,6 +485,12 @@ impl SyncClient {
         if kind == SyncObjectKind::Draft {
             return Err(SyncError::DraftElsewhere { collection });
         }
+        let privacy = self.store.privacy()?;
+        if privacy.fenced {
+            return Err(SyncError::Fenced {
+                generation: privacy.generation.get(),
+            });
+        }
         let (generation, ciphertext) = self.service.fetch(&collection).await?;
         let other = self.open_object(&collection, object_id, &ciphertext)?;
 
@@ -572,15 +499,19 @@ impl SyncClient {
         // same object, which is a choice rather than a replacement.
         let held = self.store.object(object_id)?;
         let copy = match held {
-            Some(held) if held.revision != other.revision => Some(self.keep_beside(
-                object_id,
-                held.revision,
-                // A fetch compares nothing. It asked what was there and was told.
-                Nullable::null(),
-                U64::new(generation),
-                &other,
-                now,
-            )?),
+            Some(held) if held.revision != other.revision => {
+                let copy = self.copy_of(
+                    object_id,
+                    held.revision,
+                    // A fetch compares nothing. It asked what was there and was told.
+                    Nullable::null(),
+                    U64::new(generation),
+                    &other,
+                    now,
+                )?;
+                self.store.keep_conflict(&copy)?;
+                Some(copy.conflict_id)
+            }
             _ => None,
         };
 
@@ -603,8 +534,8 @@ impl SyncClient {
         })
     }
 
-    /// Keeps one copy of what the service held beside this device's own object.
-    fn keep_beside(
+    /// Builds one copy of what the service held, to keep beside this device's own object.
+    fn copy_of(
         &self,
         object_id: SyncObjectId,
         offered_revision: SyncRevisionId,
@@ -612,8 +543,8 @@ impl SyncClient {
         current_generation: U64,
         other: &SyncObject,
         now: TimestampMs,
-    ) -> Result<SyncConflictId> {
-        let copy = ConflictCopy {
+    ) -> Result<ConflictCopy> {
+        Ok(ConflictCopy {
             conflict_id: SyncConflictId::new(fresh_uuid().map_err(|error| SyncError::Corrupt {
                 path: self.store.directory().to_path_buf(),
                 reason: error.to_string(),
@@ -624,10 +555,7 @@ impl SyncClient {
             current_generation,
             other: other.clone(),
             recorded_at_ms: now,
-        };
-        let conflict_id = copy.conflict_id;
-        self.store.keep_conflict(&copy)?;
-        Ok(conflict_id)
+        })
     }
 
     /// Opens what a collection served and checks that it is the object that was asked for.
@@ -641,15 +569,14 @@ impl SyncClient {
         object_id: SyncObjectId,
         ciphertext: &[u8],
     ) -> Result<SyncObject> {
-        let mut plaintext = self.sealer.open(ciphertext).map_err(Box::new)?;
+        // The opened buffer holds the settings in the clear and it is this client's own, so it is
+        // cleared when it goes out of scope rather than by a statement an early return could skip.
+        let plaintext = Zeroising(self.sealer.open(ciphertext).map_err(Box::new)?);
         // Anything that is not settings or a client's position stops here. There is no body variant
         // for a draft and none for authority, so a collection serving either decodes as nothing
         // this module reads rather than as something it applies.
-        let decoded =
-            kr_cbor::from_canonical_slice::<SyncObject>(&plaintext, &kr_cbor::Limits::DEFAULT);
-        // The opened buffer is this client's own and it holds the settings in the clear.
-        kr_crypto::zeroise(&mut plaintext);
-        let object = decoded?;
+        let object: SyncObject =
+            kr_cbor::from_canonical_slice(&plaintext.0, &kr_cbor::Limits::DEFAULT)?;
         if object.object_id != object_id || collection != sync_collection(object.kind(), object_id)
         {
             return Err(SyncError::NotThatObject {
@@ -665,20 +592,24 @@ impl SyncClient {
 
     /// Stops sync production at `generation`, and says what it was holding.
     ///
-    /// Immediately and prospectively: a publication after this is refused, and one that is already
-    /// out has its result discarded rather than published. Fencing first is what stops a queue
-    /// emptying itself while a cancellation walks it.
+    /// The generation is recorded durably here, before anything else happens, so a restart sees the
+    /// boundary and a late result cannot cross it. Immediately and prospectively: a publication or
+    /// a fetch admitted after this is refused, and one already out has its result discarded rather
+    /// than applied.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when the staged work cannot be counted. The fence is in place
-    /// either way: it is set before anything is read.
+    /// Returns [`SyncError::Storage`] when the generation cannot be recorded, in which case
+    /// production is **not** fenced: a boundary this device cannot record is not one it claims.
     pub fn fence(&self, generation: u64) -> Result<Fenced> {
-        self.privacy.generation.store(generation, Ordering::Release);
-        self.privacy.fenced.store(true, Ordering::Release);
+        self.store.record_privacy(PrivacyRecord {
+            generation: U64::new(generation),
+            fenced: true,
+        })?;
+        let staged = self.store.staged()?;
         Ok(Fenced {
             queues: 1,
-            items: self.store.staged()?.len() as u64,
+            items: staged.items.iter().filter(|item| !item.dispatched).count() as u64,
         })
     }
 
@@ -686,57 +617,61 @@ impl SyncClient {
     ///
     /// Work that has been dispatched cannot be taken back, so it is counted instead: it is what the
     /// late-result rule exists for, and reconciliation is not complete while any of it is
-    /// outstanding. A record this device wrote before the call left says which is which, so a
-    /// restart does not take dispatched work back as if it had never gone.
+    /// outstanding. The record this device wrote before the call left says which is which, and
+    /// reading it and removing it is one step, so a publication dispatching itself alongside this
+    /// cannot have its record taken away.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when a staged file cannot be removed. What was removed before
-    /// the failure stays removed.
+    /// Returns [`SyncError::Storage`] when a staged file cannot be read or removed.
     pub fn cancel_undispatched(&self, generation: u64) -> Result<Cancelled> {
-        self.privacy.generation.store(generation, Ordering::Release);
-        let staged = self.store.staged()?;
-        let mut undispatched = 0_u64;
-        for item in staged.items {
-            if item.dispatched {
-                continue;
-            }
-            self.store.discard(item.work_id)?;
-            undispatched = undispatched.saturating_add(1);
-        }
+        self.store.record_privacy(PrivacyRecord {
+            generation: U64::new(generation),
+            fenced: self.store.privacy()?.fenced,
+        })?;
+        let undispatched = self.store.take_back_undispatched()?;
         Ok(Cancelled {
             undispatched,
-            in_flight: self.outstanding(),
+            in_flight: self.store.unsettled()?,
         })
     }
 
-    /// Removes the staged ciphertext, the conflict copies and the checkpoints.
+    /// Removes the conflict copies and the checkpoints, and the staged work that never left.
     ///
     /// The figures are what was actually removed, counted from the files that were deleted. What
     /// stays is in [`Self::kept`], named rather than left out.
     ///
-    /// Removing a staged record does not settle the work it described. A publication that had
-    /// already been dispatched stays counted in [`Self::outstanding`] until its call returns, and
-    /// its result is refused by the generation rule rather than published.
+    /// Work that has been dispatched is not removed. Its record is what says it may be out there,
+    /// and deleting it would make [`Self::outstanding`] reach nought without anything having been
+    /// reconciled. Its result is refused by the generation rule instead of applied.
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when a file cannot be removed.
     pub fn remove_retained(&self, generation: u64) -> Result<Removed> {
-        self.privacy.generation.store(generation, Ordering::Release);
+        self.store.record_privacy(PrivacyRecord {
+            generation: U64::new(generation),
+            fenced: self.store.privacy()?.fenced,
+        })?;
         let (bytes, records) = self.store.remove_content()?;
         Ok(Removed { bytes, records })
     }
 
-    /// Returns how much in-flight work is still being reconciled.
+    /// Returns how much dispatched work has no settled outcome.
     ///
-    /// Reconciliation is this answer reaching nought. A publication counts from the moment it is
-    /// dispatched until its call returns, and a call that was abandoned at an await counts until
-    /// its future is dropped, so a cleanup cannot report complete while one is still out. Work this
-    /// device dispatched before a restart is counted from the store when the client is built.
-    #[must_use]
-    pub fn outstanding(&self) -> u64 {
-        self.privacy.in_flight.load(Ordering::Acquire)
+    /// Reconciliation is this answer reaching nought, and [`Self::reconcile`] is what makes it.
+    /// A publication counts from the moment its record says it was sent until an outcome is
+    /// settled, so an abandoned call, a failed connection and a restart all leave it counted: none
+    /// of them establishes that nothing left this device. A staged record this build cannot read
+    /// counts too, because a record it could not open is not a record it can say was nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the staged records cannot be read. A host that must
+    /// answer with a number reports one rather than nought: a store it cannot read is not a store
+    /// it can say has nothing outstanding.
+    pub fn outstanding(&self) -> Result<u64> {
+        self.store.unsettled()
     }
 
     /// Returns what this client keeps, explicitly, whatever privacy mode is doing.
@@ -757,11 +692,26 @@ impl SyncClient {
                       synchronised while privacy mode is on",
             });
         }
-        if !self.store.publications()?.is_empty() {
+        let publications = self.store.publications()?;
+        if !publications.is_empty() {
             kept.push(KeptExplicitly {
                 what: "the record of what this device published",
                 why: "it carries no content, and it is the only account of what has already left; \
                       deleting it would hide what privacy mode cannot undo",
+            });
+        }
+        if !publications.unreadable.is_empty() {
+            kept.push(KeptExplicitly {
+                what: "a record of a publication this build cannot read",
+                why: "it is kept rather than deleted, and what left under it cannot be listed, so \
+                      the account of what has left is incomplete",
+            });
+        }
+        if !self.store.staged()?.unreadable.is_empty() {
+            kept.push(KeptExplicitly {
+                what: "a record of admitted work this build cannot read",
+                why: "it is kept rather than deleted, and it counts as outstanding, because a \
+                      record that cannot be opened is not one that can be called nothing",
             });
         }
         Ok(kept)
@@ -769,13 +719,15 @@ impl SyncClient {
 
     /// Returns what had already left this device, which privacy mode does not erase.
     ///
+    /// A publication record this build cannot read is named as well, because an account of what
+    /// left that quietly dropped an entry would be worse than one that says it is incomplete.
+    ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the publication records cannot be read.
     pub fn exported(&self) -> Result<Vec<Exported>> {
-        Ok(self
-            .store
-            .publications()?
+        let publications = self.store.publications()?;
+        let mut exported: Vec<Exported> = publications
             .items
             .into_iter()
             .map(|record| Exported {
@@ -788,17 +740,33 @@ impl SyncClient {
                 left_at_ms: record.published_at_ms,
                 deletable: false,
             })
-            .collect())
+            .collect();
+        for path in publications.unreadable {
+            exported.push(Exported {
+                kind: "a publication this device cannot describe".to_owned(),
+                reference: format!(
+                    "a record this build cannot read, kept at {}",
+                    path.display()
+                ),
+                left_at_ms: TimestampMs::new(0),
+                deletable: false,
+            });
+        }
+        Ok(exported)
     }
 
-    /// Returns whether a result produced under `produced_under` may be published.
+    /// Returns whether a result produced under `produced_under` may be applied.
     ///
-    /// It is the whole rule. A result is published only when the generation it was produced under
-    /// is exactly the one in force: an older one belongs to work privacy mode cancelled, and a
-    /// newer one belongs to no generation this host has opened.
-    #[must_use]
-    pub fn accepts_result(&self, produced_under: u64) -> bool {
-        produced_under == self.generation()
+    /// It is the whole rule, and [`SyncStore::settle`] applies it under the store's lock so that a
+    /// fence cannot land between the answer and what follows from it. A result is applied only when
+    /// the generation it was produced under is exactly the one in force: an older one belongs to
+    /// work privacy mode cancelled, and a newer one belongs to no generation this host has opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the privacy record cannot be read.
+    pub fn accepts_result(&self, produced_under: u64) -> Result<bool> {
+        Ok(self.generation()? == produced_under)
     }
 
     /// Lets production start again, under a generation of its own.
@@ -807,10 +775,39 @@ impl SyncClient {
     /// where it was would make every result admitted during the private interval acceptable the
     /// moment privacy mode ended. It reconstructs nothing that was omitted while privacy mode was
     /// on, and the pinned labels it excluded from publication are still on this device.
-    pub fn resume(&self, generation: u64) -> Resumed {
-        self.privacy.generation.store(generation, Ordering::Release);
-        self.privacy.fenced.store(false, Ordering::Release);
-        Resumed { generation }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the generation cannot be recorded, in which case
+    /// production stays fenced.
+    pub fn resume(&self, generation: u64) -> Result<Resumed> {
+        self.store.record_privacy(PrivacyRecord {
+            generation: U64::new(generation),
+            fenced: false,
+        })?;
+        Ok(Resumed { generation })
+    }
+}
+
+/// What reconciling the dispatched work did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// How many publications were settled, one way or the other.
+    pub settled: u64,
+    /// How many are still outstanding, because this device still cannot say what became of them.
+    pub unknown: u64,
+}
+
+/// A buffer of plaintext this client owns, cleared when it goes out of scope.
+///
+/// A statement that clears a buffer is skipped by an early return and by an unwinding panic. This
+/// is not: dropping it clears it, on every path out.
+#[derive(Debug)]
+struct Zeroising(Vec<u8>);
+
+impl Drop for Zeroising {
+    fn drop(&mut self) {
+        kr_crypto::zeroise(&mut self.0);
     }
 }
 

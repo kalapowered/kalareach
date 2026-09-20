@@ -50,6 +50,8 @@ const PARTIAL_EXTENSION: &str = "partial";
 const LOCK_NAME: &str = "store.lock";
 /// The name the pinned labels are kept under.
 const LABELS_NAME: &str = "pinned.labels";
+/// The name this device's privacy state is kept under.
+const PRIVACY_NAME: &str = "privacy.state";
 
 /// What this device's own notes on a copy may add to the object inside it.
 ///
@@ -155,6 +157,58 @@ pub struct Publication {
     pub generation: U64,
     /// When this device last published it.
     pub published_at_ms: TimestampMs,
+}
+
+/// The privacy state this device records, durably.
+///
+/// Durably, because section 24 records the generation before any subsystem is touched: a boundary
+/// a restart could not see would be a boundary a late result could cross. It lives in the store
+/// rather than in memory for a second reason: every transition that has to be atomic against the
+/// fence, admitting work, cancelling it and settling it, already takes the store's lock, so one
+/// lock decides all of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyRecord {
+    /// The host's privacy generation in force.
+    pub generation: U64,
+    /// Whether sync production is fenced.
+    pub fenced: bool,
+}
+
+/// What the service said about one publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// It accepted the write, at this generation. The content has left this device.
+    Accepted {
+        /// The generation the service assigned.
+        generation: U64,
+    },
+    /// It refused the comparison. Nothing left this device, and this is what it held instead.
+    Conflicted {
+        /// The copy to keep beside this device's own content.
+        copy: Box<ConflictCopy>,
+        /// The generation the service holds.
+        generation: U64,
+    },
+}
+
+/// What settling one publication did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Settlement {
+    /// The result was applied under the generation in force.
+    Published,
+    /// The result belonged to an earlier generation, so nothing was applied.
+    ///
+    /// An accepted write is still recorded as a publication, because it left this device and
+    /// section 24 shows what left rather than pretending it did not. Nothing else is written: no
+    /// checkpoint moves and no copy is kept, because both are retained content the cleanup that
+    /// opened this generation has already removed.
+    Discarded {
+        /// The generation the work was produced under.
+        produced_under: u64,
+        /// The generation in force now.
+        current: u64,
+    },
 }
 
 /// A label the person pinned.
@@ -478,19 +532,28 @@ impl SyncStore {
         object_id: SyncObjectId,
         checkpoint: SyncCheckpoint,
     ) -> Result<bool> {
-        let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
         let guard = self.lock()?;
-        let outcome = (|| {
-            if let Some(held) = self.read_checkpoint(object_id)?
-                && held.generation.get() > checkpoint.generation.get()
-            {
-                return Ok(false);
-            }
-            self.write_bytes(&self.path(object_id, CHECKPOINT_EXTENSION), &bytes)?;
-            Ok(true)
-        })();
+        let outcome = self.write_checkpoint(object_id, checkpoint);
         drop(guard);
         outcome
+    }
+
+    /// Writes a checkpoint unless a later one already stands.
+    ///
+    /// The caller holds the lock.
+    fn write_checkpoint(
+        &self,
+        object_id: SyncObjectId,
+        checkpoint: SyncCheckpoint,
+    ) -> Result<bool> {
+        let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
+        if let Some(held) = self.read_checkpoint(object_id)?
+            && held.generation.get() > checkpoint.generation.get()
+        {
+            return Ok(false);
+        }
+        self.write_bytes(&self.path(object_id, CHECKPOINT_EXTENSION), &bytes)?;
+        Ok(true)
     }
 
     /// Forgets where an object reached on the service.
@@ -513,20 +576,86 @@ impl SyncStore {
 
     // -- staged ciphertext --------------------------------------------------------------------
 
-    /// Writes ciphertext admitted for publication.
+    /// Reads this device's privacy state.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when it cannot be written.
-    pub fn stage(&self, staged: &Staged) -> Result<()> {
-        let bytes = kr_cbor::to_canonical_vec(staged)?;
+    /// Returns [`SyncError::Storage`] or [`SyncError::Corrupt`].
+    pub fn privacy(&self) -> Result<PrivacyRecord> {
         let guard = self.lock()?;
-        let outcome = self.write_bytes(&self.named(staged.work_id, STAGED_EXTENSION), &bytes);
+        let outcome = self.read_privacy();
         drop(guard);
         outcome
     }
 
-    /// Returns every piece of staged ciphertext, oldest identifier first.
+    /// Records the privacy generation and whether production is fenced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when it cannot be written. A generation this device cannot
+    /// record is not one it claims to be in: the caller is told rather than left believing a
+    /// boundary exists.
+    pub fn record_privacy(&self, record: PrivacyRecord) -> Result<()> {
+        let bytes = kr_cbor::to_canonical_vec(&record)?;
+        let guard = self.lock()?;
+        let outcome = self.write_bytes(&self.directory.join(PRIVACY_NAME), &bytes);
+        drop(guard);
+        outcome
+    }
+
+    /// Admits one object for publication, under one hold of the lock.
+    ///
+    /// The fence check, the object and its note, the sealing and the staged record are one step.
+    /// Split apart, a fence could land between the check and the record, and the work would be
+    /// admitted under a generation privacy mode had already closed.
+    ///
+    /// `seal` is given the object to encrypt. It runs inside the hold, which is what makes the
+    /// generation the record names the generation that was in force when the ciphertext was made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::Unknown`] when no such
+    /// object is stored, whatever `seal` failed with, and [`SyncError::Storage`] when the record
+    /// cannot be written.
+    pub fn admit(
+        &self,
+        object_id: SyncObjectId,
+        seal: impl FnOnce(&SyncObject) -> Result<Vec<u8>>,
+    ) -> Result<Staged> {
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let privacy = self.read_privacy()?;
+            if privacy.fenced {
+                return Err(SyncError::Fenced {
+                    generation: privacy.generation.get(),
+                });
+            }
+            let object = self
+                .read_object(object_id)?
+                .ok_or(SyncError::Unknown { object_id })?;
+            let note = self.read_checkpoint(object_id)?;
+            let ciphertext = seal(&object)?;
+            let staged = Staged {
+                work_id: self.fresh_id()?,
+                object_id,
+                kind: object.kind(),
+                revision: object.revision,
+                // Nothing there yet is generation nought, which is the comparison a first
+                // publication makes.
+                expected_generation: note.map_or(U64::new(0), |note| note.generation),
+                produced_under: privacy.generation,
+                dispatched: false,
+                ciphertext,
+            };
+            let bytes = kr_cbor::to_canonical_vec(&staged)?;
+            self.write_bytes(&self.named(staged.work_id, STAGED_EXTENSION), &bytes)?;
+            Ok(staged)
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Returns every piece of staged work, oldest identifier first.
     ///
     /// # Errors
     ///
@@ -562,7 +691,118 @@ impl SyncStore {
         outcome
     }
 
-    /// Removes one piece of staged ciphertext, and makes its absence durable.
+    /// Takes back every piece of work that was admitted and never sent.
+    ///
+    /// Reading which records are undispatched and deleting them is one step, so a publication that
+    /// marks itself dispatched cannot have its record taken away as though it had never gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a record cannot be read or removed.
+    pub fn take_back_undispatched(&self) -> Result<u64> {
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let mut taken = 0_u64;
+            for item in self.read_all::<Staged>(STAGED_EXTENSION)?.items {
+                if item.dispatched {
+                    continue;
+                }
+                self.remove_file(&self.named(item.work_id, STAGED_EXTENSION))?;
+                taken = taken.saturating_add(1);
+            }
+            Ok(taken)
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Returns how much dispatched work has no settled outcome.
+    ///
+    /// A record this build cannot read counts too. A store cannot say that nothing is outstanding
+    /// on the strength of a record it could not open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the directory cannot be read.
+    pub fn unsettled(&self) -> Result<u64> {
+        let staged = self.staged()?;
+        let dispatched = staged.items.iter().filter(|item| item.dispatched).count() as u64;
+        Ok(dispatched.saturating_add(staged.unreadable.len() as u64))
+    }
+
+    /// Applies what the service answered, under the late-result rule, in one step.
+    ///
+    /// The generation is read and the effects are written under one hold, so a fence cannot land
+    /// between deciding that a result may be published and publishing it.
+    ///
+    /// The staged record is retired here and only here, and only once its effects are durable. A
+    /// caller whose settlement failed still has the record, so the work stays outstanding and can
+    /// be reconciled rather than forgotten.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a record cannot be written or removed.
+    pub fn settle(
+        &self,
+        staged: &Staged,
+        outcome: &Outcome,
+        now: TimestampMs,
+    ) -> Result<Settlement> {
+        let guard = self.lock()?;
+        let settled = (|| {
+            let privacy = self.read_privacy()?;
+            let in_force = privacy.generation.get() == staged.produced_under.get();
+
+            if let Outcome::Accepted { generation } = outcome {
+                // It left this device. That is a fact whatever generation is in force, and section
+                // 24 shows what left rather than claiming it did not happen.
+                self.write_publication(&Publication {
+                    object_id: staged.object_id,
+                    kind: staged.kind,
+                    generation: *generation,
+                    published_at_ms: now,
+                })?;
+            }
+
+            if !in_force {
+                self.remove_file(&self.named(staged.work_id, STAGED_EXTENSION))?;
+                return Ok(Settlement::Discarded {
+                    produced_under: staged.produced_under.get(),
+                    current: privacy.generation.get(),
+                });
+            }
+
+            match outcome {
+                Outcome::Accepted { generation } => {
+                    self.write_checkpoint(
+                        staged.object_id,
+                        SyncCheckpoint {
+                            generation: *generation,
+                            published_revision: Nullable::some(staged.revision),
+                        },
+                    )?;
+                }
+                Outcome::Conflicted { copy, generation } => {
+                    self.write_conflict(copy)?;
+                    // The generation is this device's to remember; the revision beside it is not,
+                    // because the revision that came down is the other device's.
+                    self.write_checkpoint(
+                        staged.object_id,
+                        SyncCheckpoint {
+                            generation: *generation,
+                            published_revision: Nullable::null(),
+                        },
+                    )?;
+                }
+            }
+            self.remove_file(&self.named(staged.work_id, STAGED_EXTENSION))?;
+            Ok(Settlement::Published)
+        })();
+        drop(guard);
+        settled
+    }
+
+    /// Removes one piece of staged work, and makes its absence durable.
     ///
     /// # Errors
     ///
@@ -586,37 +826,42 @@ impl SyncStore {
     ///
     /// Returns [`SyncError::TooLarge`] or [`SyncError::Storage`].
     pub fn keep_conflict(&self, copy: &ConflictCopy) -> Result<()> {
-        let bytes = kr_cbor::to_canonical_vec(copy)?;
+        let guard = self.lock()?;
+        let outcome = self.write_conflict(copy);
+        drop(guard);
+        outcome
+    }
+
+    /// Writes one copy and prunes the object's oldest, keeping the one just written.
+    ///
+    /// The caller holds the lock.
+    fn write_conflict(&self, copy: &ConflictCopy) -> Result<()> {
         // A copy is held to the storage bound rather than to the publishable bound. Content the
         // service was already carrying is content this device keeps: refusing it because this
         // device's own note around it costs a few hundred bytes would lose the very thing the
         // person is meant to choose from. A copy that arrived at the service's limit may therefore
         // be a few bytes too large to publish again from here.
-        if bytes.len() as u64 > MAX_CONFLICT_COPY_BYTES {
-            return Err(SyncError::TooLarge {
-                len: bytes.len(),
-                limit: MAX_CONFLICT_COPY_BYTES as usize,
-            });
+        let bytes = encode_within_limit(copy, MAX_CONFLICT_COPY_BYTES)?;
+        // The new copy is written first. Dropping an old one before the replacement is durable
+        // would lose a choice the person had and keep nothing in its place.
+        self.write_bytes(
+            &self.named(copy.conflict_id.get(), CONFLICT_EXTENSION),
+            &bytes,
+        )?;
+        let mut held = self.read_all::<ConflictCopy>(CONFLICT_EXTENSION)?.items;
+        // The copy just admitted is never the one pruned. Ordering is by a timestamp the caller
+        // supplied, and a clock that stepped back, or two answers that finished out of order,
+        // would otherwise make the newest refusal delete itself and leave a caller holding an
+        // identity nothing is stored under.
+        held.retain(|kept| {
+            kept.object_id == copy.object_id && kept.conflict_id != copy.conflict_id
+        });
+        held.sort_by_key(|kept| (kept.recorded_at_ms.get(), kept.conflict_id.get()));
+        while held.len() as u64 >= MAX_SYNC_CONFLICT_COPIES {
+            let oldest = held.remove(0);
+            self.remove_file(&self.named(oldest.conflict_id.get(), CONFLICT_EXTENSION))?;
         }
-        let guard = self.lock()?;
-        let outcome = (|| {
-            // The new copy is written first. Dropping an old one before the replacement is durable
-            // would lose a choice the person had and keep nothing in its place.
-            self.write_bytes(
-                &self.named(copy.conflict_id.get(), CONFLICT_EXTENSION),
-                &bytes,
-            )?;
-            let mut held = self.read_all::<ConflictCopy>(CONFLICT_EXTENSION)?.items;
-            held.retain(|kept| kept.object_id == copy.object_id);
-            held.sort_by_key(|kept| kept.recorded_at_ms.get());
-            while held.len() as u64 > MAX_SYNC_CONFLICT_COPIES {
-                let oldest = held.remove(0);
-                self.remove_file(&self.named(oldest.conflict_id.get(), CONFLICT_EXTENSION))?;
-            }
-            Ok(())
-        })();
-        drop(guard);
-        outcome
+        Ok(())
     }
 
     /// Returns every copy kept for one object, oldest first.
@@ -664,23 +909,28 @@ impl SyncStore {
     ///
     /// Returns [`SyncError::Storage`] when the record cannot be written.
     pub fn record_publication(&self, publication: &Publication) -> Result<bool> {
-        let bytes = kr_cbor::to_canonical_vec(publication)?;
-        let path = self.path(publication.object_id, PUBLICATION_EXTENSION);
         let guard = self.lock()?;
-        let outcome = (|| {
-            // A record already naming a later generation stands, for the reason a checkpoint does:
-            // two answers can arrive out of order, and writing the older one would say this device
-            // published less recently than it did.
-            if let Some(held) = self.read_optional::<Publication>(&path)?
-                && held.generation.get() > publication.generation.get()
-            {
-                return Ok(false);
-            }
-            self.write_bytes(&path, &bytes)?;
-            Ok(true)
-        })();
+        let outcome = self.write_publication(publication);
         drop(guard);
         outcome
+    }
+
+    /// Writes a publication record unless a later one already stands.
+    ///
+    /// The caller holds the lock.
+    fn write_publication(&self, publication: &Publication) -> Result<bool> {
+        let bytes = kr_cbor::to_canonical_vec(publication)?;
+        let path = self.path(publication.object_id, PUBLICATION_EXTENSION);
+        // A record already naming a later generation stands, for the reason a checkpoint does: two
+        // answers can arrive out of order, and writing the older one would say this device
+        // published less recently than it did.
+        if let Some(held) = self.read_optional::<Publication>(&path)?
+            && held.generation.get() > publication.generation.get()
+        {
+            return Ok(false);
+        }
+        self.write_bytes(&path, &bytes)?;
+        Ok(true)
     }
 
     /// Returns what this device has published, oldest first.
@@ -805,6 +1055,23 @@ impl SyncStore {
         Lock::take(&self.directory.join(LOCK_NAME))
     }
 
+    /// Reads the privacy state, or the state of a device that has never enabled privacy mode.
+    ///
+    /// The caller holds the lock.
+    fn read_privacy(&self) -> Result<PrivacyRecord> {
+        Ok(self
+            .read_optional(&self.directory.join(PRIVACY_NAME))?
+            .unwrap_or_default())
+    }
+
+    /// Returns a fresh identity for a record this store is about to write.
+    fn fresh_id(&self) -> Result<Uuid> {
+        kr_transport::random::fresh_uuid_v4().map_err(|error| SyncError::Corrupt {
+            path: self.directory.clone(),
+            reason: error.to_string(),
+        })
+    }
+
     fn path(&self, object_id: SyncObjectId, extension: &str) -> PathBuf {
         self.named(object_id.get(), extension)
     }
@@ -905,7 +1172,7 @@ impl SyncStore {
     }
 
     fn write_labels(&self, labels: &[PinnedLabel]) -> Result<()> {
-        let bytes = kr_cbor::to_canonical_vec(&labels.to_vec())?;
+        let bytes = encode_within_limit(&labels.to_vec(), MAX_CONFLICT_COPY_BYTES)?;
         self.write_bytes(&self.directory.join(LABELS_NAME), &bytes)
     }
 
@@ -980,11 +1247,27 @@ impl Lock {
 /// which is a size no synchronised object may be, so accepting it locally would mean accepting one
 /// that could never be published.
 fn encode_within(object: &SyncObject) -> Result<Vec<u8>> {
-    let bytes = kr_cbor::to_canonical_vec(object)?;
+    // The reader's own limits, not only a byte count. A value this store accepted and its own
+    // decoder then refused would be a value a person could write and never read back, and the byte
+    // bound does not catch it: four thousand short labels are small and are past the decoder's
+    // bound on how many members one collection may have.
+    let bytes = kr_cbor::to_canonical_vec_within(object, &kr_cbor::Limits::DEFAULT)?;
     if mailbox_size_bucket(bytes.len() as u64) > super::MAX_OBJECT_BYTES {
         return Err(SyncError::TooLarge {
             len: bytes.len(),
             limit: largest_publishable_object() as usize,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Encodes one record and holds it to a byte bound, under the reader's own structural limits.
+fn encode_within_limit<T: Serialize>(value: &T, limit: u64) -> Result<Vec<u8>> {
+    let bytes = kr_cbor::to_canonical_vec_within(value, &kr_cbor::Limits::DEFAULT)?;
+    if bytes.len() as u64 > limit {
+        return Err(SyncError::TooLarge {
+            len: bytes.len(),
+            limit: limit as usize,
         });
     }
     Ok(bytes)

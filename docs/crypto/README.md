@@ -184,7 +184,9 @@ rules first, opens, and removes the padding.
 
 The additional authenticated data is the format domain and nothing else, so a ciphertext produced
 for one purpose cannot be opened as another. What identifies an object, its own identity and its
-revision, is inside the sealed plaintext, and the reader checks it there against what it asked for.
+kind, is inside the sealed plaintext, and the reader checks both there against the collection it
+asked for. The revision travels with it so a reader can see whether the two devices hold the same
+content.
 Binding the requested collection into the additional data would be sound as well; it is left out
 because the check inside the plaintext is the one a reader has to make either way.
 

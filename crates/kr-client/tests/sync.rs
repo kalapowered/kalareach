@@ -14,15 +14,15 @@ use kr_client::drafts::{
 };
 use kr_client::services::{ServiceFuture, SyncBackupService};
 use kr_client::sync::{
-    ClientSelection, Published, Restored, SettingValue, StorageFeature, SyncBody, SyncClient,
-    SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision,
+    ClientSelection, ConflictCopy, Published, Restored, SettingValue, StorageFeature, SyncBody,
+    SyncClient, SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision,
     sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
-    AgentBindingRevision, ApplicationInstanceId, DeviceId, SessionId, SyncObjectId,
+    AgentBindingRevision, ApplicationInstanceId, DeviceId, SessionId, SyncConflictId, SyncObjectId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
@@ -213,6 +213,21 @@ fn object(object_id: SyncObjectId, device_byte: u8, body: SyncBody, at_ms: u64) 
     }
 }
 
+/// One conflict copy of `other`, recorded at `at_ms`.
+fn conflict(object_id: SyncObjectId, other: &SyncObject, at_ms: u64) -> ConflictCopy {
+    ConflictCopy {
+        conflict_id: SyncConflictId::new(
+            kr_transport::random::fresh_uuid_v4().expect("an identity"),
+        ),
+        object_id,
+        offered_revision: fresh_revision().expect("a revision"),
+        expected_generation: Nullable::null(),
+        current_generation: U64::new(1),
+        other: other.clone(),
+        recorded_at_ms: TimestampMs::new(at_ms),
+    }
+}
+
 /// One device: its own store and its own client over the shared service.
 fn device_client(
     directory: &std::path::Path,
@@ -224,8 +239,7 @@ fn device_client(
         Arc::clone(service) as Arc<dyn SyncBackupService>,
         Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
         store,
-    )
-    .expect("a client");
+    );
     (client, fresh_object_id().expect("an identity"))
 }
 
@@ -298,8 +312,7 @@ async fn a_write_that_loses_the_comparison_keeps_the_other_copy_beside_it_rather
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
         Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
         SyncStore::open(directory.path().join("two")).expect("a store"),
-    )
-    .expect("a client");
+    );
 
     // The first device publishes. The second holds its own edit and has never seen the object, so
     // it compares against nothing and loses.
@@ -386,8 +399,7 @@ async fn copies_are_bounded_and_the_newest_refusal_is_the_one_that_is_kept() {
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
         Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
         SyncStore::open(directory.path().join("two")).expect("a store"),
-    )
-    .expect("a client");
+    );
 
     let mut theirs = object(
         object_id,
@@ -438,8 +450,7 @@ async fn a_fetch_keeps_what_the_service_holds_beside_this_devices_own_content() 
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
         Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
         SyncStore::open(directory.path().join("two")).expect("a store"),
-    )
-    .expect("a client");
+    );
 
     let theirs = object(
         object_id,
@@ -524,6 +535,52 @@ async fn an_object_that_is_not_the_one_the_collection_was_asked_for_is_refused()
             .await,
         Err(SyncError::NotThatObject { .. })
     ));
+}
+
+#[tokio::test]
+async fn a_copy_that_arrives_out_of_order_is_kept_rather_than_pruning_itself() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let store = SyncStore::open(directory.path().join("one")).expect("a store");
+    let object_id = fresh_object_id().expect("an identity");
+    let other = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+
+    // Eight copies, all at one instant, which is what two answers finishing out of order or a
+    // clock that stepped back produce.
+    let mut kept = Vec::new();
+    for _ in 0..MAX_SYNC_CONFLICT_COPIES {
+        let copy = conflict(object_id, &other, NOW);
+        kept.push(copy.conflict_id);
+        store.keep_conflict(&copy).expect("kept");
+    }
+    assert_eq!(
+        store.conflicts(object_id).expect("copies").len() as u64,
+        MAX_SYNC_CONFLICT_COPIES
+    );
+
+    // A ninth at an *earlier* instant. It is the one just admitted, so it is never the one pruned:
+    // a caller holding its identity must find it stored.
+    let newest = conflict(object_id, &other, NOW - 1);
+    store.keep_conflict(&newest).expect("kept");
+    let copies = store.conflicts(object_id).expect("copies");
+    assert_eq!(copies.len() as u64, MAX_SYNC_CONFLICT_COPIES);
+    assert!(
+        copies
+            .items
+            .iter()
+            .any(|copy| copy.conflict_id == newest.conflict_id),
+        "the copy just admitted is never the one pruned"
+    );
+    assert!(
+        store
+            .resolve_conflict(newest.conflict_id)
+            .expect("resolved")
+            .is_some()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -646,8 +703,7 @@ async fn a_draft_is_synchronised_as_a_draft_and_never_as_an_execution_request() 
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
         sealer,
         store,
-    )
-    .expect("a client");
+    );
     assert!(matches!(
         client
             .fetch(SyncObjectKind::Draft, object_id, TimestampMs::new(NOW))
@@ -699,16 +755,18 @@ async fn a_service_that_was_reset_leaves_a_checkpoint_only_an_explicit_step_clea
         .await
         .expect("published");
 
-    // The service is reset or replaced. The note names a generation nothing holds, the publication
-    // is refused, and there is nothing to fetch.
+    // The service is reset or replaced. The note names a generation nothing holds, the comparison
+    // is refused, and the fetch that would have brought the other content down finds nothing. This
+    // device cannot tell an absent object from a service it could not reach, so the refusal is the
+    // service's own rather than a diagnosis it has not earned.
     service.reset().await;
     let refused = client
         .publish(object_id, TimestampMs::new(NOW + 1))
         .await
         .expect_err("the comparison is lost and the fetch finds nothing");
     assert!(
-        matches!(refused, SyncError::StaleCheckpoint { expected: 1, .. }),
-        "the refusal names what is wrong and what to do: {refused}"
+        matches!(refused, SyncError::Client(_)),
+        "an unreachable object is reported as it came: {refused}"
     );
     assert!(
         client
@@ -731,6 +789,74 @@ async fn a_service_that_was_reset_leaves_a_checkpoint_only_an_explicit_step_clea
             .expect("published"),
         Published::Accepted { generation: 1 }
     );
+}
+
+#[tokio::test]
+async fn a_service_that_has_gone_back_behind_the_note_says_so() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect("published");
+
+    // The service is replaced and another device writes once, so it answers at a generation below
+    // the one this device's note names. That is provable rather than guessed, and it is the case
+    // the explicit recovery exists for.
+    service.reset().await;
+    let elsewhere = SyncClient::new(
+        Arc::clone(&service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        SyncStore::open(directory.path().join("two")).expect("a store"),
+    );
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+    elsewhere.store().put_object(&theirs).expect("stored");
+    elsewhere
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    let refused = client
+        .publish(object_id, TimestampMs::new(NOW + 2))
+        .await
+        .expect_err("the note names a generation the service is behind");
+    assert!(
+        matches!(refused, SyncError::StaleCheckpoint { expected: 2, .. }),
+        "the refusal names what is wrong and what to do: {refused}"
+    );
+
+    client
+        .store()
+        .forget_checkpoint(object_id)
+        .expect("forgotten");
+    assert!(matches!(
+        client
+            .publish(object_id, TimestampMs::new(NOW + 3))
+            .await
+            .expect("answered"),
+        Published::Conflicted { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +923,7 @@ fn the_feature_names_its_three_parts_and_which_of_them_is_optional() {
     );
     assert!(!StorageFeature::SettingsSync.is_optional());
     assert!(StorageFeature::HistoryBackups.is_optional());
-    assert!(!StorageFeature::RecoveryMaterial.is_optional());
+    assert!(StorageFeature::RecoveryMaterial.is_optional());
     for part in StorageFeature::ALL {
         assert!(!part.alternative().is_empty());
     }
@@ -816,8 +942,7 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
         Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
         SyncStore::open(directory.path().join("two")).expect("a store"),
-    )
-    .expect("a client");
+    );
 
     // Give the second device something of each kind to clean up: a checkpoint, a conflict copy and
     // a publication record.
@@ -848,8 +973,8 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
 
     let fenced = two.fence(7).expect("fenced");
     assert_eq!(fenced.queues, 1);
-    assert!(two.is_fenced());
-    assert_eq!(two.generation(), 7);
+    assert!(two.is_fenced().expect("a record"));
+    assert_eq!(two.generation().expect("a record"), 7);
     assert!(matches!(
         two.publish(object_id, TimestampMs::new(NOW + 1)).await,
         Err(SyncError::Fenced { generation: 7 })
@@ -883,12 +1008,12 @@ async fn pinned_labels_stay_on_the_device_and_are_left_out_of_what_is_published_
     let mine = settings(&[("theme", "dark")], &["one", "two"]);
 
     // Not private: the labels travel with the settings.
-    let publishable = client.settings_to_publish(&mine);
+    let publishable = client.settings_to_publish(&mine).expect("a filter");
     assert_eq!(publishable.pinned_labels.len(), 2);
 
     // Private: they are left out of what is published, and the device still holds them.
     client.fence(3).expect("fenced");
-    let publishable = client.settings_to_publish(&mine);
+    let publishable = client.settings_to_publish(&mine).expect("a filter");
     assert!(publishable.pinned_labels.is_empty());
     assert_eq!(publishable.values, mine.values);
     assert_eq!(mine.pinned_labels.len(), 2);
@@ -910,11 +1035,11 @@ async fn pinned_labels_stay_on_the_device_and_are_left_out_of_what_is_published_
     assert!(client.store().pinned_labels().expect("labels").is_empty());
 
     // Turning privacy mode off starts a generation of its own and reconstructs nothing.
-    let resumed = client.resume(4);
+    let resumed = client.resume(4).expect("resumed");
     assert_eq!(resumed.generation, 4);
-    assert!(!client.is_fenced());
-    assert!(!client.accepts_result(3));
-    assert!(client.accepts_result(4));
+    assert!(!client.is_fenced().expect("a record"));
+    assert!(!client.accepts_result(3).expect("a record"));
+    assert!(client.accepts_result(4).expect("a record"));
 }
 
 #[tokio::test]
@@ -922,14 +1047,11 @@ async fn a_result_produced_under_an_earlier_generation_is_not_published() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(GatedService::new());
     let store = SyncStore::open(directory.path().join("one")).expect("a store");
-    let client = Arc::new(
-        SyncClient::new(
-            Arc::clone(&service) as Arc<dyn SyncBackupService>,
-            Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
-            store,
-        )
-        .expect("a client"),
-    );
+    let client = Arc::new(SyncClient::new(
+        Arc::clone(&service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        store,
+    ));
     let object_id = fresh_object_id().expect("an identity");
     let mine = object(
         object_id,
@@ -945,7 +1067,11 @@ async fn a_result_produced_under_an_earlier_generation_is_not_published() {
         async move { client.publish(object_id, TimestampMs::new(NOW)).await }
     });
     service.wait_for_a_publication().await;
-    assert_eq!(client.outstanding(), 1, "it is dispatched and unsettled");
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        1,
+        "it is dispatched and unsettled"
+    );
 
     // Privacy mode is enabled while it is in flight, which is the case section 24 names.
     client.fence(5).expect("fenced");
@@ -975,25 +1101,33 @@ async fn a_result_produced_under_an_earlier_generation_is_not_published() {
             .store()
             .checkpoint(object_id)
             .expect("a note")
-            .is_none()
+            .is_none(),
+        "no checkpoint moves for a result privacy mode refused"
     );
-    assert!(client.store().publications().expect("records").is_empty());
-    assert_eq!(client.outstanding(), 0, "it has now been reconciled");
+
+    // The upload itself happened, and this device says so. Suppressing the result does not undo
+    // what left, and section 24 shows what left rather than pretending it did not.
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].reference.contains("generation 1"));
+    assert!(!exported[0].deletable);
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        0,
+        "it has now been reconciled"
+    );
 }
 
 #[tokio::test]
-async fn a_publication_whose_caller_walked_away_stops_being_outstanding() {
+async fn a_publication_whose_caller_walked_away_stays_outstanding_until_it_is_reconciled() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(GatedService::new());
     let store = SyncStore::open(directory.path().join("one")).expect("a store");
-    let client = Arc::new(
-        SyncClient::new(
-            Arc::clone(&service) as Arc<dyn SyncBackupService>,
-            Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
-            store,
-        )
-        .expect("a client"),
-    );
+    let client = Arc::new(SyncClient::new(
+        Arc::clone(&service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        store,
+    ));
     let object_id = fresh_object_id().expect("an identity");
     let mine = object(
         object_id,
@@ -1008,36 +1142,80 @@ async fn a_publication_whose_caller_walked_away_stops_being_outstanding() {
         async move { client.publish(object_id, TimestampMs::new(NOW)).await }
     });
     service.wait_for_a_publication().await;
-    assert_eq!(client.outstanding(), 1);
+    assert_eq!(client.outstanding().expect("a count"), 1);
 
-    // The caller abandons the call at the await. The count follows the work rather than the
-    // statement after it, so cleanup is not left waiting for something nothing can settle.
+    // The caller abandons the call at the await. Nothing about that establishes that the write did
+    // not land, so the work stays outstanding: a count that followed the future rather than the
+    // work would report a cleanup complete while the object may have been on its way.
     publishing.abort();
     let _ = publishing.await;
-    assert_eq!(client.outstanding(), 0);
-
-    // What the store still holds is a record saying the work was dispatched, so a cancellation
-    // does not take it back as though it had never gone.
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        1,
+        "an abandoned call settles nothing"
+    );
     let staged = client.store().staged().expect("staged");
     assert_eq!(staged.len(), 1);
     assert!(staged.items[0].dispatched);
     assert_eq!(
         client
-            .cancel_undispatched(2)
+            .cancel_undispatched(0)
             .expect("cancelled")
             .undispatched,
-        0
+        0,
+        "work that has left cannot be taken back"
     );
 
-    // And a client built over that store again counts it, because a restart does not make an
+    // A client built over the same store counts it too, because a restart does not make an
     // uncertain outcome certain.
     let reopened = SyncClient::new(
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
         Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
         SyncStore::open(directory.path().join("one")).expect("a store"),
-    )
-    .expect("a client");
-    assert_eq!(reopened.outstanding(), 1);
+    );
+    assert_eq!(reopened.outstanding().expect("a count"), 1);
+
+    // Reconciliation is what settles it: it asks the service what it holds now. Here the write
+    // never reached the store behind the gate, so the object is absent and the outcome stays
+    // unknown.
+    let reconciled = reopened
+        .reconcile(TimestampMs::new(NOW + 1))
+        .await
+        .expect("asked");
+    assert_eq!(reconciled.settled, 0);
+    assert_eq!(reconciled.unknown, 1);
+    assert_eq!(reopened.outstanding().expect("a count"), 1);
+
+    // Once the service can answer, and what it holds is this device's own revision, the work is
+    // finished and the count reaches nought honestly.
+    service.let_it_go();
+    service
+        .inner
+        .compare_exchange(
+            &sync_collection(SyncObjectKind::Settings, object_id),
+            0,
+            &DeviceSealer::new(0x5a)
+                .seal(&kr_cbor::to_canonical_vec(&mine).expect("canonical bytes"))
+                .expect("sealed"),
+        )
+        .await
+        .expect("the write lands");
+    let reconciled = reopened
+        .reconcile(TimestampMs::new(NOW + 2))
+        .await
+        .expect("asked");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reopened.outstanding().expect("a count"), 0);
+    assert_eq!(
+        reopened
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one was written")
+            .generation
+            .get(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1053,13 +1231,13 @@ async fn outstanding_reaches_nought_only_once_a_dispatched_publication_has_settl
     );
     client.store().put_object(&mine).expect("stored");
 
-    assert_eq!(client.outstanding(), 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
     client
         .publish(object_id, TimestampMs::new(NOW))
         .await
         .expect("published");
     assert_eq!(
-        client.outstanding(),
+        client.outstanding().expect("a count"),
         0,
         "a settled publication is no longer in flight"
     );

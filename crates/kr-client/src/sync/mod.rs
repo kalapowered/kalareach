@@ -8,6 +8,12 @@
 //! compare and swap against a per-object revision, and a write that loses the comparison is kept
 //! for the person to choose from rather than resolved by whichever clock was further ahead.
 //!
+//! What this module does **not** hold is authority. There is no kind for host grants or revocation
+//! state, no body variant that names either, and no handle from here to any authority store, so
+//! nothing a restore brings down is read as authority. A setting is text, a number or a switch,
+//! which is a narrow shape rather than a promise about bytes: text is text, and what keeps a
+//! restore away from authority is that nothing here interprets one as authority.
+//!
 //! # What may be synchronised, and what may not
 //!
 //! [`kr_protocol::sync::SyncObjectKind`] is settings, drafts and a client's own position. The set
@@ -48,12 +54,12 @@ use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 pub use client::{
-    Cancelled, Exported, Fenced, KeptExplicitly, Published, Removed, Restored, Resumed, SyncClient,
-    fresh_object_id, fresh_revision,
+    Cancelled, Exported, Fenced, KeptExplicitly, Published, Reconciled, Removed, Restored, Resumed,
+    SyncClient, fresh_object_id, fresh_revision,
 };
 pub use store::{
-    ConflictCopy, Listing, PinnedLabel, Publication, Result, Staged, SyncCheckpoint, SyncError,
-    SyncStore,
+    ConflictCopy, Listing, Outcome, PinnedLabel, PrivacyRecord, Publication, Result, Settlement,
+    Staged, SyncCheckpoint, SyncError, SyncStore,
 };
 
 /// What section 18 bullet 5 offers, part by part.
@@ -89,14 +95,14 @@ impl StorageFeature {
         }
     }
 
-    /// Returns whether this part is on unless a person turns it off.
+    /// Returns whether this part is something a person chooses to have.
     ///
-    /// Only history backups are optional, and section 18 says so in the feature's own name. The
-    /// other two are what makes the feature work at all: without settings sync there is nothing to
-    /// synchronise, and without recovery material a restore needs another device.
+    /// History backups and recovery material both are: section 18 says so of backups and section 20
+    /// says so of the recovery seed. Settings sync is the feature itself, so there is nothing left
+    /// of it to turn off.
     #[must_use]
     pub const fn is_optional(self) -> bool {
-        matches!(self, Self::HistoryBackups)
+        matches!(self, Self::HistoryBackups | Self::RecoveryMaterial)
     }
 
     /// Returns what a person does without this part.
@@ -112,9 +118,11 @@ impl StorageFeature {
 
 /// One synchronised object, as it travels.
 ///
-/// The record names which object it is and what revision it is, and a reader checks both against
-/// what it asked for after opening. Sealing says the bytes came from a device that holds the key;
-/// it does not say they belong where they were found.
+/// The record names which object it is and what revision it is. A reader checks the identity and
+/// the kind against the collection it asked for; the revision is what it compares with its own to
+/// see whether the two devices hold the same content, not something it asked the service for.
+/// Sealing says the bytes came from a device that holds the key; it does not say they belong where
+/// they were found.
 ///
 /// It carries no collection of its own, because [`sync_collection`] derives the collection from the
 /// kind and the identity. A second statement of the same fact would be a second thing to check and

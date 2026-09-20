@@ -16,7 +16,9 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
-import { decodeCanonical, encodeCanonical, krBytes, krText, signingInput } from '../src/index.js'
+import {
+  decodeCanonical, encodeCanonical, krArray, krBytes, krMap, krText, signingInput
+} from '../src/index.js'
 
 import { bytesToHex, hexToBytes } from './fixtures.js'
 
@@ -190,6 +192,14 @@ describe('envelope vectors', () => {
     expect(transcript.items[1]).toEqual(krBytes(uuidToBytes(request.request_id)))
     expect(transcript.items[2]).toEqual(krBytes(uuidToBytes(request.issuer_device_id)))
     expect(transcript.items[3]).toEqual(krBytes(uuidToBytes(request.host_device_id)))
+    // The target is rebuilt from the object's own JSON, so a changed target cannot pass this test
+    // without changing the transcript the signature covers.
+    expect(transcript.items[4]).toEqual(krMap([
+      ['grants', krMap([[
+        'grant_ids',
+        krArray(request.target.grants.grant_ids.map((id: string) => krBytes(uuidToBytes(id))))
+      ]])]
+    ]))
     expect(transcript.items[5]).toEqual({ kind: 'int', value: BigInt(request.issued_at_ms) })
     expect(transcript.items[6]).toEqual(krBytes(fromBase64url(request.issuer_key_id)))
     expect(bytesToHex(encodeCanonical(transcript))).toBe(section.signing_input_hex)
