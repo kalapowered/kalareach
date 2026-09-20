@@ -42,11 +42,15 @@ pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
 /// Returns [`CliError::Usage`] when the edit is refused, and [`CliError::Ipc`] when the document
 /// cannot be written.
 pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
+    // The same lock the host takes, so a setting written here and one written by the daemon are
+    // one edit at a time rather than two writers racing for the same revision.
+    let held = configuration::lock(paths.state_dir()).map_err(CliError::Usage)?;
     let edited = configuration::edit(&load(paths), change)
         .map_err(|refused| CliError::Usage(refused.to_string()))?;
     configuration::still_current(&edited, &load(paths))
         .map_err(|refused| CliError::Usage(refused.to_string()))?;
     kr_ipc::paths::write_owner_only_file(&document_path(paths), edited.contents.as_bytes())
         .map_err(CliError::Ipc)?;
+    drop(held);
     Ok(edited.revision)
 }

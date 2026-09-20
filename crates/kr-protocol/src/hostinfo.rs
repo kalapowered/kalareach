@@ -199,7 +199,7 @@ impl HostDoctorResult {
         Self {
             checks,
             healthy,
-            configuration,
+            configuration: configuration.redacted(),
         }
     }
 }
@@ -293,6 +293,48 @@ pub struct EffectiveConfiguration {
 }
 
 impl EffectiveConfiguration {
+    /// Returns this report with every credential-shaped run in it replaced.
+    ///
+    /// A report is built from a parser's own error messages, from paths and from whatever a
+    /// document held, so it goes through the same boundary the checks do. Nothing here is
+    /// structured differently afterwards: only the free text changes.
+    #[must_use]
+    pub fn redacted(self) -> Self {
+        Self {
+            document: redaction::redact(&self.document),
+            status: configuration::DocumentStatus {
+                state: self.status.state,
+                detail: redaction::redact(&self.status.detail),
+            },
+            runtime_directory: redaction::redact(&self.runtime_directory),
+            state_directory: redaction::redact(&self.state_directory),
+            values: self
+                .values
+                .into_iter()
+                .map(|value| EffectiveValue {
+                    value: redaction::redact(&value.value),
+                    origin: Nullable(value.origin.0.as_deref().map(redaction::redact)),
+                    ..value
+                })
+                .collect(),
+            ceilings: self
+                .ceilings
+                .into_iter()
+                .map(|ceiling| CeilingValue {
+                    configured: Nullable(ceiling.configured.0.as_deref().map(redaction::redact)),
+                    value: redaction::redact(&ceiling.value),
+                    ..ceiling
+                })
+                .collect(),
+            stale_documents: self
+                .stale_documents
+                .iter()
+                .map(|path| redaction::redact(path))
+                .collect(),
+            ..self
+        }
+    }
+
     /// The report of a host whose configuration has not been read.
     ///
     /// Used where a result is assembled before a document has been looked at, and by tests that
@@ -410,9 +452,20 @@ impl SupportBundle {
         Self {
             generated_at_ms,
             software,
-            capabilities,
+            // A capability record's user-facing sentence is written by whatever probed the
+            // capability, and a probe that named a command line or a path is how a credential
+            // would arrive here. It goes through the same boundary as everything else.
+            capabilities: capabilities
+                .into_iter()
+                .map(|record| crate::desktop::CapabilityRecord {
+                    disabled_reason: Nullable(
+                        record.disabled_reason.0.as_deref().map(redaction::redact),
+                    ),
+                    ..record
+                })
+                .collect(),
             doctor: HostDoctorResult::new(doctor.checks, doctor.configuration),
-            configuration,
+            configuration: configuration.redacted(),
             errors: errors
                 .into_iter()
                 .map(|error| RedactedError::new(error.component, &error.message))
@@ -484,10 +537,12 @@ impl SupportBundle {
 ///
 /// # The creator's shell environment
 ///
-/// It is recorded as an [`ExecutionSnapshot`]: what the session's own processes run with, and
-/// nothing this host decides anything from. The overrides above are read from the *host's* own
-/// environment, never from a snapshot, which is what keeps a variable a person happened to export
-/// in one terminal from changing how the host behaves for everybody.
+/// A session create request carries it as `SessionCreateParams::environment_snapshot`, and the
+/// worker builds the session's shell environment from it. Nothing this host decides is taken from
+/// it, and nothing here reads it: [`resolve`] takes its rungs from the request, the document and
+/// the product default, and the allowlisted overrides are read from the *host's* own environment.
+/// That is what keeps a variable a person happened to export in one terminal from changing how the
+/// host behaves for everybody.
 pub mod configuration {
     use std::collections::BTreeMap;
 
@@ -496,8 +551,7 @@ pub mod configuration {
 
     use crate::desktop::SleepInhibitionSetting;
     use crate::identity::WorkerProfile;
-    use crate::scalars::{Nullable, U64};
-    use crate::session::ShellMode;
+    use crate::scalars::Nullable;
 
     /// The configuration document, in the environment's own state directory.
     pub const FILE_NAME: &str = "config.json";
@@ -534,6 +588,27 @@ pub mod configuration {
 
     /// The default cached payload budget, in bytes (section 11: 1 GiB).
     pub const DEFAULT_CACHED_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+    /// How many metadata generations a repository retains by default.
+    ///
+    /// Section 11 names a retained-generation budget without a number. Two is the smallest that
+    /// keeps a rollback target: the generation in use and the one before it.
+    pub const DEFAULT_RETAINED_GENERATIONS: u64 = 2;
+
+    /// The largest single package or asset fetched by default, in bytes.
+    pub const DEFAULT_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// How many objects one package may hold by default.
+    pub const DEFAULT_OBJECT_COUNT: u64 = 100_000;
+
+    /// The largest an expanded pack may become by default, in bytes.
+    pub const DEFAULT_EXPANDED_PACK_BYTES: u64 = 512 * 1024 * 1024;
+
+    /// How many bytes one synchronisation may transfer by default.
+    pub const DEFAULT_TRANSFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+    /// How long one package's compilation may take by default, in milliseconds.
+    pub const DEFAULT_COMPILATION_MS: u64 = 60_000;
 
     // ---------------------------------------------------------------------------------------
     // The document
@@ -605,8 +680,6 @@ pub mod configuration {
         pub sleep_inhibition: Nullable<SleepInhibitionSetting>,
         /// The execution context a session is created in when the request does not choose one.
         pub worker_profile: Nullable<WorkerProfile>,
-        /// The shell mode a session is created with when the request does not choose one.
-        pub shell_mode: Nullable<ShellMode>,
     }
 
     impl Default for PreferenceSet {
@@ -615,7 +688,6 @@ pub mod configuration {
             Self {
                 sleep_inhibition: Nullable::null(),
                 worker_profile: Nullable::null(),
-                shell_mode: Nullable::null(),
             }
         }
     }
@@ -663,19 +735,39 @@ pub mod configuration {
         pub metadata_bytes: u64,
         /// The metadata budget per repository, in entries.
         pub metadata_entries: u64,
+        /// How many metadata generations a repository may retain.
+        pub retained_generations: u64,
         /// The cached payload budget per repository, in bytes.
         pub cached_payload_bytes: u64,
+        /// The largest single package or asset a repository may fetch, in bytes.
+        pub package_bytes: u64,
+        /// How many objects one package may hold.
+        pub object_count: u64,
+        /// The largest an expanded pack may become, in bytes, checked during processing.
+        pub expanded_pack_bytes: u64,
+        /// How many bytes one synchronisation may transfer.
+        pub transfer_bytes: u64,
+        /// How long one package's compilation may take, in milliseconds.
+        pub compilation_ms: u64,
         /// Whether this host keeps a full offline mirror, which is the explicit setting a payload
         /// budget above the default needs.
         pub full_offline_mirror: bool,
     }
 
     impl Default for EnrolmentBudgets {
+        /// Section 11's own numbers, which are what a repository costs here until an owner says
+        /// otherwise.
         fn default() -> Self {
             Self {
                 metadata_bytes: DEFAULT_METADATA_BYTES,
                 metadata_entries: DEFAULT_METADATA_ENTRIES,
+                retained_generations: DEFAULT_RETAINED_GENERATIONS,
                 cached_payload_bytes: DEFAULT_CACHED_PAYLOAD_BYTES,
+                package_bytes: DEFAULT_PACKAGE_BYTES,
+                object_count: DEFAULT_OBJECT_COUNT,
+                expanded_pack_bytes: DEFAULT_EXPANDED_PACK_BYTES,
+                transfer_bytes: DEFAULT_TRANSFER_BYTES,
+                compilation_ms: DEFAULT_COMPILATION_MS,
                 full_offline_mirror: false,
             }
         }
@@ -932,8 +1024,22 @@ pub mod configuration {
             }
         }
         let budgets = &document.ceilings.enrolment;
-        if budgets.metadata_bytes == 0 || budgets.metadata_entries == 0 {
-            problems.push("an enrolment budget of zero would enrol no repository".to_owned());
+        for (field, value) in [
+            ("metadata_bytes", budgets.metadata_bytes),
+            ("metadata_entries", budgets.metadata_entries),
+            ("retained_generations", budgets.retained_generations),
+            ("cached_payload_bytes", budgets.cached_payload_bytes),
+            ("package_bytes", budgets.package_bytes),
+            ("object_count", budgets.object_count),
+            ("expanded_pack_bytes", budgets.expanded_pack_bytes),
+            ("transfer_bytes", budgets.transfer_bytes),
+            ("compilation_ms", budgets.compilation_ms),
+        ] {
+            if value == 0 {
+                problems.push(format!(
+                    "an enrolment budget of zero for {field} would enrol no repository"
+                ));
+            }
         }
         if budgets.cached_payload_bytes > DEFAULT_CACHED_PAYLOAD_BYTES
             && !budgets.full_offline_mirror
@@ -977,8 +1083,6 @@ pub mod configuration {
         SleepInhibition(SleepInhibitionSetting),
         /// Set the execution context a session is created in by default.
         WorkerProfile(WorkerProfile),
-        /// Set the shell mode a session is created with by default.
-        ShellMode(ShellMode),
         /// Set this host's configured session ceiling, or clear it.
         SessionLimit(Option<u64>),
         /// Set the rights a grant may carry on this host, or clear the ceiling.
@@ -994,7 +1098,6 @@ pub mod configuration {
             match self {
                 Self::SleepInhibition(_) => SLEEP_INHIBITION.key,
                 Self::WorkerProfile(_) => WORKER_PROFILE.key,
-                Self::ShellMode(_) => SHELL_MODE.key,
                 Self::SessionLimit(_) => "session_limit",
                 Self::GrantRights(_) => "grant_rights",
                 Self::Enrolment(_) => "enrolment",
@@ -1009,7 +1112,7 @@ pub mod configuration {
                 | Self::SessionLimit(_)
                 | Self::GrantRights(_)
                 | Self::Enrolment(_) => ValueEffect::Immediately,
-                Self::WorkerProfile(_) | Self::ShellMode(_) => ValueEffect::NewSessionsOnly,
+                Self::WorkerProfile(_) => ValueEffect::NewSessionsOnly,
             }
         }
 
@@ -1052,6 +1155,12 @@ pub mod configuration {
         pub contents: String,
         /// The revision this edit was based on.
         pub based_on: u64,
+        /// What the document on disk was when this edit was prepared.
+        ///
+        /// Compared again before the write. A revision alone is not enough: an absent document and
+        /// an unreadable one both report revision zero, so an edit prepared against nothing would
+        /// otherwise be allowed to replace a document this build must not touch.
+        pub based_on_state: DocumentState,
         /// The revision it applies.
         pub revision: u64,
         /// When it takes effect.
@@ -1067,6 +1176,9 @@ pub mod configuration {
         /// The edited document does not validate.
         #[error("{}", .0.join("; "))]
         Invalid(Vec<String>),
+        /// Another writer is applying an edit to the same document.
+        #[error("{0}")]
+        Busy(String),
     }
 
     /// Applies one change to a loaded document and validates the result.
@@ -1086,6 +1198,14 @@ pub mod configuration {
             (None, DocumentState::Absent) => 0,
             (None, _) => return Err(EditRefused::NotOurs(loaded.status.detail.clone())),
         };
+        // A revision that cannot rise is a revision that would be reused, and a reused revision is
+        // a compare-and-set that no longer compares anything.
+        if based_on == u64::MAX {
+            return Err(EditRefused::Invalid(vec![format!(
+                "this document is already at revision {based_on}, which is the highest this \
+                 schema counts to"
+            )]));
+        }
         let mut document = loaded
             .document
             .clone()
@@ -1097,23 +1217,40 @@ pub mod configuration {
             Change::WorkerProfile(profile) => {
                 document.preferences.worker_profile = Nullable::some(*profile);
             }
-            Change::ShellMode(mode) => {
-                document.preferences.shell_mode = Nullable::some(*mode);
-            }
             Change::SessionLimit(limit) => {
                 document.ceilings.session_limit = Nullable(*limit);
             }
             Change::GrantRights(rights) => {
-                document.ceilings.grant_rights = Nullable(rights.clone());
+                // Deduplicated here rather than refused. A ceiling is a set, the same right named
+                // twice asks for exactly what it asked for once, and a document that grew without
+                // bound because a caller repeated itself would be a document this build could no
+                // longer read.
+                document.ceilings.grant_rights = Nullable(rights.as_ref().map(|rights| {
+                    let mut unique: Vec<String> = rights.clone();
+                    unique.sort();
+                    unique.dedup();
+                    unique
+                }));
             }
             Change::Enrolment(budgets) => document.ceilings.enrolment = *budgets,
         }
         document.version = VERSION;
-        document.revision = based_on.saturating_add(1);
+        document.revision = based_on + 1;
         validate(&document).map_err(EditRefused::Invalid)?;
+        let text = contents(&document);
+        // The bound the reader enforces, checked against the bytes that would be written rather
+        // than against the fields. A document that validated and then could not be read back would
+        // take every preference in it with it.
+        if text.len() as u64 > MAX_LEN {
+            return Err(EditRefused::Invalid(vec![format!(
+                "this document would be {} bytes, and this host reads at most {MAX_LEN}",
+                text.len()
+            )]));
+        }
         Ok(Edited {
-            contents: contents(&document),
+            contents: text,
             based_on,
+            based_on_state: loaded.status.state,
             revision: document.revision,
             effect: change.effect(),
             document,
@@ -1131,15 +1268,101 @@ pub mod configuration {
     ///
     /// Returns [`EditRefused::NotOurs`] naming both revisions when the document moved.
     pub fn still_current(edited: &Edited, current: &Loaded) -> Result<(), EditRefused> {
-        if current.revision() == edited.based_on {
+        if current.status.state == edited.based_on_state && current.revision() == edited.based_on {
             return Ok(());
         }
         Err(EditRefused::NotOurs(format!(
-            "this document moved to revision {} while the edit to revision {} was being prepared; \
-             nothing was written",
-            current.revision(),
-            edited.revision
+            "this document was {} at revision {} when the edit to revision {} was prepared and is \
+             now {} at revision {}; nothing was written",
+            edited.based_on_state.as_str(),
+            edited.based_on,
+            edited.revision,
+            current.status.state.as_str(),
+            current.revision()
         )))
+    }
+
+    /// The lock one writer holds while it reads, edits and replaces the document.
+    ///
+    /// Reading the revision and replacing the file are two steps, and two writers that each read
+    /// revision `n` would each publish revision `n + 1`, the second erasing the first.
+    /// [`still_current`] catches a writer that came and went between the two steps; this closes
+    /// the window in which two writers are inside them at once.
+    pub const LOCK_NAME: &str = ".config.lock";
+
+    /// How long a lock is honoured before it is treated as one its holder did not live to release.
+    ///
+    /// An edit is a validation, a comparison and a rename: milliseconds. A lock older than this
+    /// was left by a process that ended without releasing it, and honouring it for ever would make
+    /// one interrupted command the end of configuration on this host.
+    pub const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The lock, held for as long as this value lives.
+    #[derive(Debug)]
+    pub struct EditLock {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for EditLock {
+        fn drop(&mut self) {
+            // Released whichever way the edit ended, including a refusal. A lock left behind by an
+            // edit that was refused would stop the next one for no reason.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Takes the configuration lock in `state_directory`.
+    ///
+    /// Exclusive creation is the whole of it: the filesystem decides which of two writers created
+    /// the file, and the other is told to try again. A lock left by a process that ended without
+    /// releasing it is taken over after [`LOCK_PATIENCE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the sentence a caller reports when another writer holds the lock, or when the lock
+    /// cannot be taken at all.
+    pub fn lock(state_directory: &std::path::Path) -> Result<EditLock, String> {
+        let path = state_directory.join(LOCK_NAME);
+        match take_lock(&path) {
+            Ok(held) => Ok(held),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|since| since.elapsed().is_ok_and(|age| age >= LOCK_PATIENCE));
+                if !stale {
+                    return Err(format!(
+                        "another writer is applying an edit to {}",
+                        state_directory.join(FILE_NAME).display()
+                    ));
+                }
+                // The holder is gone. Removing what it left and creating one of our own is still
+                // the filesystem's decision: whichever writer creates it next holds the lock.
+                let _ = std::fs::remove_file(&path);
+                take_lock(&path).map_err(|error| {
+                    format!("this host could not take {}: {error}", path.display())
+                })
+            }
+            Err(error) => Err(format!(
+                "this host could not take {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    /// Creates the lock file, failing when it is already there.
+    fn take_lock(path: &std::path::Path) -> std::io::Result<EditLock> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.mode(0o600);
+        }
+        options.open(path)?;
+        Ok(EditLock {
+            path: path.to_path_buf(),
+        })
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1244,13 +1467,6 @@ pub mod configuration {
         about: "the execution context a session is created in",
     };
 
-    /// The shell mode a session is created with.
-    pub const SHELL_MODE: Preference = Preference {
-        key: "shell_mode",
-        effect: ValueEffect::NewSessionsOnly,
-        about: "the shell mode a session is created with",
-    };
-
     /// The runtime tree this installation uses.
     pub const RUNTIME_DIRECTORY: Preference = Preference {
         key: "runtime_directory",
@@ -1271,10 +1487,9 @@ pub mod configuration {
     /// an allowlisted variable supplies them at the request rung, and the platform default is the
     /// bottom rung. Keeping them in this table is also what makes the allowlist checkable, because
     /// every entry must name a key that appears here.
-    pub const PREFERENCES: [Preference; 5] = [
+    pub const PREFERENCES: [Preference; 4] = [
         SLEEP_INHIBITION,
         WORKER_PROFILE,
-        SHELL_MODE,
         RUNTIME_DIRECTORY,
         STATE_DIRECTORY,
     ];
@@ -1449,6 +1664,128 @@ pub mod configuration {
         },
     ];
 
+    /// One variable this build reads outside the precedence, and what it selects.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct UngovernedVariable {
+        /// The variable.
+        pub variable: &'static str,
+        /// What it selects.
+        pub selects: &'static str,
+        /// True when what it selects is authority or a provider origin, which section 26 says no
+        /// inherited variable may reach.
+        pub reaches_authority: bool,
+    }
+
+    /// The variables this build still reads that are not part of the precedence.
+    ///
+    /// Section 26 asks that only documented allowlisted overrides participate and that arbitrary
+    /// inherited variables cannot change authority or provider origins. [`ALLOWLIST`] is the first
+    /// half. This table is the second, and it exists because a claim is worth nothing unless the
+    /// exceptions to it are written down: `kr doctor` prints this list, so what a person is told
+    /// about this host matches what this host actually does.
+    ///
+    /// Two kinds are here. The platform directory variables are how the operating system itself
+    /// names its conventional locations, and reading them is what "native OS-appropriate
+    /// locations" means rather than an exception to it. The network selections are the ones that
+    /// do reach a provider origin and, in one case, the owner signer; they belong in the
+    /// configuration document and in the pairing record, and until they are there this host says
+    /// so out loud.
+    pub const UNGOVERNED: [UngovernedVariable; 16] = [
+        UngovernedVariable {
+            variable: "TMPDIR",
+            selects: "the platform's per-user temporary directory, which is the macOS runtime root",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "XDG_RUNTIME_DIR",
+            selects: "the platform's per-user runtime directory on Linux",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "XDG_STATE_HOME",
+            selects: "the platform's per-user state directory on Linux",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "HOME",
+            selects: "the account's home directory, from which both default roots are derived",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "LOCALAPPDATA",
+            selects: "the account's local application data directory on Windows",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK",
+            selects: "whether this daemon puts itself on the network at all",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_BIND",
+            selects: "the address the network endpoint binds to",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_RELAYS",
+            selects: "the relay map, which is a provider origin",
+            reaches_authority: true,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_PKARR_PUBLISHER",
+            selects: "the discovery server this host publishes to, which is a provider origin",
+            reaches_authority: true,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_PKARR_RESOLVER",
+            selects: "the discovery server this host resolves from, which is a provider origin",
+            reaches_authority: true,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_DNS_ORIGIN",
+            selects: "the DNS origin peers are resolved from, which is a provider origin",
+            reaches_authority: true,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_RELAY_CA",
+            selects: "extra certificates trusted for a relay's HTTPS, which is a trust decision",
+            reaches_authority: true,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_RELAY_ONLY",
+            selects: "whether every packet goes through the relay",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_LOCAL_DISCOVERY",
+            selects: "whether this host discovers peers on the local network",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_MAINLINE",
+            selects: "whether this host uses the public distributed hash table for discovery",
+            reaches_authority: false,
+        },
+        UngovernedVariable {
+            variable: "KR_NETWORK_OWNER_KEY",
+            selects: "the owner signing key this host pairs under, which is authority itself",
+            reaches_authority: true,
+        },
+    ];
+
+    /// Returns the variables in [`UNGOVERNED`] that this process actually has set.
+    ///
+    /// The report says which of them are set here rather than only that they exist, because what
+    /// matters to a person reading a diagnostic is whether this host is running under one.
+    #[must_use]
+    pub fn ungoverned_here() -> Vec<UngovernedVariable> {
+        UNGOVERNED
+            .iter()
+            .copied()
+            .filter(|entry| std::env::var_os(entry.variable).is_some())
+            .collect()
+    }
+
     /// Returns the allowlist entry for `variable`, when it has one.
     ///
     /// Anything this returns `None` for changes nothing about how this host behaves, however it
@@ -1456,54 +1793,6 @@ pub mod configuration {
     #[must_use]
     pub fn allowlisted(variable: &str) -> Option<&'static OverrideEntry> {
         ALLOWLIST.iter().find(|entry| entry.variable == variable)
-    }
-
-    /// The creator's shell environment, recorded as an execution snapshot.
-    ///
-    /// Section 26 is explicit that this is "a distinct execution snapshot, not control
-    /// configuration". It is what the session's own processes run with; nothing this host decides
-    /// is taken from it. [`ExecutionSnapshot::variables`] holds names only, because a bundle or a
-    /// diagnostic that carried the values would be exporting whatever the person had exported.
-    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct ExecutionSnapshot {
-        /// The variable names the creator's shell had, in order, with nothing that names a
-        /// credential.
-        pub variables: Vec<String>,
-        /// How many names were left out because they name a credential.
-        pub withheld: U64,
-    }
-
-    impl ExecutionSnapshot {
-        /// Records the names of one shell environment.
-        ///
-        /// Values never enter: the snapshot says what the session's processes were given, not what
-        /// was in it. A name that itself says it is a credential is counted rather than listed,
-        /// because "`STRIPE_SECRET_KEY` was set" is already more than a diagnostic needs.
-        #[must_use]
-        pub fn record<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
-            let mut variables = Vec::new();
-            let mut withheld = 0;
-            for name in names {
-                if super::redaction::names_a_secret(name) {
-                    withheld += 1;
-                } else {
-                    variables.push(name.to_owned());
-                }
-            }
-            Self {
-                variables,
-                withheld: U64::new(withheld),
-            }
-        }
-
-        /// Returns true when this snapshot names `variable`.
-        ///
-        /// Reading it is the only thing anything may do with it, and even that is for a report.
-        #[must_use]
-        pub fn contains(&self, variable: &str) -> bool {
-            self.variables.iter().any(|name| name == variable)
-        }
     }
 }
 
@@ -1525,46 +1814,61 @@ pub mod redaction {
 
     /// The shortest run of credential-shaped characters this treats as a secret.
     ///
-    /// Short runs are words. A forty-character hexadecimal string is not a word, and neither is a
-    /// thirty-character base64 one, so the bound is set where ordinary English stops and encoded
-    /// material starts.
+    /// Short runs are words and identifiers. A generated key is longer than this and an English
+    /// word of this length is not written in three character classes at once.
     const OPAQUE_RUN: usize = 28;
 
-    /// Words that make the value beside them a credential.
+    /// Name components that make the value beside them a credential.
     ///
-    /// Matched case-insensitively against the assignment's left-hand side, so `API_KEY=`,
-    /// `api-key:` and `"apiKey":` are all the same word here.
-    const SECRET_WORDS: &[&str] = &[
+    /// Matched as whole components rather than as substrings, which is what keeps `session_limit`
+    /// and `keyboard` out of it: a name is split on its own separators and on case changes, and a
+    /// component either is one of these or is not.
+    const SECRET_COMPONENTS: &[&str] = &[
         "secret",
+        "secrets",
         "token",
+        "tokens",
         "password",
         "passwd",
         "passphrase",
         "credential",
+        "credentials",
         "authorization",
         "auth",
         "cookie",
-        "session",
-        "apikey",
-        "privatekey",
-        "signature",
         "bearer",
         "key",
+        "keys",
+        "apikey",
+        "privatekey",
     ];
+
+    /// Components that make a name public rather than secret, whatever else it contains.
+    ///
+    /// A public key is something a diagnostic exists to print. Redacting it would lose the one
+    /// identifier a person needs to compare two hosts, and it protects nothing.
+    const PUBLIC_COMPONENTS: &[&str] = &["public", "pub", "fingerprint"];
+
+    /// Components whose value runs to the end of the line rather than to the next space.
+    ///
+    /// `Authorization: Bearer <token>` is one value with a space in it. Stopping at the space
+    /// would leave the token where it was and redact the word "Bearer".
+    const WHOLE_LINE_COMPONENTS: &[&str] = &["authorization", "bearer", "cookie"];
 
     /// Returns `text` with anything that looks like a credential replaced.
     ///
     /// Three shapes are recognised, and each is the shape a credential actually arrives in.
     ///
-    /// * **An assignment whose name says it is one.** `API_KEY=sk-live-...`, `password: hunter2`,
-    ///   `"token": "..."`. The name stays, because a person reading a bundle needs to know which
-    ///   credential the host was talking about; the value goes.
-    /// * **Userinfo in a URL.** `https://user:password@host/path` keeps the host and the path and
-    ///   loses the pair in front of them, which is where a credential in a provider origin lives.
+    /// * **An assignment whose name says it is one.** `API_KEY=sk-live-...`, `password : hunter2`,
+    ///   `"token": "..."`, `Authorization: Bearer ...`. The name stays, because a person reading a
+    ///   bundle needs to know which credential the host was talking about; the value goes.
+    /// * **Userinfo in a URL.** `https://user:password@host/path` and `https://token@host/path`
+    ///   both keep the host and the path and lose what was in front of them, which is where a
+    ///   credential in a provider origin lives.
     /// * **A long opaque run.** A token pasted on its own, with nothing naming it: at least
-    ///   [`OPAQUE_RUN`] characters drawn only from the alphanumeric and base64 alphabet, mixing
-    ///   upper case, lower case and digits. That is the shape a generated credential has and the
-    ///   shape ordinary text does not.
+    ///   [`OPAQUE_RUN`] characters from the alphanumeric alphabet, mixing upper case, lower case
+    ///   and digits. That is the shape a generated credential has and the shape ordinary text
+    ///   does not.
     ///
     /// The last rule is deliberately narrow, because the first two carry the real load and an
     /// eager third rule damages diagnostics for nothing. A run never crosses a path separator, so
@@ -1578,34 +1882,71 @@ pub mod redaction {
         redact_opaque_runs(&userinfo)
     }
 
-    /// Returns true when `name` is a word that makes the value beside it a credential.
+    /// Returns true when `name` is a name whose value is a credential.
     #[must_use]
     pub fn names_a_secret(name: &str) -> bool {
-        let folded: String = name
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .map(|character| character.to_ascii_lowercase())
-            .collect();
-        SECRET_WORDS.iter().any(|word| folded.contains(word))
+        let components = components(name);
+        if components
+            .iter()
+            .any(|component| PUBLIC_COMPONENTS.contains(&component.as_str()))
+        {
+            return false;
+        }
+        components
+            .iter()
+            .any(|component| SECRET_COMPONENTS.contains(&component.as_str()))
+            || components
+                .windows(2)
+                .any(|pair| SECRET_COMPONENTS.contains(&format!("{}{}", pair[0], pair[1]).as_str()))
+    }
+
+    /// Splits a name into its lowercase components, on its own separators and on case changes.
+    fn components(name: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut previous_lower = false;
+        for character in name.chars() {
+            if !character.is_ascii_alphanumeric() {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+                previous_lower = false;
+                continue;
+            }
+            if character.is_ascii_uppercase() && previous_lower && !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            previous_lower = character.is_ascii_lowercase() || character.is_ascii_digit();
+            current.push(character.to_ascii_lowercase());
+        }
+        if !current.is_empty() {
+            parts.push(current);
+        }
+        parts
     }
 
     /// Replaces the value of every assignment whose name says it is a credential.
     fn redact_assignments(text: &str) -> String {
+        let characters: Vec<char> = text.chars().collect();
         let mut out = String::with_capacity(text.len());
-        let bytes: Vec<char> = text.chars().collect();
         let mut index = 0;
-        while index < bytes.len() {
-            let character = bytes[index];
+        while index < characters.len() {
+            let character = characters[index];
             if character == '=' || character == ':' {
-                // The name is what runs back from the separator: letters, digits and the
-                // punctuation a variable or a JSON key is spelled with.
-                let start = name_start(&bytes, index);
-                let name: String = bytes[start..index].iter().collect();
-                let name = name.trim().trim_matches('"');
-                if names_a_secret(name) {
-                    let (value_start, value_end) = value_span(&bytes, index + 1);
+                let start = name_start(&characters, index);
+                let name: String = characters[start..index]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .trim_matches('"')
+                    .to_owned();
+                if names_a_secret(&name) {
+                    let whole_line = components(&name)
+                        .iter()
+                        .any(|component| WHOLE_LINE_COMPONENTS.contains(&component.as_str()));
+                    let (value_start, value_end) = value_span(&characters, index + 1, whole_line);
                     if value_end > value_start {
-                        out.extend(&bytes[index..value_start]);
+                        out.extend(&characters[index..value_start]);
                         out.push_str(MARKER);
                         index = value_end;
                         continue;
@@ -1619,8 +1960,14 @@ pub mod redaction {
     }
 
     /// Where the name in front of a separator at `separator` begins.
+    ///
+    /// Space in front of the separator is skipped first, so `password = hunter2` is the same
+    /// assignment as `password=hunter2`.
     fn name_start(text: &[char], separator: usize) -> usize {
         let mut start = separator;
+        while start > 0 && (text[start - 1] == ' ' || text[start - 1] == '\t') {
+            start -= 1;
+        }
         while start > 0 {
             let character = text[start - 1];
             if character.is_ascii_alphanumeric()
@@ -1638,7 +1985,10 @@ pub mod redaction {
     }
 
     /// The span of the value that follows a separator, skipping the space and quote in front of it.
-    fn value_span(text: &[char], mut start: usize) -> (usize, usize) {
+    ///
+    /// A quoted value ends at its closing quote, and a backslash inside one escapes whatever
+    /// follows, so a password containing an escaped quote is not cut in half and left exposed.
+    fn value_span(text: &[char], mut start: usize, whole_line: bool) -> (usize, usize) {
         while start < text.len() && (text[start] == ' ' || text[start] == '\t') {
             start += 1;
         }
@@ -1649,12 +1999,19 @@ pub mod redaction {
         let mut end = start;
         while end < text.len() {
             let character = text[end];
-            let ends = if quoted {
-                character == '"'
-            } else {
-                character.is_whitespace() || character == ',' || character == ';'
-            };
-            if ends {
+            if quoted {
+                if character == '\\' {
+                    end = (end + 2).min(text.len());
+                    continue;
+                }
+                if character == '"' {
+                    break;
+                }
+            } else if character == '\n' || character == '\r' {
+                break;
+            } else if !whole_line
+                && (character.is_whitespace() || character == ',' || character == ';')
+            {
                 break;
             }
             end += 1;
@@ -1662,7 +2019,10 @@ pub mod redaction {
         (start, end)
     }
 
-    /// Replaces the `user:password@` in front of a host.
+    /// Replaces the userinfo in front of a host.
+    ///
+    /// With or without a password: a single opaque username in a URL is how a provider origin
+    /// carries a token, and `https://<token>@host` is as much a credential as `user:pass@host`.
     fn redact_userinfo(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
@@ -1673,17 +2033,14 @@ pub mod redaction {
                 .map_or(rest.len(), |offset| after + offset);
             let authority = &rest[after..authority_end];
             match authority.rfind('@') {
-                Some(at) if authority[..at].contains(':') => {
+                Some(at) if at > 0 => {
                     out.push_str(&rest[..after]);
                     out.push_str(MARKER);
                     out.push_str(&authority[at..]);
-                    rest = &rest[authority_end..];
                 }
-                _ => {
-                    out.push_str(&rest[..authority_end]);
-                    rest = &rest[authority_end..];
-                }
+                _ => out.push_str(&rest[..authority_end]),
             }
+            rest = &rest[authority_end..];
         }
         out.push_str(rest);
         out
@@ -1695,12 +2052,6 @@ pub mod redaction {
         let mut run = String::new();
         for character in text.chars() {
             if character.is_ascii_alphanumeric() || character == '+' {
-                run.push(character);
-                continue;
-            }
-            // `=` ends a run and belongs to it only as base64 padding, which is why it is taken
-            // here rather than treated as an assignment separator a second time.
-            if character == '=' && !run.is_empty() {
                 run.push(character);
                 continue;
             }
@@ -1798,6 +2149,138 @@ mod tests {
         }
     }
 
+    /// KR-REQ-26.44: the shapes a credential actually arrives in, and the shapes it does not.
+    #[test]
+    fn the_redaction_takes_the_credential_and_leaves_the_diagnostic() {
+        for (text, gone, kept) in [
+            (
+                "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.short.signature",
+                "eyJhbGciOiJIUzI1NiJ9",
+                "Authorization",
+            ),
+            ("password = hunter2", "hunter2", "password"),
+            (
+                r#"{"api_key": "sk-live-\"escaped\"-tail"}"#,
+                "escaped",
+                "api_key",
+            ),
+            (
+                "dialled https://gho1234abcd@relay.example.com/path",
+                "gho1234abcd",
+                "relay.example.com/path",
+            ),
+            (
+                "dialled https://operator:hunter2@relay.example.com/path",
+                "hunter2",
+                "relay.example.com/path",
+            ),
+        ] {
+            let redacted = redaction::redact(text);
+            assert!(!redacted.contains(gone), "{text} -> {redacted}");
+            assert!(redacted.contains(kept), "{text} -> {redacted}");
+        }
+        // A name that merely contains a secret word as a fragment is not one.
+        for kept in [
+            "session_limit=16",
+            "keyboard: unavailable",
+            "public_key=7f3ab99c",
+            "monkeys: 4",
+        ] {
+            assert_eq!(redaction::redact(kept), kept, "{kept} says nothing secret");
+        }
+    }
+
+    /// KR-REQ-26.44: an exported configuration goes through the same boundary as a check.
+    #[test]
+    fn a_credential_in_a_configuration_report_never_reaches_the_wire() {
+        let mut configuration = EffectiveConfiguration::unread();
+        configuration.status.detail =
+            "this file is not JSON: expected value at line 1 column 1: token=A1b2C3d4E5f6G7h8I9j0K1l2M3n4"
+                .to_owned();
+        let result = HostDoctorResult::new(Vec::new(), configuration);
+        assert!(
+            !result.configuration.status.detail.contains("A1b2C3d4E5f6"),
+            "{}",
+            result.configuration.status.detail
+        );
+    }
+
+    /// KR-REQ-26.16: an edit that would produce a document this host cannot read is refused.
+    #[test]
+    fn an_edit_larger_than_the_bound_is_refused_before_it_is_written() {
+        let loaded = configuration::load(None);
+        let many: Vec<String> = (0..4000)
+            .map(|index| format!("a.right.this.build.does.not.know.{index}"))
+            .collect();
+        let refused = configuration::edit(&loaded, &Change::GrantRights(Some(many)))
+            .expect_err("a document larger than the bound");
+        assert!(
+            format!("{refused}").contains("not an action right"),
+            "an unknown right is refused first: {refused}"
+        );
+        let repeated = vec!["session.view".to_owned(); 4000];
+        let applied = configuration::edit(&loaded, &Change::GrantRights(Some(repeated)))
+            .expect("the same right named repeatedly asks for what it asked for once");
+        assert_eq!(
+            applied
+                .document
+                .ceilings
+                .grant_rights
+                .as_ref()
+                .expect("the ceiling")
+                .len(),
+            1
+        );
+        assert!((applied.contents.len() as u64) < configuration::MAX_LEN);
+    }
+
+    /// KR-REQ-26.16: an edit is refused when the document underneath it is no longer what it was.
+    #[test]
+    fn an_edit_is_refused_when_the_document_changed_in_any_way() {
+        let absent = configuration::load(None);
+        let prepared = configuration::edit(&absent, &Change::SessionLimit(Some(4)))
+            .expect("an edit on an absent document");
+        let written = configuration::load(Some(prepared.contents.as_bytes()));
+        assert!(
+            configuration::still_current(&prepared, &written).is_err(),
+            "another writer published a document while this edit was being prepared"
+        );
+        // An unreadable document reports revision zero like an absent one. Comparing the revision
+        // alone would let an edit prepared against nothing replace a document this build must not
+        // touch.
+        let unreadable = configuration::unreadable("this file must not be a symbolic link");
+        assert_eq!(unreadable.revision(), prepared.based_on);
+        assert!(configuration::still_current(&prepared, &unreadable).is_err());
+        assert!(configuration::still_current(&prepared, &absent).is_ok());
+    }
+
+    /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied.
+    #[test]
+    fn every_variable_this_build_reads_outside_the_precedence_is_named() {
+        for entry in &configuration::UNGOVERNED {
+            assert!(
+                !entry.selects.is_empty(),
+                "{} says what it selects",
+                entry.variable
+            );
+            assert!(
+                configuration::allowlisted(entry.variable).is_none(),
+                "{} cannot be both governed and ungoverned",
+                entry.variable
+            );
+        }
+        for reaching in ["KR_NETWORK_OWNER_KEY", "KR_NETWORK_RELAYS"] {
+            let entry = configuration::UNGOVERNED
+                .iter()
+                .find(|entry| entry.variable == reaching)
+                .unwrap_or_else(|| panic!("{reaching} is recorded"));
+            assert!(
+                entry.reaches_authority,
+                "{reaching} reaches authority or a provider origin and says so"
+            );
+        }
+    }
+
     /// KR-REQ-26.13: a document declaring a version this build does not know is left alone.
     #[test]
     fn an_unknown_version_reads_as_defaults_and_says_so() {
@@ -1850,8 +2333,10 @@ mod tests {
     /// KR-REQ-26.15: a full mirror above the default payload budget needs the explicit setting.
     #[test]
     fn a_payload_budget_above_the_default_needs_the_mirror_setting() {
-        let mut budgets = configuration::EnrolmentBudgets::default();
-        budgets.cached_payload_bytes = 4 * 1024 * 1024 * 1024;
+        let mut budgets = configuration::EnrolmentBudgets {
+            cached_payload_bytes: 4 * 1024 * 1024 * 1024,
+            ..configuration::EnrolmentBudgets::default()
+        };
         let loaded = configuration::load(None);
         let refused = configuration::edit(&loaded, &Change::Enrolment(budgets))
             .expect_err("a larger mirror is an explicit setting");
@@ -1956,22 +2441,6 @@ mod tests {
                 preference.key
             );
         }
-    }
-
-    /// KR-REQ-26.13: the creator's shell environment is a snapshot and carries no value.
-    #[test]
-    fn the_execution_snapshot_holds_names_and_withholds_the_ones_that_name_a_credential() {
-        let snapshot = configuration::ExecutionSnapshot::record([
-            "PATH",
-            "HOME",
-            "OPENAI_API_KEY",
-            "STRIPE_SECRET",
-        ]);
-        assert!(snapshot.contains("PATH"));
-        assert!(!snapshot.contains("OPENAI_API_KEY"));
-        assert_eq!(snapshot.withheld.get(), 2);
-        let json = serde_json::to_string(&snapshot).expect("serialises");
-        assert!(!json.contains("sk-"), "{json}");
     }
 
     /// KR-REQ-26.13: a profile contributes only what it chooses.

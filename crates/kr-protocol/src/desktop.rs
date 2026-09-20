@@ -785,13 +785,6 @@ impl SleepInhibitionState {
     }
 }
 
-/// The host power setting as it is kept on disk.
-///
-/// The setting is per-user host configuration rather than a wire message: the owner chooses it
-/// once, through setup or through the command line, and the control daemon reads it. Its format
-/// has one definition, here, because both the daemon that reads it and the command that writes it
-/// have to agree about what a file that says nothing means — and what it means is off.
-
 /// Whether a per-user service survives the user logging out, on this platform.
 ///
 /// The answer is a platform fact, not a preference, and it is reported rather than assumed. Setup

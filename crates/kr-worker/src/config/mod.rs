@@ -28,7 +28,6 @@ use kr_protocol::hostinfo::configuration::{
 use kr_protocol::hostinfo::{EffectiveValue, OverrideReport};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::scalars::Nullable;
-use kr_protocol::session::ShellMode;
 
 /// Returns where this environment's configuration document is.
 #[must_use]
@@ -50,7 +49,20 @@ pub fn load(paths: &EnvironmentPaths) -> Loaded {
     }
 }
 
-/// Returns the documents beside the configuration that this build no longer reads.
+/// Takes this environment's configuration lock.
+///
+/// One lock for the whole installation, taken by the daemon and by the command alike, so an edit
+/// from a terminal and an edit from the host cannot each read one revision and each publish the
+/// next.
+///
+/// # Errors
+///
+/// Returns the sentence a caller reports when another writer holds the lock.
+pub fn lock(paths: &EnvironmentPaths) -> std::result::Result<configuration::EditLock, String> {
+    configuration::lock(paths.state_dir())
+}
+
+/// Returns the documents beside the configuration that this build no longer reads./// Returns the documents beside the configuration that this build no longer reads.
 ///
 /// One entry today: the separate `power.json` the sleep setting used to live in, before the
 /// schema absorbed it. Nothing reads it and nothing removes it; `kr doctor` says in one line that
@@ -224,19 +236,6 @@ impl Resolver {
         configuration::resolve(
             configuration::WORKER_PROFILE,
             self.layers(requested, |set| set.worker_profile.0, platform_default),
-        )
-    }
-
-    /// Resolves the shell mode a session is created with.
-    #[must_use]
-    pub fn shell_mode(
-        &self,
-        requested: Option<ShellMode>,
-        platform_default: ShellMode,
-    ) -> Effective<ShellMode> {
-        configuration::resolve(
-            configuration::SHELL_MODE,
-            self.layers(requested, |set| set.shell_mode.0, platform_default),
         )
     }
 

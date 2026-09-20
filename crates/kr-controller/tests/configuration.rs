@@ -129,12 +129,25 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
         host.tree().environment().state_dir().display().to_string()
     );
     for value in &reported.values {
-        assert_eq!(
-            value.source,
-            ValueSource::Default,
-            "{} has no chosen value on a fresh host",
-            value.key
-        );
+        // A directory an allowlisted variable supplied is reported at the request rung, which is
+        // where the allowlist declares it; everything else on a fresh host is the product default.
+        // Both cases are here because a build machine gives this run its own tree through those
+        // variables and a developer's machine does not.
+        match value.variable.0.as_deref() {
+            Some(variable) => {
+                assert_eq!(value.source, ValueSource::Request, "{}", value.key);
+                assert!(
+                    kr_protocol::hostinfo::configuration::allowlisted(variable).is_some(),
+                    "{variable} supplied a value without being on the allowlist"
+                );
+            }
+            None => assert_eq!(
+                value.source,
+                ValueSource::Default,
+                "{} has no chosen value on a fresh host",
+                value.key
+            ),
+        }
         assert!(
             !value.about.is_empty(),
             "{} says what it decides",
@@ -191,8 +204,12 @@ async fn only_the_documented_overrides_participate_and_they_say_where() {
     assert!(
         check
             .detail
-            .contains("Any other inherited variable changes nothing"),
+            .contains("No other inherited variable takes part in the precedence"),
         "{check:?}"
+    );
+    assert!(
+        check.detail.contains("This build also reads"),
+        "and it names what this build reads outside the precedence: {check:?}"
     );
 
     session.close();
@@ -400,6 +417,96 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
     assert!(
         check.detail.contains("per-user host configuration"),
         "the check says which rung the value came from: {check:?}"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-26.15: a configured session ceiling is what this host admits against, not only what it
+/// reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_session_ceiling_is_the_limit_this_host_admits_against() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+
+    controller
+        .apply_configuration(&Change::SessionLimit(Some(3)))
+        .await
+        .expect("the owner's ceiling");
+
+    let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("host.info is served to the device"),
+    );
+    assert_eq!(
+        info.session_limit.get(),
+        3,
+        "the limit a create is admitted against is the configured one"
+    );
+
+    controller
+        .apply_configuration(&Change::SessionLimit(None))
+        .await
+        .expect("the ceiling is cleared");
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("host.info is served to the device"),
+    );
+    assert_eq!(
+        info.session_limit.get(),
+        kr_controller::config::HardLimits::default().sessions_per_environment,
+        "and clearing it puts the hard resource limit back"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-26.13: a configured execution context is what this host creates sessions in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_execution_context_is_the_one_a_session_is_created_in() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+    // Whatever this platform answers, the configuration chooses the other one, so the assertion
+    // is about the configuration reaching session creation rather than about this machine.
+    let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
+    let before: kr_protocol::hostinfo::HostInfoResult = typed(
+        &session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("host.info is served to the device"),
+    );
+    let chosen = match before.default_worker_profile {
+        kr_protocol::identity::WorkerProfile::DesktopBound => {
+            kr_protocol::identity::WorkerProfile::HeadlessUser
+        }
+        kr_protocol::identity::WorkerProfile::HeadlessUser => {
+            kr_protocol::identity::WorkerProfile::DesktopBound
+        }
+    };
+    controller
+        .apply_configuration(&Change::WorkerProfile(chosen))
+        .await
+        .expect("the owner's execution context");
+
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("host.info is served to the device"),
+    );
+    assert_eq!(
+        info.default_worker_profile, chosen,
+        "a create that chooses nothing gets what the configuration chose, not the platform's own \
+         answer"
     );
 
     session.close();

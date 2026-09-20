@@ -185,10 +185,6 @@ export type ChangeSetVersion = string
  */
 export type CapabilityId = string
 /**
- * How the root shell is integrated.
- */
-export type ShellMode = 'managed' | 'native_compat'
-/**
  * The owner's sleep-inhibition choice.
  *
  * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
@@ -1331,7 +1327,6 @@ export interface KalaReachProtocol {
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
   evidence_reference?: EvidenceReference
-  execution_snapshot?: ExecutionSnapshot
   expiration_tombstone?: ExpirationTombstone
   fence_evidence?: FenceEvidence
   fenced_action?: FencedAction
@@ -5006,6 +5001,14 @@ export interface EnrolmentBudgets {
    */
   cached_payload_bytes?: number
   /**
+   * How long one package's compilation may take, in milliseconds.
+   */
+  compilation_ms?: number
+  /**
+   * The largest an expanded pack may become, in bytes, checked during processing.
+   */
+  expanded_pack_bytes?: number
+  /**
    * Whether this host keeps a full offline mirror, which is the explicit setting a payload
    * budget above the default needs.
    */
@@ -5018,15 +5021,27 @@ export interface EnrolmentBudgets {
    * The metadata budget per repository, in entries.
    */
   metadata_entries?: number
+  /**
+   * How many objects one package may hold.
+   */
+  object_count?: number
+  /**
+   * The largest single package or asset a repository may fetch, in bytes.
+   */
+  package_bytes?: number
+  /**
+   * How many metadata generations a repository may retain.
+   */
+  retained_generations?: number
+  /**
+   * How many bytes one synchronisation may transfer.
+   */
+  transfer_bytes?: number
 }
 /**
  * The ordinary preferences that apply when no profile is selected.
  */
 export interface PreferenceSet {
-  /**
-   * The shell mode a session is created with when the request does not choose one.
-   */
-  shell_mode?: ShellMode | null
   /**
    * Whether this host keeps itself awake for work it has admitted, and on which power
    * source.
@@ -5041,10 +5056,6 @@ export interface PreferenceSet {
  * The ordinary preferences, each absent unless this document chooses it.
  */
 export interface PreferenceSet1 {
-  /**
-   * The shell mode a session is created with when the request does not choose one.
-   */
-  shell_mode?: ShellMode | null
   /**
    * Whether this host keeps itself awake for work it has admitted, and on which power
    * source.
@@ -5633,7 +5644,7 @@ export interface SessionCreateParams {
    */
   shell: string | null
   /**
-   * How the root shell is integrated.
+   * The shell integration mode.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -7840,7 +7851,8 @@ export interface SessionSummary {
    */
   session_id: string
   /**
-   * How the root shell is integrated.
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -7976,25 +7988,6 @@ export interface HistoryGap {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   to_cursor: string
-}
-/**
- * The creator's shell environment, recorded as an execution snapshot.
- *
- * Section 26 is explicit that this is "a distinct execution snapshot, not control
- * configuration". It is what the session's own processes run with; nothing this host decides
- * is taken from it. [`ExecutionSnapshot::variables`] holds names only, because a bundle or a
- * diagnostic that carried the values would be exporting whatever the person had exported.
- */
-export interface ExecutionSnapshot {
-  /**
-   * The variable names the creator's shell had, in order, with nothing that names a
-   * credential.
-   */
-  variables: string[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  withheld: string
 }
 /**
  * The record an expired object leaves behind.
@@ -15663,7 +15656,7 @@ export interface SessionCreateParams1 {
    */
   shell: string | null
   /**
-   * How the root shell is integrated.
+   * The shell integration mode.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -15751,7 +15744,8 @@ export interface SessionSummary1 {
    */
   session_id: string
   /**
-   * How the root shell is integrated.
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -16033,7 +16027,8 @@ export interface SessionSummary2 {
    */
   session_id: string
   /**
-   * How the root shell is integrated.
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
    */
   shell_mode: 'managed' | 'native_compat'
   /**
@@ -16173,7 +16168,8 @@ export interface SessionSummary3 {
    */
   session_id: string
   /**
-   * How the root shell is integrated.
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
    */
   shell_mode: 'managed' | 'native_compat'
   /**

@@ -536,11 +536,10 @@ configuration /home/example/.local/state/kalareach/environments/70a528be/config.
 version 1, revision 3): version 1
   sleep_inhibition = mains_only from host_configuration (…/config.json), applies immediately
   worker_profile = headless_user from default, applies new_sessions_only
-  shell_mode = native_compat from default, applies new_sessions_only
   runtime_directory = /run/user/1000/kalareach/70a528be from default, applies new_sessions_only
   state_directory = …/environments/70a528be from default, applies new_sessions_only
   session_limit ceiling 128
-  enrolment ceiling 67108864 metadata bytes, 100000 entries, 1073741824 cached payload bytes
+  enrolment ceiling 67108864 metadata bytes, 100000 entries, 2 generations retained, …
   grant_rights ceiling every right the grant and the host policy allow
 ok             The runtime directory is owner-only
 warning        Every published descriptor answered its challenge
@@ -555,7 +554,7 @@ Each engineering default the product makes configurable is printed with the valu
 rung it came from, so what this host is doing and why are one reading rather than two.
 
 The exit status is 0 when no check failed and 1 when one did. `--json` returns one document with
-`ok`, `host`, `doctor`, `configuration` and `environment`.
+`ok`, `host`, `doctor`, `configuration` and `environment`, and `bundle` when one was written.
 
 ### Support bundles
 
@@ -566,7 +565,7 @@ an assignment whose name says it is a credential loses its value, a URL loses it
 generated key loses itself, whichever check or library produced the sentence.
 
 Nothing content-bearing is in it. `--include-content` adds a `content/` entry, and the command
-prints what that entry will hold before it writes anything:
+prints what that entry will hold, on the error stream, before it writes anything:
 
 ```text
 --include-content adds the content-bearing diagnostic export:

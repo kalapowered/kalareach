@@ -62,6 +62,23 @@ impl Content {
 ///
 /// Returns an error when the archive cannot be written to `path`.
 pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content], report: &str) -> Result<()> {
+    // A bare file name has no parent directory, and the atomic replacement needs one to write its
+    // temporary file into and to flush afterwards. Resolving it here is what makes
+    // `kr doctor --bundle support.tar` work from a terminal the way a person expects.
+    let path = &if path
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+    {
+        std::env::current_dir()
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "this bundle's destination could not be resolved: {error}"
+                ))
+            })?
+            .join(path)
+    } else {
+        path.to_path_buf()
+    };
     let bundle = if content.is_empty() {
         bundle.clone()
     } else {
@@ -76,10 +93,10 @@ pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content], report: &
     let manifest = serde_json::to_vec_pretty(&bundle)
         .map_err(|error| CliError::Other(format!("this bundle could not be written: {error}")))?;
     let mut archive = Archive::new();
-    archive.file(MANIFEST, &manifest);
-    archive.file(REPORT, report.as_bytes());
+    archive.file(MANIFEST, &manifest)?;
+    archive.file(REPORT, report.as_bytes())?;
     for entry in content {
-        archive.file(&entry.entry, &entry.bytes);
+        archive.file(&entry.entry, &entry.bytes)?;
     }
     kr_ipc::paths::write_owner_only_file(path, &archive.finish()).map_err(CliError::Ipc)
 }
@@ -92,6 +109,9 @@ struct Archive {
 /// One tar block.
 const BLOCK: usize = 512;
 
+/// The largest entry the header's eleven-digit octal size field can express.
+const MAX_ENTRY_LEN: u64 = 8u64.pow(11) - 1;
+
 impl Archive {
     const fn new() -> Self {
         Self { bytes: Vec::new() }
@@ -99,15 +119,29 @@ impl Archive {
 
     /// Appends one regular file.
     ///
-    /// A name longer than the header's hundred bytes is refused by truncation rather than by
-    /// splitting it across the prefix field: every name this writes is one of the constants above
-    /// or a short entry beneath them, so the case does not arise and a silent split would be more
-    /// surface than the format needs here.
-    fn file(&mut self, name: &str, contents: &[u8]) {
+    /// A name the header cannot carry, or a size its octal field cannot express, is refused rather
+    /// than truncated. Every name this writes is one of the constants above or a short entry
+    /// beneath them, so neither happens; an archive that silently renamed or mis-sized an entry
+    /// would be one a person could not trust, and refusing is cheaper than a reader finding out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is longer than the header's hundred bytes or the contents
+    /// are larger than the size field holds.
+    fn file(&mut self, name: &str, contents: &[u8]) -> Result<()> {
         let mut header = [0u8; BLOCK];
-        let name = name.as_bytes();
-        let taken = name.len().min(100);
-        header[..taken].copy_from_slice(&name[..taken]);
+        let bytes = name.as_bytes();
+        if bytes.len() > 100 {
+            return Err(CliError::Other(format!(
+                "{name} is longer than an archive entry name may be"
+            )));
+        }
+        if contents.len() as u64 > MAX_ENTRY_LEN {
+            return Err(CliError::Other(format!(
+                "{name} is larger than an archive entry may be"
+            )));
+        }
+        header[..bytes.len()].copy_from_slice(bytes);
         write_octal(&mut header[100..108], 0o600, 7);
         write_octal(&mut header[108..116], 0, 7);
         write_octal(&mut header[116..124], 0, 7);
@@ -130,6 +164,7 @@ impl Archive {
         if remainder != 0 {
             self.bytes.resize(self.bytes.len() + BLOCK - remainder, 0);
         }
+        Ok(())
     }
 
     /// Returns the finished archive, with the two empty blocks that end one.

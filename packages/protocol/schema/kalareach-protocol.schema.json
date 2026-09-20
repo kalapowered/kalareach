@@ -4299,9 +4299,15 @@
           "$ref": "#/$defs/EnrolmentBudgets",
           "default": {
             "cached_payload_bytes": 1073741824,
+            "compilation_ms": 60000,
+            "expanded_pack_bytes": 536870912,
             "full_offline_mirror": false,
             "metadata_bytes": 67108864,
-            "metadata_entries": 100000
+            "metadata_entries": 100000,
+            "object_count": 100000,
+            "package_bytes": 268435456,
+            "retained_generations": 2,
+            "transfer_bytes": 2147483648
           },
           "description": "The repository enrolment budgets section 11 calls configuration."
         },
@@ -4346,9 +4352,15 @@
           "default": {
             "enrolment": {
               "cached_payload_bytes": 1073741824,
+              "compilation_ms": 60000,
+              "expanded_pack_bytes": 536870912,
               "full_offline_mirror": false,
               "metadata_bytes": 67108864,
-              "metadata_entries": 100000
+              "metadata_entries": 100000,
+              "object_count": 100000,
+              "package_bytes": 268435456,
+              "retained_generations": 2,
+              "transfer_bytes": 2147483648
             },
             "grant_rights": null,
             "session_limit": null
@@ -4370,7 +4382,6 @@
         "preferences": {
           "$ref": "#/$defs/PreferenceSet",
           "default": {
-            "shell_mode": null,
             "sleep_inhibition": null,
             "worker_profile": null
           },
@@ -7443,6 +7454,20 @@
           "minimum": 0,
           "type": "integer"
         },
+        "compilation_ms": {
+          "default": 60000,
+          "description": "How long one package's compilation may take, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expanded_pack_bytes": {
+          "default": 536870912,
+          "description": "The largest an expanded pack may become, in bytes, checked during processing.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "full_offline_mirror": {
           "default": false,
           "description": "Whether this host keeps a full offline mirror, which is the explicit setting a payload\nbudget above the default needs.",
@@ -7458,6 +7483,34 @@
         "metadata_entries": {
           "default": 100000,
           "description": "The metadata budget per repository, in entries.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "object_count": {
+          "default": 100000,
+          "description": "How many objects one package may hold.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "package_bytes": {
+          "default": 268435456,
+          "description": "The largest single package or asset a repository may fetch, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retained_generations": {
+          "default": 2,
+          "description": "How many metadata generations a repository may retain.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transfer_bytes": {
+          "default": 2147483648,
+          "description": "How many bytes one synchronisation may transfer.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -8394,28 +8447,6 @@
         "exit_status",
         "stopped",
         "detail"
-      ],
-      "type": "object"
-    },
-    "ExecutionSnapshot": {
-      "additionalProperties": false,
-      "description": "The creator's shell environment, recorded as an execution snapshot.\n\nSection 26 is explicit that this is \"a distinct execution snapshot, not control\nconfiguration\". It is what the session's own processes run with; nothing this host decides\nis taken from it. [`ExecutionSnapshot::variables`] holds names only, because a bundle or a\ndiagnostic that carried the values would be exporting whatever the person had exported.",
-      "properties": {
-        "variables": {
-          "description": "The variable names the creator's shell had, in order, with nothing that names a\ncredential.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "withheld": {
-          "$ref": "#/$defs/U64",
-          "description": "How many names were left out because they name a credential."
-        }
-      },
-      "required": [
-        "variables",
-        "withheld"
       ],
       "type": "object"
     },
@@ -11054,7 +11085,7 @@
       "type": "object"
     },
     "LogoutPersistence": {
-      "description": "The host power setting as it is kept on disk.\n\nThe setting is per-user host configuration rather than a wire message: the owner chooses it\nonce, through setup or through the command line, and the control daemon reads it. Its format\nhas one definition, here, because both the daemon that reads it and the command that writes it\nhave to agree about what a file that says nothing means — and what it means is off.\nWhether a per-user service survives the user logging out, on this platform.\n\nThe answer is a platform fact, not a preference, and it is reported rather than assumed. Setup\nenables persistence only through an explicit choice, and only where the service configuration\nqualifies for it.",
+      "description": "Whether a per-user service survives the user logging out, on this platform.\n\nThe answer is a platform fact, not a preference, and it is reported rather than assumed. Setup\nenables persistence only through an explicit choice, and only where the service configuration\nqualifies for it.",
       "oneOf": [
         {
           "const": "ends_at_logout",
@@ -14313,18 +14344,6 @@
       "additionalProperties": false,
       "description": "The ordinary preferences, each absent unless this document chooses it.",
       "properties": {
-        "shell_mode": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ShellMode"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "The shell mode a session is created with when the request does not choose one."
-        },
         "sleep_inhibition": {
           "anyOf": [
             {
@@ -25596,9 +25615,6 @@
     },
     "evidence_reference": {
       "$ref": "#/$defs/EvidenceReference"
-    },
-    "execution_snapshot": {
-      "$ref": "#/$defs/ExecutionSnapshot"
     },
     "expiration_tombstone": {
       "$ref": "#/$defs/ExpirationTombstone"

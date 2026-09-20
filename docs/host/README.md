@@ -69,7 +69,7 @@ One versioned document per user, per environment, in that environment's own stat
   "version": 1,
   "revision": 3,
   "preferences": { "sleep_inhibition": "mains_only" },
-  "profiles": { "review": { "shell_mode": "native_compat" } },
+  "profiles": { "review": { "worker_profile": "headless_user" } },
   "default_profile": null,
   "ceilings": {
     "session_limit": 16,
@@ -77,7 +77,13 @@ One versioned document per user, per environment, in that environment's own stat
     "enrolment": {
       "metadata_bytes": 67108864,
       "metadata_entries": 100000,
+      "retained_generations": 2,
       "cached_payload_bytes": 1073741824,
+      "package_bytes": 268435456,
+      "object_count": 100000,
+      "expanded_pack_bytes": 536870912,
+      "transfer_bytes": 2147483648,
+      "compilation_ms": 60000,
       "full_offline_mirror": false
     }
   },
@@ -93,11 +99,19 @@ One versioned document per user, per environment, in that environment's own stat
 | owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
 | unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
 
-Editing is validated before a revision is applied. A change that would affect authority fences
-dispatch before the change is acknowledged, so work admitted under the old authority cannot be
-dispatched by the time the caller is told the change is in force. A change to the execution context
-invalidates the capability evidence taken under the old one and migrates no worker: a running
-session keeps the context it was created in.
+Editing is validated before a revision is applied, and one writer edits at a time: a writer takes
+`.config.lock` beside the document, reads, validates, checks that the document is still what it was,
+writes, and releases the lock. A lock left behind by a process that ended without releasing it is
+taken over after thirty seconds.
+
+A change that would affect authority fences dispatch before the change is acknowledged, so work
+admitted under the old authority cannot be dispatched by the time the caller is told the change is
+in force. A change to the execution context invalidates the capability evidence taken under the old
+one and migrates no worker: a running session keeps the context it was created in.
+
+The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
+assertion under; `worker_profile` is the execution context a create request gets when it does not
+choose one, which is what `kr new` without `--desktop` or `--headless` uses.
 
 The document the sleep setting used to live in, `power.json`, is not read. A copy found beside the
 configuration is reported by `kr doctor` in one line and ignored.
@@ -124,9 +138,22 @@ participate in configuration, and they are read from the host's own environment.
 | `KR_RUNTIME_DIR` | the runtime tree | an explicit request | it selects the runtime tree, which no document inside that tree can name |
 | `KR_STATE_DIR` | the state tree | an explicit request | it selects the state tree the configuration document itself is read from |
 
-Any other inherited variable changes nothing. No entry in that table names authority, an
+No other inherited variable takes part in the precedence. No entry in that table names authority, an
 organisation restriction, a grant ceiling, a hard resource limit or a provider origin, and none can:
 each entry has to name an ordinary preference, and those are not.
+
+Two other groups of variables this build reads are outside the precedence, and `kr doctor` lists
+both rather than leaving the sentence above to be read as more than it says.
+
+| Group | Variables | What they select |
+| --- | --- | --- |
+| platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
+| network selections | `KR_NETWORK`, `KR_NETWORK_BIND`, `KR_NETWORK_RELAYS`, `KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`, `KR_NETWORK_DNS_ORIGIN`, `KR_NETWORK_RELAY_CA`, `KR_NETWORK_RELAY_ONLY`, `KR_NETWORK_LOCAL_DISCOVERY`, `KR_NETWORK_MAINLINE`, `KR_NETWORK_OWNER_KEY` | whether and how this daemon joins a network |
+
+Five of the network selections reach a provider origin or the owner signing key. `kr doctor` warns
+whenever one of those is set on this host and names what it selects, because a provider origin and
+an owner signer belong in this host's configuration and in its pairing record rather than in the
+environment a process happened to inherit.
 
 ### Ceilings
 
@@ -139,6 +166,11 @@ force is refused and reported as refused.
 | `session_limit` | the hard limit of 128 sessions per environment |
 | `grant_rights` | the rights the grant and this host's policy already allow, which the grant intersection decides; this ceiling only removes |
 | `enrolment` | section 11's own budgets; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
+
+A ceiling is applied where the thing it restricts reads it. `session_limit` becomes the limit this
+host admits a create against, at startup and again after every edit. `grant_rights` narrows a grant
+before the method's required rights are checked, so a method whose right the ceiling has removed is
+refused rather than permitted with nothing in it.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
 it, which secure store it lives in and its name inside that store. There is no field a value would

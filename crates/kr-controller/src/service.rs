@@ -478,6 +478,16 @@ impl Controller {
         let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
         let generation = lock.advance(&mut registry)?;
+        // The configured session ceiling, intersected with the hard resource limit, becomes the
+        // limit admission actually enforces. A ceiling that was only reported would be a promise
+        // rather than a restriction, and section 26 makes it an intersection.
+        registry.set_session_limit(
+            crate::config::ceilings::session_limit(
+                &crate::config::open(&setup.paths).ceilings(),
+                crate::config::HardLimits::default(),
+            )
+            .value,
+        )?;
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let boot = setup.boot_identity.clone();
@@ -4033,7 +4043,16 @@ impl Controller {
 
     /// Returns the execution profile this host creates sessions with when a request chooses none.
     pub async fn default_profile(&self) -> WorkerProfile {
-        crate::desktop::default_profile(&self.desktop().await.0)
+        // The platform's answer is the bottom rung. What this host creates sessions in is what the
+        // precedence resolves to, so a configured execution context reaches session creation
+        // rather than only the report about it: `kr new` without a flag takes this host's default,
+        // and this is that default.
+        self.configuration()
+            .worker_profile(
+                None,
+                crate::desktop::default_profile(&self.desktop().await.0),
+            )
+            .value
     }
 
     /// Returns what this host's sleep inhibition is doing, taking or releasing the assertion.
@@ -4405,8 +4424,7 @@ impl Controller {
         crate::config::effective(
             &self.configuration(),
             crate::config::HardLimits::default(),
-            self.default_profile().await,
-            kr_protocol::session::ShellMode::NativeCompat,
+            crate::desktop::default_profile(&self.desktop().await.0),
         )
     }
 
@@ -4426,6 +4444,14 @@ impl Controller {
         change: &kr_protocol::hostinfo::configuration::Change,
     ) -> Result<crate::config::Applied> {
         let applied = crate::config::apply(&self.paths, change)?;
+        // What the new document says, put where the thing it restricts actually reads it. A
+        // ceiling this host reported and did not enforce would be worse than none.
+        let limit = crate::config::ceilings::session_limit(
+            &self.configuration().ceilings(),
+            crate::config::HardLimits::default(),
+        )
+        .value;
+        self.registry.lock().await.set_session_limit(limit)?;
         if applied.fences_dispatch {
             self.revoke_authority().await?;
         }

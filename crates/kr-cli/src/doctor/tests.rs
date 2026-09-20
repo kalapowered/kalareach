@@ -197,6 +197,71 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
     assert!(text.contains("every live and closed session"), "{text}");
 }
 
+/// KR-REQ-26.44: a bundle written to a bare file name lands in the directory the command ran in.
+#[test]
+fn a_relative_destination_is_resolved_against_the_current_directory() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let bundle = SupportBundle::new(
+        TimestampMs::new(1),
+        Vec::new(),
+        Vec::new(),
+        result(),
+        configured(),
+        Vec::new(),
+    );
+    // Written through the same path a bare `--bundle support.tar` takes, without changing this
+    // process's own directory: a relative destination has no parent for the atomic replacement to
+    // write its temporary file into, which is what used to make a bundle report failure after it
+    // had already been written.
+    let relative = std::path::Path::new("support.tar");
+    assert!(
+        relative
+            .parent()
+            .is_some_and(|parent| parent.as_os_str().is_empty())
+    );
+    bundle::write(&directory.path().join(relative), &bundle, &[], "report")
+        .expect("an absolute destination");
+    let here = std::env::current_dir().expect("a current directory");
+    bundle::write(
+        &here.join("kr-doctor-bundle-test.tar"),
+        &bundle,
+        &[],
+        "report",
+    )
+    .expect("a destination inside the current directory");
+    std::fs::remove_file(here.join("kr-doctor-bundle-test.tar")).expect("removes what it wrote");
+}
+
+/// KR-REQ-26.44: an entry the archive format cannot carry is refused rather than truncated.
+#[test]
+fn an_entry_the_format_cannot_carry_is_refused() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let bundle = SupportBundle::new(
+        TimestampMs::new(1),
+        Vec::new(),
+        Vec::new(),
+        result(),
+        configured(),
+        Vec::new(),
+    );
+    let content = vec![bundle::Content {
+        entry: format!("{}{}", bundle::CONTENT_PREFIX, "n".repeat(120)),
+        describes: "a name longer than a header holds".to_owned(),
+        bytes: Vec::new(),
+    }];
+    let refused = bundle::write(
+        &directory.path().join("support.tar"),
+        &bundle,
+        &content,
+        "report",
+    )
+    .expect_err("a name the header cannot carry");
+    assert!(
+        format!("{refused}").contains("longer than an archive entry name"),
+        "{refused}"
+    );
+}
+
 /// KR-REQ-26.16: the command's edit is the same validated one the host applies.
 #[test]
 fn the_commands_edit_validates_before_it_writes_and_refuses_a_document_it_must_not_rewrite() {

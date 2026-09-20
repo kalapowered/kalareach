@@ -538,16 +538,63 @@ async fn run(cli: Cli) -> Result<Completion> {
                     .await?,
             )?;
             let report = kr_cli::doctor::doctor_lines(&checks, arguments.verbose);
+            // The bundle is written before anything is printed, so `--json` produces one document
+            // and a bundle that could not be written is the command's failure rather than a note
+            // after a result that already said everything went well.
+            let bundle = match arguments.bundle.as_deref() {
+                Some(path) => {
+                    let content = if arguments.include_content {
+                        let selected =
+                            kr_cli::doctor::content_export(&mut client, environment.environment_id)
+                                .await?;
+                        // On the error stream, because standard output is one document. A person
+                        // sees what they selected either way, and a `--json` reader is not handed
+                        // two things to parse.
+                        eprintln!("--include-content adds the content-bearing diagnostic export:");
+                        for entry in &selected {
+                            eprintln!("{}", entry.describe());
+                        }
+                        selected
+                    } else {
+                        Vec::new()
+                    };
+                    let bundle = kr_protocol::hostinfo::SupportBundle::new(
+                        kr_protocol::scalars::TimestampMs::new(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0)),
+                        ),
+                        kr_cli::doctor::software(&info),
+                        capabilities.desktop.records.clone(),
+                        checks.clone(),
+                        checks.configuration.clone(),
+                        Vec::new(),
+                    );
+                    kr_cli::doctor::bundle::write(path, &bundle, &content, &report)?;
+                    Some((path.display().to_string(), bundle, content.len()))
+                }
+                None => None,
+            };
             // One document, whether the diagnostics passed or not. A command that printed a result
             // and then a failure would give a reader two documents to reconcile.
             if cli.json {
-                print_json(&serde_json::json!({
+                let mut document = serde_json::json!({
                     "ok": checks.healthy,
                     "host": report::host(&info),
                     "doctor": kr_cli::doctor::doctor(&checks),
                     "configuration": kr_cli::doctor::configuration_report(&checks.configuration),
                     "environment": report::environment_capabilities(&capabilities),
-                }));
+                });
+                if let Some((path, written, entries)) = bundle.as_ref() {
+                    document["bundle"] = serde_json::json!({
+                        "path": path,
+                        "software": written.software.len(),
+                        "capabilities": written.capabilities.len(),
+                        "checks": written.doctor.checks.len(),
+                        "content_entries": entries,
+                    });
+                }
+                print_json(&document);
             } else {
                 println!(
                     "environment {} generation {} ({} of {} sessions)",
@@ -569,44 +616,15 @@ async fn run(cli: Cli) -> Result<Completion> {
                     println!("{line}");
                 }
                 print!("{report}");
-            }
-            if let Some(path) = arguments.bundle.as_deref() {
-                let content = if arguments.include_content {
-                    // Printed before anything is written. The flag is the explicit selection, and
-                    // a person who gave it should see what it means while they can still stop.
-                    let selected =
-                        kr_cli::doctor::content_export(&mut client, environment.environment_id)
-                            .await?;
-                    println!("--include-content adds the content-bearing diagnostic export:");
-                    for entry in &selected {
-                        println!("{}", entry.describe());
-                    }
-                    selected
-                } else {
-                    Vec::new()
-                };
-                let bundle = kr_protocol::hostinfo::SupportBundle::new(
-                    kr_protocol::scalars::TimestampMs::new(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0)),
-                    ),
-                    kr_cli::doctor::software(&info),
-                    capabilities.desktop.records.clone(),
-                    checks.clone(),
-                    checks.configuration.clone(),
-                    Vec::new(),
-                );
-                kr_cli::doctor::bundle::write(path, &bundle, &content, &report)?;
-                println!(
-                    "support bundle written to {} ({} software versions, {} capability records, \
-                     {} checks, {} content-bearing entries)",
-                    path.display(),
-                    bundle.software.len(),
-                    bundle.capabilities.len(),
-                    bundle.doctor.checks.len(),
-                    content.len()
-                );
+                if let Some((path, written, entries)) = bundle.as_ref() {
+                    println!(
+                        "support bundle written to {path} ({} software versions, {} capability \
+                         records, {} checks, {entries} content-bearing entries)",
+                        written.software.len(),
+                        written.capabilities.len(),
+                        written.doctor.checks.len()
+                    );
+                }
             }
             if checks.healthy {
                 Ok(Completion::Done)

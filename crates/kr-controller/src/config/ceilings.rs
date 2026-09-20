@@ -154,39 +154,42 @@ pub fn decide_with_ceiling(
     policy: &mut HostPolicy,
     request: AccessRequest,
 ) -> Result<Decided, Refusal> {
-    let permitted = decide(grant, record, policy, request)?;
     let Some(ceiling) = configured_rights(ceilings) else {
         return Ok(Decided {
-            permitted,
+            permitted: decide(grant, record, policy, request)?,
             removed: CanonicalSet::new(),
             refused_rights: CanonicalSet::new(),
         });
     };
-    let removed: CanonicalSet<ActionRight> = permitted
-        .rights
+    // The ceiling is applied to the grant *before* the decision, never to its result. A method
+    // whose required right this host's configuration has removed has to be refused, and a decision
+    // taken against the unnarrowed grant would already have permitted it: emptying the answer
+    // afterwards would leave a caller holding a permission that was granted and then quietly
+    // hollowed out.
+    let narrowed = Grant {
+        actions: grant
+            .actions
+            .iter()
+            .copied()
+            .filter(|right| ceiling.contains(right))
+            .collect(),
+        ..grant.clone()
+    };
+    let removed: CanonicalSet<ActionRight> = grant
+        .actions
         .iter()
         .copied()
         .filter(|right| !ceiling.contains(right))
         .collect();
-    // What the configuration asked to allow and the intersection above it did not. Reported, never
-    // granted: a ceiling is a maximum, and asking for a right the grant does not carry is asking
-    // for nothing.
+    // What the ceiling named and the grant does not carry. Reported, never granted: a ceiling is a
+    // maximum, and naming a right the grant never had adds nothing.
     let refused_rights: CanonicalSet<ActionRight> = ceiling
         .iter()
         .copied()
-        .filter(|right| !permitted.rights.contains(right))
-        .collect();
-    let rights = permitted
-        .rights
-        .iter()
-        .copied()
-        .filter(|right| ceiling.contains(right))
+        .filter(|right| !grant.actions.contains(right))
         .collect();
     Ok(Decided {
-        permitted: Permitted {
-            rights,
-            ..permitted
-        },
+        permitted: decide(&narrowed, record, policy, request)?,
         removed,
         refused_rights,
     })

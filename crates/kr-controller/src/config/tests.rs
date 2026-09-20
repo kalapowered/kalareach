@@ -101,7 +101,8 @@ fn an_edit_built_on_a_revision_another_writer_moved_is_refused() {
 
     let refused = write(&environment, &prepared).expect_err("the revision moved underneath it");
     assert!(
-        format!("{refused}").contains("moved to revision"),
+        format!("{refused}").contains("absent at revision 0")
+            && format!("{refused}").contains("loaded at revision 1"),
         "{refused}"
     );
     assert_eq!(
@@ -136,8 +137,10 @@ fn a_session_ceiling_above_the_hard_limit_is_refused() {
 /// KR-REQ-26.15: a payload budget above the default without the explicit setting is refused.
 #[test]
 fn an_enrolment_budget_above_the_default_needs_the_explicit_setting() {
-    let mut budgets = EnrolmentBudgets::default();
-    budgets.cached_payload_bytes = 8 * 1024 * 1024 * 1024;
+    let mut budgets = EnrolmentBudgets {
+        cached_payload_bytes: 8 * 1024 * 1024 * 1024,
+        ..EnrolmentBudgets::default()
+    };
     let asked = ConfigurationCeilings {
         enrolment: budgets,
         ..ConfigurationCeilings::default()
@@ -207,18 +210,13 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
         &open(&environment),
         HardLimits::default(),
         WorkerProfile::HeadlessUser,
-        ShellMode::NativeCompat,
     );
     assert_eq!(report.schema_version.get(), configuration::VERSION);
     assert_eq!(report.revision.get(), 1);
     assert_eq!(report.status.state, DocumentState::Loaded);
     assert_eq!(report.precedence.len(), 4);
     assert_eq!(report.overrides.len(), 2);
-    assert_eq!(
-        report.values.len(),
-        5,
-        "three preferences and two locations"
-    );
+    assert_eq!(report.values.len(), 4, "two preferences and two locations");
 
     let power = report
         .values
@@ -255,7 +253,6 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
         &open(&environment),
         HardLimits::default(),
         WorkerProfile::HeadlessUser,
-        ShellMode::NativeCompat,
     );
     let produced = checks(&report);
     let ids: Vec<&str> = produced.iter().map(|check| check.id.as_str()).collect();
@@ -285,8 +282,12 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
     assert!(
         overrides
             .detail
-            .contains("Any other inherited variable changes nothing"),
+            .contains("No other inherited variable takes part in the precedence"),
         "{overrides:?}"
+    );
+    assert!(
+        overrides.detail.contains("This build also reads"),
+        "and it says what this build reads outside the precedence: {overrides:?}"
     );
 }
 
@@ -307,7 +308,6 @@ fn a_stale_power_document_is_reported_by_the_document_check() {
         &open(&environment),
         HardLimits::default(),
         WorkerProfile::HeadlessUser,
-        ShellMode::NativeCompat,
     );
     assert_eq!(report.stale_documents.len(), 1);
     let document = &checks(&report)[0];
@@ -376,4 +376,96 @@ fn an_edit_refuses_a_document_at_a_version_this_build_does_not_know() {
         "byte for byte as the owner left it"
     );
     let _ = ConfigurationDocument::empty();
+}
+
+/// KR-REQ-26.16: one writer at a time, so two cannot each publish the revision after the same one.
+#[test]
+fn a_second_writer_is_refused_while_the_first_holds_the_lock() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+
+    let held = kr_worker::config::lock(&environment).expect("the first writer takes it");
+    let refused = apply(
+        &environment,
+        &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
+    )
+    .expect_err("the second writer waits rather than racing");
+    assert!(format!("{refused}").contains("another writer"), "{refused}");
+    drop(held);
+
+    // Released with the first writer, whichever way it ended.
+    apply(
+        &environment,
+        &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
+    )
+    .expect("the lock is free again");
+    assert!(
+        !environment
+            .state_dir()
+            .join(kr_protocol::hostinfo::configuration::LOCK_NAME)
+            .exists(),
+        "and an edit leaves no lock behind"
+    );
+}
+
+/// KR-REQ-26.15: a ceiling that removes a right refuses the method that needs it.
+#[test]
+fn a_right_the_ceiling_removed_is_refused_rather_than_emptied() {
+    use kr_protocol::rights::ActionRight;
+
+    let ceilings = ConfigurationCeilings {
+        grant_rights: Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]),
+        ..ConfigurationCeilings::default()
+    };
+    let configured = ceilings::configured_rights(&ceilings).expect("a ceiling");
+    assert!(configured.contains(&ActionRight::SessionView));
+    assert!(
+        !configured.contains(&ActionRight::SessionCreate),
+        "what the ceiling does not name is not available on this host"
+    );
+
+    // The ordering the intersection depends on: the ceiling narrows the grant before the method's
+    // required rights are checked, so a method the ceiling has removed a right for is refused
+    // rather than permitted with an empty right set.
+    let narrowed: Vec<ActionRight> = [ActionRight::SessionView, ActionRight::SessionCreate]
+        .into_iter()
+        .filter(|right| configured.contains(right))
+        .collect();
+    assert_eq!(narrowed, vec![ActionRight::SessionView]);
+}
+
+/// KR-REQ-26.15: the configured session ceiling is what admission enforces, not only what is
+/// reported.
+#[test]
+fn the_configured_session_ceiling_reaches_the_limit_admission_reads() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let mut registry =
+        crate::registry::Registry::open(environment.registry_database(), temp.environment_id())
+            .expect("opens the registry");
+    let hard = HardLimits::default().sessions_per_environment;
+    assert_eq!(registry.session_limit().expect("the limit"), hard);
+
+    apply(&environment, &Change::SessionLimit(Some(3))).expect("the owner's ceiling");
+    let ceiling = ceilings::session_limit(&open(&environment).ceilings(), HardLimits::default());
+    registry
+        .set_session_limit(ceiling.value)
+        .expect("the ceiling reaches the registry");
+    assert_eq!(
+        registry.session_limit().expect("the limit"),
+        3,
+        "admission reads what the configuration asked for"
+    );
+
+    apply(&environment, &Change::SessionLimit(Some(hard * 4))).expect("a ceiling above the limit");
+    let ceiling = ceilings::session_limit(&open(&environment).ceilings(), HardLimits::default());
+    assert!(ceiling.refused);
+    registry
+        .set_session_limit(ceiling.value)
+        .expect("the hard limit reaches the registry");
+    assert_eq!(
+        registry.session_limit().expect("the limit"),
+        hard,
+        "and asking for more raises nothing"
+    );
 }

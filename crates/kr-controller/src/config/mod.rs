@@ -25,7 +25,6 @@ use kr_protocol::hostinfo::configuration::{self, Change, EditRefused, Edited, Va
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, EffectiveConfiguration, EffectiveValue};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::scalars::U64;
-use kr_protocol::session::ShellMode;
 use kr_worker::config::{Resolver, effective_value};
 
 use crate::error::{ControllerError, Result};
@@ -59,13 +58,17 @@ pub struct Applied {
 /// The order matters and is the whole of section 26's "validate edits before applying a versioned
 /// revision".
 ///
-/// 1. Read the document. One this build cannot use is not edited at all.
-/// 2. Apply the change and validate the result. A result that does not validate is refused here,
+/// 1. Take this environment's edit lock, and hold it to the end.
+/// 2. Read the document. One this build cannot use is not edited at all.
+/// 3. Apply the change and validate the result. A result that does not validate is refused here,
 ///    with nothing written.
-/// 3. Read the revision again, immediately before the write, and refuse when it has moved. Two
-///    writers would otherwise each apply their own edit to the revision they read and the second
-///    would erase the first.
-/// 4. Write, atomically and owner-only.
+/// 4. Read the document again, immediately before the write, and refuse when its revision or its
+///    condition has moved.
+/// 5. Write, atomically and owner-only.
+///
+/// The lock is what makes steps 2 to 5 one edit; the second read is what catches a writer that
+/// ran without the lock, which is what a document restored from a backup underneath a running
+/// host looks like.
 ///
 /// Fencing dispatch and invalidating capability evidence are the caller's, because both need the
 /// running daemon. [`Applied`] says which of them this change owes.
@@ -75,9 +78,13 @@ pub struct Applied {
 /// Returns [`ControllerError::Configuration`] when the document may not be edited, when the result
 /// does not validate, or when another writer moved the revision first.
 pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<Applied> {
+    // Held across the read, the edit and the replacement, so two writers cannot each read one
+    // revision and each publish the next.
+    let held = kr_worker::config::lock(paths).map_err(ControllerError::Configuration)?;
     let loaded = kr_worker::config::load(paths);
     let edited = configuration::edit(&loaded, change).map_err(refused)?;
     write(paths, &edited)?;
+    drop(held);
     Ok(Applied {
         revision: edited.revision,
         effect: edited.effect,
@@ -114,18 +121,15 @@ pub fn effective(
     resolver: &Resolver,
     limits: HardLimits,
     platform_profile: WorkerProfile,
-    platform_shell_mode: ShellMode,
 ) -> EffectiveConfiguration {
     let ceilings = resolver.ceilings();
     let power = resolver.sleep_inhibition(None);
     let profile = resolver.worker_profile(None, platform_profile);
-    let mode = resolver.shell_mode(None, platform_shell_mode);
     let runtime = resolver.runtime_directory();
     let state = resolver.state_directory();
     let values: Vec<EffectiveValue> = vec![
         effective_value(&power, power.value.as_str().to_owned()),
         effective_value(&profile, profile.value.as_str().to_owned()),
-        effective_value(&mode, mode.value.as_str().to_owned()),
         effective_value(&runtime, runtime.value.clone()),
         effective_value(&state, state.value.clone()),
     ];
@@ -149,10 +153,18 @@ pub fn effective(
             ceilings::report("session_limit", &sessions, u64::to_string),
             ceilings::report("enrolment", &enrolment, |budgets| {
                 format!(
-                    "{} metadata bytes, {} entries, {} cached payload bytes{}",
+                    "{} metadata bytes, {} entries, {} generations retained, {} cached payload \
+                     bytes, {} per package, {} objects, {} expanded, {} per transfer, {} ms to \
+                     compile{}",
                     budgets.metadata_bytes,
                     budgets.metadata_entries,
+                    budgets.retained_generations,
                     budgets.cached_payload_bytes,
+                    budgets.package_bytes,
+                    budgets.object_count,
+                    budgets.expanded_pack_bytes,
+                    budgets.transfer_bytes,
+                    budgets.compilation_ms,
                     if budgets.full_offline_mirror {
                         ", full offline mirror"
                     } else {
@@ -217,19 +229,29 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
             "; {stale} is a document this build no longer reads and is ignored"
         ));
     }
+    let wrong = status.state.is_a_problem() || !effective.stale_documents.is_empty();
     checks.push(DoctorCheck::new(
         "configuration-document",
         "This host's configuration document",
-        if status.state.is_a_problem() {
+        // A warning rather than a pass, so the default output prints the line. A stale document
+        // the owner still believes is doing something is exactly what a person needs told, and
+        // evidence only a `--verbose` run shows is evidence nobody reads.
+        if wrong {
             DoctorStatus::Warning
         } else {
             DoctorStatus::Ok
         },
         detail,
-        status.state.is_a_problem().then(|| {
-            "Every value is the product default while this document cannot be used. It is left \
-             exactly as it is: nothing here rewrites it."
-                .to_owned()
+        wrong.then(|| {
+            if status.state.is_a_problem() {
+                "Every value is the product default while this document cannot be used. It is \
+                 left exactly as it is: nothing here rewrites it."
+                    .to_owned()
+            } else {
+                "That document has no effect. Remove it once you have moved anything you still \
+                 want into the configuration above."
+                    .to_owned()
+            }
         }),
     ));
     checks.push(DoctorCheck::new(
@@ -250,12 +272,26 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         .filter(|entry| entry.set)
         .map(|entry| entry.variable.as_str())
         .collect();
+    let ungoverned = configuration::ungoverned_here();
+    let authority_reaching: Vec<&str> = ungoverned
+        .iter()
+        .filter(|entry| entry.reaches_authority)
+        .map(|entry| entry.variable)
+        .collect();
     checks.push(DoctorCheck::new(
         "configuration-overrides",
         "Which environment variables participate",
-        DoctorStatus::Ok,
+        // A variable that selects a provider origin or the owner signer is a warning wherever it
+        // is set, because section 26 says an inherited variable may not reach either. Saying so is
+        // what a diagnostic is for; saying nothing would make the line above it untrue.
+        if authority_reaching.is_empty() {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Warning
+        },
         format!(
-            "{}; set here: {}. Any other inherited variable changes nothing.",
+            "{}; set here: {}. No other inherited variable takes part in the precedence. This \
+             build also reads {} outside it: {}",
             effective
                 .overrides
                 .iter()
@@ -271,9 +307,26 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
                 "none".to_owned()
             } else {
                 set.join(", ")
+            },
+            configuration::UNGOVERNED.len(),
+            if ungoverned.is_empty() {
+                "none of them is set here".to_owned()
+            } else {
+                ungoverned
+                    .iter()
+                    .map(|entry| format!("{} selects {}", entry.variable, entry.selects))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             }
         ),
-        None,
+        (!authority_reaching.is_empty()).then(|| {
+            format!(
+                "{} selects a provider origin or the owner signing key from this process's \
+                 environment. Start this host without it and choose the same thing through its \
+                 own configuration or its pairing record.",
+                authority_reaching.join(", ")
+            )
+        }),
     ));
     let refused: Vec<&str> = effective
         .ceilings

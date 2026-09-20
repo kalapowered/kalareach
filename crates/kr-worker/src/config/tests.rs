@@ -31,7 +31,6 @@ fn a_request_beats_a_profile_and_a_profile_beats_the_document() {
     let environment = temp.environment();
     let mut document = ConfigurationDocument::empty();
     document.preferences.sleep_inhibition = Nullable::some(SleepInhibitionSetting::MainsOnly);
-    document.preferences.shell_mode = Nullable::some(ShellMode::NativeCompat);
     document.profiles.insert(
         "review".to_owned(),
         PreferenceSet {
@@ -61,9 +60,11 @@ fn a_request_beats_a_profile_and_a_profile_beats_the_document() {
     assert_eq!(from_profile.source, ValueSource::Profile);
     assert_eq!(from_profile.origin.as_deref(), Some("review"));
     assert_eq!(
-        with_profile.shell_mode(None, ShellMode::Managed).source,
-        ValueSource::HostConfiguration,
-        "a profile that chooses nothing here leaves the document's own choice standing"
+        with_profile
+            .worker_profile(None, WorkerProfile::DesktopBound)
+            .source,
+        ValueSource::Default,
+        "a profile that chooses nothing here leaves the rung below it standing"
     );
 
     let requested = with_profile.sleep_inhibition(Some(SleepInhibitionSetting::BatteryToo));
@@ -192,8 +193,11 @@ fn an_effective_value_carries_its_source_and_its_effect() {
     assert_eq!(reported.effect, ValueEffect::Immediately);
     assert!(!reported.variable.is_present());
 
-    let mode = resolver.shell_mode(Some(ShellMode::Managed), ShellMode::NativeCompat);
-    let reported = effective_value(&mode, mode.value.as_str().to_owned());
+    let requested = resolver.worker_profile(
+        Some(WorkerProfile::DesktopBound),
+        WorkerProfile::HeadlessUser,
+    );
+    let reported = effective_value(&requested, requested.value.as_str().to_owned());
     assert_eq!(reported.source, ValueSource::Request);
     assert_eq!(reported.effect, ValueEffect::NewSessionsOnly);
 }
