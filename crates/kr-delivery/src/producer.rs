@@ -948,7 +948,7 @@ impl Producer {
     /// wire when this host stopped has an outcome nobody knows, and that stays true whatever has
     /// since happened to the authorisation: a revocation is not evidence about delivery. So every
     /// interrupted attempt is recorded as an unknown outcome, and section 23 leaves it there
-    /// until a reconciliation reads the receipt.
+    /// until a reconciliation asks what became of it.
     ///
     /// **May it still be sent?** That is what `still_authorised` answers, and it applies to the
     /// records nothing has dispatched. Section 24 resumes *only what is still authorised*, so a

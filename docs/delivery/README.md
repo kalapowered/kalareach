@@ -61,9 +61,11 @@ bytes, so the gateway recognises a repeat and answers with the decision it alrea
   from what a client acknowledges.
 - A **transient failure that never reached the gateway** is presented again, with an exponential
   backoff that is jittered and capped and that stops at the notification's own expiry.
-- An **outcome nobody knows** is recorded as unknown and is not retried automatically. A
-  reconciliation pass reads the decision the gateway recorded, which is a read rather than a second
-  send.
+- An **outcome nobody knows** is recorded as unknown and is not retried automatically. What can
+  still resolve it is a question that carries the notification identifier and nothing else, on a
+  route that answers from what the gateway recorded; asking cannot deliver the notification, and
+  the request bytes go with the settlement rather than being kept for a second presentation. A
+  question nobody answers resolves nothing: the record stays uncertain and stays listed.
 - A **refused credential** is renewed rather than presented again, because presenting it again has
   the same answer.
 - A **rejected token** takes the destination out of service until a native registration proves
@@ -110,9 +112,11 @@ Cleanup is not complete while an attempt is on the wire or an outcome is unknown
 under an earlier generation is refused rather than published.
 
 What has already left is not erased and is not claimed to be. Notifications a provider queued and
-messages another service accepted are listed as retained artifacts, each saying that this host holds
-no way to recall it. Every entry is marked non-deletable (`deletable: false`), as the host implements
-no deletion action for artifacts that have already left.
+messages another service accepted are listed as retained artifacts, each carrying the notification
+and destination it is a copy of so that a separately authorised deletion action can name exactly the
+artifact a person chose. Every entry is marked non-deletable (`deletable: false`): the flag says
+whether this host holds a way to ask for a removal, and for a copy that is on a device or in another
+service it does not.
 
 ## Where the state lives
 

@@ -1,18 +1,24 @@
 //! Sending a notification to the gateway, and what each answer means.
 //!
-//! # The seam
+//! # Two seams, and why they are two
 //!
-//! [`PushSender`] has two methods and the difference between them is the whole of section 23's
-//! retry rule. [`PushSender::send`] may cause a dispatch. [`PushSender::receipt`] presents the
-//! same request again to read the decision the gateway already recorded: the gateway claims a
-//! notification identifier before anything reaches a provider and answers a repeat from what it
-//! recorded, so a receipt never produces a second notification.
+//! [`PushSender`] presents a delivery. It may cause a dispatch, and nothing else in this crate
+//! may. [`DeliveryStatus`] asks what became of a delivery already presented, by its identifier,
+//! on a route that answers from what the gateway recorded and carries no content: asking cannot
+//! deliver anything, whatever the gateway does with the question.
+//!
+//! They were one seam with two methods, where reading a decision meant presenting the identical
+//! request again. That rests on a promise about the gateway rather than on what the host sends,
+//! and a promise is not a property: a gateway that had never seen the identifier, or had lost the
+//! claim, would take the repeat as new work and deliver it. A question that carries an identifier
+//! and no request cannot.
 //!
 //! Section 23: *only idempotent reads, transfer chunks and requests whose receipt proves no
 //! dispatch may retry automatically. `OUTCOME_UNKNOWN` is not retryable.* So an attempt whose
 //! outcome nobody knows settles as [`DeliveryState::OutcomeUnknown`] and the automatic loop leaves
-//! it alone for ever. A reconciliation pass a person or a startup asks for reads the receipt; it
-//! does not send.
+//! it alone for ever. What resolves one is the status question, and a question nobody answers
+//! leaves it exactly where it was: unresolved, outstanding, and reported as a copy this host
+//! cannot account for.
 //!
 //! # One identifier is one notification
 //!
@@ -90,25 +96,49 @@ pub enum SendOutcome {
 ///
 /// It is a trait so that a test drives a double and the one implementation that speaks HTTP lives
 /// where the daemon's other outbound calls live. Nothing in this crate opens a socket.
-pub trait PushSender: std::fmt::Debug {
+pub trait PushSender: std::fmt::Debug + Send + Sync {
     /// Presents one delivery request. May cause a dispatch.
     fn send(
         &self,
         credential: &PushDeliveryCredential,
         request: &PushDeliveryRequest,
     ) -> SendOutcome;
+}
 
-    /// Reads the decision the gateway recorded for a notification already presented.
-    ///
-    /// The implementation presents the identical request again. That is a read, not a second
-    /// send: the gateway claims the identifier before anything reaches a provider and answers a
-    /// repeat from the outcome it recorded. An implementation that cannot make that guarantee
-    /// must not implement this method by sending.
-    fn receipt(
+/// What became of a delivery this host already presented.
+///
+/// One identifier, no content, no request bytes. An implementation asks a route that reads what
+/// the gateway recorded and answers it; an implementation that cannot ask such a route answers
+/// [`StatusAnswer::Unanswered`] and the record keeps its uncertainty. Presenting the delivery
+/// again is not an implementation of this trait.
+pub trait DeliveryStatus: std::fmt::Debug + Send + Sync {
+    /// Asks what the gateway recorded for one notification identifier.
+    fn status(
         &self,
         credential: &PushDeliveryCredential,
-        request: &PushDeliveryRequest,
-    ) -> SendOutcome;
+        notification_id: NotificationId,
+    ) -> StatusAnswer;
+}
+
+/// What a status question returned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StatusAnswer {
+    /// The gateway answered with the outcome it holds.
+    Recorded(Box<PushDeliveryAck>),
+    /// The gateway answered, and holds nothing under that identifier.
+    ///
+    /// It is an answer about the gateway's own records and not about the notification: a request
+    /// that never arrived and a record the gateway has since forgotten look the same from here.
+    /// Nothing is concluded from it.
+    NoRecord {
+        /// What the gateway said.
+        detail: String,
+    },
+    /// Nobody answered, so the outcome stays where it was.
+    Unanswered {
+        /// What happened, for the journal.
+        detail: String,
+    },
 }
 
 /// Where a host gets the bearer credential it delivers under.
@@ -116,7 +146,7 @@ pub trait PushSender: std::fmt::Debug {
 /// Separate from [`PushSender`] because renewing is a different authorisation with a different
 /// proof: delivery presents a bearer, renewal signs with the host key over a fresh gateway nonce.
 /// A seam that did both would let a delivery failure reach the signing key.
-pub trait SenderCredentials: std::fmt::Debug {
+pub trait SenderCredentials: std::fmt::Debug + Send + Sync {
     /// The credential in force for one authorisation, when this host holds one.
     fn current(&self, sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential>;
 

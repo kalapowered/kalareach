@@ -1573,8 +1573,19 @@ impl DeliveryJournal {
         if as_u64(due_at) > now_ms {
             return Ok(Claim::Refused(ClaimRefusal::NotDue));
         }
-        let Some(content) = content else {
-            return Ok(Claim::Refused(ClaimRefusal::NoContent));
+        let next = next_action
+            .as_deref()
+            .and_then(crate::push::NextAction::from_stored)
+            .ok_or(DeliveryError::JournalUnreadable(
+                "a stored next action is not one this build writes",
+            ))?;
+        // A status question carries the notification identifier and no request, so a record whose
+        // request has gone with an earlier settlement can still be asked about. Anything that
+        // would present a request to a destination cannot.
+        let content = match content {
+            Some(content) => content,
+            None if next == crate::push::NextAction::Receipt => Vec::new(),
+            None => return Ok(Claim::Refused(ClaimRefusal::NoContent)),
         };
         let attempt = as_u64(attempts).saturating_add(1);
         transaction.execute(
@@ -1604,23 +1615,18 @@ impl DeliveryJournal {
             privacy_generation: as_u64(record_generation),
             destination: admitted_for,
             authority_digest,
-            next: next_action
-                .as_deref()
-                .and_then(crate::push::NextAction::from_stored)
-                .ok_or(DeliveryError::JournalUnreadable(
-                    "a stored next action is not one this build writes",
-                ))?,
+            next,
             content,
         })))
     }
 
     /// Records one state transition, its attempt row and its outbox row together.
     ///
-    /// A record whose outcome is unknown keeps the bytes it presented, whatever the caller asks
-    /// for. Reading the receipt means presenting the identical request again - the gateway claims
-    /// a notification identifier before anything reaches a provider and answers a repeat from what
-    /// it recorded - so a row that dropped its request could never be resolved. The retention is
-    /// named in [`crate::privacy::DeliveryOutbox::kept`] rather than being a quiet exception.
+    /// A settlement takes the bytes it presented with it, including the settlement that leaves
+    /// the outcome unknown. What resolves an unknown outcome is a question that carries the
+    /// notification identifier and nothing else, so there is nothing a retained request would be
+    /// for, and a request kept for a question nobody will ask with it is plaintext kept for
+    /// nothing.
     ///
     /// The transition is refused unless the record is still the one the caller claimed: in flight
     /// at exactly this attempt. Anything else is a settlement for work somebody else has already
@@ -1724,7 +1730,7 @@ impl DeliveryJournal {
             }
         } else if transition.state == DeliveryState::OutcomeUnknown {
             // An unknown outcome means the question can be asked again, and only a gateway answers
-            // one. An external service has no receipt to read, so section 25's marked uncertainty
+            // one. An external service has no such question, so section 25's marked uncertainty
             // is what the record says instead of a question nobody will ever put.
             Transition {
                 state: unresolved_for(kind),
@@ -1756,9 +1762,7 @@ impl DeliveryJournal {
                 SET state = ?2,
                     attempts = MAX(attempts, ?3),
                     detail = COALESCE(?4, detail),
-                    content = CASE
-                        WHEN ?5 = 1 OR ?2 IN ('in_flight', 'outcome_unknown') THEN content
-                        ELSE NULL END,
+                    content = CASE WHEN ?5 = 1 OR ?2 = 'in_flight' THEN content ELSE NULL END,
                     suppression_reason = COALESCE(?6, suppression_reason),
                     suppression_into = COALESCE(?7, suppression_into),
                     suppression_count = COALESCE(?8, suppression_count),
@@ -1831,6 +1835,10 @@ impl DeliveryJournal {
     /// passed: section 16 stops retrying at expiry, and the read is where that is kept rather
     /// than every sender remembering it.
     ///
+    /// A record with no request left is selected only when what is due is a status question,
+    /// which carries the notification identifier and nothing else. Anything that would present a
+    /// request needs one to present.
+    ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
@@ -1844,7 +1852,8 @@ impl DeliveryJournal {
                     n.privacy_generation, n.content
                FROM delivery_outbox o JOIN delivery_notifications n
                  ON n.notification_id = o.notification_id
-              WHERE o.due_at_ms <= ?1 AND n.content IS NOT NULL
+              WHERE o.due_at_ms <= ?1
+                AND (n.content IS NOT NULL OR o.next_action = 'receipt')
                 AND n.expires_at_ms > ?1
                 AND n.privacy_generation = ?3
               ORDER BY o.due_at_ms, n.admitted_at_ms
@@ -1859,7 +1868,7 @@ impl DeliveryJournal {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
                 ))
             },
         )?;
@@ -2481,10 +2490,11 @@ impl DeliveryJournal {
     /// finished: a pass calls it before it selects.
     ///
     /// What each row becomes depends on whether it ever left. One nothing dispatched is
-    /// [`DeliveryState::Expired`] and its bytes go. One that reached the gateway is
+    /// [`DeliveryState::Expired`]. One that reached the gateway is
     /// [`DeliveryState::OutcomeUnknown`]: an expiry this host observed says when this host stopped
-    /// waiting, not what became of a notification somebody else is holding, and the request bytes
-    /// stay so a receipt read can still answer it.
+    /// waiting, not what became of a notification somebody else is holding. Either way the
+    /// request bytes go: what can still answer an unknown outcome is a question about its
+    /// identifier.
     ///
     /// A row an attempt is on the wire for is left alone: the pass that claimed it owns it.
     ///
@@ -2655,11 +2665,7 @@ impl DeliveryJournal {
                 ],
             )?;
             transaction.execute(
-                // An answer that leaves the outcome unknown answers nothing, so the request that
-                // asks the question again stays. Every other settlement takes it.
-                "UPDATE delivery_notifications
-                    SET state = ?2, detail = ?3,
-                        content = CASE WHEN ?2 = 'outcome_unknown' THEN content ELSE NULL END
+                "UPDATE delivery_notifications SET state = ?2, detail = ?3, content = NULL
                   WHERE notification_id = ?1",
                 params![identifier, state.as_str(), detail],
             )?;
@@ -2736,7 +2742,7 @@ impl DeliveryJournal {
     /// Two kinds, and both belong here. An attempt that was on the wire when this host stopped is
     /// still marked in flight and nothing will move it on its own. A row already settled as an
     /// unknown outcome is the same question asked earlier, and section 23 leaves it alone until
-    /// something reads the receipt. A reconciliation pass is what reads it; the automatic loop
+    /// something asks what became of it. A reconciliation pass asks; the automatic loop
     /// never does.
     ///
     /// Section 24 resumes *only what is still authorised*, so the caller checks each one's
@@ -3123,12 +3129,10 @@ fn settle_in(
         ],
     )?;
     transaction.execute(
-        // The request bytes go with the settlement, except for the one state a receipt can still
-        // resolve: reading a receipt means presenting the identical request, so a record that
-        // dropped it could never be reconciled.
+        // The request bytes go with every settlement. What resolves an unknown outcome is a
+        // question about its identifier, not the request again, so nothing needs them.
         "UPDATE delivery_notifications
-            SET state = ?4, attempts = MAX(attempts, ?2), detail = ?3,
-                content = CASE WHEN ?4 = 'outcome_unknown' THEN content ELSE NULL END
+            SET state = ?4, attempts = MAX(attempts, ?2), detail = ?3, content = NULL
           WHERE notification_id = ?1",
         params![identifier, as_i64(attempt), detail, state.as_str()],
     )?;
@@ -3349,7 +3353,7 @@ const SCHEMA: &str = "
         dispatched INTEGER NOT NULL DEFAULT 0,
         -- The kind of destination this was admitted for, written once. A destination row can be
         -- configured again as another kind under the same identifier, and what a settlement means
-        -- depends on what this delivery was: a paired device can be asked for a receipt and a
+        -- depends on what this delivery was: a paired device's gateway can be asked and a
         -- webhook cannot.
         destination_kind TEXT NOT NULL,
         UNIQUE (event_key, destination_id)
@@ -3453,7 +3457,7 @@ mod tests {
         }
     }
 
-    /// A paired device, which is the destination whose outcome a receipt can still resolve.
+    /// A paired device, which is the destination whose outcome a status question can resolve.
     fn phone() -> DestinationRecord {
         let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
         DestinationRecord {
@@ -3907,7 +3911,7 @@ mod tests {
         assert_eq!(
             record.state,
             DeliveryState::DuplicateUncertain,
-            "an external service has no receipt to read, so section 25's uncertainty is what is \
+            "an external service has no such question, so section 25's uncertainty is what is \
              recorded"
         );
         assert!(
@@ -4130,8 +4134,8 @@ mod tests {
                 .expect("the record");
             assert_eq!(record.state, DeliveryState::OutcomeUnknown);
             assert!(
-                record.content.is_some(),
-                "the request that asks the question again stays"
+                record.content.is_none(),
+                "and the request goes: what answers this is the identifier, not the request again"
             );
             assert_eq!(journal.outstanding().expect("a count"), 1);
         }
@@ -4280,15 +4284,18 @@ mod tests {
         assert_eq!(
             record.state,
             DeliveryState::OutcomeUnknown,
-            "it was admitted for a paired device, and a receipt can still account for it"
+            "it was admitted for a paired device, whose gateway can still account for it"
         );
-        assert!(record.content.is_some());
+        assert!(
+            record.content.is_none(),
+            "the request goes with every settlement"
+        );
     }
 
-    /// A receipt answered after privacy mode drew its boundary is recorded and queues nothing, and
-    /// an answer that leaves the outcome unknown keeps the request that asks the question again.
+    /// An answer that arrives after privacy mode drew its boundary is recorded and queues
+    /// nothing, and an answer that leaves the outcome unknown leaves the record uncertain.
     #[test]
-    fn a_receipt_answered_after_a_boundary_queues_nothing_and_keeps_its_request() {
+    fn an_answer_after_a_boundary_queues_nothing_and_keeps_the_outcome_unknown() {
         let mut journal = journal();
         journal
             .configure_destination(&phone())
@@ -4342,8 +4349,9 @@ mod tests {
             .expect("the record");
         assert_eq!(record.state, DeliveryState::OutcomeUnknown);
         assert!(
-            record.content.is_some(),
-            "an answer that resolves nothing leaves the question askable"
+            record.content.is_none(),
+            "an answer that resolves nothing leaves the record where it was, and the question is \
+             asked with the identifier rather than with the request"
         );
         assert!(
             journal.due(100_000, 10).expect("a read").is_empty(),
@@ -4355,7 +4363,7 @@ mod tests {
     /// The same boundary for a paired device: the gateway can still be asked what became of it,
     /// so the record keeps the question open and the request that asks it.
     #[test]
-    fn a_late_answer_for_a_device_keeps_the_question_the_receipt_answers() {
+    fn a_late_answer_for_a_device_keeps_the_outcome_the_gateway_still_holds() {
         let mut journal = journal();
         journal
             .configure_destination(&phone())
@@ -4389,7 +4397,7 @@ mod tests {
             .expect("a read")
             .expect("the record");
         assert_eq!(record.state, DeliveryState::OutcomeUnknown);
-        assert!(record.content.is_some(), "the receipt presents this again");
+        assert!(record.content.is_none(), "and nothing keeps its request");
         assert_eq!(
             journal.outstanding().expect("a count"),
             1,
@@ -4531,7 +4539,7 @@ mod tests {
     }
 
     /// The other half: a notification the gateway is holding outlives this host's own deadline, so
-    /// the expiry this host observed is not an outcome and the request bytes stay for the receipt.
+    /// the expiry this host observed is not an outcome, so the record stays uncertain.
     #[test]
     fn a_dispatched_delivery_that_expired_keeps_its_uncertainty_and_its_request() {
         let mut journal = journal();
@@ -4567,10 +4575,7 @@ mod tests {
             .expect("a read")
             .expect("the record");
         assert_eq!(record.state, DeliveryState::OutcomeUnknown);
-        assert!(
-            record.content.is_some(),
-            "the receipt can only be read with the same request"
-        );
+        assert!(record.content.is_none(), "and the request goes with it");
         assert_eq!(journal.outstanding().expect("a count"), 1);
     }
 

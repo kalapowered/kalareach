@@ -130,12 +130,6 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
                 why: "the burst and sustained limits are per destination and survive a restart; \
                       forgetting them would be a way to buy twenty more notifications",
             },
-            KeptExplicitly {
-                what: "the request bytes of a notification whose outcome is still unknown",
-                why: "section 24 reports completion only once in-flight work has been reconciled, \
-                      and asking the gateway what became of a notification means presenting that \
-                      request again; it goes as soon as the outcome is known",
-            },
         ]
     }
 
@@ -529,13 +523,17 @@ mod tests {
         let mut journal = journal_with_work();
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
         let kept = outbox.kept();
-        assert_eq!(kept.len(), 3);
+        assert_eq!(kept.len(), 2);
         assert!(
             kept.iter()
                 .any(|kept| kept.what.contains("delivery journal"))
         );
         assert!(kept.iter().any(|kept| kept.what.contains("rate allowance")));
-        assert!(kept.iter().any(|kept| kept.what.contains("request bytes")));
+        assert!(
+            !kept.iter().any(|kept| kept.what.contains("request bytes")),
+            "a settled delivery keeps no request: what resolves an unknown outcome is a question \
+             about its identifier"
+        );
     }
 
     #[test]

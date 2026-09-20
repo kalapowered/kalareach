@@ -19,6 +19,8 @@ clap.workspace = true
 iroh.workspace = true
 kr-cbor.workspace = true
 kr-changeset.workspace = true
+# The managed-service seams: one HTTP exchange and one signature, both supplied by the embedder.
+kr-client = { workspace = true, default-features = false }
 kr-crypto.workspace = true
 kr-delivery.workspace = true
 kr-ipc.workspace = true

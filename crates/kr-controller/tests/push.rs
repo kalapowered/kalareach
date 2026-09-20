@@ -22,7 +22,7 @@ use kr_delivery::destination::{
 use kr_delivery::external::{ExternalMessage, ExternalOutcome, ExternalSender};
 use kr_delivery::journal::{DeliveryState, EventSource};
 use kr_delivery::producer::{DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority};
-use kr_delivery::push::{PushSender, SendOutcome, SenderCredentials};
+use kr_delivery::push::{DeliveryStatus, PushSender, SendOutcome, SenderCredentials, StatusAnswer};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
@@ -48,7 +48,7 @@ const NOW: u64 = 1_700_000_000_000;
 struct GatewayDouble {
     answers: Mutex<Vec<SendOutcome>>,
     sent: Mutex<Vec<PushDeliveryRequest>>,
-    receipts: Mutex<u64>,
+    questions: Mutex<u64>,
 }
 
 impl GatewayDouble {
@@ -56,7 +56,7 @@ impl GatewayDouble {
         Self {
             answers: Mutex::new(answers),
             sent: Mutex::new(Vec::new()),
-            receipts: Mutex::new(0),
+            questions: Mutex::new(0),
         }
     }
 
@@ -88,9 +88,9 @@ impl GatewayDouble {
             .clone()
     }
 
-    /// How many times a receipt was read rather than a delivery presented as new work.
-    fn receipts(&self) -> u64 {
-        *self.receipts.lock().expect("the double is not poisoned")
+    /// How many status questions were put, rather than deliveries presented as new work.
+    fn questions(&self) -> u64 {
+        *self.questions.lock().expect("the double is not poisoned")
     }
 }
 
@@ -102,14 +102,59 @@ impl PushSender for GatewayDouble {
     ) -> SendOutcome {
         self.next(request)
     }
+}
 
-    fn receipt(
+/// The status route, which answers from what the double recorded and never delivers anything.
+///
+/// It draws from the same queue of answers as the delivery route, so a test writes one script for
+/// a notification whatever question happens to be put about it, and it records nothing in `sent`:
+/// asking is not sending, and a test that could not tell them apart would prove nothing.
+impl DeliveryStatus for GatewayDouble {
+    fn status(
         &self,
         _credential: &PushDeliveryCredential,
-        request: &PushDeliveryRequest,
-    ) -> SendOutcome {
-        *self.receipts.lock().expect("the double is not poisoned") += 1;
-        self.next(request)
+        notification_id: NotificationId,
+    ) -> StatusAnswer {
+        *self.questions.lock().expect("the double is not poisoned") += 1;
+        let answer = {
+            let mut answers = self.answers.lock().expect("the double is not poisoned");
+            if answers.is_empty() {
+                None
+            } else {
+                Some(answers.remove(0))
+            }
+        };
+        match answer {
+            Some(SendOutcome::Decided(ack)) => StatusAnswer::Recorded(ack),
+            Some(
+                SendOutcome::NotDispatched { detail }
+                | SendOutcome::Unknown { detail }
+                | SendOutcome::Forbidden { detail },
+            ) => StatusAnswer::Unanswered { detail },
+            // The unscripted answer is the one the delivery route gives: the provider took it.
+            None => StatusAnswer::Recorded(Box::new(PushDeliveryAck {
+                decided_at_ms: TimestampMs::new(NOW),
+                notification_id,
+                state: PushDeliveryState::Queued,
+                suppression: Nullable::null(),
+            })),
+        }
+    }
+}
+
+/// A gateway that answers no status question, which is what an unreachable one does.
+#[derive(Debug)]
+struct SilentStatus;
+
+impl DeliveryStatus for SilentStatus {
+    fn status(
+        &self,
+        _credential: &PushDeliveryCredential,
+        _notification_id: NotificationId,
+    ) -> StatusAnswer {
+        StatusAnswer::Unanswered {
+            detail: "the gateway did not answer".to_owned(),
+        }
     }
 }
 
@@ -438,6 +483,7 @@ fn a_provider_that_queued_it_is_recorded_as_queued() {
             .module
             .run_due(
                 &gateway,
+                &gateway,
                 &credentials,
                 &external,
                 &Granted(BTreeSet::new()),
@@ -480,6 +526,7 @@ fn what_reaches_the_gateway_carries_no_command_text_and_no_project_name() {
     environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
@@ -537,6 +584,7 @@ fn a_destination_with_previews_disabled_still_gets_the_alert() {
     environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
@@ -619,6 +667,7 @@ fn a_rejected_token_disables_the_destination() {
         .module
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -642,7 +691,7 @@ fn a_rejected_token_disables_the_destination() {
 /// KR-REQ-16.12 and section 23: an unknown outcome keeps what the receipt needs, and reading the
 /// receipt resolves it without ever presenting new work.
 #[test]
-fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
+fn an_unknown_outcome_is_resolved_by_asking_what_became_of_it() {
     let environment = environment();
     let destination = push_destination(&environment, true);
     environment
@@ -662,6 +711,7 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
         .module
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -674,8 +724,8 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
             let record = producer.journal().deliveries().expect("a read").remove(0);
             assert_eq!(record.state, DeliveryState::OutcomeUnknown);
             assert!(
-                record.content.is_some(),
-                "the request the receipt has to present is kept"
+                record.content.is_none(),
+                "and the request goes: the question carries the identifier, not the request"
             );
             assert!(record.dispatched);
             Ok(record.notification_id)
@@ -688,6 +738,7 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
             .module
             .run_due(
                 &gateway,
+                &gateway,
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &ExternalDouble::answering(Vec::new()),
                 &Granted(BTreeSet::new()),
@@ -697,10 +748,10 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
         0
     );
 
-    // The receipt does, and it is asked for rather than scheduled.
+    // The status question does, and it is asked for rather than scheduled.
     let resolved = environment
         .module
-        .read_receipts(
+        .resolve_unknown(
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 120_000),
@@ -708,7 +759,7 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
         .expect("a reconciliation");
     assert_eq!(resolved, 1);
     assert_eq!(
-        gateway.receipts(),
+        gateway.questions(),
         1,
         "the outcome was read rather than sent again"
     );
@@ -751,6 +802,7 @@ fn a_receipt_is_not_read_for_a_record_from_a_generation_that_has_ended() {
         .module
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -772,7 +824,7 @@ fn a_receipt_is_not_read_for_a_record_from_a_generation_that_has_ended() {
         .expect("a boundary");
     let resolved = environment
         .module
-        .read_receipts(
+        .resolve_unknown(
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 120_000),
@@ -780,7 +832,7 @@ fn a_receipt_is_not_read_for_a_record_from_a_generation_that_has_ended() {
         .expect("a reconciliation");
     assert_eq!(resolved, 0);
     assert_eq!(
-        gateway.receipts(),
+        gateway.questions(),
         0,
         "nothing from a generation that has ended is presented again"
     );
@@ -818,6 +870,7 @@ fn a_receipt_that_reports_a_rejected_token_takes_the_destination_out_of_service(
         .module
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -826,7 +879,7 @@ fn a_receipt_that_reports_a_rejected_token_takes_the_destination_out_of_service(
         .expect("a pass");
     environment
         .module
-        .read_receipts(
+        .resolve_unknown(
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 120_000),
@@ -887,6 +940,7 @@ fn a_notification_that_expires_during_a_renewal_is_not_presented() {
         .module
         .run_due(
             &gateway,
+            &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -917,7 +971,7 @@ fn a_notification_that_expires_during_a_renewal_is_not_presented() {
 
 /// A receipt returning retrying preserves the content bytes and schedules receipt polling.
 #[test]
-fn a_receipt_answering_retrying_keeps_content_and_schedules_next_receipt_poll() {
+fn an_answer_of_retrying_schedules_the_next_status_question() {
     let environment = environment();
     let destination = push_destination(&environment, true);
     environment
@@ -951,6 +1005,7 @@ fn a_receipt_answering_retrying_keeps_content_and_schedules_next_receipt_poll() 
         .module
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -963,22 +1018,22 @@ fn a_receipt_answering_retrying_keeps_content_and_schedules_next_receipt_poll() 
         .with(|producer| {
             let record = producer.journal().deliveries().expect("a read").remove(0);
             assert_eq!(record.state, DeliveryState::OutcomeUnknown);
-            assert!(record.content.is_some());
+            assert!(record.content.is_none());
             Ok(record.notification_id)
         })
         .expect("a read");
 
-    // Reading the receipt returns retrying from gateway.
+    // The gateway answers that it is still retrying the provider.
     let resolved = environment
         .module
-        .read_receipts(
+        .resolve_unknown(
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 60_000),
         )
         .expect("a receipt pass");
     assert_eq!(resolved, 0, "retrying is not settled yet");
-    assert_eq!(gateway.receipts(), 1);
+    assert_eq!(gateway.questions(), 1);
 
     environment
         .module
@@ -990,17 +1045,18 @@ fn a_receipt_answering_retrying_keeps_content_and_schedules_next_receipt_poll() 
                 .expect("the record");
             assert_eq!(record.state, DeliveryState::Retrying);
             assert!(
-                record.content.is_some(),
-                "recovery data is kept while still retrying"
+                record.content.is_none(),
+                "and nothing presentable is kept: the next question carries the identifier"
             );
             Ok(())
         })
         .expect("a read");
 
-    // Next pass claims the due receipt poll and gateway now answers Queued.
+    // The next pass claims the scheduled question, and the gateway now answers queued.
     let attempted = environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
@@ -1009,7 +1065,7 @@ fn a_receipt_answering_retrying_keeps_content_and_schedules_next_receipt_poll() 
         )
         .expect("a pass");
     assert_eq!(attempted, 1);
-    assert_eq!(gateway.receipts(), 2, "the receipt was polled again");
+    assert_eq!(gateway.questions(), 2, "the receipt was polled again");
 
     environment
         .module
@@ -1026,9 +1082,9 @@ fn a_receipt_answering_retrying_keeps_content_and_schedules_next_receipt_poll() 
         .expect("a read");
 }
 
-/// Reading receipts is refused while the journal is privacy-fenced.
+/// A status question is not put while the journal is privacy-fenced.
 #[test]
-fn reading_receipts_is_refused_while_privacy_fenced() {
+fn a_status_question_is_refused_while_privacy_fenced() {
     let environment = environment();
     let destination = push_destination(&environment, true);
     environment
@@ -1047,6 +1103,7 @@ fn reading_receipts_is_refused_while_privacy_fenced() {
     environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
@@ -1069,18 +1126,18 @@ fn reading_receipts_is_refused_while_privacy_fenced() {
         })
         .expect("privacy pass");
 
-    // Reading receipts while fenced is refused without making requests.
+    // The pass is refused while fenced, and nothing is asked of anyone.
     let resolved = environment
         .module
-        .read_receipts(
+        .resolve_unknown(
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 2),
         )
-        .expect("read receipts");
+        .expect("a status pass");
     assert_eq!(resolved, 0);
     assert_eq!(
-        gateway.receipts(),
+        gateway.questions(),
         0,
         "no receipt request sent while fenced"
     );
@@ -1104,6 +1161,7 @@ fn a_delivery_whose_expiry_arrives_during_the_pass_is_settled_without_sending() 
     let attempted = environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
@@ -1149,6 +1207,7 @@ fn an_unknown_outcome_is_recorded_and_left_alone() {
         .module
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -1172,6 +1231,7 @@ fn an_unknown_outcome_is_recorded_and_left_alone() {
         environment
             .module
             .run_due(
+                &gateway,
                 &gateway,
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &ExternalDouble::answering(Vec::new()),
@@ -1205,6 +1265,7 @@ fn a_credential_close_to_expiry_is_renewed_before_it_is_used() {
         .module
         .run_due(
             &GatewayDouble::queued(),
+            &SilentStatus,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -1240,6 +1301,7 @@ fn a_refused_credential_is_renewed_rather_than_presented_again() {
     environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
@@ -1291,13 +1353,14 @@ fn a_notification_the_gateway_is_holding_is_asked_about_rather_than_sent_again()
         .module
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
             &at(NOW),
         )
         .expect("a pass");
-    assert_eq!(gateway.receipts(), 0, "the first attempt is a delivery");
+    assert_eq!(gateway.questions(), 0, "the first attempt is a delivery");
 
     // The module is opened again over the same journal, so nothing is remembered in memory.
     let reopened = DeliveryModule::open_at(
@@ -1309,6 +1372,7 @@ fn a_notification_the_gateway_is_holding_is_asked_about_rather_than_sent_again()
     reopened
         .run_due(
             &gateway,
+            &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -1316,7 +1380,7 @@ fn a_notification_the_gateway_is_holding_is_asked_about_rather_than_sent_again()
         )
         .expect("a pass");
     assert_eq!(
-        gateway.receipts(),
+        gateway.questions(),
         1,
         "the second attempt reads the decision the gateway already holds"
     );
@@ -1353,6 +1417,7 @@ fn a_delivery_is_not_presented_again_until_the_renewal_has_happened() {
         .module
         .run_due(
             &gateway,
+            &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
             &Granted(BTreeSet::new()),
@@ -1365,6 +1430,7 @@ fn a_delivery_is_not_presented_again_until_the_renewal_has_happened() {
     environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
@@ -1638,6 +1704,7 @@ fn an_external_message_never_claims_to_be_private() {
         .module
         .run_due(
             &GatewayDouble::queued(),
+            &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
             &Granted([session()].into_iter().collect()),
@@ -1685,6 +1752,7 @@ fn a_destination_without_an_idempotent_identifier_is_not_sent_to_twice() {
     environment
         .module
         .run_due(
+            &GatewayDouble::queued(),
             &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
@@ -1752,6 +1820,7 @@ fn a_destination_whose_endpoint_changed_after_admission_is_not_sent_to() {
         .module
         .run_due(
             &GatewayDouble::queued(),
+            &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
             &Granted([session()].into_iter().collect()),
@@ -1814,6 +1883,7 @@ fn a_pass_sends_to_the_destination_its_claim_validated() {
     environment
         .module
         .run_due(
+            &GatewayDouble::queued(),
             &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
@@ -1930,6 +2000,7 @@ fn an_external_message_that_expires_during_the_authority_lookup_is_not_sent() {
         .module
         .run_due(
             &GatewayDouble::queued(),
+            &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
             &authority,
@@ -1996,13 +2067,18 @@ fn disabling_a_rejected_token_keeps_the_configuration_written_while_it_was_asked
                 suppression: Nullable::null(),
             }))
         }
+    }
 
-        fn receipt(
+    /// It answers no status question: the test is about what a send does.
+    impl DeliveryStatus for RotatingGateway<'_> {
+        fn status(
             &self,
-            credential: &PushDeliveryCredential,
-            request: &PushDeliveryRequest,
-        ) -> SendOutcome {
-            self.send(credential, request)
+            _credential: &PushDeliveryCredential,
+            _notification_id: NotificationId,
+        ) -> StatusAnswer {
+            StatusAnswer::Unanswered {
+                detail: "this gateway answers sends only".to_owned(),
+            }
         }
     }
 
@@ -2016,6 +2092,7 @@ fn disabling_a_rejected_token_keeps_the_configuration_written_while_it_was_asked
     environment
         .module
         .run_due(
+            &gateway,
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
@@ -2077,6 +2154,7 @@ fn an_external_delivery_whose_grant_changed_after_admission_sends_nothing() {
     environment
         .module
         .run_due(
+            &GatewayDouble::queued(),
             &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
@@ -2346,10 +2424,11 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
             .module
             .run_due(
                 &GatewayDouble::queued(),
+                &GatewayDouble::queued(),
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &ExternalDouble::answering(Vec::new()),
                 &Granted(BTreeSet::new()),
-                &at(NOW + 2),
+                &at(NOW + 2)
             )
             .expect("a pass"),
         0
@@ -2495,6 +2574,7 @@ async fn controller_startup_constructs_delivery_module_and_runs_pass() {
 
     let attempted = delivery
         .run_due(
+            &gateway,
             &gateway,
             &credentials,
             &external,
@@ -2798,4 +2878,107 @@ fn message_from_restores_withheld_metadata_and_rejects_invalid_timestamps() {
     invalid_json["interval"]["from_ms"] = serde_json::json!("not_a_number");
     let invalid_bytes = serde_json::to_vec(&invalid_json).expect("serialized");
     assert!(kr_controller::push::client::message_from(&invalid_bytes).is_err());
+}
+
+/// The question that resolves an unknown outcome carries an identifier and no request, so it
+/// cannot deliver the notification it is about. A question nobody answers resolves nothing, and
+/// the record stays outstanding and listed rather than being settled by assumption.
+#[test]
+fn an_unknown_outcome_is_resolved_by_a_question_that_carries_no_notification() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Unknown {
+        detail: "the connection was reset after the body was written".to_owned(),
+    }]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+
+    // Nobody answers. The record keeps its uncertainty, and nothing was presented to anyone.
+    assert_eq!(
+        environment
+            .module
+            .resolve_unknown(
+                &SilentStatus,
+                &held(NOW + 30 * 24 * 60 * 60 * 1000),
+                &at(NOW + 60_000),
+            )
+            .expect("a pass"),
+        0
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+            assert!(
+                record.content.is_none(),
+                "the request goes with the settlement: what answers this question is the \
+                 identifier, not the request again"
+            );
+            assert_eq!(producer.journal().outstanding().expect("a count"), 1);
+            let exported = producer.journal().exported().expect("a read");
+            assert_eq!(exported.len(), 1);
+            assert_eq!(exported[0].notification_id, record.notification_id);
+            assert_eq!(exported[0].destination_id, record.destination_id);
+            Ok(())
+        })
+        .expect("a read");
+    assert_eq!(
+        gateway.sent().len(),
+        1,
+        "asking is not sending, whatever the answer"
+    );
+
+    // The gateway answers the question, and only then is the record resolved.
+    let answering =
+        GatewayDouble::answering(vec![SendOutcome::Decided(Box::new(PushDeliveryAck {
+            decided_at_ms: TimestampMs::new(NOW + 60_000),
+            notification_id: NotificationId::new(uuid(0)),
+            state: PushDeliveryState::Queued,
+            suppression: Nullable::null(),
+        }))]);
+    assert_eq!(
+        environment
+            .module
+            .resolve_unknown(
+                &answering,
+                &held(NOW + 30 * 24 * 60 * 60 * 1000),
+                &at(NOW + 120_000),
+            )
+            .expect("a pass"),
+        1
+    );
+    assert_eq!(
+        answering.sent().len(),
+        0,
+        "and the route that answered it delivered nothing"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Accepted);
+            assert_eq!(producer.journal().outstanding().expect("a count"), 0);
+            Ok(())
+        })
+        .expect("a read");
 }

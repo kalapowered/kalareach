@@ -6,6 +6,9 @@
 //! types, so the host and the gateway agree by construction rather than by two descriptions of one
 //! document.
 //!
+//! Reading what became of a delivery is [`super::status`], on a route of its own. This client
+//! sends; it has no read.
+//!
 //! # Which failure is which
 //!
 //! Section 23 lets a request be retried automatically only when its receipt proves no dispatch.
@@ -171,26 +174,6 @@ impl PushSender for GatewayClient {
     ) -> SendOutcome {
         self.present(credential, request)
     }
-
-    fn receipt(
-        &self,
-        credential: &PushDeliveryCredential,
-        request: &PushDeliveryRequest,
-    ) -> SendOutcome {
-        // The identical request again, which for this gateway is a read.
-        //
-        // The contract it rests on is the gateway's own and is not an assumption: a delivery
-        // claims its notification identifier before anything reaches a provider, a repeat of a
-        // claimed identifier is answered from what was recorded - the settled outcome, or that it
-        // is still on its way - and a repeat that carries a different request under the same
-        // identifier is refused rather than sent. So the only case in which this dispatches is the
-        // one where the first request never reached the gateway at all, and there the
-        // notification has not been delivered to anybody.
-        //
-        // That is why the request bytes are retained for a record whose outcome is unknown: this
-        // is the only question that resolves one, and it can only be asked with the same bytes.
-        self.present(credential, request)
-    }
 }
 
 /// The standard envelope the gateway answers with.
@@ -285,7 +268,7 @@ struct StoredInterval {
 ///
 /// It is used once, in the header of one request, and never written anywhere. The secret's own
 /// debug rendering is a redaction, which is why this is spelled out here rather than formatted.
-fn bearer(bytes: &[u8]) -> String {
+pub(super) fn bearer(bytes: &[u8]) -> String {
     use base64::Engine as _;
 
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

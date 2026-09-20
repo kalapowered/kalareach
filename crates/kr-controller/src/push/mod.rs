@@ -35,7 +35,7 @@ use kr_delivery::journal::{
 };
 use kr_delivery::preview;
 use kr_delivery::producer::{Producer, RecipientAuthority};
-use kr_delivery::push::{NextAction, PushSender, SenderCredentials};
+use kr_delivery::push::{DeliveryStatus, NextAction, PushSender, SenderCredentials, StatusAnswer};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::method::Method;
 use kr_protocol::push::PushDeliveryRequest;
@@ -45,6 +45,7 @@ use crate::error::{ControllerError, Result};
 
 pub mod client;
 pub mod credentials;
+pub mod status;
 
 /// The file the environment's delivery journal lives in.
 pub const DELIVERY_JOURNAL: &str = "delivery.sqlite3";
@@ -306,26 +307,26 @@ impl DeliveryModule {
         })
     }
 
-    /// Reads the receipt of every delivery whose outcome nobody knows.
+    /// Asks the gateway what became of every delivery whose outcome nobody knows.
     ///
-    /// Section 23 keeps `OUTCOME_UNKNOWN` out of the automatic loop, so nothing schedules this: a
-    /// startup or a person asks for it. What it does is a **read** rather than a second send. The
-    /// gateway claims a notification identifier before anything reaches a provider and answers a
-    /// repeat of the identical request from the outcome it recorded, so presenting it again
-    /// returns what happened. The one case where it dispatches is the one where the first request
-    /// never arrived, and there the notification has not been delivered at all.
+    /// Section 23 keeps `OUTCOME_UNKNOWN` out of the automatic loop, so nothing here ever sends.
+    /// The question carries the notification identifier and no request, on a route that answers
+    /// from what the gateway recorded: asking cannot deliver the notification, which is what makes
+    /// it safe to ask at all. An answer the gateway does not have, and a question nobody answered,
+    /// both leave the record exactly where it was - outstanding, uncertain, and listed among the
+    /// copies this host cannot account for.
     ///
-    /// A record for a destination with no such read - an external service - never reaches here:
-    /// its uncertainty is marked at the attempt instead, which is section 25's own rule.
+    /// A record for a destination with no such question - an external service - never reaches
+    /// here: its uncertainty is marked at the attempt instead, which is section 25's own rule.
     ///
     /// Returns how many outcomes it resolved.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::Storage`] when the journal cannot be read or written.
-    pub fn read_receipts(
+    pub fn resolve_unknown(
         &self,
-        sender: &dyn PushSender,
+        status: &dyn DeliveryStatus,
         credentials: &dyn SenderCredentials,
         clock: &dyn Clock,
     ) -> Result<usize> {
@@ -345,12 +346,11 @@ impl DeliveryModule {
         })?;
         let mut resolved = 0;
         for record in unknown {
-            // A record admitted under a generation privacy mode has ended is not asked about. The
-            // request bytes are the only thing that resolves it, and presenting them is the one
-            // case where this could dispatch; nothing from a generation that has been walked past
-            // may leave this host again. Both are read again for every record, because a person
-            // can turn privacy mode on while this pass is waiting for an answer about the record
-            // before this one.
+            // A record admitted under a generation privacy mode has ended is not asked about.
+            // Nothing from a generation that has been walked past reaches the gateway again, and
+            // an identifier is something: it says this host had work for that installation. Both
+            // are read again for every record, because a person can turn privacy mode on while
+            // this pass is waiting for an answer about the record before this one.
             let (generation, fenced) = self.with(|producer| {
                 Ok((
                     producer.journal().generation().map_err(unavailable)?,
@@ -363,11 +363,6 @@ impl DeliveryModule {
             if record.privacy_generation != generation {
                 continue;
             }
-            let Some(content) = record.content else {
-                // Privacy mode removed what the receipt would present. The record stays as the
-                // artifact it is, and this host says so rather than asking about nothing.
-                continue;
-            };
             let Some(destination) = self.with(|producer| {
                 producer
                     .journal()
@@ -377,9 +372,9 @@ impl DeliveryModule {
             else {
                 continue;
             };
-            // The same request under the same authorisation, or not at all: a destination that is
-            // disabled, or one whose configuration is no longer the one this was admitted for, is
-            // not a destination this host may present content to.
+            // The same authorisation this was admitted under, or no question: a destination that
+            // is disabled, or one whose configuration is no longer the one this was admitted for,
+            // is not one this host may name its own work to.
             if !destination.enabled || destination.binding_digest() != record.destination_digest {
                 continue;
             }
@@ -389,15 +384,11 @@ impl DeliveryModule {
             let Some(credential) = credentials.current(push.sender_record_id) else {
                 continue;
             };
-            let request: PushDeliveryRequest =
-                serde_json::from_slice(&content).map_err(|error| ControllerError::Storage {
-                    operation: "read a queued notification",
-                    detail: error.to_string(),
-                })?;
-            let outcome = sender.receipt(&credential, &request);
+            let answer = status.status(&credential, record.notification_id);
             let now_ms = clock.now_ms();
-            let kr_delivery::push::SendOutcome::Decided(ack) = outcome else {
-                // Still nobody's answer. The record stays where it is.
+            let kr_delivery::push::StatusAnswer::Recorded(ack) = answer else {
+                // Nobody answered, or the gateway holds nothing under that identifier. Neither
+                // says what became of the notification, so neither settles it.
                 continue;
             };
             let decision = kr_delivery::push::decide(
@@ -407,9 +398,9 @@ impl DeliveryModule {
                 now_ms,
                 record.expires_at_ms,
             );
-            // A receipt carries the same answers a send does, so it carries the same consequences:
-            // a token the provider rejected goes out of service here as well, or the destination
-            // would keep its token until something happened to ask again.
+            // The answer carries the same consequences a send's answer does: a token the provider
+            // rejected goes out of service here as well, or the destination would keep its token
+            // until something happened to ask again.
             if decision.disable_destination {
                 self.disable(&destination)?;
             }
@@ -419,10 +410,13 @@ impl DeliveryModule {
                     .settle_receipt(record.notification_id, &decision, now_ms)
                     .map_err(unavailable)
             })?;
-            // What the journal wrote, not what this host proposed: an answer that left the
-            // outcome where it was resolved nothing, and counting it would report a question as
-            // answered while the destination still holds the notification.
-            resolved += usize::from(settled.is_some_and(|state| !state.is_outstanding()));
+            // What the journal wrote, not what this host proposed. An answer that leaves the
+            // outcome where it was, and an answer that asks for another question later, have both
+            // resolved nothing; counting either would report a question as answered while the
+            // destination still holds the notification.
+            resolved += usize::from(
+                settled.is_some_and(|state| state.is_settled() && !state.is_outstanding()),
+            );
         }
         Ok(resolved)
     }
@@ -447,6 +441,7 @@ impl DeliveryModule {
     pub fn run_due(
         &self,
         sender: &dyn PushSender,
+        status: &dyn DeliveryStatus,
         credentials: &dyn SenderCredentials,
         external: &dyn ExternalSender,
         authority: &dyn RecipientAuthority,
@@ -528,7 +523,15 @@ impl DeliveryModule {
             }
             attempted += 1;
             if record.as_push().is_some() {
-                self.attempt_push(&claimed, &record, sender, credentials, now_ms, clock)?;
+                self.attempt_push(
+                    &claimed,
+                    &record,
+                    sender,
+                    status,
+                    credentials,
+                    now_ms,
+                    clock,
+                )?;
             } else {
                 self.attempt_external(&claimed, &record, external, now_ms, clock)?;
             }
@@ -635,23 +638,18 @@ impl DeliveryModule {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attempt_push(
         &self,
         delivery: &ClaimedDelivery,
         record: &DestinationRecord,
         sender: &dyn PushSender,
+        status: &dyn DeliveryStatus,
         credentials: &dyn SenderCredentials,
         now_ms: u64,
         clock: &dyn Clock,
     ) -> Result<()> {
         let push = record.as_push().expect("a push destination");
-        let request: PushDeliveryRequest =
-            serde_json::from_slice(&delivery.content).map_err(|error| {
-                ControllerError::Storage {
-                    operation: "read a queued notification",
-                    detail: error.to_string(),
-                }
-            })?;
         // The claim already recorded this attempt as on the wire, in the transaction that took the
         // row: a host that stops in the middle finds a record that says an attempt was in flight
         // rather than one that says nothing happened.
@@ -694,14 +692,28 @@ impl DeliveryModule {
                 now_ms,
             );
         }
-        let outcome = if delivery.next == NextAction::Receipt {
-            // The gateway is holding this notification and retrying the provider itself. Asking
-            // what became of it is a read; presenting it as new work would be a second
-            // notification.
-            sender.receipt(&credential, &request)
-        } else {
-            sender.send(&credential, &request)
-        };
+        let outcome =
+            if delivery.next == NextAction::Receipt {
+                // The gateway is holding this notification and retrying the provider itself. What is
+                // asked is the identifier's recorded outcome, on the route that carries no request;
+                // presenting the delivery again would be a second notification.
+                match status.status(&credential, delivery.notification_id) {
+                    StatusAnswer::Recorded(ack) => kr_delivery::push::SendOutcome::Decided(ack),
+                    // The gateway holds nothing under the identifier, and nobody answering is the
+                    // same for this host: neither says what became of the notification, and neither
+                    // is a reason to present it again.
+                    StatusAnswer::NoRecord { detail } | StatusAnswer::Unanswered { detail } => {
+                        kr_delivery::push::SendOutcome::Unknown { detail }
+                    }
+                }
+            } else {
+                let request: PushDeliveryRequest = serde_json::from_slice(&delivery.content)
+                    .map_err(|error| ControllerError::Storage {
+                        operation: "read a queued notification",
+                        detail: error.to_string(),
+                    })?;
+                sender.send(&credential, &request)
+            };
         // The answer arrived now, not when the pass started. Everything that follows - whether
         // there is time for another attempt, when it is due, what the attempt row is stamped
         // with - is decided from this reading.
