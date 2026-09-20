@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,15 +74,41 @@ fn gates() -> std::path::PathBuf {
 
 /// The shell that waits for one of those files to appear.
 fn waits_for(gates: &std::path::Path, gate: &str) -> String {
-    format!(
-        "while [ ! -e {} ]; do sleep 0.05; done",
-        gates.join(gate).display()
-    )
+    let fifo = gates.join(gate);
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success(), "mkfifo {}", fifo.display());
+    format!("read -r _ < {}", fifo.display())
 }
 
 /// Lets the application past one.
 fn open_gate(gates: &std::path::Path, gate: &str) {
-    std::fs::write(gates.join(gate), b"").expect("opens a gate the application is waiting on");
+    let fifo = gates.join(gate);
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(mut file) => {
+                file.write_all(b"\n")
+                    .expect("writes the trigger into the gate FIFO");
+                return;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for application to open gate FIFO at {}",
+                    fifo.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("opening gate FIFO at {}: {err}", fifo.display()),
+        }
+    }
 }
 
 async fn hosted(script: &str) -> Hosted {
@@ -383,7 +410,7 @@ fn saw(haystack: &[u8], needle: &[u8]) -> bool {
 fn shell_running(hosted: &Hosted, command_line: &str) -> CommandBuilder {
     let mut builder = CommandBuilder::new("/bin/sh");
     builder.arg("-c");
-    builder.arg(command_line);
+    builder.arg(format!("{command_line}; read -r _"));
     builder.env_clear();
     builder.env("PATH", "/usr/bin:/bin");
     builder.env("TERM", "xterm-256color");
@@ -679,7 +706,7 @@ fn answer_and_type(
 fn answer_keyboard_and_mode_queries(
     output: &TerminalOutput,
     mut writer: Box<dyn std::io::Write + Send>,
-) {
+) -> std::thread::JoinHandle<()> {
     let output = output.clone();
     std::thread::spawn(move || {
         output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
@@ -688,7 +715,7 @@ fn answer_keyboard_and_mode_queries(
             b"\x1b[?5u\x1b[>4;2m\x1b[?25;2$y\x1b[?1000;1$y\x1b[?1002;2$y\x1b[?1003;2$y\x1b[?1006;2$y\x1b[?2004;1$y\x1b[?62;22c",
         );
         let _ = writer.flush();
-    });
+    })
 }
 
 /// What the terminal above reported, and therefore what it is owed back.
@@ -888,7 +915,7 @@ fn stack_operations(bytes: &[u8]) -> usize {
 /// back after the attach process is killed outright, because the guard is holding them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
-    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1003,7 +1030,7 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
 /// process is killed outright here, so the only thing that can put them back is the guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill() {
-    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1024,11 +1051,21 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
+    let queries =
+        answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
         b"ready",
         LIVENESS_DEADLINE,
         "the session's output reached the terminal",
+    );
+    answered(queries);
+
+    let during = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+    assert!(
+        !during
+            .local_modes
+            .contains(rustix::termios::LocalModes::ICANON),
+        "the attachment put the terminal into raw mode"
     );
 
     let attach = attach_process(shell.process_id().expect("the shell has an identifier"));
@@ -1042,6 +1079,11 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
         .status()
         .expect("sends the signal");
     assert!(killed.success(), "the attach process was killed");
+
+    let _after = canonical_again(
+        &pty,
+        "the guard put the terminal back after the attach process was killed",
+    );
 
     // The guard writes the reset block and then this terminal's own values over it. Waiting for the
     // cursor's own value is waiting for the whole of that, because it is written in one go.
@@ -1091,7 +1133,7 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
 /// mouse reporting they had, which nothing in the failed attempt ever touched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_it_reported() {
-    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
     // A second session, published and never served: its endpoint has no listener, so the command
     // resolves it, asks the terminal what it is, and then fails to reach the worker.
     let unreachable = DisplayNumber::new(2);
@@ -1129,9 +1171,11 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
+    let queries =
+        answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
 
     output.expect_within(b"attach-finished-", LIVENESS_DEADLINE, "the attach ended");
+    answered(queries);
     assert!(
         !output.contains(b"attach-finished-0"),
         "and it failed, because nothing is listening on that endpoint: {}",
@@ -1143,9 +1187,9 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
         "the terminal was asked what its mouse reporting was: {}",
         output.text().escape_debug()
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
     while Instant::now() < deadline && mouse_tracking(&output.bytes()) != Some(1000) {
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
         mouse_tracking(&output.bytes()),
@@ -1167,7 +1211,7 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
 /// this process rather than in the guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn detaching_from_another_window_ends_the_attachment_and_restores_its_terminal() {
-    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1292,7 +1336,7 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
     let gates = gates();
     let hosted = hosted(&format!(
         "printf 'kr-up.\\n'; {}; printf '\\033[<65535u'; printf 'kr-popped.\\n'; \
-         while true; do echo ready; sleep 1; done",
+         printf 'ready\\r\\n'; exec cat",
         waits_for(&gates, "pop")
     ))
     .await;
@@ -1401,7 +1445,7 @@ async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keep
     // Section 8: the capability handshake is bounded and ends with the device-attributes
     // terminator. A terminal that never sends it may still send a late reply, so the attachment
     // fails rather than beginning to forward live input on that stream.
-    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1498,7 +1542,7 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
     // attachment could have changed it, which is once it forwards. An attach that asked the
     // terminal what it was and then failed on its way to the session changed nothing, so its
     // cleanup puts the modes back and leaves the protocols the person set up for themselves.
-    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
     // A second display whose descriptor names an endpoint nothing is listening on. The command
     // reaches the terminal, completes the handshake, and then fails to reach the session.
     let unreachable = DisplayNumber::new(2);
@@ -1579,7 +1623,7 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
     // then change its keyboard protocols: the host serves such an attachment a screen that installs
     // none, and the command opens no stack entry of its own, so a person who had negotiated a
     // keyboard protocol for themselves still has exactly that afterwards.
-    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1616,6 +1660,12 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
     let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
 
     // And typing does not end it: the bytes go nowhere rather than becoming a refused request.
+    // Contract justification (§8, KR-REQ-08.84): An attachment started with `--no-probe` is granted
+    // no input lease (`epoch: None`). The CLI client locally drops all keystrokes from the terminal
+    // rather than submitting `input.write` calls that the worker would refuse with `LeaseLost`.
+    // Because the CLI locally suppresses unleased keystrokes without producing an observable event,
+    // this test uses a bounded quiet window of 300 ms to verify that the attachment process remains
+    // watching without terminating.
     pty.master
         .take_writer()
         .expect("a writer")
@@ -1764,14 +1814,14 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // including the end-of-file byte: the outer worker treats the inner command as an ordinary
     // foreground application, so no root-only interception of its own is in the way.
     types(b"kr-nested-typing\x04");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
     let mut seen = Vec::new();
     while Instant::now() < deadline {
         seen = application_saw(&inner);
         if saw(&seen, b"kr-nested-typing") && seen.contains(&0x04) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
         saw(&seen, b"kr-nested-typing"),
@@ -1822,14 +1872,14 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // a paste it cannot tell from typing.
     types(b"\x1b[200~kr-pasted\x1b[201~");
     let framed = &b"\x1b[200~kr-pasted\x1b[201~"[..];
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
     let mut pasted = Vec::new();
     while Instant::now() < deadline {
         pasted = application_saw(&inner);
         if saw(&pasted, framed) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
         saw(&pasted, framed),
