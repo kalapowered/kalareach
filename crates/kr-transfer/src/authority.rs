@@ -1836,8 +1836,7 @@ fn read_linux_access_control(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result
                     Err(err) => return Err(err.into()),
                 }
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "access-control list attribute was repeatedly resized during read",
             ))
         }
