@@ -151,14 +151,16 @@ the same compare-and-swap discipline and the same sealing seam.
   because absence and unreachability are not the same answer.
 - An answer this device cannot make sense of leaves the work outstanding. Only an accepted write
   and a refused comparison say what became of a publication; anything else, including an abandoned
-  call and a restart, leaves a durable record saying it was sent. `SyncClient::reconcile` asks the
-  service what it holds now and settles each one, which is what lets `outstanding` reach nought
-  honestly.
+  call and a restart, leaves a durable record saying it was sent. This contract offers no way to
+  ask what became of one request: a service takes a comparison and answers with a generation, and
+  what it holds afterwards is a fact about the object rather than about any one write of it. So a
+  later definite answer about that object retires the earlier dispatch, and what it may have sent
+  is listed by `exported` as content sent without an answer rather than resolved.
 
 `sync::StorageFeature` names the three parts of what section 18 offers: encrypted settings sync,
-which is this module; optional history backups; and recovery material, which is what a restore
-without another device needs. Only history backups are optional, and each part carries what a
-person does without it.
+which is this module; history backups; and recovery material, which is what a restore without
+another device needs. The last two are optional, which is what sections 18 and 20 call them, and
+each part carries what a person does without it.
 
 ### Privacy mode
 
@@ -170,8 +172,8 @@ client never depends on a host crate:
 | --- | --- |
 | `fence` | Stops production at the generation. A publication after it is refused. |
 | `cancel_undispatched` | Discards the staged ciphertext that was admitted and never sent, and counts what had already been dispatched, which cannot be taken back. |
-| `remove_retained` | Removes the conflict copies, the checkpoints and the staged work that never left, and reports the bytes and records it actually deleted. Work already dispatched keeps its record, because that record is what says it may be out there. |
-| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and `reconcile` is what gets it there. |
+| `remove_retained` | Removes the conflict copies, the checkpoints and the staged work that never left, and reports the bytes and records it actually deleted. Work already dispatched keeps its record, because that record is what says it may be out there, and work admitted under a later generation is another cleanup's. |
+| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and a later definite answer about the same object is what gets it there. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
 | `exported` | What has already left, shown rather than claimed to be erased, including a write the service accepted after the fence: suppressing a result does not undo an upload. None of it is deletable from here, because a compare-and-exchange store takes a replacement and not a deletion. |
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |

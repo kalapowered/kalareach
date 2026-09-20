@@ -224,12 +224,21 @@ describe('envelope vectors', () => {
     altered[altered.length - 1] ^= 0x01
     expect(verify(null, Buffer.from(altered), publicKey, Buffer.from(signature))).toBe(false)
 
-    // The envelope's payload is the object's canonical encoding and nothing else, which is what
-    // makes the envelope a delivery rather than an authorisation.
+    // The envelope's payload is this very object's canonical encoding and nothing else, which is
+    // what makes the envelope a delivery rather than an authorisation. It is rebuilt field by
+    // field, so a payload carrying a different object cannot pass while the transcript above does.
     const payload = hexToBytes(section.payload_canonical_hex)
-    const object = decodeCanonical(payload)
-    expect(object.kind).toBe('map')
-    expect(bytesToHex(encodeCanonical(object))).toBe(section.payload_canonical_hex)
+    const rebuilt = krMap([['revocation_request', krMap([
+      ['request_id', krBytes(uuidToBytes(request.request_id))],
+      ['issuer_device_id', krBytes(uuidToBytes(request.issuer_device_id))],
+      ['host_device_id', krBytes(uuidToBytes(request.host_device_id))],
+      ['target', transcript.items[4]],
+      ['issued_at_ms', { kind: 'int', value: BigInt(request.issued_at_ms) }],
+      ['issuer_key_id', krBytes(fromBase64url(request.issuer_key_id))],
+      ['signature', krBytes(signature)]
+    ])]])
+    expect(bytesToHex(encodeCanonical(rebuilt))).toBe(section.payload_canonical_hex)
+    expect(decodeCanonical(payload)).toEqual(rebuilt)
     expect(section.envelope.plaintext_json.payload).toBe(
       Buffer.from(payload).toString('base64url')
     )

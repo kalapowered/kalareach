@@ -54,12 +54,12 @@ use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 pub use client::{
-    Cancelled, Exported, Fenced, KeptExplicitly, Published, Reconciled, Removed, Restored, Resumed,
-    SyncClient, fresh_object_id, fresh_revision,
+    Cancelled, Exported, Fenced, KeptExplicitly, Published, Removed, Restored, Resumed, SyncClient,
+    fresh_object_id, fresh_revision,
 };
 pub use store::{
     ConflictCopy, Listing, Outcome, PinnedLabel, PrivacyRecord, Publication, Result, Settlement,
-    Staged, SyncCheckpoint, SyncError, SyncStore,
+    Staged, SyncCheckpoint, SyncError, SyncStore, Uncertain,
 };
 
 /// What section 18 bullet 5 offers, part by part.
@@ -243,6 +243,21 @@ impl ClientSelection {
             session_id: Nullable::null(),
             rows_from_newest: U64::new(0),
         }
+    }
+}
+
+/// A buffer of plaintext this library owns, cleared when it goes out of scope.
+///
+/// A statement that clears a buffer is skipped by an early return and by an unwinding panic. This
+/// is not: dropping it clears it, on every path out. It covers the buffers this crate allocates
+/// itself; the intermediate value trees the encoder builds belong to the crate that owns the
+/// encoder, and the cryptography reference records that.
+#[derive(Debug)]
+pub(crate) struct Zeroising(pub Vec<u8>);
+
+impl Drop for Zeroising {
+    fn drop(&mut self) {
+        kr_crypto::zeroise(&mut self.0);
     }
 }
 

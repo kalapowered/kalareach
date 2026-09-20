@@ -1119,7 +1119,7 @@ async fn a_result_produced_under_an_earlier_generation_is_not_published() {
 }
 
 #[tokio::test]
-async fn a_publication_whose_caller_walked_away_stays_outstanding_until_it_is_reconciled() {
+async fn a_publication_whose_caller_walked_away_stays_outstanding_until_a_later_answer() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(GatedService::new());
     let store = SyncStore::open(directory.path().join("one")).expect("a store");
@@ -1175,47 +1175,119 @@ async fn a_publication_whose_caller_walked_away_stays_outstanding_until_it_is_re
     );
     assert_eq!(reopened.outstanding().expect("a count"), 1);
 
-    // Reconciliation is what settles it: it asks the service what it holds now. Here the write
-    // never reached the store behind the gate, so the object is absent and the outcome stays
-    // unknown.
-    let reconciled = reopened
-        .reconcile(TimestampMs::new(NOW + 1))
-        .await
-        .expect("asked");
-    assert_eq!(reconciled.settled, 0);
-    assert_eq!(reconciled.unknown, 1);
-    assert_eq!(reopened.outstanding().expect("a count"), 1);
-
-    // Once the service can answer, and what it holds is this device's own revision, the work is
-    // finished and the count reaches nought honestly.
+    // What settles it is a later definite answer about the same object. This contract offers no
+    // way to ask what became of one request: a service takes a comparison and answers with a
+    // generation, and what it holds afterwards is a fact about the object rather than about any
+    // one write of it.
     service.let_it_go();
-    service
-        .inner
-        .compare_exchange(
-            &sync_collection(SyncObjectKind::Settings, object_id),
-            0,
-            &DeviceSealer::new(0x5a)
-                .seal(&kr_cbor::to_canonical_vec(&mine).expect("canonical bytes"))
-                .expect("sealed"),
-        )
-        .await
-        .expect("the write lands");
-    let reconciled = reopened
-        .reconcile(TimestampMs::new(NOW + 2))
-        .await
-        .expect("asked");
-    assert_eq!(reconciled.settled, 1);
-    assert_eq!(reopened.outstanding().expect("a count"), 0);
-    assert_eq!(
+    reopened.store().put_object(&mine).expect("stored");
+    assert!(matches!(
         reopened
-            .store()
-            .checkpoint(object_id)
-            .expect("a note")
-            .expect("one was written")
-            .generation
-            .get(),
+            .publish(object_id, TimestampMs::new(NOW + 2))
+            .await
+            .expect("answered"),
+        Published::Accepted { .. } | Published::Conflicted { .. }
+    ));
+    assert_eq!(
+        reopened.outstanding().expect("a count"),
+        0,
+        "a later answer about the object retires the earlier dispatch"
+    );
+
+    // What that earlier dispatch may have sent is kept, because it left this device and nothing
+    // here can say whether the service stored it.
+    let exported = reopened.exported().expect("exported");
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.kind.contains("sent without an answer")),
+        "what may have left is named rather than dropped: {exported:?}"
+    );
+    assert!(exported.iter().all(|entry| !entry.deletable));
+}
+
+#[tokio::test]
+async fn a_cleanup_keeps_the_record_of_work_that_had_already_left() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let store = SyncStore::open(directory.path().join("one")).expect("a store");
+    let client = Arc::new(SyncClient::new(
+        Arc::clone(&service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        store,
+    ));
+    let object_id = fresh_object_id().expect("an identity");
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    let publishing = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.publish(object_id, TimestampMs::new(NOW)).await }
+    });
+    service.wait_for_a_publication().await;
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // The whole cleanup, in the order section 24 states it. It must not make this device say
+    // nothing is outstanding while a write it sent has no answer.
+    client.fence(4).expect("fenced");
+    assert_eq!(
+        client.cancel_undispatched(4).expect("cancelled").in_flight,
         1
     );
+    client.remove_retained(4).expect("removed");
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        1,
+        "a cleanup does not settle a write that has left"
+    );
+    let staged = client.store().staged().expect("staged");
+    assert_eq!(staged.len(), 1);
+    assert!(staged.items[0].dispatched);
+
+    service.let_it_go();
+    let _ = publishing.await.expect("the task finished");
+}
+
+#[tokio::test]
+async fn a_fence_between_admission_and_dispatch_takes_the_work_back() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // Admitted under generation nought, and a fence lands before it is sent. The record is taken
+    // back rather than dispatched, which is what the cancellation would have done to it.
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    client.fence(9).expect("fenced");
+    assert!(matches!(
+        client.store().mark_dispatched(staged.work_id, object_id),
+        Err(SyncError::Fenced { generation: 9 })
+    ));
+    assert!(client.store().staged().expect("staged").is_empty());
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // And a publication started after the fence never reaches the service at all.
+    assert!(matches!(
+        client.publish(object_id, TimestampMs::new(NOW)).await,
+        Err(SyncError::Fenced { generation: 9 })
+    ));
+    assert!(service.collections().await.is_empty());
 }
 
 #[tokio::test]

@@ -33,7 +33,7 @@
 //! | [`SyncClient::fence`] | stop every content-bearing queue, at once |
 //! | [`SyncClient::cancel_undispatched`] | take back what was admitted and never dispatched |
 //! | [`SyncClient::remove_retained`] | remove the retained local content |
-//! | [`SyncClient::outstanding`] | how much in-flight work is still being reconciled |
+//! | [`SyncClient::outstanding`] | how much dispatched work has no settled outcome |
 //! | [`SyncClient::kept`] | what is kept, explicitly |
 //! | [`SyncClient::exported`] | what already left, which is shown rather than erased |
 //! | [`SyncClient::accepts_result`] | a result is published only under the generation in force |
@@ -50,10 +50,9 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    ConflictCopy, Outcome, PrivacyRecord, Result, Settlement, Staged, SyncCheckpoint, SyncError,
-    SyncStore,
+    ConflictCopy, Outcome, PrivacyRecord, Result, Settlement, SyncCheckpoint, SyncError, SyncStore,
 };
-use super::{SyncBody, SyncObject, SyncSettings, sync_collection};
+use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
 use crate::services::SyncBackupService;
 
@@ -306,8 +305,9 @@ impl SyncClient {
     /// read.
     ///
     /// An answer this device cannot make sense of leaves the work outstanding rather than throwing
-    /// it away: only an accepted write and a refused comparison say what became of it, and anything
-    /// else is reconciled by [`Self::reconcile`].
+    /// it away: only an accepted write and a refused comparison say what became of it. A later
+    /// definite answer about the same object retires it, and what it may have sent is kept in the
+    /// account of what may have left.
     ///
     /// # Errors
     ///
@@ -318,8 +318,8 @@ impl SyncClient {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = sync_collection(staged.kind, object_id);
 
-        // Written before the call leaves, so a device that stops here still knows this may have
-        // reached the service and does not later take it back as undispatched work.
+        // Written before the call leaves, and refused if a fence landed since admission: work that
+        // has not gone is work the fence still reaches, and it is taken back rather than sent.
         self.store.mark_dispatched(staged.work_id, object_id)?;
         let answer = self
             .service
@@ -330,105 +330,83 @@ impl SyncClient {
             )
             .await;
 
-        let outcome = match answer {
-            Ok(generation) => Outcome::Accepted {
-                generation: U64::new(generation),
-            },
+        match answer {
+            Ok(generation) => {
+                let settled = self.store.settle(
+                    &staged,
+                    Outcome::Accepted {
+                        generation: U64::new(generation),
+                    },
+                    now,
+                )?;
+                Ok(match settled {
+                    Settlement::Published | Settlement::AlreadySettled => {
+                        Published::Accepted { generation }
+                    }
+                    Settlement::Discarded {
+                        produced_under,
+                        current,
+                    } => Published::Discarded {
+                        produced_under,
+                        current,
+                    },
+                })
+            }
             Err(error) if error.code() == ErrorCode::DraftConflict => {
                 // The service answered the comparison and refused it, which is the one refusal that
-                // says nothing was written. What it holds instead comes down beside this device's
-                // own content.
+                // says nothing was written. That is settled first, so a fetch this device cannot
+                // make does not leave a refusal it already knows about sitting outstanding.
+                let settled = self.store.settle(&staged, Outcome::Refused, now)?;
+                if let Settlement::Discarded {
+                    produced_under,
+                    current,
+                } = settled
+                {
+                    return Ok(Published::Discarded {
+                        produced_under,
+                        current,
+                    });
+                }
                 let (generation, other) = self.fetch_current(&staged, &collection).await?;
-                Outcome::Conflicted {
-                    copy: Box::new(self.copy_of(
-                        object_id,
-                        staged.revision,
-                        Nullable::some(staged.expected_generation),
-                        U64::new(generation),
-                        &other,
-                        now,
-                    )?),
-                    generation: U64::new(generation),
+                let copy = self.copy_of(
+                    object_id,
+                    staged.revision,
+                    Nullable::some(staged.expected_generation),
+                    U64::new(generation),
+                    &other,
+                    now,
+                )?;
+                match self.store.apply_fetch(
+                    staged.produced_under.get(),
+                    Some(&copy),
+                    object_id,
+                    SyncCheckpoint {
+                        generation: U64::new(generation),
+                        // The generation is this device's to remember; the revision beside it is
+                        // not, because the revision that came down is the other device's.
+                        published_revision: Nullable::null(),
+                    },
+                )? {
+                    Settlement::Published | Settlement::AlreadySettled => {
+                        Ok(Published::Conflicted {
+                            copy: copy.conflict_id,
+                            other_revision: other.revision,
+                            generation,
+                        })
+                    }
+                    Settlement::Discarded {
+                        produced_under,
+                        current,
+                    } => Ok(Published::Discarded {
+                        produced_under,
+                        current,
+                    }),
                 }
             }
-            // Anything else leaves the outcome open. The staged record stays where reconciliation
-            // can see it rather than being retired on a guess about whether the write landed.
-            Err(error) => return Err(error.into()),
-        };
-
-        Ok(match self.store.settle(&staged, &outcome, now)? {
-            Settlement::Published => match outcome {
-                Outcome::Accepted { generation } => Published::Accepted {
-                    generation: generation.get(),
-                },
-                Outcome::Conflicted { copy, generation } => Published::Conflicted {
-                    copy: copy.conflict_id,
-                    other_revision: copy.other.revision,
-                    generation: generation.get(),
-                },
-            },
-            Settlement::Discarded {
-                produced_under,
-                current,
-            } => Published::Discarded {
-                produced_under,
-                current,
-            },
-        })
-    }
-
-    /// Settles the dispatched work this device has no answer for.
-    ///
-    /// A publication whose call was abandoned, whose connection failed, or that a restart found
-    /// staged, may or may not have reached the service. This asks: the object the service holds now
-    /// carries this device's revision, or it does not, and either way the work is finished. It is
-    /// the reconciliation that lets [`Self::outstanding`] reach nought honestly.
-    ///
-    /// # Errors
-    ///
-    /// Returns the service's refusal, and [`SyncError::Storage`] when a record cannot be read or
-    /// written. Work whose outcome is still unknown after this stays outstanding.
-    pub async fn reconcile(&self, now: TimestampMs) -> Result<Reconciled> {
-        let mut settled = 0_u64;
-        let mut unknown = 0_u64;
-        for staged in self.store.staged()?.items {
-            if !staged.dispatched {
-                continue;
-            }
-            let collection = sync_collection(staged.kind, staged.object_id);
-            let Ok((generation, ciphertext)) = self.service.fetch(&collection).await else {
-                unknown = unknown.saturating_add(1);
-                continue;
-            };
-            let Ok(held) = self.open_object(&collection, staged.object_id, &ciphertext) else {
-                unknown = unknown.saturating_add(1);
-                continue;
-            };
-            let outcome = if held.revision == staged.revision {
-                // This device's own write is what the service holds, so it landed.
-                Outcome::Accepted {
-                    generation: U64::new(generation),
-                }
-            } else {
-                // Somebody else's content is there. Whether this device's write landed and was
-                // replaced or never landed at all, what is on the service is not this device's, and
-                // the copy is what the person chooses from.
-                Outcome::Conflicted {
-                    copy: Box::new(self.copy_of(
-                        staged.object_id,
-                        staged.revision,
-                        Nullable::some(staged.expected_generation),
-                        U64::new(generation),
-                        &held,
-                        now,
-                    )?),
-                    generation: U64::new(generation),
-                }
-            };
-            self.store.settle(&staged, &outcome, now)?;
-            settled = settled.saturating_add(1);
+            // Anything else leaves the outcome open. The staged record stays where it counts as
+            // outstanding rather than being retired on a guess about whether the write landed.
+            Err(error) => Err(error.into()),
         }
-        Ok(Reconciled { settled, unknown })
     }
 
     /// Seals one object, clearing the encoding it made on the way.
@@ -440,7 +418,11 @@ impl SyncClient {
     }
 
     /// Fetches what the service holds now, diagnosing a service that has gone backwards.
-    async fn fetch_current(&self, staged: &Staged, collection: &str) -> Result<(u64, SyncObject)> {
+    async fn fetch_current(
+        &self,
+        staged: &super::Staged,
+        collection: &str,
+    ) -> Result<(u64, SyncObject)> {
         let (generation, ciphertext) = self.service.fetch(collection).await?;
         // A service that answers with a generation below the one this device's note names has gone
         // back behind it, which is what a reset or a replaced service looks like from here. That is
@@ -463,11 +445,13 @@ impl SyncClient {
     /// Applying a choice is the caller's own step, through [`SyncStore::put_object`].
     ///
     /// It is refused while privacy mode is on, because a copy and a note are retained sync content
-    /// and recreating either after the cleanup would undo it.
+    /// and recreating either after the cleanup would undo it. An answer that arrives after a fence
+    /// is refused for the same reason, and nothing it brought down is written.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Fenced`] while privacy mode is on, the service's refusal,
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::LateResult`] when a
+    /// fence landed while the answer was on its way, the service's refusal,
     /// [`SyncError::NotThatObject`] when the object that came down is not the one this collection
     /// was asked for, [`SyncError::DraftElsewhere`] when a draft is asked for, and
     /// [`SyncError::Storage`] when the copy or the note cannot be written.
@@ -499,29 +483,42 @@ impl SyncClient {
         // same object, which is a choice rather than a replacement.
         let held = self.store.object(object_id)?;
         let copy = match held {
-            Some(held) if held.revision != other.revision => {
-                let copy = self.copy_of(
-                    object_id,
-                    held.revision,
-                    // A fetch compares nothing. It asked what was there and was told.
-                    Nullable::null(),
-                    U64::new(generation),
-                    &other,
-                    now,
-                )?;
-                self.store.keep_conflict(&copy)?;
-                Some(copy.conflict_id)
-            }
+            Some(held) if held.revision != other.revision => Some(self.copy_of(
+                object_id,
+                held.revision,
+                // A fetch compares nothing. It asked what was there and was told.
+                Nullable::null(),
+                U64::new(generation),
+                &other,
+                now,
+            )?),
             _ => None,
         };
 
-        self.store.record_checkpoint(
+        // The copy and the note are written under one hold, against the generation this fetch was
+        // started under. A cleanup that landed while the answer was on its way finds nothing to
+        // undo, because nothing is written.
+        match self.store.apply_fetch(
+            privacy.generation.get(),
+            copy.as_ref(),
             object_id,
             SyncCheckpoint {
                 generation: U64::new(generation),
                 published_revision: Nullable::null(),
             },
-        )?;
+        )? {
+            Settlement::Published | Settlement::AlreadySettled => {}
+            Settlement::Discarded {
+                produced_under,
+                current,
+            } => {
+                return Err(SyncError::LateResult {
+                    produced_under,
+                    current,
+                });
+            }
+        }
+        let copy = copy.map(|copy| copy.conflict_id);
         Ok(match other.body {
             SyncBody::Settings(_) => Restored::Settings {
                 object: other,
@@ -625,10 +622,7 @@ impl SyncClient {
     ///
     /// Returns [`SyncError::Storage`] when a staged file cannot be read or removed.
     pub fn cancel_undispatched(&self, generation: u64) -> Result<Cancelled> {
-        self.store.record_privacy(PrivacyRecord {
-            generation: U64::new(generation),
-            fenced: self.store.privacy()?.fenced,
-        })?;
+        self.store.advance_privacy(generation)?;
         let undispatched = self.store.take_back_undispatched()?;
         Ok(Cancelled {
             undispatched,
@@ -642,28 +636,33 @@ impl SyncClient {
     /// stays is in [`Self::kept`], named rather than left out.
     ///
     /// Work that has been dispatched is not removed. Its record is what says it may be out there,
-    /// and deleting it would make [`Self::outstanding`] reach nought without anything having been
-    /// reconciled. Its result is refused by the generation rule instead of applied.
+    /// and deleting it would make [`Self::outstanding`] reach nought while the write was still
+    /// unaccounted for. Its result is refused by the generation rule instead of applied. Work
+    /// admitted under a later generation is another cleanup's and is left alone.
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when a file cannot be removed.
     pub fn remove_retained(&self, generation: u64) -> Result<Removed> {
-        self.store.record_privacy(PrivacyRecord {
-            generation: U64::new(generation),
-            fenced: self.store.privacy()?.fenced,
-        })?;
-        let (bytes, records) = self.store.remove_content()?;
+        let privacy = self.store.advance_privacy(generation)?;
+        let (bytes, records) = self.store.remove_content(privacy.generation.get())?;
         Ok(Removed { bytes, records })
     }
 
     /// Returns how much dispatched work has no settled outcome.
     ///
-    /// Reconciliation is this answer reaching nought, and [`Self::reconcile`] is what makes it.
-    /// A publication counts from the moment its record says it was sent until an outcome is
-    /// settled, so an abandoned call, a failed connection and a restart all leave it counted: none
-    /// of them establishes that nothing left this device. A staged record this build cannot read
-    /// counts too, because a record it could not open is not a record it can say was nothing.
+    /// A publication counts from the moment its record says it was sent until the service answers
+    /// about that object, so an abandoned call, a failed connection and a restart all leave it
+    /// counted: none of them establishes that nothing left this device. A staged record this build
+    /// cannot read counts too, because a record it could not open is not a record it can say was
+    /// nothing.
+    ///
+    /// **What makes it reach nought is a later definite answer about the same object.** This
+    /// contract gives a device no way to ask what became of one particular request: a service takes
+    /// a comparison and answers with a generation, and the value it holds afterwards is a fact
+    /// about the object rather than about any one write of it. So a publication that is accepted or
+    /// refused settles this device's earlier dispatches of that object as well, and what those may
+    /// have sent is kept in [`Self::exported`] rather than resolved.
     ///
     /// # Errors
     ///
@@ -741,6 +740,33 @@ impl SyncClient {
                 deletable: false,
             })
             .collect();
+        // A dispatch with no answer may have reached the service, and this contract gives no way
+        // to ask. Saying so is the honest entry: the content was sent, and whether it was stored is
+        // not something this device can find out.
+        let uncertain = self.store.uncertain()?;
+        for record in uncertain.items {
+            exported.push(Exported {
+                kind: format!("synchronised {}, sent without an answer", record.kind),
+                reference: format!(
+                    "{} at revision {}",
+                    sync_collection(record.kind, record.object_id),
+                    record.revision
+                ),
+                left_at_ms: record.recorded_at_ms,
+                deletable: false,
+            });
+        }
+        for path in uncertain.unreadable {
+            exported.push(Exported {
+                kind: "work sent without an answer, which this device cannot describe".to_owned(),
+                reference: format!(
+                    "a record this build cannot read, kept at {}",
+                    path.display()
+                ),
+                left_at_ms: TimestampMs::new(0),
+                deletable: false,
+            });
+        }
         for path in publications.unreadable {
             exported.push(Exported {
                 kind: "a publication this device cannot describe".to_owned(),
@@ -786,28 +812,6 @@ impl SyncClient {
             fenced: false,
         })?;
         Ok(Resumed { generation })
-    }
-}
-
-/// What reconciling the dispatched work did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Reconciled {
-    /// How many publications were settled, one way or the other.
-    pub settled: u64,
-    /// How many are still outstanding, because this device still cannot say what became of them.
-    pub unknown: u64,
-}
-
-/// A buffer of plaintext this client owns, cleared when it goes out of scope.
-///
-/// A statement that clears a buffer is skipped by an early return and by an unwinding panic. This
-/// is not: dropping it clears it, on every path out.
-#[derive(Debug)]
-struct Zeroising(Vec<u8>);
-
-impl Drop for Zeroising {
-    fn drop(&mut self) {
-        kr_crypto::zeroise(&mut self.0);
     }
 }
 
