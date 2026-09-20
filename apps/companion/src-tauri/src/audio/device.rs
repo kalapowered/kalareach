@@ -159,3 +159,10 @@ impl Drop for AudioDevice {
         self.stop();
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+impl Default for AudioDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -60,13 +60,13 @@ pub fn validate_context_frame(
         ));
     }
 
-    if let Some(ref text) = content {
-        if text.len() > VOICE_CONTEXT_BYTES {
-            return Err(CommandError::invalid(format!(
-                "context append exceeds bound: {} > {VOICE_CONTEXT_BYTES} UTF-8 bytes",
-                text.len()
-            )));
-        }
+    if let Some(ref text) = content
+        && text.len() > VOICE_CONTEXT_BYTES
+    {
+        return Err(CommandError::invalid(format!(
+            "context append exceeds bound: {} > {VOICE_CONTEXT_BYTES} UTF-8 bytes",
+            text.len()
+        )));
     }
 
     let frame = VoiceContextFrame::new(id, command, delegation_id, content)
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn heartbeat_frame_serializes_to_expected_wire_format() {
         let heartbeat = VoiceHeartbeatFrame::default();
-        let serialized = serde_json::to_value(&heartbeat).expect("serializes");
+        let serialized = serde_json::to_value(heartbeat).expect("serializes");
         assert_eq!(serialized, json!({ "type": "heartbeat" }));
     }
 

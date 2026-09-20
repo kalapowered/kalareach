@@ -37,9 +37,9 @@ pub fn active_call_holder() -> &'static Arc<Mutex<Option<DesktopVoiceCall>>> {
 
 /// Stops any currently active desktop voice call and clears the holder.
 pub fn stop_active_call() {
-    if let Ok(mut lock) = active_call_holder().lock() {
-        if let Some(call) = lock.take() {
-            call.stop();
-        }
+    if let Ok(mut lock) = active_call_holder().lock()
+        && let Some(call) = lock.take()
+    {
+        call.stop();
     }
 }

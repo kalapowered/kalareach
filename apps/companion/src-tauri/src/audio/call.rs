@@ -183,11 +183,9 @@ impl DesktopVoiceCall {
         // which initiates VoiceProcessingIO on macOS and returns UNAVAILABLE on non-macOS.
         let is_muted = Arc::clone(&self.is_muted_by_person);
         device.start(move |_captured_pcm| {
-            if is_muted.load(Ordering::Relaxed) {
-                // When microphone is muted by user, captured audio is dropped locally.
-                return;
+            if !is_muted.load(Ordering::Relaxed) {
+                // Media path forwards captured PCM frames to encoder.
             }
-            // Media path forwards captured PCM frames to encoder.
         })?;
 
         Ok(())
@@ -208,9 +206,7 @@ impl DesktopVoiceCall {
     pub fn set_playback_muted(&self, muted: bool) {
         self.is_playback_muted.store(muted, Ordering::SeqCst);
         if muted {
-            if let Ok(mut ring) = self.render_ring.lock() {
-                ring.clear();
-            }
+            let _ = self.render_ring.lock().map(|mut ring| ring.clear());
         }
     }
 
