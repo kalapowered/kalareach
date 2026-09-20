@@ -33,7 +33,7 @@ use kr_voice::Coordinator;
 use kr_voice::broker::{ManagedVoiceBroker, ManagedVoiceService, ServiceHttp};
 
 pub use authority::GrantAuthority;
-pub use context::{FilteredContext, SessionFacts, SessionSnapshot};
+pub use context::{FilteredContext, SessionFacts, SessionSnapshot, snapshot_of};
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use submit::{HostDispatch, ProposalSubmitter};
 

@@ -2282,6 +2282,13 @@ impl Controller {
     /// Read through this daemon's ordinary session read, so voice sees what any other reader sees
     /// and nothing more. What this daemon does not hold — the worker's semantic history and its
     /// pending decisions — is reported as unavailable rather than left out silently.
+    ///
+    /// Every item carries the moment its content was produced, because that moment is what a
+    /// grant's history lower bound is checked against. The shell a session runs and the directory
+    /// it started in are fixed when the session is created, so the creation time is theirs; a fact
+    /// this daemon cannot place in time is withheld rather than stamped with the moment it was
+    /// read, which would let a retained summary of a session that closed long ago pass a bound
+    /// written after it.
     pub(crate) async fn voice_session_snapshot(
         self: &Arc<Self>,
         session_id: SessionId,
@@ -2289,35 +2296,7 @@ impl Controller {
         let params = ParamsValue::from_typed(&SessionReadParams { session_id })
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
-        let summary = read.session;
-        let observed_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| {
-                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-            });
-        let item = |text: String| kr_voice::seams::ContextItem::new(text, observed_at_ms);
-        Ok(crate::voice::SessionSnapshot {
-            // The session's own description is the shell it runs and where it runs it. Both are
-            // facts this daemon holds itself, so the description never rests on something it would
-            // have to ask a worker for.
-            description: Some(item(format!(
-                "session {} running {}",
-                summary.display_number, summary.shell_path
-            ))),
-            working_directory: Some(item(summary.cwd.clone())),
-            active_application: Some(item(summary.application_state.0.as_ref().map_or_else(
-                || "no foreground application".to_owned(),
-                |state| format!("{state:?}"),
-            ))),
-            pending_decisions: Vec::new(),
-            recent_messages: Vec::new(),
-            selected: Vec::new(),
-            resources: vec![format!("session:{session_id}")],
-            unavailable: vec![kr_voice::seams::WithheldRun {
-                reason: "this host does not hold the worker's semantic history".to_owned(),
-                count: 0,
-            }],
-        })
+        Ok(crate::voice::snapshot_of(&read.session, session_id))
     }
 
     /// Performs one voice proposal under the method the registry lists for its effect.
