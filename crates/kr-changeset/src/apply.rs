@@ -1955,7 +1955,7 @@ fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool 
 /// the copy here. What is established instead is whether there is one, asked of the copy's **own
 /// descriptor**, and a copy that has one ends the operation: the destination is left exactly as it
 /// was rather than replaced by a file carrying protection it never had.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool {
     !staged.carries_access_control()
 }
