@@ -2388,7 +2388,36 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
         "a package bound into an editor whose version it never qualified"
     );
 
-    // A record that names no editor decides nothing, and neither does one that cannot be read.
+    // A name that differs only in case is another directory wherever the filesystem says so, and
+    // this package was qualified against one of the two.
+    let base = qualified["psreadline_module_base"]
+        .as_str()
+        .expect("the published module base");
+    let mut spelled = published.clone();
+    spelled["qualified"]["psreadline_module_base"] = serde_json::Value::String(flip_case(base));
+    write_record(&record_path, &spelled);
+    assert_eq!(
+        refusal(&package, &copy),
+        "psreadline_not_the_qualified_editor",
+        "a package bound into a directory whose name is another spelling of the one it qualified"
+    );
+
+    // One directory reached by two paths is one editor: a link on the way to the qualified editor
+    // is the qualified editor, and refusing it would refuse the installation this package holds.
+    let through = root.path().join("through-a-link");
+    std::os::unix::fs::symlink(base, &through).expect("a link to the qualified editor");
+    let mut linked = published.clone();
+    linked["qualified"]["psreadline_module_base"] =
+        serde_json::Value::String(through.display().to_string());
+    write_record(&record_path, &linked);
+    assert_eq!(
+        refusal(&package, &copy),
+        "",
+        "the package refused the editor it was qualified against, reached through a link"
+    );
+
+    // A record that names no editor decides nothing, whether it holds no qualification at all,
+    // one that is empty, or one that is missing either half of the answer.
     let mut silent = published.clone();
     silent
         .as_object_mut()
@@ -2400,12 +2429,42 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
         "package_qualification_unreadable",
         "a package that says nothing about its editor bound into one anyway"
     );
+    let mut empty = published.clone();
+    empty["qualified"] = serde_json::json!({});
+    write_record(&record_path, &empty);
+    assert_eq!(
+        refusal(&package, &copy),
+        "package_qualification_unreadable",
+        "a package whose qualification holds nothing bound into an editor anyway"
+    );
+    let mut half = published.clone();
+    half["qualified"] = serde_json::json!({ "psreadline_module_base": base });
+    write_record(&record_path, &half);
+    assert_eq!(
+        refusal(&package, &copy),
+        "package_qualification_unreadable",
+        "a package that named no version bound into an editor anyway"
+    );
     std::fs::write(&record_path, "{").expect("the record");
     assert_eq!(
         refusal(&package, &copy),
         "package_qualification_unreadable",
         "a package whose record cannot be read bound into an editor anyway"
     );
+}
+
+/// The same path with the case of its letters turned over, which is another directory wherever the
+/// filesystem keeps one and another spelling wherever it does not.
+fn flip_case(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_uppercase() {
+                character.to_lowercase().to_string()
+            } else {
+                character.to_uppercase().to_string()
+            }
+        })
+        .collect()
 }
 
 /// Writes one package record back the way a package holds it.

@@ -164,8 +164,41 @@ function Get-KrPublishedQualification {
     $root = Get-KrPackageRoot
     if ($null -eq $root) { return $null }
     $record = Join-Path $root 'kr-shell-identity.json'
-    try { @{ Path = $record; Qualified = (Get-Content -Raw -Path $record | ConvertFrom-Json).qualified } }
-    catch { @{ Path = $record; Qualified = $null } }
+    $answer = @{ Path = $record; ModuleBase = ''; Version = '' }
+    $qualified = try {
+        (Get-Content -Raw -Path $record | ConvertFrom-Json).PSObject.Properties['qualified']
+    } catch { $null }
+    if ($null -eq $qualified -or $null -eq $qualified.Value) { return $answer }
+    # Each field is taken from the record's own property list rather than read off it by name: a
+    # record that holds a qualification with a field missing is a record that says nothing about
+    # that field, and asking for it by name would end this function rather than answer it.
+    foreach ($field in @(@{ From = 'psreadline_module_base'; To = 'ModuleBase' },
+                         @{ From = 'psreadline_found'; To = 'Version' })) {
+        $property = $qualified.Value.PSObject.Properties[$field.From]
+        if ($null -ne $property) { $answer[$field.To] = "$($property.Value)" }
+    }
+    $answer
+}
+
+function Get-KrFinalPath {
+    <#
+    .SYNOPSIS
+    Where a path ends up, with every link on the way followed.
+
+    .DESCRIPTION
+    Two spellings of one directory are one directory, and two directories whose names differ only
+    in case are two directories wherever the filesystem says so. Comparing where each path ends is
+    what tells those apart; comparing the spellings tells neither.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    try {
+        $directory = [System.IO.DirectoryInfo]::new($Path)
+        $final = $directory.ResolveLinkTarget($true)
+        if ($null -ne $final) { return $final.FullName }
+        return $directory.FullName
+    } catch { return $Path }
 }
 
 function Test-KrQualifiedEditor {
@@ -196,21 +229,26 @@ function Test-KrQualifiedEditor {
     # replaced or updated since is diagnosed rather than bound into.
     $published = Get-KrPublishedQualification
     if ($null -ne $published) {
-        $base = try { "$((Get-Module PSReadLine).ModuleBase)" } catch { '' }
-        if ($null -eq $published.Qualified -or
-            [string]::IsNullOrEmpty("$($published.Qualified.psreadline_module_base)")) {
+        if ([string]::IsNullOrEmpty($published.ModuleBase) -or
+            [string]::IsNullOrEmpty($published.Version)) {
             return @{
                 Ok     = $false
                 Reason = 'package_qualification_unreadable'
                 Detail = "$($published.Path) does not say which editor this package was qualified against"
             }
         }
-        if ("$version" -ne "$($published.Qualified.psreadline_found)" -or
-            $base -ne "$($published.Qualified.psreadline_module_base)") {
+        $base = try { "$((Get-Module PSReadLine).ModuleBase)" } catch { '' }
+        # Where each path ends, compared as the bytes it is: a filesystem that keeps two
+        # directories whose names differ only in case keeps two editors, and this package was
+        # qualified against one of them.
+        $here = Get-KrFinalPath $base
+        $there = Get-KrFinalPath $published.ModuleBase
+        if (-not [string]::Equals("$version", $published.Version, [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals($here, $there, [System.StringComparison]::Ordinal)) {
             return @{
                 Ok     = $false
                 Reason = 'psreadline_not_the_qualified_editor'
-                Detail = "PSReadLine $version at '$base' is not the $($published.Qualified.psreadline_found) at '$($published.Qualified.psreadline_module_base)' this package was qualified against"
+                Detail = "PSReadLine $version at '$base' is not the $($published.Version) at '$($published.ModuleBase)' this package was qualified against"
             }
         }
     }
