@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use kr_describe::budget::{Budgets, ProcessFigures, ResidentCost};
+use kr_describe::budget::{Budgets, ResidentCost};
 use kr_describe::context::{ContextBinding, ContextSignal};
 use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment};
 use kr_describe::metadata::RepositoryFacts;
@@ -285,42 +285,40 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         declared.weights_bytes,
         declared.beyond_the_weights()
     );
-    let figures = ProcessFigures {
-        whole_product_rss_bytes: peak_rss_during_load,
-        model_rss_bytes: peak_rss_during_load.saturating_sub(baseline_rss),
-        whole_product_cpu_centis: model_cpu,
-        model_cpu_centis: model_cpu.saturating_sub(baseline_cpu),
-    };
+    // Every figure below is of this one process, and it is named that way. The model and runtime
+    // share is the growth over the baseline taken before the load, which is an estimate rather than
+    // a measurement of the runtime on its own: the harness, its samplers and later the terminal
+    // workload are in the same process and no per-thread accounting separates them. Calling the
+    // difference a measurement is how a benchmark comes to publish its own cost as the product's.
     println!(
-        "measured_rss_bytes: whole process {}, model and runtime {}, process without the model {} [{machine}]",
-        figures.whole_product_rss_bytes,
-        figures.model_rss_bytes,
-        figures.product_without_model_rss_bytes()
+        "baseline_before_load: rss {baseline_rss} bytes, cpu {baseline_cpu} centis, benchmark \
+         process [{machine}]"
     );
     println!(
-        "measured_cpu_centis: whole process {}, model and runtime {}, process without the model {} [{machine}]",
-        figures.whole_product_cpu_centis,
-        figures.model_cpu_centis,
-        figures.product_without_model_cpu_centis()
+        "measured_load_rss_bytes: benchmark process {peak_rss_during_load}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
+        peak_rss_during_load.saturating_sub(baseline_rss)
     );
     println!(
-        "figures_are_of: one process, which holds the runtime, this harness and its samplers; the \
-         model and runtime share is what the process grew by over the baseline above, and the \
-         product's other processes are not in these figures [{machine}]"
+        "measured_load_cpu_centis: benchmark process {model_cpu}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
+        model_cpu.saturating_sub(baseline_cpu)
+    );
+    println!(
+        "whole_product_rss_cpu: not measured by this run, which is one process; the controller, \
+         the workers and the shared services are not running beside it [{machine}]"
     );
     // A breached budget is a failed qualification target and the run says so at the end, having
     // measured everything it can still measure. Stopping here would answer the memory question by
     // withholding the latency ones, and section 27 asks for both.
     let mut unmet: Vec<String> = Vec::new();
-    let ceiling_held = figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes;
+    let ceiling_held = peak_rss_during_load <= budgets.process_memory_ceiling_bytes;
     println!(
         "process_ceiling_bytes: {} held: {} [{machine}]",
         budgets.process_memory_ceiling_bytes, ceiling_held
     );
     if !ceiling_held {
         unmet.push(format!(
-            "the {} byte process ceiling was breached during model load: {} bytes",
-            budgets.process_memory_ceiling_bytes, figures.whole_product_rss_bytes
+            "the {} byte process ceiling was breached during model load: {peak_rss_during_load} bytes",
+            budgets.process_memory_ceiling_bytes
         ));
     }
 
@@ -405,11 +403,14 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
          and no job admitted) [{machine}]"
     );
 
+    // Both accumulators start empty, so the active figures are of the passes and of nothing else.
+    // Seeding them with the load's peaks would have republished the load as a measurement of
+    // inference under contention, which is the one thing this pass exists to measure.
     let bench_sampling = Arc::new(AtomicBool::new(true));
     let bench_sampling_clone = bench_sampling.clone();
-    let peak_bench_rss = Arc::new(AtomicU64::new(peak_rss_during_load));
+    let peak_bench_rss = Arc::new(AtomicU64::new(0));
     let peak_bench_rss_clone = peak_bench_rss.clone();
-    let peak_bench_cpu = Arc::new(AtomicU64::new(model_cpu));
+    let peak_bench_cpu = Arc::new(AtomicU64::new(0));
     let peak_bench_cpu_clone = peak_bench_cpu.clone();
     let bench_sampler_thread = std::thread::spawn(move || {
         let pid = sysinfo::Pid::from_u32(std::process::id());
@@ -519,34 +520,23 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
 
     let active_rss = peak_bench_rss.load(Ordering::Acquire);
     let active_cpu = peak_bench_cpu.load(Ordering::Acquire);
-    let active_figures = ProcessFigures {
-        whole_product_rss_bytes: active_rss,
-        model_rss_bytes: active_rss.saturating_sub(baseline_rss),
-        whole_product_cpu_centis: active_cpu,
-        model_cpu_centis: active_cpu.saturating_sub(workload_cpu_centis.max(baseline_cpu)),
-    };
     println!(
-        "measured_active_inference_rss_bytes: whole process {}, model and runtime {}, process without the model {} [{machine}]",
-        active_figures.whole_product_rss_bytes,
-        active_figures.model_rss_bytes,
-        active_figures.product_without_model_rss_bytes()
+        "measured_active_inference_rss_bytes: benchmark process {active_rss}, over the baseline {} (estimate of the model, its runtime and the work of the passes) [{machine}]",
+        active_rss.saturating_sub(baseline_rss)
     );
     println!(
-        "measured_active_inference_cpu_centis: whole process {}, model and runtime {}, process without the model {} [{machine}]",
-        active_figures.whole_product_cpu_centis,
-        active_figures.model_cpu_centis,
-        active_figures.product_without_model_cpu_centis()
+        "measured_active_inference_cpu_centis: benchmark process {active_cpu}, over the terminal workload {} (estimate; the workload's own figure above was measured with no job admitted, and a peak taken under contention is not the workload's share of this one) [{machine}]",
+        active_cpu.saturating_sub(workload_cpu_centis.max(baseline_cpu))
     );
-    let active_ceiling_held =
-        active_figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes;
+    let active_ceiling_held = active_rss <= budgets.process_memory_ceiling_bytes;
     println!(
         "active_inference_process_ceiling_bytes: {} held: {} [{machine}]",
         budgets.process_memory_ceiling_bytes, active_ceiling_held
     );
     if !active_ceiling_held {
         unmet.push(format!(
-            "the {} byte process ceiling was breached during active inference: {} bytes",
-            budgets.process_memory_ceiling_bytes, active_figures.whole_product_rss_bytes
+            "the {} byte process ceiling was breached during active inference: {active_rss} bytes",
+            budgets.process_memory_ceiling_bytes
         ));
     }
 

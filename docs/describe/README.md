@@ -254,12 +254,16 @@ That last point matters: section 22 forbids passing the active-contention case b
 switched off, so the pause is measured beside real production rather than instead of it.
 
 Every figure is of one process, which holds the runtime, the harness and the terminal workload the
-contention case needs. The model and runtime share is what that process grew by over the baseline
-taken before the model was loaded, and the processor figures take out what the terminal workload
-costs on its own, measured with the workload running and no job admitted. A budget the run misses is
-named as a qualification target that was not met and the run exits non-zero, after it has measured
-everything else it can still measure: a benchmark that stopped at the first breach would answer one
-question by withholding the rest.
+contention case needs, and each line says so. What that process grew by over a baseline is reported
+as an estimate of the model and its runtime rather than as a measurement of them: the baselines are
+real (the process before the model was loaded, and the terminal workload running with no job
+admitted), but subtracting one peak from another does not separate threads that share a process.
+Whole-product RSS and CPU are not measured here at all, because the controller, the workers and the
+shared services are not running beside this one process; the release matrix measures them.
+
+A budget the run misses is named as a qualification target that was not met and the run exits
+non-zero, after it has measured everything else it can still measure: a benchmark that stopped at
+the first breach would answer one question by withholding the rest.
 
 `cargo test -p kr-describe` never downloads weights. It drives a deterministic runtime behind the
 same identity checks, which is what makes the rules — fairness, rejection, unloading, privacy —
