@@ -27,10 +27,12 @@ unsafe extern "C" {
     fn acl_init(count: i32) -> Acl;
     /// Sets an access-control list on a descriptor.
     fn acl_set_fd(fd: i32, acl: Acl) -> i32;
-    /// Translates an access-control list into a string.
-    fn acl_to_text(acl: Acl, len_p: *mut isize) -> *mut core::ffi::c_char;
-    /// Parses an access-control list from text.
-    fn acl_from_text(buf_p: *const core::ffi::c_char) -> Acl;
+    /// Returns the buffer size needed for the external binary representation.
+    fn acl_size(acl: Acl) -> isize;
+    /// Converts an access-control list to an external binary representation in native byte order.
+    fn acl_copy_ext_native(buf_p: *mut core::ffi::c_void, acl: Acl, size: isize) -> isize;
+    /// Reconstructs an access-control list from an external binary representation in native byte order.
+    fn acl_copy_int_native(buf_p: *const core::ffi::c_void) -> Acl;
 }
 
 /// Returns true when the file behind one descriptor carries an access-control list.
@@ -53,11 +55,14 @@ pub(crate) fn carries_access_control(fd: BorrowedFd<'_>) -> bool {
     held
 }
 
-/// Reads the access-control list from a descriptor, returning text if present with entries.
+/// Darwin ACL external representation header magic (`0x012cc16d`).
+const ACL_EXT_MAGIC: u32 = 0x012c_c16d;
+
+/// Reads the access-control list from a descriptor, returning its lossless binary representation.
 ///
 /// Returns `Ok(None)` when the file carries no extended access-control list beyond its mode bits,
 /// or when the list has no entries.
-pub(crate) fn read_access_control(fd: BorrowedFd<'_>) -> std::io::Result<Option<String>> {
+pub(crate) fn read_access_control(fd: BorrowedFd<'_>) -> std::io::Result<Option<Vec<u8>>> {
     let acl = unsafe { acl_get_fd(fd.as_raw_fd()) };
     if acl.is_null() {
         let why = std::io::Error::last_os_error();
@@ -67,56 +72,79 @@ pub(crate) fn read_access_control(fd: BorrowedFd<'_>) -> std::io::Result<Option<
         return Err(why);
     }
     let mut entry: AclEntry = core::ptr::null_mut();
-    let held = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &raw mut entry) } == 0;
-    if !held {
+    let has_entries = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &raw mut entry) } == 0;
+    if !has_entries {
         unsafe { acl_free(acl) };
         return Ok(None);
     }
-    let mut len: isize = 0;
-    let text_ptr = unsafe { acl_to_text(acl, &raw mut len) };
-    unsafe { acl_free(acl) };
-    if text_ptr.is_null() {
-        return Err(std::io::Error::last_os_error());
+    let size = unsafe { acl_size(acl) };
+    if size <= 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { acl_free(acl) };
+        return Err(err);
     }
-    let c_str = unsafe { core::ffi::CStr::from_ptr(text_ptr) };
-    let text = c_str.to_string_lossy().into_owned();
-    unsafe { acl_free(text_ptr.cast::<core::ffi::c_void>()) };
-    Ok(Some(text))
+    let mut buf = vec![0_u8; size as usize];
+    let written = unsafe { acl_copy_ext_native(buf.as_mut_ptr().cast(), acl, size) };
+    let err = if written <= 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe { acl_free(acl) };
+    if let Some(err) = err {
+        return Err(err);
+    }
+    buf.truncate(written as usize);
+    Ok(Some(buf))
 }
 
 /// Sets or clears the access-control list on a descriptor.
 ///
-/// Setting `None` clears any access-control list by setting an empty list. Setting `Some(text)`
-/// parses the text format and applies it to the descriptor.
-pub(crate) fn set_access_control(fd: BorrowedFd<'_>, text: Option<&str>) -> std::io::Result<()> {
-    match text {
+/// Setting `None` clears any access-control list by setting an empty list. Setting `Some(raw)`
+/// validates the binary header and applies the lossless representation to the descriptor.
+pub(crate) fn set_access_control(fd: BorrowedFd<'_>, raw: Option<&[u8]>) -> std::io::Result<()> {
+    match raw {
         None => {
             let empty = unsafe { acl_init(0) };
             if empty.is_null() {
                 return Err(std::io::Error::last_os_error());
             }
             let rc = unsafe { acl_set_fd(fd.as_raw_fd(), empty) };
+            let err = if rc != 0 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
             unsafe { acl_free(empty) };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
+            if let Some(err) = err {
+                return Err(err);
             }
             Ok(())
         }
-        Some(s) => {
-            let c_str = std::ffi::CString::new(s).map_err(|_| {
-                std::io::Error::new(
+        Some(bytes) => {
+            // Validate minimum size and Darwin ACL external native magic before passing to
+            // acl_copy_int_native.
+            if bytes.len() < 4
+                || u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != ACL_EXT_MAGIC
+            {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "access-control list text contains a null byte",
-                )
-            })?;
-            let acl = unsafe { acl_from_text(c_str.as_ptr()) };
+                    "invalid access-control list binary representation",
+                ));
+            }
+            let acl = unsafe { acl_copy_int_native(bytes.as_ptr().cast()) };
             if acl.is_null() {
                 return Err(std::io::Error::last_os_error());
             }
             let rc = unsafe { acl_set_fd(fd.as_raw_fd(), acl) };
+            let err = if rc != 0 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
             unsafe { acl_free(acl) };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
+            if let Some(err) = err {
+                return Err(err);
             }
             Ok(())
         }

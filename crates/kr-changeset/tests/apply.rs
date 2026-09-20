@@ -475,6 +475,25 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
     };
     match given {
         Ok(status) if status.success() => {
+            let authority_before = kr_transfer::AuthorisedDirectory::open_root(
+                fixture.service().environment_id(),
+                &destination,
+            )
+            .expect("opens authority before");
+            let name = kr_transfer::RelativeName::parse("README.md").expect("valid name");
+            let file_before = authority_before
+                .open_read(&name, kr_transfer::ObjectPolicy::ReadableFile)
+                .expect("opens file before");
+            let initial_acl = file_before
+                .access_control()
+                .expect("reads initial access control");
+            assert!(
+                initial_acl.has_entries(),
+                "the destination initially carries access-control entries"
+            );
+            drop(file_before);
+            drop(authority_before);
+
             let workspace = fixture.workspace("destination-tree");
             let affected = expectations(&destination, &["README.md"]);
             let limitations = apply::limitations(DestinationClass::SharedExisting);
@@ -502,7 +521,6 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
                 &destination,
             )
             .expect("opens authority");
-            let name = kr_transfer::RelativeName::parse("README.md").expect("valid name");
             let file = authority
                 .open_read(&name, kr_transfer::ObjectPolicy::ReadableFile)
                 .expect("opens file");
@@ -511,15 +529,98 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
                 "the destination still carries its access-control list after apply"
             );
             let acl = file.access_control().expect("reads access control");
-            assert!(
-                acl.has_entries(),
-                "the destination's access-control list has entries"
+            assert_eq!(
+                acl, initial_acl,
+                "the destination's access-control list matches before apply exactly"
             );
         }
         _ => println!(
             "not exercised: this platform's access-control tool did not run, so the \
              ACL preservation apply test was skipped"
         ),
+    }
+}
+
+/// An access-control list altered on the staged copy before rename is caught by read-back
+/// verification, leaving the result unresolved rather than claiming success under altered permissions.
+#[test]
+fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "tampered-acl-source");
+    write_bytes(&source, "README.md", b"tampered ACL content\n");
+    let source_workspace = fixture.workspace("tampered-acl-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "tampered-acl-destination");
+    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+    // Destination has no ACL initially.
+    let racing = destination.clone();
+    fixture.service().inject(Some(Fault {
+        after_paths: usize::MAX,
+        act: None,
+        before_rename: Some(std::sync::Arc::new(move |path: &str| {
+            if path == "README.md" {
+                let temporary = format!(
+                    ".kr-apply-{}",
+                    kr_changeset::objects::hex_of(kr_changeset::objects::digest_of(
+                        path.as_bytes()
+                    ))
+                );
+                let staged_path = racing.join(temporary);
+                if cfg!(target_os = "macos") {
+                    let _ = std::process::Command::new("/bin/chmod")
+                        .arg("+a")
+                        .arg(format!("{who} allow read"))
+                        .arg(&staged_path)
+                        .status();
+                } else {
+                    let _ = std::process::Command::new("setfacl")
+                        .arg("-m")
+                        .arg(format!("u:{who}:r"))
+                        .arg(&staged_path)
+                        .status();
+                }
+            }
+        })),
+        stop: false,
+        detail: String::new(),
+    }));
+
+    let workspace = fixture.workspace("tampered-acl-destination");
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let result = apply::apply(fixture.service(), &order).expect("the apply runs");
+    // If chmod/setfacl succeeded during staging, the verification must fail.
+    let authority = kr_transfer::AuthorisedDirectory::open_root(
+        fixture.service().environment_id(),
+        &destination,
+    )
+    .expect("opens authority");
+    let name = kr_transfer::RelativeName::parse("README.md").expect("valid name");
+    if let Ok(file) = authority.open_read(&name, kr_transfer::ObjectPolicy::ReadableFile) {
+        if file.carries_access_control() {
+            assert_ne!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+            assert_eq!(result.unresolved_paths, vec!["README.md".to_owned()]);
+            let row = result
+                .progress
+                .iter()
+                .find(|row| row.path == "README.md")
+                .expect("the path is named");
+            assert_eq!(row.state, PathProgressState::Unresolved);
+            assert!(
+                row.detail
+                    .contains("under permissions this host did not set on it"),
+                "the row says what happened: {}",
+                row.detail
+            );
+        }
     }
 }
 

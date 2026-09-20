@@ -1870,6 +1870,13 @@ fn carry_permissions(
     staged: &kr_transfer::AuthorisedFile,
     executable: bool,
 ) -> Result<Option<CarriedPermissions>> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // This Unix platform does not support reading or setting access-control lists.
+        // Refuse before rename rather than risking silent ACL loss or verification failure.
+        let _ = (destination, leaf, staged, executable);
+        return Ok(None);
+    }
     use cap_std::fs::PermissionsExt as _;
     let existing = match destination.open_read(leaf, ObjectPolicy::ReadableFile) {
         Ok(file) => {

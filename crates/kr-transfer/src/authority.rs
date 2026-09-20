@@ -446,19 +446,25 @@ pub enum ObjectPolicy {
 pub enum AccessControl {
     /// The file carries no access-control list beyond its mode bits.
     None,
-    /// An Apple extended access-control list text representation.
+    /// An Apple extended access-control list native binary representation.
     #[cfg(target_os = "macos")]
-    Apple(String),
+    Apple(Vec<u8>),
     /// A POSIX access-control list raw attribute bytes on Linux.
     #[cfg(target_os = "linux")]
     Posix(Vec<u8>),
-    /// A platform whose access-control lists this host does not know how to read.
+    /// A platform whose access-control lists this host does not know how to read or verify.
+    ///
+    /// Note: `AccessControl::Unsupported.has_entries()` returns `false`, but that does not prove
+    /// absence of access-control protection.
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Unsupported,
 }
 
 impl AccessControl {
     /// Returns true when this represents a file carrying an access-control list beyond mode bits.
+    ///
+    /// Note that on unsupported platforms, this returns `false` because no access-control entries
+    /// could be parsed, not because the underlying file is guaranteed to carry no access control.
     #[must_use]
     pub const fn has_entries(&self) -> bool {
         match self {
@@ -1227,7 +1233,7 @@ impl AuthorisedFile {
             use std::os::fd::AsFd as _;
 
             match crate::apple::read_access_control(self.file.as_fd())? {
-                Some(text) => Ok(AccessControl::Apple(text)),
+                Some(bytes) => Ok(AccessControl::Apple(bytes)),
                 None => Ok(AccessControl::None),
             }
         }
@@ -1258,8 +1264,8 @@ impl AuthorisedFile {
 
             match acl {
                 AccessControl::None => crate::apple::set_access_control(self.file.as_fd(), None),
-                AccessControl::Apple(text) => {
-                    crate::apple::set_access_control(self.file.as_fd(), Some(text))
+                AccessControl::Apple(bytes) => {
+                    crate::apple::set_access_control(self.file.as_fd(), Some(bytes))
                 }
             }
         }
@@ -1276,13 +1282,11 @@ impl AuthorisedFile {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            match acl {
-                AccessControl::None => Ok(()),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "access-control lists cannot be written on this platform",
-                )),
-            }
+            let _ = acl;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "access-control lists cannot be written on this platform",
+            ))
         }
     }
 
@@ -1808,24 +1812,31 @@ fn read_linux_access_control(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result
         Ok(size) => Ok(Some(initial[..size].to_vec())),
         Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(None),
         Err(rustix::io::Errno::RANGE) => {
-            let size = match rustix::fs::fgetxattr(
-                fd.as_fd(),
-                "system.posix_acl_access",
-                &mut [0_u8; 0][..],
-            ) {
-                Ok(size) => size,
-                Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => return Ok(None),
-                Err(err) => return Err(err.into()),
-            };
-            let mut buf = vec![0_u8; size];
-            match rustix::fs::fgetxattr(fd.as_fd(), "system.posix_acl_access", &mut buf) {
-                Ok(read_size) => {
-                    buf.truncate(read_size);
-                    Ok(Some(buf))
+            for _ in 0..3 {
+                let size = match rustix::fs::fgetxattr(
+                    fd.as_fd(),
+                    "system.posix_acl_access",
+                    &mut [0_u8; 0][..],
+                ) {
+                    Ok(size) => size,
+                    Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                };
+                let mut buf = vec![0_u8; size];
+                match rustix::fs::fgetxattr(fd.as_fd(), "system.posix_acl_access", &mut buf) {
+                    Ok(read_size) => {
+                        buf.truncate(read_size);
+                        return Ok(Some(buf));
+                    }
+                    Err(rustix::io::Errno::RANGE) => continue,
+                    Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => return Ok(None),
+                    Err(err) => return Err(err.into()),
                 }
-                Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(None),
-                Err(err) => Err(err.into()),
             }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "access-control list attribute was repeatedly resized during read",
+            ))
         }
         Err(err) => Err(err.into()),
     }

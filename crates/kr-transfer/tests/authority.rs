@@ -603,11 +603,24 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
     std::fs::write(&listed, b"content\n").expect("a second file");
     let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
     let given = if cfg!(target_os = "macos") {
-        std::process::Command::new("/bin/chmod")
+        // Add both an allow ACE and a deny ACE to verify multi-entry and deny-entry preservation.
+        let s1 = std::process::Command::new("/bin/chmod")
             .arg("+a")
             .arg(format!("{who} allow read"))
             .arg(&listed)
-            .status()
+            .status();
+        let s2 = std::process::Command::new("/bin/chmod")
+            .arg("+a")
+            .arg("everyone deny delete")
+            .arg(&listed)
+            .status();
+        match (s1, s2) {
+            (Ok(a), Ok(b)) if a.success() && b.success() => Ok(a),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "chmod failed",
+            )),
+        }
     } else {
         std::process::Command::new("setfacl")
             .arg("-m")
