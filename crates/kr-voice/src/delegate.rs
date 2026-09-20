@@ -32,6 +32,7 @@
 //! And nothing reads an admission as execution. A host that accepted a proposal without performing
 //! it answers [`VoiceDelegationOutcome::Admitted`], never `Performed`.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use kr_client::services::voice::{ManagedVoiceService, VoiceStart};
@@ -103,6 +104,29 @@ pub struct Coordinator {
 struct State {
     sessions: VoiceSessions,
     ledger: ConfirmationLedger,
+    /// The devices with a start in flight.
+    ///
+    /// A start asks the broker between reading a device's authority and recording what came back,
+    /// and that wait is the window two starts can cross in. A device is in this set for the whole
+    /// of its own start, so the second one is answered rather than run beside the first.
+    starting: BTreeSet<DeviceId>,
+}
+
+/// One device's start, held for as long as it runs.
+///
+/// A guard rather than a pair of calls: every exit from `start` is a return, and a marker that a
+/// failure path forgot to clear would stop that device starting a voice session again.
+struct StartGate<'a> {
+    state: &'a Mutex<State>,
+    device_id: DeviceId,
+}
+
+impl Drop for StartGate<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.starting.remove(&self.device_id);
+        }
+    }
 }
 
 impl Coordinator {
@@ -276,6 +300,21 @@ impl Coordinator {
                     .to_owned(),
             ));
         };
+        // One start at a time for one device. The broker call sits between reading this device's
+        // authority and recording the call that came back, and two starts crossing in that window
+        // can each decide about a call the other is about to bind. The second is told that one is
+        // already running, which is what it would be told a moment later anyway.
+        let Some(_gate) = self.begin_start(device_id) else {
+            return Ok(VoiceStartResult {
+                outcome: VoiceStartOutcome::Unavailable {
+                    reason: "session_in_progress".to_owned(),
+                    message: "a voice session is already starting for this device".to_owned(),
+                    alternatives: vec![
+                        "Wait for the call that is starting, and use it.".to_owned(),
+                    ],
+                },
+            });
+        };
         let device_grant = self
             .authority
             .device_grant(device_id, None, now_ms)?
@@ -394,10 +433,11 @@ impl Coordinator {
             // second grant for it would leave two pieces of authority over one call, and stopping
             // either would leave the other standing. The caller is told to use the call it has.
             //
-            // The call is closed only when nothing holds it. A call a live voice session is
-            // running under is that session's, and closing it here would end a call this host has
-            // just told the caller to go on using.
-            if !self.holds_call(&session.call_id) {
+            // The call is closed only when nothing holds it and nothing is about to. A call a live
+            // voice session is running under is that session's, and closing it here would end a
+            // call this host has just told the caller to go on using; a call another start is
+            // still waiting on is one that start will bind or close itself.
+            if self.may_close_replayed(&session.call_id, device_id) {
                 self.close_unbound(&provider, &session.call_id).await;
             }
             return Ok(VoiceStartResult {
@@ -470,18 +510,40 @@ impl Coordinator {
         })
     }
 
-    /// Whether a live voice session is running under one broker call.
+    /// Marks one device as starting, when it is not already.
+    ///
+    /// `None` means a start for that device is already running, which is the answer the second
+    /// one gets: a device holds one managed call, and two starts would be two pieces of authority
+    /// over it.
     ///
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
-    fn holds_call(&self, call_id: &str) -> bool {
-        self.state
-            .lock()
-            .expect("the coordinator's state")
+    fn begin_start(&self, device_id: DeviceId) -> Option<StartGate<'_>> {
+        let mut state = self.state.lock().expect("the coordinator's state");
+        state.starting.insert(device_id).then(|| StartGate {
+            state: &self.state,
+            device_id,
+        })
+    }
+
+    /// Whether a replayed call is one this host may close.
+    ///
+    /// Both questions are answered in one critical section, because a start records its session
+    /// under the same lock: a call is left alone when a live voice session holds it, and when
+    /// another device's start is still in flight and may be about to hold it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    fn may_close_replayed(&self, call_id: &str, device_id: DeviceId) -> bool {
+        let state = self.state.lock().expect("the coordinator's state");
+        let held = state
             .sessions
             .iter()
-            .any(|record| record.call_id.as_deref() == Some(call_id))
+            .any(|record| record.call_id.as_deref() == Some(call_id));
+        let others_starting = state.starting.iter().any(|starting| *starting != device_id);
+        !held && !others_starting
     }
 
     /// Ends a call this host could not bind to a voice session.

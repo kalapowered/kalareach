@@ -333,6 +333,12 @@ struct ManagedFake {
     answer: Mutex<Answer>,
     closed: Mutex<Vec<String>>,
     offers: Mutex<Vec<String>>,
+    /// Held creations, for a test that needs one start to still be waiting while another arrives.
+    ///
+    /// A real creation takes as long as a network round trip, and the window this opens is that
+    /// round trip rather than an invention of the test.
+    holding: tokio::sync::Semaphore,
+    held: Mutex<bool>,
 }
 
 impl ManagedFake {
@@ -341,7 +347,19 @@ impl ManagedFake {
             answer: Mutex::new(answer),
             closed: Mutex::new(Vec::new()),
             offers: Mutex::new(Vec::new()),
+            holding: tokio::sync::Semaphore::new(0),
+            held: Mutex::new(false),
         }
+    }
+
+    /// Makes every creation wait until [`ManagedFake::release`] lets one through.
+    fn hold_creations(&self) {
+        *self.held.lock().expect("the hold") = true;
+    }
+
+    /// Lets one held creation answer.
+    fn release(&self) {
+        self.holding.add_permits(1);
     }
 
     fn closed(&self) -> Vec<String> {
@@ -394,7 +412,15 @@ impl ManagedVoiceService for ManagedFake {
             .expect("the offers")
             .push(request.offer_sdp.clone());
         let answer = self.answer.lock().expect("the answer").clone();
+        let held = *self.held.lock().expect("the hold");
         Box::pin(async move {
+            if held {
+                self.holding
+                    .acquire()
+                    .await
+                    .expect("the hold is never closed")
+                    .forget();
+            }
             Ok(match answer {
                 Answer::Started => VoiceStart::Started(Box::new(running_call("managed"))),
                 Answer::Replayed => VoiceStart::Started(Box::new(VoiceSession {
@@ -846,6 +872,72 @@ async fn a_replayed_answer_for_a_call_nothing_holds_is_closed() {
         fixture.broker.closed(),
         vec!["call-managed".to_owned(), "call-managed".to_owned()],
         "the stop closed it once and the unbound replay closed it again"
+    );
+}
+
+/// KR-REQ-15.01 and 23.51: one device starts one call at a time, so two starts cannot each decide
+/// about the call the other is creating.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
+    let fixture = fixture();
+    fixture
+        .coordinator
+        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
+        .expect("a standing voice grant");
+    fixture.broker.hold_creations();
+
+    let coordinator = Arc::new(fixture.coordinator);
+    let first = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .start(
+                    device(PHONE),
+                    &start_params(),
+                    AuthorityRevision::new(1),
+                    10_010,
+                )
+                .await
+                .expect("an answer")
+        }
+    });
+    // The first start is inside the creation the broker is holding, which is the window two starts
+    // would otherwise cross in.
+    while fixture.broker.offers().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let second = coordinator
+        .start(
+            device(PHONE),
+            &start_params(),
+            AuthorityRevision::new(1),
+            10_020,
+        )
+        .await
+        .expect("an answer");
+    let VoiceStartOutcome::Unavailable { reason, .. } = &second.outcome else {
+        panic!("the second start is told one is running, not {second:?}");
+    };
+    assert_eq!(reason, "session_in_progress");
+    assert_eq!(
+        fixture.broker.offers().len(),
+        1,
+        "the second start never reached the broker, so it created nothing to race over"
+    );
+
+    fixture.broker.release();
+    let first = first.await.expect("the first start finishes");
+    assert!(
+        matches!(first.outcome, VoiceStartOutcome::Started { .. }),
+        "{:?}",
+        first.outcome
+    );
+    assert_eq!(coordinator.live_sessions(), 1);
+    assert!(
+        fixture.broker.closed().is_empty(),
+        "nothing closed the call the first start was creating"
     );
 }
 
