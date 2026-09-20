@@ -1209,6 +1209,8 @@ fn nested_repositories(
     // in the set too, so a directory that is that object reaches the same refusal whatever it is
     // called here.
     let mut refused: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // What this host has looked inside, which is not the same question as what it excludes.
+    let mut inspected: BTreeSet<(u64, u64)> = BTreeSet::new();
     // **Every administrative directory Git itself reports for this working tree** (D-087a), each
     // entered by what it is rather than by what it is called. There can be two: the common one,
     // which holds the configuration, the references and the objects, and this worktree's own,
@@ -1241,7 +1243,18 @@ fn nested_repositories(
         // are reachable as ordinary content under a path that crosses neither. What answers that
         // is the same thing that answers the rest: the object. So every directory beneath this one
         // is asked what it is, and the capture compares what it opens with all of them.
-        administrative_descendants(&held, root_mount, &mut refused, &mut budget, 0)?;
+        // Its own mount, not the tree's: a repository can keep its data on another filesystem
+        // and an ordinary directory of that data is then not on the tree's mount at all. What
+        // this refuses is a mount **inside** the administrative tree.
+        let seed_mount = mount_of(&held)?;
+        administrative_descendants(
+            &held,
+            seed_mount,
+            &mut refused,
+            &mut inspected,
+            &mut budget,
+            0,
+        )?;
     }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
@@ -1282,7 +1295,15 @@ fn nested_repositories(
             return Err(unplaceable(directory));
         }
         refused.insert(identity_of(data));
-        administrative_descendants(data, root_mount, &mut refused, &mut budget, 0)?;
+        let data_mount = mount_of(data)?;
+        administrative_descendants(
+            data,
+            data_mount,
+            &mut refused,
+            &mut inspected,
+            &mut budget,
+            0,
+        )?;
         let common = RelativeName::parse("commondir")?;
         match data.probe(&common) {
             // It keeps everything in one place.
@@ -1295,7 +1316,15 @@ fn nested_repositories(
                         return Err(unplaceable(directory));
                     }
                     refused.insert(identity_of(last));
-                    administrative_descendants(last, root_mount, &mut refused, &mut budget, 0)?;
+                    let common_mount = mount_of(last)?;
+                    administrative_descendants(
+                        last,
+                        common_mount,
+                        &mut refused,
+                        &mut inspected,
+                        &mut budget,
+                        0,
+                    )?;
                 }
             }
             Err(_) => return Err(unplaceable(directory)),
@@ -1329,6 +1358,7 @@ fn administrative_descendants(
     directory: &AuthorisedDirectory,
     root: Mount,
     into: &mut BTreeSet<(u64, u64)>,
+    inspected: &mut BTreeSet<(u64, u64)>,
     budget: &mut usize,
     depth: usize,
 ) -> Result<()> {
@@ -1390,8 +1420,12 @@ fn administrative_descendants(
                     .to_owned(),
             ));
         }
-        if into.insert(identity_of(&held)) {
-            administrative_descendants(&held, root, into, budget, depth + 1)?;
+        // Two sets, because "already excluded" is not "already looked at": a directory can be in
+        // the exclusion set because it is a nested repository's tree and still hold a link this
+        // host has not seen. What stops the descent running away is having **inspected** it.
+        into.insert(identity_of(&held));
+        if inspected.insert(identity_of(&held)) {
+            administrative_descendants(&held, root, into, inspected, budget, depth + 1)?;
         }
     }
     Ok(())
