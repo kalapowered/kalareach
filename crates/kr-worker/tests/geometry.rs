@@ -42,12 +42,29 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+mod common;
+
+use common::{LIVENESS_DEADLINE, carries, produced, retained};
+
 /// The session's own size in these tests. An attachment of exactly this size takes the stream.
 const CANONICAL: Dimensions = Dimensions::new(80, 24);
+
+/// An application that writes nothing and stays until the session stops it.
+///
+/// It waits on its terminal for a line nobody ever types rather than counting seconds. A fixture
+/// on a timer ends itself when a loaded host makes a test take longer than the timer allowed, and
+/// a session whose shell has gone is not what any of these tests is about.
+const WAITS: &str = "read -r _";
 
 /// A root program that reports its own size whenever the kernel says the window changed.
 ///
 /// Nothing else distinguishes a bookkeeping change from a resize the application actually saw.
+///
+/// A shell runs a trap between commands rather than inside one, so the loop at the end is how this
+/// application waits for a signal: its own pace, not a length of time any test here depends on.
+/// Every test waits for the report itself, however long the application takes to make it, and a
+/// loop over a blocked read is not the alternative - a read that fails once the session has closed
+/// its terminal would spin.
 const REPORTS_ITS_SIZE: &str = "stty raw -echo; \
      trap 'printf kr-size:; stty size' WINCH; \
      printf 'kr-ready.'; while :; do sleep 0.2; done";
@@ -118,61 +135,6 @@ fn attach(session: &mut Session, params: &SessionAttachParams) -> AttachmentId {
     id
 }
 
-fn retained(session: &Session) -> Vec<u8> {
-    let mut seen = Vec::new();
-    let mut cursor = 0_u64;
-    loop {
-        let page = session
-            .history_page(cursor, 1024 * 1024)
-            .expect("reads the retained output");
-        if page.bytes.as_slice().is_empty() {
-            break;
-        }
-        seen.extend_from_slice(page.bytes.as_slice());
-        cursor = page.next_cursor.get();
-    }
-    seen
-}
-
-/// How long a wait for something to appear is given.
-///
-/// A liveness wait is not a measurement: it is there to fail when something never happens. The ten
-/// and thirty second windows these waits had were inside the range the slowest reference hosts
-/// reach when several suites share them, which turned each of them into a coin toss; two minutes is
-/// outside it. The poll intervals are unchanged, so a wait that succeeds costs what it always did.
-/// What is deliberately *not* raised is a window that asserts something never arrives, or one that
-/// samples what arrives inside it: those are not waiting for anything.
-const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
-
-/// Waits for `marker` to appear in the session's retained output.
-///
-/// A marker that never appears is a failure here rather than partial output a caller has to make
-/// sense of, and the failure says how long it waited and what for.
-async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
-    let started = tokio::time::Instant::now();
-    let deadline = started + within;
-    loop {
-        let seen = retained(&runtime.session());
-        if contains(&seen, marker) {
-            return seen;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for {:?} in the session's retained output: {:?}",
-            started.elapsed(),
-            String::from_utf8_lossy(marker),
-            String::from_utf8_lossy(&seen)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-01.13, KR-REQ-08.67, KR-REQ-08.68: the first eligible claim owns, and a view never does.
 // ---------------------------------------------------------------------------------------------
@@ -181,7 +143,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_eligible_claim_owns_the_size_and_a_conversation_view_never_claims() {
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "sleep 120", CANONICAL);
+    let config = configuration(&host, WAITS, CANONICAL);
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
@@ -260,7 +222,7 @@ async fn the_first_eligible_claim_owns_the_size_and_a_conversation_view_never_cl
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_is_added_or_withdrawn_without_displacing_the_owner() {
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "sleep 120", CANONICAL);
+    let config = configuration(&host, WAITS, CANONICAL);
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
@@ -347,7 +309,7 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    produced(&runtime, b"kr-ready.").await;
 
     // The watcher reports the size it is looking at. It is a report, not an insistence.
     {
@@ -371,14 +333,6 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
             ErrorCode::GeometryNotOwner
         );
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    {
-        let session = runtime.session();
-        assert!(
-            !contains(&retained(&session), b"kr-size:"),
-            "the application was never told about a size nobody owned"
-        );
-    }
 
     // The owner resizes, and the application is told.
     {
@@ -389,11 +343,24 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
         assert_eq!(changed.dimensions, Dimensions::new(100, 30));
         assert_eq!(changed.epoch.get(), epoch + 1);
     }
-    let seen = retained_within(&runtime, b"kr-size:30 100", LIVENESS_DEADLINE).await;
+    // The kernel moved with the bookkeeping, which is what the application reporting its own size
+    // says.
+    produced(&runtime, b"kr-size:30 100").await;
+
+    // And that report is the first the application has ever made, so neither the watcher's report
+    // of the size it is looking at nor its refused resize reached the kernel. Waiting a while
+    // after them and finding nothing would have proved that only for as long as the wait, and for
+    // less of it the busier the host; the owner's own report is a fence the application wrote, and
+    // everything it could have been told before it is in front of it.
+    let seen = retained(&runtime);
+    let first = seen
+        .windows(b"kr-size:".len())
+        .position(|window| window == b"kr-size:")
+        .expect("the application reported its size");
     assert!(
-        contains(&seen, b"kr-size:30 100"),
-        "the kernel moved with the bookkeeping: {}",
-        String::from_utf8_lossy(&seen)
+        seen[first..].starts_with(b"kr-size:30 100"),
+        "the application was never told about a size nobody owned: {}",
+        String::from_utf8_lossy(&seen[first..]).escape_debug()
     );
 
     runtime.close(ClosureReason::CloseRequested).1.release();
@@ -407,7 +374,7 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn all_three_dimension_limits_apply_at_once_and_a_refusal_changes_nothing() {
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "sleep 120", CANONICAL);
+    let config = configuration(&host, WAITS, CANONICAL);
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
@@ -501,7 +468,7 @@ async fn the_invisible_default_and_every_page_bound_are_what_section_eight_state
     // A session created with no size of its own is created at this one: it is what
     // `kr-worker`'s own argument handling and the daemon's create both fall back to, and this is
     // the size such a session then runs at.
-    let mut config = configuration(&host, "sleep 120", INVISIBLE_DEFAULT_DIMENSIONS);
+    let mut config = configuration(&host, WAITS, INVISIBLE_DEFAULT_DIMENSIONS);
     config.resident_bytes = 8 * 1024 * 1024;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
@@ -568,7 +535,7 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    produced(&runtime, b"kr-ready.").await;
 
     {
         let mut session = runtime.session();
@@ -580,12 +547,9 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
         );
         assert_eq!(succeeded.dimensions, Dimensions::new(100, 30));
     }
-    let seen = retained_within(&runtime, b"kr-size:30 100", LIVENESS_DEADLINE).await;
-    assert!(
-        contains(&seen, b"kr-size:30 100"),
-        "and the application was resized to the successor's size: {}",
-        String::from_utf8_lossy(&seen)
-    );
+    // The wait is the assertion: the successor's size is what the application was resized to, and
+    // a host that resized it to anything else never satisfies it.
+    produced(&runtime, b"kr-size:30 100").await;
 
     // With every eligible claim gone the last geometry is retained rather than reset.
     {
@@ -622,7 +586,7 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     let phone_attachment = attach_over(&mut phone, &wired, Dimensions::new(48, 16), true).await;
     subscribe_over(&mut desk, &wired, desk_attachment).await;
     subscribe_over(&mut phone, &wired, phone_attachment).await;
-    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    produced(&wired.runtime, b"kr-ready.").await;
 
     let epoch = wired.runtime.session().geometry().epoch;
     // A stale epoch is refused. The size is not moved by a caller working from a view that has
@@ -676,12 +640,8 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     )
     .await;
     expect_resynchronised(&mut phone, LIVENESS_DEADLINE, "and neither is the phone's").await;
-    let seen = retained_within(&wired.runtime, b"kr-size:16 48", LIVENESS_DEADLINE).await;
-    assert!(
-        contains(&seen, b"kr-size:16 48"),
-        "and the shell was resized rather than replaced: {}",
-        String::from_utf8_lossy(&seen)
-    );
+    // The shell was resized rather than replaced: the same application reports the phone's size.
+    produced(&wired.runtime, b"kr-size:16 48").await;
     assert!(
         !wired.runtime.session().lease().holder.is_present(),
         "moving the size is not taking the keys"
@@ -700,7 +660,7 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keyboard_takeover_leaves_the_size_exactly_where_it_was() {
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "sleep 120", CANONICAL);
+    let config = configuration(&host, WAITS, CANONICAL);
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
@@ -759,8 +719,9 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
     let second = row("kr-near-two", "kr-far-two");
     let wired = wired(
         &format!(
-            "stty raw -echo; printf 'kr-ready.'; read -r ignored; \
-             printf '\\033[1;1H{first}\\033[2;1H{second}\\033[3;1Hkr-drawn.'; sleep 120"
+            "stty raw -echo; printf 'kr-ready.'; read -r ignored; printf 'kr-set.'; \
+             read -r ignored; \
+             printf '\\033[1;1H{first}\\033[2;1H{second}\\033[3;1Hkr-drawn.'; read -r ignored"
         ),
         CANONICAL,
     )
@@ -774,7 +735,7 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
     let mut narrow = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
-    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    produced(&wired.runtime, b"kr-ready.").await;
 
     // Everybody joins before anything is drawn, so what each one receives is live output rather
     // than the screen it was restored with.
@@ -799,44 +760,29 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
     subscribe_over(&mut same, &wired, same_attachment).await;
     subscribe_over(&mut also_same, &wired, also_same_attachment).await;
     subscribe_over(&mut narrow, &wired, narrow_attachment).await;
-    // Whatever the restoration sent each of them, before the application draws.
-    collect(&mut same, Duration::from_millis(500)).await;
-    collect(&mut also_same, Duration::from_millis(500)).await;
-    collect(&mut narrow, Duration::from_millis(500)).await;
+    // One short line, released before the drawing, that every one of them can wait for: whatever
+    // the restoration sent each of them is queued in front of it, so a run that starts after it
+    // starts at the same point in the session's output for all three. A length of time spent
+    // draining instead would drain different amounts of it on a busy host, and the two terminals
+    // of the session's own size would then be compared to each other from different places.
+    let mut keys = Typist::take(&wired);
+    keys.release(&wired);
+    collect_until(&mut same, b"kr-set.").await;
+    collect_until(&mut also_same, b"kr-set.").await;
+    collect_rows_until(&mut narrow, "kr-set.").await;
 
-    // Now the application draws.
-    {
-        let mut session = wired.runtime.session();
-        let attachment = attach_over_locally(&mut session, &wired);
-        let lease = session
-            .acquire_input(
-                attachment,
-                kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
-                None,
-            )
-            .expect("the keys");
-        session
-            .write_input(
-                attachment,
-                lease.lease.epoch.get(),
-                0,
-                b"go\n",
-                None,
-                std::time::Instant::now(),
-            )
-            .expect("lets the application proceed");
-    }
-    wired.runtime.flush_input();
-    retained_within(&wired.runtime, b"kr-drawn.", LIVENESS_DEADLINE).await;
+    // Now the application draws, and each of them is read to the last thing it wrote.
+    keys.release(&wired);
+    produced(&wired.runtime, b"kr-drawn.").await;
 
-    let direct = collect_until(&mut same, b"kr-far-two", Duration::from_secs(3)).await;
-    let also_direct = collect_until(&mut also_same, b"kr-far-two", Duration::from_secs(3)).await;
+    let direct = collect_until(&mut same, b"kr-drawn.").await;
+    let also_direct = collect_until(&mut also_same, b"kr-drawn.").await;
     // The same wait for the terminal of another size, which is served rows rather than bytes.
-    let projected = collect_rows_until(&mut narrow, "kr-near-two", Duration::from_secs(3)).await;
+    let projected = collect_rows_until(&mut narrow, "kr-drawn.").await;
 
     // Equal size means the same filtered live byte stream, to both of them.
     assert!(
-        contains(&direct, b"kr-far-one") && contains(&direct, b"kr-far-two"),
+        carries(&direct, b"kr-far-one") && carries(&direct, b"kr-far-two"),
         "the equal-sized terminal receives the session's own bytes: {}",
         String::from_utf8_lossy(&direct).escape_debug()
     );
@@ -905,21 +851,68 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
         .release();
 }
 
-/// Attaches directly on the session, for the one case that needs to type into it.
-fn attach_over_locally(session: &mut Session, wired: &Wired) -> AttachmentId {
-    let mut params = terminal(wired.session_id, CANONICAL, false);
-    params.requested.insert(AttachmentCapability::Input);
-    let id = AttachmentId::new(kr_ipc::new_uuid());
-    session
-        .attach(&params, params.requested.clone(), id)
-        .expect("attaches");
-    id
+/// An attachment that holds the keys, which is how a test releases the next step of an application
+/// waiting for a line.
+///
+/// It attaches on the session rather than over a socket because typing is all it does, and it
+/// types through the session for the same reason: a client waiting for an answer to a call of its
+/// own drops the notifications that arrive while it waits, and the terminals in this test are
+/// reading theirs. What it sends is the same call the worker makes for a keystroke off a socket.
+struct Typist {
+    attachment: AttachmentId,
+    epoch: u64,
+    sequence: u64,
+}
+
+impl Typist {
+    /// Attaches a terminal that may type, and takes the input lease for it.
+    fn take(wired: &Wired) -> Self {
+        let mut session = wired.runtime.session();
+        let mut params = terminal(wired.session_id, CANONICAL, false);
+        params.requested.insert(AttachmentCapability::Input);
+        let attachment = AttachmentId::new(kr_ipc::new_uuid());
+        session
+            .attach(&params, params.requested.clone(), attachment)
+            .expect("attaches");
+        let lease = session
+            .acquire_input(
+                attachment,
+                kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+                None,
+            )
+            .expect("the keys");
+        Self {
+            attachment,
+            epoch: lease.lease.epoch.get(),
+            sequence: 0,
+        }
+    }
+
+    /// Releases the next step of an application that is waiting for a line.
+    fn release(&mut self, wired: &Wired) {
+        {
+            let mut session = wired.runtime.session();
+            session
+                .write_input(
+                    self.attachment,
+                    self.epoch,
+                    self.sequence,
+                    b"go\n",
+                    None,
+                    std::time::Instant::now(),
+                )
+                .expect("lets the application proceed");
+        }
+        self.sequence += 1;
+        // Outside the session, because the batches go to the terminal while the session is held.
+        wired.runtime.flush_input();
+    }
 }
 
 /// KR-REQ-08.74: a transfer between two terminals of one size still tells everybody.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {
-    let wired = wired("sleep 120", CANONICAL).await;
+    let wired = wired(WAITS, CANONICAL).await;
     let mut desk = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -1015,7 +1008,7 @@ async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {
 /// attachment the host never granted the geometry right.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfer_selects_an_eligible_terminal_on_another_connection() {
-    let wired = wired("sleep 120", CANONICAL).await;
+    let wired = wired(WAITS, CANONICAL).await;
     let mut desk = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -1104,14 +1097,13 @@ async fn a_transfer_selects_an_eligible_terminal_on_another_connection() {
 async fn a_window_that_changed_presentation_is_told_while_the_application_is_idle() {
     // The application writes its marker and then nothing at all, so anything the client is told
     // about afterwards came from the size change rather than from output.
-    let wired = wired("stty raw -echo; printf 'kr-ready.'; sleep 120", CANONICAL).await;
+    let wired = wired("stty raw -echo; printf 'kr-ready.'; read -r _", CANONICAL).await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
     let attachment = attach_over(&mut client, &wired, CANONICAL, false).await;
     subscribe_over(&mut client, &wired, attachment).await;
-    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
-    collect(&mut client, Duration::from_millis(500)).await;
+    produced(&wired.runtime, b"kr-ready.").await;
     assert_eq!(
         presentation_of(&wired, attachment),
         Some(TerminalPresentationMode::Direct)
@@ -1258,7 +1250,7 @@ fn every_attachment_method_requires_the_right_its_row_names() {
 /// KR-REQ-23.35: the attachment methods over the wire, including the owner epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_attachment_methods_answer_with_the_geometry_and_the_epoch_they_produced() {
-    let wired = wired("sleep 120", CANONICAL).await;
+    let wired = wired(WAITS, CANONICAL).await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -1387,7 +1379,7 @@ async fn a_claim_the_session_budget_cannot_admit_is_refused_at_attach_and_owns_n
     // The bound that refuses this geometry is the engine's own state budget, which is what both
     // screen buffers of a grid have to fit inside. `resident_bytes` below bounds the retained
     // output rather than the grids, and is set small only to keep this session cheap.
-    let mut config = configuration(&host, "sleep 120", Dimensions::new(80, 24));
+    let mut config = configuration(&host, WAITS, Dimensions::new(80, 24));
     config.resident_bytes = 512 * 1024;
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
@@ -1607,18 +1599,33 @@ async fn resynchronised(client: &mut LocalClient, within: Duration) -> bool {
     false
 }
 
-/// Collects the canonical rows a projected client is sent, as (row, column, text) for each run.
+/// Collects the canonical rows a projected client is sent until one of them carries `marker`.
 ///
 /// A projected attachment is sent the canonical grid as state rather than bytes, so what it
-/// received is read as rows and runs. The column is the canonical one, which is what makes the
-/// absence of reflow visible.
-async fn collect_rows(client: &mut LocalClient, window: Duration) -> Vec<(u64, u64, String)> {
-    let deadline = tokio::time::Instant::now() + window;
-    let mut seen = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline - tokio::time::Instant::now();
-        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
-            break;
+/// received is read as rows and runs, as (row, column, text). The column is the canonical one,
+/// which is what makes the absence of reflow visible.
+///
+/// The rows answer the same question [`collect_until`] answers for a terminal that is sent bytes,
+/// and it ends the same way: on something the application wrote where the run should end, rather
+/// than after a length of time. [`LIVENESS_DEADLINE`] is what a marker that never arrives fails
+/// at.
+async fn collect_rows_until(client: &mut LocalClient, marker: &str) -> Vec<(u64, u64, String)> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut seen: Vec<(u64, u64, String)> = Vec::new();
+    while !seen.iter().any(|(_, _, text)| text.contains(marker)) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => panic!(
+                "waited {:?} for {marker:?} to reach this terminal and the connection ended \
+                 ({error}): {seen:?}",
+                started.elapsed()
+            ),
+            Err(_) => panic!(
+                "waited {:?} for {marker:?} to reach this terminal: {seen:?}",
+                started.elapsed()
+            ),
         };
         let kr_protocol::envelope::ControlFrame::Notification(notification) = frame else {
             continue;
@@ -1645,53 +1652,20 @@ async fn collect_rows(client: &mut LocalClient, window: Duration) -> Vec<(u64, u
     seen
 }
 
-/// Collects projected rows until one of them carries `marker`, and then for `window` longer.
+/// Collects the bytes this client is sent until they carry `marker`.
 ///
-/// The rows are the answer to the same question [`collect_until`] answers for a terminal that is
-/// sent bytes: whether the thing arrives at all is a liveness wait a loaded host can take its time
-/// over, and what arrives beside it is what the window is for.
-async fn collect_rows_until(
-    client: &mut LocalClient,
-    marker: &str,
-    window: Duration,
-) -> Vec<(u64, u64, String)> {
-    let started = tokio::time::Instant::now();
-    let deadline = started + LIVENESS_DEADLINE;
-    let mut seen: Vec<(u64, u64, String)> = Vec::new();
-    while !seen.iter().any(|(_, _, text)| text.contains(marker)) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for {marker:?} to reach this terminal: {seen:?}",
-            started.elapsed()
-        );
-        seen.extend(collect_rows(client, Duration::from_secs(1)).await);
-    }
-    seen.extend(collect_rows(client, window).await);
-    seen
-}
-
-/// Collects everything this client is sent for `window`.
-/// Collects until `marker` has arrived, and then for `window` longer.
-///
-/// The two halves answer different questions. Whether the marker arrives at all is a liveness wait,
-/// and a loaded host can take far longer over it than the window a test wants to watch afterwards;
-/// what arrives *beside* the marker is what that window is for. So the wait is bounded by
-/// [`LIVENESS_DEADLINE`] and the window keeps its own length, and a marker that never arrives fails
-/// here, saying how long it waited and for what.
-async fn collect_until(client: &mut LocalClient, marker: &[u8], window: Duration) -> Vec<u8> {
+/// There is no window afterwards: each caller here picks a marker the application wrote at the
+/// point where the run should end, so that everything the claim is about is queued in front of it.
+/// A window would sample what arrived inside a length of time instead, and two terminals sampled
+/// that way are compared from wherever each of them happened to get to.
+/// [`LIVENESS_DEADLINE`] is what a marker that never arrives fails at.
+async fn collect_until(client: &mut LocalClient, marker: &[u8]) -> Vec<u8> {
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     let mut seen: Vec<u8> = Vec::new();
-    while !contains(&seen, marker) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for {:?} to reach this terminal: {}",
-            started.elapsed(),
-            String::from_utf8_lossy(marker),
-            String::from_utf8_lossy(&seen).escape_debug()
-        );
-        let remaining = deadline - tokio::time::Instant::now();
-        match tokio::time::timeout(remaining.min(Duration::from_secs(1)), client.recv()).await {
+    while !carries(&seen, marker) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, client.recv()).await {
             Ok(Ok(ControlFrame::Notification(notification)))
                 if notification.event_type.as_str() == "session.output" =>
             {
@@ -1702,38 +1676,23 @@ async fn collect_until(client: &mut LocalClient, marker: &[u8], window: Duration
                     seen.extend_from_slice(event.bytes.as_slice());
                 }
             }
-            // A quiet moment is a busy machine, so the loop keeps looking; a connection that has
-            // gone can never deliver the marker, and that is this wait's failure rather than a
-            // partial answer for the caller to puzzle over.
-            Ok(Ok(_)) | Err(_) => {}
+            // Anything else this client is sent is not what this wait is about.
+            Ok(Ok(_)) => {}
+            // A connection that has gone can never deliver the marker, and that is this wait's
+            // failure rather than a partial answer for the caller to puzzle over.
             Ok(Err(error)) => panic!(
                 "waited {:?} for {:?} to reach this terminal and the connection ended ({error}): \
-                 {:?}",
+                 {}",
                 started.elapsed(),
                 String::from_utf8_lossy(marker),
-                String::from_utf8_lossy(&seen)
+                String::from_utf8_lossy(&seen).escape_debug()
             ),
-        }
-    }
-    seen.extend_from_slice(&collect(client, window).await);
-    seen
-}
-
-async fn collect(client: &mut LocalClient, window: Duration) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + window;
-    let mut seen = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline - tokio::time::Instant::now();
-        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
-            break;
-        };
-        if let ControlFrame::Notification(notification) = frame
-            && notification.event_type.as_str() == "session.output"
-            && let Ok(event) = notification
-                .payload
-                .to_typed::<kr_protocol::recovery::OutputEvent>()
-        {
-            seen.extend_from_slice(event.bytes.as_slice());
+            Err(_) => panic!(
+                "waited {:?} for {:?} to reach this terminal: {}",
+                started.elapsed(),
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&seen).escape_debug()
+            ),
         }
     }
     seen
