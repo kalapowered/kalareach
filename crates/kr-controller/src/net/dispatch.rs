@@ -603,11 +603,30 @@ impl RemoteConnection {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
-            // A diff is the working copy's current state, and the grant's environment and
-            // workspace selectors are what reach it. A change-set read returns retained content
-            // with the moment each version was captured, so the grant's history lower bound is
-            // applied to the answer.
-            Method::DiffRead | Method::ChangesetRead => {
+            // A diff of a working copy is that copy's current state, and the grant's environment
+            // and workspace selectors are what reach it. A diff of a **captured version** is
+            // retained content, and its answer carries the moment of the read rather than the
+            // moment of the capture, so nothing on this path can apply the grant's lower bound to
+            // it: a host that cannot narrow content to a grant refuses it rather than serving
+            // more than the grant allows. A change-set read does carry the capture, and its
+            // answer is narrowed below.
+            Method::DiffRead => {
+                if let Ok(params) = request
+                    .params
+                    .to_typed::<kr_protocol::changeset::DiffReadParams>()
+                    && params.change_set_id.is_present()
+                {
+                    return failure(
+                        request.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this host does not serve a diff of a recorded change-set version to                              a paired device; read the working copy instead",
+                        ),
+                    );
+                }
+                self.controller.read_method(&actor_id, request).await
+            }
+            Method::ChangesetRead => {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
