@@ -147,6 +147,8 @@ fn session_config(
         },
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+        worker_endpoint: None,
         desktop: DesktopBinding::none(),
         dimensions: Dimensions::new(80, 24),
         journal_path: Some(environment.journal_database(session_id)),

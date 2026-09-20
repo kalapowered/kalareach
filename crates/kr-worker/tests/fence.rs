@@ -1442,7 +1442,7 @@ async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value)),
     );
-    config.shell = ShellCommand {
+    config.shell = kr_worker::pty::ShellCommand {
         program: package.executable().display().to_string(),
         arguments: package.arguments(kr_shell_integration::host::package::StartupMode::Interactive),
         cwd: home.path().display().to_string(),
