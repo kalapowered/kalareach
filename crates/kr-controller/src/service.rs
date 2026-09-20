@@ -4063,12 +4063,13 @@ impl Controller {
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DevicePreviewKeyUpdateParams = parse(&mutation.params)?;
-        if let Some(paired) = self.paired_device(actor_id) {
-            if paired != params.device_id {
-                return Err(ControllerError::InvalidArgument(
-                    "a paired device may rotate only its own preview key".to_owned(),
-                ));
-            }
+        if self
+            .paired_device(actor_id)
+            .is_some_and(|paired| paired != params.device_id)
+        {
+            return Err(ControllerError::InvalidArgument(
+                "a paired device may rotate only its own preview key".to_owned(),
+            ));
         }
         let now_ms = self.settled_now_ms();
         let destination_id =
