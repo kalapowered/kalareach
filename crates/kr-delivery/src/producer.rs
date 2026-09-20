@@ -992,6 +992,8 @@ impl Producer {
                 keep_content: true,
                 // It was on the wire. Whether it arrived is the unknown; that it left is not.
                 left_this_host: true,
+                // This host stopping is not the destination's account of anything.
+                reported_by_destination: false,
             })?;
             if recorded {
                 reconciled.push((record.notification_id, DeliveryState::OutcomeUnknown));

@@ -62,10 +62,11 @@ use crate::error::{DeliveryError, Result};
 
 /// The schema this build writes and reads.
 ///
-/// Version 2 keys the rate allowance by the installation the policy belongs to rather than by the
-/// destination row that names it. A journal written under version 1 is refused rather than read
-/// with the columns of another shape.
-const SCHEMA_VERSION: i64 = 2;
+/// Version 3 keys the rate allowance by the installation the policy belongs to rather than by the
+/// destination row that names it, and records with each notification the kind of destination it
+/// was admitted for. A journal written under an earlier version is refused rather than read with
+/// the columns of another shape.
+const SCHEMA_VERSION: i64 = 3;
 
 /// Every table a working journal has.
 ///
@@ -502,6 +503,13 @@ pub struct Transition {
     /// both did. It is recorded once and never cleared, because privacy mode's question is not
     /// *is this still moving* but *is it too late to take it back*.
     pub left_this_host: bool,
+    /// Whether the destination itself reported this state.
+    ///
+    /// It separates an answer from a decision. A gateway that says a notification expired before
+    /// the provider took it has told this host what became of it; this host running out of
+    /// attempts, or its own deadline passing, has not, and a record something has already
+    /// dispatched keeps its uncertainty in that second case.
+    pub reported_by_destination: bool,
 }
 
 /// One delivery the outbox says is due.
@@ -1396,10 +1404,9 @@ impl DeliveryJournal {
                 "SELECT n.destination_id, n.state, n.attempts, n.expires_at_ms,
                         n.privacy_generation, n.content, o.due_at_ms,
                         n.destination_digest, n.authority_digest, o.next_action,
-                        n.dispatched, d.kind
+                        n.dispatched, n.destination_kind
                    FROM delivery_notifications n
                    LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
-                   JOIN delivery_destinations d ON d.destination_id = n.destination_id
                   WHERE n.notification_id = ?1",
                 params![identifier],
                 |row| {
@@ -1575,10 +1582,9 @@ impl DeliveryJournal {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let held: Option<(String, i64, i64, i64, String)> = transaction
             .query_row(
-                "SELECT n.state, n.attempts, n.privacy_generation, n.dispatched, d.kind
-                   FROM delivery_notifications n
-                   JOIN delivery_destinations d ON d.destination_id = n.destination_id
-                  WHERE n.notification_id = ?1",
+                "SELECT state, attempts, privacy_generation, dispatched, destination_kind
+                   FROM delivery_notifications
+                  WHERE notification_id = ?1",
                 params![identifier],
                 |row| {
                     Ok((
@@ -1641,6 +1647,7 @@ impl DeliveryJournal {
                 ..transition.clone()
             }
         } else if left_this_host
+            && !transition.reported_by_destination
             && matches!(
                 transition.state,
                 DeliveryState::Abandoned | DeliveryState::Expired
@@ -1657,6 +1664,14 @@ impl DeliveryJournal {
                     "this host stopped before the outcome was known: {}",
                     transition.detail.as_deref().unwrap_or("no further attempt")
                 )),
+                ..transition.clone()
+            }
+        } else if transition.state == DeliveryState::OutcomeUnknown {
+            // An unknown outcome means the question can be asked again, and only a gateway answers
+            // one. An external service has no receipt to read, so section 25's marked uncertainty
+            // is what the record says instead of a question nobody will ever put.
+            Transition {
+                state: unresolved_for(kind),
                 ..transition.clone()
             }
         } else {
@@ -2415,10 +2430,9 @@ impl DeliveryJournal {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let overdue: Vec<(String, i64, i64, String)> = {
             let mut statement = transaction.prepare(
-                "SELECT n.notification_id, n.attempts, n.dispatched, d.kind
+                "SELECT n.notification_id, n.attempts, n.dispatched, n.destination_kind
                    FROM delivery_outbox o JOIN delivery_notifications n
                      ON n.notification_id = o.notification_id
-                   JOIN delivery_destinations d ON d.destination_id = n.destination_id
                   WHERE n.expires_at_ms <= ?1
                     AND n.state IN ('admitted', 'retrying')
                   ORDER BY n.admitted_at_ms",
@@ -2918,8 +2932,10 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
              (notification_id, event_key, destination_id, state, privacy_generation,
               content, payload_bytes, expires_at_ms, admitted_at_ms, attempts,
               suppression_reason, suppression_into, suppression_count,
-              suppression_next_ms, detail, destination_digest, authority_digest)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?13, ?14, ?10, ?15, ?16)",
+              suppression_next_ms, detail, destination_digest, authority_digest,
+              destination_kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?13, ?14, ?10, ?15, ?16,
+                 (SELECT kind FROM delivery_destinations WHERE destination_id = ?3))",
         params![
             record.notification_id.to_string(),
             record.event.stored(),
@@ -3234,6 +3250,11 @@ const SCHEMA: &str = "
         destination_digest TEXT NOT NULL DEFAULT '',
         authority_digest TEXT NOT NULL DEFAULT '',
         dispatched INTEGER NOT NULL DEFAULT 0,
+        -- The kind of destination this was admitted for, written once. A destination row can be
+        -- configured again as another kind under the same identifier, and what a settlement means
+        -- depends on what this delivery was: a paired device can be asked for a receipt and a
+        -- webhook cannot.
+        destination_kind TEXT NOT NULL,
         UNIQUE (event_key, destination_id)
     );
     CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -3583,6 +3604,7 @@ mod tests {
                 suppression: None,
                 keep_content: false,
                 left_this_host: false,
+                reported_by_destination: false,
             })
             .expect("a transition");
         assert!(!settled, "the attempt number is not the claimed one");
@@ -3727,6 +3749,7 @@ mod tests {
                     suppression: None,
                     keep_content: true,
                     left_this_host: false,
+                    reported_by_destination: false,
                 })
                 .expect("a transition")
         );
@@ -3776,6 +3799,7 @@ mod tests {
                     suppression: None,
                     keep_content: true,
                     left_this_host: true,
+                    reported_by_destination: false,
                 })
                 .expect("a transition")
         );
@@ -3801,6 +3825,110 @@ mod tests {
                 .any(|artifact| artifact.reference.contains("duplicate_uncertain")),
             "and it is reported as an artifact that may have arrived"
         );
+    }
+
+    /// A gateway that says a notification expired is telling this host what became of it, and that
+    /// is an answer. This host's own deadline passing is not, and only the second leaves the
+    /// outcome open.
+    #[test]
+    fn an_expiry_the_gateway_reported_settles_and_one_this_host_observed_does_not() {
+        for reported in [true, false] {
+            let mut journal = journal();
+            journal
+                .configure_destination(&phone())
+                .expect("a destination");
+            journal
+                .take_events(&consumer(), &[taken(1, 1)], 1)
+                .expect("a page");
+            journal
+                .admit(&delivery_for(9, event(1), &phone()))
+                .expect("admitted");
+            let claimed = claim(&mut journal, 9, 2_000);
+            journal
+                .record_attempt(&Transition {
+                    notification_id: claimed.notification_id,
+                    attempt: claimed.attempt,
+                    state: DeliveryState::Expired,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_010)),
+                    next_attempt_at_ms: None,
+                    next: crate::push::NextAction::None,
+                    detail: Some("expired".to_owned()),
+                    suppression: None,
+                    keep_content: false,
+                    left_this_host: true,
+                    reported_by_destination: reported,
+                })
+                .expect("a transition");
+            let record = journal
+                .delivery(NotificationId::new(uuid(9)))
+                .expect("a read")
+                .expect("the record");
+            if reported {
+                assert_eq!(
+                    record.state,
+                    DeliveryState::Expired,
+                    "the gateway said what became of it"
+                );
+                assert_eq!(journal.outstanding().expect("a count"), 0);
+            } else {
+                assert_eq!(
+                    record.state,
+                    DeliveryState::OutcomeUnknown,
+                    "this host stopped asking, which settles nothing"
+                );
+                assert_eq!(journal.outstanding().expect("a count"), 1);
+            }
+        }
+    }
+
+    /// What a settlement means depends on what the delivery was, not on what the destination row
+    /// says now: a row can be configured again as another kind under the same identifier.
+    #[test]
+    fn a_settlement_uses_the_kind_the_delivery_was_admitted_for() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery_for(9, event(1), &phone()))
+            .expect("admitted");
+        let claimed = claim(&mut journal, 9, 2_000);
+        // The same identifier is configured again as a webhook while the attempt is on the wire.
+        let mut replaced = destination("hook");
+        replaced.id = DestinationId::new("phone").expect("an identifier");
+        journal
+            .configure_destination(&replaced)
+            .expect("the replacement");
+        journal
+            .record_attempt(&Transition {
+                notification_id: claimed.notification_id,
+                attempt: claimed.attempt,
+                state: DeliveryState::Abandoned,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("this host stopped trying".to_owned()),
+                suppression: None,
+                keep_content: false,
+                left_this_host: true,
+                reported_by_destination: false,
+            })
+            .expect("a transition");
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(
+            record.state,
+            DeliveryState::OutcomeUnknown,
+            "it was admitted for a paired device, and a receipt can still account for it"
+        );
+        assert!(record.content.is_some());
     }
 
     /// A receipt answered after privacy mode drew its boundary is recorded and queues nothing, and
@@ -3831,6 +3959,7 @@ mod tests {
                 suppression: None,
                 keep_content: true,
                 left_this_host: true,
+                reported_by_destination: false,
             })
             .expect("a transition");
         journal.fence(1).expect("a fence");
@@ -3846,6 +3975,7 @@ mod tests {
                         suppression: None,
                         disable_destination: false,
                         left_this_host: true,
+                        reported_by_destination: false,
                     },
                     3_000,
                 )
@@ -3896,6 +4026,7 @@ mod tests {
                 suppression: None,
                 keep_content: true,
                 left_this_host: true,
+                reported_by_destination: false,
             })
             .expect("a transition");
         let record = journal
@@ -3937,6 +4068,7 @@ mod tests {
                 suppression: None,
                 keep_content: true,
                 left_this_host: false,
+                reported_by_destination: false,
             })
             .expect("a transition");
         let record = journal
@@ -3999,6 +4131,7 @@ mod tests {
                 suppression: None,
                 keep_content: true,
                 left_this_host: false,
+                reported_by_destination: false,
             })
             .expect("a transition");
         assert!(
@@ -4070,6 +4203,7 @@ mod tests {
                 suppression: None,
                 keep_content: true,
                 left_this_host: true,
+                reported_by_destination: false,
             })
             .expect("a transition");
         assert_eq!(journal.expire_overdue(100_000).expect("a pass"), 1);
@@ -4128,6 +4262,7 @@ mod tests {
                     keep_content: false,
                     // The gateway answered, so the request did reach it.
                     left_this_host: true,
+                    reported_by_destination: false,
                 })
                 .expect("a transition")
         );
@@ -4181,6 +4316,7 @@ mod tests {
                 suppression: None,
                 keep_content: false,
                 left_this_host: true,
+                reported_by_destination: false,
             })
             .expect("a transition");
         assert_eq!(
@@ -4216,6 +4352,7 @@ mod tests {
                 suppression: None,
                 keep_content: false,
                 left_this_host: false,
+                reported_by_destination: false,
             })
             .expect("a transition");
         assert!(journal.due(50_000, 10).expect("a read").is_empty());

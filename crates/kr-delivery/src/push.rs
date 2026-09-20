@@ -201,6 +201,14 @@ pub struct Decision {
     /// the same as knowing it did not go. A credential the gateway refused and a connection that
     /// was never established do not.
     pub left_this_host: bool,
+    /// Whether the destination itself reported this state.
+    ///
+    /// A gateway that says a notification expired before the provider took it, or that it stopped
+    /// trying, is reporting what became of the notification, and that is an answer. This host
+    /// running out of attempts, or its own deadline passing, is not: it says when this host
+    /// stopped asking. The journal keeps the two apart, because only the second leaves the
+    /// outcome open.
+    pub reported_by_destination: bool,
 }
 
 /// Decides what one gateway answer means.
@@ -222,6 +230,8 @@ pub fn decide(
         suppression: None,
         disable_destination: false,
         left_this_host: false,
+        // This host's own decision to stop, not the gateway's account of what happened.
+        reported_by_destination: false,
     };
     match outcome {
         SendOutcome::Decided(ack) => {
@@ -240,6 +250,7 @@ pub fn decide(
                     suppression: None,
                     disable_destination: false,
                     left_this_host: false,
+                    reported_by_destination: false,
                 },
                 None if attempt >= MAX_ATTEMPTS => settle(
                     DeliveryState::Abandoned,
@@ -261,6 +272,7 @@ pub fn decide(
                     suppression: None,
                     disable_destination: false,
                     left_this_host: false,
+                    reported_by_destination: false,
                 },
                 None if attempt >= MAX_ATTEMPTS => settle(
                     DeliveryState::Abandoned,
@@ -273,6 +285,7 @@ pub fn decide(
             }
         }
         SendOutcome::Unknown { detail } => Decision {
+            reported_by_destination: false,
             state: DeliveryState::OutcomeUnknown,
             // Nothing automatic. A reconciliation pass reads the receipt, and that pass is asked
             // for rather than scheduled.
@@ -304,6 +317,8 @@ fn decide_from_ack(
         // The gateway answered, and it claims the identifier before anything reaches a provider,
         // so the notification is the gateway's from here whatever the answer was.
         left_this_host: true,
+        // And what it answered is its account of what became of the notification.
+        reported_by_destination: true,
     };
     match ack.state {
         // Queued is acceptance for delivery. It is recorded as acceptance and never as displayed,
@@ -324,6 +339,7 @@ fn decide_from_ack(
                     suppression,
                     disable_destination: false,
                     left_this_host: true,
+                    reported_by_destination: true,
                 },
                 // The host has stopped asking; the gateway has not stopped trying. A local limit
                 // decides how often this host reads a receipt and decides nothing about what the
@@ -342,11 +358,19 @@ fn decide_from_ack(
                     suppression,
                     disable_destination: false,
                     left_this_host: true,
+                    // The gateway said it was still trying, which is the opposite of an account
+                    // of what became of it.
+                    reported_by_destination: false,
                 },
-                None => settled(
-                    DeliveryState::Expired,
-                    "the notification expired while the gateway was still retrying",
-                ),
+                // The gateway is still trying and this host's own deadline has passed, which
+                // settles nothing about what the gateway does next.
+                None => Decision {
+                    reported_by_destination: false,
+                    ..settled(
+                        DeliveryState::Expired,
+                        "the notification expired while the gateway was still retrying",
+                    )
+                },
             }
         }
         PushDeliveryState::Collapsed => settled(
@@ -358,6 +382,7 @@ fn decide_from_ack(
             "this notification identifier was already handled and the earlier outcome stands",
         ),
         PushDeliveryState::TokenDisabled => Decision {
+            reported_by_destination: true,
             state: DeliveryState::TokenDisabled,
             next: NextAction::None,
             next_attempt_at_ms: None,

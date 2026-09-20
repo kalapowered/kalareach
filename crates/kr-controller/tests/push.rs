@@ -2300,6 +2300,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                     suppression: None,
                     keep_content: false,
                     left_this_host: false,
+                    reported_by_destination: false,
                 })
                 .expect("a transition");
             let selected = producer.journal().due(NOW, 1).expect("a read");

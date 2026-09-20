@@ -207,6 +207,29 @@ mod tests {
         );
     }
 
+    /// A paired device, whose unresolved deliveries a receipt can still account for.
+    fn phone() -> DestinationRecord {
+        let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+        DestinationRecord {
+            id: DestinationId::new("phone").expect("an identifier"),
+            destination: crate::destination::Destination::Push(Box::new(
+                crate::destination::PushDestination {
+                    installation_id: kr_protocol::ids::InstallationId::new(uuid(41)),
+                    sender_record_id: kr_protocol::ids::PushSenderRecordId::new(uuid(42)),
+                    preview_keys: crate::destination::PreviewKeys::only(*device.public(), 1),
+                    previews_enabled: true,
+                    mailbox_key: None,
+                },
+            )),
+            rule: Some(crate::destination::DeliveryRule {
+                name: "anything that wants a person".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        }
+    }
+
     fn journal_with_work() -> DeliveryJournal {
         let mut journal = DeliveryJournal::in_memory().expect("a journal");
         journal
@@ -306,6 +329,7 @@ mod tests {
                 suppression: None,
                 keep_content: true,
                 left_this_host: true,
+                reported_by_destination: false,
             })
             .expect("a transition");
 
@@ -369,19 +393,59 @@ mod tests {
                 suppression: None,
                 keep_content: false,
                 left_this_host: false,
+                reported_by_destination: false,
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
         assert_eq!(PrivacyMode::reconcile(&[&outbox]), Completion::Complete);
     }
 
+    /// A notification the gateway may still deliver keeps the cleanup reconciling: section 24
+    /// reports completion only after what is outstanding has been accounted for, and a paired
+    /// device's receipt is the account.
     #[test]
     fn an_unknown_outcome_keeps_the_cleanup_reconciling() {
         let mut journal = journal_with_work();
-        claim(&mut journal, 11, 1_500);
+        let phone = phone();
+        journal
+            .configure_destination(&phone)
+            .expect("a destination");
+        journal
+            .take_events(
+                &consumer(),
+                &[TakenEvent {
+                    key: EventKey::outbox(&uuid(9)),
+                    source_cursor: 9,
+                    session_id: None,
+                    recorded_at_ms: TimestampMs::new(1_000),
+                    notice: Vec::new(),
+                }],
+                9,
+            )
+            .expect("a page");
+        journal
+            .admit(&DeliveryRecord {
+                notification_id: NotificationId::new(uuid(21)),
+                event: EventKey::outbox(&uuid(9)),
+                destination_id: phone.id.clone(),
+                state: DeliveryState::Admitted,
+                privacy_generation: 0,
+                destination_digest: phone.binding_digest(),
+                authority_digest: String::new(),
+                content: Some(vec![b'x'; 100]),
+                payload_bytes: 100,
+                expires_at_ms: TimestampMs::new(1_000_000),
+                admitted_at_ms: TimestampMs::new(1_000),
+                attempts: 0,
+                suppression: None,
+                detail: None,
+                dispatched: false,
+            })
+            .expect("admitted");
+        claim(&mut journal, 21, 1_500);
         journal
             .record_attempt(&Transition {
-                notification_id: NotificationId::new(uuid(11)),
+                notification_id: NotificationId::new(uuid(21)),
                 attempt: 1,
                 state: DeliveryState::OutcomeUnknown,
                 started_at_ms: TimestampMs::new(1_500),
@@ -392,6 +456,7 @@ mod tests {
                 suppression: None,
                 keep_content: false,
                 left_this_host: false,
+                reported_by_destination: false,
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
@@ -418,6 +483,7 @@ mod tests {
                 suppression: None,
                 keep_content: false,
                 left_this_host: false,
+                reported_by_destination: false,
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
@@ -447,6 +513,7 @@ mod tests {
                 suppression: None,
                 keep_content: false,
                 left_this_host: true,
+                reported_by_destination: false,
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);

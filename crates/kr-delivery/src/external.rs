@@ -345,6 +345,12 @@ pub struct ExternalDecision {
     /// read it either way. An outcome nobody knows has it too, which is the whole of section 25's
     /// duplicate-delivery uncertainty. A connection that was never established does not.
     pub left_this_host: bool,
+    /// Whether the destination itself reported this state, rather than this host deciding to stop.
+    ///
+    /// A service that took the message, refused it or recognised it as one it already had is
+    /// saying what became of it. This host running out of attempts is saying when it stopped
+    /// asking, which settles nothing.
+    pub reported_by_destination: bool,
 }
 
 /// Decides what one external answer means, under section 25's retry rule.
@@ -363,24 +369,27 @@ pub fn decide_external(
         next_attempt_at_ms: None,
         detail,
         left_this_host,
+        // This host's own decision to stop, not the service's account of what it did.
+        reported_by_destination: false,
+    };
+    let reported = |state: DeliveryState, detail: String| ExternalDecision {
+        reported_by_destination: true,
+        ..settle(state, detail, true)
     };
     match outcome {
-        ExternalOutcome::Delivered => settle(
+        ExternalOutcome::Delivered => reported(
             DeliveryState::Accepted,
             "the destination accepted the message".to_owned(),
-            true,
         ),
-        ExternalOutcome::Duplicate => settle(
+        ExternalOutcome::Duplicate => reported(
             DeliveryState::Duplicate,
             "the destination had already seen this delivery identifier".to_owned(),
-            true,
         ),
         // The destination read the message and refused it, so the content reached the service
         // whatever it decided to do with it.
-        ExternalOutcome::Refused { detail } => settle(
+        ExternalOutcome::Refused { detail } => reported(
             DeliveryState::Refused,
             format!("the destination refused the message: {detail}"),
-            true,
         ),
         // Section 25: retry only idempotent delivery IDs where the destination supports them,
         // and mark duplicate-delivery uncertainty otherwise.
@@ -392,6 +401,7 @@ pub fn decide_external(
                     next_attempt_at_ms: Some(at),
                     detail: format!("nothing was dispatched, so it is sent again: {detail}"),
                     left_this_host: false,
+                    reported_by_destination: false,
                 },
                 None if attempt >= MAX_ATTEMPTS => settle(
                     DeliveryState::Abandoned,
@@ -424,6 +434,7 @@ pub fn decide_external(
                          delivery identifier, so it is sent again: {detail}"
                     ),
                     left_this_host: true,
+                    reported_by_destination: false,
                 },
                 // Section 25 marks the uncertainty rather than resolving it by guessing. This host
                 // stopped presenting the message; the destination may still have taken one of the
