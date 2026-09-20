@@ -1365,14 +1365,18 @@ impl DeliveryJournal {
             String,
             String,
             Option<String>,
+            i64,
+            String,
         );
         let row: Option<Row> = transaction
             .query_row(
                 "SELECT n.destination_id, n.state, n.attempts, n.expires_at_ms,
                         n.privacy_generation, n.content, o.due_at_ms,
-                        n.destination_digest, n.authority_digest, o.next_action
+                        n.destination_digest, n.authority_digest, o.next_action,
+                        n.dispatched, d.kind
                    FROM delivery_notifications n
                    LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
+                   JOIN delivery_destinations d ON d.destination_id = n.destination_id
                   WHERE n.notification_id = ?1",
                 params![identifier],
                 |row| {
@@ -1387,6 +1391,8 @@ impl DeliveryJournal {
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
                     ))
                 },
             )
@@ -1402,6 +1408,8 @@ impl DeliveryJournal {
             destination_digest,
             authority_digest,
             next_action,
+            dispatched,
+            kind,
         )) = row
         else {
             return Ok(Claim::Refused(ClaimRefusal::Missing));
@@ -1421,20 +1429,35 @@ impl DeliveryJournal {
         let Some(due_at) = due_at else {
             return Ok(Claim::Refused(ClaimRefusal::NotEligible));
         };
+        let kind = DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+            "a stored destination kind is not one this build writes",
+        ))?;
         if as_u64(expires) <= now_ms {
             // Section 16 stops at expiry. Settling it here, in the transaction that would
             // otherwise have handed it to a sender, is what makes that true of a pass whose clock
-            // moved on while it was blocked.
+            // moved on while it was blocked. An expiry this host observed is not an outcome for
+            // something it has already sent, so a record an earlier attempt dispatched keeps its
+            // uncertainty instead.
+            let settled = if dispatched == 0 {
+                DeliveryState::Expired
+            } else {
+                unresolved_for(kind)
+            };
             settle_in(
                 &transaction,
                 &identifier,
                 as_u64(attempts),
                 now_ms,
-                DeliveryState::Expired,
-                "the notification expired before this attempt could be made",
+                settled,
+                if dispatched == 0 {
+                    "the notification expired before this attempt could be made"
+                } else {
+                    "the notification expired after an attempt had already reached the \
+                     destination, so what became of it is not this host's to say"
+                },
             )?;
             transaction.commit()?;
-            return Ok(Claim::Settled(DeliveryState::Expired));
+            return Ok(Claim::Settled(settled));
         }
         // The destination this was built for, as it stood at admission, against the destination
         // configured now. An endpoint edited after admission is another recipient, and content
@@ -1527,23 +1550,44 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let held: Option<(String, i64, i64)> = transaction
+        let held: Option<(String, i64, i64, i64, String)> = transaction
             .query_row(
-                "SELECT state, attempts, privacy_generation FROM delivery_notifications
-                  WHERE notification_id = ?1",
+                "SELECT n.state, n.attempts, n.privacy_generation, n.dispatched, d.kind
+                   FROM delivery_notifications n
+                   JOIN delivery_destinations d ON d.destination_id = n.destination_id
+                  WHERE n.notification_id = ?1",
                 params![identifier],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let record_generation = match held {
-            Some((state, attempts, record_generation))
+        let (record_generation, dispatched_before, kind) = match held {
+            Some((state, attempts, record_generation, dispatched, kind))
                 if state == DeliveryState::InFlight.as_str()
                     && as_u64(attempts) == transition.attempt =>
             {
-                as_u64(record_generation)
+                (
+                    as_u64(record_generation),
+                    dispatched != 0,
+                    DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+                        "a stored destination kind is not one this build writes",
+                    ))?,
+                )
             }
             _ => return Ok(false),
         };
+        // What an earlier attempt did is part of this record, not of this attempt. A notification
+        // one attempt handed to the gateway is one the gateway may still deliver, whatever the
+        // attempt after it failed to do, so the history and not the last answer decides whether
+        // the outcome is still open.
+        let left_this_host = transition.left_this_host || dispatched_before;
         // Privacy mode can fence the outbox while an attempt is on the wire, and the answer to
         // that attempt arrives afterwards. It is recorded, because what happened happened, but it
         // does not put the notification back to work: an answer that asks for another attempt
@@ -1559,8 +1603,8 @@ impl DeliveryJournal {
         let walked_past = fenced != 0 || record_generation != as_u64(generation);
         let transition = &if walked_past && !transition.state.is_settled() {
             Transition {
-                state: if transition.left_this_host {
-                    DeliveryState::OutcomeUnknown
+                state: if left_this_host {
+                    unresolved_for(kind)
                 } else {
                     DeliveryState::Cancelled
                 },
@@ -1571,6 +1615,25 @@ impl DeliveryJournal {
                     transition.detail.as_deref().unwrap_or("no further attempt")
                 )),
                 keep_content: false,
+                ..transition.clone()
+            }
+        } else if left_this_host
+            && matches!(
+                transition.state,
+                DeliveryState::Abandoned | DeliveryState::Expired
+            )
+        {
+            // This host stopping, and this host's own deadline passing, are both facts about this
+            // host. Neither settles what became of something the gateway or the service already
+            // has.
+            Transition {
+                state: unresolved_for(kind),
+                next: crate::push::NextAction::None,
+                next_attempt_at_ms: None,
+                detail: Some(format!(
+                    "this host stopped before the outcome was known: {}",
+                    transition.detail.as_deref().unwrap_or("no further attempt")
+                )),
                 ..transition.clone()
             }
         } else {
@@ -2327,17 +2390,18 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let overdue: Vec<(String, i64, i64)> = {
+        let overdue: Vec<(String, i64, i64, String)> = {
             let mut statement = transaction.prepare(
-                "SELECT n.notification_id, n.attempts, n.dispatched
+                "SELECT n.notification_id, n.attempts, n.dispatched, d.kind
                    FROM delivery_outbox o JOIN delivery_notifications n
                      ON n.notification_id = o.notification_id
+                   JOIN delivery_destinations d ON d.destination_id = n.destination_id
                   WHERE n.expires_at_ms <= ?1
                     AND n.state IN ('admitted', 'retrying')
                   ORDER BY n.admitted_at_ms",
             )?;
             let rows = statement.query_map(params![as_i64(now_ms)], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?;
             let mut overdue = Vec::new();
             for row in rows {
@@ -2346,32 +2410,31 @@ impl DeliveryJournal {
             overdue
         };
         let settled = overdue.len();
-        for (identifier, attempts, dispatched) in overdue {
-            if dispatched == 0 {
-                settle_in(
-                    &transaction,
-                    &identifier,
-                    as_u64(attempts),
-                    now_ms,
+        for (identifier, attempts, dispatched, kind) in overdue {
+            let kind =
+                DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+                    "a stored destination kind is not one this build writes",
+                ))?;
+            let (settled, detail) = if dispatched == 0 {
+                (
                     DeliveryState::Expired,
                     "the notification expired before it was dispatched",
-                )?;
+                )
             } else {
-                transaction.execute(
-                    "UPDATE delivery_notifications SET state = ?2, detail = ?3
-                      WHERE notification_id = ?1",
-                    params![
-                        identifier,
-                        DeliveryState::OutcomeUnknown.as_str(),
-                        "the notification expired while the gateway was holding it, so what \
-                         became of it is unknown"
-                    ],
-                )?;
-                transaction.execute(
-                    "DELETE FROM delivery_outbox WHERE notification_id = ?1",
-                    params![identifier],
-                )?;
-            }
+                (
+                    unresolved_for(kind),
+                    "the notification expired after it had already been dispatched, so what \
+                     became of it is not this host's to say",
+                )
+            };
+            settle_in(
+                &transaction,
+                &identifier,
+                as_u64(attempts),
+                now_ms,
+                settled,
+                detail,
+            )?;
         }
         transaction.commit()?;
         Ok(settled)
@@ -2406,19 +2469,40 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let held: Option<(String, i64)> = transaction
+        let held: Option<(String, i64, i64)> = transaction
             .query_row(
-                "SELECT state, attempts FROM delivery_notifications WHERE notification_id = ?1",
+                "SELECT state, attempts, privacy_generation FROM delivery_notifications
+                  WHERE notification_id = ?1",
                 params![identifier],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((held_state, attempts)) = held else {
+        let Some((held_state, attempts, record_generation)) = held else {
             return Ok(false);
         };
         if held_state != DeliveryState::OutcomeUnknown.as_str() {
             return Ok(false);
         }
+        // The answer can arrive after privacy mode has drawn its boundary, and then it is recorded
+        // without putting the notification back to work: an outbox row written here would be work
+        // queued under a generation that has ended, and the record would stop counting as
+        // outstanding while the gateway was still holding it.
+        let (generation, fenced): (i64, i64) = transaction.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let walked_past = fenced != 0 || as_u64(record_generation) != as_u64(generation);
+        let (state, next, next_attempt_at_ms, detail) = if walked_past && !state.is_settled() {
+            (
+                DeliveryState::OutcomeUnknown,
+                crate::push::NextAction::None,
+                None,
+                detail,
+            )
+        } else {
+            (state, next, next_attempt_at_ms, detail)
+        };
         if state.is_settled() {
             transaction.execute(
                 "INSERT INTO delivery_attempts
@@ -2437,7 +2521,11 @@ impl DeliveryJournal {
                 ],
             )?;
             transaction.execute(
-                "UPDATE delivery_notifications SET state = ?2, detail = ?3, content = NULL
+                // An answer that leaves the outcome unknown answers nothing, so the request that
+                // asks the question again stays. Every other settlement takes it.
+                "UPDATE delivery_notifications
+                    SET state = ?2, detail = ?3,
+                        content = CASE WHEN ?2 = 'outcome_unknown' THEN content ELSE NULL END
                   WHERE notification_id = ?1",
                 params![identifier, state.as_str(), detail],
             )?;
@@ -2855,6 +2943,19 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
     Ok(())
 }
 
+/// What a delivery whose outcome this host cannot establish is recorded as.
+///
+/// A notification the gateway holds can be asked about, so it is the outcome nobody knows and its
+/// request is kept for that question. An external message has no such question: section 25 marks
+/// the duplicate-delivery uncertainty instead, and keeping plaintext for a reconciliation that
+/// will never happen would be content retained for nothing.
+const fn unresolved_for(kind: DestinationKind) -> DeliveryState {
+    match kind {
+        DestinationKind::Push => DeliveryState::OutcomeUnknown,
+        _ => DeliveryState::DuplicateUncertain,
+    }
+}
+
 /// Settles one record inside a transaction the caller owns, without it ever having been sent.
 ///
 /// It is the answer to a claim the store itself can refuse: an expiry that has passed, or a
@@ -2886,8 +2987,12 @@ fn settle_in(
         ],
     )?;
     transaction.execute(
+        // The request bytes go with the settlement, except for the one state a receipt can still
+        // resolve: reading a receipt means presenting the identical request, so a record that
+        // dropped it could never be reconciled.
         "UPDATE delivery_notifications
-            SET state = ?4, attempts = MAX(attempts, ?2), content = NULL, detail = ?3
+            SET state = ?4, attempts = MAX(attempts, ?2), detail = ?3,
+                content = CASE WHEN ?4 = 'outcome_unknown' THEN content ELSE NULL END
           WHERE notification_id = ?1",
         params![identifier, as_i64(attempt), detail, state.as_str()],
     )?;
@@ -3204,6 +3309,36 @@ mod tests {
             }),
             enabled: true,
             configured_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    /// A paired device, which is the destination whose outcome a receipt can still resolve.
+    fn phone() -> DestinationRecord {
+        let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+        DestinationRecord {
+            id: DestinationId::new("phone").expect("an identifier"),
+            destination: Destination::Push(Box::new(PushDestination {
+                installation_id: InstallationId::new(uuid(5)),
+                sender_record_id: PushSenderRecordId::new(uuid(6)),
+                preview_keys: PreviewKeys::only(*device.public(), 1),
+                previews_enabled: true,
+                mailbox_key: None,
+            })),
+            rule: Some(DeliveryRule {
+                name: "anything that wants a person".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    /// One delivery for a destination the caller has already configured.
+    fn delivery_for(byte: u8, event: EventKey, destination: &DestinationRecord) -> DeliveryRecord {
+        DeliveryRecord {
+            destination_id: destination.id.clone(),
+            destination_digest: destination.binding_digest(),
+            ..delivery(byte, event, "hook")
         }
     }
 
@@ -3625,11 +3760,127 @@ mod tests {
             .delivery(NotificationId::new(uuid(9)))
             .expect("a read")
             .expect("the record");
-        assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+        assert_eq!(
+            record.state,
+            DeliveryState::DuplicateUncertain,
+            "an external service has no receipt to read, so section 25's uncertainty is what is \
+             recorded"
+        );
         assert!(
             journal.due(10_000, 10).expect("a read").is_empty(),
             "nothing is queued under a generation privacy mode has ended"
         );
+        assert!(
+            journal
+                .exported()
+                .expect("a read")
+                .iter()
+                .any(|artifact| artifact.reference.contains("duplicate_uncertain")),
+            "and it is reported as an artifact that may have arrived"
+        );
+    }
+
+    /// A receipt answered after privacy mode drew its boundary is recorded and queues nothing, and
+    /// an answer that leaves the outcome unknown keeps the request that asks the question again.
+    #[test]
+    fn a_receipt_answered_after_a_boundary_queues_nothing_and_keeps_its_request() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery_for(9, event(1), &phone()))
+            .expect("admitted");
+        let claimed = claim(&mut journal, 9, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: claimed.notification_id,
+                attempt: claimed.attempt,
+                state: DeliveryState::OutcomeUnknown,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("the connection was reset".to_owned()),
+                suppression: None,
+                keep_content: true,
+                left_this_host: true,
+            })
+            .expect("a transition");
+        journal.fence(1).expect("a fence");
+        assert!(
+            journal
+                .settle_receipt(
+                    claimed.notification_id,
+                    &crate::push::Decision {
+                        state: DeliveryState::Retrying,
+                        next: crate::push::NextAction::Receipt,
+                        next_attempt_at_ms: Some(TimestampMs::new(9_000)),
+                        detail: "the gateway is still retrying the provider".to_owned(),
+                        suppression: None,
+                        disable_destination: false,
+                        left_this_host: true,
+                    },
+                    3_000,
+                )
+                .expect("a settlement")
+        );
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+        assert!(
+            record.content.is_some(),
+            "an answer that resolves nothing leaves the question askable"
+        );
+        assert!(
+            journal.due(100_000, 10).expect("a read").is_empty(),
+            "and nothing is queued under a generation privacy mode has ended"
+        );
+        assert_eq!(journal.outstanding().expect("a count"), 1);
+    }
+
+    /// The same boundary for a paired device: the gateway can still be asked what became of it,
+    /// so the record keeps the question open and the request that asks it.
+    #[test]
+    fn a_late_answer_for_a_device_keeps_the_question_the_receipt_answers() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery_for(9, event(1), &phone()))
+            .expect("admitted");
+        let claimed = claim(&mut journal, 9, 2_000);
+        journal.fence(1).expect("a fence");
+        journal
+            .record_attempt(&Transition {
+                notification_id: claimed.notification_id,
+                attempt: claimed.attempt,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_600)),
+                next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                next: crate::push::NextAction::Receipt,
+                detail: Some("the gateway is holding it".to_owned()),
+                suppression: None,
+                keep_content: true,
+                left_this_host: true,
+            })
+            .expect("a transition");
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+        assert!(record.content.is_some(), "the receipt presents this again");
         assert_eq!(
             journal.outstanding().expect("a count"),
             1,
@@ -3774,10 +4025,13 @@ mod tests {
     fn a_dispatched_delivery_that_expired_keeps_its_uncertainty_and_its_request() {
         let mut journal = journal();
         journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
             .take_events(&consumer(), &[taken(1, 1)], 1)
             .expect("a page");
         journal
-            .admit(&delivery(9, event(1), "hook"))
+            .admit(&delivery_for(9, event(1), &phone()))
             .expect("admitted");
         claim(&mut journal, 9, 2_000);
         journal
