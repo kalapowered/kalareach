@@ -1341,6 +1341,60 @@ fn a_repository_that_names_its_own_data_in_full_is_still_read_as_this_tree() {
     }
 }
 
+/// KR-REQ-14.33 and D-097: a repository that names its shared data out of the tree and back in.
+///
+/// `commondir` here climbs above the working tree and comes down into it again. Every step of that
+/// is walked through the handles this host already holds — the climb opens the directory a handle
+/// is in, never a path from outside — and the moment a step **is** the working tree the rest of
+/// the name is read with the tree's own rule. The directory it ends at is this repository's own
+/// data and is excluded, however far around the name goes to reach it.
+#[test]
+fn a_repository_that_names_its_shared_data_out_of_the_tree_and_back_is_still_this_tree() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "out-and-back");
+    std::fs::rename(path.join(".git"), path.join("common")).expect("the shared data");
+    std::fs::create_dir_all(path.join("meta")).expect("this worktree's own");
+    for name in ["HEAD", "index"] {
+        let from = path.join("common").join(name);
+        if from.exists() {
+            std::fs::copy(&from, path.join("meta").join(name)).expect("its own copy");
+        }
+    }
+    // Out of the tree, then back into it by name.
+    std::fs::write(path.join("meta/commondir"), b"../../out-and-back/common\n")
+        .expect("naming the shared one the long way round");
+    std::fs::write(
+        path.join("meta/config.worktree"),
+        b"[remote]\n\turl = a-secret\n",
+    )
+    .expect("something only this worktree has");
+    std::fs::write(path.join(".git"), b"gitdir: meta\n").expect("and the file that names it");
+    git_raw(&path, ["add", "--force", "meta/config.worktree"]);
+    git_raw(&path, ["commit", "--quiet", "-m", "its own configuration"]);
+
+    let workspace = fixture.workspace("out-and-back");
+    let record = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect("a repository that names its data the long way round is captured");
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    for entry in &manifest.paths {
+        assert!(
+            !entry.path.starts_with("meta/") && !entry.path.starts_with("common/"),
+            "neither of this repository's own directories is in its own version: {}",
+            entry.path
+        );
+    }
+}
+
 /// KR-REQ-14.33 and D-087a: a linked worktree's two directories, built by Git itself.
 #[test]
 fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {

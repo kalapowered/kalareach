@@ -571,6 +571,30 @@ impl AuthorisedDirectory {
         Ok(held)
     }
 
+    /// Opens the directory this one is **in**, from this one's own handle.
+    ///
+    /// The one operation here that goes upward, and it goes upward the same way everything else
+    /// goes downward: through the handle. A caller that has to account for something a name leads
+    /// to above its own root walks there rather than resolving a path from outside, so what it
+    /// reaches is the directory this object is actually in rather than whatever the name it was
+    /// opened under leads to now. At the root of a filesystem this is that root again, which is
+    /// how a caller knows the climb has ended.
+    ///
+    /// The authority that comes back is **not** confined, whatever this one is: the mount rule is
+    /// about a tree, and the directory above a tree is outside it. A caller that comes back down
+    /// into its tree confines again from the object it recognises.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::Unopenable`] when the parent cannot be opened, and on a platform that
+    /// does not open a directory's parent from its own handle.
+    pub fn parent(&self) -> Result<Self, Escape> {
+        let held = parent_of(&self.directory, &self.display.display().to_string())?;
+        let mut display = self.display.clone();
+        display.push("..");
+        Self::from_handle(self.environment_id, held, display)
+    }
+
     /// Returns the mount this authority is confined to, when it is confined to one.
     #[must_use]
     pub const fn mount(&self) -> Option<MountId> {
@@ -1333,6 +1357,35 @@ fn mount_of_file(file: &File, what: &str) -> Result<MountId, Escape> {
     Ok(MountId {
         mount: 0,
         device: metadata.dev(),
+    })
+}
+
+/// Opens the directory one open directory is in, from its own descriptor.
+#[cfg(unix)]
+fn parent_of(directory: &Dir, what: &str) -> Result<Dir, Escape> {
+    use std::os::fd::{AsFd as _, OwnedFd};
+
+    let held: OwnedFd = rustix::fs::openat(
+        directory.as_fd(),
+        "..",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| Escape::Unopenable {
+        component: what.to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(Dir::from_std_file(std::fs::File::from(held)))
+}
+
+/// Reports that this platform does not open a directory's parent from its own handle.
+#[cfg(not(unix))]
+fn parent_of(_directory: &Dir, what: &str) -> Result<Dir, Escape> {
+    Err(Escape::Unopenable {
+        component: what.to_owned(),
+        detail: "this host does not open the directory an open directory is in from its own \
+                 handle, so it does not follow a name that leads above one"
+            .to_owned(),
     })
 }
 

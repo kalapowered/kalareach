@@ -1349,13 +1349,8 @@ fn administrative_directories(
             stack
         }
         Ok(kr_transfer::authority::ObjectKind::File) => {
-            let target = read_target(".git", tree, &administrative)?;
-            if std::path::Path::new(&target).is_absolute() {
-                from_root(&target, tree)?
-            } else {
-                resolve_target(vec![clone_of(tree)?], ".git", tree, &administrative, tree)?
-                    .ok_or_else(|| unplaceable("this repository's own data"))?
-            }
+            resolve_target(vec![clone_of(tree)?], ".git", tree, &administrative, tree)?
+                .ok_or_else(|| unplaceable("this repository's own data"))?
         }
         // A tree whose own data this host cannot find from the tree is one it does not read
         // around: it would be excluding what it was handed rather than what is there.
@@ -1373,13 +1368,8 @@ fn administrative_directories(
         // It keeps everything in the one place.
         Err(kr_transfer::Escape::NotFound { .. }) => clone_of(own)?,
         Ok(_) => {
-            let target = read_target("commondir", own, &commondir)?;
-            let reached = if std::path::Path::new(&target).is_absolute() {
-                from_root(&target, tree)?
-            } else {
-                resolve_target(clone_stack(&stack)?, "commondir", own, &commondir, tree)?
-                    .ok_or_else(|| unplaceable("this repository's own data"))?
-            };
+            let reached = resolve_target(clone_stack(&stack)?, "commondir", own, &commondir, tree)?
+                .ok_or_else(|| unplaceable("this repository's own data"))?;
             let last = reached
                 .last()
                 .ok_or_else(|| unplaceable("this repository's own data"))?;
@@ -1398,69 +1388,6 @@ fn administrative_directories(
         .confined_to_one_mount()
         .map_err(|_| unplaceable("this repository's own data"))?;
     Ok((own, common))
-}
-
-/// Returns the handles from the root of an absolute name down to what it names, step by step.
-///
-/// A name given in full cannot be descended from the tree's own handle, and opening the whole name
-/// in one call would follow whatever each component is at the instant it is resolved. So it is
-/// walked the way everything else here is: one component against the handle above it, refusing a
-/// link at each. A `..` is refused rather than followed, because what it reaches depends on what
-/// the components around it are; a `.` names the directory it is in and falls out of the name
-/// before the walk sees it.
-///
-/// **A name that arrives at this working tree continues as one of the tree's own.** The moment a
-/// step **is** the tree — the object, not the spelling — the rest of the walk goes through the
-/// tree's own confined handle, so every remaining component is compared with the tree's mount
-/// exactly as a content read is. Otherwise a directory of this tree reached by its full name would
-/// be the one place a mount could be put without this host seeing it. Only a name that never meets
-/// the tree stays outside, and there the identity this walk is checked against is all there is.
-fn from_root(target: &str, tree: &AuthorisedDirectory) -> Result<Vec<AuthorisedDirectory>> {
-    let mut root = std::path::PathBuf::new();
-    let mut names: Vec<String> = Vec::new();
-    for component in std::path::Path::new(target).components() {
-        match component {
-            std::path::Component::Prefix(prefix) => root.push(prefix.as_os_str()),
-            std::path::Component::RootDir => root.push(std::path::MAIN_SEPARATOR_STR),
-            std::path::Component::Normal(name) => {
-                let Some(name) = name.to_str() else {
-                    return Err(unplaceable("this repository's own data"));
-                };
-                names.push(name.to_owned());
-            }
-            std::path::Component::CurDir | std::path::Component::ParentDir => {
-                return Err(unplaceable("this repository's own data"));
-            }
-        }
-    }
-    let mut stack = vec![
-        AuthorisedDirectory::open_root(tree.environment_id(), &root)
-            .map_err(|_| unplaceable("this repository's own data"))?,
-    ];
-    if identity_of(&stack[0]) == identity_of(tree) {
-        stack[0] = clone_of(tree)?;
-    }
-    for name in names {
-        let step = RelativeName::parse(&name)?;
-        let here = stack
-            .last()
-            .ok_or_else(|| unplaceable("this repository's own data"))?;
-        // Through the checked opener, which compares the mount as soon as the walk is inside the
-        // tree and has nothing to compare before that.
-        let next = open_beneath(here, &step, "this repository's own data")?
-            .map_err(|_| unplaceable("this repository's own data"))?;
-        stack.push(next);
-        let reached = stack
-            .last()
-            .ok_or_else(|| unplaceable("this repository's own data"))?;
-        if identity_of(reached) == identity_of(tree) {
-            // It is the tree. What follows is the tree's own, and is walked as such.
-            let held = clone_of(tree)?;
-            stack.pop();
-            stack.push(held);
-        }
-    }
-    Ok(stack)
 }
 
 /// Adds the identity of every directory beneath one administrative directory, and refuses a
@@ -1761,22 +1688,61 @@ fn resolve_target(
     tree: &AuthorisedDirectory,
 ) -> Result<Option<Vec<AuthorisedDirectory>>> {
     let target = read_target(directory, holder, file)?;
-    if std::path::Path::new(&target).is_absolute() {
-        return Err(unplaceable(directory));
-    }
+    let path = std::path::Path::new(&target);
     let mut stack = from;
-    for component in target.split('/') {
-        match component {
-            "" | "." => continue,
-            ".." => {
-                stack.pop();
-                if stack.is_empty() {
-                    // Above the working tree, where this handle reaches nothing.
+    let steps: Vec<String> = if path.is_absolute() {
+        // A name given in full is still walked from a handle this host holds: it climbs to the
+        // root of the filesystem through the directories the walk is standing in, and comes back
+        // down the name from there. Nothing is opened from outside, so the one way into this tree
+        // is the same descent every other name takes.
+        let base = stack.first().ok_or_else(|| unplaceable(directory))?;
+        let mut root = clone_of(base)?;
+        loop {
+            let above = root.parent().map_err(|_| unplaceable(directory))?;
+            if identity_of(&above) == identity_of(&root) {
+                break;
+            }
+            root = above;
+        }
+        stack = vec![root];
+        let mut steps = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {}
+                std::path::Component::Normal(name) => {
+                    let Some(name) = name.to_str() else {
+                        return Err(unplaceable(directory));
+                    };
+                    steps.push(name.to_owned());
+                }
+                std::path::Component::CurDir | std::path::Component::ParentDir => {
                     return Err(unplaceable(directory));
                 }
             }
+        }
+        steps
+    } else {
+        target.split('/').map(str::to_owned).collect()
+    };
+    for component in steps {
+        match component.as_str() {
+            "" | "." => continue,
+            ".." => {
+                if stack.len() > 1 {
+                    stack.pop();
+                } else {
+                    // Above where this walk started. The directory that holds it is opened from
+                    // the handle rather than by name, and the walk goes on **outside** this tree:
+                    // there is nothing to compare a mount with out here, and a component that is
+                    // the tree again puts the tree's own rule back on.
+                    let here = stack.last().ok_or_else(|| unplaceable(directory))?;
+                    let above = here.parent().map_err(|_| unplaceable(directory))?;
+                    stack.clear();
+                    stack.push(above);
+                }
+            }
             _ => {
-                let step = RelativeName::parse(component)?;
+                let step = RelativeName::parse(&component)?;
                 let here = stack.last().ok_or_else(|| unplaceable(directory))?;
                 match here.probe(&step) {
                     // A directory, asked about before it is entered.
@@ -2736,40 +2702,54 @@ mod tests {
     }
 
     #[test]
-    fn a_name_given_in_full_that_arrives_at_this_tree_continues_as_the_tree_s_own() {
-        // The property the mount rule rests on for a name that says nothing about where it leads:
-        // the walk that reaches this working tree carries the tree's own rule from there, so the
-        // rest of the name is compared with the tree's mount exactly as a content read is. A name
-        // that never meets the tree carries no such rule, because outside it there is nothing to
-        // compare with.
+    fn a_name_that_leaves_this_tree_and_comes_back_is_read_as_the_tree_s_own() {
+        // Two properties in one walk. A name that climbs above the tree is followed through the
+        // handles this host holds rather than resolved from outside, and the moment a component
+        // **is** the tree again the rest of it carries the tree's own rule — the mount comparison
+        // a content read carries. Outside the tree there is nothing to compare with, and the walk
+        // says so by holding no rule there.
         let host = kr_ipc::testing::TempHost::create();
-        let root =
-            std::fs::canonicalize(host.environment().state_dir()).expect("a name to walk with");
-        std::fs::create_dir_all(root.join("meta/inner")).expect("a directory inside the tree");
+        let root = std::fs::canonicalize(host.environment().state_dir()).expect("a name to walk");
+        let inside = root.join("tree");
+        std::fs::create_dir_all(inside.join("meta")).expect("the tree and a directory in it");
+        std::fs::create_dir_all(inside.join("common")).expect("and another");
         let environment_id = host.environment_id();
-        let tree = kr_transfer::AuthorisedDirectory::open_root(environment_id, &root)
+        let tree = kr_transfer::AuthorisedDirectory::open_root(environment_id, &inside)
             .and_then(kr_transfer::AuthorisedDirectory::confined_to_one_mount)
             .expect("the tree opens, confined to its own mount");
 
-        let named = root.join("meta/inner");
-        let stack = from_root(named.to_str().expect("a name"), &tree).expect("the name is walked");
+        // What the walk stands in when it starts, which is a directory of the tree.
+        let held = clone_of(&tree).expect("a second handle on the tree");
+        let start = vec![
+            clone_of(&tree).expect("one more"),
+            open_beneath(&held, &RelativeName::parse("meta").expect("a name"), "meta")
+                .expect("it opens")
+                .expect("it is there"),
+        ];
+        let name = RelativeName::parse("commondir").expect("a name");
+        std::fs::write(inside.join("meta/commondir"), b"../../tree/common\n").expect("the file");
+        let holder = start.last().expect("the directory it is in");
+        let stack = resolve_target(
+            clone_stack(&start).expect("a second set"),
+            "commondir",
+            holder,
+            &name,
+            &tree,
+        )
+        .expect("the name is followed")
+        .expect("it names something that is there");
         let reached = stack.last().expect("what it reached");
-        let directly = kr_transfer::AuthorisedDirectory::open_root(environment_id, &named)
-            .expect("the same directory opens");
+        let directly =
+            kr_transfer::AuthorisedDirectory::open_root(environment_id, &inside.join("common"))
+                .expect("the same directory opens");
         assert_eq!(
             identity_of(reached),
             identity_of(&directly),
-            "it reached the directory the name is for"
+            "it reached the directory the name is for, out of the tree and back into it"
         );
         assert!(
             reached.mount().is_some(),
-            "and it is held under the tree's own rule"
-        );
-
-        let outside = from_root("/", &tree).expect("the root is walked");
-        assert!(
-            outside.last().expect("what it reached").mount().is_none(),
-            "a name that never meets the tree is outside it, where there is nothing to compare"
+            "and it came back under the tree's own rule"
         );
     }
 

@@ -677,6 +677,14 @@ removes is never opened at all:
    entries, than this host reads refuses on the same terms, naming the limit it reached. None of
    this is skipped, and what was found is named where it was found.
 
+   What none of this covers is an actor that can **mount and unmount while the capture runs**. Such
+   an actor already holds the repository's own data, and a cover placed over a directory for the
+   length of one step and taken away before the next is outside what this host promises. What it
+   does promise is about the tree as it stands: a link, a second name, a mount that is there when
+   the capture reads, and the ordinary races an account without that privilege can arrange — a
+   rename, a replacement, a file swapped under a reader — which handle-based resolution answers by
+   holding the object rather than the name.
+
    What is left is a *file* with two names in two directories: a hard link from a repository's own
    data to a file of the tree is an alias nothing about either path says is there. A mount over a
    file is refused on both sides; a second hard link is not.
