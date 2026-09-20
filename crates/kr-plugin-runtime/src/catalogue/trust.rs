@@ -285,33 +285,13 @@ pub async fn verify(
 
     let delegations = scope_delegations(&repository.targets().signed)?;
 
+    let index_record = resolve_target(&repository, INDEX_TARGET)?
+        .ok_or_else(|| CatalogueError::Untrusted {
+            detail: format!("the generation's metadata does not pin {INDEX_TARGET}"),
+        })?;
     let mut targets = BTreeMap::new();
-    for (name, target) in repository.all_targets() {
-        let digest: [u8; 32] =
-            target
-                .hashes
-                .sha256
-                .as_ref()
-                .try_into()
-                .map_err(|_| CatalogueError::Untrusted {
-                    detail: format!("{} is pinned without a SHA-256 digest", name.raw()),
-                })?;
-        targets.insert(
-            name.raw().to_owned(),
-            TargetRecord {
-                digest: PayloadDigest::from_bytes(digest),
-                length: target.length,
-            },
-        );
-    }
+    targets.insert(INDEX_TARGET.to_owned(), index_record);
 
-    let index_record =
-        targets
-            .get(INDEX_TARGET)
-            .copied()
-            .ok_or_else(|| CatalogueError::Untrusted {
-                detail: format!("the generation's metadata does not pin {INDEX_TARGET}"),
-            })?;
     // The index is held whole, because it is parsed and searched offline. Its signed length is
     // checked against the metadata budget before it is read, so what is held is what this host
     // said it was willing to hold.
@@ -353,18 +333,23 @@ pub async fn verify(
             detail: "a catalogue generation starts at one".to_owned(),
         });
     }
-    for name in declared_target_names(&index) {
-        if let Some(record) = resolve_target(&repository, &name)? {
-            targets.insert(name, record);
-        }
-    }
     // What each entry declares is checked before the index and the metadata are compared. A
     // package whose declared layout is unsafe is refused for that, rather than for whichever of
     // its consequences the comparison happens to notice first.
     for entry in &index.entries {
         crate::catalogue::extract::check_declared(entry, ledger)?;
     }
+    for name in declared_target_names(&index) {
+        let record = resolve_target(&repository, &name)?
+            .ok_or_else(|| CatalogueError::Untrusted {
+                detail: format!("target {name} could not be resolved through delegation"),
+            })?;
+        targets.insert(name, record);
+    }
     check_index_against_targets(&index, &targets)?;
+
+    let total_spent = budgeted.spent.load(std::sync::atomic::Ordering::Relaxed);
+    ledger.check_metadata_bytes(total_spent, Stage::Actual, "metadata")?;
 
     Ok(VerifiedGeneration {
         generation: index.generation,
@@ -652,6 +637,31 @@ fn classify(error: &tough::error::Error) -> CatalogueError {
         // are refusals of trust, and reporting them as "offline" would tell somebody to check
         // their network about a repository that answered and lied.
         tough::error::Error::Transport { .. } => CatalogueError::UnavailableOffline {
+            detail: error.to_string(),
+        },
+        tough::error::Error::HashMismatch {
+            context,
+            calculated,
+            expected,
+            ..
+        } => CatalogueError::Integrity {
+            detail: format!(
+                "hash mismatch for {context}: calculated {calculated}, expected {expected}"
+            ),
+        },
+        tough::error::Error::DatastoreInit { .. }
+        | tough::error::Error::DatastoreCreate { .. }
+        | tough::error::Error::DatastoreOpen { .. }
+        | tough::error::Error::DatastoreRemove { .. }
+        | tough::error::Error::DatastoreSerialize { .. }
+        | tough::error::Error::DirCreate { .. }
+        | tough::error::Error::FileOpen { .. }
+        | tough::error::Error::FileRead { .. }
+        | tough::error::Error::FileWrite { .. }
+        | tough::error::Error::CacheFileRead { .. }
+        | tough::error::Error::CacheFileWrite { .. }
+        | tough::error::Error::CacheDirectoryCreate { .. }
+        | tough::error::Error::CacheTargetWrite { .. } => CatalogueError::StorageUnavailable {
             detail: error.to_string(),
         },
         other => CatalogueError::Untrusted {

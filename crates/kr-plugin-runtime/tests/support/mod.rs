@@ -110,6 +110,10 @@ impl KeySet {
     }
 
     fn root_document(&self, expires: jiff::Timestamp) -> Root {
+        self.root_document_with_version(NonZeroU64::new(1).expect("one is not zero"), expires)
+    }
+
+    fn root_document_with_version(&self, version: NonZeroU64, expires: jiff::Timestamp) -> Root {
         let mut keys = HashMap::new();
         let mut roles = HashMap::new();
         for (role, key) in [
@@ -133,7 +137,7 @@ impl KeySet {
         Root {
             spec_version: "1.0.0".to_owned(),
             consistent_snapshot: false,
-            version: NonZeroU64::new(1).expect("one is not zero"),
+            version,
             expires,
             keys,
             roles,
@@ -167,6 +171,10 @@ pub struct GenerationSpec {
     pub keys: Option<KeySet>,
     /// Whether the metadata expires in the past.
     pub expired: bool,
+    /// Whether to build a nested two-level delegation (top -> vendor -> vendor-leaf).
+    pub nested_delegation: bool,
+    /// Whether the leaf role carries no package targets (for terminating-miss test).
+    pub empty_leaf: bool,
 }
 
 impl Default for GenerationSpec {
@@ -180,6 +188,8 @@ impl Default for GenerationSpec {
             drop_payload: None,
             keys: None,
             expired: false,
+            nested_delegation: false,
+            empty_leaf: false,
         }
     }
 }
@@ -280,6 +290,126 @@ impl Generation {
         }
         std::fs::rename(&self.directory, &aside).expect("movable");
     }
+
+    /// Rotates the root to version 2 using `new_keys`, cross-signing with the old root key,
+    /// writing `2.root.json` and signing metadata at generation 2.
+    pub async fn rotate_root_to_v2(&self, new_keys: &KeySet) -> Vec<u8> {
+        let metadata = self.directory.join("metadata");
+        let targets = self.directory.join("targets");
+        let root_expires: jiff::Timestamp =
+            "2036-01-01T00:00:00Z".parse().expect("a literal instant");
+        let expires = root_expires;
+
+        let root_v2 = new_keys.root_document_with_version(
+            NonZeroU64::new(2).expect("two is not zero"),
+            root_expires,
+        );
+
+        let old_root_doc = self.keys.root_document(root_expires);
+        let old_signed = SignedRole::new(
+            root_v2.clone(),
+            &KeyHolder::Root(old_root_doc),
+            &self.keys.sources(),
+            &SystemRandom::new(),
+        )
+        .await
+        .expect("signed with old root");
+        let old_signatures = old_signed.signed().signatures.clone();
+
+        let signed_root_v2 = SignedRole::new(
+            root_v2.clone(),
+            &KeyHolder::Root(root_v2),
+            &new_keys.sources(),
+            &SystemRandom::new(),
+        )
+        .await
+        .expect("signed root v2");
+
+        let cross_signed = signed_root_v2
+            .add_old_signatures(old_signatures)
+            .expect("cross signed");
+        let root_v2_bytes = cross_signed.buffer().clone();
+
+        std::fs::write(self.directory.join("root.json"), &root_v2_bytes).expect("writable");
+        std::fs::write(metadata.join("root.json"), &root_v2_bytes).expect("writable");
+        std::fs::write(metadata.join("2.root.json"), &root_v2_bytes).expect("writable");
+
+        // Now resign the repository metadata using new_keys at version 2
+        let version = NonZeroU64::new(2).expect("two is not zero");
+        let mut editor = RepositoryEditor::new(self.directory.join("root.json"))
+            .await
+            .expect("editor");
+        editor
+            .targets_version(version)
+            .expect("version")
+            .targets_expires(expires)
+            .expect("expiry")
+            .snapshot_version(version)
+            .snapshot_expires(expires)
+            .timestamp_version(version)
+            .timestamp_expires(expires);
+
+        let (manifest, files) = package_files(&self.spec);
+        let manifest_bytes = files
+            .iter()
+            .find(|(name, _)| name == kr_plugin_sdk::package::MANIFEST_FILE)
+            .map(|(_, bytes)| bytes.clone())
+            .expect("a manifest");
+        let manifest_digest = PayloadDigest::of(&manifest_bytes);
+        let entry = IndexEntry::from_manifest(&manifest, manifest_digest, manifest_bytes.len() as u64);
+        let index = CatalogueIndex {
+            index_version: INDEX_VERSION,
+            generation: RepositoryGeneration::new(2),
+            produced_at: TimestampMs::new(1_760_000_000_000),
+            publishers: vec![PublisherRecord {
+                id: manifest.publisher_id.clone(),
+                display_name: Label::new("KalaReach").expect("a literal label"),
+                homepage: "https://reach.kala.to".to_owned(),
+                first_party: true,
+            }],
+            entries: vec![entry],
+        };
+        let index_bytes = index.canonical_json().expect("serialisable").into_bytes();
+        std::fs::write(targets.join("index.json"), &index_bytes).expect("writable");
+
+        let prefix = format!(
+            "packages/{}/{}/{}",
+            manifest.publisher_id, manifest.plugin_name, manifest.version
+        );
+
+        let mut names: Vec<(String, PathBuf)> =
+            vec![("index.json".to_owned(), targets.join("index.json"))];
+        for (name, _) in &files {
+            names.push((format!("{prefix}/{name}"), targets.join(&prefix).join(name)));
+        }
+        names.sort();
+        for (name, path) in &names {
+            let target = Target::from_path(path).await.expect("a target");
+            editor.add_target(name.as_str(), target).expect("added");
+        }
+
+        let signed = editor.sign(&new_keys.sources()).await.expect("signed");
+        signed.write(&metadata).await.expect("written");
+        std::fs::write(metadata.join("root.json"), &root_v2_bytes).expect("writable");
+
+        root_v2_bytes
+    }
+
+    /// Withholds root v2 by replacing `metadata/root.json` with root v1 and removing `2.root.json`.
+    pub fn withhold_root_v2(&self) {
+        let metadata = self.directory.join("metadata");
+        let _ = std::fs::remove_file(metadata.join("2.root.json"));
+        let root_v1 = std::fs::read(metadata.join("1.root.json")).expect("root 1");
+        std::fs::write(metadata.join("root.json"), &root_v1).expect("writable");
+    }
+
+    /// Restores root v2 metadata.
+    pub fn restore_root_v2(&self, root_v2_bytes: &[u8]) {
+        let metadata = self.directory.join("metadata");
+        std::fs::write(self.directory.join("root.json"), root_v2_bytes).expect("writable");
+        std::fs::write(metadata.join("root.json"), root_v2_bytes).expect("writable");
+        std::fs::write(metadata.join("2.root.json"), root_v2_bytes).expect("writable");
+    }
 }
 
 async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec) -> PayloadDigest {
@@ -360,34 +490,119 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         .timestamp_version(version)
         .timestamp_expires(expires);
 
-    let mut names: Vec<(String, PathBuf)> =
-        vec![("index.json".to_owned(), targets.join("index.json"))];
-    for (name, _) in &files {
-        names.push((format!("{prefix}/{name}"), targets.join(&prefix).join(name)));
-    }
-    names.sort();
-    for (name, path) in &names {
-        let target = Target::from_path(path).await.expect("a target");
-        editor.add_target(name.as_str(), target).expect("added");
-    }
+    if spec.nested_delegation {
+        let index_target = Target::from_path(targets.join("index.json"))
+            .await
+            .expect("an index target");
+        editor.add_target("index.json", index_target).expect("added");
 
-    for (role, pattern, terminating) in &spec.delegations {
-        let delegated = TestKey::generate();
-        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(delegated)];
+        let vendor_key = TestKey::generate();
+        let vendor_sources: Vec<Box<dyn KeySource>> = vec![Box::new(vendor_key.clone())];
         editor
             .delegate_role(
-                role,
-                &sources,
+                "vendor",
+                &vendor_sources,
                 PathSet::Paths(vec![
-                    PathPattern::new(pattern.clone()).expect("a parsable pattern"),
+                    PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
+                        .expect("a parsable pattern"),
                 ]),
-                *terminating,
+                false,
                 NonZeroU64::new(1).expect("one is not zero"),
                 expires,
                 version,
             )
             .await
-            .expect("a delegated role");
+            .expect("delegated vendor");
+
+        editor
+            .sign_targets_editor(&keys.sources())
+            .await
+            .expect("signed top level");
+
+        editor
+            .change_delegated_targets("vendor")
+            .expect("change to vendor");
+        editor
+            .targets_version(version)
+            .expect("version")
+            .targets_expires(expires)
+            .expect("expiry");
+
+        let leaf_key = TestKey::generate();
+        let leaf_sources: Vec<Box<dyn KeySource>> = vec![Box::new(leaf_key.clone())];
+        editor
+            .delegate_role(
+                "vendor-leaf",
+                &leaf_sources,
+                PathSet::Paths(vec![
+                    PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
+                        .expect("a parsable pattern"),
+                ]),
+                true,
+                NonZeroU64::new(1).expect("one is not zero"),
+                expires,
+                version,
+            )
+            .await
+            .expect("delegated vendor-leaf");
+
+        editor
+            .sign_targets_editor(&vendor_sources)
+            .await
+            .expect("signed vendor");
+
+        editor
+            .change_delegated_targets("vendor-leaf")
+            .expect("change to vendor-leaf");
+        editor
+            .targets_version(version)
+            .expect("version")
+            .targets_expires(expires)
+            .expect("expiry");
+
+        if !spec.empty_leaf {
+            for (name, _) in &files {
+                let target_name = format!("{prefix}/{name}");
+                let target_path = targets.join(&prefix).join(name);
+                let target = Target::from_path(&target_path).await.expect("a target");
+                editor.add_target(target_name.as_str(), target).expect("added");
+            }
+        }
+
+        editor
+            .sign_targets_editor(&leaf_sources)
+            .await
+            .expect("signed vendor-leaf");
+    } else {
+        let mut names: Vec<(String, PathBuf)> =
+            vec![("index.json".to_owned(), targets.join("index.json"))];
+        for (name, _) in &files {
+            names.push((format!("{prefix}/{name}"), targets.join(&prefix).join(name)));
+        }
+        names.sort();
+        for (name, path) in &names {
+            let target = Target::from_path(path).await.expect("a target");
+            editor.add_target(name.as_str(), target).expect("added");
+        }
+
+        for (role, pattern, terminating) in &spec.delegations {
+            let delegated = TestKey::generate();
+            let sources: Vec<Box<dyn KeySource>> = vec![Box::new(delegated)];
+            editor
+                .delegate_role(
+                    role,
+                    &sources,
+                    PathSet::Paths(vec![
+                        PathPattern::new(pattern.clone()).expect("a parsable pattern"),
+                    ]),
+                    *terminating,
+                    NonZeroU64::new(1).expect("one is not zero"),
+                    expires,
+                    version,
+                )
+                .await
+                .expect("a delegated role");
+        }
     }
 
     let signed = editor

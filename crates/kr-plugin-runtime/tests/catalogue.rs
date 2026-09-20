@@ -32,7 +32,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
-use support::{Generation, GenerationSpec};
+use support::{Generation, GenerationSpec, KeySet};
 
 fn environment() -> EnvironmentId {
     EnvironmentId::new(Uuid::NIL)
@@ -243,6 +243,199 @@ async fn kr_req_11_08_vendor_delegations_verify_and_each_names_one_publisher() {
         )
         .await
         .expect("the package resolves through the delegations");
+}
+
+#[tokio::test]
+async fn kr_req_11_08_nested_two_level_delegation_resolves_package_from_leaf() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            nested_delegation: true,
+            empty_leaf: false,
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+
+    let outcome = catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation with nested delegations");
+
+    let roles: Vec<&str> = outcome
+        .delegations
+        .iter()
+        .map(|(role, _)| role.as_str())
+        .collect();
+    assert!(roles.contains(&"vendor"), "{roles:?}");
+    assert!(roles.contains(&"vendor-leaf"), "{roles:?}");
+    assert_eq!(outcome.delegations.len(), 2);
+
+    catalogue
+        .activate_package(
+            &repository(),
+            &plugin(),
+            &version(),
+            FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect("the package resolves through two levels of delegation");
+}
+
+#[tokio::test]
+async fn kr_req_11_08_terminating_miss_in_leaf_fails_package_resolution() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            nested_delegation: true,
+            empty_leaf: true,
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+
+    // Because the leaf role has no package targets and is terminating, the package target
+    // cannot be resolved through delegation, so sync must reject the generation as untrusted.
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("terminating miss in leaf must fail");
+    assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted);
+    assert!(
+        refusal
+            .to_string()
+            .contains("could not be resolved through delegation"),
+        "{refusal}"
+    );
+}
+
+#[tokio::test]
+async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fails() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+
+    // Sync generation 1 under root v1
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("sync generation 1");
+
+    let initial_root = catalogue
+        .repository(&repository())
+        .expect("enrolled")
+        .root
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&initial_root).expect("readable")["signed"]["version"],
+        serde_json::json!(1)
+    );
+
+    // Rotate root to v2 cross-signed by root v1 and root v2 keys
+    let new_keys = KeySet::generate();
+    let root_v2_bytes = generation.rotate_root_to_v2(&new_keys).await;
+
+    // A host enrolled with root v1 fails to sync if root v2 is withheld by the repository:
+    let home2 = tempfile::tempdir().expect("tempdir");
+    let mut catalogue2 = Catalogue::open(&home2.path().join("catalogue")).expect("openable");
+    let enrolment2 = Enrolment::new(
+        repository(),
+        RepositoryKind::Official,
+        generation.metadata_url(),
+        generation.targets_url(),
+        initial_root.clone(),
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .expect("enrollable");
+    catalogue2.enrol(enrolment2, true).expect("enrolled with root v1");
+
+    generation.withhold_root_v2();
+    let refusal = catalogue2
+        .sync(&repository())
+        .await
+        .expect_err("withholding root v2 must fail");
+    assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted);
+
+    // Restore root v2 so the generation publishes properly
+    generation.restore_root_v2(&root_v2_bytes);
+
+    // Now catalogue2 with root v1 can sync and advance to root v2
+    let outcome2 = catalogue2
+        .sync(&repository())
+        .await
+        .expect("sync generation 2 advances root to v2");
+    assert_eq!(outcome2.generation.get(), 2);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&catalogue2.repository(&repository()).expect("enrolled").root).expect("readable"),
+        serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
+    );
+
+    // Sync from root v1 advances to root v2
+    let outcome = catalogue
+        .sync(&repository())
+        .await
+        .expect("sync generation 2 advances root to v2");
+    assert_eq!(outcome.generation.get(), 2);
+
+    let rotated_root = catalogue
+        .repository(&repository())
+        .expect("enrolled")
+        .root
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rotated_root).expect("readable"),
+        serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rotated_root).expect("readable")["signed"]["version"],
+        serde_json::json!(2)
+    );
+
+    // Verify store on disk holds root v2
+    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
+    let disk_root = store.read_root().expect("root on disk");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&disk_root).expect("readable"),
+        serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
+    );
+
+    // Restart retains root v2
+    let mut restarted = Catalogue::open(&home.path().join("catalogue")).expect("reopenable");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&restarted.repository(&repository()).expect("enrolled").root).expect("readable"),
+        serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
+    );
+
+    // A repository that tries to revert to generation 3 signed by old keys fails against a host on root v2
+    generation.rewrite_as(3).await;
+    let refusal = restarted
+        .sync(&repository())
+        .await
+        .expect_err("metadata signed with old keys must fail on root v2 host");
+    assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted);
 }
 
 #[tokio::test]
