@@ -620,7 +620,8 @@ impl RemoteConnection {
                         request.request_id,
                         ProtocolError::new(
                             ErrorCode::PermissionDenied,
-                            "this host does not serve a diff of a recorded change-set version to                              a paired device; read the working copy instead",
+                            "this host does not serve a diff of a recorded change-set version to \
+                             a paired device; read the working copy instead",
                         ),
                     );
                 }

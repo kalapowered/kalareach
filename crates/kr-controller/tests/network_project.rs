@@ -1,21 +1,22 @@
 //! The project and workspace methods over the network path.
 //!
 //! What these demonstrate, towards KR-REQ-23.42 and KR-REQ-23.43 for the paired-device ingress.
-//! The registry admits a device to all ten methods; until now the network dispatcher refused the
-//! reads as unsupported and sent the mutations to the worker proxy, which wants a session a
-//! project mutation does not name.
+//! The registry admits a device to all ten methods, and the grant is what it is additionally held
+//! to.
 //!
-//! Five of the ten now answer a device differently on purpose: `project.init`, `project.clone`,
-//! `project.adopt`, `workspace.create` and `workspace.remove` name a destination or a source this
-//! host cannot check a device's authority over, so they are refused to one and the owner's own
-//! path is untouched. What is shown to be identical on both doors is the four reads, for the same
-//! subject, and the refusals the daemon decides about an envelope. On top of those, the grant is
-//! what a device is additionally held to, and a device that submits its own action again is given
-//! the answer its first submission produced rather than the answer performing it now would give.
+//! `project.init`, `project.clone`, `project.adopt`, `workspace.create` and `workspace.remove`
+//! each name a destination or a source, and one rule decides all five: the destination or the
+//! source has to be in an environment the grant names. A grant that bounds nothing reaches none of
+//! them, because these five act on this host's own filesystem and a grant that bounds nothing
+//! would make the action right the whole of the restriction. The owner's own path is untouched.
+//! The four reads answer a device and the owner alike for the same subject, narrowed to what the
+//! grant admits, and a device that submits its own action again is given the answer its first
+//! submission produced rather than the answer performing it now would give.
 //!
-//! What these do not show is the rest of those rows: the destination and source authority sections
-//! 14 and 23 ask for, which this host does not yet establish and which is why the five are
-//! refused, and recovery through `action.read`, which is refused for an action this host owns.
+//! What these do not show is the rest of those rows. Inside an admitted environment the
+//! destination is still whatever absolute parent the caller names, so the filesystem authority
+//! section 14 asks for is bounded by the environment rather than by the directories the owner
+//! chose. Recovery through `action.read` is refused for an action this host owns.
 //!
 //! No worker is started here. A project acts on a repository rather than on a session, so the
 //! daemon answers all ten itself; the repositories are real ones built with installed Git in a
@@ -1553,5 +1554,74 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
 
     session.close();
     raw.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42: a diff of a **recorded change-set version** is not served to a paired device.
+///
+/// `diff.read` names either a live working copy or a captured version. The captured version is
+/// retained content, and this answer carries the moment of the read rather than the moment of the
+/// capture, so nothing on this path can hold it to the grant's history lower bound. A host that
+/// cannot narrow content to a grant refuses it rather than serving more than the grant allows. A
+/// diff of a live working copy is a different subject and reaches the ordinary read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_refused_a_diff_of_a_recorded_change_set_version() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::FilesRead],
+    )
+    .await;
+
+    // Both spellings of a captured version: one that names the version and one that takes the
+    // latest. Neither is served.
+    for version in [
+        Nullable::null(),
+        Nullable::some(kr_protocol::ids::ChangeSetVersion::new(1)),
+    ] {
+        let refused = session
+            .read::<_, kr_protocol::changeset::DiffReadResult>(
+                Method::DiffRead,
+                &kr_protocol::changeset::DiffReadParams {
+                    workspace_id: Nullable::null(),
+                    change_set_id: Nullable::some(kr_protocol::ids::ChangeSetId::new(
+                        kr_ipc::new_uuid(),
+                    )),
+                    version,
+                },
+            )
+            .await
+            .expect_err("a recorded version is not served to a device");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+        assert!(
+            refused.to_string().contains("recorded change-set version"),
+            "the refusal says which subject it refused: {refused}"
+        );
+    }
+
+    // A diff that names a working copy instead is refused for the working copy not being there,
+    // which is the ordinary read answering: this rule takes away the captured version and nothing
+    // else.
+    let other = session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(
+                    kr_protocol::ids::WorkspaceId::new(kr_ipc::new_uuid()),
+                ),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect_err("no such working copy");
+    assert!(
+        !other.to_string().contains("recorded change-set version"),
+        "a live working copy is not refused by this rule: {other}"
+    );
+
+    session.close();
     host.stop().await;
 }
