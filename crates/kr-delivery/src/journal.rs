@@ -1527,19 +1527,55 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let held: Option<(String, i64)> = transaction
+        let held: Option<(String, i64, i64)> = transaction
             .query_row(
-                "SELECT state, attempts FROM delivery_notifications WHERE notification_id = ?1",
+                "SELECT state, attempts, privacy_generation FROM delivery_notifications
+                  WHERE notification_id = ?1",
                 params![identifier],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        match held {
-            Some((state, attempts))
+        let record_generation = match held {
+            Some((state, attempts, record_generation))
                 if state == DeliveryState::InFlight.as_str()
-                    && as_u64(attempts) == transition.attempt => {}
+                    && as_u64(attempts) == transition.attempt =>
+            {
+                as_u64(record_generation)
+            }
             _ => return Ok(false),
-        }
+        };
+        // Privacy mode can fence the outbox while an attempt is on the wire, and the answer to
+        // that attempt arrives afterwards. It is recorded, because what happened happened, but it
+        // does not put the notification back to work: an answer that asks for another attempt
+        // would restore an outbox row and hold its content past the boundary privacy mode drew,
+        // and the row would stop counting as outstanding while the gateway was still retrying it.
+        // What is left instead is what is true: an outcome nobody knows, when the attempt reached
+        // the gateway, and a cancellation when it did not.
+        let (generation, fenced): (i64, i64) = transaction.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let walked_past = fenced != 0 || record_generation != as_u64(generation);
+        let transition = &if walked_past && !transition.state.is_settled() {
+            Transition {
+                state: if transition.left_this_host {
+                    DeliveryState::OutcomeUnknown
+                } else {
+                    DeliveryState::Cancelled
+                },
+                next: crate::push::NextAction::None,
+                next_attempt_at_ms: None,
+                detail: Some(format!(
+                    "privacy mode ended the generation this was queued under: {}",
+                    transition.detail.as_deref().unwrap_or("no further attempt")
+                )),
+                keep_content: false,
+                ..transition.clone()
+            }
+        } else {
+            transition.clone()
+        };
         transaction.execute(
             "INSERT INTO delivery_attempts
                  (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
@@ -3543,6 +3579,91 @@ mod tests {
         );
         assert!(journal.due(2_999, 10).expect("a read").is_empty());
         assert_eq!(journal.due(3_000, 10).expect("a read").len(), 1);
+    }
+
+    /// An answer that arrives after privacy mode has drawn its boundary is recorded, and it does
+    /// not put the notification back to work. Reconciliation is not complete while the gateway is
+    /// still holding it, so what the row says is that nobody knows.
+    #[test]
+    fn a_late_retry_answer_does_not_queue_work_across_a_privacy_boundary() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let claimed = claim(&mut journal, 9, 2_000);
+        journal.fence(1).expect("a fence");
+        journal.cancel_undispatched(2_500).expect("a cancellation");
+        assert!(
+            journal
+                .record_attempt(&Transition {
+                    notification_id: claimed.notification_id,
+                    attempt: claimed.attempt,
+                    state: DeliveryState::Retrying,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_600)),
+                    next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                    next: crate::push::NextAction::Send,
+                    detail: Some("the destination asked for later".to_owned()),
+                    suppression: None,
+                    keep_content: true,
+                    left_this_host: true,
+                })
+                .expect("a transition")
+        );
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+        assert!(
+            journal.due(10_000, 10).expect("a read").is_empty(),
+            "nothing is queued under a generation privacy mode has ended"
+        );
+        assert_eq!(
+            journal.outstanding().expect("a count"),
+            1,
+            "reconciliation is not complete while the gateway may still deliver it"
+        );
+    }
+
+    /// The same boundary, for an attempt that never left: there is nothing for anybody to
+    /// reconcile, so the record says privacy mode took it back.
+    #[test]
+    fn a_late_answer_to_an_attempt_that_never_left_is_a_cancellation() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let claimed = claim(&mut journal, 9, 2_000);
+        journal.fence(1).expect("a fence");
+        journal
+            .record_attempt(&Transition {
+                notification_id: claimed.notification_id,
+                attempt: claimed.attempt,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_600)),
+                next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                next: crate::push::NextAction::Send,
+                detail: Some("the destination could not be reached".to_owned()),
+                suppression: None,
+                keep_content: true,
+                left_this_host: false,
+            })
+            .expect("a transition");
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::Cancelled);
+        assert_eq!(record.content, None);
+        assert_eq!(journal.outstanding().expect("a count"), 0);
     }
 
     /// The claim validates the destination inside its own transaction and hands it to the sender,
