@@ -437,6 +437,10 @@ export type CapabilityInvalidation =
  */
 export type DesktopSessionId = string
 /**
+ * The catalogue generation a plugin package was resolved against.
+ */
+export type RepositoryGeneration = string
+/**
  * How consistent the source of one capture was.
  *
  * There is no default and no fourth member that means "probably fine". A live multi-file capture
@@ -841,10 +845,6 @@ export type RelayReservationId = string
  */
 export type RemoteDispatchLeaseId = string
 /**
- * The catalogue generation a plugin package was resolved against.
- */
-export type RepositoryGeneration = string
-/**
  * A request identifier, unique for the lifetime of one connection.
  */
 export type RequestId = string
@@ -1025,6 +1025,16 @@ export type PairStatus =
         reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
       }
     }
+/**
+ * What makes a capability answer stale.
+ */
+export type PluginInvalidationTrigger =
+  | 'binary_changed'
+  | 'binding_changed'
+  | 'schema_changed'
+  | 'os_permission_changed'
+  | 'desktop_generation_changed'
+  | 'profile_changed'
 /**
  * One directory the owner authorised for repository work.
  */
@@ -1458,6 +1468,19 @@ export interface KalaReachProtocol {
   capability_map?: CapabilityMap1
   capability_record?: CapabilityRecord
   capture_count?: CaptureCount
+  catalogue_add_params?: CatalogueAddParams
+  catalogue_add_result?: CatalogueAddResult
+  catalogue_budgets?: CatalogueBudgets2
+  catalogue_delegation?: CatalogueDelegation
+  catalogue_list_params?: CatalogueListParams
+  catalogue_list_result?: CatalogueListResult
+  catalogue_pin_params?: CataloguePinParams
+  catalogue_pin_result?: CataloguePinResult
+  catalogue_remove_params?: CatalogueRemoveParams
+  catalogue_remove_result?: CatalogueRemoveResult
+  catalogue_summary?: CatalogueSummary1
+  catalogue_sync_params?: CatalogueSyncParams
+  catalogue_sync_result?: CatalogueSyncResult
   causal_budget_summary?: CausalBudgetSummary
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
@@ -1698,6 +1721,23 @@ export interface KalaReachProtocol {
   pending_resource?: PendingResource
   plugin_action_invoke_params?: PluginActionInvokeParams
   plugin_action_invoke_result?: PluginActionInvokeResult
+  plugin_capabilities_params?: PluginCapabilitiesParams
+  plugin_capabilities_result?: PluginCapabilitiesResult
+  plugin_capability_evidence?: PluginCapabilityEvidence
+  plugin_capability_grant?: PluginCapabilityGrant
+  plugin_enable_params?: PluginEnableParams
+  plugin_enable_result?: PluginEnableResult
+  plugin_grant_params?: PluginGrantParams
+  plugin_grant_result?: PluginGrantResult
+  plugin_install_params?: PluginInstallParams
+  plugin_install_result?: PluginInstallResult
+  plugin_list_params?: PluginListParams
+  plugin_list_result?: PluginListResult
+  plugin_pin_params?: PluginPinParams
+  plugin_pin_result?: PluginPinResult
+  plugin_remove_params?: PluginRemoveParams
+  plugin_remove_result?: PluginRemoveResult
+  plugin_summary?: PluginSummary4
   policy_authority?: PolicyAuthority
   prepared_effect?: PreparedEffect
   preview_entry?: PreviewEntry
@@ -6035,6 +6075,390 @@ export interface CaptureCount {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   total: string
+}
+/**
+ * Parameters of `catalogue.add`.
+ *
+ * Adding a catalogue adopts a trust root, which is always the owner's decision. The root travels
+ * with the request because a host that fetched it from the location it is meant to verify would
+ * be trusting the thing it is checking.
+ */
+export interface CatalogueAddParams {
+  budgets: CatalogueBudgets
+  /**
+   * This host's identifier for the repository.
+   */
+  catalogue_id: string
+  /**
+   * Capabilities its packages may hold without a further grant, beyond the default ceiling.
+   */
+  ceiling: string[]
+  /**
+   * The environment the repository is enrolled in.
+   */
+  environment_id: string
+  /**
+   * What kind of repository it is.
+   */
+  kind: 'official' | 'vendor' | 'community' | 'local' | 'mirror'
+  /**
+   * Where its metadata lives.
+   */
+  metadata_url: string
+  /**
+   * The trust root, as its bytes, base64 encoded.
+   */
+  root: string
+  /**
+   * Where its targets live.
+   */
+  targets_url: string
+}
+/**
+ * The budgets it runs inside.
+ */
+export interface CatalogueBudgets {
+  /**
+   * Whether every referenced payload is fetched rather than only what is installed.
+   *
+   * A larger full mirror is this setting plus a payload budget that admits it. It is never
+   * reached by syncing more often.
+   */
+  full_offline_mirror: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_entries: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  payload_cache_bytes: string
+}
+/**
+ * Result of `catalogue.add`.
+ */
+export interface CatalogueAddResult {
+  catalogue: CatalogueSummary
+}
+/**
+ * The repository as it was enrolled.
+ */
+export interface CatalogueSummary {
+  budgets: CatalogueBudgets1
+  /**
+   * This host's identifier for the repository.
+   */
+  catalogue_id: string
+  /**
+   * What its packages may do without a further grant.
+   */
+  ceiling: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  entries: string
+  /**
+   * The generation currently active, where one is.
+   */
+  generation: RepositoryGeneration | null
+  /**
+   * What kind of repository it is.
+   */
+  kind: 'official' | 'vendor' | 'community' | 'local' | 'mirror'
+  /**
+   * Where its metadata lives.
+   */
+  metadata_url: string
+  /**
+   * The generation the owner pinned, where one is pinned.
+   */
+  pinned_generation: RepositoryGeneration | null
+  /**
+   * The digest of the trust root this host adopted for it.
+   *
+   * A repository verified against a different root is a different trust anchor, whatever it is
+   * called, so the digest is shown rather than a name.
+   */
+  root_digest: string
+  /**
+   * When it last synchronised, where it has.
+   */
+  synced_at_ms: TimestampMs | null
+  /**
+   * Where its targets live.
+   */
+  targets_url: string
+}
+/**
+ * The budgets it runs inside.
+ */
+export interface CatalogueBudgets1 {
+  /**
+   * Whether every referenced payload is fetched rather than only what is installed.
+   *
+   * A larger full mirror is this setting plus a payload budget that admits it. It is never
+   * reached by syncing more often.
+   */
+  full_offline_mirror: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_entries: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  payload_cache_bytes: string
+}
+/**
+ * The budgets one repository runs inside.
+ *
+ * Enrolment sets these before the first fetch. Exceeding one leaves the previous generation
+ * usable and reports which allowance ran out.
+ */
+export interface CatalogueBudgets2 {
+  /**
+   * Whether every referenced payload is fetched rather than only what is installed.
+   *
+   * A larger full mirror is this setting plus a payload budget that admits it. It is never
+   * reached by syncing more often.
+   */
+  full_offline_mirror: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_entries: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  payload_cache_bytes: string
+}
+/**
+ * One vendor delegation beneath a repository's root.
+ */
+export interface CatalogueDelegation {
+  /**
+   * The one publisher it may sign for.
+   */
+  publisher_id: string
+  /**
+   * The delegated role's name.
+   */
+  role: string
+}
+/**
+ * Parameters of `catalogue.list`.
+ */
+export interface CatalogueListParams {
+  /**
+   * The environment whose catalogues are listed.
+   */
+  environment_id: string
+}
+/**
+ * Result of `catalogue.list`.
+ */
+export interface CatalogueListResult {
+  /**
+   * The enrolled repositories, ordered by identifier.
+   */
+  catalogues: CatalogueSummary1[]
+}
+/**
+ * One enrolled repository as `catalogue.list` reports it.
+ */
+export interface CatalogueSummary1 {
+  budgets: CatalogueBudgets1
+  /**
+   * This host's identifier for the repository.
+   */
+  catalogue_id: string
+  /**
+   * What its packages may do without a further grant.
+   */
+  ceiling: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  entries: string
+  /**
+   * The generation currently active, where one is.
+   */
+  generation: RepositoryGeneration | null
+  /**
+   * What kind of repository it is.
+   */
+  kind: 'official' | 'vendor' | 'community' | 'local' | 'mirror'
+  /**
+   * Where its metadata lives.
+   */
+  metadata_url: string
+  /**
+   * The generation the owner pinned, where one is pinned.
+   */
+  pinned_generation: RepositoryGeneration | null
+  /**
+   * The digest of the trust root this host adopted for it.
+   *
+   * A repository verified against a different root is a different trust anchor, whatever it is
+   * called, so the digest is shown rather than a name.
+   */
+  root_digest: string
+  /**
+   * When it last synchronised, where it has.
+   */
+  synced_at_ms: TimestampMs | null
+  /**
+   * Where its targets live.
+   */
+  targets_url: string
+}
+/**
+ * Parameters of `catalogue.pin`.
+ */
+export interface CataloguePinParams {
+  /**
+   * The repository to pin.
+   */
+  catalogue_id: string
+  /**
+   * The environment.
+   */
+  environment_id: string
+  /**
+   * The generation to hold it at, or nothing to remove the pin.
+   */
+  generation: RepositoryGeneration | null
+}
+/**
+ * Result of `catalogue.pin`.
+ */
+export interface CataloguePinResult {
+  catalogue: CatalogueSummary2
+}
+/**
+ * One enrolled repository as `catalogue.list` reports it.
+ */
+export interface CatalogueSummary2 {
+  budgets: CatalogueBudgets1
+  /**
+   * This host's identifier for the repository.
+   */
+  catalogue_id: string
+  /**
+   * What its packages may do without a further grant.
+   */
+  ceiling: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  entries: string
+  /**
+   * The generation currently active, where one is.
+   */
+  generation: RepositoryGeneration | null
+  /**
+   * What kind of repository it is.
+   */
+  kind: 'official' | 'vendor' | 'community' | 'local' | 'mirror'
+  /**
+   * Where its metadata lives.
+   */
+  metadata_url: string
+  /**
+   * The generation the owner pinned, where one is pinned.
+   */
+  pinned_generation: RepositoryGeneration | null
+  /**
+   * The digest of the trust root this host adopted for it.
+   *
+   * A repository verified against a different root is a different trust anchor, whatever it is
+   * called, so the digest is shown rather than a name.
+   */
+  root_digest: string
+  /**
+   * When it last synchronised, where it has.
+   */
+  synced_at_ms: TimestampMs | null
+  /**
+   * Where its targets live.
+   */
+  targets_url: string
+}
+/**
+ * Parameters of `catalogue.remove`.
+ */
+export interface CatalogueRemoveParams {
+  /**
+   * The repository to remove.
+   */
+  catalogue_id: string
+  /**
+   * The environment.
+   */
+  environment_id: string
+}
+/**
+ * Result of `catalogue.remove`.
+ */
+export interface CatalogueRemoveResult {
+  /**
+   * The repository that was removed.
+   */
+  catalogue_id: string
+  /**
+   * The packages still installed from it, which removing a repository does not uninstall.
+   */
+  installed_packages: PluginId[]
+}
+/**
+ * Parameters of `catalogue.sync`.
+ */
+export interface CatalogueSyncParams {
+  /**
+   * The repository to synchronise.
+   */
+  catalogue_id: string
+  /**
+   * The environment.
+   */
+  environment_id: string
+}
+/**
+ * Result of `catalogue.sync`.
+ */
+export interface CatalogueSyncResult {
+  /**
+   * The vendor delegations the generation carries, each scoped to one publisher.
+   */
+  delegations: CatalogueDelegation[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  entries: string
+  /**
+   * The catalogue generation a plugin package was resolved against.
+   */
+  generation: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  index_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  mirrored_payloads: string
 }
 /**
  * Summary of a causal budget and its consumption.
@@ -12920,6 +13344,510 @@ export interface AgentMutationResult2 {
    * The upstream's own identifier for it, where the upstream gave one.
    */
   upstream_request_id: UpstreamRequestId | null
+}
+/**
+ * Parameters of `plugin.capabilities`.
+ */
+export interface PluginCapabilitiesParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+}
+/**
+ * Result of `plugin.capabilities`.
+ */
+export interface PluginCapabilitiesResult {
+  /**
+   * What each requested capability needs, and whether it has it.
+   */
+  capabilities: PluginCapabilityGrant[]
+  /**
+   * What this host currently knows about each of them.
+   */
+  evidence: PluginCapabilityEvidence[]
+  plugin: PluginSummary
+}
+/**
+ * One capability a package asks for, and where it stands.
+ */
+export interface PluginCapabilityGrant {
+  /**
+   * A versioned capability name. Capabilities describe feasibility, never authority.
+   */
+  capability: string
+  /**
+   * Whether it is permitted as things stand.
+   */
+  permitted: boolean
+  /**
+   * What the package said it needs it for.
+   */
+  reason: string
+  /**
+   * Who has to permit it.
+   */
+  requirement:
+    'within_ceiling' | 'repository_grant' | 'installation_grant' | 'confirmed_installation_grant'
+}
+/**
+ * What this host currently knows about one capability of one installed package.
+ *
+ * Evidence describes feasibility and never creates authority. An action still checks its grant,
+ * and it rechecks this record's revision independently.
+ */
+export interface PluginCapabilityEvidence {
+  /**
+   * A versioned capability name. Capabilities describe feasibility, never authority.
+   */
+  capability: string
+  /**
+   * What a person is told when the capability is not available.
+   */
+  disabled_reason: string | null
+  /**
+   * What makes the answer stale.
+   */
+  invalidated_by: PluginInvalidationTrigger[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  observed_at_ms: string
+  /**
+   * The exact package hash the answer is about.
+   *
+   * A live binding stays on the hash it was made against, so a record for another release is
+   * about another release and never moves it.
+   */
+  package_digest: string
+  /**
+   * The digest of the signed qualification profile the answer came from, where one did.
+   */
+  profile_digest: string | null
+  /**
+   * Where it came from.
+   */
+  source: 'host_probe' | 'live_binding' | 'signed_record' | 'package_declaration'
+  /**
+   * What the answer is.
+   */
+  state:
+    | 'qualified_available'
+    | 'version_qualified'
+    | 'missing_installation'
+    | 'permission_required'
+    | 'incompatible'
+    | 'temporarily_unavailable'
+    | 'not_tested'
+}
+/**
+ * The installation the answer is about.
+ */
+export interface PluginSummary {
+  /**
+   * The repository it came from.
+   */
+  catalogue_id: string
+  /**
+   * Whether it is enabled here.
+   */
+  enabled: boolean
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_bindings: string
+  /**
+   * The exact package hash installed.
+   */
+  package_digest: string
+  /**
+   * Whether the owner pinned this exact hash.
+   */
+  pinned: boolean
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * Whether the catalogue has revoked this release.
+   */
+  revoked: boolean
+  /**
+   * The installed release.
+   */
+  version: string
+}
+/**
+ * Parameters of `plugin.enable` and `plugin.disable`.
+ */
+export interface PluginEnableParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+}
+/**
+ * Result of `plugin.enable` and `plugin.disable`.
+ */
+export interface PluginEnableResult {
+  plugin: PluginSummary1
+}
+/**
+ * The installation as it now stands.
+ */
+export interface PluginSummary1 {
+  /**
+   * The repository it came from.
+   */
+  catalogue_id: string
+  /**
+   * Whether it is enabled here.
+   */
+  enabled: boolean
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_bindings: string
+  /**
+   * The exact package hash installed.
+   */
+  package_digest: string
+  /**
+   * Whether the owner pinned this exact hash.
+   */
+  pinned: boolean
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * Whether the catalogue has revoked this release.
+   */
+  revoked: boolean
+  /**
+   * The installed release.
+   */
+  version: string
+}
+/**
+ * Parameters of `plugin.grant`.
+ */
+export interface PluginGrantParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The capabilities the installation is to hold after this change.
+   *
+   * The whole set, not an addition: an increase over what the installation already had is a new
+   * decision, and a host that received only additions could not tell one from a removal.
+   */
+  grant: string[]
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+}
+/**
+ * Result of `plugin.grant`.
+ */
+export interface PluginGrantResult {
+  /**
+   * What each requested capability needs, and whether it has it.
+   */
+  capabilities: PluginCapabilityGrant[]
+  plugin: PluginSummary2
+}
+/**
+ * The installation as it now stands.
+ */
+export interface PluginSummary2 {
+  /**
+   * The repository it came from.
+   */
+  catalogue_id: string
+  /**
+   * Whether it is enabled here.
+   */
+  enabled: boolean
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_bindings: string
+  /**
+   * The exact package hash installed.
+   */
+  package_digest: string
+  /**
+   * Whether the owner pinned this exact hash.
+   */
+  pinned: boolean
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * Whether the catalogue has revoked this release.
+   */
+  revoked: boolean
+  /**
+   * The installed release.
+   */
+  version: string
+}
+/**
+ * Parameters of `plugin.install`.
+ */
+export interface PluginInstallParams {
+  /**
+   * The repository to install from.
+   */
+  catalogue_id: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Capabilities the owner is granting this installation.
+   */
+  grant: string[]
+  /**
+   * The exact package hash the caller expects.
+   *
+   * Installation verifies the signature before it installs, and the hash makes the caller's
+   * expectation explicit: a repository that published something else between the caller reading
+   * the index and this request arriving is a refusal rather than a surprise.
+   */
+  package_digest: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * The release.
+   */
+  version: string
+}
+/**
+ * Result of `plugin.install`.
+ */
+export interface PluginInstallResult {
+  /**
+   * What each requested capability needs, and whether it has it.
+   */
+  capabilities: PluginCapabilityGrant[]
+  plugin: PluginSummary3
+}
+/**
+ * The installation as it now stands.
+ */
+export interface PluginSummary3 {
+  /**
+   * The repository it came from.
+   */
+  catalogue_id: string
+  /**
+   * Whether it is enabled here.
+   */
+  enabled: boolean
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_bindings: string
+  /**
+   * The exact package hash installed.
+   */
+  package_digest: string
+  /**
+   * Whether the owner pinned this exact hash.
+   */
+  pinned: boolean
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * Whether the catalogue has revoked this release.
+   */
+  revoked: boolean
+  /**
+   * The installed release.
+   */
+  version: string
+}
+/**
+ * Parameters of `plugin.list`.
+ */
+export interface PluginListParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+}
+/**
+ * Result of `plugin.list`.
+ */
+export interface PluginListResult {
+  /**
+   * The installations, ordered by package identifier.
+   */
+  plugins: PluginSummary4[]
+}
+/**
+ * One installed plugin as `plugin.list` reports it.
+ */
+export interface PluginSummary4 {
+  /**
+   * The repository it came from.
+   */
+  catalogue_id: string
+  /**
+   * Whether it is enabled here.
+   */
+  enabled: boolean
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_bindings: string
+  /**
+   * The exact package hash installed.
+   */
+  package_digest: string
+  /**
+   * Whether the owner pinned this exact hash.
+   */
+  pinned: boolean
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * Whether the catalogue has revoked this release.
+   */
+  revoked: boolean
+  /**
+   * The installed release.
+   */
+  version: string
+}
+/**
+ * Parameters of `plugin.pin`.
+ */
+export interface PluginPinParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The exact package hash to hold it at, or nothing to remove the pin.
+   */
+  package_digest: string | null
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+}
+/**
+ * Result of `plugin.pin`.
+ */
+export interface PluginPinResult {
+  plugin: PluginSummary5
+}
+/**
+ * One installed plugin as `plugin.list` reports it.
+ */
+export interface PluginSummary5 {
+  /**
+   * The repository it came from.
+   */
+  catalogue_id: string
+  /**
+   * Whether it is enabled here.
+   */
+  enabled: boolean
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_bindings: string
+  /**
+   * The exact package hash installed.
+   */
+  package_digest: string
+  /**
+   * Whether the owner pinned this exact hash.
+   */
+  pinned: boolean
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * Whether the catalogue has revoked this release.
+   */
+  revoked: boolean
+  /**
+   * The installed release.
+   */
+  version: string
+}
+/**
+ * Parameters of `plugin.remove`.
+ */
+export interface PluginRemoveParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+}
+/**
+ * Result of `plugin.remove`.
+ */
+export interface PluginRemoveResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  closed_bindings: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
 }
 /**
  * An organisation's policy-signing authority as it is published.

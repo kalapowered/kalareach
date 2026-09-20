@@ -4188,6 +4188,411 @@
       ],
       "type": "object"
     },
+    "CatalogueAddParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `catalogue.add`.\n\nAdding a catalogue adopts a trust root, which is always the owner's decision. The root travels\nwith the request because a host that fetched it from the location it is meant to verify would\nbe trusting the thing it is checking.",
+      "properties": {
+        "budgets": {
+          "$ref": "#/$defs/CatalogueBudgets",
+          "description": "The budgets it runs inside."
+        },
+        "catalogue_id": {
+          "description": "This host's identifier for the repository.",
+          "type": "string"
+        },
+        "ceiling": {
+          "description": "Capabilities its packages may hold without a further grant, beyond the default ceiling.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the repository is enrolled in."
+        },
+        "kind": {
+          "$ref": "#/$defs/CatalogueKind",
+          "description": "What kind of repository it is."
+        },
+        "metadata_url": {
+          "description": "Where its metadata lives.",
+          "type": "string"
+        },
+        "root": {
+          "description": "The trust root, as its bytes, base64 encoded.",
+          "type": "string"
+        },
+        "targets_url": {
+          "description": "Where its targets live.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_id",
+        "catalogue_id",
+        "kind",
+        "metadata_url",
+        "targets_url",
+        "root",
+        "budgets",
+        "ceiling"
+      ],
+      "type": "object"
+    },
+    "CatalogueAddResult": {
+      "additionalProperties": false,
+      "description": "Result of `catalogue.add`.",
+      "properties": {
+        "catalogue": {
+          "$ref": "#/$defs/CatalogueSummary",
+          "description": "The repository as it was enrolled."
+        }
+      },
+      "required": [
+        "catalogue"
+      ],
+      "type": "object"
+    },
+    "CatalogueBudgets": {
+      "additionalProperties": false,
+      "description": "The budgets one repository runs inside.\n\nEnrolment sets these before the first fetch. Exceeding one leaves the previous generation\nusable and reports which allowance ran out.",
+      "properties": {
+        "full_offline_mirror": {
+          "description": "Whether every referenced payload is fetched rather than only what is installed.\n\nA larger full mirror is this setting plus a payload budget that admits it. It is never\nreached by syncing more often.",
+          "type": "boolean"
+        },
+        "metadata_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum bytes of catalogue metadata."
+        },
+        "metadata_entries": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum number of index entries."
+        },
+        "payload_cache_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum bytes of cached payloads."
+        }
+      },
+      "required": [
+        "metadata_bytes",
+        "metadata_entries",
+        "payload_cache_bytes",
+        "full_offline_mirror"
+      ],
+      "type": "object"
+    },
+    "CatalogueDelegation": {
+      "additionalProperties": false,
+      "description": "One vendor delegation beneath a repository's root.",
+      "properties": {
+        "publisher_id": {
+          "description": "The one publisher it may sign for.",
+          "type": "string"
+        },
+        "role": {
+          "description": "The delegated role's name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "publisher_id"
+      ],
+      "type": "object"
+    },
+    "CatalogueKind": {
+      "description": "The kind of repository an enrolment is.\n\nThe kind is descriptive and changes nothing about verification: every repository's metadata is\nverified against the root this host adopted for it.",
+      "oneOf": [
+        {
+          "const": "official",
+          "description": "The repository KalaReach ships the root for.",
+          "type": "string"
+        },
+        {
+          "const": "vendor",
+          "description": "A vendor's own repository.",
+          "type": "string"
+        },
+        {
+          "const": "community",
+          "description": "A community repository with its own root.",
+          "type": "string"
+        },
+        {
+          "const": "local",
+          "description": "A directory on this machine.",
+          "type": "string"
+        },
+        {
+          "const": "mirror",
+          "description": "A mirror of another repository, carrying that repository's root.",
+          "type": "string"
+        }
+      ]
+    },
+    "CatalogueListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `catalogue.list`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment whose catalogues are listed."
+        }
+      },
+      "required": [
+        "environment_id"
+      ],
+      "type": "object"
+    },
+    "CatalogueListResult": {
+      "additionalProperties": false,
+      "description": "Result of `catalogue.list`.",
+      "properties": {
+        "catalogues": {
+          "description": "The enrolled repositories, ordered by identifier.",
+          "items": {
+            "$ref": "#/$defs/CatalogueSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "catalogues"
+      ],
+      "type": "object"
+    },
+    "CataloguePinParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `catalogue.pin`.",
+      "properties": {
+        "catalogue_id": {
+          "description": "The repository to pin.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        },
+        "generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RepositoryGeneration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The generation to hold it at, or nothing to remove the pin."
+        }
+      },
+      "required": [
+        "environment_id",
+        "catalogue_id",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "CataloguePinResult": {
+      "additionalProperties": false,
+      "description": "Result of `catalogue.pin`.",
+      "properties": {
+        "catalogue": {
+          "$ref": "#/$defs/CatalogueSummary",
+          "description": "The repository as it now stands."
+        }
+      },
+      "required": [
+        "catalogue"
+      ],
+      "type": "object"
+    },
+    "CatalogueRemoveParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `catalogue.remove`.",
+      "properties": {
+        "catalogue_id": {
+          "description": "The repository to remove.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        }
+      },
+      "required": [
+        "environment_id",
+        "catalogue_id"
+      ],
+      "type": "object"
+    },
+    "CatalogueRemoveResult": {
+      "additionalProperties": false,
+      "description": "Result of `catalogue.remove`.",
+      "properties": {
+        "catalogue_id": {
+          "description": "The repository that was removed.",
+          "type": "string"
+        },
+        "installed_packages": {
+          "description": "The packages still installed from it, which removing a repository does not uninstall.",
+          "items": {
+            "$ref": "#/$defs/PluginId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "catalogue_id",
+        "installed_packages"
+      ],
+      "type": "object"
+    },
+    "CatalogueSummary": {
+      "additionalProperties": false,
+      "description": "One enrolled repository as `catalogue.list` reports it.",
+      "properties": {
+        "budgets": {
+          "$ref": "#/$defs/CatalogueBudgets",
+          "description": "The budgets it runs inside."
+        },
+        "catalogue_id": {
+          "description": "This host's identifier for the repository.",
+          "type": "string"
+        },
+        "ceiling": {
+          "description": "What its packages may do without a further grant.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "entries": {
+          "$ref": "#/$defs/U64",
+          "description": "How many entries its index carries."
+        },
+        "generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RepositoryGeneration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The generation currently active, where one is."
+        },
+        "kind": {
+          "$ref": "#/$defs/CatalogueKind",
+          "description": "What kind of repository it is."
+        },
+        "metadata_url": {
+          "description": "Where its metadata lives.",
+          "type": "string"
+        },
+        "pinned_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RepositoryGeneration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The generation the owner pinned, where one is pinned."
+        },
+        "root_digest": {
+          "description": "The digest of the trust root this host adopted for it.\n\nA repository verified against a different root is a different trust anchor, whatever it is\ncalled, so the digest is shown rather than a name.",
+          "type": "string"
+        },
+        "synced_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it last synchronised, where it has."
+        },
+        "targets_url": {
+          "description": "Where its targets live.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalogue_id",
+        "kind",
+        "metadata_url",
+        "targets_url",
+        "root_digest",
+        "generation",
+        "pinned_generation",
+        "budgets",
+        "ceiling",
+        "entries",
+        "synced_at_ms"
+      ],
+      "type": "object"
+    },
+    "CatalogueSyncParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `catalogue.sync`.",
+      "properties": {
+        "catalogue_id": {
+          "description": "The repository to synchronise.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        }
+      },
+      "required": [
+        "environment_id",
+        "catalogue_id"
+      ],
+      "type": "object"
+    },
+    "CatalogueSyncResult": {
+      "additionalProperties": false,
+      "description": "Result of `catalogue.sync`.",
+      "properties": {
+        "delegations": {
+          "description": "The vendor delegations the generation carries, each scoped to one publisher.",
+          "items": {
+            "$ref": "#/$defs/CatalogueDelegation"
+          },
+          "type": "array"
+        },
+        "entries": {
+          "$ref": "#/$defs/U64",
+          "description": "How many entries its index carries."
+        },
+        "generation": {
+          "$ref": "#/$defs/RepositoryGeneration",
+          "description": "The generation now active."
+        },
+        "index_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many bytes the index is."
+        },
+        "mirrored_payloads": {
+          "$ref": "#/$defs/U64",
+          "description": "How many payloads a full mirror fetched."
+        }
+      },
+      "required": [
+        "generation",
+        "entries",
+        "index_bytes",
+        "mirrored_payloads",
+        "delegations"
+      ],
+      "type": "object"
+    },
     "CausalBudgetSummary": {
       "additionalProperties": false,
       "description": "Summary of a causal budget and its consumption.",
@@ -17743,11 +18148,594 @@
       ],
       "type": "object"
     },
+    "PluginCapabilitiesParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.capabilities`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        }
+      },
+      "required": [
+        "environment_id",
+        "plugin_id"
+      ],
+      "type": "object"
+    },
+    "PluginCapabilitiesResult": {
+      "additionalProperties": false,
+      "description": "Result of `plugin.capabilities`.",
+      "properties": {
+        "capabilities": {
+          "description": "What each requested capability needs, and whether it has it.",
+          "items": {
+            "$ref": "#/$defs/PluginCapabilityGrant"
+          },
+          "type": "array"
+        },
+        "evidence": {
+          "description": "What this host currently knows about each of them.",
+          "items": {
+            "$ref": "#/$defs/PluginCapabilityEvidence"
+          },
+          "type": "array"
+        },
+        "plugin": {
+          "$ref": "#/$defs/PluginSummary",
+          "description": "The installation the answer is about."
+        }
+      },
+      "required": [
+        "plugin",
+        "capabilities",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "PluginCapabilityEvidence": {
+      "additionalProperties": false,
+      "description": "What this host currently knows about one capability of one installed package.\n\nEvidence describes feasibility and never creates authority. An action still checks its grant,\nand it rechecks this record's revision independently.",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityId",
+          "description": "The capability, in the shared versioned namespace."
+        },
+        "disabled_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What a person is told when the capability is not available."
+        },
+        "invalidated_by": {
+          "description": "What makes the answer stale.",
+          "items": {
+            "$ref": "#/$defs/PluginInvalidationTrigger"
+          },
+          "type": "array"
+        },
+        "observed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the answer was established."
+        },
+        "package_digest": {
+          "description": "The exact package hash the answer is about.\n\nA live binding stays on the hash it was made against, so a record for another release is\nabout another release and never moves it.",
+          "type": "string"
+        },
+        "profile_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the signed qualification profile the answer came from, where one did."
+        },
+        "source": {
+          "$ref": "#/$defs/PluginEvidenceSource",
+          "description": "Where it came from."
+        },
+        "state": {
+          "$ref": "#/$defs/PluginCapabilityState",
+          "description": "What the answer is."
+        }
+      },
+      "required": [
+        "capability",
+        "state",
+        "source",
+        "package_digest",
+        "profile_digest",
+        "invalidated_by",
+        "disabled_reason",
+        "observed_at_ms"
+      ],
+      "type": "object"
+    },
+    "PluginCapabilityGrant": {
+      "additionalProperties": false,
+      "description": "One capability a package asks for, and where it stands.",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityId",
+          "description": "The capability, in the shared versioned namespace."
+        },
+        "permitted": {
+          "description": "Whether it is permitted as things stand.",
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "What the package said it needs it for.",
+          "type": "string"
+        },
+        "requirement": {
+          "$ref": "#/$defs/PluginGrantRequirement",
+          "description": "Who has to permit it."
+        }
+      },
+      "required": [
+        "capability",
+        "requirement",
+        "permitted",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "PluginCapabilityState": {
+      "description": "The section 11 runtime-state vocabulary.\n\nSeven states, because \"unavailable\" alone sends a person to the wrong fix. The one that is easy\nto miss is [`Self::VersionQualified`]: a signed catalogue artifact says how a release behaved\nwhere it was tested, which is not the same as saying it works on this host.",
+      "oneOf": [
+        {
+          "const": "qualified_available",
+          "description": "Tested here and working.",
+          "type": "string"
+        },
+        {
+          "const": "version_qualified",
+          "description": "This release was qualified, and this host has not been checked.",
+          "type": "string"
+        },
+        {
+          "const": "missing_installation",
+          "description": "The application, bridge or component is not installed.",
+          "type": "string"
+        },
+        {
+          "const": "permission_required",
+          "description": "The operating system or the user has not granted the permission it needs.",
+          "type": "string"
+        },
+        {
+          "const": "incompatible",
+          "description": "The installed version cannot support it.",
+          "type": "string"
+        },
+        {
+          "const": "temporarily_unavailable",
+          "description": "It worked before and does not right now.",
+          "type": "string"
+        },
+        {
+          "const": "not_tested",
+          "description": "No evidence has been gathered.",
+          "type": "string"
+        }
+      ]
+    },
+    "PluginEnableParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.enable` and `plugin.disable`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        }
+      },
+      "required": [
+        "environment_id",
+        "plugin_id"
+      ],
+      "type": "object"
+    },
+    "PluginEnableResult": {
+      "additionalProperties": false,
+      "description": "Result of `plugin.enable` and `plugin.disable`.",
+      "properties": {
+        "plugin": {
+          "$ref": "#/$defs/PluginSummary",
+          "description": "The installation as it now stands."
+        }
+      },
+      "required": [
+        "plugin"
+      ],
+      "type": "object"
+    },
+    "PluginEvidenceSource": {
+      "description": "Where a capability answer came from.",
+      "oneOf": [
+        {
+          "const": "host_probe",
+          "description": "A bounded disclosed probe with declared effects, run on this host.",
+          "type": "string"
+        },
+        {
+          "const": "live_binding",
+          "description": "A live binding that performed the operation on this host.",
+          "type": "string"
+        },
+        {
+          "const": "signed_record",
+          "description": "A signed compatibility record shipped in the catalogue.",
+          "type": "string"
+        },
+        {
+          "const": "package_declaration",
+          "description": "The package's own declaration, believed only for negative states.",
+          "type": "string"
+        }
+      ]
+    },
+    "PluginGrantParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.grant`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        },
+        "grant": {
+          "description": "The capabilities the installation is to hold after this change.\n\nThe whole set, not an addition: an increase over what the installation already had is a new\ndecision, and a host that received only additions could not tell one from a removal.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        }
+      },
+      "required": [
+        "environment_id",
+        "plugin_id",
+        "grant"
+      ],
+      "type": "object"
+    },
+    "PluginGrantRequirement": {
+      "description": "Who has to permit one capability.",
+      "oneOf": [
+        {
+          "const": "within_ceiling",
+          "description": "The repository's ceiling already permits it.",
+          "type": "string"
+        },
+        {
+          "const": "repository_grant",
+          "description": "An explicit package or repository grant is needed.",
+          "type": "string"
+        },
+        {
+          "const": "installation_grant",
+          "description": "An explicit installation grant is needed.",
+          "type": "string"
+        },
+        {
+          "const": "confirmed_installation_grant",
+          "description": "An installation grant the owner confirms, because the code runs outside the sandbox.",
+          "type": "string"
+        }
+      ]
+    },
+    "PluginGrantResult": {
+      "additionalProperties": false,
+      "description": "Result of `plugin.grant`.",
+      "properties": {
+        "capabilities": {
+          "description": "What each requested capability needs, and whether it has it.",
+          "items": {
+            "$ref": "#/$defs/PluginCapabilityGrant"
+          },
+          "type": "array"
+        },
+        "plugin": {
+          "$ref": "#/$defs/PluginSummary",
+          "description": "The installation as it now stands."
+        }
+      },
+      "required": [
+        "plugin",
+        "capabilities"
+      ],
+      "type": "object"
+    },
     "PluginId": {
       "description": "A plugin identifier from its manifest.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "PluginInstallParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.install`.",
+      "properties": {
+        "catalogue_id": {
+          "description": "The repository to install from.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        },
+        "grant": {
+          "description": "Capabilities the owner is granting this installation.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "package_digest": {
+          "description": "The exact package hash the caller expects.\n\nInstallation verifies the signature before it installs, and the hash makes the caller's\nexpectation explicit: a repository that published something else between the caller reading\nthe index and this request arriving is a refusal rather than a surprise.",
+          "type": "string"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        },
+        "version": {
+          "description": "The release.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_id",
+        "catalogue_id",
+        "plugin_id",
+        "version",
+        "package_digest",
+        "grant"
+      ],
+      "type": "object"
+    },
+    "PluginInstallResult": {
+      "additionalProperties": false,
+      "description": "Result of `plugin.install`.",
+      "properties": {
+        "capabilities": {
+          "description": "What each requested capability needs, and whether it has it.",
+          "items": {
+            "$ref": "#/$defs/PluginCapabilityGrant"
+          },
+          "type": "array"
+        },
+        "plugin": {
+          "$ref": "#/$defs/PluginSummary",
+          "description": "The installation as it now stands."
+        }
+      },
+      "required": [
+        "plugin",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "PluginInvalidationTrigger": {
+      "description": "What makes a capability answer stale.",
+      "oneOf": [
+        {
+          "const": "binary_changed",
+          "description": "The tested binary changed.",
+          "type": "string"
+        },
+        {
+          "const": "binding_changed",
+          "description": "The active binding changed.",
+          "type": "string"
+        },
+        {
+          "const": "schema_changed",
+          "description": "The upstream schema or protocol version changed.",
+          "type": "string"
+        },
+        {
+          "const": "os_permission_changed",
+          "description": "An operating-system permission changed.",
+          "type": "string"
+        },
+        {
+          "const": "desktop_generation_changed",
+          "description": "The desktop session generation changed.",
+          "type": "string"
+        },
+        {
+          "const": "profile_changed",
+          "description": "A signed profile in the catalogue changed.",
+          "type": "string"
+        }
+      ]
+    },
+    "PluginListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.list`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment whose installations are listed."
+        }
+      },
+      "required": [
+        "environment_id"
+      ],
+      "type": "object"
+    },
+    "PluginListResult": {
+      "additionalProperties": false,
+      "description": "Result of `plugin.list`.",
+      "properties": {
+        "plugins": {
+          "description": "The installations, ordered by package identifier.",
+          "items": {
+            "$ref": "#/$defs/PluginSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "plugins"
+      ],
+      "type": "object"
+    },
+    "PluginPinParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.pin`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        },
+        "package_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The exact package hash to hold it at, or nothing to remove the pin."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        }
+      },
+      "required": [
+        "environment_id",
+        "plugin_id",
+        "package_digest"
+      ],
+      "type": "object"
+    },
+    "PluginPinResult": {
+      "additionalProperties": false,
+      "description": "Result of `plugin.pin`.",
+      "properties": {
+        "plugin": {
+          "$ref": "#/$defs/PluginSummary",
+          "description": "The installation as it now stands."
+        }
+      },
+      "required": [
+        "plugin"
+      ],
+      "type": "object"
+    },
+    "PluginRemoveParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.remove`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        }
+      },
+      "required": [
+        "environment_id",
+        "plugin_id"
+      ],
+      "type": "object"
+    },
+    "PluginRemoveResult": {
+      "additionalProperties": false,
+      "description": "Result of `plugin.remove`.",
+      "properties": {
+        "closed_bindings": {
+          "$ref": "#/$defs/U64",
+          "description": "How many live bindings it had, which removal closed."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package that was removed."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "closed_bindings"
+      ],
+      "type": "object"
+    },
+    "PluginSummary": {
+      "additionalProperties": false,
+      "description": "One installed plugin as `plugin.list` reports it.",
+      "properties": {
+        "catalogue_id": {
+          "description": "The repository it came from.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Whether it is enabled here.",
+          "type": "boolean"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment it is installed in."
+        },
+        "live_bindings": {
+          "$ref": "#/$defs/U64",
+          "description": "How many live bindings hold it."
+        },
+        "package_digest": {
+          "description": "The exact package hash installed.",
+          "type": "string"
+        },
+        "pinned": {
+          "description": "Whether the owner pinned this exact hash.",
+          "type": "boolean"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        },
+        "revoked": {
+          "description": "Whether the catalogue has revoked this release.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "The installed release.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "catalogue_id",
+        "version",
+        "package_digest",
+        "environment_id",
+        "enabled",
+        "pinned",
+        "revoked",
+        "live_bindings"
+      ],
+      "type": "object"
     },
     "PolicyAuthority": {
       "additionalProperties": false,
@@ -30497,6 +31485,45 @@
     "capture_count": {
       "$ref": "#/$defs/CaptureCount"
     },
+    "catalogue_add_params": {
+      "$ref": "#/$defs/CatalogueAddParams"
+    },
+    "catalogue_add_result": {
+      "$ref": "#/$defs/CatalogueAddResult"
+    },
+    "catalogue_budgets": {
+      "$ref": "#/$defs/CatalogueBudgets"
+    },
+    "catalogue_delegation": {
+      "$ref": "#/$defs/CatalogueDelegation"
+    },
+    "catalogue_list_params": {
+      "$ref": "#/$defs/CatalogueListParams"
+    },
+    "catalogue_list_result": {
+      "$ref": "#/$defs/CatalogueListResult"
+    },
+    "catalogue_pin_params": {
+      "$ref": "#/$defs/CataloguePinParams"
+    },
+    "catalogue_pin_result": {
+      "$ref": "#/$defs/CataloguePinResult"
+    },
+    "catalogue_remove_params": {
+      "$ref": "#/$defs/CatalogueRemoveParams"
+    },
+    "catalogue_remove_result": {
+      "$ref": "#/$defs/CatalogueRemoveResult"
+    },
+    "catalogue_summary": {
+      "$ref": "#/$defs/CatalogueSummary"
+    },
+    "catalogue_sync_params": {
+      "$ref": "#/$defs/CatalogueSyncParams"
+    },
+    "catalogue_sync_result": {
+      "$ref": "#/$defs/CatalogueSyncResult"
+    },
     "causal_budget_summary": {
       "$ref": "#/$defs/CausalBudgetSummary"
     },
@@ -31207,6 +32234,57 @@
     },
     "plugin_action_invoke_result": {
       "$ref": "#/$defs/PluginActionInvokeResult"
+    },
+    "plugin_capabilities_params": {
+      "$ref": "#/$defs/PluginCapabilitiesParams"
+    },
+    "plugin_capabilities_result": {
+      "$ref": "#/$defs/PluginCapabilitiesResult"
+    },
+    "plugin_capability_evidence": {
+      "$ref": "#/$defs/PluginCapabilityEvidence"
+    },
+    "plugin_capability_grant": {
+      "$ref": "#/$defs/PluginCapabilityGrant"
+    },
+    "plugin_enable_params": {
+      "$ref": "#/$defs/PluginEnableParams"
+    },
+    "plugin_enable_result": {
+      "$ref": "#/$defs/PluginEnableResult"
+    },
+    "plugin_grant_params": {
+      "$ref": "#/$defs/PluginGrantParams"
+    },
+    "plugin_grant_result": {
+      "$ref": "#/$defs/PluginGrantResult"
+    },
+    "plugin_install_params": {
+      "$ref": "#/$defs/PluginInstallParams"
+    },
+    "plugin_install_result": {
+      "$ref": "#/$defs/PluginInstallResult"
+    },
+    "plugin_list_params": {
+      "$ref": "#/$defs/PluginListParams"
+    },
+    "plugin_list_result": {
+      "$ref": "#/$defs/PluginListResult"
+    },
+    "plugin_pin_params": {
+      "$ref": "#/$defs/PluginPinParams"
+    },
+    "plugin_pin_result": {
+      "$ref": "#/$defs/PluginPinResult"
+    },
+    "plugin_remove_params": {
+      "$ref": "#/$defs/PluginRemoveParams"
+    },
+    "plugin_remove_result": {
+      "$ref": "#/$defs/PluginRemoveResult"
+    },
+    "plugin_summary": {
+      "$ref": "#/$defs/PluginSummary"
     },
     "policy_authority": {
       "$ref": "#/$defs/PolicyAuthority"

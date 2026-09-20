@@ -47,6 +47,7 @@
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
 //! | [`collection_keys`] | A synchronised collection's key record: its members, its epoch and each member's key wrap |
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
+//! | [`catalogue`] | The plugin catalogue and plugin method groups: enrolments, installations and what a package may do |
 //! | [`desktop`] | The desktop execution context, capability evidence and the power setting |
 //! | [`digest`] | The mutation payload digest |
 //! | [`project`] | Project repositories, workspaces, inclusion previews and repository operations |
@@ -113,6 +114,7 @@ pub mod attention;
 pub mod authority;
 pub mod automation;
 pub mod broker;
+pub mod catalogue;
 pub mod changeset;
 pub mod collection_keys;
 pub mod describe;
