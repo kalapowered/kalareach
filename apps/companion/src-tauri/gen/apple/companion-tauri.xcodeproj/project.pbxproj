@@ -8,7 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		06B3AB8BA52A0737BE652DAC /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
+		0D98162CEC30F1D818006E25 /* VoiceCeremony.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B391808796597DF04323FC2 /* VoiceCeremony.swift */; };
 		0EDC15DCA7A4E554312092F4 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */; };
+		10783ADDD4C4372BD229CE42 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = AEC884C5D046E9A2F1550FC0 /* WebRTC */; };
 		1128549C68FB9201F70F942C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 3CC3E46F612EC707E33F9F70 /* Assets.xcassets */; };
 		162D159780A61679A7269833 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 183BCF063CD995ED3E3B4C00 /* main.mm */; };
 		1A05E5428BA1AFDCFB0F6367 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 9763735ADB959CD6F7877892 /* assets */; };
@@ -21,11 +23,15 @@
 		4885115428043D10878AD99B /* PreviewDecisionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */; };
 		4E93831717B567BEBE15595F /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
 		557BCD21D6575EA5F9F5943B /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BED7978EB7718B27C0AC5311 /* SystemConfiguration.framework */; };
+		5A7CC9F06D58FF0A7A9952AC /* VoiceCeremony.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B391808796597DF04323FC2 /* VoiceCeremony.swift */; };
+		5B75B7779EBDB43EFCF66B13 /* VoiceCeremony.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B391808796597DF04323FC2 /* VoiceCeremony.swift */; };
 		5D27A11CFB87F37C191F9A5F /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 343C7C2C560F586215BF9C3F /* UIKit.framework */; };
 		5E149929F729886E49F1C45D /* KalaReachNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		70CE80D39ED8CF570A2B5323 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3121E24E1630B06FCF24ECAF /* QuartzCore.framework */; };
 		7999A20AD4AAB5D34E7ABE73 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
+		7F6324AEB51F8C80D5C597E8 /* VoiceCall.swift in Sources */ = {isa = PBXBuildFile; fileRef = D607C597A5761B168642D0EB /* VoiceCall.swift */; };
 		865E8AD7457D4A8EC288015A /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5AAECC7799B8A609EB72D33A /* AVFoundation.framework */; };
+		8A6FFBB0B2F8EF1B311DD1B3 /* VoiceCall.swift in Sources */ = {isa = PBXBuildFile; fileRef = D607C597A5761B168642D0EB /* VoiceCall.swift */; };
 		8C8D5305283EBB3006AE42A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
 		94997D5DBE6F90518D2BE6DD /* ShareSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF8072943115F58C78CD7C9 /* ShareSurface.swift */; };
 		9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
@@ -36,16 +42,22 @@
 		AA8AFDF8D79B4556939EC269 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 860B01BDA0495D0568077001 /* MetalKit.framework */; };
 		B04C06ED622904545BE168D8 /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
 		BA2F20C51EB97A9A2EA35674 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
+		BF7F4A8BFD07646441CBC2C3 /* VoiceCaptureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */; };
 		C27F9176430AA311DB59212D /* PreviewDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */; };
 		C812EE43DA396FCF003C6ABE /* SecureKeys.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC81452583E1A11378351821 /* SecureKeys.swift */; };
 		CAB2C7432861A6D02761B7AB /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
+		CCEAD023F0BB224C5E3793BF /* VoiceCaptureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */; };
 		D1FD9FFA3E55CF47F92920CB /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2DF4188C16A66634654971D /* WebKit.framework */; };
+		DB64188BC1D07E2AE680A656 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 1D6186CC73C61118431242D5 /* WebRTC */; };
+		DE6062C82CFE63F3867BEC4B /* VoiceCaptureStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A6B16292DE3C43BE1E61AFB /* VoiceCaptureStateTests.swift */; };
 		E0323C62307BEB4D7C24ED54 /* PreviewDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */; };
 		E8C021C2AAA31205088A0B5C /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
 		F04163155A595CF98164B6A6 /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
 		F4984261D3997326A7756045 /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 019E652DB2C27D9CDAB07505 /* UserNotifications.framework */; };
+		F4DE4E78D9BA87F6373E92C0 /* VoiceCaptureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */; };
 		F683A3B4BC275D0384F922CF /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = E8C92E50E96FEA4B90C404F3 /* libapp.a */; };
 		F8EF4A8CBBF87EBEBC5CFD35 /* PreviewDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */; };
+		FDA8FF66AE6776BACE0F6391 /* VoiceCeremonyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FEF54BF56555825E7EE8283 /* VoiceCeremonyTests.swift */; };
 		FF58E75D4698A18147FFD948 /* ShareSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF8072943115F58C78CD7C9 /* ShareSurface.swift */; };
 /* End PBXBuildFile section */
 
@@ -75,13 +87,20 @@
 
 /* Begin PBXFileReference section */
 		019E652DB2C27D9CDAB07505 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
+		01BA9EF81D56E832E4F72411 /* ceremony.rs */ = {isa = PBXFileReference; path = ceremony.rs; sourceTree = "<group>"; };
 		02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		0F27CA2E0B14038A22B9EF0C /* identity.rs */ = {isa = PBXFileReference; path = identity.rs; sourceTree = "<group>"; };
+		0FEF54BF56555825E7EE8283 /* VoiceCeremonyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCeremonyTests.swift; sourceTree = "<group>"; };
+		14EA6778E306DFA8DC4625F9 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		15C964AFE64445D908AF5275 /* links.rs */ = {isa = PBXFileReference; path = links.rs; sourceTree = "<group>"; };
 		183BCF063CD995ED3E3B4C00 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		20D78A09D280B9BA8932D5A2 /* buffer.rs */ = {isa = PBXFileReference; path = buffer.rs; sourceTree = "<group>"; };
 		21EFF08FF9DFE8027EAA8B8F /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		233EDCC125C890EB364292DC /* state.rs */ = {isa = PBXFileReference; path = state.rs; sourceTree = "<group>"; };
+		286BC5287B5926CF34F943B6 /* device.rs */ = {isa = PBXFileReference; path = device.rs; sourceTree = "<group>"; };
 		2A45B1371EDD793B4134FF79 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSession.swift; sourceTree = "<group>"; };
+		3059F574B246BBF7D8FD5B78 /* call.rs */ = {isa = PBXFileReference; path = call.rs; sourceTree = "<group>"; };
 		3121E24E1630B06FCF24ECAF /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		343C7C2C560F586215BF9C3F /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
 		3CC3E46F612EC707E33F9F70 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -92,15 +111,20 @@
 		529A8B9ADD788615F4718EB0 /* PushRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushRegistration.swift; sourceTree = "<group>"; };
 		53DC9988B24BB9D8AF674AA2 /* commands.rs */ = {isa = PBXFileReference; path = commands.rs; sourceTree = "<group>"; };
 		5AAECC7799B8A609EB72D33A /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
+		5B391808796597DF04323FC2 /* VoiceCeremony.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCeremony.swift; sourceTree = "<group>"; };
 		5DC0FEC180F00EA2178F4445 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		66F54D2F258FCD3383A592D3 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		69D5CF4D29D34D99D53D6F1F /* remote.rs */ = {isa = PBXFileReference; path = remote.rs; sourceTree = "<group>"; };
 		706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewDecisionTests.swift; sourceTree = "<group>"; };
+		78C823D47F18DFFD2735CD80 /* codec.rs */ = {isa = PBXFileReference; path = codec.rs; sourceTree = "<group>"; };
+		7A6B16292DE3C43BE1E61AFB /* VoiceCaptureStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCaptureStateTests.swift; sourceTree = "<group>"; };
 		7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewDecision.swift; sourceTree = "<group>"; };
 		8120C7D6C368D7D113319C7D /* error.rs */ = {isa = PBXFileReference; path = error.rs; sourceTree = "<group>"; };
 		860B01BDA0495D0568077001 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
 		867641E9571FFF4D300F4601 /* KalaReachNativeTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = KalaReachNativeTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCaptureState.swift; sourceTree = "<group>"; };
 		887BFCE065F103DCEEC3E5F7 /* verify.rs */ = {isa = PBXFileReference; path = verify.rs; sourceTree = "<group>"; };
+		9036197802CA380577FAE896 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		9763735ADB959CD6F7877892 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
 		9BF8072943115F58C78CD7C9 /* ShareSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareSurface.swift; sourceTree = "<group>"; };
 		A9011D4AFA5E6579D9C0375B /* transfers.rs */ = {isa = PBXFileReference; path = transfers.rs; sourceTree = "<group>"; };
@@ -110,8 +134,11 @@
 		C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewKeyStore.swift; sourceTree = "<group>"; };
 		C64D4F0C05D1651BEE197024 /* target.rs */ = {isa = PBXFileReference; path = target.rs; sourceTree = "<group>"; };
 		C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		CCDE8F6B0D2B775A6D9FFA85 /* control.rs */ = {isa = PBXFileReference; path = control.rs; sourceTree = "<group>"; };
 		D2F94BCB7283BE2B071B831A /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		D607C597A5761B168642D0EB /* VoiceCall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCall.swift; sourceTree = "<group>"; };
 		D806D2225CDFB68693658DC5 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		D8EA8B17DA1A639AC0E92112 /* settings.rs */ = {isa = PBXFileReference; path = settings.rs; sourceTree = "<group>"; };
 		DA7F7F5739685BC591FB8A2D /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewEnvelope.swift; sourceTree = "<group>"; };
 		E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = KalaReachNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -128,6 +155,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				F683A3B4BC275D0384F922CF /* libapp.a in Frameworks */,
+				DB64188BC1D07E2AE680A656 /* WebRTC in Frameworks */,
 				865E8AD7457D4A8EC288015A /* AVFoundation.framework in Frameworks */,
 				F4984261D3997326A7756045 /* UserNotifications.framework in Frameworks */,
 				557BCD21D6575EA5F9F5943B /* SystemConfiguration.framework in Frameworks */,
@@ -141,6 +169,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		5B9CCC16D56254D444C55617 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				10783ADDD4C4372BD229CE42 /* WebRTC in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -151,9 +187,21 @@
 				DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */,
 				C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */,
 				F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */,
+				8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */,
+				5B391808796597DF04323FC2 /* VoiceCeremony.swift */,
 			);
 			name = Shared;
 			path = ../../../native/ios/Shared;
+			sourceTree = "<group>";
+		};
+		27022A4CE482FADA6C717B52 /* setup */ = {
+			isa = PBXGroup;
+			children = (
+				0F27CA2E0B14038A22B9EF0C /* identity.rs */,
+				9036197802CA380577FAE896 /* mod.rs */,
+				D8EA8B17DA1A639AC0E92112 /* settings.rs */,
+			);
+			path = setup;
 			sourceTree = "<group>";
 		};
 		3BDBEB386023E2D63A29DDD6 /* Sources */ = {
@@ -174,6 +222,20 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		5A7F67E2DD8917AEC7F1B309 /* audio */ = {
+			isa = PBXGroup;
+			children = (
+				20D78A09D280B9BA8932D5A2 /* buffer.rs */,
+				3059F574B246BBF7D8FD5B78 /* call.rs */,
+				01BA9EF81D56E832E4F72411 /* ceremony.rs */,
+				78C823D47F18DFFD2735CD80 /* codec.rs */,
+				CCDE8F6B0D2B775A6D9FFA85 /* control.rs */,
+				286BC5287B5926CF34F943B6 /* device.rs */,
+				14EA6778E306DFA8DC4625F9 /* mod.rs */,
+			);
+			path = audio;
+			sourceTree = "<group>";
+		};
 		759ED3EAF99DD6D22AC770CE /* KalaReachNative */ = {
 			isa = PBXGroup;
 			children = (
@@ -182,6 +244,7 @@
 				BC81452583E1A11378351821 /* SecureKeys.swift */,
 				9BF8072943115F58C78CD7C9 /* ShareSurface.swift */,
 				E49D3EC99878D20FEB66A165 /* SigningGate.swift */,
+				D607C597A5761B168642D0EB /* VoiceCall.swift */,
 			);
 			name = KalaReachNative;
 			path = ../../../native/ios/KalaReachNative;
@@ -211,6 +274,8 @@
 				C64D4F0C05D1651BEE197024 /* target.rs */,
 				A9011D4AFA5E6579D9C0375B /* transfers.rs */,
 				887BFCE065F103DCEEC3E5F7 /* verify.rs */,
+				5A7F67E2DD8917AEC7F1B309 /* audio */,
+				27022A4CE482FADA6C717B52 /* setup */,
 			);
 			name = src;
 			path = ../../src;
@@ -254,6 +319,8 @@
 			isa = PBXGroup;
 			children = (
 				706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */,
+				7A6B16292DE3C43BE1E61AFB /* VoiceCaptureStateTests.swift */,
+				0FEF54BF56555825E7EE8283 /* VoiceCeremonyTests.swift */,
 			);
 			name = Tests;
 			path = ../../../native/ios/Tests;
@@ -313,7 +380,7 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		"TEMP_F7C92612-CACB-450F-92DE-B20CBD5ECEBF" /* x86_64 */ = {
+		"TEMP_F81D1563-7C46-4148-8597-8A1416CDDBB5" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -340,6 +407,7 @@
 			);
 			name = "companion-tauri_iOS";
 			packageProductDependencies = (
+				1D6186CC73C61118431242D5 /* WebRTC */,
 			);
 			productName = "companion-tauri_iOS";
 			productReference = 45752446E12DEC199411BC9D /* companion-tauri_iOS.app */;
@@ -367,6 +435,7 @@
 			buildConfigurationList = F1F4D89102687C7026A36134 /* Build configuration list for PBXNativeTarget "KalaReachNativeTests" */;
 			buildPhases = (
 				3668133642C5E24626AFA07B /* Sources */,
+				5B9CCC16D56254D444C55617 /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -374,6 +443,7 @@
 			);
 			name = KalaReachNativeTests;
 			packageProductDependencies = (
+				AEC884C5D046E9A2F1550FC0 /* WebRTC */,
 			);
 			productName = KalaReachNativeTests;
 			productReference = 867641E9571FFF4D300F4601 /* KalaReachNativeTests.xctest */;
@@ -399,6 +469,9 @@
 			);
 			mainGroup = AD937C991610E19AA57EC59C;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				4FC1E0748421EFBBDABA2621 /* XCRemoteSwiftPackageReference "WebRTC" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 5A54F39A1118D3FEAD667A9F /* Products */;
 			projectDirPath = "";
@@ -458,6 +531,8 @@
 				F04163155A595CF98164B6A6 /* PreviewEnvelope.swift in Sources */,
 				A223AB1550608EDAD2B5FFC9 /* PreviewKeyStore.swift in Sources */,
 				7999A20AD4AAB5D34E7ABE73 /* SharedClientPreviewOpener.swift in Sources */,
+				F4DE4E78D9BA87F6373E92C0 /* VoiceCaptureState.swift in Sources */,
+				5B75B7779EBDB43EFCF66B13 /* VoiceCeremony.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -475,6 +550,11 @@
 				94997D5DBE6F90518D2BE6DD /* ShareSurface.swift in Sources */,
 				BA2F20C51EB97A9A2EA35674 /* SharedClientPreviewOpener.swift in Sources */,
 				4E93831717B567BEBE15595F /* SigningGate.swift in Sources */,
+				8A6FFBB0B2F8EF1B311DD1B3 /* VoiceCall.swift in Sources */,
+				BF7F4A8BFD07646441CBC2C3 /* VoiceCaptureState.swift in Sources */,
+				DE6062C82CFE63F3867BEC4B /* VoiceCaptureStateTests.swift in Sources */,
+				0D98162CEC30F1D818006E25 /* VoiceCeremony.swift in Sources */,
+				FDA8FF66AE6776BACE0F6391 /* VoiceCeremonyTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -491,6 +571,9 @@
 				FF58E75D4698A18147FFD948 /* ShareSurface.swift in Sources */,
 				2649DEFDEEC785F1D317F0E7 /* SharedClientPreviewOpener.swift in Sources */,
 				261806B6F7A3AFFD7D57B70C /* SigningGate.swift in Sources */,
+				7F6324AEB51F8C80D5C597E8 /* VoiceCall.swift in Sources */,
+				CCEAD023F0BB224C5E3793BF /* VoiceCaptureState.swift in Sources */,
+				5A7CC9F06D58FF0A7A9952AC /* VoiceCeremony.swift in Sources */,
 				162D159780A61679A7269833 /* main.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -548,7 +631,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.companion;
-				PRODUCT_NAME = "KalaReach";
+				PRODUCT_NAME = KalaReach;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
@@ -596,7 +679,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.companion;
-				PRODUCT_NAME = "KalaReach";
+				PRODUCT_NAME = KalaReach;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
@@ -797,6 +880,30 @@
 			defaultConfigurationName = debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		4FC1E0748421EFBBDABA2621 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stasel/WebRTC";
+			requirement = {
+				kind = revision;
+				revision = 4266157cd08f92115de885ab12d87196a8db87e1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		1D6186CC73C61118431242D5 /* WebRTC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4FC1E0748421EFBBDABA2621 /* XCRemoteSwiftPackageReference "WebRTC" */;
+			productName = WebRTC;
+		};
+		AEC884C5D046E9A2F1550FC0 /* WebRTC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4FC1E0748421EFBBDABA2621 /* XCRemoteSwiftPackageReference "WebRTC" */;
+			productName = WebRTC;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 417D28560F7FCD23FD378F68 /* Project object */;
 }

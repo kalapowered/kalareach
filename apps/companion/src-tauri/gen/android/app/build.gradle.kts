@@ -1,3 +1,4 @@
+import java.security.MessageDigest
 import java.util.Properties
 
 plugins {
@@ -92,7 +93,7 @@ dependencies {
     implementation("io.github.webrtc-sdk:android") { version { strictly("150.7871.01") } }
     // The device-owner ceremony an unlocked-screen confirmation needs, with the device-credential
     // fallback for a device that has no biometric enrolled.
-    implementation("androidx.biometric:biometric:1.4.0")
+    implementation("androidx.biometric:biometric:1.2.0-alpha05")
     // Push, and the scheduler that runs what a message callback cannot finish in its budget.
     implementation("com.google.firebase:firebase-messaging:24.1.2")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
@@ -120,32 +121,26 @@ dependencies {
  */
 val voiceMediaSha256 = "0a1627b1a48c2bc17d9a40d62fc47bd45166f44a311e95917f147c402de379b0"
 
-val verifyVoiceMedia by tasks.registering {
-    description = "Checks the native media library's bytes against the digest this build pins."
-    doLast {
-        val artefact = configurations.getByName("debugRuntimeClasspath")
-            .resolvedConfiguration
-            .resolvedArtifacts
-            .firstOrNull {
-                it.moduleVersion.id.group == "io.github.webrtc-sdk" &&
-                    it.moduleVersion.id.name == "android"
+afterEvaluate {
+    val verifyVoiceMedia by tasks.registering {
+        description = "Checks the native media library's bytes against the digest this build pins."
+        doLast {
+            val detached = configurations.detachedConfiguration(
+                dependencies.create("io.github.webrtc-sdk:android:150.7871.01")
+            )
+            val file = detached.singleFile
+            val digestBytes = MessageDigest.getInstance("SHA-256").digest(file.readBytes())
+            val digest = digestBytes.joinToString("") { b -> "%02x".format(b) }
+            if (digest != voiceMediaSha256) {
+                throw GradleException(
+                    "the native media library's bytes are not the ones this build pins: expected " +
+                        "$voiceMediaSha256, found $digest"
+                )
             }
-            ?: throw GradleException(
-                "the native media library io.github.webrtc-sdk:android was not resolved, so its " +
-                    "bytes could not be checked"
-            )
-        val digest = java.security.MessageDigest.getInstance("SHA-256")
-            .digest(artefact.file.readBytes())
-            .joinToString("") { "%02x".format(it) }
-        if (digest != voiceMediaSha256) {
-            throw GradleException(
-                "the native media library's bytes are not the ones this build pins: expected " +
-                    "$voiceMediaSha256, found $digest"
-            )
         }
     }
-}
 
-tasks.named("preBuild") { dependsOn(verifyVoiceMedia) }
+    tasks.named("preBuild") { dependsOn(verifyVoiceMedia) }
+}
 
 apply(from = "tauri.build.gradle.kts")

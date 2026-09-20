@@ -27,12 +27,13 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Take a photo to attach it to a session on one of your hosts.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Speak to a session on one of your hosts.</string>
+	<string>Speak to a session on one of your hosts. The microphone is open only during a call you started, and keeps running if the screen locks during that call.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo or a video to attach it to a session on one of your hosts.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
+		<string>audio</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
