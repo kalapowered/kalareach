@@ -3107,3 +3107,98 @@ fn climbing_more_than_max_climb_hops_to_root_refuses_the_capture() {
         "the refusal names the climb limit: {said}"
     );
 }
+
+/// KR-REQ-23.44: the authority a mutation arrived under is decided inside the transaction that
+/// commits its **effect**, not once at the claim.
+///
+/// A capture reads a whole working tree between the two, and a revocation that lands during that
+/// read has to stop it. Here the claim is taken under an authority that holds, the authority is
+/// then withdrawn, and the capture that follows records no change set and no version.
+#[test]
+fn an_authority_withdrawn_after_the_claim_records_no_version() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "withdrawn");
+    write(&path, "README.md", "changed after the commit\n");
+    let workspace = fixture.workspace("withdrawn");
+
+    // One version, so there is a change set for the refused capture to be appended to and the
+    // count below says exactly what the refusal left behind.
+    let first = fixture.capture(workspace, &include_everything());
+    let change_set_id = first.change_set_id;
+
+    let authority = support::Authority::held();
+    support::claim(fixture.service(), "changeset.capture", &authority);
+    assert_eq!(authority.asked(), 1, "the claim asked once");
+    authority.withdraw();
+
+    let refusal = fixture
+        .capture_admitted(workspace, Some(change_set_id), &authority)
+        .expect_err("a capture whose authority has gone is refused");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refusal.to_string().contains("has been withdrawn"),
+        "the daemon's own sentence reaches the caller: {refusal}"
+    );
+    assert!(
+        authority.asked() > 1,
+        "the effect asked for itself rather than relying on the claim's answer"
+    );
+    let versions = fixture
+        .service()
+        .versions(change_set_id)
+        .expect("the change set reads");
+    assert_eq!(
+        versions.len(),
+        1,
+        "the refused capture appended nothing: only the version that was captured under \
+         authority that held is there"
+    );
+    assert_eq!(versions[0].version, first.version);
+
+    // And with the authority in force again, a capture of the same workspace succeeds: what the
+    // refusal stopped was this mutation, not the change set.
+    let held = support::Authority::held();
+    let second = fixture
+        .capture_admitted(workspace, Some(change_set_id), &held)
+        .expect("a capture under authority that holds");
+    assert!(
+        second.version.get() > first.version.get(),
+        "the version that follows comes after the one that was recorded"
+    );
+}
+
+/// KR-REQ-23.44: the same rule for a capture that would start a **new** change set.
+///
+/// The change set is the first row such a capture writes, so the authority is asked there too: a
+/// refusal leaves no empty change set for a reader to find.
+#[test]
+fn an_authority_withdrawn_before_a_new_change_set_leaves_none_behind() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "empty-set");
+    let workspace = fixture.workspace("empty-set");
+
+    let authority = support::Authority::held();
+    support::claim(fixture.service(), "changeset.capture", &authority);
+    authority.withdraw();
+
+    let refusal = fixture
+        .capture_admitted(workspace, None, &authority)
+        .expect_err("a capture whose authority has gone is refused");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+
+    // A capture under authority that holds makes the first change set this workspace has, and its
+    // first version is version one: nothing of the refused attempt is there to append to.
+    let held = support::Authority::held();
+    let made = fixture
+        .capture_admitted(workspace, None, &held)
+        .expect("a capture under authority that holds");
+    assert_eq!(made.version.get(), 1);
+    assert_eq!(
+        fixture
+            .service()
+            .versions(made.change_set_id)
+            .expect("the change set reads")
+            .len(),
+        1
+    );
+}

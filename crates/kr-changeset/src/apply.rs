@@ -110,6 +110,11 @@ pub struct ApplyOrder<'a> {
     /// A request with none is one nothing arbitrates, which is what a direct in-process caller
     /// and every test are.
     pub claim: Option<&'a dyn ActionClaim>,
+    /// The authority this apply arrived under, asked again inside the transactions that record
+    /// it: the readings of the destination it takes, and the journal that opens the apply.
+    ///
+    /// A request with none is one nothing arbitrates, as with the claim above.
+    pub admitted: Option<&'a dyn crate::store::StillAdmitted>,
 }
 
 /// What a test runs immediately before one path's rename, named by that path.
@@ -744,6 +749,7 @@ fn proposal(
          applied, recorded rather than written. Its content is what this host read from the \
          destination one file at a time, with this change's own content put over it"
             .to_owned(),
+        order.admitted,
     )?;
     let now = kr_ipc::now_ms();
     let reference = VersionRef {
@@ -770,6 +776,7 @@ fn proposal(
         // so a recovered answer names them rather than describing a proposal that carried
         // everything.
         &unresolved,
+        order.admitted,
     )?;
     for path in &unresolved {
         service.locked()?.settle_path(
@@ -991,6 +998,7 @@ fn direct(
             decided_at_ms: None,
         },
         &planned,
+        order.admitted,
     )?;
     // Staged and validated: every byte is written into a private directory of this host's own and
     // read back against its digest, so a recoverable copy of what this apply meant to install
@@ -2358,6 +2366,7 @@ fn capture_destination(
             ),
             ..order.provenance.clone()
         },
+        admitted: order.admitted,
     };
     let (record, _) = service.capture(&captured)?;
     Ok(record)
@@ -3186,6 +3195,7 @@ mod tests {
             revert: false,
             provenance,
             claim: None,
+            admitted: None,
         };
         let result = clean_preflight(&order, &limitations(DestinationClass::SharedExisting));
         assert_eq!(result.outcome, Nullable(None));

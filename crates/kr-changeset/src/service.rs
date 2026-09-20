@@ -86,7 +86,7 @@ pub struct ResolvedWorkspace {
 }
 
 /// What one capture is asked for.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CaptureOrder<'a> {
     /// The workspace to capture.
     pub workspace_id: WorkspaceId,
@@ -100,6 +100,28 @@ pub struct CaptureOrder<'a> {
     pub pin: bool,
     /// Where it came from.
     pub provenance: Provenance,
+    /// The authority this capture arrived under, asked again inside the transactions that record
+    /// it.
+    ///
+    /// A capture reads a whole working tree between the claim and the version it writes, and
+    /// authority can run out inside that read. A request with none is one nothing arbitrates,
+    /// which is what a direct in-process caller and every test are.
+    pub admitted: Option<&'a dyn crate::store::StillAdmitted>,
+}
+
+impl std::fmt::Debug for CaptureOrder<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureOrder")
+            .field("workspace_id", &self.workspace_id)
+            .field("change_set_id", &self.change_set_id)
+            .field("label", &self.label)
+            .field("request", &self.request)
+            .field("pin", &self.pin)
+            .field("provenance", &self.provenance)
+            .field("admitted", &self.admitted.is_some())
+            .finish()
+    }
 }
 
 /// What one recovery resolved.
@@ -416,7 +438,7 @@ impl ChangeSetService {
         )?;
         let now = kr_ipc::now_ms();
         let (change_set_id, label) = {
-            let store = self.locked()?;
+            let mut store = self.locked()?;
             match order.change_set_id {
                 Some(existing) => {
                     let row = store.change_set(existing)?.ok_or_else(|| {
@@ -435,14 +457,17 @@ impl ChangeSetService {
                 }
                 None => {
                     let fresh = ChangeSetId::new(kr_ipc::new_uuid());
-                    store.insert_change_set(&ChangeSetRow {
-                        change_set_id: fresh,
-                        environment_id: self.environment_id,
-                        project_repository_id: resolved.project_repository_id,
-                        workspace_id: order.workspace_id,
-                        label: order.label.to_owned(),
-                        created_at_ms: now,
-                    })?;
+                    store.insert_change_set(
+                        &ChangeSetRow {
+                            change_set_id: fresh,
+                            environment_id: self.environment_id,
+                            project_repository_id: resolved.project_repository_id,
+                            workspace_id: order.workspace_id,
+                            label: order.label.to_owned(),
+                            created_at_ms: now,
+                        },
+                        order.admitted,
+                    )?;
                     (fresh, order.label.to_owned())
                 }
             }
@@ -519,11 +544,16 @@ impl ChangeSetService {
                 captured_at_ms: now,
             },
             &captured.objects,
+            order.admitted,
         )?;
         let mut pinned = false;
         if order.pin {
             // The pin goes through the project service, so a workspace removal accounts for it
-            // exactly as it accounts for dirty content and review evidence.
+            // exactly as it accounts for dirty content and review evidence. It is the one write
+            // of a capture whose transaction is not this store's, so the authority this capture
+            // carries cannot be asked inside it; it follows a version that is already committed,
+            // and a version left unpinned by a late refusal would be a worse half-effect than the
+            // pin. The project store's own half of the admission rule is its service's.
             self.project.retain(
                 order.workspace_id,
                 &RetainedRow {
@@ -748,6 +778,7 @@ impl ChangeSetService {
         provenance: Provenance,
         consistency: SourceConsistency,
         consistency_detail: String,
+        admitted: Option<&dyn crate::store::StillAdmitted>,
     ) -> Result<ChangeSetVersionRecord> {
         let now = kr_ipc::now_ms();
         // From the same counter a capture takes its number from, so a derived version never
@@ -831,6 +862,7 @@ impl ChangeSetService {
                 captured_at_ms: now,
             },
             &objects,
+            admitted,
         )?;
         Ok(record)
     }

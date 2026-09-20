@@ -174,10 +174,17 @@ pub struct ApplyRow {
 /// Whether the authority one mutation arrived under is still in force.
 ///
 /// The daemon owns the answer and this store asks for it **inside the transaction that commits
-/// the effect**. Everything between a request being admitted and its effect can wait: a task to
-/// be scheduled, a blocking thread, this store's own lock. Authority that ran out in that
-/// interval must leave nothing behind, so a refusal here rolls the transaction back and there is
-/// no claim row and no state for a later attempt to find.
+/// the effect**, not once on the way in. Everything between a request being admitted and its
+/// effect can wait: a task to be scheduled, a blocking thread, this store's own lock, and — for a
+/// capture — a whole working tree being read. Authority that ran out in any of those intervals
+/// must leave nothing behind, so a refusal rolls its transaction back.
+///
+/// Every transaction that commits an effect of this service asks: the claim
+/// ([`Store::claim_action`]), a new change set and its version ([`Store::insert_change_set`],
+/// [`Store::insert_version`]), a materialisation ([`Store::insert_materialisation`]), an apply's
+/// journal ([`Store::begin_apply`]) and a deletion ([`Store::delete_version_if_unheld`]). A claim
+/// taken under authority that has since gone therefore carries nothing through to an effect: each
+/// effect decides again, inside itself.
 pub trait StillAdmitted: Send + Sync {
     /// Returns the refusal the daemon decided, when the authority this mutation arrived under has
     /// gone.
@@ -469,11 +476,28 @@ impl Store {
 
     /// Records a new change set.
     ///
+    /// `admitted` is the authority the mutation arrived under, asked inside this transaction.
+    ///
     /// # Errors
     ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn insert_change_set(&self, row: &ChangeSetRow) -> Result<()> {
-        self.connection
+    /// Returns whatever `admitted` answers a withdrawn authority with, and
+    /// [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn insert_change_set(
+        &mut self,
+        row: &ChangeSetRow,
+        admitted: Option<&dyn StillAdmitted>,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(ChangeSetError::store)?;
+        // The first row a capture of a new change set writes, so the authority is asked here as
+        // well as at the version below: a capture whose authority ran out during its read of the
+        // working tree leaves no change set behind either.
+        if let Some(admitted) = admitted {
+            admitted.check()?;
+        }
+        transaction
             .execute(
                 "INSERT INTO change_sets
                    (change_set_id, environment_id, project_repository_id, workspace_id, label,
@@ -489,7 +513,7 @@ impl Store {
                 ],
             )
             .map_err(ChangeSetError::store)?;
-        Ok(())
+        transaction.commit().map_err(ChangeSetError::store)
     }
 
     /// Returns one change set.
@@ -525,12 +549,24 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn insert_version(&mut self, row: &VersionRow, objects: &[Digest256]) -> Result<()> {
+    /// Returns whatever `admitted` answers a withdrawn authority with, and
+    /// [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn insert_version(
+        &mut self,
+        row: &VersionRow,
+        objects: &[Digest256],
+        admitted: Option<&dyn StillAdmitted>,
+    ) -> Result<()> {
         let transaction = self
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        // The version **is** a capture's effect, and everything between the claim and this point
+        // reads a whole working tree. The authority is asked here, inside the transaction that
+        // commits the version, so a capture whose authority ran out while it read records nothing.
+        if let Some(admitted) = admitted {
+            admitted.check()?;
+        }
         // A version that is derived from another names it, and a version whose parent is gone
         // cannot say where it came from. The parent is required inside this transaction, so a
         // deletion that ran while this one was being built refuses it rather than leaving a
@@ -903,12 +939,23 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn insert_materialisation(&mut self, row: &MaterialisationRow) -> Result<()> {
+    /// Returns whatever `admitted` answers a withdrawn authority with, and
+    /// [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn insert_materialisation(
+        &mut self,
+        row: &MaterialisationRow,
+        admitted: Option<&dyn StillAdmitted>,
+    ) -> Result<()> {
         let transaction = self
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        // Not one byte of a materialisation is written until this row is in, so this transaction
+        // is where a materialisation's authority is decided: a request whose authority ran out
+        // while it waited for this lock writes no row and therefore no directory content.
+        if let Some(admitted) = admitted {
+            admitted.check()?;
+        }
         Self::require_version(&transaction, row.change_set_id, row.version)?;
         transaction
             .execute(
@@ -1623,14 +1670,30 @@ impl Store {
 
     /// Begins one apply, before anything is written anywhere.
     ///
+    /// This row is the apply's fence. It commits under the authority the request arrived under,
+    /// and every later write of that apply — a staged temporary, a path's outcome, the
+    /// settlement — belongs to the journal this row opens rather than to a fresh decision. An
+    /// apply that stopped half way because authority lapsed between two of its paths would leave
+    /// a working tree neither as it was nor as the request asked for, which is the state §14's
+    /// outcome classes exist to avoid; what a withdrawal stops is an apply that has not begun.
+    ///
     /// # Errors
     ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn begin_apply(&mut self, row: &ApplyRow, planned: &[String]) -> Result<()> {
+    /// Returns whatever `admitted` answers a withdrawn authority with, and
+    /// [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn begin_apply(
+        &mut self,
+        row: &ApplyRow,
+        planned: &[String],
+        admitted: Option<&dyn StillAdmitted>,
+    ) -> Result<()> {
         let transaction = self
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        if let Some(admitted) = admitted {
+            admitted.check()?;
+        }
         // Every version this apply names is required inside the transaction that records it, so a
         // deletion cannot take away the change set an apply carries or the reading it would
         // recover from.
@@ -2225,17 +2288,20 @@ mod tests {
         Store::in_memory(EnvironmentId::new(kr_ipc::new_uuid())).expect("an in-memory store")
     }
 
-    fn change_set(store: &Store) -> ChangeSetId {
+    fn change_set(store: &mut Store) -> ChangeSetId {
         let change_set_id = ChangeSetId::new(kr_ipc::new_uuid());
         store
-            .insert_change_set(&ChangeSetRow {
-                change_set_id,
-                environment_id: store.environment_id(),
-                project_repository_id: ProjectRepositoryId::new(kr_ipc::new_uuid()),
-                workspace_id: WorkspaceId::new(kr_ipc::new_uuid()),
-                label: "a change set".to_owned(),
-                created_at_ms: TimestampMs::new(1),
-            })
+            .insert_change_set(
+                &ChangeSetRow {
+                    change_set_id,
+                    environment_id: store.environment_id(),
+                    project_repository_id: ProjectRepositoryId::new(kr_ipc::new_uuid()),
+                    workspace_id: WorkspaceId::new(kr_ipc::new_uuid()),
+                    label: "a change set".to_owned(),
+                    created_at_ms: TimestampMs::new(1),
+                },
+                None,
+            )
             .expect("the change set is recorded");
         change_set_id
     }
@@ -2357,9 +2423,9 @@ mod tests {
         // the removal are one transaction, so a deletion cannot commit under authority that ran
         // out while it waited for this lock.
         let mut store = store();
-        let change_set_id = change_set(&store);
+        let change_set_id = change_set(&mut store);
         store
-            .insert_version(&version_row(change_set_id, 1), &[])
+            .insert_version(&version_row(change_set_id, 1), &[], None)
             .expect("the version is recorded");
         let authority = Authority::new(true);
         authority.withdraw();
@@ -2378,19 +2444,124 @@ mod tests {
     }
 
     #[test]
+    fn every_transaction_that_commits_an_effect_decides_its_own_authority() {
+        // KR-REQ-23.44: a claim taken under authority that held carries nothing forward. Each of
+        // these transactions asks for itself, so a withdrawal between the claim and the effect
+        // stops the effect and leaves the store exactly as it was.
+        let mut store = store();
+        let change_set_id = change_set(&mut store);
+        store
+            .insert_version(&version_row(change_set_id, 1), &[], None)
+            .expect("the version the effects below name");
+        let authority = Authority::new(true);
+        authority.withdraw();
+
+        let fresh = ChangeSetId::new(kr_ipc::new_uuid());
+        let refusal = store
+            .insert_change_set(
+                &ChangeSetRow {
+                    change_set_id: fresh,
+                    environment_id: store.environment_id(),
+                    project_repository_id: ProjectRepositoryId::new(kr_ipc::new_uuid()),
+                    workspace_id: WorkspaceId::new(kr_ipc::new_uuid()),
+                    label: "a change set nothing admits".to_owned(),
+                    created_at_ms: TimestampMs::new(2),
+                },
+                Some(&authority),
+            )
+            .expect_err("a change set nothing admits is refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(
+            store.change_set(fresh).expect("the read runs").is_none(),
+            "no change set was committed"
+        );
+
+        let refusal = store
+            .insert_version(&version_row(change_set_id, 2), &[], Some(&authority))
+            .expect_err("a version nothing admits is refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            store.versions(change_set_id).expect("the read runs").len(),
+            1,
+            "the version that was recorded under authority that held is the only one"
+        );
+
+        let refusal = store
+            .insert_materialisation(
+                &MaterialisationRow {
+                    materialisation_id: MaterialisationId::new(kr_ipc::new_uuid()),
+                    change_set_id,
+                    version: ChangeSetVersion::new(1),
+                    purpose: MaterialisationPurpose::Test,
+                    record: vec![7],
+                    directory_name: "m-nothing-admits".to_owned(),
+                    identity: kr_transfer::ObjectIdentity {
+                        device: 1,
+                        file_id: 2,
+                    },
+                    created_at_ms: TimestampMs::new(3),
+                    released_at_ms: None,
+                },
+                Some(&authority),
+            )
+            .expect_err("a materialisation nothing admits is refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(
+            store
+                .materialisations(change_set_id, ChangeSetVersion::new(1), true)
+                .expect("the read runs")
+                .is_empty(),
+            "no materialisation row was committed, so nothing accounts for a directory"
+        );
+
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        let refusal = store
+            .begin_apply(
+                &ApplyRow {
+                    action_id,
+                    change_set_id,
+                    version: ChangeSetVersion::new(1),
+                    workspace_id: None,
+                    destination: DestinationClass::SharedExisting,
+                    outcome: None,
+                    before_version: None,
+                    after_version: None,
+                    staged_name: Some("apply-nothing-admits".to_owned()),
+                    detail: "beginning".to_owned(),
+                    started_at_ms: TimestampMs::new(4),
+                    decided_at_ms: None,
+                },
+                &["a.txt".to_owned()],
+                Some(&authority),
+            )
+            .expect_err("an apply nothing admits is refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(
+            store.apply(action_id).expect("the read runs").is_none(),
+            "no journal was opened, so recovery has nothing of this apply to find"
+        );
+        assert!(store.progress(action_id).expect("the read runs").is_empty());
+        assert_eq!(
+            authority.asked(),
+            4,
+            "each effect asked for itself rather than sharing one answer"
+        );
+    }
+
+    #[test]
     fn versions_append_and_an_earlier_one_stays_exactly_as_it_was() {
         // Section 14: new edits produce a different version; they do not mutate the subject of an
         // earlier test or review. There is no statement in this module that updates a version.
         let mut store = store();
-        let change_set_id = change_set(&store);
+        let change_set_id = change_set(&mut store);
         assert_eq!(store.latest_version(change_set_id).expect("a read"), None);
         let first = version_row(change_set_id, 1);
         store
-            .insert_version(&first, &[first.content_digest])
+            .insert_version(&first, &[first.content_digest], None)
             .expect("the first version");
         let second = version_row(change_set_id, 2);
         store
-            .insert_version(&second, &[second.content_digest])
+            .insert_version(&second, &[second.content_digest], None)
             .expect("the second version");
         assert_eq!(
             store.latest_version(change_set_id).expect("a read"),
@@ -2407,13 +2578,13 @@ mod tests {
     #[test]
     fn a_version_number_cannot_be_written_twice() {
         let mut store = store();
-        let change_set_id = change_set(&store);
+        let change_set_id = change_set(&mut store);
         let row = version_row(change_set_id, 1);
         store
-            .insert_version(&row, &[])
+            .insert_version(&row, &[], None)
             .expect("the first write succeeds");
         assert!(
-            store.insert_version(&row, &[]).is_err(),
+            store.insert_version(&row, &[], None).is_err(),
             "a second write of the same version is refused by the key"
         );
     }
@@ -2424,9 +2595,9 @@ mod tests {
         // so a daemon that dies between the two leaves `planned`.
         let mut store = store();
         let action_id = ActionId::new(kr_ipc::new_uuid());
-        let change_set_id = change_set(&store);
+        let change_set_id = change_set(&mut store);
         let row = version_row(change_set_id, 1);
-        store.insert_version(&row, &[]).expect("a version");
+        store.insert_version(&row, &[], None).expect("a version");
         store
             .begin_apply(
                 &ApplyRow {
@@ -2444,6 +2615,7 @@ mod tests {
                     decided_at_ms: None,
                 },
                 &["a.txt".to_owned(), "b.txt".to_owned()],
+                None,
             )
             .expect("the apply begins with its whole plan");
         let progress = store.progress(action_id).expect("a read");
@@ -2495,25 +2667,28 @@ mod tests {
         // Retention has to account for every materialisation before a version is deleted, so the
         // materialisation and the evidence reference that names it commit together.
         let mut store = store();
-        let change_set_id = change_set(&store);
+        let change_set_id = change_set(&mut store);
         let row = version_row(change_set_id, 1);
-        store.insert_version(&row, &[]).expect("a version");
+        store.insert_version(&row, &[], None).expect("a version");
         let materialisation_id = MaterialisationId::new(kr_ipc::new_uuid());
         store
-            .insert_materialisation(&MaterialisationRow {
-                materialisation_id,
-                change_set_id,
-                version: ChangeSetVersion::new(1),
-                purpose: MaterialisationPurpose::Test,
-                record: vec![7],
-                directory_name: "m-1".to_owned(),
-                identity: kr_transfer::ObjectIdentity {
-                    device: 1,
-                    file_id: 2,
+            .insert_materialisation(
+                &MaterialisationRow {
+                    materialisation_id,
+                    change_set_id,
+                    version: ChangeSetVersion::new(1),
+                    purpose: MaterialisationPurpose::Test,
+                    record: vec![7],
+                    directory_name: "m-1".to_owned(),
+                    identity: kr_transfer::ObjectIdentity {
+                        device: 1,
+                        file_id: 2,
+                    },
+                    created_at_ms: TimestampMs::new(11),
+                    released_at_ms: None,
                 },
-                created_at_ms: TimestampMs::new(11),
-                released_at_ms: None,
-            })
+                None,
+            )
             .expect("a materialisation");
         let evidence = store
             .evidence(change_set_id, ChangeSetVersion::new(1))

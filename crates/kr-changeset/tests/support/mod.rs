@@ -226,6 +226,7 @@ impl Fixture {
             },
             pin: false,
             provenance: provenance(),
+            admitted: None,
         };
         self.changesets.capture(&order).map(|(record, _)| record)
     }
@@ -276,9 +277,104 @@ impl Fixture {
             },
             pin: false,
             provenance: provenance(),
+            admitted: None,
         };
         self.changesets.capture(&order).map(|(record, _)| record)
     }
+
+    /// Captures one version under an admission the daemon can withdraw while it runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the capture returns.
+    pub fn capture_admitted(
+        &self,
+        workspace_id: WorkspaceId,
+        change_set_id: Option<kr_protocol::ids::ChangeSetId>,
+        admitted: &dyn kr_changeset::store::StillAdmitted,
+    ) -> kr_changeset::Result<ChangeSetVersionRecord> {
+        let policy = include_everything();
+        let grant = FileGrant::default();
+        let order = CaptureOrder {
+            workspace_id,
+            change_set_id,
+            label: "the work",
+            request: CaptureRequest {
+                policy: &policy,
+                grant: &grant,
+                quiescence_declared: false,
+                required_consistency: None,
+                quiescence: None,
+            },
+            pin: false,
+            provenance: provenance(),
+            admitted: Some(admitted),
+        };
+        self.changesets.capture(&order).map(|(record, _)| record)
+    }
+}
+
+/// An authority a test takes away between one call and the next.
+///
+/// It stands for what the daemon answers when the registration a mutation arrived under is
+/// withdrawn, or its window passes, while the mutation is being served. The count is what a test
+/// uses to show that the claim and the effect ask **separately**: a claim that carried its answer
+/// forward would leave the count at one.
+#[derive(Debug, Default)]
+pub struct Authority {
+    withdrawn: std::sync::atomic::AtomicBool,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl Authority {
+    /// An authority that is in force.
+    #[must_use]
+    pub fn held() -> Self {
+        Self::default()
+    }
+
+    /// Takes the authority away, as a revocation does.
+    pub fn withdraw(&self) {
+        self.withdrawn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many times it has been asked.
+    #[must_use]
+    pub fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl kr_changeset::store::StillAdmitted for Authority {
+    fn check(&self) -> kr_changeset::Result<()> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.withdrawn.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(kr_changeset::ChangeSetError::NotAdmitted {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "the authority this action was admitted under has been withdrawn".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Takes the durable claim one action is performed under, as the daemon does before the effect.
+///
+/// # Panics
+///
+/// Panics when the claim cannot be taken.
+pub fn claim(service: &ChangeSetService, method: &str, authority: &Authority) {
+    let claimed = service
+        .claim_action(
+            &actor(),
+            kr_ipc::new_uuid(),
+            method,
+            kr_changeset::objects::digest_of(method.as_bytes()),
+            Some(authority),
+        )
+        .expect("the claim is taken");
+    assert!(claimed, "this copy of the action holds the claim");
 }
 
 /// The order one apply is performed under, with everything a test usually leaves alone.
@@ -307,6 +403,7 @@ pub fn apply_order<'a>(
         revert: false,
         provenance: provenance(),
         claim: None,
+        admitted: None,
     }
 }
 

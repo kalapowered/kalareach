@@ -2316,3 +2316,67 @@ fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
         settled.detail
     );
 }
+
+/// KR-REQ-23.44: an apply's authority is decided inside the transaction that opens its journal,
+/// which is the row every write of that apply follows.
+///
+/// The claim is taken under an authority that holds, the authority is then withdrawn, and the
+/// apply that follows opens no journal and writes nothing into the destination's working tree.
+#[test]
+fn an_authority_withdrawn_after_the_claim_opens_no_apply() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "source-tree");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("source-tree");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "destination-tree");
+    let before = support::read_bytes(&destination, "README.md");
+    let workspace = fixture.workspace("destination-tree");
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+
+    let authority = support::Authority::held();
+    support::claim(fixture.service(), "diff.apply", &authority);
+    assert_eq!(authority.asked(), 1, "the claim asked once");
+    authority.withdraw();
+
+    let order = ApplyOrder {
+        admitted: Some(&authority),
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &limitations,
+        )
+    };
+    let action = order.action_id;
+    let refusal =
+        apply::apply(fixture.service(), &order).expect_err("an apply whose authority has gone");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        authority.asked() > 1,
+        "the effect asked for itself rather than relying on the claim's answer"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        before,
+        "the destination's own file is exactly as it was"
+    );
+    // And no journal was opened, so there is no apply for a reader or a recovery to find.
+    let read = apply::read_apply(fixture.service(), action);
+    assert!(
+        read.is_err(),
+        "an apply that never began is not one this host can report on"
+    );
+    assert!(
+        fixture
+            .service()
+            .recover_before_serving()
+            .expect("recovery runs")
+            .applies_settled
+            == 0,
+        "there is no undecided apply to settle"
+    );
+}

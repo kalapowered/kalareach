@@ -55,10 +55,13 @@ pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
 /// The daemon's answer to "is this mutation still admitted?", as the change-set store asks it.
 ///
-/// The store asks inside the transaction that commits the claim every effect of this service
-/// follows, and inside the one that deletes a version. Everything between the envelope check and
-/// that transaction can wait — a task to be scheduled, a blocking thread, the journal's lock —
-/// and a mutation whose authority ran out in that interval must leave nothing behind.
+/// The store asks inside **every** transaction that commits an effect of this service: the claim,
+/// the change set and version a capture records, the row a materialisation is written under, the
+/// journal an apply opens, and the deletion of a version. Everything between the envelope check
+/// and those transactions can wait — a task to be scheduled, a blocking thread, the journal's
+/// lock, a whole working tree being read — and a mutation whose authority ran out in any of those
+/// intervals must leave nothing behind. A claim taken earlier carries no authority forward: each
+/// effect asks again, inside itself.
 struct Admission<A>(A);
 
 impl<A> kr_changeset::store::StillAdmitted for Admission<A>
@@ -320,6 +323,12 @@ impl ChangeSetModule {
             // that commits the claim. A first admission that has lost its authority while it
             // waited leaves no claim row, so the next attempt finds nothing rather than a claim
             // nobody can settle. A retry never reaches here: the record above answered it.
+            //
+            // **The claim does not carry authority forward.** The same answer travels on into the
+            // effect itself, which asks it again inside its own transaction: the version a
+            // capture records after reading a whole working tree, the row a materialisation is
+            // written under, the journal an apply opens. So authority that ran out between the
+            // claim and the effect stops the effect rather than being taken as settled.
             let admitted = Admission(admission);
             let deferred = DeferredClaim::new(&service, &actor, action_id, name, digest, &admitted);
             if !matches!(method, Method::DiffApply | Method::DiffRevert)
@@ -336,10 +345,10 @@ impl ChangeSetModule {
             let outcome = (|| -> Answer<ParamsValue> {
                 match method {
                     Method::ChangesetCapture => {
-                        encode(&capture(&service, &actor, &typed(&params)?)?)
+                        encode(&capture(&service, &actor, &typed(&params)?, &admitted)?)
                     }
                     Method::ChangesetMaterialize => {
-                        encode(&materialise_version(&service, &typed(&params)?)?)
+                        encode(&materialise_version(&service, &typed(&params)?, &admitted)?)
                     }
                     Method::DiffApply | Method::DiffRevert => encode(&run_apply(
                         &service,
@@ -348,6 +357,7 @@ impl ChangeSetModule {
                         &typed(&params)?,
                         method == Method::DiffRevert,
                         Some(&deferred),
+                        &admitted,
                     )?),
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,
@@ -443,6 +453,7 @@ fn capture(
     service: &ChangeSetService,
     actor_id: &ActorId,
     params: &ChangesetCaptureParams,
+    admitted: &dyn kr_changeset::store::StillAdmitted,
 ) -> kr_changeset::Result<ChangesetCaptureResult> {
     let order = CaptureOrder {
         workspace_id: params.workspace_id,
@@ -465,6 +476,7 @@ fn capture(
             derivation: String::new(),
             note: params.note.clone(),
         },
+        admitted: Some(admitted),
     };
     let (version, pinned) = service.capture(&order)?;
     Ok(ChangesetCaptureResult { version, pinned })
@@ -474,6 +486,7 @@ fn capture(
 fn materialise_version(
     service: &ChangeSetService,
     params: &ChangesetMaterializeParams,
+    admitted: &dyn kr_changeset::store::StillAdmitted,
 ) -> kr_changeset::Result<ChangesetMaterializeResult> {
     let materialisation = materialise::materialise(
         service,
@@ -483,6 +496,7 @@ fn materialise_version(
         },
         params.purpose,
         &params.label,
+        Some(admitted),
     )?;
     Ok(ChangesetMaterializeResult {
         materialisation,
@@ -590,6 +604,7 @@ fn run_apply(
     params: &DiffApplyParams,
     revert: bool,
     claim: Option<&dyn kr_changeset::apply::ActionClaim>,
+    admitted: &dyn kr_changeset::store::StillAdmitted,
 ) -> kr_changeset::Result<DiffApplyResult> {
     let order = ApplyOrder {
         action_id,
@@ -615,6 +630,7 @@ fn run_apply(
             note: String::new(),
         },
         claim,
+        admitted: Some(admitted),
     };
     apply::apply(service, &order)
 }

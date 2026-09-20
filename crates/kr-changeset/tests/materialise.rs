@@ -70,6 +70,7 @@ fn a_materialisation_is_independent_of_the_tree_it_came_from() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the reviewer's copy",
+        None,
     )
     .expect("the version is materialised");
     let directory = Path::new(&made.directory_path);
@@ -113,6 +114,7 @@ fn a_materialisation_is_independent_of_the_tree_it_came_from() {
         reference(&record),
         MaterialisationPurpose::Review,
         "a second copy",
+        None,
     )
     .expect("a second materialisation");
     assert_ne!(second.materialisation_id, made.materialisation_id);
@@ -141,6 +143,7 @@ fn a_result_about_an_unmodified_materialisation_attests_that_version() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
 
@@ -177,6 +180,7 @@ fn a_changed_materialisation_is_recorded_as_a_derived_version() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
 
@@ -276,6 +280,7 @@ fn a_result_whose_source_cannot_be_established_attests_nothing() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
     // Whatever ran took its own directory away, so what it ran against cannot be established.
@@ -317,6 +322,7 @@ fn a_version_is_not_deleted_while_anything_still_names_it() {
         version,
         MaterialisationPurpose::Review,
         "the reviewer's copy",
+        None,
     )
     .expect("the version is materialised");
     let held = fixture
@@ -417,6 +423,7 @@ fn a_pin_against_the_workspace_holds_the_version() {
         },
         pin: true,
         provenance: support::provenance(),
+        admitted: None,
     };
     let (record, pinned) = fixture
         .service()
@@ -460,6 +467,7 @@ fn a_secret_a_run_left_behind_is_neither_stored_nor_attested() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
     let directory = Path::new(&made.directory_path);
@@ -507,6 +515,7 @@ fn a_link_a_run_added_makes_the_tested_source_indeterminate() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
     std::os::unix::fs::symlink(
@@ -552,6 +561,7 @@ fn a_derived_version_describes_itself_rather_than_its_parent() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
     let directory = Path::new(&made.directory_path);
@@ -633,6 +643,7 @@ fn an_indeterminate_result_still_holds_the_version_it_ran_against() {
         version,
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
     std::fs::remove_dir_all(&made.directory_path).expect("the run removes its copy");
@@ -672,6 +683,7 @@ fn a_release_that_finds_another_directory_removes_nothing() {
         reference(&record),
         MaterialisationPurpose::Test,
         "the test copy",
+        None,
     )
     .expect("the version is materialised");
     let directory = Path::new(&made.directory_path);
@@ -703,4 +715,64 @@ fn a_release_that_finds_another_directory_removes_nothing() {
             .expect("the holders are read")
             .is_empty()
     );
+}
+
+/// KR-REQ-23.44: a materialisation's authority is decided inside the transaction that records it,
+/// which is the row every byte of the directory follows.
+///
+/// The claim is taken under an authority that holds; the authority is then withdrawn; the
+/// materialisation that follows writes no row, no directory and no evidence.
+#[test]
+fn an_authority_withdrawn_after_the_claim_writes_no_materialisation() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "withdrawn");
+    write(&path, "README.md", "changed after the commit\n");
+    let workspace = fixture.workspace("withdrawn");
+    let record = fixture.capture(workspace, &include_everything());
+
+    let authority = support::Authority::held();
+    support::claim(fixture.service(), "changeset.materialize", &authority);
+    assert_eq!(authority.asked(), 1, "the claim asked once");
+    authority.withdraw();
+
+    let refusal = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the copy nothing admits",
+        Some(&authority),
+    )
+    .expect_err("a materialisation whose authority has gone is refused");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        authority.asked() > 1,
+        "the effect asked for itself rather than relying on the claim's answer"
+    );
+    assert!(
+        materialise::every(fixture.service(), record.change_set_id, record.version)
+            .expect("the materialisations read")
+            .is_empty(),
+        "nothing accounts for a directory, because no directory was written"
+    );
+    assert!(
+        fixture
+            .service()
+            .holders(record.change_set_id, record.version)
+            .expect("the holders read")
+            .is_empty(),
+        "and nothing holds the version the refused materialisation named"
+    );
+
+    // Under authority that holds, the same version materialises: what the refusal stopped was the
+    // mutation, not the version.
+    let held = support::Authority::held();
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the copy under authority that holds",
+        Some(&held),
+    )
+    .expect("a materialisation under authority that holds");
+    assert!(Path::new(&made.directory_path).is_dir());
 }

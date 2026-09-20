@@ -66,15 +66,20 @@ pub fn limitations() -> Vec<String> {
 
 /// Writes one exact version into a private directory of this service's own.
 ///
+/// `admitted` is the authority the request arrived under. The row below is where it is asked,
+/// inside the transaction that records the materialisation and before a byte is written.
+///
 /// # Errors
 ///
-/// Returns [`ChangeSetError::UnknownVersion`] when there is no such version, and
+/// Returns whatever `admitted` answers a withdrawn authority with,
+/// [`ChangeSetError::UnknownVersion`] when there is no such version, and
 /// [`ChangeSetError::StorageUnavailable`] when the directory cannot be written.
 pub fn materialise(
     service: &ChangeSetService,
     version: VersionRef,
     purpose: MaterialisationPurpose,
     label: &str,
+    admitted: Option<&dyn crate::store::StillAdmitted>,
 ) -> Result<MaterialisationRecord> {
     let record = service.record(version.change_set_id, Some(version.version))?;
     let manifest = service.manifest(version.change_set_id, version.version)?;
@@ -142,9 +147,8 @@ pub fn materialise(
     // The row goes in **before** a byte is written, and it refuses when the version is no longer
     // there. A directory written first and recorded afterwards is a directory whose version a
     // deletion could take away in between, leaving files nothing accounts for.
-    let recorded = service
-        .locked()?
-        .insert_materialisation(&MaterialisationRow {
+    let recorded = service.locked()?.insert_materialisation(
+        &MaterialisationRow {
             materialisation_id,
             change_set_id: version.change_set_id,
             version: version.version,
@@ -154,7 +158,9 @@ pub fn materialise(
             identity,
             created_at_ms,
             released_at_ms: None,
-        });
+        },
+        admitted,
+    );
     if let Err(error) = recorded {
         // The row is what accounts for this directory. Without one there is nothing to release it
         // later, so the empty directory this host had just made goes now. It holds nothing: not a
@@ -877,6 +883,10 @@ fn derive_from(
          working tree or a commit; it is a record of what that directory held when the result was \
          recorded"
             .to_owned(),
+        // Recording a result is not one of the methods the daemon serves: it is reached from
+        // inside this host, by the code that ran the command, and there is no admitted request
+        // whose authority could be asked for. The method that does reach it carries its own.
+        None,
     )
 }
 
