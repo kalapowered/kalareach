@@ -1889,24 +1889,24 @@ async fn kr_req_11_27_a_claim_is_given_back_when_the_upstream_resolves_underneat
     broker.bind_connection_dispatch(GatewayConnectionId::new(1), dispatch);
 
     // A rich answer and the upstream's own withdrawal, at once.
+    let caller = kr_worker::broker::Caller {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+    };
+    let params = kr_protocol::agent::AgentApprovalRespondParams {
+        target: target(),
+        resource_id,
+        option_id: "allow".to_owned(),
+    };
+    let admitted = broker
+        .admit_approval(&caller, &params, TimestampMs::new(4))
+        .expect("the approval response is admitted and the claim is acquired");
+    let claim = admitted.claim().expect("the admission holds a claim");
+
     let claiming = {
         let broker = Arc::clone(&broker);
-        tokio::spawn(async move {
-            broker
-                .agent_approval_respond(
-                    &kr_worker::broker::Caller {
-                        actor_id: ActorId::new("device-1").expect("valid"),
-                        grant_id: None,
-                    },
-                    &kr_protocol::agent::AgentApprovalRespondParams {
-                        target: target(),
-                        resource_id,
-                        option_id: "allow".to_owned(),
-                    },
-                    TimestampMs::new(4),
-                )
-                .await
-        })
+        let claim = claim.clone();
+        tokio::spawn(async move { broker.release_claim(&claim, TimestampMs::new(5)) })
     };
     let withdrawing = {
         let owner = Arc::clone(&owner);
@@ -1914,7 +1914,7 @@ async fn kr_req_11_27_a_claim_is_given_back_when_the_upstream_resolves_underneat
             owner
                 .from_upstream(
                     br#"{"id":95,"result":{"outcome":"deny"}}"#,
-                    TimestampMs::new(5),
+                    TimestampMs::new(6),
                 )
                 .await
         })
@@ -1952,15 +1952,14 @@ async fn kr_req_11_27_a_claim_is_given_back_when_the_upstream_resolves_underneat
             .is_terminal(),
         "the chain ends where the resource did: {chain:?}"
     );
-    if let Some(position) = chain
+    let position = chain
         .iter()
         .position(|event| event.cause == kr_worker::broker::TransitionCause::RichClaim)
-    {
-        assert!(
-            position + 1 < chain.len(),
-            "a claim is never the last thing that happened to a resource"
-        );
-    }
+        .expect("a claim event was recorded on the resource");
+    assert!(
+        position + 1 < chain.len(),
+        "a claim is never the last thing that happened to a resource"
+    );
 
     upstream_reader.abort();
     served.drained.abort();
@@ -2484,9 +2483,11 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
         EnvironmentId::new(Uuid::from_bytes([4; 16])),
         "agent-user",
     );
-    let driving = tokio::spawn(writes);
+    let (upstream_in_here, _upstream_in_there) = tokio::io::duplex(1024);
+    let (client_in_here, client_in_there) = tokio::io::duplex(1 << 20);
+
     let read_back = Arc::new(std::sync::Mutex::new(String::new()));
-    let reading = {
+    let reading_client_output = {
         let read_back = Arc::clone(&read_back);
         let mut client = client_there;
         tokio::spawn(async move {
@@ -2500,6 +2501,32 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
                     .expect("the record is not poisoned")
                     .push_str(&String::from_utf8_lossy(&chunk[..bytes]));
             }
+        })
+    };
+
+    // Start owner readers for upstream and client.
+    let reading_upstream = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move { owner.serve(upstream_in_here, true).await })
+    };
+    let reading_client = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move { owner.serve(client_in_here, false).await })
+    };
+
+    // Start the supervisor task that drives writes and coordinates teardown.
+    let supervisor = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            let mut writing = tokio::spawn(writes);
+            while !owner.stopping() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            owner.shutdown();
+            tokio::time::timeout(std::time::Duration::from_secs(120), &mut writing)
+                .await
+                .expect("the writers finish rather than waiting for a sentinel nothing will send")
+                .expect("their task is joined");
         })
     };
 
@@ -2524,11 +2551,22 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
     }
     assert_eq!(owner.forwarded_client_requests(), 3);
 
-    // The deadline passes, the connection ends, and the writers finish on their own.
-    tokio::time::timeout(std::time::Duration::from_secs(120), driving)
+    // The supervisor joins the writers when the deadline passes.
+    tokio::time::timeout(std::time::Duration::from_secs(120), supervisor)
         .await
-        .expect("the writers finish rather than waiting for a sentinel nothing will send")
-        .expect("their task is joined");
+        .expect("the supervisor finishes")
+        .expect("the supervisor task is joined");
+
+    // Readers finish once stopped.
+    tokio::time::timeout(std::time::Duration::from_secs(5), reading_upstream)
+        .await
+        .expect("upstream reader terminates")
+        .expect("joined");
+    tokio::time::timeout(std::time::Duration::from_secs(5), reading_client)
+        .await
+        .expect("client reader terminates")
+        .expect("joined");
+
     assert!(
         owner.stopping(),
         "a write that did not finish is a connection this host stops using"
@@ -2538,7 +2576,9 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
         0,
         "every identifier behind the failure is given back"
     );
-    reading.await.expect("the terminal's reader finished");
+    reading_client_output
+        .await
+        .expect("the terminal's reader finished");
     let told = read_back
         .lock()
         .expect("the record is not poisoned")
@@ -2554,6 +2594,7 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
         "and each one is an error rather than an answer: {told}"
     );
     drop(upstream_there);
+    drop(client_in_there);
 }
 
 /// KR-REQ-11.32: an owner nothing holds any longer ends its connection.
@@ -3292,12 +3333,6 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
 /// The connection stays open and the backend this host launched stays live for the whole of this
 /// test. The terminal exits well after any window a teardown could have waited, and the backend is
 /// stopped, because what is watched is the process rather than the socket.
-///
-/// The connection stays open on purpose. With a worker-launched gateway the dedicated backend *is*
-/// the process on the connection, so its socket reaching end of file and its exit are one event:
-/// there is no such thing here as a live dedicated backend whose connection has closed. The other
-/// order, end of file before the exit, is therefore proved in the test above, on a backend this
-/// host did not dedicate, where the process on the connection and the terminal are separate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_it() {
     let directory = private_directory();
@@ -3363,6 +3398,120 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
         .terminal
         .take()
         .expect("this host started a terminal");
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
+        .await
+        .expect("the supervision reports")
+        .expect("its task is joined")
+        .expect("a dedicated backend is stopped");
+    assert!(stopped.asked, "the backend was asked to stop");
+    assert!(stopped.ended, "and this host waited until it had");
+    let _ = launched.child.wait();
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&launched.process),
+            kr_ipc::identity::ProcessState::Ended
+        ),
+        "the backend has gone"
+    );
+    assert!(
+        broker.binding_state(instance()).is_err(),
+        "and the instance the terminal was running ended with it"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-07.67: a dedicated backend that closes its socket (EOF) while remaining alive is stopped
+/// when the terminal subsequently exits.
+///
+/// A process can close its socket and stay alive. When the socket closes, the attachment is
+/// reported as detached, the process continues running, and the terminal supervision continues
+/// watching the terminal until its exit stops the dedicated backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal_exits() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let mut terminal = sleeper();
+    let terminal_pid = terminal.id().expect("the terminal has an identifier");
+    let terminal_identity = kr_ipc::identity::process_start_identity(terminal_pid)
+        .expect("the kernel names the terminal");
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, Some(terminal_identity)),
+    )
+    .expect("the endpoint binds");
+
+    // The backend is launched with `--close-after-hello` so it sends hello, closes its socket,
+    // and stays alive.
+    let mut profile = forwarder_profile();
+    profile.arguments = vec!["--close-after-hello".to_owned()];
+    let intent = broker
+        .prepare_launch(profile, kr_worker::broker::ForegroundMark::idle(4), None)
+        .expect("the launch is prepared");
+    let mut launched = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect("the agent is started");
+    broker
+        .pin_table(instance(), table(), rich())
+        .expect("the installed tables are pinned");
+    bind_component(&broker);
+    record_capabilities(&broker);
+
+    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (client_reads, client_writes) = tokio::io::split(client_here);
+    let mut attached = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        gateway.accept(client_reads, client_writes),
+    )
+    .await
+    .expect("the forwarder reaches the endpoint")
+    .expect("it is authenticated and admitted");
+
+    // The forwarder closes its socket after hello. The connection teardown finishes and reports
+    // Closure::Detached, but the dedicated backend process and terminal are still running.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(20), attached.served())
+        .await
+        .expect("the connection ends")
+        .expect("its task is joined");
+    assert_eq!(
+        ended.closure,
+        kr_worker::broker::Closure::Detached,
+        "a connection closing before terminal exit is detached"
+    );
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&launched.process),
+            kr_ipc::identity::ProcessState::Running
+        ),
+        "the dedicated backend stays alive after closing its socket"
+    );
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(
+                &kr_ipc::identity::process_start_identity(terminal_pid).expect("readable")
+            ),
+            kr_ipc::identity::ProcessState::Running
+        ),
+        "the terminal is still running"
+    );
+
+    let watching = attached
+        .terminal
+        .take()
+        .expect("this host started a terminal");
+
+    // End of file came first and the terminal exit comes now. The supervision is still watching,
+    // so the exit stops the dedicated backend.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    terminal.kill().await.expect("the terminal is ended");
+    let _ = terminal.wait().await;
+
     let stopped = tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
         .await
         .expect("the supervision reports")

@@ -1865,7 +1865,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::Arbitration`] when an answer has already gone for the resource.
-    fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+    pub fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         self.state().release_claim_in(claim, now)
     }
 

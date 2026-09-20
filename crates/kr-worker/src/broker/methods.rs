@@ -500,6 +500,14 @@ impl MutationAdmission {
             .as_ref()
             .is_some_and(|permit| permit.plan.is_some())
     }
+
+    /// Returns the claim held by this admission, where it answers an approval.
+    #[must_use]
+    pub fn claim(&self) -> Option<Claim> {
+        self.held()
+            .as_ref()
+            .and_then(|permit| permit.settlement.clone())
+    }
 }
 
 /// One admitted answer whose bytes are on their way to the upstream.

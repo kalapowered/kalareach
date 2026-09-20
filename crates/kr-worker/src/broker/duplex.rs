@@ -2371,9 +2371,9 @@ mod tests {
 
     /// Everything admitted before a close is written; nothing admitted after it exists.
     ///
-    /// Frames are queued from several tasks while one of them closes the end. Whichever way that
-    /// race goes, a caller that was told its frame was admitted sees it on the peer's side, and a
-    /// caller that was refused sees nothing of it.
+    /// Frames are queued while the end closes. Deterministically forces both boundary cases:
+    /// frames admitted before the close and frames refused after the close. Byte accounting
+    /// settles to zero once the writer finishes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_frame_admitted_as_the_end_closes_is_written_and_a_refused_one_is_not() {
         let (writer, reader) = tokio::io::duplex(1 << 20);
@@ -2385,32 +2385,73 @@ mod tests {
         );
         let driving = tokio::spawn(writes);
         let sink = Arc::new(sink);
+
+        let barrier_before_close = Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_after_close = Arc::new(tokio::sync::Barrier::new(2));
+
         let admitting = {
             let sink = Arc::clone(&sink);
+            let b1 = Arc::clone(&barrier_before_close);
+            let b2 = Arc::clone(&barrier_after_close);
             tokio::spawn(async move {
                 let mut admitted = Vec::new();
-                for id in 0..64_u32 {
-                    if sink.queue(format!("{{\"id\":{id}}}").as_bytes()).is_ok() {
-                        admitted.push(id);
-                    }
-                    tokio::task::yield_now().await;
+                let mut refused = Vec::new();
+                // 1. Boundary case 1: frames before close are all admitted.
+                for id in 0..16_u32 {
+                    let frame = format!("{{\"id\":{id}}}");
+                    assert!(
+                        sink.queue(frame.as_bytes()).is_ok(),
+                        "frame before close must be admitted"
+                    );
+                    admitted.push(id);
                 }
-                admitted
+                // Coordinate with closing task: frames 0..16 are queued.
+                b1.wait().await;
+                // Wait until closing task has closed the sink.
+                b2.wait().await;
+                // 2. Boundary case 2: frames after close are all refused.
+                for id in 16..32_u32 {
+                    let frame = format!("{{\"id\":{id}}}");
+                    assert!(
+                        sink.queue(frame.as_bytes()).is_err(),
+                        "frame after close must be refused"
+                    );
+                    refused.push(id);
+                }
+                (admitted, refused)
             })
         };
         let closing = {
             let sink = Arc::clone(&sink);
+            let b1 = Arc::clone(&barrier_before_close);
+            let b2 = Arc::clone(&barrier_after_close);
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                b1.wait().await;
                 sink.close();
+                b2.wait().await;
             })
         };
-        let admitted = admitting.await.expect("the admitting task finished");
+        let (admitted, refused) = admitting.await.expect("the admitting task finished");
         closing.await.expect("the closing task finished");
+        assert_eq!(
+            admitted.len(),
+            16,
+            "exactly 16 frames admitted before close"
+        );
+        assert_eq!(refused.len(), 16, "exactly 16 frames refused after close");
+
         tokio::time::timeout(std::time::Duration::from_secs(10), driving)
             .await
             .expect("the writer ends at the close")
             .expect("its task is joined");
+
+        // Byte accounting settles to zero.
+        assert_eq!(
+            sink.queued_bytes(),
+            0,
+            "byte accounting must settle to 0 after writer drains admitted frames"
+        );
+
         let mut written = String::new();
         let mut reader = tokio::io::BufReader::new(reader);
         tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut written)
@@ -2428,13 +2469,11 @@ mod tests {
                 "an admitted frame reached the peer: {id}"
             );
         }
-        for id in 0..64_u32 {
-            if !admitted.contains(&id) {
-                assert!(
-                    !written.contains(&format!("{{\"id\":{id}}}")),
-                    "a refused frame never existed: {id}"
-                );
-            }
+        for id in &refused {
+            assert!(
+                !written.contains(&format!("{{\"id\":{id}}}")),
+                "a refused frame never existed: {id}"
+            );
         }
     }
 

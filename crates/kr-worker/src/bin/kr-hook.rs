@@ -50,7 +50,8 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "the registration names no endpoint".to_owned())?;
     let framing = fields.get("framing").map_or("json_lines", String::as_str);
     let hello = hello(credential.trim(), framing)?;
-    connect_and_pump(endpoint, &hello)
+    let close_after_hello = std::env::args().any(|arg| arg == "--close-after-hello");
+    connect_and_pump(endpoint, &hello, close_after_hello)
 }
 
 /// Reads one required path out of the environment.
@@ -129,7 +130,7 @@ fn frame(body: &[u8], framing: &str) -> Vec<u8> {
 
 /// Connects to the endpoint, says who this is, and carries bytes both ways until either end ends.
 #[cfg(unix)]
-fn connect_and_pump(endpoint: &str, hello: &[u8]) -> Result<(), String> {
+fn connect_and_pump(endpoint: &str, hello: &[u8], close_after_hello: bool) -> Result<(), String> {
     use std::io::Read as _;
     use std::os::unix::net::UnixStream;
 
@@ -152,6 +153,16 @@ fn connect_and_pump(endpoint: &str, hello: &[u8]) -> Result<(), String> {
     stream
         .flush()
         .map_err(|error| format!("could not say who this is: {error}"))?;
+
+    if close_after_hello {
+        // Wait a short bounded interval so the worker's accept task reads the socket credentials
+        // and admits the peer before the socket reaches end-of-file.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(stream);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 
     // Both directions at once, each on its own thread, because either end may speak first and
     // neither waits for the other.
@@ -181,7 +192,7 @@ fn connect_and_pump(endpoint: &str, hello: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn connect_and_pump(endpoint: &str, hello: &[u8]) -> Result<(), String> {
+fn connect_and_pump(endpoint: &str, hello: &[u8], _close_after_hello: bool) -> Result<(), String> {
     let _ = (endpoint, hello);
     Err(
         "this platform has no private socket, and its protected exchange is not built yet"

@@ -1713,16 +1713,22 @@ fn uuid_from(bytes: &[u8]) -> Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broker::process::{BrokerTransport, ManagedProcess, TransportHandle};
+    use crate::broker::{Broker, Credential};
     use kr_protocol::broker::{
-        BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, OfferedDecision,
+        BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, IntegrationMode,
+        OfferedDecision,
     };
     use kr_protocol::gateway::{
-        DownstreamRequestId, NativeClassification, NativeMethodClass, PendingKind,
+        DeclarativeEntry, DeclarativeTable, DownstreamRequestId, NativeClassification,
+        NativeFraming, NativeMethodClass, PendingKind, RichMethodEntry, RichMethodTable,
+        RichOperation,
     };
     use kr_protocol::ids::{
-        GatewayConnectionId, PluginId, PublisherId, SourceGeneration, UpstreamMethod,
-        UpstreamRequestId,
+        GatewayConnectionId, MethodTableVersion, PluginId, PublisherId, SessionId,
+        SourceGeneration, UpstreamMethod, UpstreamRequestId,
     };
+    use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
 
     /// A journal file of this test's own, on the internal disk.
@@ -1746,6 +1752,63 @@ mod tests {
 
     fn handle(name: &str) -> SourceEventHandle {
         SourceEventHandle::new(name).expect("valid")
+    }
+
+    fn test_declarative_table() -> DeclarativeTable {
+        let mut table = DeclarativeTable {
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            table_version: MethodTableVersion::new(1),
+            upstream_protocol_version: "1".to_owned(),
+            digest: Digest256::from_bytes([1; 32]),
+            framing: NativeFraming::JsonLines,
+            request_id_field: "id".to_owned(),
+            response_id_field: "id".to_owned(),
+            method_field: "method".to_owned(),
+            params_field: "params".to_owned(),
+            result_field: "result".to_owned(),
+            error_field: "error".to_owned(),
+            entries: vec![DeclarativeEntry {
+                method: UpstreamMethod::new("session/request_permission").expect("valid"),
+                class: NativeMethodClass::Mutation,
+                expects_response: true,
+                approval_option_field: Nullable::some("behavior".to_owned()),
+                reverse: Nullable::null(),
+            }],
+        };
+        table.digest = table.canonical_digest().expect("encodable");
+        table
+    }
+
+    fn test_rich_table() -> RichMethodTable {
+        RichMethodTable {
+            table_version: MethodTableVersion::new(1),
+            upstream_protocol_version: "1".to_owned(),
+            entries: vec![RichMethodEntry {
+                method: UpstreamMethod::new("session/answer").expect("valid"),
+                class: NativeMethodClass::Mutation,
+                required_right: ActionRight::AgentApprovalRespond,
+                operation: Nullable::some(RichOperation::ApprovalRespond),
+                provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+            }],
+        }
+    }
+
+    fn test_managed_process() -> ManagedProcess {
+        let running = kr_ipc::identity::current_process_start_identity().expect("process");
+        ManagedProcess::new(
+            instance(),
+            running.clone(),
+            TransportHandle {
+                transport: BrokerTransport::PrivateSocket,
+                application_instance_id: instance(),
+                executable_digest: Digest256::from_bytes([3; 32]),
+                process: running,
+            },
+            Credential::from_bytes([9; 32]),
+            false,
+            TimestampMs::new(1),
+        )
     }
 
     fn trust() -> DecodingTrust {
@@ -1894,74 +1957,107 @@ mod tests {
     /// An event the outbox refuses takes its transition back with it.
     ///
     /// Section 24 commits the change and the event that announces it in one transaction, so the
-    /// failure of either is the failure of both. A settle whose event cannot be written leaves
-    /// the resource as it was, and the event it would have followed is still the last one, so the
-    /// next event about that resource names the same parent it would have named before.
+    /// failure of either is the failure of both. A transition whose event cannot be written leaves
+    /// the resource as it was, and the broker's parent map retains the event it would have
+    /// followed, so the next event about that resource names the same parent it would have named
+    /// before without the caller supplying it.
     #[test]
     fn a_transition_whose_event_cannot_be_written_goes_back_whole() {
-        let ledger = Ledger::open(None).expect("the ledger opens");
-        let pending = resource(31, "71", PendingState::Pending);
-        let recording = event(1, &pending);
-        ledger
-            .record_opaque(&pending, &recording)
-            .expect("the request is recorded");
+        let path = ledger_path();
+        let broker = Broker::open(Some(&path), SessionId::new(Uuid::from_bytes([1; 16])))
+            .expect("the broker opens");
+        broker
+            .register_instance(
+                instance(),
+                IntegrationMode::Gateway,
+                None,
+                Some(test_managed_process()),
+            )
+            .expect("instance registered");
+        broker
+            .pin_table(instance(), test_declarative_table(), test_rich_table())
+            .expect("table pinned");
+        let connection = broker
+            .open_native_connection(
+                instance(),
+                &[9; 32],
+                &kr_ipc::identity::current_process_start_identity().expect("process"),
+                &PluginId::new("kalareach.codex").expect("valid"),
+                "1",
+            )
+            .expect("connection opened");
 
-        // An event under an identifier the outbox already holds cannot be written.
-        let settled = PendingResource {
-            state: PendingState::Resolved,
-            ..pending.clone()
-        };
-        let duplicate = TransitionEvent {
-            sequence: 2,
-            ..event(1, &settled)
-        };
-        let refused = ledger.settle_pending(
-            &settled,
-            PendingState::Pending,
-            false,
-            TimestampMs::new(12),
-            &duplicate,
+        // The first request is admitted and recorded as sequence 1.
+        let (forwarded, recorded) = broker
+            .forward_native(
+                connection,
+                br#"{"id":71,"method":"session/request_permission","params":{}}"#,
+                TimestampMs::new(10),
+            )
+            .expect("the request is forwarded");
+        assert!(forwarded.request.is_some());
+        assert!(recorded.is_some());
+        let initial_events = broker.transitions_after(0).expect("outbox reads");
+        assert_eq!(initial_events.len(), 1);
+        let first_seq = initial_events[0].sequence;
+        assert_eq!(initial_events[0].parent_sequence, None);
+
+        // Inject an SQLite trigger so that inserting the next event (sequence 2) fails and aborts.
+        let injector = rusqlite::Connection::open(&path).expect("injector connection opens");
+        injector
+            .execute(
+                "CREATE TRIGGER fail_seq_2 BEFORE INSERT ON broker_events WHEN new.sequence = 2 \
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+                [],
+            )
+            .expect("trigger is installed");
+
+        // An upstream response that attempts to settle the resource fails when writing the event.
+        let failed = broker.upstream_response(
+            connection,
+            br#"{"id":71,"result":{"outcome":"deny"}}"#,
+            TimestampMs::new(11),
         );
         assert!(
-            refused.is_err(),
-            "an event the outbox will not take is not a transition this host records"
+            failed.is_err(),
+            "an event the outbox will not take rolls back the transition"
         );
-        let held = ledger.unresolved().expect("the records read");
-        assert_eq!(
-            held.iter()
-                .find(|record| record.resource.resource_id == pending.resource_id)
-                .expect("the resource is still there")
-                .resource
-                .state,
-            PendingState::Pending,
-            "the change went back with the event"
-        );
-        let outbox = ledger.events_after(0).expect("the outbox reads");
-        assert_eq!(outbox.len(), 1, "and nothing was announced for it");
-        assert_eq!(outbox[0].event_id, recording.event_id);
 
-        // The next event about it, under an identifier of its own, still follows the recording.
-        let following = TransitionEvent {
-            sequence: 3,
-            parent_sequence: Some(recording.sequence),
-            ..event(3, &settled)
-        };
-        ledger
-            .settle_pending(
-                &settled,
-                PendingState::Pending,
-                false,
-                TimestampMs::new(13),
-                &following,
+        let outbox_after_failure = broker.transitions_after(0).expect("outbox reads");
+        assert_eq!(
+            outbox_after_failure.len(),
+            1,
+            "nothing was announced for the failed transition"
+        );
+
+        // Remove the injected failure.
+        injector
+            .execute("DROP TRIGGER fail_seq_2", [])
+            .expect("trigger is removed");
+
+        // The next transition on that resource through the broker automatically looks up the parent
+        // in the broker's announced parent map and names the first sequence, without the test
+        // supplying it.
+        let retried = broker
+            .upstream_response(
+                connection,
+                br#"{"id":71,"result":{"outcome":"deny"}}"#,
+                TimestampMs::new(12),
             )
             .expect("the retry succeeds");
-        let outbox = ledger.events_after(0).expect("the outbox reads");
+        assert!(retried.is_some());
+
+        let outbox = broker.transitions_after(0).expect("outbox reads");
         assert_eq!(outbox.len(), 2);
         assert_eq!(
             outbox[1].parent_sequence,
-            Some(recording.sequence),
-            "the rollback left the chain where it was"
+            Some(first_seq),
+            "the broker's announced parent map survived rollback and supplied the parent sequence"
         );
+        assert!(outbox[1].state.is_terminal());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent dir"));
     }
 
     /// One transition event, as a settle writes beside the change it records.
