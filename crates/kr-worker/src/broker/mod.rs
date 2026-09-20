@@ -1146,6 +1146,7 @@ impl Broker {
         if state.volatile.writes_are_durable() {
             state.ledger.record_opaque(&resource, &event)?;
         }
+        state.remember(&event);
         state.publish(&resource, &event);
         state
             .arbitration
@@ -1352,6 +1353,7 @@ impl Broker {
             Some(claim.actor_id.clone()),
         );
         state.ledger.mark_dispatched(&transition.resource, &event)?;
+        state.remember(&event);
         let resource = state.arbitration.commit(transition)?;
         state.publish(&resource, &event);
         Ok(resource)
@@ -3141,6 +3143,9 @@ impl BrokerState {
     ) -> Result<PendingResource> {
         let event = self.next_transition_event(&transition.resource, now, cause, actor_id);
         self.write_transition(&transition, now, &event)?;
+        // Recorded as this resource's latest only once the write has succeeded, so a transition
+        // that failed does not become the parent of one that did.
+        self.remember(&event);
         let settled = self.arbitration.commit(transition)?;
         self.publish(&settled, &event);
         Ok(settled)
@@ -3173,13 +3178,6 @@ impl BrokerState {
                 |instance| instance.binding_revision,
             );
         let parent_sequence = self.announced.get(&resource.resource_id).copied();
-        // A resource that has reached a state nothing follows has no next event, so it stops
-        // being remembered here rather than staying for the life of the process.
-        if resource.state.is_terminal() {
-            self.announced.remove(&resource.resource_id);
-        } else {
-            self.announced.insert(resource.resource_id, sequence);
-        }
         crate::broker::ledger::TransitionEvent {
             sequence,
             event_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
@@ -3194,6 +3192,18 @@ impl BrokerState {
             causal_root: resource.request.to_string(),
             parent_sequence,
             recorded_at: now,
+        }
+    }
+
+    /// Records one written event as the latest about its resource, so the next names it.
+    ///
+    /// A resource that has reached a state nothing follows has no next event, so it stops being
+    /// remembered rather than staying for the life of the process.
+    fn remember(&mut self, event: &crate::broker::ledger::TransitionEvent) {
+        if event.state.is_terminal() {
+            self.announced.remove(&event.resource_id);
+        } else {
+            self.announced.insert(event.resource_id, event.sequence);
         }
     }
 
@@ -3216,6 +3226,11 @@ impl BrokerState {
                 resource_id: resource.resource_id,
                 binding_revision: event.binding_revision,
                 state: resource.state,
+                durability: event.durability,
+                cause: event.cause,
+                actor_id: event.actor_id.clone(),
+                causal_root: event.causal_root.clone(),
+                parent_sequence: event.parent_sequence,
             },
         );
     }

@@ -265,31 +265,45 @@ impl Sink {
         self.reserve(framed.len())?;
         let (report, receiver) = tokio::sync::oneshot::channel();
         let length = framed.len();
-        let admitted = {
+        // The refused frame comes back out of the lock rather than being dropped inside it.
+        // Dropping it runs the work that waited on it, and that work may close this very end; a
+        // drop under the guard would be this thread waiting for itself.
+        let refused = {
             let closed = self.admitting();
             if *closed {
-                Err(BrokerError::UpstreamUnavailable {
-                    detail: "this connection has stopped taking frames".to_owned(),
-                })
-            } else {
-                self.frames
-                    .send(Outbound::Frame {
+                Some((
+                    Outbound::Frame {
                         body: framed,
                         report,
                         after,
-                    })
-                    .map_err(|_| BrokerError::UpstreamUnavailable {
-                        detail: "this connection is no longer being written".to_owned(),
-                    })
+                    },
+                    BrokerError::UpstreamUnavailable {
+                        detail: "this connection has stopped taking frames".to_owned(),
+                    },
+                ))
+            } else {
+                match self.frames.send(Outbound::Frame {
+                    body: framed,
+                    report,
+                    after,
+                }) {
+                    Ok(()) => None,
+                    Err(tokio::sync::mpsc::error::SendError(outbound)) => Some((
+                        outbound,
+                        BrokerError::UpstreamUnavailable {
+                            detail: "this connection is no longer being written".to_owned(),
+                        },
+                    )),
+                }
             }
         };
-        match admitted {
-            Ok(()) => Ok(Queued { report: receiver }),
-            Err(error) => {
+        match refused {
+            None => Ok(Queued { report: receiver }),
+            Some((outbound, error)) => {
                 // Nothing was taken, so nothing is reserved. The work that waited on this frame
-                // goes with the frame that was refused: the `Outbound` it was in is dropped here,
-                // and dropping it runs that work for the unsent frame it is.
+                // runs now, outside the lock, for the unsent frame it is.
                 self.queued.fetch_sub(length, Ordering::Release);
+                drop(outbound);
                 Err(error)
             }
         }
@@ -742,6 +756,20 @@ pub struct ResourceTransition {
     pub binding_revision: kr_protocol::ids::AgentBindingRevision,
     /// What it became.
     pub state: PendingState,
+    /// What the resource's own history is: durable, or lived through an evidence gap.
+    ///
+    /// A transition made while the journal is faulted is announced and not recorded, exactly as
+    /// the resource itself is not, and this is what says so to an observer that is reading the
+    /// live stream rather than the outbox.
+    pub durability: kr_protocol::session::Durability,
+    /// Which of the broker's paths decided it.
+    pub cause: crate::broker::ledger::TransitionCause,
+    /// The actor whose action caused it, where one did.
+    pub actor_id: Option<kr_protocol::ids::ActorId>,
+    /// The upstream request this resource belongs to, which is the root of its causal chain.
+    pub causal_root: String,
+    /// The previous event about this same resource, where there is one.
+    pub parent_sequence: Option<u64>,
 }
 
 /// Where one authorised observer reads the resolutions of the instance it watches.
@@ -1205,7 +1233,7 @@ impl Duplex {
     async fn sweep(self: &Arc<Self>) {
         while !self.stopped.load(Ordering::Acquire) {
             for (id, client) in self.outstanding.expired() {
-                self.give_up(&id, &client, "the upstream did not answer this request");
+                self.refuse_to_client(&id, &client, "the upstream did not answer this request");
             }
             tokio::select! {
                 () = tokio::time::sleep(SWEEP_INTERVAL) => {}
@@ -1237,9 +1265,12 @@ impl Duplex {
     }
 
     /// Tells the client that one of its own requests will not be answered.
-    fn give_up(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) {
+    ///
+    /// Returns true when the terminal was told. A refusal that cannot be handed over is a person
+    /// left waiting on a reply that is not coming, so its caller ends the connection instead.
+    fn give_up(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) -> bool {
         let Some(held) = self.broker.connection(self.connection) else {
-            return;
+            return false;
         };
         let mut body = serde_json::Map::new();
         body.insert(held.table.response_id_field.clone(), client.clone());
@@ -1251,9 +1282,9 @@ impl Duplex {
             }),
         );
         let Ok(encoded) = serde_json::to_vec(&serde_json::Value::Object(body)) else {
-            return;
+            return false;
         };
-        let _ = self.client.queue(&encoded);
+        self.client.queue(&encoded).is_ok()
     }
 
     /// Returns how many of the client's own requests are waiting for the upstream.
@@ -1311,9 +1342,19 @@ impl Duplex {
     }
 
     /// Gives up every request of the client's this connection is still holding, and says why.
+    ///
+    /// This runs as the connection ends, so a refusal the client end can no longer take changes
+    /// nothing: there is nothing left to stop.
     fn abandon_client_requests(&self, why: &str) {
         for (id, client) in self.outstanding.abandon() {
             self.give_up(&id, &client, why);
+        }
+    }
+
+    /// Tells the client one of its requests is refused, and ends the connection if it cannot be.
+    fn refuse_to_client(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) {
+        if !self.give_up(id, client, why) {
+            self.fail("a refusal could not be handed to the terminal");
         }
     }
 
@@ -1571,7 +1612,7 @@ impl Duplex {
             // Refused in place, and the terminal is told under its own identifier: a request this
             // connection cannot carry is an answer the person gets now rather than a wait that
             // never ends.
-            self.give_up(
+            self.refuse_to_client(
                 &upstream_request_id,
                 &client_identifier,
                 "this connection cannot carry another request until the upstream answers one",
@@ -1581,7 +1622,7 @@ impl Duplex {
         if let Err(error) = self.queue_client_frame(&encoded, admitted, Some(upstream_request_id)) {
             // The mapping the queue refusal gave back is not one the upstream will ever answer.
             self.outstanding.client_identifier(&forwarded_as);
-            self.give_up(
+            self.refuse_to_client(
                 &forwarded_as,
                 &client_identifier,
                 "this connection could not carry the request",

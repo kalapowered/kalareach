@@ -505,19 +505,11 @@ impl Ledger {
                     .map_err(BrokerError::ledger)?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
-            // Every version this build has added is a table that was not there before, and the
-            // statements above have just created it. So an older ledger is brought forward by
-            // recording the version it now has: the tables it gained are empty, which is exactly
-            // what a ledger written before they existed knows about them. This one-way step goes
-            // when the retained-ledger policy replaces it.
-            Some(version) if version < SCHEMA_VERSION => {
-                self.connection
-                    .execute(
-                        "UPDATE broker_schema SET version = ?1",
-                        params![SCHEMA_VERSION],
-                    )
-                    .map_err(BrokerError::ledger)?;
-            }
+            // Not every change this build has made is one a `CREATE TABLE IF NOT EXISTS` brings
+            // forward: a table that already exists keeps the columns it was made with. So an
+            // older ledger is refused by name rather than relabelled into a shape it does not
+            // have. Integration uses a fresh ledger; what happens to a retained one is a policy
+            // decision, and the ledger-transition work is where it is made.
             Some(version) => {
                 return Err(BrokerError::ledger(format!(
                     "this ledger is at schema version {version}; this build reads {SCHEMA_VERSION}"
