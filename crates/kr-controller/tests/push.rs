@@ -73,6 +73,11 @@ impl GatewayDouble {
             .expect("the double is not poisoned")
             .clone()
     }
+
+    /// How many times a receipt was read rather than a delivery presented as new work.
+    fn receipts(&self) -> u64 {
+        *self.receipts.lock().expect("the double is not poisoned")
+    }
 }
 
 impl PushSender for GatewayDouble {
@@ -579,6 +584,94 @@ fn a_rejected_token_disables_the_destination() {
                 .expect("a read")
                 .expect("the record");
             assert!(!record.enabled, "nothing more is sent to it");
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-16.12 and section 23: an unknown outcome keeps what the receipt needs, and reading the
+/// receipt resolves it without ever presenting new work.
+#[test]
+fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Unknown {
+        detail: "the connection was reset".to_owned(),
+    }]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    let held_request = environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+            assert!(
+                record.content.is_some(),
+                "the request the receipt has to present is kept"
+            );
+            assert!(record.dispatched);
+            Ok(record.notification_id)
+        })
+        .expect("a read");
+
+    // The automatic loop never touches it.
+    assert_eq!(
+        environment
+            .module
+            .run_due(
+                &gateway,
+                &held(NOW + 30 * 24 * 60 * 60 * 1000),
+                &ExternalDouble::answering(Vec::new()),
+                &Granted(BTreeSet::new()),
+                &at(NOW + 60_000),
+            )
+            .expect("a pass"),
+        0
+    );
+
+    // The receipt does, and it is asked for rather than scheduled.
+    let resolved = environment
+        .module
+        .read_receipts(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &at(NOW + 120_000),
+        )
+        .expect("a reconciliation");
+    assert_eq!(resolved, 1);
+    assert_eq!(
+        gateway.receipts(),
+        1,
+        "the outcome was read rather than sent again"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer
+                .journal()
+                .delivery(held_request)
+                .expect("a read")
+                .expect("the record");
+            assert_eq!(record.state, DeliveryState::Accepted);
+            assert_eq!(record.content, None, "nothing needs to ask again");
             Ok(())
         })
         .expect("a read");

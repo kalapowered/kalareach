@@ -861,6 +861,11 @@ impl Producer {
     ) -> Result<Vec<(NotificationId, DeliveryState)>> {
         let mut reconciled = Vec::new();
         for record in self.journal.unreconciled()? {
+            if record.state != DeliveryState::InFlight {
+                // Already recorded as unknown by an earlier pass. Saying so again would only move
+                // its timestamps; what resolves it is a receipt, which a caller reads.
+                continue;
+            }
             let detail = if still_authorised(&record.destination_id) {
                 "this host stopped while the attempt was on the wire, so its outcome is unknown \
                  and it is not retried automatically"

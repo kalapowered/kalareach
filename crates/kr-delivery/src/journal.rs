@@ -1420,6 +1420,12 @@ impl DeliveryJournal {
 
     /// Records one state transition, its attempt row and its outbox row together.
     ///
+    /// A record whose outcome is unknown keeps the bytes it presented, whatever the caller asks
+    /// for. Reading the receipt means presenting the identical request again - the gateway claims
+    /// a notification identifier before anything reaches a provider and answers a repeat from what
+    /// it recorded - so a row that dropped its request could never be resolved. The retention is
+    /// named in [`crate::privacy::DeliveryOutbox::kept`] rather than being a quiet exception.
+    ///
     /// The transition is refused unless the record is still the one the caller claimed: in flight
     /// at exactly this attempt. Anything else is a settlement for work somebody else has already
     /// moved on, and writing it would undo a cancellation or a reconciliation. `Ok(false)` says
@@ -1469,7 +1475,9 @@ impl DeliveryJournal {
                 SET state = ?2,
                     attempts = MAX(attempts, ?3),
                     detail = COALESCE(?4, detail),
-                    content = CASE WHEN ?5 = 1 THEN content ELSE NULL END,
+                    content = CASE
+                        WHEN ?5 = 1 OR ?2 IN ('in_flight', 'outcome_unknown') THEN content
+                        ELSE NULL END,
                     suppression_reason = COALESCE(?6, suppression_reason),
                     suppression_into = COALESCE(?7, suppression_into),
                     suppression_count = COALESCE(?8, suppression_count),
@@ -1735,12 +1743,21 @@ impl DeliveryJournal {
             [],
             |row| row.get(0),
         )?;
+        // What has left and can still be asked about is left in a state a reconciliation
+        // resolves; what has left and cannot is marked as the uncertainty it is. Only a push
+        // notification can be asked about: the gateway answers a repeat of one identifier from
+        // what it recorded, and an external service has no such read.
         transaction.execute(
             "UPDATE delivery_notifications
-                SET state = 'outcome_unknown',
-                    content = NULL,
-                    detail = 'privacy mode stopped this after it had already left, so what
-                              became of it is unknown until it is reconciled'
+                SET state = CASE WHEN (SELECT kind FROM delivery_destinations d
+                                        WHERE d.destination_id
+                                              = delivery_notifications.destination_id) = 'push'
+                                 THEN 'outcome_unknown' ELSE 'duplicate_uncertain' END,
+                    content = CASE WHEN (SELECT kind FROM delivery_destinations d
+                                          WHERE d.destination_id
+                                                = delivery_notifications.destination_id) = 'push'
+                                   THEN content ELSE NULL END,
+                    detail = 'privacy mode stopped this after it had already left this host'
               WHERE dispatched = 1 AND state IN ('admitted', 'retrying')",
             [],
         )?;
@@ -1786,7 +1803,10 @@ impl DeliveryJournal {
     /// Removes the queued content and the preview material this journal holds.
     ///
     /// The records stay: what happened is not content, and a host that forgot its own attempts
-    /// could not tell a person what the device did not see. The bytes go.
+    /// could not tell a person what the device did not see. The bytes go, except for the request
+    /// of a delivery whose outcome is still unknown: section 24 reports completion only once
+    /// in-flight work has been reconciled, and asking the gateway what became of a notification
+    /// means presenting that request again. It goes as soon as the outcome is known.
     ///
     /// Returns how many bytes and how many records were emptied.
     ///
@@ -1799,7 +1819,7 @@ impl DeliveryJournal {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let bytes: i64 = transaction.query_row(
             "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM delivery_notifications
-              WHERE content IS NOT NULL",
+              WHERE content IS NOT NULL AND state NOT IN ('in_flight', 'outcome_unknown')",
             [],
             |row| row.get(0),
         )?;
@@ -1813,8 +1833,13 @@ impl DeliveryJournal {
             [],
             |row| row.get(0),
         )?;
+        // Everything but what an unresolved delivery needs to be asked about again. Section 24
+        // reports completion only after reconciliation, and a row that threw away its request
+        // could never be reconciled, so the request stays until the outcome is known and the
+        // retention is named explicitly.
         let emptied = transaction.execute(
-            "UPDATE delivery_notifications SET content = NULL WHERE content IS NOT NULL",
+            "UPDATE delivery_notifications SET content = NULL
+              WHERE content IS NOT NULL AND state NOT IN ('in_flight', 'outcome_unknown')",
             [],
         )?;
         let objects = transaction.execute("DELETE FROM delivery_objects", [])?;
@@ -2115,18 +2140,87 @@ impl DeliveryJournal {
         Ok(true)
     }
 
-    /// Returns the deliveries a restart has to reconcile, oldest first.
+    /// Settles one record whose outcome nobody knew, from the receipt that answered it.
     ///
-    /// An attempt that was on the wire when this host stopped has an outcome nobody knows. Section
-    /// 24 resumes *only what is still authorised*, so the caller checks each one's destination and
-    /// authorisation before it resumes anything; this read is the list, not the decision.
+    /// It applies only to a record already settled as an unknown outcome: this is the resolution
+    /// of a question, not a state transition a sender makes. The request goes with the answer,
+    /// because nothing needs to ask again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn settle_receipt(
+        &mut self,
+        notification_id: NotificationId,
+        state: DeliveryState,
+        detail: &str,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let identifier = notification_id.to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT state, attempts FROM delivery_notifications WHERE notification_id = ?1",
+                params![identifier],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((held_state, attempts)) = held else {
+            return Ok(false);
+        };
+        if held_state != DeliveryState::OutcomeUnknown.as_str() {
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO delivery_attempts
+                 (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5)
+             ON CONFLICT (notification_id, attempt) DO UPDATE SET
+                 settled_at_ms = excluded.settled_at_ms,
+                 outcome = excluded.outcome,
+                 detail = excluded.detail",
+            params![
+                identifier,
+                as_i64(as_u64(attempts).max(1)),
+                as_i64(now_ms),
+                state.as_str(),
+                detail
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE delivery_notifications SET state = ?2, detail = ?3, content = NULL
+              WHERE notification_id = ?1",
+            params![identifier, state.as_str(), detail],
+        )?;
+        transaction.execute(
+            "DELETE FROM delivery_outbox WHERE notification_id = ?1",
+            params![identifier],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Returns the deliveries whose outcome nobody knows, oldest first.
+    ///
+    /// Two kinds, and both belong here. An attempt that was on the wire when this host stopped is
+    /// still marked in flight and nothing will move it on its own. A row already settled as an
+    /// unknown outcome is the same question asked earlier, and section 23 leaves it alone until
+    /// something reads the receipt. A reconciliation pass is what reads it; the automatic loop
+    /// never does.
+    ///
+    /// Section 24 resumes *only what is still authorised*, so the caller checks each one's
+    /// destination and authorisation before it resumes anything; this read is the list, not the
+    /// decision.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
     pub fn unreconciled(&self) -> Result<Vec<DeliveryRecord>> {
         let mut statement = self.connection.prepare(&format!(
-            "{NOTIFICATION_COLUMNS} WHERE state = 'in_flight' ORDER BY admitted_at_ms"
+            "{NOTIFICATION_COLUMNS} WHERE state IN ('in_flight', 'outcome_unknown')
+              ORDER BY admitted_at_ms"
         ))?;
         let rows = statement.query_map([], decode_delivery)?;
         let mut records = Vec::new();

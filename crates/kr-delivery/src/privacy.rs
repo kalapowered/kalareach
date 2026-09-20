@@ -130,6 +130,12 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
                 why: "the burst and sustained limits are per destination and survive a restart; \
                       forgetting them would be a way to buy twenty more notifications",
             },
+            KeptExplicitly {
+                what: "the request bytes of a notification whose outcome is still unknown",
+                why: "section 24 reports completion only once in-flight work has been reconciled, \
+                      and asking the gateway what became of a notification means presenting that \
+                      request again; it goes as soon as the outcome is known",
+            },
         ]
     }
 
@@ -325,13 +331,13 @@ mod tests {
                 .expect("a read")
                 .expect("the record")
                 .state,
-            DeliveryState::OutcomeUnknown,
-            "it is left in a state a reconciliation can still resolve"
+            // A webhook has no receipt to read, so what it leaves behind is the uncertainty
+            // itself rather than a question nothing can answer.
+            DeliveryState::DuplicateUncertain,
+            "it is marked as having left rather than taken back"
         );
-        assert!(matches!(
-            PrivacyMode::reconcile(&[&DeliveryOutbox::over(&mut journal, 2_000)]),
-            Completion::Reconciling { .. }
-        ));
+        let exported = DeliveryOutbox::over(&mut journal, 2_000).exported();
+        assert_eq!(exported.len(), 1, "it is shown as a retained artifact");
     }
 
     #[test]
@@ -425,12 +431,13 @@ mod tests {
         let mut journal = journal_with_work();
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
         let kept = outbox.kept();
-        assert_eq!(kept.len(), 2);
+        assert_eq!(kept.len(), 3);
         assert!(
             kept.iter()
                 .any(|kept| kept.what.contains("delivery journal"))
         );
         assert!(kept.iter().any(|kept| kept.what.contains("rate allowance")));
+        assert!(kept.iter().any(|kept| kept.what.contains("request bytes")));
     }
 
     #[test]

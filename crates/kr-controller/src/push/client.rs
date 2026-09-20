@@ -177,9 +177,18 @@ impl PushSender for GatewayClient {
         credential: &PushDeliveryCredential,
         request: &PushDeliveryRequest,
     ) -> SendOutcome {
-        // The identical request again. The gateway claimed the identifier before it sent anything
-        // and answers a repeat from the outcome it recorded, so this reads a decision rather than
-        // making a second one.
+        // The identical request again, which for this gateway is a read.
+        //
+        // The contract it rests on is the gateway's own and is not an assumption: a delivery
+        // claims its notification identifier before anything reaches a provider, a repeat of a
+        // claimed identifier is answered from what was recorded - the settled outcome, or that it
+        // is still on its way - and a repeat that carries a different request under the same
+        // identifier is refused rather than sent. So the only case in which this dispatches is the
+        // one where the first request never reached the gateway at all, and there the
+        // notification has not been delivered to anybody.
+        //
+        // That is why the request bytes are retained for a record whose outcome is unknown: this
+        // is the only question that resolves one, and it can only be asked with the same bytes.
         self.present(credential, request)
     }
 }

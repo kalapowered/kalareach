@@ -267,6 +267,94 @@ impl DeliveryModule {
         })
     }
 
+    /// Reads the receipt of every delivery whose outcome nobody knows.
+    ///
+    /// Section 23 keeps `OUTCOME_UNKNOWN` out of the automatic loop, so nothing schedules this: a
+    /// startup or a person asks for it. What it does is a **read** rather than a second send. The
+    /// gateway claims a notification identifier before anything reaches a provider and answers a
+    /// repeat of the identical request from the outcome it recorded, so presenting it again
+    /// returns what happened. The one case where it dispatches is the one where the first request
+    /// never arrived, and there the notification has not been delivered at all.
+    ///
+    /// A record for a destination with no such read - an external service - never reaches here:
+    /// its uncertainty is marked at the attempt instead, which is section 25's own rule.
+    ///
+    /// Returns how many outcomes it resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the journal cannot be read or written.
+    pub fn read_receipts(
+        &self,
+        sender: &dyn PushSender,
+        credentials: &dyn SenderCredentials,
+        clock: &dyn Clock,
+    ) -> Result<usize> {
+        let unknown = self.with(|producer| {
+            Ok(producer
+                .journal()
+                .unreconciled()
+                .map_err(unavailable)?
+                .into_iter()
+                .filter(|record| record.state == DeliveryState::OutcomeUnknown)
+                .collect::<Vec<_>>())
+        })?;
+        let mut resolved = 0;
+        for record in unknown {
+            let Some(content) = record.content else {
+                // Privacy mode removed what the receipt would present. The record stays as the
+                // artifact it is, and this host says so rather than asking about nothing.
+                continue;
+            };
+            let Some(destination) = self.with(|producer| {
+                producer
+                    .journal()
+                    .destination(&record.destination_id)
+                    .map_err(unavailable)
+            })?
+            else {
+                continue;
+            };
+            let Some(push) = destination.as_push() else {
+                continue;
+            };
+            let Some(credential) = credentials.current(push.sender_record_id) else {
+                continue;
+            };
+            let request: PushDeliveryRequest =
+                serde_json::from_slice(&content).map_err(|error| ControllerError::Storage {
+                    operation: "read a queued notification",
+                    detail: error.to_string(),
+                })?;
+            let outcome = sender.receipt(&credential, &request);
+            let now_ms = clock.now_ms();
+            let kr_delivery::push::SendOutcome::Decided(ack) = outcome else {
+                // Still nobody's answer. The record stays where it is.
+                continue;
+            };
+            let decision = kr_delivery::push::decide(
+                &kr_delivery::push::SendOutcome::Decided(ack),
+                record.notification_id,
+                record.attempts,
+                now_ms,
+                record.expires_at_ms,
+            );
+            let settled = self.with(|producer| {
+                producer
+                    .journal_mut()
+                    .settle_receipt(
+                        record.notification_id,
+                        decision.state,
+                        &decision.detail,
+                        now_ms,
+                    )
+                    .map_err(unavailable)
+            })?;
+            resolved += usize::from(settled);
+        }
+        Ok(resolved)
+    }
+
     /// Drives one pass of the outbox.
     ///
     /// Each due delivery is **claimed** first - one transaction that checks the fence, the
