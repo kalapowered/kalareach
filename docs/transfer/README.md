@@ -368,10 +368,15 @@ is compared before it is served, and every chunk's digest is compared against th
 off the disk. A tampered attachment is refused rather than delivered. For a source this service
 never verified, detection is not enough and it stages its own copy.
 
-Handle-based resolution removes the race between checking a path and using it, because there is no
-path to re-resolve: the boundary is a descriptor. What it does not remove is what happens *inside*
-one resolution of a multi-component name. Something that moves a component while a read is
-resolving it can make that read reach an object the caller did not name.
+Handle-based resolution removes the race between checking an *object* and using it, because there
+is no path to re-resolve: what a handle is asked about is the object it was opened on. It removes
+neither of two other things. One is what happens *inside* one resolution of a multi-component name:
+something that moves a component while a read is resolving it can make that read reach an object
+the caller did not name. The other is what stands at a name between one operation and the next:
+publishing still names an entry in a directory this host holds open, and something can put another
+object at that name between the check and the rename or the removal. What answers that is not the
+handle but the identity recorded at the first open, compared again before the object is used, and
+the read-back after a write, which is why every operation here that cannot be undone has one.
 
 Containment is `cap-std`'s to enforce, by `RESOLVE_BENEATH` where the platform has it and by its own
 component-wise resolution otherwise, and its documentation is the authority on what each of those

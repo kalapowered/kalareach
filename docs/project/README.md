@@ -819,12 +819,13 @@ and leaves exactly as it is.
 Permissions are the destination's own, put on the staged copy through the handle this host created
 it with, before the rename, so a file that was executable stays executable and one that was not
 does not become one. A destination whose permissions this host cannot read is a path it does not
-replace. What it carries is everything that decides who may use the file: its mode bits, the user
-and group it belongs to, and the access-control list beside them. A destination that carries a list
-is applied to rather than refused. The list is read through the destination's own descriptor and
-put on the staged copy before the rename, and where the destination has none, any list the copy
-inherited from the directory it was made in comes off it, so the published file carries the
-protection of the file it replaced and nothing else. The published file is then read back through
+replace. What it carries is three things, which decide between them who may use the file: its mode
+bits, the user and group it belongs to, and the access-control list beside them. Anything else a
+platform keeps about a file, a security label among it, is not carried and is not claimed to be. A
+destination that carries a list is applied to rather than refused. The list is read through the
+destination's own descriptor and put on the staged copy before the rename, and where the
+destination has none, any list the copy inherited from the directory it was made in comes off it,
+so the published file carries the protection of the file it replaced and nothing else. The published file is then read back through
 its handle, and a mode, an owner or a list that is not the one this host set leaves the path
 unresolved rather than reported as applied. Where a host can neither read nor put back the
 platform's lists, or cannot give the copy the user and group the destination has, the path is left
