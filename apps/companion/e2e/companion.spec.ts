@@ -119,22 +119,11 @@ test.describe('the semantic view', () => {
     })
     const scroller = page.getByTestId('conversation-scroll')
     // The burst is folded in on an animation frame, so the view has the content before the scroll
-    // position means anything. The height has to have stopped moving too: scrolling into content
-    // that is still being laid out measures the layout rather than the view. Both wait for the
-    // state they name; the bound is only there to stop a machine that has stopped drawing.
+    // position means anything. These two say the folding is over: the last line of the burst is
+    // drawn, and the view is still at the live end. Nothing else arrives after that, and the window
+    // only changes when the reader scrolls, so the height the scrolls below are measured against
+    // has finished moving. The bound is only there to stop a machine that has stopped drawing.
     await expect(page.getByText('line 399')).toBeVisible({ timeout: PRESENTATION_DEADLINE })
-    let previous = -1
-    await expect
-      .poll(
-        async () => {
-          const height = await scroller.evaluate((element) => element.scrollHeight)
-          const stable = height === previous && height > 0
-          previous = height
-          return stable
-        },
-        { timeout: PRESENTATION_DEADLINE }
-      )
-      .toBe(true)
     await expect(scroller).toHaveAttribute('data-following', 'true')
 
     await scroller.evaluate((element) => {
@@ -148,7 +137,9 @@ test.describe('the semantic view', () => {
       element.scrollTop = 0
     })
     await expect
-      .poll(async () => scroller.evaluate((element) => element.scrollTop))
+      .poll(async () => scroller.evaluate((element) => element.scrollTop), {
+        timeout: PRESENTATION_DEADLINE
+      })
       .toBeGreaterThan(0)
     await expect(scroller).toHaveAttribute('data-following', 'false')
 
@@ -244,8 +235,21 @@ test.describe('the raw terminal', () => {
     await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
 
     await page.getByRole('tab', { name: 'View' }).click()
+    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'view')
+    // Back over the surface first: clicking the tab left the pointer on the header, and a wheel
+    // delivered there would never reach the terminal at all.
+    await surface.hover()
     await page.mouse.wheel(0, 120)
     await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
+
+    // That the count did not move is only worth something once something has moved it since. In
+    // control mode the next wheel is given to the application, and the count goes to two rather
+    // than to three, which is the view-mode wheel having been delivered and withheld.
+    await page.getByRole('tab', { name: 'Control' }).click()
+    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'control')
+    await surface.hover()
+    await page.mouse.wheel(0, 120)
+    await expect(surface).toHaveAttribute('data-wheel-to-application', '2')
     await page.screenshot({ path: shot('terminal-modes-13.18'), fullPage: true })
   })
 })

@@ -22,8 +22,9 @@ afterEach(cleanup)
 // a fixed number of animation frames, so what it costs is a count of frames, and how long a frame
 // lasts is the machine's answer rather than this application's: the flick that dismisses one spends
 // three quarters of the library's own one-second default on an idle machine, and a machine running
-// several builds at once would lose to it while nothing at all was wrong. These two are outside
-// anything a machine that is still running frames reaches.
+// several builds at once would lose to it while nothing at all was wrong. These two are the chosen
+// liveness limits: a machine can always be slow enough to pass any fixed figure, so they are the
+// point past which waiting longer is worth less than being told what the wait was for.
 configure({ asyncUtilTimeout: 20_000 })
 vi.setConfig({ testTimeout: 30_000 })
 

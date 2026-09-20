@@ -17,8 +17,10 @@
  * On a machine painting at its display's rate the sheet leaves in about half a second. On a shared
  * build runner that has just been asked for a full-page screenshot, painting drops to one frame
  * every few hundred milliseconds and the same motion takes five to nine seconds, which is what an
- * ordinary five-second bound loses to while nothing at all is wrong. Twenty seconds is outside
- * anything a machine that is still painting reaches, so a wait that runs out of it has stopped
- * painting altogether.
+ * ordinary five-second bound loses to while nothing at all is wrong. Twenty seconds is the chosen
+ * liveness limit against those measurements: it is four times the slowest case seen, and it leaves
+ * the whole of a test inside the project's own thirty-second limit. A machine can always be slow
+ * enough to pass any fixed figure, so this does not prove a page has stopped; it is the point past
+ * which waiting any longer is worth less than being told what the wait was for.
  */
 export const PRESENTATION_DEADLINE = 20_000

@@ -384,11 +384,12 @@ const REDUCED_MOTION_FADE_MS = 120
 /**
  * Where a sheet's own motion has got to, published as `data-presentation`.
  *
- * `arriving` while the surface is coming in, `here` once it has come to rest over the screen, and
- * `leaving` from the moment it is dismissed until it is taken away. This is what the surface is
- * doing, not what was asked of it: `data-open` says whether it has been dismissed, and the two
- * differ for as long as the motion lasts. A drag is the person moving the surface rather than the
- * surface presenting itself, and does not change this.
+ * `arriving` while the surface is coming in or on its way back to where it sits, `here` once it has
+ * come to rest over the screen, and `leaving` from the moment it is dismissed until it is taken
+ * away. This is what the surface is doing, not what was asked of it: `data-open` says whether it
+ * has been dismissed, and the two differ for as long as the motion lasts. A drag takes the surface
+ * off its rest, so it reads `arriving` again from the moment a finger lands on it until it has
+ * settled back.
  *
  * It is here because the surface arrives and leaves over a number of animation frames, and how
  * long a frame lasts is the machine's answer rather than this application's. Anything that has to
@@ -587,6 +588,9 @@ export function Sheet({
             if (!sheet || event.button !== 0) return
             event.currentTarget.setPointerCapture(event.pointerId)
             animation.current?.stop()
+            // The surface is under a finger, so it is not where it was left and is not at rest.
+            // Stopping the animation above also takes away whatever would have said so later.
+            setAtRest(false)
             const currentOffset = animation.current?.value ?? 0
             // The grab offset is respected: the surface does not jump to centre under the finger.
             dragStart.current = { pointer: event.clientY, offset: currentOffset }
@@ -619,6 +623,7 @@ export function Sheet({
             presented.current.velocity = velocity
             if (Math.abs(offset - start.offset) < DRAG_THRESHOLD && velocity === 0) {
               place(start.offset)
+              setAtRest(start.offset === 0)
               return
             }
             if (shouldDismiss(offset, velocity, height)) {
@@ -627,6 +632,7 @@ export function Sheet({
             }
             if (reduced) {
               place(0)
+              setAtRest(true)
               return
             }
             animation.current?.stop()
@@ -639,6 +645,10 @@ export function Sheet({
               onFrame: (value) => {
                 presented.current.velocity = (value - presented.current.offset) * 60
                 place(value)
+              },
+              onDone: () => {
+                presented.current.velocity = 0
+                setAtRest(true)
               }
             })
           }}

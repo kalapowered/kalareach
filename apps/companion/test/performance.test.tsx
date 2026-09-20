@@ -43,12 +43,14 @@ function node(index: number): DocumentNode {
 }
 
 /**
- * Appends a burst and waits for the whole of it to be on the screen.
+ * Appends a burst and waits for the last node of it to be drawn.
  *
  * The batching under test is what makes this a wait at all: the events are folded into one frame's
- * work rather than rendered one at a time, so the screen catches up on an animation frame. What
- * follows waits for the last of the burst to be drawn, which is the batch having been published,
- * rather than for a length of time an animation frame is assumed to fit inside.
+ * work rather than rendered one at a time, so the screen catches up on an animation frame. The last
+ * node is the one that says the batch has been published, and every caller here starts on a fresh
+ * conversation that is following the live end, so the bounded window it renders holds that node.
+ * Waiting for it is the batch having arrived, rather than a length of time an animation frame is
+ * assumed to fit inside.
  */
 async function burst(controls: { appendNode: (node: DocumentNode) => void }, count: number): Promise<void> {
   act(() => {
@@ -131,19 +133,32 @@ describe('KR-PERF-008', () => {
     const small = median(await measure('short history', false))
 
     await burst(controls, 4_000)
-    // One keystroke absorbs the frame that folds the whole backlog in. That frame is the batching
-    // working, and it happens once; the steady state is what follows it.
+    // One keystroke on the far side of the backlog, so that the samples below are the steady state
+    // rather than the first key pressed against a document that has just grown by four thousand
+    // nodes.
     await user.type(input, '.')
 
+    // The second figure is only about a keystroke *during streamed output* if the output was being
+    // drawn while it was typed. Counting what the document did over the measured stretch says so:
+    // a run where every keystroke finished before any of the stream reached the screen would
+    // report the same milliseconds and mean something else entirely. The count is passive, so it
+    // costs the measurement nothing.
+    let drawn = 0
+    const streaming = new MutationObserver((records) => {
+      drawn += records.length
+    })
+    streaming.observe(screen.getByTestId('conversation-scroll'), { childList: true, subtree: true })
     const large = median(await measure('long history', true))
+    streaming.disconnect()
 
     const growth = large / small
     record(
       'keystroke cost against history size',
-      `${small.toFixed(2)} ms with a short history, ${large.toFixed(2)} ms with 4000 nodes and output streaming, growth ${growth.toFixed(2)}x`,
-      growth <= MAXIMUM_GROWTH ? 'met' : 'missed'
+      `${small.toFixed(2)} ms with a short history, ${large.toFixed(2)} ms with 4000 nodes and output streaming, growth ${growth.toFixed(2)}x, ${drawn} document changes drawn while it was typed`,
+      growth <= MAXIMUM_GROWTH && drawn > 0 ? 'met' : 'missed'
     )
 
+    expect(drawn).toBeGreaterThan(0)
     expect(growth).toBeLessThanOrEqual(MAXIMUM_GROWTH)
   })
 

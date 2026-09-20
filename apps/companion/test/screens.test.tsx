@@ -298,11 +298,44 @@ describe('the sheet', () => {
   it('closes on Escape', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('open-settings'))
-    await screen.findByTestId('sheet')
+    const sheet = await screen.findByTestId('sheet')
+    // Dismissed from where it sits, not from halfway in. A surface still on its way has almost no
+    // distance left to travel, so a run that pressed Escape straight after the element appeared
+    // would be watching a journey the person never makes.
+    await waitFor(() => {
+      expect(sheet).toHaveAttribute('data-presentation', 'here')
+    })
     await userEvent.keyboard('{Escape}')
     await waitFor(() => {
       expect(screen.queryByTestId('sheet')).toBeNull()
     })
+  })
+
+  it('says it is off its rest while a finger is on it, and here again once it settles back', async () => {
+    start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    await userEvent.click(await screen.findByTestId('open-settings'))
+    const sheet = await screen.findByTestId('sheet')
+    await waitFor(() => {
+      expect(sheet).toHaveAttribute('data-presentation', 'here')
+    })
+
+    // Taking hold of it stops the surface wherever it is, so it is not at rest any more; letting
+    // go short of a dismissal springs it back, and it says so again when it gets there. Without
+    // that last part the surface would sit there claiming to be arriving for good.
+    const grip = screen.getByTestId('sheet-grip')
+    grip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientY: 200 }))
+    await waitFor(() => {
+      expect(sheet).toHaveAttribute('data-presentation', 'arriving')
+    })
+    grip.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 300 }))
+    grip.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 150 }))
+    grip.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 150 }))
+
+    await waitFor(() => {
+      expect(sheet).toHaveAttribute('data-presentation', 'here')
+    })
+    // The gesture reversed, so it stayed.
+    expect(screen.getByTestId('sheet')).toBeInTheDocument()
   })
 
   it('dismisses on a downward flick', async () => {
@@ -541,18 +574,33 @@ describe('one session at a time', () => {
     )
     await screen.findByTestId('conversation')
 
-    controls.appendNode(
-      {
-        id: 'n-elsewhere',
-        revision: '1',
-        body: { kind: 'message', author: 'agent', text: 'this belongs to the build session' }
-      } as never,
-      SESSION_BUILD
-    )
-
-    await waitFor(() => {
-      expect(screen.queryByText('this belongs to the build session')).toBeNull()
+    // Addressed to the other session by hand. `appendNode` takes a session but publishes to the
+    // main one whatever it is given, so an event that went through it would not be a foreign event
+    // at all and this would be asserting nothing.
+    controls.emit({
+      stream_id: `semantic:${SESSION_BUILD}`,
+      sequence: '1',
+      body: {
+        kind: 'node',
+        node: {
+          id: 'n-elsewhere',
+          revision: '1',
+          body: { kind: 'message', author: 'agent', text: 'this belongs to the build session' }
+        }
+      }
     })
+    // A fence behind it: one node this session really does carry, published after the foreign one.
+    // When the fence is on the screen everything queued in front of it has been drawn, so the
+    // other session's text is missing because it was ignored rather than because the frame that
+    // would have drawn it had not come round yet.
+    controls.appendNode({
+      id: 'n-here',
+      revision: '1',
+      body: { kind: 'message', author: 'agent', text: 'this one is for the session on screen' }
+    } as never)
+
+    await screen.findByText('this one is for the session on screen')
+    expect(screen.queryByText('this belongs to the build session')).toBeNull()
   })
 
   it('gives the text back when the host refuses a submission', async () => {
