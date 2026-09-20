@@ -371,9 +371,9 @@ pub fn decide_external(
             format!("the destination refused the message: {detail}"),
             true,
         ),
-        // Nothing left this host, so presenting it again cannot be a second message whatever the
-        // destination does about identifiers.
-        ExternalOutcome::NotDispatched { detail } => {
+        // Section 25: retry only idempotent delivery IDs where the destination supports them,
+        // and mark duplicate-delivery uncertainty otherwise.
+        ExternalOutcome::NotDispatched { detail } if idempotency.supports_retry() => {
             match next_attempt(notification_id, attempt, now_ms, expires_at_ms) {
                 Some(at) => ExternalDecision {
                     state: DeliveryState::Retrying,
@@ -394,6 +394,14 @@ pub fn decide_external(
                 ),
             }
         }
+        ExternalOutcome::NotDispatched { detail } => settle(
+            DeliveryState::DuplicateUncertain,
+            format!(
+                "this destination has no idempotent delivery identifier, so it is not retried \
+                 after a dispatch failure: {detail}"
+            ),
+            false,
+        ),
         ExternalOutcome::Unknown { detail } if idempotency.supports_retry() => {
             match next_attempt(notification_id, attempt, now_ms, expires_at_ms) {
                 Some(at) => ExternalDecision {
@@ -615,25 +623,34 @@ mod tests {
     }
 
     #[test]
-    fn nothing_dispatched_is_sent_again_whatever_the_destination_does_about_identifiers() {
-        for idempotency in [
-            Idempotency::Unsupported,
-            Idempotency::Supported {
+    fn only_destinations_with_idempotent_identifiers_retry_external_dispatch_failures() {
+        let supported = decide_external(
+            &ExternalOutcome::NotDispatched {
+                detail: "the host could not connect".to_owned(),
+            },
+            &Idempotency::Supported {
                 field: "Message-ID".to_owned(),
             },
-        ] {
-            let decision = decide_external(
-                &ExternalOutcome::NotDispatched {
-                    detail: "the host could not connect".to_owned(),
-                },
-                &idempotency,
-                notification(1),
-                1,
-                1_000,
-                TimestampMs::new(1_000_000),
-            );
-            assert_eq!(decision.next, NextAction::Send);
-        }
+            notification(1),
+            1,
+            1_000,
+            TimestampMs::new(1_000_000),
+        );
+        assert_eq!(supported.state, DeliveryState::Retrying);
+        assert_eq!(supported.next, NextAction::Send);
+
+        let unsupported = decide_external(
+            &ExternalOutcome::NotDispatched {
+                detail: "the host could not connect".to_owned(),
+            },
+            &Idempotency::Unsupported,
+            notification(1),
+            1,
+            1_000,
+            TimestampMs::new(1_000_000),
+        );
+        assert_eq!(unsupported.state, DeliveryState::DuplicateUncertain);
+        assert_eq!(unsupported.next, NextAction::None);
     }
 
     #[test]
