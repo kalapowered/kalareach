@@ -13,6 +13,7 @@
 //! | --- | --- |
 //! | [`agent_tools`] | Installing the contact skill for an agent, and undoing exactly what it wrote |
 //! | [`archive`] | Closed and crashed sessions: their history, final receipts and retained references, served with no worker |
+//! | [`automation`] | Workflow definitions, runs, node receipts and the causal budgets they share |
 //! | [`backup`] | The environment's backup generations, their staged ciphertext, their outbox and what a restore may put back |
 //! | [`authority`] | The dispatch lease, the revocation barrier and the generation both are bound to |
 //! | [`bridge`] | The enrolled environments this host reaches, and the local process bridge that reaches them |
@@ -34,6 +35,7 @@
 pub mod agent_tools;
 pub mod archive;
 pub mod authority;
+pub mod automation;
 pub mod backup;
 pub mod bridge;
 pub mod changeset;

@@ -4132,6 +4132,7 @@ dependencies = [
  "exacl",
  "iroh",
  "iroh-relay",
+ "kr-automation",
  "kr-cbor",
  "kr-changeset",
  "kr-client",

@@ -63,7 +63,7 @@ pub use crate::causal::CausalContext;
 pub use crate::definition::{
     REGISTERED_ACTION_KINDS, create_workflow_definition, validate_definition,
 };
-pub use crate::engine::{ActionOutcome, ActionRunner, MockActionRunner, WorkflowEngine};
+pub use crate::engine::{ActionOutcome, ActionRunner, Dispatch, MockActionRunner, WorkflowEngine};
 pub use crate::error::{AutomationError, Result};
 pub use crate::service::AutomationService;
 pub use crate::source_workflow::{

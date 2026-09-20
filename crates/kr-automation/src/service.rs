@@ -68,6 +68,15 @@ pub struct AutomationService {
     source_workflow: Arc<SourceWorkflowCoordinator>,
 }
 
+impl std::fmt::Debug for AutomationService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AutomationService")
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AutomationService {
     /// Opens the automation service on the workflow journal in `state_dir`.
     ///

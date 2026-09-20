@@ -6,18 +6,59 @@ and per-grant admission limits.
 
 ## The five methods
 
-| Method | What it does | Authority |
+| Method | What it does | Right |
 | --- | --- | --- |
-| `workflow.install` | Validates and stores a versioned workflow definition document | `workflow.manage` |
-| `workflow.enable` | Activates an installed workflow definition revision | `workflow.manage` |
-| `workflow.pause` | Pauses an enabled workflow definition revision | `workflow.manage` |
-| `workflow.run` | Explicitly triggers an execution run of an enabled workflow | `workflow.manage` |
-| `workflow.read` | Reads workflow definitions, revision states, runs, and budgets | `workflow.read` |
+| `workflow.install` | Validates and stores a versioned workflow definition document | `automation.manage` |
+| `workflow.enable` | Activates an installed workflow definition revision | `automation.manage` |
+| `workflow.pause` | Pauses an enabled workflow definition revision | `automation.manage` |
+| `workflow.run` | Explicitly triggers an execution run of an enabled workflow | `automation.manage` |
+| `workflow.read` | Reads workflow definitions, revision states, runs, and budgets | `automation.manage` |
+
+The control daemon serves all five. They arrive through its ordinary path: a read is checked
+against current authority, and a mutation carries an action window, is checked against the method
+registry and its rights, and runs on a task a dropped connection cannot cancel part way through.
+A workflow belongs to the environment rather than to a session, so a request that targets a
+session or a foreground application is refused before anything is written.
 
 Every method has an exhaustive authority entry in `kr_protocol::method::REGISTRY` naming its
 effect class, the ingress an actor may reach it through, the rights it requires, its resource
 selectors, its freshness and its idempotency. Each method names the exact definition revision it
 acts on, and a request whose revision does not match the document it carries is refused.
+
+## The grant a workflow acts under
+
+A definition names a grant identifier and nothing more. The host reads that grant from its own
+grant store, and reads it again immediately before every node it dispatches.
+
+* **Read, never supplied.** Nothing a caller passes in decides what a run may do. A grant this
+  host never issued names no workflow it will install.
+* **Withdrawn is withdrawn.** A grant that has expired, has been revoked, has a revoked ancestor,
+  or has never had its invitation redeemed admits no run. A withdrawal that lands between two
+  nodes of a run stops the run where it stands: the node that has not been dispatched is paused,
+  and nothing is claimed about the node that already ran.
+* **Each node needs the right its effect needs.** A `shell_command` or `run_tests` node needs
+  `terminal.input`, `create_session` needs `session.create`, `request_review` needs
+  `agent.prompt` and `session.view`, `capture_changeset` needs `changeset.create`,
+  `materialize_changeset` needs `workspace.manage`, and `apply_diff` needs `files.apply_diff`.
+  These are the rights the methods that perform the same effects require, so a workflow is not a
+  way around the method a person would otherwise have called, and a view-only invitation cannot
+  obtain terminal input through one.
+* **Scope is checked too.** A definition scoped to an environment or a session is refused unless
+  the grant covers it, and a shell node's declared execution environment has to be one the grant
+  admits.
+
+## What a node actually does
+
+The host carries out the change-set nodes against the environment's own change-set service. A
+`capture_changeset` node's parameters are the `changeset.capture` method's own typed parameters,
+and a `materialize_changeset` node's are `changeset.materialize`'s, so a node asks for exactly
+what the method asks for and nothing is interpreted along the way. The version a capture produces
+records the run that asked for it, whatever the document said, so evidence a later node reads is
+bound to the execution that made it.
+
+Every other registered action kind is refused by name. A refusal is not an uncertain outcome:
+nothing was dispatched, so the node failed and its dependants see a failure rather than a result
+nobody produced.
 
 ## Definitions and graph validation
 
@@ -69,8 +110,8 @@ the unit it derives them for.
   delivered to the attention engine (`kr_attention`) and settled there, so a chain that ran out
   raises one item however many refusals follow and whatever restarts intervene.
 * **Re-arming.** Only an authorised re-arm establishes a new budget. It advances the chain's
-  generation and resets its counters, so the same ceilings become usable again without anybody
-  raising them, and a descendant of a run from the previous generation is refused as late.
+  generation and resets its counters without anybody raising a ceiling, and a descendant of a run
+  from the previous generation carries that earlier generation and is refused as late.
 * **External triggers.** A trigger with no verifiable causal parent, an unauthenticated callback
   among them, is a new external trigger: the host mints its root and host-wide admission bounds
   it. It can never adopt a causal root of its choosing.
@@ -89,7 +130,8 @@ is what makes it runnable, and `workflow.pause` stops it.
 
 ## Durability, execution, and restart
 
-The workflow journal is an environment SQLite store located under the runtime directory.
+The workflow journal is an environment SQLite store in the environment's state directory, beside
+the daemon's registry, because a causal budget has to survive a reboot as well as a restart.
 * **Transactional commitment.** A trigger, its run, its deduplication key, its node receipts and
   the chain's budget reservation commit in one transaction before any node dispatches. A
   refusal commits its own consequences the same way: the chain's pause and the one attention
@@ -123,6 +165,7 @@ The source workflow registers what a run reported against the exact version it w
 * **Separate identities.** The agent, the test run and the reviewer each carry their own session
   and agent identity, and a review is recorded against the reviewer who gave it.
 
-The version, the session and the outcome come from the caller. Tying them to the execution that
-produced them, so that a result cannot be registered against a version the run never read, needs
-the host execution path and is not yet in place.
+A change-set version a run captured is bound to that run by the host, not by what the caller
+said: the provenance a capture records names the run that asked for it. A test result and a
+review result registered through the coordinator are still the caller's account of what happened,
+and binding those to the execution that produced them is the remaining half of this.

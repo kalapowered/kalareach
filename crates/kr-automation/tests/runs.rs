@@ -398,13 +398,11 @@ async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
     impl kr_automation::ActionRunner for UncertainRunner {
         fn execute(
             &self,
-            node: &WorkflowNode,
-            _action_id: kr_protocol::ids::ActionId,
-            _now_ms: u64,
+            dispatch: &kr_automation::Dispatch<'_>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
         > {
-            let node_id = node.node_id.clone();
+            let node_id = dispatch.node.node_id.clone();
             Box::pin(async move {
                 if node_id == "step1" {
                     // The action was dispatched and the answer never came back.
@@ -490,14 +488,12 @@ async fn cancellation_stops_undispatched_nodes() {
     impl kr_automation::ActionRunner for CancellingRunner {
         fn execute(
             &self,
-            node: &WorkflowNode,
-            _action_id: kr_protocol::ids::ActionId,
-            _now_ms: u64,
+            dispatch: &kr_automation::Dispatch<'_>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
         > {
             // While the first node runs, somebody cancels the run.
-            if node.node_id == "step1"
+            if dispatch.node.node_id == "step1"
                 && let Some(store) = self.store.lock().unwrap().as_ref()
             {
                 let engine = WorkflowEngine::with_clock(

@@ -15,7 +15,7 @@ use kr_protocol::automation::{
     EdgeCondition, NodeStatus, WorkflowDefinition, WorkflowEdge, WorkflowEnableParams,
     WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
 };
-use kr_protocol::ids::{ActionId, EnvironmentId, GrantId, WorkflowId};
+use kr_protocol::ids::{EnvironmentId, GrantId, WorkflowId};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, Uuid};
 
@@ -80,16 +80,14 @@ struct RevokesWhileRunning {
 impl ActionRunner for RevokesWhileRunning {
     fn execute(
         &self,
-        node: &WorkflowNode,
-        _action_id: ActionId,
-        _now_ms: u64,
+        dispatch: &kr_automation::Dispatch<'_>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
     > {
-        if node.node_id == "first" {
+        if dispatch.node.node_id == "first" {
             self.table.restand(self.grant_id, GrantStanding::Revoked);
         }
-        let output = format!("ran {}", node.node_id);
+        let output = format!("ran {}", dispatch.node.node_id);
         Box::pin(async move { Ok(ActionOutcome::Success { output }) })
     }
 }

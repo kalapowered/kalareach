@@ -362,6 +362,9 @@ pub struct Controller {
     /// The environment's change-set service, which reads repositories through the project
     /// service's own profile and boundary.
     changesets: Arc<crate::changeset::ChangeSetModule>,
+    /// The environment's automation service: workflow definitions, runs and the causal budgets
+    /// they share. It reads the grant each definition names from this daemon's own grant store.
+    automation: Arc<crate::automation::AutomationModule>,
     /// The serial boundary every contact-skill installation passes through.
     ///
     /// Reading an action's record, writing its dispatch marker, changing the files and recording
@@ -622,6 +625,17 @@ impl Controller {
         // force.
         feed.note_revision(authority_revision);
         sharing.grants().store_feed(&feed.snapshot())?;
+        // The automation service reads the grant each definition names from the grant store this
+        // daemon already holds, and carries out its change-set nodes through the change-set
+        // service, so it takes both rather than opening anything of its own beside its journal.
+        let automation = Arc::new(
+            crate::automation::AutomationModule::open(
+                &setup.paths,
+                Arc::clone(&sharing),
+                Arc::clone(changesets.service()),
+            )
+            .await?,
+        );
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
@@ -692,6 +706,7 @@ impl Controller {
             policy,
             feed: std::sync::Mutex::new(feed),
             changesets,
+            automation,
             agent_tools: tokio::sync::Mutex::new(()),
             worker_program,
             build_id: setup.build_id,
@@ -2243,6 +2258,12 @@ impl Controller {
         self.delivery_runtime.attach_transport(transports)
     }
 
+    /// The environment's automation service.
+    #[must_use]
+    pub const fn automation(&self) -> &Arc<crate::automation::AutomationModule> {
+        &self.automation
+    }
+
     /// Returns the registry, for a module that needs to read the environment's own records.
     pub(crate) const fn registry_handle(&self) -> &Mutex<Registry> {
         &self.registry
@@ -3138,6 +3159,9 @@ impl Controller {
             _ if crate::changeset::ChangeSetModule::serves(method) => {
                 crate::changeset::ChangeSetModule::check_subject(method, mutation)?;
             }
+            _ if crate::automation::AutomationModule::serves(method) => {
+                crate::automation::AutomationModule::check_subject(method, mutation)?;
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a mutation this daemon serves",
@@ -3615,6 +3639,9 @@ impl Controller {
         if crate::changeset::ChangeSetModule::serves(method) {
             return self.changesets.read_frame(request).await;
         }
+        if crate::automation::AutomationModule::serves(method) {
+            return self.automation.read_frame(request).await;
+        }
         // The diagnostics are two answers, not one. The owner at their own machine is shown the
         // paths this host resolved and the names they chose, because that is a person asking their
         // own host where its files are; everything else that reaches a read arrived over the
@@ -3778,6 +3805,42 @@ impl Controller {
                 self.project_mutation(actor_id, mutation, method, carried, None)
                     .await,
             );
+        }
+        if crate::automation::AutomationModule::serves(method) {
+            // Everything between the envelope check and this point can wait: for this task to be
+            // scheduled and for a blocking thread. An action whose accepted deadline passed while
+            // it queued does not go on to write, and neither does one whose connection lost its
+            // authority in the meantime.
+            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
+                return respond(
+                    mutation.request_id,
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                );
+            }
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
+            let answered = self.automation.write_frame(mutation, method).await;
+            // A run dispatches its nodes and waits for each of them, so the effect and its reply
+            // are separated by however long that took, and a revocation can land in the interval.
+            // What this host must not do is **disclose** an answer under authority that has since
+            // been withdrawn, so the check is made again here, where the reply is about to go out.
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
+            return answered;
         }
         if crate::changeset::ChangeSetModule::serves(method) {
             // Everything between the envelope check and this point can wait: for this task to be

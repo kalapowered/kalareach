@@ -44,14 +44,35 @@ pub enum ActionOutcome {
     },
 }
 
+/// Everything the host knows about the node it is about to dispatch.
+///
+/// A workflow's effects are the host's own actions, and section 25 requires the causal root, the
+/// depth and the parent to travel with every session, action and derived trigger a workflow
+/// creates. So a runner is handed the chain this node belongs to rather than only the node's own
+/// parameters: what it starts is recorded as this run's work, and the chain it charges is the one
+/// the host verified.
+#[derive(Clone, Copy, Debug)]
+pub struct Dispatch<'a> {
+    /// The run this node belongs to.
+    pub run_id: WorkflowRunId,
+    /// The definition being run.
+    pub definition: &'a WorkflowDefinition,
+    /// The node itself.
+    pub node: &'a WorkflowNode,
+    /// The action identifier the journal recorded for this node.
+    pub action_id: ActionId,
+    /// The verified causal chain this dispatch belongs to.
+    pub causal: &'a CausalContext,
+    /// The host's clock as it stood when the node was claimed.
+    pub now_ms: u64,
+}
+
 /// Trait implemented by action node runners (e.g., shell commands, test runners, reviews).
 pub trait ActionRunner: Send + Sync {
     /// Executes one action node.
     fn execute(
         &self,
-        node: &WorkflowNode,
-        action_id: ActionId,
-        now_ms: u64,
+        dispatch: &Dispatch<'_>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ActionOutcome>> + Send>>;
 }
 
@@ -80,18 +101,17 @@ impl MockActionRunner {
 impl ActionRunner for MockActionRunner {
     fn execute(
         &self,
-        node: &WorkflowNode,
-        _action_id: ActionId,
-        _now_ms: u64,
+        dispatch: &Dispatch<'_>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ActionOutcome>> + Send>> {
+        let node_id = dispatch.node.node_id.clone();
         let outcome = self
             .outcomes
             .lock()
             .unwrap()
-            .get(&node.node_id)
+            .get(&node_id)
             .cloned()
             .unwrap_or_else(|| ActionOutcome::Success {
-                output: format!("mock-success for {}", node.node_id),
+                output: format!("mock-success for {node_id}"),
             });
         Box::pin(async move { Ok(outcome) })
     }
@@ -318,8 +338,15 @@ impl WorkflowEngine {
                         return self.pause_on_refusal(run_id, &node.node_id, err, dispatch_time_ms);
                     }
 
-                    let action_id = node_actions[&node.node_id];
-                    let outcome_res = self.runner.execute(node, action_id, dispatch_time_ms).await;
+                    let dispatch = Dispatch {
+                        run_id,
+                        definition,
+                        node,
+                        action_id: node_actions[&node.node_id],
+                        causal: causal_ctx,
+                        now_ms: dispatch_time_ms,
+                    };
+                    let outcome_res = self.runner.execute(&dispatch).await;
 
                     match outcome_res {
                         Ok(ActionOutcome::Success { output }) => {

@@ -2389,8 +2389,15 @@ runs, and causal budgets.
 
 Workflows execute as versioned directed acyclic graphs of registered action nodes. Each run is
 bound to an explicit grant, an immutable causal root, and a causal budget. The workflow journal
-is an environment SQLite store in the daemon's runtime directory that commits triggers, runs,
-and budget reservations transactionally before execution dispatches.
+is an environment SQLite store in the environment's state directory that commits triggers, runs,
+and budget reservations transactionally before execution dispatches, and that keeps a budget
+across a restart and a reboot.
+
+The five methods of the automation group arrive through the daemon's ordinary path, and the
+grant each definition names is read from the daemon's own grant store rather than from the
+request. The daemon reads it again before every node a run dispatches, so a revocation or an
+expiry stops the run where it stands, and a node is dispatched only when that grant carries the
+right its effect needs.
 
 Admission limits enforce per-workflow concurrency, host-wide rates, and per-grant quotas.
 Breaching a causal budget pauses the chain with error code `CAUSAL_LIMIT`, rejects further

@@ -40,6 +40,23 @@ pub enum AutomationError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    /// This host could not read the grant a definition names, so it cannot say what it admits.
+    ///
+    /// This is not a refusal. A refusal says the grant does not authorise the work; this says the
+    /// host does not know, which is a different thing to tell a caller.
+    #[error("the grant store could not be read: {0}")]
+    AuthorityUnavailable(String),
+
+    /// This host carries out no action of that kind.
+    ///
+    /// Nothing was dispatched, so nothing happened: a node refused this way is a definite failure
+    /// of the run rather than an outcome nobody can establish.
+    #[error("this host carries out no action of kind '{action_kind}'")]
+    ActionUnavailable {
+        /// The action kind the node named.
+        action_kind: String,
+    },
+
     /// The named workflow was not found.
     #[error("workflow {0} not found")]
     WorkflowNotFound(WorkflowId),
@@ -215,6 +232,14 @@ impl From<AutomationError> for ProtocolError {
             AutomationError::PermissionDenied(message) => {
                 Self::new(ErrorCode::PermissionDenied, message)
             }
+            AutomationError::AuthorityUnavailable(message) => Self::new(
+                ErrorCode::StorageUnavailable,
+                format!("this host could not read the grant this workflow names: {message}"),
+            ),
+            AutomationError::ActionUnavailable { action_kind } => Self::new(
+                ErrorCode::ResourceUnavailable,
+                format!("this host carries out no action of kind '{action_kind}'"),
+            ),
             AutomationError::WorkflowNotFound(id) => Self::new(
                 ErrorCode::InvalidArgument,
                 format!("workflow {id} not found"),
