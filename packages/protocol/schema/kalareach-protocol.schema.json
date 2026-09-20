@@ -3498,6 +3498,100 @@
       ],
       "type": "object"
     },
+    "CommandBackend": {
+      "additionalProperties": false,
+      "description": "The worker-owned backend an integrated invocation is given.\n\nSection 12 requires it to exist *before* the native program starts, which is why it is part of\nthe answer to the hook that runs in front of the command rather than something a detected agent\nasks for afterwards. There is no other route to one: an agent that is noticed after it started\nnever gets a gateway created for it retroactively.",
+      "properties": {
+        "environment": {
+          "description": "The variables the shell exports for this one invocation.\n\nThey name this session and the worker's own private endpoint. A bypassed invocation is\ngiven none of them, which is what keeps its execution the one the person asked for.",
+          "items": {
+            "$ref": "#/$defs/EnvironmentVariable"
+          },
+          "type": "array"
+        },
+        "prompt_generation": {
+          "$ref": "#/$defs/PromptGeneration",
+          "description": "The prompt generation it is bound to.\n\nOne backend per accepted line. A second resolve for the same generation is answered with\nthe binding that already exists rather than with another one, and a generation that has\nmoved on has no binding at all: there is no route by which a program that is already\nrunning acquires one."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the backend belongs to."
+        }
+      },
+      "required": [
+        "session_id",
+        "prompt_generation",
+        "environment"
+      ],
+      "type": "object"
+    },
+    "CommandBypassReason": {
+      "description": "Why an invocation ran exactly as it was typed.\n\nSection 12: an absolute-path invocation and a user-disabled integration keep their actual\nbypassed execution, with only verified observation and the terminal's own capabilities.",
+      "oneOf": [
+        {
+          "const": "not_integrated",
+          "description": "No integration is configured for this command.",
+          "type": "string"
+        },
+        {
+          "const": "disabled",
+          "description": "The user has not enabled it.",
+          "type": "string"
+        },
+        {
+          "const": "absolute_path",
+          "description": "The command was invoked by absolute path, which is the documented way to bypass it.",
+          "type": "string"
+        },
+        {
+          "const": "unmanaged_shell",
+          "description": "The shell is not a managed KalaReach root shell.",
+          "type": "string"
+        },
+        {
+          "const": "not_interactive",
+          "description": "The invocation is a script rather than an interactive command.",
+          "type": "string"
+        },
+        {
+          "const": "backend_unavailable",
+          "description": "No worker-owned backend could be established, so the invocation runs as it was typed.\n\nSection 12 requires the backend to exist before the program does. A host that cannot\nestablish one does not add the integration flags either: an agent started with them and no\ngateway behind them is worse than one started without them.",
+          "type": "string"
+        },
+        {
+          "const": "session_closing",
+          "description": "The session is closing, so nothing new is started inside it.",
+          "type": "string"
+        }
+      ]
+    },
+    "CommandIntegration": {
+      "additionalProperties": false,
+      "description": "One agent's opt-in command integration.\n\nSection 12: where an agent needs integration flags, an explicitly enabled integration adds them\nto interactive invocations inside a managed root shell. The command name and the argument\nvector the person typed are preserved; the flags are added and nothing is removed or reordered.",
+      "properties": {
+        "command": {
+          "description": "The command name this integration applies to, as typed.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Whether the user has enabled it. A disabled integration changes nothing.",
+          "type": "boolean"
+        },
+        "flags": {
+          "description": "The flags the agent needs, added to an interactive invocation.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "command",
+        "flags",
+        "enabled"
+      ],
+      "type": "object"
+    },
     "ConfirmationChannel": {
       "description": "How an owner confirmation reached the host.\n\nNoninteractive confirmation from a session, plugin or contact-tool channel is rejected: an\nagent's process label, operating-system peer credentials, terminal output or a newly created\ninvitation context is not a confirmation.",
       "oneOf": [
@@ -8687,7 +8781,7 @@
       "type": "object"
     },
     "LaunchCommand": {
-      "description": "What a launch installs in the editor.\n\nAn argument vector is the safe form: the integration quotes it for its own shell. A quoted\ncommand is already the exact text to run, and neither form is assembled by interpolation.",
+      "description": "What a launch installs in the editor./// What a launch installs in the editor.\n\nAn argument vector is the safe form: the integration quotes it for its own shell. A quoted\ncommand is already the exact text to run, and neither form is assembled by interpolation.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -8719,6 +8813,33 @@
           "type": "object"
         }
       ]
+    },
+    "LaunchProfile": {
+      "additionalProperties": false,
+      "description": "How a session starts its root shell and what may be launched inside it.\n\nSection 23 lists the launch profile among `shell.launch`'s preconditions, beside the terminal\ninput right, the current input lease, a qualified root editor, an empty prompt behind a fence\nand the working-directory revision. It is the one of those six that is a decision about the\nsession rather than a fact about the reader, which is why it is fixed when the session is\ncreated and read back wherever the session is described.",
+      "properties": {
+        "command_integrations": {
+          "description": "The opt-in command integrations this session applies to interactive invocations.",
+          "items": {
+            "$ref": "#/$defs/CommandIntegration"
+          },
+          "type": "array"
+        },
+        "fenced_launch": {
+          "description": "Whether a host-authorised `shell.launch` may install a command in this session's editor.\n\nA profile that says no keeps everything else a managed session has: the fence, the\nempty-prompt end-of-file gesture and the attributed acceptance. What it refuses is the one\noperation that puts text a person did not type into their editor.",
+          "type": "boolean"
+        },
+        "startup": {
+          "$ref": "#/$defs/ShellStartup",
+          "description": "Which startup files the root shell reads."
+        }
+      },
+      "required": [
+        "startup",
+        "fenced_launch",
+        "command_integrations"
+      ],
+      "type": "object"
     },
     "LiveScreenPreview": {
       "additionalProperties": false,
@@ -17000,6 +17121,169 @@
       ],
       "type": "object"
     },
+    "RootCommandBlockParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `root.command.block`.\n\nSection 25: the shell adapter reports command blocks with their exit status, duration and\nworking directory, from the same private hooks the fence rests on. All four come from the\nreader's own boundaries rather than from parsed terminal output.",
+      "properties": {
+        "command": {
+          "description": "The command line, exactly as the editor accepted it.",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "The working directory it ran in.",
+          "type": "string"
+        },
+        "cwd_revision": {
+          "$ref": "#/$defs/CwdRevision",
+          "description": "The working-directory revision at that boundary, which is what a launch is checked against."
+        },
+        "duration_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long it ran. Null while it is still running."
+        },
+        "exit_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The status it exited with. Null while it is still running."
+        },
+        "prompt_generation": {
+          "$ref": "#/$defs/PromptGeneration",
+          "description": "The prompt generation the command was accepted at."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "started_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it started."
+        }
+      },
+      "required": [
+        "session_id",
+        "prompt_generation",
+        "command",
+        "started_at_ms",
+        "duration_ms",
+        "exit_status",
+        "cwd",
+        "cwd_revision"
+      ],
+      "type": "object"
+    },
+    "RootCommandBlockResult": {
+      "additionalProperties": false,
+      "description": "The result of `root.command.block`.",
+      "properties": {
+        "prompt_generation": {
+          "$ref": "#/$defs/PromptGeneration",
+          "description": "The prompt generation the block was recorded under."
+        },
+        "retained": {
+          "$ref": "#/$defs/U64",
+          "description": "How many blocks the session is retaining, newest included."
+        }
+      },
+      "required": [
+        "prompt_generation",
+        "retained"
+      ],
+      "type": "object"
+    },
+    "RootCommandResolveParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `root.command.resolve`.\n\nThe integration's pre-execution hook asks the worker what to run, before it runs anything. The\ncommand name and the argument vector are the person's; what the answer may do is add flags.",
+      "properties": {
+        "argv": {
+          "description": "The invocation, split by the shell: the command name first, then its arguments.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "interactive": {
+          "description": "Whether this is an interactive invocation rather than a line of a script.",
+          "type": "boolean"
+        },
+        "prompt_generation": {
+          "$ref": "#/$defs/PromptGeneration",
+          "description": "The prompt generation the line this invocation came from was accepted at."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "prompt_generation",
+        "argv",
+        "interactive"
+      ],
+      "type": "object"
+    },
+    "RootCommandResolveResult": {
+      "additionalProperties": false,
+      "description": "The result of `root.command.resolve`.",
+      "properties": {
+        "added": {
+          "description": "The flags this answer added. Empty for a bypassed invocation.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "arguments": {
+          "description": "The argument vector to run: what was typed, plus any flags the integration added.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandBackend"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The worker-owned backend, established before this answer was sent. Null for a bypass."
+        },
+        "bypass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandBypassReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the invocation was left alone, or null when the integration applied."
+        }
+      },
+      "required": [
+        "arguments",
+        "added",
+        "bypass",
+        "backend"
+      ],
+      "type": "object"
+    },
     "RootEditorEnterParams": {
       "additionalProperties": false,
       "description": "Parameters of `root.editor.enter`.\n\nSent when the actual primary reader starts, not when a prompt is printed. A prompt hook runs\nbefore the reader exists and cannot stand in for this.",
@@ -17820,6 +18104,10 @@
           },
           "type": "array"
         },
+        "launch_profile": {
+          "$ref": "#/$defs/LaunchProfile",
+          "description": "How this session starts its root shell and what may be launched inside it."
+        },
         "palette": {
           "anyOf": [
             {
@@ -17850,6 +18138,17 @@
           "$ref": "#/$defs/ShellMode",
           "description": "The shell integration mode."
         },
+        "terminal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The terminal application a `terminal` presentation opens in, by its stable identifier.\n\nThe first step of section 7's order. Null leaves the choice to the host, which detects what\nis installed; a named application this host does not have is `TERMINAL_UNAVAILABLE` rather\nthan a substitution, because somebody asked for that terminal."
+        },
         "worker_profile": {
           "$ref": "#/$defs/WorkerProfile",
           "description": "How long the worker's execution context should last."
@@ -17864,7 +18163,9 @@
         "dimensions",
         "worker_profile",
         "environment_snapshot",
-        "palette"
+        "palette",
+        "launch_profile",
+        "terminal"
       ],
       "type": "object"
     },
@@ -18050,6 +18351,39 @@
           ],
           "description": "The endpoint a local client can attach to, while the session is running."
         },
+        "last_command_block": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RootCommandBlockParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The most recent command block the session's private hooks reported.\n\nSection 25's typed event: the command, its exit status, how long it ran and where. Null\nwhere the host does not say, which is not the same as no command having run: no hook has\nreported one, which is every session without a managed root integration; the caller's grant\ndoes not reach it; or the worker is from a build that did not report blocks."
+        },
+        "launch_profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchProfile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How this session starts its root shell and what may be launched inside it.\n\nNull where the host does not say, which is not the same as a session without a profile: a\nsession that has already closed, whose profile decides nothing any more, and a live session\nwhose worker is from a build that did not report one."
+        },
+        "outstanding_launches": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How many `shell.launch` confirmations this session is still waiting on its reader for.\n\nWork this host has admitted and not finished: a launch is with the reader, and the caller\nis waiting for the reader's decision. Null and zero are different answers. Null is the host\nnot saying: a session with no managed root editor, one that has closed, or one whose worker\nis from a build that did not report a count. Zero is a session that could have one and has\nnone."
+        },
         "session": {
           "$ref": "#/$defs/SessionSummary",
           "description": "The session."
@@ -18057,7 +18391,10 @@
       },
       "required": [
         "session",
-        "endpoint"
+        "endpoint",
+        "launch_profile",
+        "last_command_block",
+        "outstanding_launches"
       ],
       "type": "object"
     },
@@ -18346,6 +18683,26 @@
         {
           "const": "native_compat",
           "description": "An explicitly selected stock shell. Create, attach, detach, close, transfer and terminal\npresentation all work. Empty-prompt Ctrl-D, fenced `shell.launch` and authoritative\neditor-buffer observation do not: Ctrl-D follows the shell's own behaviour and can close\nthe session, and `kr detach` remains available.",
+          "type": "string"
+        }
+      ]
+    },
+    "ShellStartup": {
+      "description": "Whether a root shell reads the user's login startup as well as its interactive startup.\n\nSection 7 states the platform defaults: macOS runs normal login startup, including any path\nchanges it makes, and Linux does not unless a profile asks for it. That is a property of the\nsession being created rather than of the shell package, so it travels with the create request.",
+      "oneOf": [
+        {
+          "const": "host_default",
+          "description": "Whatever the host platform does when nothing asks otherwise.",
+          "type": "string"
+        },
+        {
+          "const": "interactive",
+          "description": "The interactive startup only.",
+          "type": "string"
+        },
+        {
+          "const": "login",
+          "description": "The login startup as well.",
           "type": "string"
         }
       ]
@@ -22661,6 +23018,18 @@
     },
     "root_command_accepted_result": {
       "$ref": "#/$defs/RootCommandAcceptedResult"
+    },
+    "root_command_block_params": {
+      "$ref": "#/$defs/RootCommandBlockParams"
+    },
+    "root_command_block_result": {
+      "$ref": "#/$defs/RootCommandBlockResult"
+    },
+    "root_command_resolve_params": {
+      "$ref": "#/$defs/RootCommandResolveParams"
+    },
+    "root_command_resolve_result": {
+      "$ref": "#/$defs/RootCommandResolveResult"
     },
     "root_editor_busy_event": {
       "$ref": "#/$defs/EditorBusyEvent"
