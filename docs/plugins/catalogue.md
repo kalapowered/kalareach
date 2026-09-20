@@ -173,7 +173,7 @@ prompts. Past the default, each decision is somebody's and they are not intercha
 | Anything the previous installation did not hold | An installation grant, because an increase is a new decision |
 
 Qualification data ships as signed, immutable catalogue artifacts, separately from host binaries. A
-vendor can say "this release was qualified against Codex 1.4" without waiting for a core release,
+vendor can say "this release was qualified against ExternalApp 1.4" without waiting for a core release,
 and four lines hold:
 
 - a qualification cannot create a new primitive effect: it may only describe a capability the

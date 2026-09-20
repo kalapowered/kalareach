@@ -535,3 +535,22 @@ is the question worth answering; it does not replay what the run was doing.
 `bundled-plugins/` against the lock and reports any drift, including a file, a directory or a whole
 package that is there and is not in the lock. It reaches no network, builds nothing and needs no
 plugin repository, which is why it runs in continuous integration.
+
+## Capability ceiling and installation grants
+
+Section 11 establishes the repository ceiling to bound what packages can do without explicit
+permission. When evaluating what a requested capability requires, the SDK's stricter rule governs:
+the capabilities `terminal.input`, `filesystem.read`, `network.outbound`, `approval.decode`, and
+`approval.respond` require an explicit installation grant even where an explicit repository grant
+exists.
+
+| Capability | Requirement |
+| --- | --- |
+| `metadata.match`, `presentation.declarative`, `broker.semantic_events` | Within default ceiling (enrolment already permits) |
+| `terminal.stream`, `terminal.transcript_tail`, `process.observe`, `upstream.action` | Explicit repository or installation grant |
+| `terminal.input`, `filesystem.read`, `network.outbound`, `approval.decode`, `approval.respond` | Explicit installation grant required (repository ceiling cannot satisfy) |
+| `native_bridge.install` | Confirmed installation grant (owner confirmation required) |
+
+The specification's "package or repository grant" names the ceiling's source, and the stricter check
+never grants more than either. An increase over what the previous installation held also requires an
+installation grant.
