@@ -1,7 +1,6 @@
 package to.kala.reach.companion.push
 
 import android.content.Context
-import android.os.Build
 import android.os.UserManager
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
@@ -55,7 +54,6 @@ class KeystorePreviewKeys(private val context: Context) : PreviewKeyReading {
     }
 
     private fun isUnlockedSinceBoot(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return true
         val users = context.getSystemService(UserManager::class.java) ?: return true
         return users.isUserUnlocked
     }
