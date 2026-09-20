@@ -595,13 +595,14 @@ fn build_owner_only_directory(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(unix))]
+/// Creates the directory with an access-control list of this host's own.
+///
+/// The list is protected, so nothing above it in the user profile is inherited into it, and it
+/// carries an inherit-only entry for the object's owner, so a file or a directory created beneath
+/// it is owner-only without a second call per object.
+#[cfg(windows)]
 fn build_owner_only_directory(path: &Path) -> Result<()> {
-    match std::fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(IpcError::io("create", path, error)),
-    }
+    windows::create_owner_only_directory(path)
 }
 
 #[cfg(unix)]
@@ -622,13 +623,523 @@ fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn check_owner_only(_path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
-    // Windows has no mode bits. The runtime and state directories live under the user's own
-    // profile, and each endpoint carries its own owner-only access-control list; the Windows
-    // qualification pass adds an explicit protected access-control list here.
-    Ok(())
+/// Checks that a directory belongs to this user and that its list names nobody else.
+///
+/// Windows has no mode bits, so the question the Unix check asks of a mode is asked of the
+/// object's access-control list, and it is read from a handle rather than from the name: what
+/// answers is the directory that was opened.
+///
+/// A *protected* list is not demanded here, though every directory this host creates carries one.
+/// A KalaReach root can legitimately be created on the way to another - on Windows the runtime
+/// root lives inside the state root - and a directory created as a parent is an ordinary one of
+/// the user's profile until this host adopts it. Its inherited entries name this user, the local
+/// system and the administrators group, all of which already hold the machine, and demanding
+/// protection of it would refuse a perfectly ordinary installation for a reason it could not act
+/// on. What is refused is a directory owned by another account, or one whose list grants access to
+/// anybody but the accounts above. A directory whose list must be proof against the one above it
+/// asks for that explicitly, through [`check_access_list`].
+#[cfg(windows)]
+fn check_owner_only(path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsHandle as _;
+
+    // A directory has no data to read, and Windows will not open one at all without the backup
+    // semantics that say so. The open asks for read access, which carries the right to read the
+    // object's own security information, and for nothing else.
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|error| IpcError::io("inspect", path, error))?;
+    let what = path.display().to_string();
+    match check_access_list(directory.as_handle(), &what, false) {
+        Ok(()) => Ok(()),
+        Err(AccessListRefusal::Policy(detail)) => Err(IpcError::DirectoryAccessRefused {
+            path: path.to_path_buf(),
+            detail,
+        }),
+        Err(AccessListRefusal::Unreadable(detail)) => {
+            Err(IpcError::io("inspect", path, std::io::Error::other(detail)))
+        }
+    }
 }
+
+/// The Windows access rules of this host's own directories.
+///
+/// Windows has no mode bits, so the equivalent of `0700` is the object's access-control list. Two
+/// things have to happen to it. A directory is created with a list of this host's own, protected
+/// so nothing is inherited into it from the user profile above. Every later open reads the list
+/// back from the handle it just opened and refuses one that has been widened, because a directory
+/// that already existed is a directory this host did not create.
+///
+/// This is one of the two places in this crate that leave safe Rust. The list comes from
+/// `advapi32` and is applied by `kernel32`, and reading one back is four more calls into the same
+/// library.
+#[cfg(windows)]
+mod windows {
+    #![expect(
+        unsafe_code,
+        reason = "an owner-only access-control list, and reading one back from an opened handle, \
+                  are calls into advapi32, which has no safe interface"
+    )]
+
+    use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+        TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use crate::error::{IpcError, Result};
+
+    /// The object's owner only, with inheritance blocked and children covered.
+    ///
+    /// `D:P` makes the list protected, so no inherited entry from the user profile widens it.
+    /// `(A;;GA;;;OW)` grants everything to OWNER RIGHTS, which resolves to whoever owns the object:
+    /// the process that created the directory, which is this user. `(A;OICIIO;GA;;;CO)` is
+    /// inherit-only and names CREATOR OWNER, the placeholder that becomes the owner's own entry on
+    /// each file and directory created beneath, so a payload file is owner-only without a second call
+    /// per file.
+    const OWNER_ONLY_DESCRIPTOR: &str = "D:P(A;;GA;;;OW)(A;OICIIO;GA;;;CO)";
+
+    /// The accounts an entry in one of these directories may name.
+    ///
+    /// `S-1-5-18` is the local system and `S-1-5-32-544` the local administrators group: both already
+    /// hold the machine, and nothing this host does can keep them out. `S-1-3-0` is CREATOR OWNER and
+    /// `S-1-3-4` is OWNER RIGHTS, the two placeholders that resolve to the object's owner, which is
+    /// this user. The owner itself is trusted separately. Every other account is a refusal.
+    const TRUSTED_ACCOUNTS: &[&str] = &["S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4"];
+
+    /// An entry that grants access.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    /// An entry that denies access, which cannot widen anything.
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    /// An entry that records an access attempt.
+    const SYSTEM_AUDIT_ACE_TYPE: u8 = 2;
+    /// An entry that raises an alarm on an access attempt.
+    const SYSTEM_ALARM_ACE_TYPE: u8 = 3;
+
+    /// Why an access-control list was not accepted.
+    #[derive(Debug)]
+    pub enum AccessListRefusal {
+        /// The list could not be read, which is a storage failure rather than a policy one.
+        Unreadable(String),
+        /// The list was read and does not meet the policy.
+        Policy(String),
+    }
+
+    /// Creates a directory whose access-control list names its owner and nothing else.
+    ///
+    /// An existing directory is left alone: the caller checks the list it already carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the list cannot be built or the directory cannot be created.
+    pub(super) fn create_owner_only_directory(path: &Path) -> Result<()> {
+        create_directory_with_list(path, OWNER_ONLY_DESCRIPTOR)
+    }
+
+    /// Creates a directory with one explicit access-control list, written as SDDL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the list cannot be built or the directory cannot be created.
+    pub(super) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<()> {
+        let wide_path = wide(path.as_os_str());
+        let wide_descriptor = wide_str(descriptor);
+        let mut built: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: both pointers are null-terminated wide buffers this function owns for the whole
+        // call, `built` is a live out parameter, and the size parameter is optional.
+        let parsed = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_descriptor.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut built,
+                std::ptr::null_mut(),
+            )
+        };
+        if parsed == 0 {
+            return Err(IpcError::io(
+                "create",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: built,
+            bInheritHandle: 0,
+        };
+        // SAFETY: `wide_path` is a null-terminated wide buffer this function owns, and `attributes`
+        // points at a descriptor that stays live until it is freed below.
+        let created = unsafe { CreateDirectoryW(wide_path.as_ptr(), &raw const attributes) };
+        let failure = (created == 0).then(std::io::Error::last_os_error);
+        // SAFETY: `built` was allocated by the conversion above and is freed exactly once.
+        unsafe {
+            LocalFree(built.cast());
+        }
+        match failure {
+            None => Ok(()),
+            // An existing staging directory is the ordinary case on every start after the first. Its
+            // list is checked by the caller rather than replaced here.
+            Some(error) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS.cast_signed()) => {
+                Ok(())
+            }
+            Some(error) => Err(IpcError::io("create", path, error)),
+        }
+    }
+
+    /// Checks the access-control list of an opened directory.
+    ///
+    /// `what` names the directory in the refusal. `require_protected` additionally demands a protected
+    /// list, which is the check for a boundary directory: nothing above it can widen it later. A
+    /// directory beneath one of those inherits the owner entry from it by design, so its list is
+    /// checked for the accounts it names and not for protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessListRefusal::Unreadable`] when the list cannot be read and [`AccessListRefusal::Policy`] when it
+    /// names an account this host does not trust.
+    pub fn check_access_list(
+        handle: BorrowedHandle<'_>,
+        what: &str,
+        require_protected: bool,
+    ) -> std::result::Result<(), AccessListRefusal> {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut list: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle is borrowed for the whole call and was opened for reading, which on
+        // Windows carries the right to read the list. The three out parameters are live, and the two
+        // this host does not ask for are null, which the function documents as "do not return this".
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &raw mut owner,
+                std::ptr::null_mut(),
+                &raw mut list,
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(AccessListRefusal::Unreadable(format!(
+                "the access-control list of {what} could not be read: {}",
+                std::io::Error::from_raw_os_error(status.cast_signed())
+            )));
+        }
+        let outcome = evaluate(owner, list, descriptor, what, require_protected);
+        // SAFETY: the descriptor came from the call above and is freed exactly once. `owner` and
+        // `list` point into it and are not used after this.
+        unsafe {
+            LocalFree(descriptor.cast());
+        }
+        outcome
+    }
+
+    /// Applies the policy to a list that has been read.
+    fn evaluate(
+        owner: PSID,
+        list: *mut ACL,
+        descriptor: PSECURITY_DESCRIPTOR,
+        what: &str,
+        require_protected: bool,
+    ) -> std::result::Result<(), AccessListRefusal> {
+        if owner.is_null() {
+            return Err(AccessListRefusal::Policy(format!(
+                "{what} records no owner"
+            )));
+        }
+        if require_protected {
+            let mut control: u16 = 0;
+            let mut revision: u32 = 0;
+            // SAFETY: the descriptor is the one just read, and both out parameters are live.
+            let read = unsafe {
+                GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision)
+            };
+            if read == 0 {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "the access-control list of {what} could not be inspected: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if control & SE_DACL_PROTECTED == 0 {
+                return Err(AccessListRefusal::Policy(format!(
+                    "{what} inherits its access-control list from the directory above it, which can \
+                     widen it at any time"
+                )));
+            }
+        }
+        // A missing list is not an empty one: an object with no list at all grants every account full
+        // access, which is the widest answer Windows has.
+        if list.is_null() {
+            return Err(AccessListRefusal::Policy(format!(
+                "{what} carries no access-control list, which grants every account full access"
+            )));
+        }
+        let accounts = TokenAccounts::read()?;
+        let mut trusted = Vec::with_capacity(TRUSTED_ACCOUNTS.len());
+        for text in TRUSTED_ACCOUNTS {
+            trusted.push(OwnedSid::parse(text)?);
+        }
+        // Two different rules, so they are two different predicates. The owner has to be an account
+        // this process could have created the directory as: its own user, or the owner new objects of
+        // this process receive. The machine's own accounts are trusted to *hold* the directory, which
+        // nothing can prevent, but a directory owned by one of them is not one this host created.
+        let is_owner = |sid: PSID| equal(sid, accounts.user()) || equal(sid, accounts.owner());
+        let permitted = |sid: PSID| {
+            is_owner(sid) || trusted.iter().any(|account| equal(sid, account.as_psid()))
+        };
+        if !is_owner(owner) {
+            return Err(AccessListRefusal::Policy(format!(
+                "{what} belongs to {}, and this host runs as another account",
+                describe(owner)
+            )));
+        }
+        // SAFETY: `list` points at the list inside the descriptor read above.
+        let count = unsafe { (*list).AceCount };
+        for index in 0..u32::from(count) {
+            let mut entry: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `list` is live and `index` is below the entry count it reported.
+            let got = unsafe { GetAce(list, index, &raw mut entry) };
+            if got == 0 || entry.is_null() {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "entry {index} of the access-control list of {what} could not be read: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: every entry in a list begins with its header.
+            let header = unsafe { std::ptr::read(entry.cast::<ACE_HEADER>()) };
+            match header.AceType {
+                // A denial, an audit and an alarm grant nothing.
+                ACCESS_DENIED_ACE_TYPE | SYSTEM_AUDIT_ACE_TYPE | SYSTEM_ALARM_ACE_TYPE => continue,
+                ACCESS_ALLOWED_ACE_TYPE => {}
+                // A callback or conditional entry can grant access on terms this host does not read.
+                // Refusing it is the answer that cannot be wrong.
+                other => {
+                    return Err(AccessListRefusal::Policy(format!(
+                        "the access-control list of {what} carries a type-{other} entry, which this \
+                         host does not evaluate"
+                    )));
+                }
+            }
+            // SAFETY: the identifier of an allowed entry begins at the offset of `SidStart` within it,
+            // inside the list this pointer came from.
+            let sid: PSID = unsafe {
+                entry
+                    .cast::<u8>()
+                    .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+            }
+            .cast();
+            if !permitted(sid) {
+                return Err(AccessListRefusal::Policy(format!(
+                    "the access-control list of {what} grants access to {}, which is neither its \
+                     owner nor an account that already holds this machine",
+                    describe(sid)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A security identifier this module allocated.
+    struct OwnedSid(PSID);
+
+    impl OwnedSid {
+        /// Resolves one identifier written in the numeric form.
+        fn parse(text: &str) -> std::result::Result<Self, AccessListRefusal> {
+            let wide = wide_str(text);
+            let mut sid: PSID = std::ptr::null_mut();
+            // SAFETY: `wide` is a null-terminated wide buffer this function owns for the call, and
+            // `sid` is a live out parameter.
+            let parsed = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut sid) };
+            if parsed == 0 || sid.is_null() {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "the account {text} could not be resolved: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(Self(sid))
+        }
+
+        const fn as_psid(&self) -> PSID {
+            self.0
+        }
+    }
+
+    impl Drop for OwnedSid {
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from the resolution above and is freed exactly once.
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
+    }
+
+    /// The two accounts this process could have created a directory as.
+    struct TokenAccounts {
+        /// The buffer holding this process's user identifier.
+        user: Vec<u64>,
+        /// The buffer holding the identifier new objects of this process are owned by.
+        owner: Vec<u64>,
+    }
+
+    impl TokenAccounts {
+        /// Reads both from this process's own token.
+        fn read() -> std::result::Result<Self, AccessListRefusal> {
+            let token = TokenHandle::open()?;
+            Ok(Self {
+                user: token.information(TokenUser, std::mem::size_of::<TOKEN_USER>())?,
+                owner: token.information(TokenOwner, std::mem::size_of::<TOKEN_OWNER>())?,
+            })
+        }
+
+        /// Returns this process's user, which points into the buffer this holds.
+        fn user(&self) -> PSID {
+            // SAFETY: the buffer holds a `TOKEN_USER` the kernel wrote, and a `Vec<u64>` is aligned
+            // for the pointer inside it.
+            unsafe { std::ptr::read(self.user.as_ptr().cast::<TOKEN_USER>()) }
+                .User
+                .Sid
+        }
+
+        /// Returns the owner new objects of this process receive.
+        fn owner(&self) -> PSID {
+            // SAFETY: the buffer holds a `TOKEN_OWNER` the kernel wrote, aligned as above.
+            unsafe { std::ptr::read(self.owner.as_ptr().cast::<TOKEN_OWNER>()) }.Owner
+        }
+    }
+
+    /// This process's own token, closed when it goes out of scope.
+    struct TokenHandle(HANDLE);
+
+    impl TokenHandle {
+        /// Opens the token for reading.
+        fn open() -> std::result::Result<Self, AccessListRefusal> {
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: the process handle is a pseudo-handle that needs no release, and `token` is a
+            // live out parameter.
+            let opened =
+                unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) };
+            if opened == 0 || token.is_null() {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "this process's own token could not be read: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(Self(token))
+        }
+
+        /// Reads one class of token information into an aligned buffer.
+        fn information(
+            &self,
+            class: TOKEN_INFORMATION_CLASS,
+            least: usize,
+        ) -> std::result::Result<Vec<u64>, AccessListRefusal> {
+            let mut needed: u32 = 0;
+            // SAFETY: a null buffer with a zero length asks for the size, which is what this call is
+            // for; `needed` is a live out parameter and the failure it returns is expected.
+            let _ = unsafe {
+                GetTokenInformation(self.0, class, std::ptr::null_mut(), 0, &raw mut needed)
+            };
+            let bytes = usize::try_from(needed).unwrap_or(0).max(least);
+            let mut buffer = vec![0_u64; bytes.div_ceil(8).max(1)];
+            let length = u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX);
+            // SAFETY: the buffer holds `length` bytes, which is at least the size the call above
+            // reported, and `needed` is a live out parameter.
+            let read = unsafe {
+                GetTokenInformation(
+                    self.0,
+                    class,
+                    buffer.as_mut_ptr().cast(),
+                    length,
+                    &raw mut needed,
+                )
+            };
+            if read == 0 {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "this process's own accounts could not be read: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if usize::try_from(needed).unwrap_or(0) < least {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "this process's own token returned {needed} bytes where {least} were needed"
+                )));
+            }
+            Ok(buffer)
+        }
+    }
+
+    impl Drop for TokenHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from the open above and is closed exactly once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Compares two identifiers, treating a missing one as no match.
+    fn equal(left: PSID, right: PSID) -> bool {
+        if left.is_null() || right.is_null() {
+            return false;
+        }
+        // SAFETY: both pointers name live identifiers inside buffers this call does not outlive.
+        unsafe { EqualSid(left, right) != 0 }
+    }
+
+    /// Names one identifier for a refusal.
+    fn describe(sid: PSID) -> String {
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` is live and `text` is a live out parameter.
+        let converted = unsafe { ConvertSidToStringSidW(sid, &raw mut text) };
+        if converted == 0 || text.is_null() {
+            return "an account that could not be named".to_owned();
+        }
+        let mut length = 0_usize;
+        // SAFETY: the buffer the conversion allocated is null-terminated, so the scan stops inside it.
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: the buffer holds `length` code units before its terminator.
+        let described =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        // SAFETY: the buffer came from the conversion above and is freed exactly once.
+        unsafe {
+            LocalFree(text.cast());
+        }
+        described
+    }
+
+    /// Encodes a path for the wide form of a Windows call.
+    fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        text.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Encodes a string for the wide form of a Windows call.
+    fn wide_str(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+#[cfg(windows)]
+pub use self::windows::{AccessListRefusal, check_access_list};
 
 /// Returns the current user's identifier.
 #[cfg(unix)]
@@ -892,9 +1403,10 @@ fn sync_directory(directory: &Path) -> Result<()> {
 
 /// Flushes a directory entry to disk after a file inside it is created or renamed.
 ///
-/// Windows has no directory handle a program can synchronise: a directory cannot be opened for
-/// reading and `FlushFileBuffers` has nothing to act on. The ordering the rename needs is the
-/// filesystem's own, so there is nothing here to do and nothing to report.
+/// Windows has no directory handle a program can synchronise. A directory can be opened, with the
+/// backup semantics that say so, but `FlushFileBuffers` on that handle is not an operation the
+/// platform supports. The ordering the rename needs is the filesystem's own, so there is nothing
+/// here to do and nothing to report.
 #[cfg(not(unix))]
 const fn sync_directory(_directory: &Path) -> Result<()> {
     Ok(())
@@ -1169,6 +1681,80 @@ mod tests {
         environment
             .worker_endpoint(DisplayNumber::new(999_999))
             .expect("fits");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Opens a directory the way the owner-only check does.
+    #[cfg(windows)]
+    fn opened(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("opens the directory")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_private_directory_carries_a_protected_owner_only_list() {
+        use std::os::windows::io::AsHandle as _;
+
+        let root = temporary_root("acl-owner");
+        let path = root.join("private");
+        create_private_directory(&path).expect("creates");
+
+        check_access_list(opened(&path).as_handle(), "the directory", true)
+            .expect("the list is this host's own and nothing above it can widen it");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_that_grants_another_account_is_refused() {
+        let root = temporary_root("acl-wide");
+        let path = root.join("wide");
+        // `WD` is the Everyone group and `GA` is full control.
+        windows::create_directory_with_list(&path, "D:P(A;;GA;;;OW)(A;;GA;;;WD)").expect("creates");
+
+        let error = create_private_directory(&path).expect_err("refuses");
+
+        assert!(
+            matches!(
+                &error,
+                IpcError::DirectoryAccessRefused { detail, .. } if detail.contains("grants access to")
+            ),
+            "a list naming Everyone is refused, got {error}"
+        );
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_that_inherits_its_list_is_adopted_but_is_not_a_boundary() {
+        use std::os::windows::io::AsHandle as _;
+
+        let root = temporary_root("acl-inherited");
+        let path = root.join("inherited");
+        // Created without a list of its own, so it inherits the one above it.
+        std::fs::create_dir(&path).expect("creates");
+
+        let refusal = check_access_list(opened(&path).as_handle(), "the directory", true)
+            .expect_err("a directory that inherits its list is not a boundary");
+        assert!(
+            matches!(refusal, AccessListRefusal::Policy(detail) if detail.contains("inherits")),
+            "the refusal names inheritance"
+        );
+        // The entries it inherited name this user, the local system and the administrators group,
+        // so it is still a directory this host can use.
+        create_private_directory(&path).expect("adopts a directory of this user's own");
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

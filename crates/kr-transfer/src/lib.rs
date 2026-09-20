@@ -65,19 +65,6 @@ pub mod service;
 pub mod staging;
 pub mod store;
 
-/// The access-control list of this service's own directories.
-///
-/// Windows has no mode bits, so an owner-only directory is one whose list says so. Building that
-/// list and reading one back are calls into `advapi32`, which is why this module is allowed to
-/// leave safe Rust and nothing else in the crate is.
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "an owner-only access-control list, and reading one back from an opened handle, are \
-              calls into advapi32; this is the only module in this crate that leaves safe Rust"
-)]
-mod windows;
-
 /// Whether an open Apple file carries an access-control list.
 ///
 /// The platform's list is reachable only through a descriptor and only through its own interface,

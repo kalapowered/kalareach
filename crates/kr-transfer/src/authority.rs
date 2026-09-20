@@ -1529,23 +1529,24 @@ fn owner_only(directory: &Dir, path: &str, _privacy: Privacy) -> Result<(), Esca
 
 /// Checks the access-control list of a directory on Windows, which is where its access rules live.
 ///
-/// The list is read from the handle that was opened, so an existing directory is checked rather
-/// than adopted. A list that names any account except the directory's owner, the local system and
-/// the administrators group is refused; so is one whose entries this host cannot evaluate. A
-/// boundary additionally has to hold a protected list.
+/// The check itself is `kr-ipc`'s, because every private directory this host makes carries the
+/// same list. The list is read from the handle that was opened, so an existing directory is
+/// checked rather than adopted. A list that names any account except the directory's owner, the
+/// local system and the administrators group is refused; so is one whose entries this host cannot
+/// evaluate. A boundary additionally has to hold a protected list.
 #[cfg(not(unix))]
 fn owner_only(directory: &Dir, path: &str, privacy: Privacy) -> Result<(), Escape> {
     use std::os::windows::io::AsHandle as _;
 
-    let outcome = crate::windows::check_access_list(
+    let outcome = kr_ipc::paths::check_access_list(
         directory.as_handle(),
         path,
         matches!(privacy, Privacy::Boundary),
     );
     match outcome {
         Ok(()) => Ok(()),
-        Err(crate::windows::Refusal::Policy(detail)) => Err(Escape::WrongKind { detail }),
-        Err(crate::windows::Refusal::Unreadable(detail)) => Err(Escape::Unopenable {
+        Err(kr_ipc::paths::AccessListRefusal::Policy(detail)) => Err(Escape::WrongKind { detail }),
+        Err(kr_ipc::paths::AccessListRefusal::Unreadable(detail)) => Err(Escape::Unopenable {
             component: path.to_owned(),
             detail,
         }),

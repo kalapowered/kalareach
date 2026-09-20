@@ -247,9 +247,10 @@ fn build_private_staging_directory(
 ) -> Result<AuthorisedDirectory> {
     // The list is applied at creation, by absolute path, because that is the one call Windows
     // offers for it. It happens once, at startup, inside the environment's own state directory;
-    // every access after it is relative to the handle this returns.
+    // every access after it is relative to the handle this returns. The directory is made the way
+    // every other private directory of this host is, so one rule decides what the list says.
     let path = root.host_path(name);
-    crate::windows::create_owner_only_directory(&path)?;
+    kr_ipc::paths::create_private_directory(&path)?;
     root.subdirectory(name).map_err(TransferError::from)
 }
 

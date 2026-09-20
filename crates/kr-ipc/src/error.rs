@@ -45,6 +45,17 @@ pub enum IpcError {
         /// The permission bits it carries.
         found_mode: u32,
     },
+    /// A directory that must be owner-only carries an access-control list that says otherwise.
+    ///
+    /// The Windows answer to the question [`Self::DirectoryNotOwnerOnly`] asks on Unix. There are
+    /// no mode bits to report, so what is carried is what the list said.
+    #[error("{path} is not owner-only: {detail}")]
+    DirectoryAccessRefused {
+        /// The directory.
+        path: PathBuf,
+        /// What its access-control list says.
+        detail: String,
+    },
     /// A computed socket path exceeded what the platform's address family allows.
     #[error("socket path {path} is {len} bytes, over the {limit}-byte platform limit")]
     SocketPathTooLong {
@@ -147,6 +158,7 @@ impl IpcError {
                 ErrorCode::ResourceUnavailable
             }
             Self::DirectoryNotOwnerOnly { .. }
+            | Self::DirectoryAccessRefused { .. }
             | Self::PeerRejected { .. }
             | Self::UntrustedFile { .. } => ErrorCode::PermissionDenied,
             Self::EnvironmentPrefixCollision { .. } => ErrorCode::EnvironmentUnavailable,

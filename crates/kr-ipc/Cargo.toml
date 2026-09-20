@@ -26,7 +26,9 @@ sysctl.workspace = true
 interprocess.workspace = true
 sysinfo.workspace = true
 widestring.workspace = true
-windows-sys.workspace = true
+# The owner-only access-control list a private directory carries is built and read through
+# `advapi32`, which is what this feature brings in beyond the workspace's own list.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 
 [features]
 # A disposable owner-only host tree for the other host crates' tests.
