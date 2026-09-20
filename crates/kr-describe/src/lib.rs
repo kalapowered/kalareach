@@ -18,6 +18,11 @@
 //! | [`priority`] | Background CPU and IO priority, through the mechanism each platform qualifies |
 //! | [`queue`] | One latest job per session, aging, fairness and the cadence |
 //! | [`metrics`] | Queue-wait and execution latency, published separately, beside whole-product figures |
+//! | [`store`] | Names, pins and generated-description provenance, which outlive the session |
+//! | [`privacy`] | Privacy mode's four calls over this crate's own stores |
+//! | [`runtime`] | The inference seam, and the deterministic runtime the tests drive |
+//! | [`service`] | The whole of it: admit, dispatch, validate, publish, unload |
+//! | [`qualification`] | The matrix section 22 ends with, and what has and has not been run |
 //! | [`error`] | What this crate refuses |
 //!
 //! # Four properties the design rests on
@@ -72,17 +77,25 @@ pub mod budget;
 pub mod context;
 pub mod environment;
 pub mod error;
+#[cfg(feature = "llama")]
+pub mod llama;
 pub mod metadata;
 pub mod metrics;
 pub mod output;
 pub mod priority;
+pub mod privacy;
 pub mod profile;
+pub mod qualification;
 pub mod queue;
 pub mod resource;
+pub mod runtime;
+pub mod service;
+pub mod store;
 pub mod time;
 
 pub use crate::error::{DescribeError, Result};
 pub use crate::metadata::{SessionFacts, SessionLabel, Title, VerifiedStatus};
 pub use crate::profile::ModelProfile;
 pub use crate::profile::catalogue::{Catalogue, Selection};
+pub use crate::service::DescriptionService;
 pub use crate::time::Reading;
