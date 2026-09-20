@@ -1042,40 +1042,51 @@ fn name_of(event: &BridgeEvent) -> &'static str {
     }
 }
 
-/// The terminal's input side, written by a thread of its own.
+/// The terminal's input side: one writer, and a thread that types on it.
 ///
 /// A pseudo-terminal's input queue is the shell's to drain, so a shell that has stopped reading
 /// fills it, and a write into a full queue waits inside a system call, where no clock of the
-/// caller's can reach it. The writes are made here instead, on one thread, in the order they were
-/// asked for: a caller waits for the answer that its bytes went in, and never past the deadline it
-/// brought. Bytes a caller stopped waiting for may still reach the shell afterwards, by which time
-/// that caller has already failed its test.
+/// caller's can reach it. What a session types therefore goes to a thread of its own, in the order
+/// it was asked for, and the caller waits for the answer that its bytes went in rather than for the
+/// write: that wait ends at the caller's deadline whatever the terminal is doing. Bytes a caller
+/// stopped waiting for may still reach the shell afterwards, by which time that caller has already
+/// failed its test.
+///
+/// What the terminal answers the editor with does not go through that thread: [`answer_now`] takes
+/// the writer directly, because an editor that asked where the cursor is waits only briefly for the
+/// answer and reads a late one as keys a person typed.
+///
+/// [`answer_now`]: TerminalInput::answer_now
 struct TerminalInput {
     typing: mpsc::Sender<Typing>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
 /// Bytes to type, and where to say that they went in.
 struct Typing {
     bytes: Vec<u8>,
-    typed: Option<mpsc::Sender<Result<(), String>>>,
+    typed: mpsc::Sender<Result<(), String>>,
 }
 
 impl TerminalInput {
-    /// Takes the terminal's input side and starts the thread that writes to it.
-    fn of(mut writer: Box<dyn Write + Send>) -> Self {
+    /// Takes the terminal's input side and starts the thread that types on it.
+    fn of(writer: Box<dyn Write + Send>) -> Self {
+        let writer = Arc::new(Mutex::new(writer));
+        let typing_on = Arc::clone(&writer);
         let (typing, asked) = mpsc::channel::<Typing>();
         std::thread::spawn(move || {
             while let Ok(next) = asked.recv() {
-                let outcome = writer
-                    .write_all(&next.bytes)
-                    .and_then(|()| writer.flush())
-                    .map_err(|error| format!("the terminal refused input: {error}"));
-                if let Some(typed) = next.typed {
-                    let _ = typed.send(outcome);
-                }
+                let outcome = match typing_on.lock() {
+                    Ok(mut writer) => writer
+                        .write_all(&next.bytes)
+                        .and_then(|()| writer.flush())
+                        .map_err(|error| format!("the terminal refused input: {error}")),
+                    Err(_) => Err("the terminal's writer was left broken".to_owned()),
+                };
+                let _ = next.typed.send(outcome);
             }
         });
-        Self { typing }
+        Self { typing, writer }
     }
 
     /// Types `bytes`, and says by `deadline` whether they went in.
@@ -1084,7 +1095,7 @@ impl TerminalInput {
         self.typing
             .send(Typing {
                 bytes: bytes.to_vec(),
-                typed: Some(typed),
+                typed,
             })
             .map_err(|_| "the terminal's writer has gone".to_owned())?;
         match done.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -1099,21 +1110,22 @@ impl TerminalInput {
         }
     }
 
-    /// Types `bytes` without waiting to hear that they went in.
-    fn write_later(&self, bytes: &[u8]) {
-        let _ = self.typing.send(Typing {
-            bytes: bytes.to_vec(),
-            typed: None,
-        });
+    /// Answers a query the editor is waiting on, from the thread that read it.
+    fn answer_now(&self, bytes: &[u8]) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+        }
     }
 }
 
 /// Answers the queries a terminal is expected to answer while an editor draws a prompt.
 ///
 /// An editor that asks where the cursor is and waits for the reply cannot start its read loop
-/// until something answers, so this terminal answers rather than leaving it waiting. The answer is
-/// handed to the terminal's writer rather than written here: this is the thread that collects the
-/// terminal's output for every assertion in the suite, and a wedged shell must not stop it.
+/// until something answers, so this terminal answers rather than leaving it waiting. It answers on
+/// this thread, the one that read the query: an answer that arrives after the editor has stopped
+/// waiting for it is read as keys a person typed, and the prompt the test then types at is not the
+/// one it thinks.
 fn answer_terminal_queries(bytes: &[u8], terminal: &TerminalInput) {
     let mut reply: Vec<u8> = Vec::new();
     if find(bytes, b"\x1b[6n") {
@@ -1128,7 +1140,7 @@ fn answer_terminal_queries(bytes: &[u8], terminal: &TerminalInput) {
     if reply.is_empty() {
         return;
     }
-    terminal.write_later(&reply);
+    terminal.answer_now(&reply);
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> bool {
