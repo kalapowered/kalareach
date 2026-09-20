@@ -3665,7 +3665,13 @@ export interface ClosureRecord {
   terminated: TerminatedProcess[]
 }
 /**
- * A resource that intentionally outlives the session.
+ * A resource the session did not take with it.
+ *
+ * Most entries are resources that outlive a session by design, such as a brokered desktop
+ * resource. An entry is also how a host says it *could not establish* that something ended: a
+ * closure written without a confirmed death names the session's own worker here rather than
+ * among the processes it terminated, because the host did not terminate it and cannot say it
+ * stopped.
  */
 export interface SurvivingResource {
   /**

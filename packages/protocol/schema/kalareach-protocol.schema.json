@@ -18717,7 +18717,7 @@
     },
     "SurvivingResource": {
       "additionalProperties": false,
-      "description": "A resource that intentionally outlives the session.",
+      "description": "A resource the session did not take with it.\n\nMost entries are resources that outlive a session by design, such as a brokered desktop\nresource. An entry is also how a host says it *could not establish* that something ended: a\nclosure written without a confirmed death names the session's own worker here rather than\namong the processes it terminated, because the host did not terminate it and cannot say it\nstopped.",
       "properties": {
         "detail": {
           "description": "A description for the user.",

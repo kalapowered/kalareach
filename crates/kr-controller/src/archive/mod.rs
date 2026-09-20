@@ -368,11 +368,12 @@ impl ArchiveService {
     /// query the platform declines establishes nothing, which is not the same as establishing
     /// that there is nothing there.
     ///
-    /// This is asked of the descriptor rather than of the registry because a closure deletes the
-    /// registry's worker row, and a closure can be recorded for a session whose death this host
-    /// inferred rather than confirmed - a boot that is not this one ends every process in it, and
-    /// the platform may still decline to say so about any one of them. The descriptor is not
-    /// deleted by a closure; it goes when the session is fenced.
+    /// This is one of three things that can say so, and it is the one a live session has: a
+    /// worker publishes a descriptor when it starts. It does not outlast a closure - writing one
+    /// retires the descriptor along with the registry's worker row - so a session closed without a
+    /// confirmed death is answered for by the closure's own surviving list instead. The daemon's
+    /// `a_worker_may_still_own` asks all three; this half is here because a migration is a write
+    /// and must be able to refuse on its own.
     #[must_use]
     pub fn a_worker_may_still_own(&self, session_id: SessionId) -> bool {
         match kr_ipc::descriptor::read(&self.paths, session_id) {
