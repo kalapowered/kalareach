@@ -234,9 +234,18 @@ try:
                     )
                 folded.setdefault(key, (prefix, kind))
 
+        # Segment by segment, so a link anywhere on the way to the package is refused rather than
+        # only one at its last name.
+        descent = []
         try:
-            package_fd = open_directory(name, bundle_fd)
+            parent_fd = bundle_fd
+            for segment in name.split("/"):
+                descent.append(open_directory(segment, parent_fd))
+                parent_fd = descent[-1]
+            package_fd = descent[-1]
         except OSError as error:
+            for descriptor in descent:
+                os.close(descriptor)
             problems.append(f"{name} is not a readable package directory: {error}")
             continue
 
@@ -306,7 +315,8 @@ try:
                     f" and the lock declares {package['total_size_bytes']}"
                 )
         finally:
-            os.close(package_fd)
+            for descriptor in descent:
+                os.close(descriptor)
 finally:
     os.close(bundle_fd)
 
@@ -359,53 +369,69 @@ fi
 plugins="$(cd "$plugins" && pwd)"
 
 # The commit is the pin, and it pins two things: the generation whose bytes are bundled, and the
-# source of the tool that verifies them. A checkout with any uncommitted change is neither, so it
-# is refused before anything is built or read.
+# source of the tool that verifies them. Both are taken out of the commit below, so what the
+# checkout's working tree happens to hold is never read; the checkout has to be at the pin all the
+# same, because a run is about the commit the person named.
 head="$(git -C "$plugins" rev-parse HEAD)"
 [ "$head" = "$pinned_commit" ] || fail "$plugins is at $head and the pin is $pinned_commit"
-[ -z "$(git -C "$plugins" status --porcelain)" ] ||
-    fail "$plugins has uncommitted changes, so it is not $pinned_commit"
 git -C "$plugins" cat-file -e "$pinned_commit:$generation_path" 2>/dev/null ||
     fail "$pinned_commit carries no $generation_path"
 
 # One sync at a time. The directory is the lock: creating it is one operation the filesystem either
-# does or refuses, so two runs cannot both believe they own the publish.
+# does or refuses, so two runs cannot both believe they own the publish. The owner file says which
+# run holds it, and a release removes it only when it is still that run's.
 publish_lock="$bundle_root/.sync.lock"
 held_lock=false
 stage_root="$bundle_root/.staging.$$"
 staging="$stage_root/$bundle_name"
-export_root="$stage_root/generation"
+export_root="$stage_root/checkout"
 generation="$export_root/$generation_path"
 plan="$stage_root/plan.tsv"
 staged_lock="$stage_root/lock.json"
 pending_lock="$(dirname "$lock_file")/.$(basename "$lock_file").$$.pending"
 retiring="$bundle_root/.retiring.$$"
 published="$bundle_root/$bundle_name"
-retired=false
-publish_done=false
 
+owner_of_publish_lock() {
+    awk '{print $1; exit}' "$publish_lock/owner" 2>/dev/null || true
+}
+
+# What to do about a run that did not finish, decided from what is on disk rather than from how far
+# a variable got: a flag is set after the rename it describes, and an interruption lands between the
+# two. The staged package is the witness. It is still there when nothing was published, and it is
+# gone when the rename that published it ran.
 cleanup() {
     local status=$?
+    set +e
+    local published_here=false
+    if [ ! -d "$staging" ] && [ -e "$published" ]; then
+        published_here=true
+    fi
     rm -rf "${stage_root:?}"
-    if [ "$retired" = true ] && [ -d "$retiring" ]; then
-        if [ "$publish_done" = true ]; then
-            # The package is published and the lock is not. Neither is thrown away: a person
-            # decides, with both in front of them.
-            echo "sync-bundled-plugins: $published is published and $lock_file is not;" \
-                "the previous package is at $retiring and the new lock at $pending_lock" >&2
-        else
-            rename_path "$retiring" "$published" ||
-                echo "sync-bundled-plugins: the previous package is at $retiring" >&2
-            rm -f "${pending_lock:?}"
+    if [ "$published_here" = true ]; then
+        if [ -f "$pending_lock" ]; then
+            # The package is published and the lock that describes it is not. Neither is thrown
+            # away: a person decides, with both in front of them.
+            echo "sync-bundled-plugins: $published is the new package and $lock_file is not the" \
+                "new lock; the new lock is at $pending_lock and the previous package at" \
+                "$retiring" >&2
+        elif [ -d "$retiring" ]; then
+            rm -rf "${retiring:?}"
         fi
     else
         rm -f "${pending_lock:?}"
+        if [ -d "$retiring" ]; then
+            rename_path "$retiring" "$published" ||
+                echo "sync-bundled-plugins: the previous package is at $retiring" >&2
+        fi
     fi
-    if [ "$held_lock" = true ]; then
+    if [ "$held_lock" = true ] && [ "$(owner_of_publish_lock)" = "$$" ]; then
+        held_lock=false
         rm -rf "${publish_lock:?}"
     fi
     return "$status"
 }
+
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
@@ -420,26 +446,76 @@ mkdir "$stage_root"
 chmod 700 "$stage_root"
 mkdir "$staging" "$export_root"
 
-# The generation, taken out of the commit rather than read from the working tree. Everything after
-# this reads only from here, so the bytes that are verified are the bytes that are copied even if
-# somebody checks out another branch beside this run.
-git -C "$plugins" archive --format=tar "$pinned_commit" "$generation_path" |
-    tar -x -f - -C "$export_root"
+# The repository, taken out of the commit rather than read from the working tree: both the
+# generation and the source of the tool that verifies it. Everything after this reads only from
+# here, so the bytes that are verified are the bytes that are copied even if somebody checks out
+# another branch beside this run. The export is inside this run's own private directory, which
+# nothing publishes and the exit takes with it.
+git -C "$plugins" archive --format=tar "$pinned_commit" | tar -x -f - -C "$export_root"
 [ -d "$generation" ] || fail "the export of $pinned_commit carries no $generation_path"
 
+# Nothing in the export may be a link or anything else that is not a file or a directory. A commit
+# can carry a link, and a link under the metadata would be read by the verifier and again by the
+# steps below, with the file it names free to change between the two. Refusing them here is what
+# makes "the export is what was verified" true of the whole generation rather than of the payloads
+# alone.
+python3 - "$export_root" "$generation_path" <<'PY'
+import os
+import sys
+
+export_root, generation_path = sys.argv[1], sys.argv[2]
+problems = []
+
+
+def open_directory(name, parent_fd=None):
+    return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=parent_fd)
+
+
+def scan(parent_fd, prefix):
+    with os.scandir(parent_fd) as entries:
+        listed = list(entries)
+    for entry in listed:
+        relative = f"{prefix}{entry.name}"
+        if entry.is_symlink():
+            problems.append(f"{relative} is a link")
+        elif entry.is_dir(follow_symlinks=False):
+            child = open_directory(entry.name, parent_fd)
+            try:
+                scan(child, f"{relative}/")
+            finally:
+                os.close(child)
+        elif not entry.is_file(follow_symlinks=False):
+            problems.append(f"{relative} is not a regular file")
+
+
+descent = [open_directory(export_root)]
+try:
+    for segment in generation_path.split("/"):
+        descent.append(open_directory(segment, descent[-1]))
+    scan(descent[-1], f"{generation_path}/")
+finally:
+    for descriptor in descent:
+        os.close(descriptor)
+
+if problems:
+    for problem in problems:
+        print(f"sync-bundled-plugins: {problem}", file=sys.stderr)
+    sys.exit(f"sync-bundled-plugins: {len(problems)} finding(s) in the exported generation")
+PY
+
 # The chain first: root, timestamp, snapshot, targets and every target's digest and length, through
-# the client the plugin repository publishes with. Expiry is enforced, because metadata that has
-# expired blocks a new generation however well it is signed. Nothing has been taken out of the
-# generation at this point, and nothing is until this returns.
+# the client the plugin repository publishes with, built from the same commit. Expiry is enforced,
+# because metadata that has expired blocks a new generation however well it is signed. Nothing has
+# been taken out of the generation at this point, and nothing is until this returns.
 #
 # The build output goes beside this repository. The plugin checkout is something this script reads
-# and never writes.
+# through Git and never writes.
 echo "sync-bundled-plugins: verifying $generation_path at $pinned_commit"
 (
     cd "$root"
     CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}/catalogue-tool" \
-        cargo run --quiet --locked --manifest-path "$plugins/pipeline/Cargo.toml" -- \
-        --repository "$plugins" verify "$generation"
+        cargo run --quiet --locked --manifest-path "$export_root/pipeline/Cargo.toml" -- \
+        --repository "$export_root" verify "$generation"
 )
 
 # What the verified metadata says this package consists of, checked against what the index says
@@ -743,14 +819,11 @@ if [ -e "$published" ]; then
     check_bundle "$lock_file" "$bundle_root" >/dev/null 2>&1 ||
         fail "$published is not what $lock_file describes; move it aside to replace it"
     rename_path "$published" "$retiring"
-    retired=true
 fi
 rename_path "$staging" "$published"
-publish_done=true
 rename_path "$pending_lock" "$lock_file"
-if [ "$retired" = true ]; then
+if [ -d "$retiring" ]; then
     rm -rf "${retiring:?}"
-    retired=false
 fi
 
 check_bundle "$lock_file" "$bundle_root"
