@@ -61,8 +61,9 @@ Each is an explicit selection. Nothing falls back on its own.
 ## Triage record
 
 `assessment` says what the change is and whether the pinned release already carries it.
-`status` is one of `released` (a requalified package is published), `scheduled` (inside its target
-date), `flagged` (past its target date, with the choices above) or `not-affected`.
+`status` is one of `released` (a requalified package is published, and the assessment names the
+identity it was published under), `scheduled` (inside its target date), `flagged` (past its target
+date, with the choices above) or `not-affected`.
 
 <!-- kr:triage -->
 | Date | Upstream change | Packages | Assessment | Target release | Status |
