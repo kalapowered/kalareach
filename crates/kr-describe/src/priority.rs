@@ -192,7 +192,8 @@ impl Cancellation {
     /// Writes this job's description through the token, unless the job has been cancelled.
     ///
     /// `None` is a cancelled job, and nothing was written. A write that fails leaves the job
-    /// cancellable, because a failed write published nothing.
+    /// cancellable, because a failed write published nothing. A write that panics leaves the job
+    /// published, because whether its row reached the store is exactly what nobody knows.
     pub fn publish_unless_cancelled<T, E>(
         &self,
         write: impl FnOnce() -> Result<T, E>,
@@ -201,9 +202,15 @@ impl Cancellation {
         if *stage == Stage::Cancelled {
             return None;
         }
+        // The stage moves before the write rather than after it. A write that panics between
+        // committing its row and returning would otherwise leave a job this token still calls
+        // cancellable, and a cancellation that reported success over a row already in the store is
+        // the one answer this gate exists to prevent. A write that comes back with a failure
+        // published nothing, and the job goes back to being cancellable.
+        *stage = Stage::Published;
         let written = write();
-        if written.is_ok() {
-            *stage = Stage::Published;
+        if written.is_err() {
+            *stage = Stage::Running;
         }
         Some(written)
     }
@@ -211,7 +218,9 @@ impl Cancellation {
     /// Returns the stage, taking it as it stands from a thread that panicked while holding it.
     ///
     /// The stage is one of three values and a panic cannot leave it half written, so a poisoned
-    /// lock is recovered rather than turned into a second failure in the middle of a job.
+    /// lock is recovered rather than turned into a second failure in the middle of a job. What the
+    /// panicking thread left behind is deliberate: [`Cancellation::publish_unless_cancelled`]
+    /// records the publication before the write, so an interrupted write is read as published.
     fn stage(&self) -> std::sync::MutexGuard<'_, Stage> {
         self.0
             .lock()
@@ -287,6 +296,27 @@ mod tests {
         assert!(
             cancellation.cancel(),
             "nothing was published, so the job can still be cancelled"
+        );
+    }
+
+    #[test]
+    fn a_write_that_panics_leaves_the_job_published() {
+        let cancellation = Cancellation::new();
+
+        let panicked = {
+            let cancellation = cancellation.clone();
+            std::thread::spawn(move || {
+                cancellation.publish_unless_cancelled(|| -> Result<(), ()> {
+                    panic!("the store panicked after committing")
+                })
+            })
+            .join()
+        };
+
+        assert!(panicked.is_err(), "the panic must reach the caller");
+        assert!(
+            !cancellation.cancel(),
+            "nobody knows whether the row reached the store, so the job is past cancelling"
         );
     }
 
