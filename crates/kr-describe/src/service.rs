@@ -524,6 +524,11 @@ impl DescriptionService {
         self.events.remove(session_id);
         self.generations.remove(session_id);
         self.live_sessions.remove(session_id);
+        // The fence and the cleanup debt go with it too. A closed session cannot be made private
+        // and has nothing left to clean, so an entry kept for it would be a row per session this
+        // host has ever run.
+        self.fence.lower(session_id);
+        self.debt.settle(session_id);
         // Everything the queue remembered about this session goes with it. Its pin and its
         // provenance stay, because they are in a store the session does not own.
         self.scheduler.forget(session_id);

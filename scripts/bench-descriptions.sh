@@ -84,10 +84,19 @@ while IFS=$'\t' read -r name url bytes digest; do
   [ -z "$name" ] && continue
   target="$cache/$name"
   if [ -f "$target" ] && [ "$(wc -c < "$target" | tr -d ' ')" = "$bytes" ]; then
-    echo "$name: already held ($bytes bytes)"
-    continue
+    # The size matches, so the digest decides. A cached file that fails it is removed rather than
+    # skipped for ever: a run that refused the same corrupt file every time would be a cache with
+    # no way out of it.
+    if shasum -a 256 "$target" 2>/dev/null | grep -qi "^$digest" ||
+      sha256sum "$target" 2>/dev/null | grep -qi "^$digest"; then
+      echo "$name: already held and verified ($bytes bytes)"
+      continue
+    fi
+    echo "$name: cached copy does not match $digest, fetching again"
+    rm -f "${target:?}"
   fi
   echo "$name: fetching $bytes bytes from $url"
+  rm -f "${target:?}.partial"
   curl --fail --location --show-error --silent --retry 3 --output "$target.partial" "$url"
   mv "$target.partial" "$target"
 done < "$manifest"
