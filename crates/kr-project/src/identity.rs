@@ -430,6 +430,7 @@ mod tests {
     /// This is what a caller accounting for a repository's own data stands on. Resolving those
     /// paths again would let whatever has since taken the name be the thing that was accounted
     /// for, while the data it covered went unexamined.
+    #[cfg(unix)]
     #[test]
     fn the_administrative_handles_keep_their_objects_when_the_paths_name_something_else() {
         let root = tempfile::tempdir().expect("a temporary directory");
