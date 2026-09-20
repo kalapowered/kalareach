@@ -2702,6 +2702,41 @@ to every caller that may read the inbox at all. So it carries a digest of the su
 the subject: a command line or a notification body cannot reach a caller inside the key of the item
 whose text was withheld.
 
+## Notification delivery
+
+An attention decision is not a notification. The engine decides that something wants a person and
+offers the decision; the delivery journal takes it, records it durably, and only then tells a
+destination.
+
+The order matters and the store is what keeps it. A notification row names the event row it was
+produced from, and the reference is a foreign key: a notification for an event nothing has taken
+cannot be written. Taking an event and producing from it are two transactions, so a host that stops
+between them has the event and no notification, and the pending work is still where a person can
+see it. The event row carries the notice it was taken with, so the next pass finishes what the last
+one started.
+
+Each source keeps its own cursor, per store rather than per kind: a position in one session's
+outbox says nothing about another's. The cursor and the de-duplication record are committed in the
+same transaction as the work they describe, and the source is acknowledged only afterwards, so a
+host that dies in between is offered the same page again and the event keys absorb it. Both
+consumers register before they rely on collection keeping anything for them.
+
+What travels to a device is an opaque identifier, a preview sealed to that device's own
+notification-preview key, an expiry, and a collapse identifier that is a keyed digest. The alert a
+locked screen shows is one of six fixed sentences. There is no field for text a producer supplies.
+
+External destinations are different in the way that matters: their recipients can read what
+arrives, every message says so, and nothing in this host claims otherwise. A destination needs a
+configured address **and** an explicit rule or grant, and the content is intersected with the
+recipient's own authority rather than assumed from the address.
+
+Privacy mode fences the delivery outbox at once, takes back what was never dispatched, removes the
+queued content, and does not report complete while a send is still on the wire. Notifications that
+already reached a provider are shown as retained artifacts with a separate deletion action; this
+host does not claim it can recall them.
+
+`docs/delivery/README.md` is the whole of it.
+
 ## Closure
 
 `session.close` is a state, not a request to exit.

@@ -18,6 +18,7 @@ iroh.workspace = true
 kr-cbor.workspace = true
 kr-changeset.workspace = true
 kr-crypto.workspace = true
+kr-delivery.workspace = true
 kr-ipc.workspace = true
 kr-pairing.workspace = true
 kr-protocol.workspace = true
@@ -32,6 +33,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 toml_edit.workspace = true
+# The one outbound request this daemon makes: presenting a notification to the push gateway.
+ureq.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]

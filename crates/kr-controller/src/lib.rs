@@ -28,6 +28,7 @@
 //! | [`voice`] | The voice coordinator's seams over the history filter, the grant store and this host's dispatch |
 //! | [`project`] | The environment's project service: repositories, workspaces and the restricted Git profile |
 //! | [`changeset`] | The environment's change-set service: immutable versions, materialisations and applies |
+//! | [`push`] | The environment's delivery journal, the gateway client and the notification-preview key |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod agent_tools;
@@ -42,6 +43,7 @@ pub mod directory;
 pub mod error;
 pub mod grants;
 pub mod project;
+pub mod push;
 pub mod registry;
 pub mod service;
 pub mod sharing;
