@@ -177,10 +177,15 @@ step "3. Each distribution runs KalaReach on its own"
 
 # The helper and the daemon are built inside the distribution, from the same commit, into that
 # distribution's own filesystem. Nothing here is a Windows binary, and nothing crosses /mnt.
+commit="$(git rev-parse HEAD)"
+
 build_inside() {
   local distribution="$1"
-  if wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c "test -x '$helper_path'" 2>/dev/null; then
-    echo "  $distribution: a helper is already installed at $helper_path"
+  # A helper from another commit would prove something about another candidate, so the commit that
+  # built it is recorded beside it and checked here.
+  if wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c \
+    "test -x '$helper_path' && test \"\$(cat /usr/local/lib/kalareach-acc-commit 2>/dev/null)\" = '$commit'" 2>/dev/null; then
+    echo "  $distribution: the helper at $helper_path was built from this commit"
     return 0
   fi
   echo "  $distribution: building the helper inside the distribution (this takes a few minutes)"
@@ -197,6 +202,8 @@ build_inside() {
     install -m 0755 target/debug/kr '$helper_path'
     install -m 0755 target/debug/kr-controller '$(dirname "$helper_path")/kr-controller'
     install -m 0755 target/debug/kr-worker '$(dirname "$helper_path")/kr-worker'
+    mkdir -p /usr/local/lib
+    printf '%s' '$commit' >/usr/local/lib/kalareach-acc-commit
   " || fail "$distribution could not build the Linux helper"
 }
 
@@ -204,20 +211,18 @@ start_daemon_inside() {
   local distribution="$1"
   wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "
     set -e
-    mkdir -p /run/kalareach-acc /var/lib/kalareach-acc
     running=0
     if [ -f /tmp/kr-acc-controller.pid ] && kill -0 \$(cat /tmp/kr-acc-controller.pid) 2>/dev/null; then
       running=1
     fi
     if [ \$running -eq 0 ]; then
       nohup '$(dirname "$helper_path")/kr-controller' \
-        --runtime-dir /run/kalareach-acc --state-dir /var/lib/kalareach-acc \
         --worker '$(dirname "$helper_path")/kr-worker' --secret-store file \
         >/tmp/kr-controller.log 2>&1 &
       echo \$! >/tmp/kr-acc-controller.pid
     fi
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      if KR_RUNTIME_DIR=/run/kalareach-acc KR_STATE_DIR=/var/lib/kalareach-acc '$helper_path' list >/dev/null 2>&1; then
+      if '$helper_path' list >/dev/null 2>&1; then
         exit 0
       fi
       sleep 1
@@ -232,9 +237,13 @@ start_daemon_inside() {
 inside() {
   local distribution="$1"
   shift
-  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc \
-    "KR_RUNTIME_DIR=/run/kalareach-acc KR_STATE_DIR=/var/lib/kalareach-acc $*" | tr -d '\r'
+  # The distribution's own default paths, which is what the helper the Windows side starts will
+  # discover. A directory of this run's own here would leave the two halves talking past each other.
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "$*" | tr -d '\r'
 }
+
+# One line of JSON with the spaces taken out, so an assertion can name a whole key path.
+compact() { tr -d ' \n\r'; }
 
 for distribution in "$first" "$second"; do
   build_inside "$distribution"
@@ -253,9 +262,22 @@ for distribution in "$first" "$second"; do
   if tasklist //FI "PID eq $linux_pid" 2>/dev/null | grep -qi "kr-controller"; then
     fail "a Linux process identifier resolved to a Windows process, so the identifier spaces are shared"
   fi
-  socket_path="$(inside "$distribution" 'ls /run/kalareach-acc')"
-  [ -n "$socket_path" ] ||
-    fail "$distribution kept no runtime directory of its own"
+  # A session of the distribution's own: its worker is a Linux process with Linux paths, and
+  # nothing on the Windows side takes part in it.
+  session="$(inside "$distribution" "'$helper_path' --json new --command /bin/sh" | compact)"
+  case "$session" in
+    *'"session_id":"'*) : ;;
+    *) fail "$distribution could not create a session of its own: $session" ;;
+  esac
+  listed="$(inside "$distribution" "'$helper_path' --json list" | compact)"
+  case "$listed" in
+    *'"session_id":"'*) : ;;
+    *) fail "$distribution does not list the session it created: $listed" ;;
+  esac
+  worker_pid="$(inside "$distribution" 'pgrep -n kr-worker || true')"
+  [[ "$worker_pid" =~ ^[0-9]+$ ]] ||
+    fail "$distribution runs no worker for the session it created"
+  inside "$distribution" "'$helper_path' close --all" >/dev/null 2>&1 || true
 done
 pass "Linux paths, binaries and process identifiers stay local to each distribution"
 
@@ -329,11 +351,21 @@ done
 pass "the recorded identity is the one each distribution reports for itself"
 
 refresh_and_check() {
-  local label="$1" expect_id="$2"
-  "$kr_exe" --json bridge refresh "$label" >"$run_dir/refresh-$label.json" 2>&1 ||
+  local label="$1" expect_id="$2" flags="${3:-}" text
+  # shellcheck disable=SC2086
+  "$kr_exe" --json bridge refresh "$label" $flags >"$run_dir/refresh-$label.json" 2>&1 ||
     fail "refreshing $label failed: $(cat "$run_dir/refresh-$label.json")"
-  grep -q "\"environment_id\":\"$expect_id\"" "$run_dir/refresh-$label.json" ||
-    fail "the refresh of $label did not carry a verification from $expect_id: $(cat "$run_dir/refresh-$label.json")"
+  text="$(compact <"$run_dir/refresh-$label.json")"
+  # The verification is what the destination answered. Matching the whole document would accept the
+  # enrolment's own identity where the verification is absent, so the key path is named here.
+  case "$text" in
+    *"\"verification\":{\"environment_id\":\"$expect_id\""*) : ;;
+    *) fail "the refresh of $label carried no verification from $expect_id: $text" ;;
+  esac
+  case "$text" in
+    *'"role":"controller"'*) : ;;
+    *) fail "the refresh of $label was not answered by a control daemon: $text" ;;
+  esac
 }
 
 refresh_and_check first "$first_id"
@@ -350,19 +382,31 @@ sleep 2
 
 "$kr_exe" --json bridge list >"$run_dir/list-while-stopped.json" 2>&1 ||
   fail "the listing failed: $(cat "$run_dir/list-while-stopped.json")"
-grep -q '"observation":"cache"' "$run_dir/list-while-stopped.json" ||
-  fail "the listing did not report its rows as cached: $(cat "$run_dir/list-while-stopped.json")"
-grep -q "\"environment_id\":\"$second_id\"" "$run_dir/list-while-stopped.json" ||
-  fail "the stopped distribution is missing from the listing"
+listing="$(compact <"$run_dir/list-while-stopped.json")"
+# The row for the stopped distribution, as one string: its identity, the status that was last
+# observed, and the fact that this came from the cache rather than from asking the platform.
+case "$listing" in
+  *"\"environment_id\":\"$second_id\""*) : ;;
+  *) fail "the stopped distribution is missing from the listing: $listing" ;;
+esac
+case "$listing" in
+  *'"observation":"cache"'*) : ;;
+  *) fail "the listing did not report its rows as cached: $listing" ;;
+esac
+case "$listing" in
+  *'"status":"running","observation":"refresh"'*)
+    fail "the listing reported a live observation: $listing"
+    ;;
+  *) : ;;
+esac
 [ "$(state_of "$second")" = "Stopped" ] ||
   fail "the listing started $second, which a listing must never do"
 pass "the listing reported the stopped distribution from the cache and started nothing"
 
-"$kr_exe" --json bridge refresh second --start >"$run_dir/refresh-start.json" 2>&1 ||
-  fail "the refresh that was told to start failed: $(cat "$run_dir/refresh-start.json")"
+refresh_and_check second "$second_id" --start
 [ "$(state_of "$second")" = "Running" ] ||
   fail "the refresh that was told to start did not start $second"
-pass "a refresh that was told to start the distribution started it"
+pass "a refresh that was told to start the distribution started it and reached it"
 
 # ---------------------------------------------------------------------------------------------
 step "6. NAT and mirrored networking"
@@ -377,8 +421,14 @@ else
 fi
 
 networking_facts() {
-  local mode="$1" distribution="$2"
-  local addresses
+  local mode="$1" distribution="$2" effective addresses
+  # What WSL is actually doing, not what the file asks for.
+  effective="$(inside "$distribution" 'wslinfo --networking-mode 2>/dev/null || true' | tr -d ' ')"
+  echo "  $mode: $distribution reports networking mode: ${effective:-unknown}"
+  [ -n "$effective" ] ||
+    fail "$mode: this WSL build does not report its networking mode, so the mode cannot be established"
+  [ "$effective" = "$mode" ] ||
+    fail "$mode was asked for and $effective is in effect"
   addresses="$(inside "$distribution" 'ip -br addr' || true)"
   echo "  $mode: $distribution addresses:"
   printf '    %s\n' "$addresses"
@@ -389,7 +439,8 @@ networking_facts() {
 set_mode() {
   local mode="$1"
   printf '[wsl2]\nnetworkingMode=%s\n' "$mode" >"$wslconfig_path"
-  wsl.exe --shutdown >/dev/null 2>&1 || true
+  wsl.exe --shutdown >/dev/null 2>&1 ||
+    fail "the distributions could not be shut down to take up $mode networking"
   sleep 3
   daemons=""
   for distribution in "$first" "$second"; do
@@ -397,7 +448,7 @@ set_mode() {
   done
 }
 
-for mode in NAT mirrored; do
+for mode in nat mirrored; do
   set_mode "$mode"
   networking_facts "$mode" "$first"
   # The bridge opens no socket, so it must behave the same in both modes. This is the measurement
@@ -409,12 +460,24 @@ done
 # ---------------------------------------------------------------------------------------------
 step "7. The helper refuses what may not cross"
 
-# A frame that declares a network origin is refused by the helper inside the distribution, before
-# it connects to anything there.
-refusal="$(printf 'not a bridge frame' | wsl.exe -d "$first" -u "$linux_user" --exec "$helper_path" bridge --stdio 2>&1 || true)"
-echo "$refusal" | grep -qi "bridge" ||
-  fail "the helper gave no diagnostic for input that is not a frame: $refusal"
-pass "the helper refuses input that is not a bridge frame, with a diagnostic on standard error"
+# Input that is not a frame at all: the helper ends non-zero and says why.
+malformed_code=0
+malformed="$(printf 'not a bridge frame' |
+  wsl.exe -d "$first" -u "$linux_user" --exec "$helper_path" bridge --stdio 2>&1)" || malformed_code=$?
+[ "$malformed_code" -ne 0 ] ||
+  fail "the helper served a stream that is not a bridge frame: $malformed"
+echo "$malformed" | grep -qi "bridge" ||
+  fail "the helper gave no diagnostic for input that is not a frame: $malformed"
+pass "input that is not a bridge frame ends the helper non-zero with a diagnostic"
+
+# A properly encoded handshake that declares a network origin has to be refused by protocol, not by
+# a parse failure. The suite that builds those frames runs inside the distribution, against the
+# Linux helper this run installed.
+inside "$first" 'cd /tmp/kalareach-src && cargo test -p kr-cli --test bridge' >"$run_dir/wsl-bridge-suite.log" 2>&1 ||
+  fail "the bridge suite failed inside $first: $(tail -n 30 "$run_dir/wsl-bridge-suite.log")"
+grep -q "test result: ok" "$run_dir/wsl-bridge-suite.log" ||
+  fail "the bridge suite reported no result inside $first"
+pass "the bridge suite passes inside the distribution, including the refusal of a network origin"
 
 echo
 echo "KR-ACC-011: $passed checks passed."
