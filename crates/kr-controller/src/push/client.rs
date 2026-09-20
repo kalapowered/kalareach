@@ -218,20 +218,49 @@ pub fn message_from(content: &[u8]) -> Result<ExternalMessage> {
             operation: "read a queued external message",
             detail: "a stored alert is not one this build writes".to_owned(),
         })?;
+    let from_ms =
+        stored
+            .interval
+            .from_ms
+            .parse::<u64>()
+            .map_err(|error| ControllerError::Storage {
+                operation: "read a queued external message",
+                detail: format!("invalid interval from_ms: {error}"),
+            })?;
+    let to_ms = stored
+        .interval
+        .to_ms
+        .parse::<u64>()
+        .map_err(|error| ControllerError::Storage {
+            operation: "read a queued external message",
+            detail: format!("invalid interval to_ms: {error}"),
+        })?;
+    let mut withheld = Vec::with_capacity(stored.withheld.len());
+    for [reason_str, count_str] in stored.withheld {
+        let reason =
+            kr_delivery::external::Withheld::from_stored(&reason_str).ok_or_else(|| {
+                ControllerError::Storage {
+                    operation: "read a queued external message",
+                    detail: format!("unknown withheld reason: {reason_str}"),
+                }
+            })?;
+        let count = count_str
+            .parse::<u64>()
+            .map_err(|error| ControllerError::Storage {
+                operation: "read a queued external message",
+                detail: format!("invalid withheld count: {error}"),
+            })?;
+        withheld.push((reason, count));
+    }
     Ok(ExternalMessage {
         delivery_id: stored.delivery_id,
         alert,
         body: stored.body,
         provenance: kr_worker::history_filter::Provenance {
-            interval: kr_worker::history_filter::SourceInterval::new(
-                stored.interval.from_ms.parse().unwrap_or(0),
-                stored.interval.to_ms.parse().unwrap_or(0),
-            ),
+            interval: kr_worker::history_filter::SourceInterval::new(from_ms, to_ms),
             resources: stored.resources,
         },
-        // The reasons a line was withheld are in the body the recipient reads; the record here is
-        // what the host shows locally, and it is rebuilt as a count rather than re-derived.
-        withheld: Vec::new(),
+        withheld,
     })
 }
 
@@ -242,6 +271,8 @@ struct StoredMessage {
     delivery_id: Option<String>,
     interval: StoredInterval,
     resources: Vec<String>,
+    #[serde(default)]
+    withheld: Vec<[String; 2]>,
 }
 
 #[derive(serde::Deserialize)]

@@ -1996,3 +1996,56 @@ async fn device_preview_key_update_via_controller() {
             .is_err()
     );
 }
+
+#[test]
+fn message_from_restores_withheld_metadata_and_rejects_invalid_timestamps() {
+    let filter = kr_worker::history_filter::HistoryFilter::new(
+        kr_worker::history_filter::ViewerScope::owner(),
+    );
+    let mut granted_sessions = BTreeSet::new();
+    granted_sessions.insert(SessionId::new(uuid(1)));
+
+    let line = kr_delivery::external::ContentLine {
+        produced_at_ms: None, // Will cause NoProductionTime
+        session_id: Some(SessionId::new(uuid(1))),
+        text: "line without time".to_owned(),
+    };
+
+    let composed = kr_delivery::external::compose(
+        DestinationKind::Telegram,
+        PushAlert::WorkComplete,
+        vec![line],
+        &filter,
+        &granted_sessions,
+        Some("delivery-1".to_owned()),
+    )
+    .expect("compose succeeds");
+
+    assert!(!composed.is_complete());
+    assert_eq!(
+        composed.withheld,
+        vec![(kr_delivery::external::Withheld::NoProductionTime, 1)]
+    );
+
+    let json = kr_delivery::producer::message_json(&composed);
+    let bytes = serde_json::to_vec(&json).expect("serialized");
+
+    let restored =
+        kr_controller::push::client::message_from(&bytes).expect("restored from serialized json");
+    assert!(!restored.is_complete());
+    assert_eq!(restored.withheld, composed.withheld);
+    assert_eq!(
+        restored.provenance.interval.from_ms,
+        composed.provenance.interval.from_ms
+    );
+    assert_eq!(
+        restored.provenance.interval.to_ms,
+        composed.provenance.interval.to_ms
+    );
+
+    // Rejects invalid interval timestamps
+    let mut invalid_json = json.clone();
+    invalid_json["interval"]["from_ms"] = serde_json::json!("not_a_number");
+    let invalid_bytes = serde_json::to_vec(&invalid_json).expect("serialized");
+    assert!(kr_controller::push::client::message_from(&invalid_bytes).is_err());
+}

@@ -8,7 +8,7 @@
 //! those external messages private.*
 //!
 //! So [`RECIPIENTS_CAN_READ`] is appended to every composed message by [`compose`], which is the
-//! only constructor of an [`ExternalMessage`] that takes content. There is no confidentiality
+//! standard constructor for messages composed from host content. There is no confidentiality
 //! claim anywhere in this module, and an interface that reports on a destination has
 //! [`ExternalDestination`]'s own [`DestinationKind::recipients_read_the_content`] to say the same
 //! thing in its own words.
@@ -100,6 +100,17 @@ impl Withheld {
             Self::NoProductionTime => "no_production_time",
         }
     }
+
+    /// Parses a stored reason name back into [`Withheld`].
+    #[must_use]
+    pub fn from_stored(name: &str) -> Option<Self> {
+        match name {
+            "outside_history_scope" => Some(Self::OutsideHistoryScope),
+            "resource_not_granted" => Some(Self::ResourceNotGranted),
+            "no_production_time" => Some(Self::NoProductionTime),
+            _ => None,
+        }
+    }
 }
 
 /// One message, composed and ready for an adapter.
@@ -109,7 +120,7 @@ pub struct ExternalMessage {
     pub delivery_id: Option<String>,
     /// Which generic alert this is about.
     pub alert: PushAlert,
-    /// The whole text, ending with [`RECIPIENTS_CAN_READ`].
+    /// The message body. When built via [`compose`], this ends with [`RECIPIENTS_CAN_READ`].
     pub body: String,
     /// What the content was derived from, published beside it.
     pub provenance: Provenance,
