@@ -275,14 +275,36 @@ else
   # run built are qualified below either way. Any other refusal is this run's.
   refusal="$(read_json "$artifacts/fence-create.json" code)"
   detail="$(read_json "$artifacts/fence-create.json" message)"
+  # What the daemon printed while it was refusing, and what the worker it launched said for
+  # itself: an answer that only says something did not happen in time carries no reason, and the
+  # reason is in the worker's own diagnostics.
+  cp "$run_root/controller.log" "$artifacts/fence-controller.log" 2>/dev/null || true
+  # The worker writes its own last word as it goes, which can be a moment after the daemon has
+  # answered the caller.
+  sleep 3
+  worker_said=""
+  for diagnostics in "$run_root"/s/environments/*/jobs/*.diagnostics; do
+    [ -r "$diagnostics" ] || continue
+    cp "$diagnostics" "$artifacts/fence-worker.log"
+    worker_said="$(cat "$diagnostics")"
+  done
   echo "  the daemon refused a managed session:"
   echo "    ${detail:-$(cat "$run_root/create.err")}"
+  [ -n "$worker_said" ] && echo "    the worker said: $worker_said"
   if [ "$refusal" = "SHELL_INTEGRATION_UNSUPPORTED" ] && \
      [ "${detail#*"$packages/powershell/"}" != "$detail" ] && \
      [ "${detail#*names paths outside the package it is in}" != "$detail" ]; then
     echo "    the package this run asked for is $managed_shell, and the record the daemon could"
     echo "    not read is another shell's: an installation is read as a whole here, so one"
     echo "    unreadable record refuses every shell in it."
+    incomplete=1
+  elif [ "${worker_said#*the root integration did not qualify}" != "$worker_said" ]; then
+    # The packaged shell started and never activated its hooks, because this stage puts no
+    # guarded startup entry in the home the session's shell reads. Writing one, and driving the
+    # operations that follow it, is what this stage is still to gain; the person's own startup
+    # files are not this run's to write into.
+    echo "    the shell this session started read a home with no guarded startup entry in it, so"
+    echo "    its hooks never activated. This stage does not yet install one."
     incomplete=1
   else
     fail "a managed session could not be created"
