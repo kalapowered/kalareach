@@ -287,7 +287,12 @@ impl JsonSchema for RegistrationToken {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_REGISTRATION_TOKEN_LEN,
-            "description": "A provider registration token, printable ASCII without spaces. It reaches the gateway once and is never carried in a record that leaves it."
+            // The alphabet is part of the contract rather than a detail of one implementation: a
+            // notification's provider payload reserves the unescaped maximum token size, and a
+            // token carrying a quote or a backslash would cost twice its length once it was
+            // written into JSON. Every implementation that accepts a token checks this.
+            "pattern": "^[!#-\\[\\]-~]+$",
+            "description": "A provider registration token: printable ASCII without spaces, quotes or backslashes, so it costs no more in a JSON document than its own length. It reaches the gateway once and is never carried in a record that leaves it."
         })
     }
 }

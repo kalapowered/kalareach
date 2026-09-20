@@ -254,7 +254,15 @@ function signingInput (domain: string, payload: CanonicalValue): Uint8Array {
 /** The longest a provider registration token may be, in bytes. */
 export const MAX_REGISTRATION_TOKEN_LEN = 1024
 
-/** A provider registration token: printable ASCII without spaces, bounded. */
+/**
+ * A provider registration token: printable ASCII without spaces, quotes or backslashes, bounded.
+ *
+ * The alphabet is what makes the length a cost. A notification's provider payload reserves the
+ * unescaped maximum token size, and a token carrying a quote or a backslash would take twice its
+ * own length once it was written into a JSON document, which is a payload over the bound the host
+ * measured. So the rule belongs to the token rather than to one implementation of it, and every
+ * implementation that accepts one checks the same alphabet.
+ */
 export function registrationToken (value: unknown): string {
   if (typeof value !== 'string' || value === '') {
     refuse('a registration token is not empty')
@@ -264,8 +272,8 @@ export function registrationToken (value: unknown): string {
   }
   for (const character of value) {
     const code = character.codePointAt(0) as number
-    if (code < 0x21 || code > 0x7e) {
-      refuse('a registration token is printable ASCII without spaces')
+    if (code < 0x21 || code > 0x7e || code === 0x22 || code === 0x5c) {
+      refuse('a registration token is printable ASCII without spaces, quotes or backslashes')
     }
   }
   return value

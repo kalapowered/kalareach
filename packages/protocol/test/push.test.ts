@@ -22,6 +22,7 @@ import {
   FREE_RATE_POLICY,
   MAX_PREVIEW_PLAINTEXT_BYTES,
   MAX_PROVIDER_PAYLOAD_BYTES,
+  MAX_REGISTRATION_TOKEN_LEN,
   PUSH_ALERTS,
   PUSH_ALERT_TEXT,
   PUSH_COLLAPSE_WINDOW_MS,
@@ -55,6 +56,7 @@ import {
   pushRequestSigner,
   pushRequestSigningInput,
   registrationAnswerSigningInput,
+  registrationToken,
   renewalOpensAtMs,
   senderBindingDigest,
   senderBindingSigningInput,
@@ -306,6 +308,27 @@ describe('push registration', () => {
     expect(bytesToHex(await tokenDigest(`${push.token.registration_token}x`))).not.toBe(
       bytesToHex(digest)
     )
+  })
+
+  /**
+   * KR-REQ-16.12: the provider payload reserves the unescaped maximum token size, so a token that
+   * would need escaping is refused here rather than measured later.
+   */
+  it('refuses a token outside the alphabet the payload bound assumes', () => {
+    expect(registrationToken('a-token_9')).toBe('a-token_9')
+    expect(registrationToken('x'.repeat(MAX_REGISTRATION_TOKEN_LEN))).toHaveLength(
+      MAX_REGISTRATION_TOKEN_LEN
+    )
+    for (const refused of ['with"quote', 'with\\backslash', 'with space', '', 'tab\t']) {
+      expect(() => registrationToken(refused)).toThrow(PushSchemaError)
+    }
+    expect(() => registrationToken('x'.repeat(MAX_REGISTRATION_TOKEN_LEN + 1))).toThrow(
+      PushSchemaError
+    )
+    // What a maximum-length token costs in a JSON document is its own length, which is what the
+    // host reserved for it.
+    const longest = registrationToken('x'.repeat(MAX_REGISTRATION_TOKEN_LEN))
+    expect(JSON.stringify(longest).length).toBe(MAX_REGISTRATION_TOKEN_LEN + 2)
   })
 
   it('refuses an answer that changes what the challenge asked', () => {

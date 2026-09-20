@@ -20998,9 +20998,10 @@
       "type": "object"
     },
     "RegistrationToken": {
-      "description": "A provider registration token, printable ASCII without spaces. It reaches the gateway once and is never carried in a record that leaves it.",
+      "description": "A provider registration token: printable ASCII without spaces, quotes or backslashes, so it costs no more in a JSON document than its own length. It reaches the gateway once and is never carried in a record that leaves it.",
       "maxLength": 1024,
       "minLength": 1,
+      "pattern": "^[!#-\\[\\]-~]+$",
       "type": "string"
     },
     "RejectionReason": {
