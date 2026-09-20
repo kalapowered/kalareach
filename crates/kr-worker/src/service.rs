@@ -5093,12 +5093,17 @@ mod tests {
         notification(&stream, 0, "session.output", &event).expect("a notification")
     }
 
+    /// The schedule a withdrawal has to win, and how it is arranged.
+    ///
+    /// This fills a peer's socket to put a writer mid-frame, which is a property of the socket
+    /// rather than of the code under test. A Windows named pipe does not fill the way a Unix
+    /// domain socket does - the same frame goes straight into it - so the arrangement never
+    /// happens there and the test fails at its own setup rather than at what it is for. What it
+    /// checks holds on Windows too; establishing that needs an arrangement this test does not
+    /// have, and nobody has written one.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_protected_write_waiting_for_a_peer_ends_at_the_withdrawal() {
-        // The schedule a withdrawal has to win: a peer that has stopped reading, a frame part way
-        // into its socket, and an authority that ends while the writer is waiting for room. The
-        // wait happens outside the lock the withdrawal takes, so the withdrawal does not wait for
-        // the peer, and the write does not resume afterwards.
         let (_temp, writable, writer, _reader) = connected().await;
         let withdrawn = Arc::new(Withdrawal::default());
         let frame = output_frame(MAX_OUTPUT_EVENT_BYTES);
