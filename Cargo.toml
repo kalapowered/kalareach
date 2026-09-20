@@ -9,6 +9,7 @@ members = [
     "crates/kr-client",
     "crates/kr-controller",
     "crates/kr-crypto",
+    "crates/kr-describe",
     "crates/kr-ipc",
     "crates/kr-pairing",
     "crates/kr-plugin-host",
@@ -67,6 +68,7 @@ kr-cli = { path = "crates/kr-cli", version = "=0.1.0" }
 kr-client = { path = "crates/kr-client", version = "=0.1.0", default-features = false }
 kr-controller = { path = "crates/kr-controller", version = "=0.1.0" }
 kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
+kr-describe = { path = "crates/kr-describe", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }
 kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
 kr-plugin-host = { path = "crates/kr-plugin-host", version = "=0.1.0" }
@@ -87,6 +89,11 @@ landlock = "=0.4.7"
 libc = "=0.2.189"
 libproc = "=0.14.11"
 libsodium-sys-stable = "=1.24.0"
+# The CPU inference runtime, pinned to one exact release. The binding vendors a fixed llama.cpp
+# revision, and that revision is what every signed model profile records as its runtime identity,
+# so a profile qualified against one build of the runtime cannot be loaded by another.
+llama-cpp-2 = { version = "=0.1.156", default-features = false }
+llama-cpp-sys-2 = { version = "=0.1.156", default-features = false }
 # The Apple runtime bindings the companion application's user-verification ceremony calls through.
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", default-features = false }

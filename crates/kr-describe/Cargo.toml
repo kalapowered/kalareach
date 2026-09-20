@@ -1,0 +1,55 @@
+[package]
+name = "kr-describe"
+description = "The KalaReach description service: deterministic session titles, one shared CPU-only inference process per execution environment, its signed model profiles, the scheduler and resource policy, and the names, pins and provenance store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# The llama.cpp runtime is on by default because section 22 makes local descriptions a default
+# product component. Turning it off leaves every deterministic title, the scheduler, the resource
+# policy and the stores exactly as they are and removes only the model: a build with no runtime
+# still describes every session from metadata, which is the fallback section 22 names.
+default = ["llama"]
+llama = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
+
+[dependencies]
+# The profile's identity is signed over a canonical encoding, not over a JSON rendering, so the
+# transcript is built the same way every other signature in this product is built.
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+# Privacy mode's contract. Section 24 gives every subsystem one trait, and this crate implements
+# it over its own stores rather than restating the rule.
+kr-worker.workspace = true
+# The runtime. CPU only: no GPU or accelerator feature is asked for here, and every profile this
+# crate will load records zero GPU layers.
+llama-cpp-2 = { workspace = true, optional = true }
+llama-cpp-sys-2 = { workspace = true, optional = true }
+# Names, pins and generated-description provenance are a store of their own beside the session
+# journal, because section 24 gives them their own owner and they outlive the session.
+rusqlite = { workspace = true, features = ["bundled"] }
+serde = { workspace = true }
+serde_json.workspace = true
+# Streaming digests of model assets, which are gigabytes and are never read into memory whole.
+sha2.workspace = true
+# The qualified available-memory signal the reserve is checked against, and the process figures
+# reported beside the separated model and runtime ones.
+sysinfo.workspace = true
+thiserror.workspace = true
+# Background scheduling for the inference thread, through the one mechanism this build can apply
+# on each platform. What it cannot apply, it reports as unqualified rather than assuming.
+thread-priority.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

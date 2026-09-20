@@ -1,0 +1,81 @@
+{
+  "profile_id": "smollm3-3b-q4-k-m",
+  "profile_revision": 1,
+  "gate": "candidate",
+  "model": {
+    "repository": "HuggingFaceTB/SmolLM3-3B",
+    "model_revision": "a07cc9a04f16550a088caea529712d1d335b0ac1",
+    "source_revision": "a07cc9a04f16550a088caea529712d1d335b0ac1",
+    "parameters_billions": 3.0
+  },
+  "conversion": {
+    "repository": "ggml-org/SmolLM3-3B-GGUF",
+    "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+    "quantisation": "Q4_K_M",
+    "format": "gguf"
+  },
+  "runtime": {
+    "binding": "llama-cpp-2",
+    "binding_version": "0.1.156",
+    "llama_cpp_revision": "e79e4bf660e19f2ad851e06c6913f7a8c5852621"
+  },
+  "assets": [
+    {
+      "role": "weights",
+      "file_name": "SmolLM3-Q4_K_M.gguf",
+      "url": "https://huggingface.co/ggml-org/SmolLM3-3B-GGUF/resolve/4965cb60b150737b68a0408c36aeefb65078f894/SmolLM3-Q4_K_M.gguf",
+      "bytes": 1915305312,
+      "sha256": "8334b850b7bd46238c16b0c550df2138f0889bf433809008cc17a8b05761863e"
+    }
+  ],
+  "tokenizer": {
+    "source_repository": "HuggingFaceTB/SmolLM3-3B",
+    "source_revision": "a07cc9a04f16550a088caea529712d1d335b0ac1",
+    "tokenizer_sha256": "7b6a500b662a34eb3f0374db856ba4ad7de4c81040571d78dc0d357238930005",
+    "tokenizer_config_sha256": "59a64b39f05ee0acf7479bbccf99a44d9e481c1a4a494eb03838ae3c35eb29be",
+    "chat_template_sha256": "3e0e275a527f249670056e0078e474eadbdd007c134b4fdfae5a7b3089702814"
+  },
+  "sampler": {
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "min_p": 0.0,
+    "repeat_penalty": 1.05,
+    "repeat_last_n": 64,
+    "seed": 20260913
+  },
+  "reasoning": {
+    "mode": "disabled",
+    "directive": "/no_think"
+  },
+  "components": {
+    "tools": false,
+    "vision": false
+  },
+  "execution": {
+    "gpu_layers": 0,
+    "context_tokens": 4096,
+    "max_output_tokens": 128,
+    "cpu_threads": 4,
+    "resident_estimate": {
+      "weights_bytes": 1915305312,
+      "mapping_bytes": 16777216,
+      "kv_cache_bytes": 301989888,
+      "additional_cache_bytes": 67108864,
+      "batch_bytes": 134217728,
+      "runtime_overhead_bytes": 100663296
+    }
+  },
+  "targets": [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc"
+  ],
+  "gates": [
+    "platform",
+    "resource",
+    "quality"
+  ]
+}

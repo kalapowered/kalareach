@@ -1,0 +1,77 @@
+{
+  "profile_id": "minicpm5-2b-q4-k-m",
+  "profile_revision": 1,
+  "gate": "default",
+  "model": {
+    "repository": "openbmb/MiniCPM5-2B",
+    "model_revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
+    "source_revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
+    "parameters_billions": 2.0
+  },
+  "conversion": {
+    "repository": "openbmb/MiniCPM5-2B-GGUF",
+    "revision": "2079a22f3beaa4e306449978533478fe0522f4b3",
+    "quantisation": "Q4_K_M",
+    "format": "gguf"
+  },
+  "runtime": {
+    "binding": "llama-cpp-2",
+    "binding_version": "0.1.156",
+    "llama_cpp_revision": "e79e4bf660e19f2ad851e06c6913f7a8c5852621"
+  },
+  "assets": [
+    {
+      "role": "weights",
+      "file_name": "MiniCPM5-2B-Q4_K_M.gguf",
+      "url": "https://huggingface.co/openbmb/MiniCPM5-2B-GGUF/resolve/2079a22f3beaa4e306449978533478fe0522f4b3/MiniCPM5-2B-Q4_K_M.gguf",
+      "bytes": 1561318368,
+      "sha256": "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd"
+    }
+  ],
+  "tokenizer": {
+    "source_repository": "openbmb/MiniCPM5-2B",
+    "source_revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
+    "tokenizer_sha256": "3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81",
+    "tokenizer_config_sha256": "e9b1064649e771d7a8e15637c68b2d2749724877ba3648bd74a4ece31c26303b",
+    "chat_template_sha256": "cc945752db555d60949b16989df4ccfeb52a313d6b4b5c5229dd786e2e9fcf1c"
+  },
+  "sampler": {
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "min_p": 0.0,
+    "repeat_penalty": 1.05,
+    "repeat_last_n": 64,
+    "seed": 20260913
+  },
+  "reasoning": {
+    "mode": "disabled",
+    "directive": null
+  },
+  "components": {
+    "tools": false,
+    "vision": false
+  },
+  "execution": {
+    "gpu_layers": 0,
+    "context_tokens": 4096,
+    "max_output_tokens": 128,
+    "cpu_threads": 4,
+    "resident_estimate": {
+      "weights_bytes": 1561318368,
+      "mapping_bytes": 16777216,
+      "kv_cache_bytes": 268435456,
+      "additional_cache_bytes": 67108864,
+      "batch_bytes": 134217728,
+      "runtime_overhead_bytes": 100663296
+    }
+  },
+  "targets": [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc"
+  ],
+  "gates": []
+}
