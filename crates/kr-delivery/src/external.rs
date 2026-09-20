@@ -425,9 +425,16 @@ pub fn decide_external(
                     ),
                     left_this_host: true,
                 },
+                // Section 25 marks the uncertainty rather than resolving it by guessing. This host
+                // stopped presenting the message; the destination may still have taken one of the
+                // attempts whose answer never arrived, so the message is recorded as possibly
+                // delivered rather than as one this host abandoned before it went.
                 None if attempt >= MAX_ATTEMPTS => settle(
-                    DeliveryState::Abandoned,
-                    format!("{MAX_ATTEMPTS} attempts reached an unknown outcome: {detail}"),
+                    DeliveryState::DuplicateUncertain,
+                    format!(
+                        "{MAX_ATTEMPTS} attempts reached an unknown outcome, so whether the \
+                         destination has it is not something this host can say: {detail}"
+                    ),
                     true,
                 ),
                 None => settle(
@@ -719,8 +726,11 @@ mod tests {
         assert!(decision.detail.contains("attempts reached nothing"));
     }
 
+    /// Section 25 marks duplicate-delivery uncertainty rather than resolving it. Attempts this
+    /// host stopped making are still attempts whose answers never arrived, so the message is
+    /// recorded as one the destination may hold rather than one that never went.
     #[test]
-    fn unknown_outcome_past_max_attempts_is_recorded_as_abandoned() {
+    fn unknown_outcome_past_max_attempts_keeps_the_delivery_uncertain() {
         let decision = decide_external(
             &ExternalOutcome::Unknown {
                 detail: "read timeout".to_owned(),
@@ -733,8 +743,9 @@ mod tests {
             1_000,
             TimestampMs::new(1_000_000),
         );
-        assert_eq!(decision.state, DeliveryState::Abandoned);
+        assert_eq!(decision.state, DeliveryState::DuplicateUncertain);
         assert_eq!(decision.next, NextAction::None);
+        assert!(decision.left_this_host);
         assert!(
             decision
                 .detail

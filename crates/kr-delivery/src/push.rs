@@ -325,10 +325,24 @@ fn decide_from_ack(
                     disable_destination: false,
                     left_this_host: true,
                 },
-                None if attempt >= MAX_ATTEMPTS => settled(
-                    DeliveryState::Abandoned,
-                    "receipt polling reached the maximum attempts while the gateway was still retrying",
-                ),
+                // The host has stopped asking; the gateway has not stopped trying. A local limit
+                // decides how often this host reads a receipt and decides nothing about what the
+                // gateway does with a notification it is holding, so the outcome is the one
+                // nobody knows rather than one this host abandoned. The record keeps its request
+                // bytes, stays outstanding for privacy mode, keeps the preview key it was sealed
+                // to, and a later receipt read can still resolve it.
+                None if attempt >= MAX_ATTEMPTS => Decision {
+                    state: DeliveryState::OutcomeUnknown,
+                    next: NextAction::None,
+                    next_attempt_at_ms: None,
+                    detail: format!(
+                        "{MAX_ATTEMPTS} receipt reads reached a gateway that was still retrying, \
+                         so the outcome is unknown and is not retried automatically"
+                    ),
+                    suppression,
+                    disable_destination: false,
+                    left_this_host: true,
+                },
                 None => settled(
                     DeliveryState::Expired,
                     "the notification expired while the gateway was still retrying",
@@ -528,8 +542,11 @@ mod tests {
         assert_eq!(decision.state, DeliveryState::Retrying);
     }
 
+    /// A local limit on how often this host reads a receipt says nothing about a gateway that is
+    /// still retrying the provider, so the record keeps the uncertainty rather than claiming this
+    /// host abandoned a notification that may still be delivered.
     #[test]
-    fn receipt_polling_past_max_attempts_is_recorded_as_abandoned_rather_than_expired() {
+    fn receipt_polling_past_max_attempts_leaves_the_outcome_unknown() {
         let decision = decide(
             &ack(PushDeliveryState::Retrying),
             notification(1),
@@ -537,13 +554,15 @@ mod tests {
             1_000,
             TimestampMs::new(1_000_000),
         );
-        assert_eq!(decision.state, DeliveryState::Abandoned);
+        assert_eq!(decision.state, DeliveryState::OutcomeUnknown);
         assert_eq!(decision.next, NextAction::None);
+        assert_eq!(decision.next_attempt_at_ms, None);
         assert!(
-            decision
-                .detail
-                .contains("receipt polling reached the maximum attempts")
+            decision.left_this_host,
+            "the gateway has it, so it is a retained artifact"
         );
+        assert!(decision.state.may_still_arrive());
+        assert!(decision.detail.contains("receipt reads"));
     }
 
     #[test]
