@@ -41,6 +41,13 @@ pub struct BundleStore {
     service: Arc<dyn SyncBackupService>,
     context: RecoveryContext,
     generation: Option<u64>,
+    /// The bundle this store last authenticated at that generation.
+    ///
+    /// A caller holding a bundle it read earlier holds a snapshot, and writing that snapshot back
+    /// against this store's newer compare-and-swap token would write over whatever landed in
+    /// between. The store keeps what it read, so a commit of a bundle that is not what this store
+    /// last saw is refused rather than accepted with the token it happens to hold.
+    held: Option<RecoveryBundle>,
 }
 
 impl std::fmt::Debug for BundleStore {
@@ -62,6 +69,7 @@ impl BundleStore {
             service,
             context,
             generation: None,
+            held: None,
         }
     }
 
@@ -107,6 +115,7 @@ impl BundleStore {
         let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext)
             .map_err(|_| RecoveryError::BundleNotAuthentic)?;
         self.generation = Some(generation);
+        self.held = Some(bundle.clone());
         Ok(bundle)
     }
 
@@ -126,6 +135,16 @@ impl BundleStore {
         now_ms: TimestampMs,
     ) -> Result<u64> {
         let expected = self.generation.unwrap_or(0);
+        // The bundle being written has to be the one this store last authenticated, changed. A
+        // snapshot from before somebody else's write would otherwise be committed against this
+        // store's newer token and take their change with it.
+        if self
+            .held
+            .as_ref()
+            .is_some_and(|held| held.revision.get() != bundle.revision.get())
+        {
+            return Err(RecoveryError::BundleConflict { expected });
+        }
         bundle.revision = U64::new(bundle.revision.get().saturating_add(1));
         bundle.written_at_ms = now_ms;
         let key = seed.bundle_key_for(&self.context)?;
@@ -137,6 +156,7 @@ impl BundleStore {
         {
             Ok(generation) => {
                 self.generation = Some(generation);
+                self.held = Some(bundle.clone());
                 Ok(generation)
             }
             Err(error) => {

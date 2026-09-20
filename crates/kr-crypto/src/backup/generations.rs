@@ -33,6 +33,26 @@ impl CheckpointSource {
     }
 }
 
+/// What a restore compares the generation it is offered against.
+///
+/// Three different questions, and they have different answers, so they are three cases rather than
+/// an optional checkpoint and a flag. A restore that was authorised for one exact generation is
+/// not asking whether the archive is recent; it is asking whether this is the archive whose
+/// authority was established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationExpectation<'a> {
+    /// Nothing to compare against. The recovery-only case: the restore goes ahead and proves
+    /// nothing about what else might exist.
+    Unverified,
+    /// The latest generation the owner verified. A generation at or after it is admitted; one
+    /// before it is a replay, and one that claims it with another manifest is a substitution.
+    Checkpoint(CheckpointSource, &'a ArchiveCheckpoint),
+    /// Exactly this generation, with exactly this encrypted manifest. Anything else is refused,
+    /// however genuine: a caller that pins has already established the authority of one archive,
+    /// and a second one is not it.
+    Exactly(&'a ArchiveCheckpoint),
+}
+
 /// Where one archive stands against the checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenerationStanding {
@@ -68,6 +88,11 @@ pub enum GenerationStanding {
         /// The archive the checkpoint is for.
         checkpoint_archive: ArchiveId,
     },
+    /// It is not the exact generation this restore was authorised for.
+    NotThePinnedGeneration {
+        /// The generation the restore was authorised for.
+        pinned: BackupGeneration,
+    },
     /// There is no checkpoint for this archive at all.
     NoCheckpoint,
 }
@@ -89,18 +114,35 @@ pub struct RestoreGeneration {
 impl RestoreGeneration {
     /// Compares one descriptor against the checkpoint the owner trusts, if there is one.
     #[must_use]
-    pub fn against(
-        descriptor: &ArchiveDescriptor,
-        checkpoint: Option<(CheckpointSource, &ArchiveCheckpoint)>,
-    ) -> Self {
-        let standing = match checkpoint {
-            None => GenerationStanding::NoCheckpoint,
-            Some((_, checkpoint)) if checkpoint.archive_id != descriptor.archive_id => {
+    pub fn against(descriptor: &ArchiveDescriptor, expectation: GenerationExpectation<'_>) -> Self {
+        let standing = match expectation {
+            GenerationExpectation::Unverified => GenerationStanding::NoCheckpoint,
+            GenerationExpectation::Exactly(pinned) => {
+                if pinned.archive_id != descriptor.archive_id {
+                    GenerationStanding::OtherArchive {
+                        checkpoint_archive: pinned.archive_id,
+                    }
+                } else if pinned.backup_generation == descriptor.backup_generation
+                    && pinned.encrypted_manifest_hash
+                        == descriptor.encrypted_manifest.encrypted_object_hash
+                {
+                    GenerationStanding::AtCheckpoint {
+                        source: CheckpointSource::Pairing,
+                    }
+                } else {
+                    GenerationStanding::NotThePinnedGeneration {
+                        pinned: pinned.backup_generation,
+                    }
+                }
+            }
+            GenerationExpectation::Checkpoint(_, checkpoint)
+                if checkpoint.archive_id != descriptor.archive_id =>
+            {
                 GenerationStanding::OtherArchive {
                     checkpoint_archive: checkpoint.archive_id,
                 }
             }
-            Some((source, checkpoint)) => {
+            GenerationExpectation::Checkpoint(source, checkpoint) => {
                 let trusted = checkpoint.backup_generation.get();
                 let offered = descriptor.backup_generation.get();
                 if offered < trusted {
@@ -146,6 +188,7 @@ impl RestoreGeneration {
             GenerationStanding::Replayed { .. }
                 | GenerationStanding::Substituted { .. }
                 | GenerationStanding::OtherArchive { .. }
+                | GenerationStanding::NotThePinnedGeneration { .. }
         )
     }
 
@@ -198,6 +241,11 @@ impl RestoreGeneration {
                  backup that was asked for and it is not being restored."
                     .to_owned()
             }
+            GenerationStanding::NotThePinnedGeneration { pinned } => format!(
+                "This restore was authorised for generation {}, and this is not it, so it is not \
+                 being restored.",
+                pinned.get()
+            ),
             GenerationStanding::NoCheckpoint => {
                 "There is no verified generation to compare it with.".to_owned()
             }

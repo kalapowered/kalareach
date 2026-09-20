@@ -47,8 +47,8 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// The most bytes a recovery kit may render to.
 ///
-/// A QR code carries the document in byte mode. Version 25 at the medium error correction a
-/// printed kit wants holds 1 062 bytes, so a kit inside this bound fits one; a kit that would not
+/// A QR code carries the document in byte mode. Version 26 at the medium error correction a
+/// printed kit wants holds 1 059 bytes, so a kit inside this bound fits one; a kit that would not
 /// is refused when it is built rather than discovered at the camera.
 pub const MAX_RECOVERY_KIT_BYTES: usize = 1024;
 

@@ -6,14 +6,14 @@
 //! the object identifier and encrypted hash the *manifest* named.
 
 use kr_protocol::archive::{
-    ARCHIVE_MANIFEST_SCHEMA_VERSION, ArchiveCheckpoint, ArchiveDescriptor, MANIFEST_PAYLOAD_LIMITS,
-    ManifestObject, ManifestPayload, SealedKeyWrap, SignedArchiveManifest, TrustedWriter,
+    ARCHIVE_MANIFEST_SCHEMA_VERSION, ArchiveDescriptor, MANIFEST_PAYLOAD_LIMITS, ManifestObject,
+    ManifestPayload, SealedKeyWrap, SignedArchiveManifest, TrustedWriter,
 };
 use kr_protocol::ids::{ArchiveId, BackupObjectId};
 use kr_protocol::scalars::{KeyId, StoredEnvelopeKey};
 
 use crate::archive;
-use crate::backup::generations::{CheckpointSource, RestoreGeneration};
+use crate::backup::generations::{GenerationExpectation, RestoreGeneration};
 use crate::backup::{manifest_context, member_context};
 use crate::error::{CryptoError, Result};
 use crate::kdf::RecoveryRecipient;
@@ -65,14 +65,15 @@ impl ArchiveReader<'_> {
 /// backup. The checkpoint is the latest generation the owner verified, which is what catches a
 /// service replaying an older archive whose signature is perfectly genuine.
 ///
-/// A restore that has no checkpoint says so by leaving it `None`, which is the recovery-only case:
-/// it goes ahead, and [`RestoreGeneration::proves_no_newer_archive`] stays false either way.
+/// A restore that has nothing to compare against says so with
+/// [`GenerationExpectation::Unverified`], which is the recovery-only case: it goes ahead, and
+/// [`RestoreGeneration::proves_no_newer_archive`] stays false whichever case is used.
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveExpectation<'a> {
     /// The archive the caller means to restore.
     pub archive_id: ArchiveId,
-    /// The latest generation the owner verified, and where that came from.
-    pub checkpoint: Option<(CheckpointSource, &'a ArchiveCheckpoint)>,
+    /// What the generation it is offered is compared against.
+    pub generation: GenerationExpectation<'a>,
 }
 
 /// Reads a descriptor, so a caller can show what it is about to restore before it restores it.
@@ -236,7 +237,7 @@ pub fn open_archive(
     // And the generation, against the checkpoint the owner verified. Refusing here rather than
     // leaving it to the caller is what makes the checkpoint a protection instead of a report: a
     // caller that never asked still cannot restore a replayed generation.
-    let generation = RestoreGeneration::against(&descriptor, expectation.checkpoint);
+    let generation = RestoreGeneration::against(&descriptor, expectation.generation);
     if !generation.is_admissible() {
         return Err(CryptoError::BindingMismatch {
             what: "an archive generation the owner's verified checkpoint refuses",

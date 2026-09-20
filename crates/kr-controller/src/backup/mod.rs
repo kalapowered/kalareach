@@ -19,8 +19,9 @@
 //! * **The privacy hook.** [`BackupService`] implements `kr_worker::privacy::PrivacySubsystem`
 //!   directly: it fences the outbox at the generation, takes back what has not been dispatched,
 //!   removes the staged ciphertext it holds, reports what is still in flight, names what it keeps,
-//!   and shows already-uploaded archives as retained artifacts with a deletion that is authorised
-//!   on its own.
+//!   and shows already-uploaded archives as retained artifacts. It marks them **not** deletable,
+//!   because this host holds no route through which it could ask a service to remove one; the
+//!   separately authorised deletion action section 24 asks for is not built here.
 //!
 //! # What this host never writes down
 //!
@@ -34,8 +35,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use kr_crypto::backup::{
-    CheckpointSource, Material, RestoreAdmissions, RestoreGeneration, SealedArchive, StagedObject,
-    admit_for_restore,
+    GenerationExpectation, Material, RestoreAdmissions, RestoreGeneration, SealedArchive,
+    StagedObject, admit_for_restore,
 };
 use kr_protocol::archive::{
     ArchiveCheckpoint, BackupGenerationPublication, BackupWriterRecord, BackupWriterRecordPayload,
@@ -53,6 +54,16 @@ use crate::error::{ControllerError, Result};
 
 /// The stable name this subsystem is reported under, which is section 24's.
 pub const SUBSYSTEM_NAME: &str = "backup";
+
+/// The obligation each privacy step owes while it has not done what it was asked.
+///
+/// One name per step, so a retry that works clears exactly what the failure recorded.
+const FENCE_STEP: &str = "record the backup fence";
+const CANCEL_STEP: &str = "cancel undispatched backup work";
+const REMOVE_STEP: &str = "remove staged backup ciphertext";
+
+/// The obligation a store that will not answer leaves behind.
+const FAILED_TO_RECORD: &str = "read the backup store";
 
 /// One generation this host has admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,8 +126,8 @@ pub struct RestoreRequest<'a> {
     pub owner_key: &'a AuthorisationKey,
     /// The writer's signing key, from the owner's recovery bundle and nowhere else.
     pub writer_key: &'a AuthorisationKey,
-    /// The latest generation the owner verified for this archive, and where it came from.
-    pub checkpoint: Option<(CheckpointSource, &'a ArchiveCheckpoint)>,
+    /// What the generation the service offered is compared against.
+    pub generation: GenerationExpectation<'a>,
 }
 
 /// A restore whose authority and generation have both been established.
@@ -129,6 +140,11 @@ pub struct VerifiedRestore {
     writer_key_id: KeyId,
     writer_revision: u64,
     generation: RestoreGeneration,
+    /// The generation and manifest the publication's signature actually covered.
+    ///
+    /// The archive that is opened is opened against this, so a second valid generation of the same
+    /// collection cannot be substituted for the one whose authority was established.
+    pinned: ArchiveCheckpoint,
 }
 
 impl VerifiedRestore {
@@ -157,19 +173,18 @@ impl VerifiedRestore {
         self.generation
     }
 
-    /// Returns what this restore is allowed to hand to `kr_crypto::backup::open_archive`.
+    /// Returns what this restore hands to `kr_crypto::backup::open_archive`.
     ///
-    /// It is built from what was verified rather than from anything the caller still holds, so the
-    /// archive that is opened is the archive whose authority was established, under the checkpoint
-    /// it was established against.
+    /// It takes no argument, and that is the point. It is built entirely from what verification
+    /// established: the archive whose authority was checked, and the exact generation and
+    /// encrypted-manifest hash the publication's signature covered. Opening against it therefore
+    /// admits one archive at one generation with one manifest, so a second genuine generation of
+    /// the same collection cannot be substituted for the one that was verified.
     #[must_use]
-    pub const fn expectation<'a>(
-        &self,
-        checkpoint: Option<(CheckpointSource, &'a ArchiveCheckpoint)>,
-    ) -> kr_crypto::backup::ArchiveExpectation<'a> {
+    pub const fn expectation(&self) -> kr_crypto::backup::ArchiveExpectation<'_> {
         kr_crypto::backup::ArchiveExpectation {
             archive_id: self.archive_id,
-            checkpoint,
+            generation: GenerationExpectation::Exactly(&self.pinned),
         }
     }
 }
@@ -239,15 +254,22 @@ impl RestoreRequest<'_> {
 
         // 4. The generation, against the checkpoint the owner trusts.
         let generation =
-            RestoreGeneration::against(&self.publication.payload.descriptor, self.checkpoint);
+            RestoreGeneration::against(&self.publication.payload.descriptor, self.generation);
         if !generation.is_admissible() {
             return Err(ControllerError::InvalidArgument(generation.describe()));
         }
+        let descriptor = &self.publication.payload.descriptor;
         Ok(VerifiedRestore {
-            archive_id: self.publication.payload.descriptor.archive_id,
+            archive_id: descriptor.archive_id,
             writer_key_id,
             writer_revision: payload.writer_revision.get(),
             generation,
+            pinned: ArchiveCheckpoint {
+                archive_id: descriptor.archive_id,
+                backup_generation: descriptor.backup_generation,
+                encrypted_manifest_hash: descriptor.encrypted_manifest.encrypted_object_hash,
+                verified_at_ms: self.publication.payload.published_at_ms,
+            },
         })
     }
 
@@ -308,7 +330,20 @@ impl BackupService {
     /// [`PrivacySubsystem::outstanding`] counts it: a restart comes back owing what it owed, and
     /// only the retry's own success clears it.
     fn owe(&self, store: &mut BackupStore, what: String) {
-        let _ = store.record_obligation(&what, kr_ipc::now_ms());
+        if store.record_obligation(&what, kr_ipc::now_ms()).is_err() {
+            // A store that will not record the obligation cannot be asked what it owes either, so
+            // the failure is kept where `outstanding` will still see it: a store that cannot be
+            // read answers "one thing outstanding" rather than "nothing".
+            let _ = store.record_obligation(FAILED_TO_RECORD, kr_ipc::now_ms());
+        }
+    }
+
+    /// Records that one privacy step did what it was asked, clearing what it owed.
+    ///
+    /// Keyed by the step rather than by the message, so a retry that works clears the obligation
+    /// the failure recorded rather than adding a second entry beside it.
+    fn settled(&self, store: &mut BackupStore, step: &str) {
+        let _ = store.clear_obligation(step);
     }
 
     /// Returns what privacy mode asked for that this host has not done.
@@ -334,13 +369,33 @@ impl BackupService {
         self.store().enrol_writer(writer_key_id, archive_id, now_ms)
     }
 
-    /// Retires a backup writer, so its unfinished generations stop being authorised.
+    /// Retires a backup writer for one archive, so its unfinished generations there stop being
+    /// authorised. Its enrolments for other collections are untouched.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn retire_writer(&self, writer_key_id: KeyId, now_ms: TimestampMs) -> Result<()> {
-        self.store().retire_writer(writer_key_id, now_ms)
+    pub fn retire_writer(
+        &self,
+        archive_id: ArchiveId,
+        writer_key_id: KeyId,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        self.store()
+            .retire_writer(archive_id, writer_key_id, now_ms)
+    }
+
+    /// Releases the privacy fence, so backup production is admitted again from this moment.
+    ///
+    /// It is the durable half of turning privacy mode off, and it reconstructs nothing: the work
+    /// the fence cancelled stays cancelled, and what is admitted afterwards is admitted under the
+    /// new generation. A caller takes this step after `PrivacyMode::disable`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn release_fence(&self) -> Result<()> {
+        self.store().release_fence()
     }
 
     /// Stages one sealed generation and records it.
@@ -399,6 +454,29 @@ impl BackupService {
         {
             return Err(ControllerError::InvalidArgument(
                 "a member object under the encrypted manifest's own identifier".to_owned(),
+            ));
+        }
+        // The writer is the one that signed the manifest, not a label the caller chose. Admitting
+        // work under a writer that did not sign it would account for it under an authority it does
+        // not have.
+        if sealed.signed_manifest.writer_key_id != writer_key_id {
+            return Err(ControllerError::PermissionDenied {
+                detail: "that generation's manifest is signed by another writer".to_owned(),
+            });
+        }
+        // And the objects are the manifest's members, exactly. A caller that admitted fewer than
+        // the manifest names would stage an archive this host could complete and publish while
+        // some of its members had never been uploaded at all.
+        let members = &sealed.signed_manifest.manifest.objects;
+        if members.len() != objects.len()
+            || !members.iter().all(|entry| {
+                objects
+                    .iter()
+                    .any(|staged| staged.reference() == &entry.object)
+            })
+        {
+            return Err(ControllerError::InvalidArgument(
+                "the objects offered are not the members the signed manifest names".to_owned(),
             ));
         }
 
@@ -583,13 +661,18 @@ impl BackupService {
 
     /// Resolves whatever an earlier daemon left unfinished.
     ///
-    /// Three answers, and only three:
+    /// Four answers, in this order:
     ///
-    /// * A generation whose writer this host no longer holds an enrolment for is **cancelled**. It
-    ///   is work this host may not do, whatever state it was left in.
     /// * A generation whose *publication* was dispatched and never answered is recorded as
-    ///   **unknown**. The service may hold it and may not, and a host that wrote either answer
-    ///   would be writing something it does not know. Section 23 never retries that automatically.
+    ///   **unknown**, and that is decided first. The service may hold it and may not, and a host
+    ///   that wrote either answer would be writing something it does not know; section 23 never
+    ///   retries that automatically, and retiring the writer afterwards must not rewrite an
+    ///   outcome this host never learned.
+    /// * A generation whose writer this host no longer holds an enrolment for, **for that
+    ///   archive**, is **cancelled**. It is work this host may not do, whatever state it was left
+    ///   in.
+    /// * A generation privacy mode fenced stays **fenced**. A restart does not un-fence work a
+    ///   fence stopped.
     /// * Everything else **resumes**. A dispatched upload is put back in hand: the same object
     ///   under the same identity and hash is the same object, so sending it again is not a second
     ///   publication.
@@ -754,11 +837,41 @@ fn write_staged(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     file.flush().map_err(ControllerError::registry)?;
     file.sync_all().map_err(ControllerError::registry)?;
     drop(file);
-    // The bytes are on the disk; the name that reaches them may not be until the directory is
-    // flushed too.
-    let directory = std::fs::File::open(parent).map_err(ControllerError::registry)?;
-    directory.sync_all().map_err(ControllerError::registry)?;
-    Ok(())
+    // The bytes are on the disk; the name that reaches them may not be until the directory that
+    // holds it is flushed, nor the directory itself until *its* parent is.
+    sync_directory(path)
+}
+
+/// Flushes the directory entry of `path` and of every directory made for it under the staging root.
+///
+/// A file flushed into a directory that was itself created and never flushed is a file whose name
+/// losing power can take away, so the walk goes up to the staging root rather than stopping at the
+/// immediate parent.
+///
+/// On Windows it does nothing and says so. There is no portable way to flush a directory entry
+/// there, and opening a directory as a file fails outright: a staging write that tried would fail
+/// after the ciphertext was already on the disk. The contents are written and flushed on every
+/// platform, so a reader never sees a file half written; what a Windows host does not get is the
+/// guarantee that a name survives losing power, and `docs/host/README.md` says so.
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let mut directory = path.parent();
+        while let Some(current) = directory {
+            let handle = std::fs::File::open(current).map_err(ControllerError::registry)?;
+            handle.sync_all().map_err(ControllerError::registry)?;
+            if current.file_name().is_some_and(|name| name == "backup") {
+                break;
+            }
+            directory = current.parent();
+        }
+        Ok(())
+    }
 }
 
 /// Builds the transcript one writer enrolment is signed over.
@@ -812,24 +925,16 @@ impl PrivacySubsystem for BackupService {
         let mut store = self.store();
         let items = match store.outbox() {
             Ok(entries) => entries.iter().filter(|entry| !entry.dispatched).count() as u64,
-            Err(error) => {
-                self.owe(
-                    &mut store,
-                    format!("the backup outbox could not be read: {error}"),
-                );
+            Err(_) => {
+                self.owe(&mut store, FENCE_STEP.to_owned());
                 return Fenced::default();
             }
         };
-        if let Err(error) = store.record_fence(generation.get(), now_ms) {
-            self.owe(
-                &mut store,
-                format!(
-                    "the backup fence at privacy generation {} could not be recorded: {error}",
-                    generation.get()
-                ),
-            );
+        if store.record_fence(generation.get(), now_ms).is_err() {
+            self.owe(&mut store, FENCE_STEP.to_owned());
             return Fenced::default();
         }
+        self.settled(&mut store, FENCE_STEP);
         Fenced { queues: 1, items }
     }
 
@@ -841,15 +946,15 @@ impl PrivacySubsystem for BackupService {
         let now_ms = kr_ipc::now_ms();
         let mut store = self.store();
         match store.cancel_undispatched(now_ms, "privacy mode cancelled undispatched backup work") {
-            Ok((undispatched, in_flight)) => Cancelled {
-                undispatched,
-                in_flight,
-            },
-            Err(error) => {
-                self.owe(
-                    &mut store,
-                    format!("undispatched backup work could not be cancelled: {error}"),
-                );
+            Ok((undispatched, in_flight)) => {
+                self.settled(&mut store, CANCEL_STEP);
+                Cancelled {
+                    undispatched,
+                    in_flight,
+                }
+            }
+            Err(_) => {
+                self.owe(&mut store, CANCEL_STEP.to_owned());
                 Cancelled::default()
             }
         }
@@ -872,21 +977,15 @@ impl PrivacySubsystem for BackupService {
         let mut store = self.store();
         let generations = match store.generations() {
             Ok(generations) => generations,
-            Err(error) => {
-                self.owe(
-                    &mut store,
-                    format!("the backup generations could not be read: {error}"),
-                );
+            Err(_) => {
+                self.owe(&mut store, REMOVE_STEP.to_owned());
                 return removed;
             }
         };
         let outbox = match store.outbox() {
             Ok(outbox) => outbox,
-            Err(error) => {
-                self.owe(
-                    &mut store,
-                    format!("the backup outbox could not be read: {error}"),
-                );
+            Err(_) => {
+                self.owe(&mut store, REMOVE_STEP.to_owned());
                 return removed;
             }
         };
@@ -959,8 +1058,13 @@ impl PrivacySubsystem for BackupService {
                 Err(error) => faults.push(format!("a generation could not be forgotten: {error}")),
             }
         }
-        for fault in faults {
-            self.owe(&mut store, fault);
+        if faults.is_empty() {
+            self.settled(&mut store, REMOVE_STEP);
+        } else {
+            // One name for the step, whatever went wrong inside it: a retry that empties the
+            // staging directory clears the obligation the failure recorded rather than leaving a
+            // per-file entry nothing will ever match.
+            self.owe(&mut store, REMOVE_STEP.to_owned());
         }
         removed
     }
@@ -1007,10 +1111,11 @@ impl PrivacySubsystem for BackupService {
 
     /// Names the archives that had already left this host.
     ///
-    /// Privacy mode does not erase them and does not claim it could. What it offers instead is
-    /// this list and a deletion that is authorised on its own: the reference is the archive and
-    /// generation, never a path, and `deletable` says this host has a reference it can ask through,
-    /// not that asking will succeed or that no other copy exists.
+    /// Privacy mode does not erase them and does not claim it could. What it offers is this list:
+    /// the reference is the archive and generation, never a path. `deletable` is false, because
+    /// this host holds no route through which it could ask a service to remove one; the separately
+    /// authorised deletion action section 24 asks for needs that route, and building it belongs
+    /// with the component that carries an object to a service.
     fn exported(&self) -> Vec<Exported> {
         self.store()
             .generations()

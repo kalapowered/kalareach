@@ -8,8 +8,8 @@
 use kr_controller::backup::store::{GenerationState, ObjectState, Step};
 use kr_controller::backup::{BackupService, RestoreRequest, SUBSYSTEM_NAME};
 use kr_crypto::backup::{
-    ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, KeyRotation, Material,
-    ObjectSource, SealedArchive, StagedObject, seal_archive, stage_object,
+    ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, GenerationExpectation,
+    KeyRotation, Material, ObjectSource, SealedArchive, StagedObject, seal_archive, stage_object,
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_protocol::archive::{
@@ -290,22 +290,23 @@ fn the_publish_step_is_enqueued_with_the_last_object_that_finished_uploading() {
 fn reconciliation_resumes_what_is_authorised_and_cancels_what_is_not() {
     let environment = Environment::open();
     let producer = Producer::generate();
-    let retired = AuthorisationKeyPair::generate().expect("a writer key");
-    environment
-        .service()
-        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
-        .expect("the writer is enrolled");
-    environment
-        .service()
-        .enrol_writer(retired.key_id(), archive_id(), TimestampMs::new(1))
-        .expect("the second writer is enrolled");
+    // A second producer of the same collection, with its own signing key. The writer a generation
+    // is admitted under has to be the writer that signed it, so the second generation is sealed by
+    // the writer it is admitted under.
+    let leaving = Producer::generate();
+    for writer in [producer.writer.key_id(), leaving.writer.key_id()] {
+        environment
+            .service()
+            .enrol_writer(writer, archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+    }
 
     let objects = [stage(1, "a.cbor", b"one")];
     let first = producer.seal(1, &objects);
-    let second = producer.seal(2, &objects);
+    let second = leaving.seal(2, &objects);
     for (sealed, writer) in [
         (&first, producer.writer.key_id()),
-        (&second, retired.key_id()),
+        (&second, leaving.writer.key_id()),
     ] {
         environment
             .service()
@@ -322,7 +323,11 @@ fn reconciliation_resumes_what_is_authorised_and_cancels_what_is_not() {
     // The owner retires the second writer, and the daemon restarts.
     environment
         .service()
-        .retire_writer(retired.key_id(), TimestampMs::new(6_000))
+        .retire_writer(
+            archive_id(),
+            leaving.writer.key_id(),
+            TimestampMs::new(6_000),
+        )
         .expect("the writer is retired");
     let outcome = environment
         .service()
@@ -624,6 +629,71 @@ fn a_generation_already_admitted_is_not_admitted_again() {
     }
 }
 
+#[test]
+fn releasing_the_fence_admits_backup_production_again_under_the_new_generation() {
+    let environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+
+    let mut environment = environment;
+    let mut mode = PrivacyMode::new();
+    mode.open_generation(TimestampMs::new(6_000));
+    {
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut environment.service];
+        mode.apply(&mut subsystems, TimestampMs::new(6_000));
+    }
+    assert!(
+        environment
+            .service()
+            .admit(
+                &producer.seal(1, &objects),
+                &objects,
+                producer.writer.key_id(),
+                mode.generation(),
+                TimestampMs::new(6_500),
+            )
+            .is_err(),
+        "nothing is admitted while the fence holds"
+    );
+
+    // Turning privacy mode off releases the fence, under a generation of its own. Nothing the
+    // fence cancelled comes back.
+    let resumed = mode.disable(TimestampMs::new(7_000));
+    environment
+        .service()
+        .release_fence()
+        .expect("the fence is released");
+    assert_eq!(environment.service().fenced_at().expect("a read"), None);
+    environment
+        .service()
+        .admit(
+            &producer.seal(2, &objects),
+            &objects,
+            producer.writer.key_id(),
+            resumed.generation,
+            TimestampMs::new(8_000),
+        )
+        .expect("backup production is admitted again");
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(2))
+        .expect("a read")
+        .expect("the generation");
+    assert_eq!(record.privacy_generation, resumed.generation.get());
+    assert!(
+        environment
+            .service()
+            .generation(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .is_none(),
+        "what the fence stopped is not reconstructed"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-24.16: generation and writer authority verified, and a restore that returns data only.
 // ---------------------------------------------------------------------------------------------
@@ -649,7 +719,7 @@ fn a_restore_verifies_the_owners_enrolment_the_writers_signature_and_the_generat
         enrolment: &enrolment,
         owner_key: producer.owner.public(),
         writer_key: producer.writer.public(),
-        checkpoint: Some((CheckpointSource::Pairing, &checkpoint)),
+        generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &checkpoint),
     }
     .verify()
     .expect("the restore is admitted");
@@ -658,6 +728,38 @@ fn a_restore_verifies_the_owners_enrolment_the_writers_signature_and_the_generat
     assert_eq!(verified.writer_revision(), 1);
     assert!(verified.generation().describe().contains("generation 4"));
     assert!(!verified.generation().proves_no_newer_archive());
+
+    // What it hands the archive layer is built from what was verified and takes no argument, so a
+    // second genuine generation of the same collection cannot be substituted for it.
+    let expectation = verified.expectation();
+    assert_eq!(expectation.archive_id, archive_id());
+    let GenerationExpectation::Exactly(pinned) = expectation.generation else {
+        panic!("a verified restore pins the generation it established");
+    };
+    assert_eq!(pinned.backup_generation, BackupGeneration::new(4));
+    assert_eq!(
+        pinned.encrypted_manifest_hash,
+        sealed.descriptor.encrypted_manifest.encrypted_object_hash
+    );
+
+    // And the archive layer refuses another generation against it.
+    let other = producer.seal(6, &objects);
+    assert!(
+        kr_crypto::backup::open_archive(
+            &kr_crypto::backup::ArchiveReader::Device(&producer.device),
+            producer.sender.public(),
+            &[TrustedWriter {
+                writer_key_id: producer.writer.key_id(),
+                signing_key: *producer.writer.public(),
+                enrolled_at_ms: TimestampMs::new(1_000),
+            }],
+            &expectation,
+            &other.descriptor_bytes,
+            &other.encrypted_manifest,
+        )
+        .is_err(),
+        "the archive opened is the archive whose authority was established"
+    );
 }
 
 #[test]
@@ -678,7 +780,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
             enrolment: &enrolment,
             owner_key: impostor.owner.public(),
             writer_key: producer.writer.public(),
-            checkpoint: None,
+            generation: GenerationExpectation::Unverified,
         }
         .verify()
         .is_err(),
@@ -694,7 +796,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
             enrolment: &enrolment,
             owner_key: producer.owner.public(),
             writer_key: impostor.writer.public(),
-            checkpoint: None,
+            generation: GenerationExpectation::Unverified,
         }
         .verify()
         .is_err(),
@@ -714,7 +816,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
             enrolment: &enrolment,
             owner_key: producer.owner.public(),
             writer_key: producer.writer.public(),
-            checkpoint: None,
+            generation: GenerationExpectation::Unverified,
         }
         .verify()
         .is_err(),
@@ -730,7 +832,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
             enrolment: &enrolment,
             owner_key: producer.owner.public(),
             writer_key: producer.writer.public(),
-            checkpoint: None,
+            generation: GenerationExpectation::Unverified,
         }
         .verify()
         .is_err(),
@@ -751,7 +853,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
         enrolment: &enrolment,
         owner_key: producer.owner.public(),
         writer_key: producer.writer.public(),
-        checkpoint: Some((CheckpointSource::Pairing, &checkpoint)),
+        generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &checkpoint),
     }
     .verify()
     .expect_err("a replayed older archive");
@@ -766,15 +868,20 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
             enrolment: &enrolment,
             owner_key: producer.owner.public(),
             writer_key: producer.writer.public(),
-            checkpoint: None,
+            generation: GenerationExpectation::Unverified,
         }
         .verify()
         .is_err()
     );
 }
 
+/// The table's answers, which are the decision a restore acts on rather than a gate over bytes.
+///
+/// `RestoreRequest::admit` classifies kinds a caller names. The archive layer below it carries
+/// opaque objects, so what closes section 20 ¶11 is each import path asking for every kind it
+/// carries; this establishes the answer it gets.
 #[test]
-fn a_restore_returns_data_and_never_a_reusable_host_control_key() {
+fn a_restore_classifies_a_reusable_host_control_key_as_material_it_refuses() {
     let admitted = RestoreRequest::admit(&[
         Material::SessionData,
         Material::DeviceConfiguration,

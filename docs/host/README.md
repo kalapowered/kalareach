@@ -1404,12 +1404,21 @@ publishes, and a repeated acknowledgement does not enqueue a second publication.
 settles the generation and clears its outbox entries together.
 
 Staging the ciphertext is the one step *outside* that transaction, and it goes first: each file is
-created exclusively, written, flushed and its directory entry flushed before any row names it, so a
-committed row never names a file that losing power took away. A crash between the two leaves files
-nothing claims, which a sweep can remove; the other order would leave rows naming files that are
-not there, which nothing can recover from. Exclusive creation is also what stops a second admission
-of the same generation writing over ciphertext the first is still accounting for, and that second
-admission is refused outright.
+created exclusively, written, flushed, and every directory made for it up to the staging root
+flushed, before any row names it. A committed row therefore never names a file that losing power
+took away. The other order would leave rows naming files that are not there, which nothing can
+recover from. Exclusive creation is also what stops a second admission of the same generation
+writing over ciphertext the first is still accounting for, and that second admission is refused
+outright.
+
+Two limits are stated rather than implied. **On Windows nothing flushes a directory entry**: there
+is no portable way to do it, and opening a directory as a file fails outright, so a staging write
+that tried would fail after the ciphertext was already on the disk. The contents are written and
+flushed on every platform, so a reader never sees a file half written; what a Windows host does not
+get is the guarantee that a *name* survives losing power. And **a crash between the file and the
+row leaves ciphertext nothing claims**. Nothing sweeps it: startup reconciliation and privacy
+cleanup both read the database, so a staged file with no row is invisible to them, and the
+generation it belonged to cannot be admitted again until it is removed by hand.
 
 ### What a restart resolves
 
@@ -1439,9 +1448,10 @@ checkpoint the owner trusts, which refuses an archive older than what the owner 
 that claims the checkpoint's generation with a different manifest.
 
 `VerifiedRestore` is built by that call and by nothing else, and its fields are private.
-`VerifiedRestore::expectation` builds what `kr_crypto::backup::open_archive` is handed, from what
-was verified rather than from anything the caller still holds, so the archive that is opened is the
-archive whose authority was established.
+`VerifiedRestore::expectation` builds what `kr_crypto::backup::open_archive` is handed, and it takes
+no argument: it carries the archive, the exact generation and the encrypted-manifest hash the
+publication's signature covered, so the archive that is opened is the one whose authority was
+established and a second genuine generation of the same collection cannot be substituted for it.
 
 What a restore puts back is decided by `kr_crypto::backup`'s table, so this host and the device that
 made the backup give the same answer: session content, device configuration and generation
@@ -1449,7 +1459,9 @@ checkpoints come back; reusable endpoint and control-signing private keys, the n
 extension's preview key, the recovery seed, this host's own grant and revocation authority and any
 revoked grant do not, each with the reason rather than as a silent omission. The table classifies
 material a caller names rather than inspecting an object's bytes, so it is the decision and the
-caller's export and import paths are the gate.
+caller's export and import paths are the gate. **This build has no such path**: nothing here reads
+an archive back into a host, so what is here is the check a future import will make, not an import
+that makes it.
 
 ### What it does not do
 
@@ -1513,23 +1525,31 @@ undispatched outbox entry, settles the generations that had nothing else in flig
 staged ciphertext this host holds.
 
 It reports only what it actually removed. A file it could not unlink stays in the accounting, and
-the failure becomes a **durable obligation**: it is counted as work outstanding, a restart comes
-back owing what it owed, and only the retry's own success clears it, so privacy mode cannot report
-complete over a cleanup that did not happen. Three kinds of generation keep their record once their
+the failure becomes a **durable obligation**, named for the step that owed it: it is counted as
+work outstanding, a restart comes back owing what it owed, and the step's own next success clears
+it, so privacy mode cannot report complete over a cleanup that did not happen. A store that will
+not answer at all is itself an obligation, so an unreadable store reports something outstanding
+rather than nothing. Three kinds of generation keep their record once their
 bytes have gone: one already published, because it has left and is shown rather than pretended
 away; one whose outcome this host could not establish, for the same reason; and one with work still
 in flight, because its outbox entry is what says the cleanup is not finished.
 
 A publication is recorded only under the generation *this host admitted the work under*, which it
 reads from its own store rather than taking from the caller. A result from an earlier generation is
-refused, and so is one relabelled with the generation in force.
+refused, and so is one relabelled with the generation in force. What stops a publication actually
+reaching a service is the dispatch gate rather than this: recording a refusal cannot recall
+something already sent, which is why the fence stops the send.
+
+Turning privacy mode off releases the fence, under a generation of its own. Nothing the fence
+cancelled comes back; what is admitted afterwards is admitted under the new generation.
 
 What has already left the host is shown rather than erased. An uploaded archive is listed by its
 archive and generation, and so is one whose outcome this host could not establish, because a copy
 it cannot account for is still a copy. The backup service marks them **not** deletable: it holds no
 route through which it could ask the service to remove one, and offering an action nothing here can
-perform would be the false promise section 24 forbids. A notification or an archive this host does
-hold a reference to is listed with a separately authorised deletion action;
+perform would be the false promise section 24 forbids, so **the separately authorised deletion
+action that section asks for is not built**. A notification or another artifact this host does hold
+a reference to is listed with one;
 it does not silently delete unrelated backup collections and does not claim a copy somebody else
 holds can be recalled. Local deletion is logical cleanup of this host's own records rather than a
 claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here

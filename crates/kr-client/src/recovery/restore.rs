@@ -40,11 +40,15 @@ impl RetrievalPolicy {
     }
 }
 
-/// Proof that a restore reached the service through the configured retrieval policy.
+/// The caller's own statement that it reached the service through the configured retrieval policy.
 ///
-/// It carries no key. Holding one means a restore can *fetch* ciphertext; opening that ciphertext
-/// needs the kit, and section 20 says so in as many words: service login alone does not decrypt
-/// the bundle.
+/// It is an assertion rather than a proof: nothing here authenticates anybody to a service, and a
+/// caller that constructed one without signing in would be lying to itself. What it does is order
+/// the two steps, so a restore cannot skip the policy its owner configured.
+///
+/// It carries no key, and that half *is* structural. Holding one means a restore can *fetch*
+/// ciphertext; opening that ciphertext needs the seed the kit carries, and section 20 says so in
+/// as many words: service login alone does not decrypt the bundle.
 #[derive(Clone, Debug)]
 pub struct ServiceAccess {
     /// Which policy granted it.

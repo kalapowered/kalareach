@@ -268,6 +268,50 @@ impl BackupStore {
     }
 
     fn migrate(&self) -> Result<()> {
+        // A store that records a version already has its tables. Creating a missing one would turn
+        // a lost fence or a lost set of cleanup obligations into an empty table, which reads as
+        // "nothing was fenced" and "nothing is owed": the two answers a host must never guess.
+        let existing: Option<i64> = self
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .optional()
+            .unwrap_or(None);
+        if let Some(version) = existing {
+            if version != SCHEMA_VERSION {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: format!(
+                        "this backup store is at schema version {version}; this build reads \
+                         {SCHEMA_VERSION}"
+                    ),
+                });
+            }
+            for table in [
+                "generations",
+                "objects",
+                "outbox",
+                "writers",
+                "fence",
+                "obligations",
+            ] {
+                let present: i64 = self
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                        params![table],
+                        |row| row.get(0),
+                    )
+                    .map_err(ControllerError::registry)?;
+                if present == 0 {
+                    return Err(ControllerError::RegistryUnavailable {
+                        detail: format!(
+                            "this backup store is missing its {table} table, so what it recorded \
+                             cannot be established"
+                        ),
+                    });
+                }
+            }
+            return Ok(());
+        }
         self.connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -307,10 +351,11 @@ impl BackupStore {
                      enqueued_at_ms     INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS writers (
-                     writer_key_id  BLOB PRIMARY KEY,
                      archive_id     BLOB NOT NULL,
+                     writer_key_id  BLOB NOT NULL,
                      enrolled_at_ms INTEGER NOT NULL,
-                     retired_at_ms  INTEGER
+                     retired_at_ms  INTEGER,
+                     PRIMARY KEY (archive_id, writer_key_id)
                  );
                  CREATE TABLE IF NOT EXISTS fence (
                      id                 INTEGER PRIMARY KEY CHECK (id = 0),
@@ -324,29 +369,13 @@ impl BackupStore {
                  );",
             )
             .map_err(ControllerError::registry)?;
-        let recorded: Option<i64> = self
-            .connection
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .optional()
+        self.connection
+            .execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![SCHEMA_VERSION],
+            )
             .map_err(ControllerError::registry)?;
-        match recorded {
-            None => {
-                self.connection
-                    .execute(
-                        "INSERT INTO schema_version (version) VALUES (?1)",
-                        params![SCHEMA_VERSION],
-                    )
-                    .map_err(ControllerError::registry)?;
-                Ok(())
-            }
-            Some(version) if version == SCHEMA_VERSION => Ok(()),
-            Some(version) => Err(ControllerError::RegistryUnavailable {
-                detail: format!(
-                    "this backup store is at schema version {version}; this build reads \
-                     {SCHEMA_VERSION}"
-                ),
-            }),
-        }
+        Ok(())
     }
 
     /// Returns the directory staged ciphertext lives in.
@@ -511,7 +540,19 @@ impl BackupStore {
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        let complete = outstanding == 0;
+        // A generation that has settled takes no more transitions. Its outbox is empty by
+        // definition, and an acknowledgement arriving afterwards must not put work back into it.
+        let state: String = transaction
+            .query_row(
+                "SELECT state FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
+                params![
+                    archive_id.get().as_bytes().as_slice(),
+                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let complete = outstanding == 0 && !GenerationState::parse(&state)?.is_settled();
         if complete {
             // Exactly one publish entry, and the upload entry goes with it. A second
             // acknowledgement of an object that had already arrived would otherwise enqueue a
@@ -574,13 +615,24 @@ impl BackupStore {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn note_dispatched(&mut self, sequence: u64) -> Result<()> {
-        self.connection
+        // Exactly one undispatched entry, claimed. A row that is already dispatched, or gone
+        // because its generation settled, is not something this host may dispatch again: the first
+        // would be a second send of work already out there, and the second would be work nothing
+        // accounts for.
+        let claimed = self
+            .connection
             .execute(
-                "UPDATE outbox SET dispatched = 1 WHERE sequence = ?1",
+                "UPDATE outbox SET dispatched = 1 WHERE sequence = ?1 AND dispatched = 0",
                 params![i64::try_from(sequence).unwrap_or(i64::MAX)],
             )
             .map_err(ControllerError::registry)?;
-        Ok(())
+        if claimed == 1 {
+            Ok(())
+        } else {
+            Err(ControllerError::registry(
+                "that outbox entry is not one this host holds undispatched",
+            ))
+        }
     }
 
     /// Settles one generation and its outbox entries in one transaction.
@@ -777,8 +829,8 @@ impl BackupStore {
             .execute(
                 "INSERT INTO writers (writer_key_id, archive_id, enrolled_at_ms, retired_at_ms)
                  VALUES (?1, ?2, ?3, NULL)
-                 ON CONFLICT (writer_key_id) DO UPDATE
-                     SET archive_id = ?2, enrolled_at_ms = ?3, retired_at_ms = NULL",
+                 ON CONFLICT (archive_id, writer_key_id) DO UPDATE
+                     SET enrolled_at_ms = ?3, retired_at_ms = NULL",
                 params![
                     writer_key_id.as_bytes().as_slice(),
                     archive_id.get().as_bytes().as_slice(),
@@ -789,16 +841,27 @@ impl BackupStore {
         Ok(())
     }
 
-    /// Retires one backup writer. Its unfinished generations stop being authorised.
+    /// Retires one backup writer for one archive. Its unfinished generations there stop being
+    /// authorised, and its enrolments for other collections are untouched.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn retire_writer(&mut self, writer_key_id: KeyId, now_ms: TimestampMs) -> Result<()> {
+    pub fn retire_writer(
+        &mut self,
+        archive_id: ArchiveId,
+        writer_key_id: KeyId,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
         self.connection
             .execute(
-                "UPDATE writers SET retired_at_ms = ?2 WHERE writer_key_id = ?1",
-                params![writer_key_id.as_bytes().as_slice(), millis(now_ms)],
+                "UPDATE writers SET retired_at_ms = ?3
+                 WHERE archive_id = ?1 AND writer_key_id = ?2",
+                params![
+                    archive_id.get().as_bytes().as_slice(),
+                    writer_key_id.as_bytes().as_slice(),
+                    millis(now_ms),
+                ],
             )
             .map_err(ControllerError::registry)?;
         Ok(())
@@ -959,6 +1022,22 @@ impl BackupStore {
             outstanding.push(row.map_err(ControllerError::registry)?);
         }
         Ok(outstanding)
+    }
+
+    /// Releases the fence, so backup production is admitted again from this moment.
+    ///
+    /// It is the durable half of turning privacy mode off. Nothing it releases is reconstructed:
+    /// the work the fence cancelled stays cancelled, and what is admitted afterwards is admitted
+    /// under the new generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn release_fence(&mut self) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM fence WHERE id = 0", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
     }
 
     /// Returns the privacy generation this host recorded a fence at, if it has.

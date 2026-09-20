@@ -8,7 +8,7 @@ use kr_crypto::CryptoError;
 use kr_crypto::archive::{self, EncryptedObject};
 use kr_crypto::backup::{
     ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
-    CollectionKind, GenerationStanding, KeyRotation, ObjectSource,
+    CollectionKind, GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource,
     RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, RestoreGeneration, ResumeDecision, RetainedObjectKeys,
     SealedArchive, StagedObject, open_archive, recipient_key_id, resume_object, seal_archive,
     stage_object, still_readable_after_revocation,
@@ -101,7 +101,7 @@ fn stage_at(seed: u8, filename: &str, plaintext: &[u8], rotation: KeyRotation) -
 fn expecting() -> ArchiveExpectation<'static> {
     ArchiveExpectation {
         archive_id: archive_id(),
-        checkpoint: None,
+        generation: GenerationExpectation::Unverified,
     }
 }
 
@@ -981,9 +981,14 @@ fn an_interrupted_upload_resumes_on_the_ciphertext_it_already_made() {
 
 #[test]
 fn a_source_that_changed_restarts_encryption_under_a_new_key() {
+    // The original key is recovered through the wrap the first generation published, which is the
+    // only place it exists outside the staged object. Comparing the resumed object against an
+    // independently staged one would pass even if the key had been kept.
+    let parties = Parties::generate();
     let staged = stage(1, "a.cbor", b"the body");
     let before = staged.bytes().to_vec();
-    let kept = stage(1, "a.cbor", b"the body");
+    let published = seal(&parties, 1, std::slice::from_ref(&staged));
+    let original = member_key(&parties, &published, staged.object_id());
 
     let resumed = resume_object(
         staged,
@@ -997,10 +1002,51 @@ fn a_source_that_changed_restarts_encryption_under_a_new_key() {
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReencryptedUnderNewKey);
     assert_ne!(resumed.staged.bytes(), before);
+
+    // The object the resume produced does not open under the key the first generation published.
+    let again = seal(&parties, 2, std::slice::from_ref(&resumed.staged));
+    let now = member_key(&parties, &again, resumed.staged.object_id());
     assert!(
-        !resumed.staged.shares_key_with(&kept),
+        !now.constant_time_eq(&original),
         "a changed source never continues under the old key"
     );
+    assert!(
+        archive::decrypt_object(
+            &original,
+            resumed.staged.reference(),
+            resumed.staged.bytes()
+        )
+        .is_err(),
+        "the old key opens nothing the resume produced"
+    );
+}
+
+/// Recovers one member object's key out of the wrap a sealed generation published for it.
+///
+/// It is the only place the key exists outside the staged object, whose own fields are private, so
+/// this is how a test establishes that a key really changed rather than that two objects staged
+/// separately happen to differ.
+fn member_key(
+    parties: &Parties,
+    sealed: &SealedArchive,
+    object_id: BackupObjectId,
+) -> kr_crypto::secret::SymmetricKey {
+    let payload = manifest_payload(parties, sealed);
+    let wrap = payload
+        .member_key_wraps
+        .iter()
+        .find(|wrap| {
+            wrap.context.object_id == object_id
+                && wrap.context.recipient_key_id == parties.device.key_id()
+        })
+        .expect("a wrap for this device");
+    archive::unwrap_object_key(
+        &parties.device,
+        &parties.sender_key(),
+        wrap,
+        &wrap.context.clone(),
+    )
+    .expect("the object key")
 }
 
 #[test]
@@ -1152,9 +1198,18 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     assert!(shared.add(*leaving.public()));
     let before = shared.rotation();
     let staged = stage_at(1, "a.cbor", b"shared content", before);
-    // The same object staged again at the same rotation, kept so the key after the rotation can be
-    // compared with a key from before it without either leaving its own type.
-    let twin = stage_at(1, "a.cbor", b"shared content", before);
+    // The original key, recovered through the wrap the generation before the revocation published.
+    // That generation is what the removed device holds a wrap for, so it is the key that must not
+    // be reused.
+    let published = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &shared,
+        &plan(1),
+        std::slice::from_ref(&staged),
+    )
+    .expect("a sealed archive");
+    let original = member_key(&parties, &published, staged.object_id());
 
     let rotated = shared.revoke(&leaving.key_id()).expect("a revocation");
     assert!(rotated.rotates_object_keys);
@@ -1188,20 +1243,27 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     )
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReencryptedAfterRotation);
+    let rekeyed = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &shared,
+        &plan(2),
+        std::slice::from_ref(&resumed.staged),
+    )
+    .expect("the re-staged object seals");
+    let now = member_key(&parties, &rekeyed, resumed.staged.object_id());
     assert!(
-        !resumed.staged.shares_key_with(&twin),
-        "the object is under a new key"
+        !now.constant_time_eq(&original),
+        "the object is under a key the removed device holds no wrap for"
     );
     assert!(
-        seal_archive(
-            &parties.writer,
-            &parties.sender,
-            &shared,
-            &plan(2),
-            std::slice::from_ref(&resumed.staged),
+        archive::decrypt_object(
+            &original,
+            resumed.staged.reference(),
+            resumed.staged.bytes()
         )
-        .is_ok(),
-        "the re-staged object seals"
+        .is_err(),
+        "the key that device holds opens nothing written after it left"
     );
 
     // An owned collection does not rotate, so its staged bytes still seal.
@@ -1319,7 +1381,7 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
     let verified = checkpoint(7, new.descriptor.encrypted_manifest.encrypted_object_hash);
     let replayed = RestoreGeneration::against(
         &old.descriptor,
-        Some((CheckpointSource::Pairing, &verified)),
+        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
     );
     assert!(matches!(
         replayed.standing,
@@ -1333,7 +1395,7 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
     // manifest verifies.
     let against = ArchiveExpectation {
         archive_id: archive_id(),
-        checkpoint: Some((CheckpointSource::Pairing, &verified)),
+        generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
     };
     assert!(
         open_archive(
@@ -1350,7 +1412,7 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
 
     let current = RestoreGeneration::against(
         &new.descriptor,
-        Some((CheckpointSource::Pairing, &verified)),
+        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
     );
     assert!(matches!(
         current.standing,
@@ -1382,7 +1444,7 @@ fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
     // verifies. It is simply not the collection being restored.
     let elsewhere = ArchiveExpectation {
         archive_id: ArchiveId::new(Uuid::from_bytes([0x99; 16])),
-        checkpoint: None,
+        generation: GenerationExpectation::Unverified,
     };
     assert!(
         open_archive(
@@ -1405,7 +1467,7 @@ fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
     };
     let standing = RestoreGeneration::against(
         &sealed.descriptor,
-        Some((CheckpointSource::Pairing, &other)),
+        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &other),
     );
     assert!(matches!(
         standing.standing,
@@ -1419,7 +1481,7 @@ fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
             &[trusted(&parties.writer)],
             &ArchiveExpectation {
                 archive_id: archive_id(),
-                checkpoint: Some((CheckpointSource::Pairing, &other)),
+                generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &other),
             },
             &sealed.descriptor_bytes,
             &sealed.encrypted_manifest,
@@ -1437,7 +1499,7 @@ fn an_archive_claiming_the_checkpoints_generation_with_another_manifest_is_refus
 
     let substituted = RestoreGeneration::against(
         &second.descriptor,
-        Some((CheckpointSource::Pairing, &verified)),
+        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
     );
     assert!(matches!(
         substituted.standing,
@@ -1451,7 +1513,10 @@ fn an_archive_claiming_the_checkpoints_generation_with_another_manifest_is_refus
             &[trusted(&parties.writer)],
             &ArchiveExpectation {
                 archive_id: archive_id(),
-                checkpoint: Some((CheckpointSource::Pairing, &verified)),
+                generation: GenerationExpectation::Checkpoint(
+                    CheckpointSource::Pairing,
+                    &verified,
+                ),
             },
             &second.descriptor_bytes,
             &second.encrypted_manifest,
@@ -1488,7 +1553,10 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
         &[trusted(&parties.writer)],
         &ArchiveExpectation {
             archive_id: archive_id(),
-            checkpoint: Some((CheckpointSource::RecoveryBundle, &bundle_checkpoint)),
+            generation: GenerationExpectation::Checkpoint(
+                CheckpointSource::RecoveryBundle,
+                &bundle_checkpoint,
+            ),
         },
         &sealed.descriptor_bytes,
         &sealed.encrypted_manifest,
@@ -1512,7 +1580,7 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     let verified = checkpoint(9, Digest256::from_bytes([0xab; 32]));
     let ahead = RestoreGeneration::against(
         &sealed.descriptor,
-        Some((CheckpointSource::RecoveryBundle, &verified)),
+        GenerationExpectation::Checkpoint(CheckpointSource::RecoveryBundle, &verified),
     );
     assert!(matches!(ahead.standing, GenerationStanding::Ahead { .. }));
     assert!(ahead.is_admissible());
@@ -1524,7 +1592,7 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     assert!(sentence.contains("holding a newer backup back"));
 
     // With no checkpoint at all, the generation is still displayed.
-    let bare = RestoreGeneration::against(&sealed.descriptor, None);
+    let bare = RestoreGeneration::against(&sealed.descriptor, GenerationExpectation::Unverified);
     assert!(matches!(bare.standing, GenerationStanding::NoCheckpoint));
     assert!(bare.is_admissible());
     assert!(!bare.checkpoint_available());

@@ -16,7 +16,8 @@ use kr_client::recovery::{
 use kr_client::services::{ServiceFuture, SyncBackupService};
 use kr_crypto::backup::{
     ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
-    CollectionKind, ObjectSource, RestoreGeneration, open_archive, seal_archive, stage_object,
+    CollectionKind, GenerationExpectation, ObjectSource, RestoreGeneration, open_archive,
+    seal_archive, stage_object,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -681,7 +682,15 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     drop(sealed);
     drop(staged);
 
-    let kit = kit_of(&seed, &[ORIGIN]);
+    // The kit goes through its printed form and back, and the recovery recipient is derived from
+    // the seed that came out of it. Nothing of the device that made the archive is still held.
+    let printed = render_kit(&kit_of(&seed, &[ORIGIN])).expect("a printable kit");
+    drop(recovery);
+    drop(seed);
+    let kit = parse_kit(&printed).expect("the kit reads back");
+    let recovered = RecoverySeed::from_kit(&kit).expect("the seed");
+    let recovery = recovered.recipient().expect("a recovery recipient");
+
     let mut restore = FreshRestore::new(kit, RetrievalPolicy::Account);
     restore
         .obtained_access(ServiceAccess {
@@ -708,9 +717,12 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     let reader = ArchiveReader::Recovery(&recovery);
     let expectation = ArchiveExpectation {
         archive_id: archive_id(),
-        checkpoint: material
-            .checkpoint(archive_id())
-            .map(|checkpoint| (CheckpointSource::RecoveryBundle, checkpoint)),
+        generation: material.checkpoint(archive_id()).map_or(
+            GenerationExpectation::Unverified,
+            |checkpoint| {
+                GenerationExpectation::Checkpoint(CheckpointSource::RecoveryBundle, checkpoint)
+            },
+        ),
     };
     let opened = open_archive(
         &reader,
@@ -747,7 +759,9 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
         &descriptor,
         material
             .checkpoint(archive_id())
-            .map(|checkpoint| (CheckpointSource::RecoveryBundle, checkpoint)),
+            .map_or(GenerationExpectation::Unverified, |checkpoint| {
+                GenerationExpectation::Checkpoint(CheckpointSource::RecoveryBundle, checkpoint)
+            }),
     );
     assert!(standing.describe().contains("generation 4"));
     assert!(!standing.proves_no_newer_archive());
@@ -1041,6 +1055,16 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
         )
         .await
         .expect("the bundle commits");
+    store
+        .enable_producer(
+            &seed,
+            &mut bundle,
+            producer.key_id(),
+            *producer.public(),
+            TimestampMs::new(1_100),
+        )
+        .await
+        .expect("the producer is enrolled");
 
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
     assert!(recipients.add_recovery(&recovery));
@@ -1093,26 +1117,31 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
         kr_crypto::archive::decrypt_recovery_bundle(&key, &restored.encrypted_bundle)
             .expect("the bundle opens offline");
     let writers: Vec<TrustedWriter> = offline_bundle.trusted_writers.iter().cloned().collect();
+    // The producer key comes out of the exported bundle, not out of anything the restoring device
+    // was handed: the export is the encrypted bundle and the archive's own ciphertext.
+    let descriptor =
+        kr_crypto::backup::read_descriptor(&restored.descriptor).expect("a descriptor");
+    let sender = offline_bundle
+        .trusted_producers
+        .iter()
+        .find(|held| held.sender_key_id == descriptor.manifest_key_wraps[0].context.sender_key_id)
+        .expect("the bundle names the producer")
+        .stored_envelope_key;
     let reader = ArchiveReader::Recovery(&recovery);
     let opened = open_archive(
         &reader,
-        producer.public(),
+        &sender,
         &writers,
         &ArchiveExpectation {
             archive_id: archive_id(),
-            checkpoint: None,
+            generation: GenerationExpectation::Unverified,
         },
         &restored.descriptor,
         &restored.encrypted_manifest,
     )
     .expect("the exported archive opens");
     let object = opened
-        .restore_object(
-            &reader,
-            producer.public(),
-            staged.object_id(),
-            &restored.objects[0],
-        )
+        .restore_object(&reader, &sender, staged.object_id(), &restored.objects[0])
         .expect("the exported object restores");
     assert_eq!(object.plaintext.expose(), b"kept offline");
 }
@@ -1133,8 +1162,11 @@ struct OfflineExport {
 // KR-REQ-20.17: what a backup carries, what a restore puts back, and what neither does.
 // ---------------------------------------------------------------------------------------------
 
+/// The table's answers. It is the decision an export or import path acts on, not a gate over
+/// bytes: the archive layer carries opaque objects, and what closes section 20 ¶11 is each path
+/// asking for every kind it carries.
 #[test]
-fn a_backup_never_carries_a_reusable_key_and_a_restore_never_gives_back_a_revoked_grant() {
+fn the_material_table_refuses_a_reusable_key_and_a_revoked_grant() {
     for allowed in [
         Material::SessionData,
         Material::DeviceConfiguration,
@@ -1171,7 +1203,7 @@ fn a_backup_never_carries_a_reusable_key_and_a_restore_never_gives_back_a_revoke
 }
 
 #[test]
-fn a_restore_puts_back_data_and_configuration_and_still_needs_fresh_owner_pairing() {
+fn the_admitted_set_is_data_and_configuration_and_the_limits_still_require_owner_pairing() {
     let admitted = FreshRestore::admits(&[
         Material::SessionData,
         Material::DeviceConfiguration,
