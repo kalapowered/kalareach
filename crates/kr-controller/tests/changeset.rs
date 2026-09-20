@@ -107,6 +107,7 @@ async fn host() -> Host {
             build_id: build(),
             release: "0".to_owned(),
             shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
         })
         .await;
         match attempt {
