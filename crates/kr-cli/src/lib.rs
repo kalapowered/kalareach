@@ -14,6 +14,7 @@
 //! | [`create`] | The palette a new session starts with |
 //! | [`question`] | Reading and answering an agent's questions from the terminal |
 //! | [`skill`] | Installing the contact skill and its tool configuration for an agent |
+//! | [`bridge`] | `kr bridge`: the process-bridge helper and this host's enrolled environments |
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
 //! | [`session`] | Driving one attachment's input, output and connection in a single loop |
 //! | [`render`] | Drawing a projected session into this terminal, at canonical cell positions |
@@ -25,6 +26,7 @@
 
 pub mod account;
 pub mod attach;
+pub mod bridge;
 pub mod cli;
 pub mod contact;
 pub mod create;

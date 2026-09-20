@@ -63,6 +63,98 @@ pub enum Command {
     Shell(ShellArguments),
     /// Manage this host's managed-service account credentials.
     Account(AccountArguments),
+    /// Serve this environment to a local process bridge, or manage the environments this host has
+    /// enrolled.
+    Bridge(BridgeArguments),
+}
+
+/// `kr bridge`.
+///
+/// Section 3 names the invocation this command has to answer to exactly: a Windows host runs
+/// `wsl.exe --distribution <name> --user <user> --exec <absolute-kr-path> bridge --stdio`, and a
+/// container host runs the equivalent against an enrolled container identifier. So `--stdio` is a
+/// flag on this command rather than a word of its own, and the other operations are subcommands
+/// beside it.
+#[derive(Debug, Args)]
+pub struct BridgeArguments {
+    /// Serve this environment on standard input and output.
+    #[arg(long)]
+    pub stdio: bool,
+
+    /// The environment to serve. Without it, this installation's own.
+    #[arg(long)]
+    pub environment: Option<String>,
+
+    /// What to do instead of serving a bridge.
+    #[command(subcommand)]
+    pub command: Option<BridgeCommand>,
+}
+
+/// One `kr bridge` operation on this host's enrolled environments.
+#[derive(Debug, Subcommand)]
+pub enum BridgeCommand {
+    /// List the enrolled environments from this host's cached inventory.
+    ///
+    /// The listing reports what was last observed and starts nothing.
+    List(BridgeListArguments),
+    /// Record an environment this host may reach.
+    Enrol(BridgeEnrolArguments),
+    /// Remove one enrolled environment and its cached inventory row.
+    Forget(BridgeForgetArguments),
+    /// Observe one enrolled environment now, optionally starting it.
+    Refresh(BridgeRefreshArguments),
+}
+
+/// `kr bridge list`.
+#[derive(Debug, Args)]
+pub struct BridgeListArguments {
+    /// Report only this access class: `wsl`, `container`, `ssh` or `paired`.
+    #[arg(long)]
+    pub access: Option<String>,
+}
+
+/// `kr bridge enrol`.
+#[derive(Debug, Args)]
+pub struct BridgeEnrolArguments {
+    /// How this host reaches it: `wsl`, `container`, `ssh` or `paired`.
+    #[arg(long)]
+    pub access: String,
+    /// The name a person selects this record by. A label, never an identity.
+    #[arg(long)]
+    pub label: String,
+    /// The identity the platform issued: the distribution name, the container identifier, or the
+    /// SSH destination. A container's human name is not its identity.
+    #[arg(long)]
+    pub target: String,
+    /// The operating-system user the helper runs as inside the target.
+    #[arg(long)]
+    pub user: String,
+    /// The absolute path of the helper installed in the target.
+    #[arg(long)]
+    pub helper: String,
+    /// Where this environment's clipboard writes go.
+    #[arg(long)]
+    pub clipboard: Option<String>,
+    /// The environment identity this record names, when it is already known.
+    #[arg(long)]
+    pub environment_id: Option<String>,
+}
+
+/// `kr bridge forget`.
+#[derive(Debug, Args)]
+pub struct BridgeForgetArguments {
+    /// The label of the record to remove.
+    pub label: String,
+}
+
+/// `kr bridge refresh`.
+#[derive(Debug, Args)]
+pub struct BridgeRefreshArguments {
+    /// The label of the record to observe.
+    pub label: String,
+    /// Start the environment when it is stopped. A listing never does; a refresh may.
+    #[arg(long)]
+    pub start: bool,
 }
 
 /// `kr account`.

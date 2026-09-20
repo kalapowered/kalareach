@@ -867,6 +867,25 @@ async fn run(cli: Cli) -> Result<Completion> {
             }
             Ok(Completion::Done)
         }
+        Command::Bridge(arguments) => match (arguments.stdio, &arguments.command) {
+            (true, None) => {
+                // Nothing is printed on standard output here: it is the bridge's own stream, and a
+                // line of text on it would be read as the front of a frame.
+                kr_cli::bridge::helper::run(arguments.environment.as_deref()).await?;
+                Ok(Completion::Done)
+            }
+            (false, Some(command)) => {
+                kr_cli::bridge::print(command, cli.json).await?;
+                Ok(Completion::Done)
+            }
+            (true, Some(_)) => Err(CliError::Usage(
+                "--stdio serves a bridge; it takes no other operation".to_owned(),
+            )),
+            (false, None) => Err(CliError::Usage(
+                "kr bridge --stdio serves a bridge; otherwise name list, enrol, forget or refresh"
+                    .to_owned(),
+            )),
+        },
     }
 }
 
