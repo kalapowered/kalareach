@@ -3307,6 +3307,59 @@ fn sleeper() -> tokio::process::Child {
 /// the connection, the broker publishes each transition where it commits it, and the session
 /// pipeline hands every one to the views that are attached. What this asserts is that a view is
 /// told, in the order the broker committed, and told what the event actually was.
+async fn session_runtime_and_stream(
+    session_id: SessionId,
+    host: &kr_ipc::testing::TempHost,
+) -> (
+    Arc<kr_worker::runtime::SessionRuntime>,
+    kr_worker::output::OutputStream,
+) {
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    requested.insert(kr_protocol::attachment::AttachmentCapability::Input);
+    requested.insert(kr_protocol::attachment::AttachmentCapability::Geometry);
+    let config = kr_worker::session::SessionConfig {
+        session_id,
+        session_epoch: kr_protocol::ids::SessionEpoch::V1,
+        environment_id: host.environment_id(),
+        display_number: kr_protocol::session::DisplayNumber::new(1),
+        shell: kr_worker::testing::posix_script("exec cat"),
+        shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        desktop: kr_protocol::identity::DesktopBinding::none(),
+        dimensions: kr_protocol::session::Dimensions::new(80, 24),
+        journal_path: Some(host.environment().journal_database(session_id)),
+        spool_directory: Some(host.environment().session_spool(session_id)),
+        worker_endpoint: None,
+        send_queue_bytes: 8 * 1024 * 1024,
+        resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+    };
+    let mut session = kr_worker::session::Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = kr_protocol::ids::AttachmentId::new(Uuid::from_bytes([5; 16]));
+    let params = kr_protocol::attachment::SessionAttachParams {
+        session_id,
+        mode: kr_protocol::attachment::AttachMode::Terminal,
+        claim_geometry: true,
+        dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+        terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+        requested: requested.clone(),
+    };
+    session
+        .attach(&params, requested, attachment_id)
+        .expect("attaches");
+    let stream = session.subscribe(attachment_id).expect("subscribes");
+    let runtime = Arc::new(
+        kr_worker::runtime::SessionRuntime::start(
+            session,
+            Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    (runtime, stream)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
     let broker = broker();
@@ -3315,30 +3368,18 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
     let owner = Arc::clone(&served.owner);
     let mut client = tokio::io::BufReader::new(served.client);
 
-    // The session pipeline, standing in for the one a worker runs: it takes the transitions this
-    // connection observes and publishes each to the views attached to the session.
-    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let carrying = {
-        let delivered = Arc::clone(&delivered);
-        let mut observations = observations;
-        tokio::spawn(async move {
-            while let Some(transition) = observations.next().await {
-                delivered.lock().expect("the record is not poisoned").push(
-                    kr_protocol::projection::AgentResourceEvent {
-                        session_id: session(),
-                        application_instance_id: transition.application_instance_id,
-                        resource_id: transition.resource_id,
-                        state: transition.state,
-                        durability: transition.durability,
-                        binding_revision: transition.binding_revision,
-                        sequence: U64::new(transition.sequence),
-                        event_id: transition.event_id,
-                        parent_sequence: Nullable(transition.parent_sequence.map(U64::new)),
-                    },
-                );
-            }
-        })
-    };
+    // The session pipeline: deliver_to_views reads from the broker and publishes to the session,
+    // which delivers to the attached view's output stream.
+    let host = kr_ipc::testing::TempHost::create();
+    let (runtime, mut stream) = session_runtime_and_stream(session(), &host).await;
+
+    let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
+        observations,
+        GatewayConnectionId::new(1),
+        Arc::clone(&broker),
+        session(),
+        Arc::clone(&runtime),
+    ));
 
     owner
         .from_upstream(
@@ -3368,16 +3409,20 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
     .await
     .expect("the answer settles it");
 
-    let seen = loop {
-        let held = delivered
-            .lock()
-            .expect("the record is not poisoned")
-            .clone();
-        if held.iter().any(|event| event.state.is_terminal()) {
-            break held;
+    let mut seen = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv()).await
+    {
+        if let kr_worker::output::OutputDelivery::AgentResource { event, bytes } = delivery {
+            stream.written(bytes);
+            let state = event.state;
+            seen.push(*event);
+            if state.is_terminal() {
+                break;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    };
+    }
+
     assert!(
         seen.windows(2)
             .all(|pair| pair[0].sequence.get() < pair[1].sequence.get()),
@@ -3398,6 +3443,85 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
     assert!(
         settled.parent_sequence.0.is_some(),
         "a settlement names the event before it"
+    );
+
+    carrying.abort();
+    served.drained.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_subscription_overflow_replays_transitions_to_attached_views() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let observations = served.observations;
+    let owner = Arc::clone(&served.owner);
+    let mut client = tokio::io::BufReader::new(served.client);
+
+    let host = kr_ipc::testing::TempHost::create();
+    let (runtime, mut stream) = session_runtime_and_stream(session(), &host).await;
+
+    let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
+        observations,
+        GatewayConnectionId::new(1),
+        Arc::clone(&broker),
+        session(),
+        Arc::clone(&runtime),
+    ));
+
+    owner
+        .from_upstream(
+            br#"{"id":82,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut client).await;
+
+    // Simulate an observation overflow by withdrawing the subscription in the observatory
+    // while the connection stays alive in the broker.
+    broker.observatory().withdraw(GatewayConnectionId::new(1));
+
+    // Answer request while observation channel is closed - broker commits event to outbox.
+    owner
+        .from_client(
+            br#"{"id":82,"result":{"outcome":"allow"}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the person answers");
+
+    let resource = broker
+        .pending_resources()
+        .into_iter()
+        .next()
+        .expect("the resource is held");
+    settled_within(
+        &broker,
+        resource.resource_id,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .expect("the answer settles it");
+
+    // deliver_to_views detects the closed observation channel, resubscribes, replays
+    // transitions_after, and delivers to the attached view.
+    let mut seen = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv()).await
+    {
+        if let kr_worker::output::OutputDelivery::AgentResource { event, bytes } = delivery {
+            stream.written(bytes);
+            let state = event.state;
+            seen.push(*event);
+            if state.is_terminal() {
+                break;
+            }
+        }
+    }
+
+    assert!(
+        seen.iter().any(|event| event.state.is_terminal()),
+        "the replayed transitions reached the attached view: {seen:?}"
     );
 
     carrying.abort();

@@ -224,30 +224,82 @@ async fn stop_what_ended(
 ///
 /// It is the production consumer of the broker's own published transitions: the broker commits
 /// them in order and publishes them in that order, and this reads that one stream and hands each
-/// one to the session pipeline, which delivers it to every attached view. It ends when the
-/// subscription is withdrawn, which is what teardown does.
+/// one to the session pipeline, which delivers it to every attached view. If an observation
+/// subscription is withdrawn (for example due to queue overflow), it reconnects and replays the
+/// outbox transitions or requests view resynchronisation. It ends when the connection is closed.
 pub async fn deliver_to_views(
     mut observations: Observations,
+    connection: GatewayConnectionId,
+    broker: Arc<Broker>,
     session_id: kr_protocol::ids::SessionId,
     runtime: Arc<crate::runtime::SessionRuntime>,
 ) {
-    while let Some(transition) = observations.next().await {
-        let event = kr_protocol::projection::AgentResourceEvent {
-            session_id,
-            application_instance_id: transition.application_instance_id,
-            resource_id: transition.resource_id,
-            state: transition.state,
-            durability: transition.durability,
-            binding_revision: transition.binding_revision,
-            sequence: kr_protocol::scalars::U64::new(transition.sequence),
-            event_id: transition.event_id,
-            parent_sequence: kr_protocol::scalars::Nullable(
-                transition
-                    .parent_sequence
-                    .map(kr_protocol::scalars::U64::new),
-            ),
-        };
-        runtime.session().publish_agent_resource(&event);
+    let mut last_sequence = 0_u64;
+    loop {
+        match observations.next().await {
+            Some(transition) => {
+                if transition.sequence <= last_sequence {
+                    continue;
+                }
+                last_sequence = transition.sequence;
+                let event = kr_protocol::projection::AgentResourceEvent {
+                    session_id,
+                    application_instance_id: transition.application_instance_id,
+                    resource_id: transition.resource_id,
+                    state: transition.state,
+                    durability: transition.durability,
+                    binding_revision: transition.binding_revision,
+                    sequence: kr_protocol::scalars::U64::new(transition.sequence),
+                    event_id: transition.event_id,
+                    parent_sequence: kr_protocol::scalars::Nullable(
+                        transition
+                            .parent_sequence
+                            .map(kr_protocol::scalars::U64::new),
+                    ),
+                };
+                runtime.session().publish_agent_resource(&event);
+            }
+            None => {
+                // If the connection is no longer held by the broker, teardown has completed.
+                if broker.connection(connection).is_none() {
+                    break;
+                }
+                // Subscription closed (e.g. queue overflow). Re-subscribe.
+                observations = broker.observatory().subscribe(connection);
+                // Replay missed transitions from the broker's ledger outbox.
+                match broker.transitions_after(last_sequence) {
+                    Ok(missed) => {
+                        for transition in missed {
+                            if transition.sequence <= last_sequence {
+                                continue;
+                            }
+                            last_sequence = transition.sequence;
+                            let event = kr_protocol::projection::AgentResourceEvent {
+                                session_id,
+                                application_instance_id: transition.application_instance_id,
+                                resource_id: transition.resource_id,
+                                state: transition.state,
+                                durability: transition.durability,
+                                binding_revision: transition.binding_revision,
+                                sequence: kr_protocol::scalars::U64::new(transition.sequence),
+                                event_id: transition.event_id,
+                                parent_sequence: kr_protocol::scalars::Nullable(
+                                    transition
+                                        .parent_sequence
+                                        .map(kr_protocol::scalars::U64::new),
+                                ),
+                            };
+                            runtime.session().publish_agent_resource(&event);
+                        }
+                    }
+                    Err(_) => {
+                        runtime
+                            .session()
+                            .resync_all_views(kr_protocol::recovery::ResyncReason::SendQueueFull);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -268,6 +320,8 @@ pub struct Attached {
     pub terminal: Option<TerminalWatch>,
     /// The task driving the owner's own writes and reads.
     served: tokio::task::JoinHandle<Ended>,
+    /// The broker that minted this attachment and holds its state.
+    pub broker: Arc<Broker>,
 }
 
 impl Attached {
@@ -291,8 +345,12 @@ impl Attached {
                 .ok_or_else(|| BrokerError::PreconditionFailed {
                     detail: "this attachment's transitions are already being read".to_owned(),
                 })?;
+        let connection = self.connection;
+        let broker = Arc::clone(&self.broker);
         Ok(tokio::spawn(deliver_to_views(
             observations,
+            connection,
+            broker,
             session_id,
             runtime,
         )))
@@ -744,6 +802,7 @@ impl NativeGateway {
             observations: Some(observations),
             terminal,
             served,
+            broker: Arc::clone(&self.broker),
         })
     }
 
