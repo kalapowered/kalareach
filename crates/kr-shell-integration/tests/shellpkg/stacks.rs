@@ -687,6 +687,7 @@ impl Session {
             pty.master.take_writer().expect("a terminal writer"),
         ));
         let answering = Arc::clone(&writer);
+        let (finished_reading, stopped_reading) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             // A terminal read ends wherever the kernel had bytes, which can be in the middle of a
@@ -706,6 +707,7 @@ impl Session {
                     }
                 }
             }
+            drop(finished_reading);
         });
 
         let stream = accept_within(&listener, REPLY).unwrap_or_else(|| {
@@ -745,6 +747,7 @@ impl Session {
             next_request: 1,
             output,
             stopped,
+            stopped_reading,
             writer,
             child,
             _master: pty.master,

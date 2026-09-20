@@ -54,6 +54,9 @@ pub const STEP: Duration = Duration::from_millis(60);
 /// The environment variable that turns a missing package into a failure rather than a skip.
 pub const REQUIRE: &str = "KR_REQUIRE_SHELL_PACKAGES";
 
+/// How long a torn-down session waits for the thread reading its terminal to stop.
+const READER_STOP: Duration = Duration::from_secs(5);
+
 /// One built package, as `scripts/build-shells.sh` installed it.
 pub struct Package {
     pub kind: ShellKind,
@@ -281,6 +284,9 @@ pub struct Session {
     next_request: u64,
     output: Arc<Mutex<Vec<u8>>>,
     stopped: Arc<AtomicBool>,
+    /// The reader thread's report that it has stopped, so a session that is torn down does not
+    /// leave a thread still writing into what the next case reads.
+    stopped_reading: std::sync::mpsc::Receiver<()>,
     terminal: Arc<TerminalInput>,
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
@@ -397,6 +403,7 @@ impl Session {
             pty.master.take_writer().expect("a terminal writer"),
         ));
         let answering = Arc::clone(&terminal);
+        let (finished_reading, stopped_reading) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             while !finished.load(Ordering::Relaxed) {
@@ -413,6 +420,7 @@ impl Session {
                     }
                 }
             }
+            drop(finished_reading);
         });
 
         let stream = accept_within(&listener, REPLY)
@@ -439,6 +447,7 @@ impl Session {
             next_request: 1,
             output,
             stopped,
+            stopped_reading,
             terminal,
             child,
             _master: pty.master,
@@ -1023,6 +1032,11 @@ impl Drop for Session {
             }
         }
         self.stopped.store(true, Ordering::Relaxed);
+        // The thread's read ends when the last handle on the other side of the terminal is closed,
+        // which is the shell going away above. The wait is bounded: a shell whose own children
+        // still hold that terminal would otherwise hold up every case after this one, and a thread
+        // that outlives its session is a smaller problem than a suite that cannot be torn down.
+        let _ = self.stopped_reading.recv_timeout(READER_STOP);
     }
 }
 
