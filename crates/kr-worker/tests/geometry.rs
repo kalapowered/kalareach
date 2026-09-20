@@ -1130,58 +1130,30 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
 
     // The person drags the window narrower. It is now a viewport onto a session it used to share
     // the stream with, and the screen it holds was drawn for the other size.
-    let reported: AttachmentViewportResult = client
-        .mutate(
-            Method::AttachmentViewport,
-            ActionId::new(kr_ipc::new_uuid()),
-            wired.target(),
-            &AttachmentViewportParams {
-                position: kr_protocol::scalars::Nullable::null(),
-                attachment_id: attachment,
-                dimensions: Dimensions::new(40, 12),
-            },
-        )
-        .await
-        .expect("reaches the worker")
-        .expect("reports")
-        .to_typed()
-        .expect("decodes");
+    let reported = reported_and_told(
+        &mut client,
+        &wired,
+        attachment,
+        Dimensions::new(40, 12),
+        "it is told at once that what it holds is no longer continuous",
+    )
+    .await;
     assert_eq!(reported.presentation, TerminalPresentationMode::Viewport);
     assert_eq!(
         reported.geometry.dimensions, CANONICAL,
         "and the canonical geometry did not move"
     );
-    expect_resynchronised(
-        &mut client,
-        LIVENESS_DEADLINE,
-        "it is told at once that what it holds is no longer continuous",
-    )
-    .await;
 
     // And back again, with the application still writing nothing.
-    let reported: AttachmentViewportResult = client
-        .mutate(
-            Method::AttachmentViewport,
-            ActionId::new(kr_ipc::new_uuid()),
-            wired.target(),
-            &AttachmentViewportParams {
-                position: kr_protocol::scalars::Nullable::null(),
-                attachment_id: attachment,
-                dimensions: CANONICAL,
-            },
-        )
-        .await
-        .expect("reaches the worker")
-        .expect("reports")
-        .to_typed()
-        .expect("decodes");
-    assert_eq!(reported.presentation, TerminalPresentationMode::Direct);
-    expect_resynchronised(
+    let reported = reported_and_told(
         &mut client,
-        LIVENESS_DEADLINE,
+        &wired,
+        attachment,
+        CANONICAL,
         "and told again on the way back",
     )
     .await;
+    assert_eq!(reported.presentation, TerminalPresentationMode::Direct);
 
     drop(client);
     wired
@@ -1588,6 +1560,92 @@ fn presentation_of(wired: &Wired, attachment_id: AttachmentId) -> Option<Termina
         .into_iter()
         .find(|summary| summary.attachment_id == attachment_id)
         .and_then(|summary| summary.presentation.as_ref().copied())
+}
+
+/// Reports a new size for this window and returns when both answers have arrived: what the host
+/// says the window is now, and the word that what it holds is no longer continuous.
+///
+/// The two are written by different tasks and arrive in either order, and neither may be lost.
+/// `LocalClient::mutate` would read and discard the notification while it waited for the response,
+/// because it asked for one thing and something else arrived; the window section 8 is about here
+/// is the window that changed, and a viewport names an attachment of its own connection, so the
+/// answer and the notification cannot be put on different sockets. So the mutation is composed and
+/// sent through this client's own halves, and every frame is read until both have come.
+async fn reported_and_told(
+    client: &mut LocalClient,
+    wired: &Wired,
+    attachment: AttachmentId,
+    dimensions: Dimensions,
+    what: &str,
+) -> AttachmentViewportResult {
+    let mutation = client
+        .compose(
+            Method::AttachmentViewport,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &AttachmentViewportParams {
+                position: Nullable::null(),
+                attachment_id: attachment,
+                dimensions,
+            },
+        )
+        .await
+        .expect("composes the report");
+    let request_id = mutation.request_id;
+    client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("reaches the worker");
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut reported: Option<AttachmentViewportResult> = None;
+    let mut told = false;
+    while reported.is_none() || !told {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(ControlFrame::Response(response))) if response.request_id == request_id => {
+                match response.outcome {
+                    kr_protocol::envelope::Outcome::Ok(value) => {
+                        reported = Some(value.to_typed().expect("decodes"));
+                    }
+                    kr_protocol::envelope::Outcome::Error(error) => {
+                        panic!("{what}: the host refused the report: {error}")
+                    }
+                }
+            }
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.resync" =>
+            {
+                told = true;
+            }
+            // Anything else this client is sent is not one of the two answers.
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!(
+                "{what}: the connection ended after {:?} ({error}), with the report {} and the \
+                 word {}",
+                started.elapsed(),
+                if reported.is_some() {
+                    "in"
+                } else {
+                    "still out"
+                },
+                if told { "given" } else { "still out" }
+            ),
+            Err(_) => panic!(
+                "{what}: waited {:?} with the report {} and the word {}",
+                started.elapsed(),
+                if reported.is_some() {
+                    "in"
+                } else {
+                    "still out"
+                },
+                if told { "given" } else { "still out" }
+            ),
+        }
+    }
+    reported.expect("the host's answer to the report")
 }
 
 /// Waits for a client to be told its view is no longer continuous, and fails with how long it
