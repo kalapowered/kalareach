@@ -1306,7 +1306,7 @@ impl BackupStore {
                         object.object_id.get().as_bytes().as_slice(),
                         object.encrypted_object_hash.as_bytes().as_slice(),
                         i64::try_from(object.encrypted_len).unwrap_or(i64::MAX),
-                        object.staged_path.to_string_lossy().as_ref(),
+                        &*object.staged_path.to_string_lossy(),
                         LocalState::Present.as_str(),
                     ],
                 )

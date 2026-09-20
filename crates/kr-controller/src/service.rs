@@ -334,6 +334,8 @@ pub struct Controller {
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
     project: Arc<crate::project::ProjectModule>,
+    /// The environment's plugin catalogues, whose two method groups this daemon dispatches.
+    catalogue: Arc<crate::catalogue::CatalogueModule>,
     /// The environment's grants and invitations, which the sharing and device method groups act on.
     sharing: Arc<crate::sharing::SharingService>,
     /// The environment's voice service: the coordinator and the seams it reads and proposes
@@ -572,6 +574,7 @@ impl Controller {
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
+        let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(&setup.paths)?);
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
         // a second one.
@@ -704,6 +707,7 @@ impl Controller {
             backup,
             transfer,
             project,
+            catalogue,
             sharing,
             voice: std::sync::OnceLock::new(),
             delivery,
@@ -3766,6 +3770,9 @@ impl Controller {
                 .read_frame(device_id, request, wall_clock_ms())
                 .await;
         }
+        if crate::catalogue::CatalogueModule::serves(method) {
+            return self.catalogue.read_frame(request).await;
+        }
         if crate::changeset::ChangeSetModule::serves(method) {
             return self.changesets.read_frame(request).await;
         }
@@ -3943,6 +3950,29 @@ impl Controller {
                 )
                 .await,
             );
+        }
+        if crate::catalogue::CatalogueModule::serves(method) {
+            // Everything between the envelope check and this point can wait, so the admission is
+            // checked here rather than earlier: an action whose accepted deadline passed while it
+            // queued does not go on to change a trust root or install a package.
+            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
+                return respond(
+                    mutation.request_id,
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                );
+            }
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
+            return self.catalogue.write_frame(mutation, method).await;
         }
         if crate::project::ProjectModule::serves(method) {
             let Some(admitted_revision) = admitted else {

@@ -12,6 +12,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`agent_tools`] | Installing the contact skill for an agent, and undoing exactly what it wrote |
+//! | [`catalogue`] | The plugin catalogues, the packages installed from them and what each one may do |
 //! | [`archive`] | Closed and crashed sessions: their history, final receipts and retained references, served with no worker |
 //! | [`automation`] | Workflow definitions, runs, node receipts and the causal budgets they share |
 //! | [`backup`] | The environment's backup generations, their staged ciphertext, their outbox and what a restore may put back |
@@ -38,6 +39,7 @@ pub mod authority;
 pub mod automation;
 pub mod backup;
 pub mod bridge;
+pub mod catalogue;
 pub mod changeset;
 pub mod config;
 pub mod desktop;

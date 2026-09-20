@@ -4193,6 +4193,8 @@ dependencies = [
  "kr-delivery",
  "kr-ipc",
  "kr-pairing",
+ "kr-plugin-runtime",
+ "kr-plugin-sdk",
  "kr-project",
  "kr-protocol",
  "kr-shell-integration",
