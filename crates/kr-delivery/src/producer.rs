@@ -591,7 +591,17 @@ impl Producer {
                 continue;
             };
             let Production { notice, lines } = production;
-            let produced = self.produce(&notice, destinations, authority, &lines, now_ms)?;
+            let produced = match self.produce(&notice, destinations, authority, &lines, now_ms) {
+                Ok(produced) => produced,
+                Err(DeliveryError::Expiry(_)) => {
+                    self.journal.produce(&pending.key, &[], &[])?;
+                    total
+                        .refused
+                        .push((DestinationId::new("-")?, pending.key.stored()));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             total.admitted += produced.admitted;
             total.collapsed += produced.collapsed;
             total.refused.extend(produced.refused);
@@ -1562,6 +1572,45 @@ mod tests {
             .finish_pending(&[], &Everything(BTreeSet::new()), 1_000)
             .expect("a recovery pass");
         assert!(producer.journal().deliveries().expect("a read").is_empty());
+    }
+
+    #[test]
+    fn an_expired_pending_notice_does_not_block_recovery() {
+        let mut producer = Producer::new(
+            DeliveryJournal::in_memory().expect("a journal"),
+            NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        )
+        .expect("a producer");
+        let (destination, _, _) = push_destination_with_keys("phone", true, None);
+        let notice = notice(1);
+        let taken = notice.taken_with(1, Vec::new()).expect("an event record");
+        producer
+            .take(EventSource::Attention, "session-1", &[taken], 1, 1_000)
+            .expect("a page");
+
+        assert_eq!(
+            producer.journal().pending_events(10).expect("read").len(),
+            1
+        );
+
+        // Run recovery at a time well past expiry
+        let far_future = notice.expires_at_ms.get() + 10_000;
+        let finished = producer
+            .finish_pending(&[destination], &Everything(BTreeSet::new()), far_future)
+            .expect("finish pending succeeds despite expired notice");
+        assert_eq!(finished.admitted, 0);
+        assert_eq!(finished.refused.len(), 1);
+
+        // Verify no pending events remain
+        assert!(
+            producer
+                .journal()
+                .pending_events(10)
+                .expect("read")
+                .is_empty(),
+            "the expired notice is settled and removed from pending"
+        );
     }
 
     #[test]
