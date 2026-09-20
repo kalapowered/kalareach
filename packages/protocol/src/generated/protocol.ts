@@ -13445,6 +13445,10 @@ export interface PluginCapabilityEvidence {
    */
   capability: string
   /**
+   * The capability version.
+   */
+  capability_version: string
+  /**
    * What a person is told when the capability is not available.
    */
   disabled_reason: string | null
@@ -13468,6 +13472,10 @@ export interface PluginCapabilityEvidence {
    */
   profile_digest: string | null
   /**
+   * The current revision of this record.
+   */
+  revision: string
+  /**
    * Where it came from.
    */
   source: 'host_probe' | 'live_binding' | 'signed_record' | 'package_declaration'
@@ -13482,6 +13490,28 @@ export interface PluginCapabilityEvidence {
     | 'incompatible'
     | 'temporarily_unavailable'
     | 'not_tested'
+  subject: PluginEvidenceSubject
+}
+/**
+ * What the record is about.
+ */
+export interface PluginEvidenceSubject {
+  /**
+   * The application the evidence is about, where it is about one.
+   */
+  application: string | null
+  /**
+   * The desktop session generation the evidence is bound to, where it is bound to one.
+   */
+  desktop_generation: string | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The terminal profile the evidence is about, where it is about one.
+   */
+  terminal: string | null
 }
 /**
  * The installation the answer is about.

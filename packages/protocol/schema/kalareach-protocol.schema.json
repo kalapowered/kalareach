@@ -18210,6 +18210,10 @@
           "$ref": "#/$defs/CapabilityId",
           "description": "The capability, in the shared versioned namespace."
         },
+        "capability_version": {
+          "description": "The capability version.",
+          "type": "string"
+        },
         "disabled_reason": {
           "anyOf": [
             {
@@ -18247,6 +18251,10 @@
           ],
           "description": "The digest of the signed qualification profile the answer came from, where one did."
         },
+        "revision": {
+          "$ref": "#/$defs/CapabilityRevision",
+          "description": "The current revision of this record."
+        },
         "source": {
           "$ref": "#/$defs/PluginEvidenceSource",
           "description": "Where it came from."
@@ -18254,10 +18262,17 @@
         "state": {
           "$ref": "#/$defs/PluginCapabilityState",
           "description": "What the answer is."
+        },
+        "subject": {
+          "$ref": "#/$defs/PluginEvidenceSubject",
+          "description": "What the record is about."
         }
       },
       "required": [
         "capability",
+        "capability_version",
+        "revision",
+        "subject",
         "state",
         "source",
         "package_digest",
@@ -18394,6 +18409,56 @@
           "type": "string"
         }
       ]
+    },
+    "PluginEvidenceSubject": {
+      "additionalProperties": false,
+      "description": "What capability evidence is about.",
+      "properties": {
+        "application": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The application the evidence is about, where it is about one."
+        },
+        "desktop_generation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The desktop session generation the evidence is bound to, where it is bound to one."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the evidence was gathered in."
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The terminal profile the evidence is about, where it is about one."
+        }
+      },
+      "required": [
+        "environment_id",
+        "application",
+        "terminal",
+        "desktop_generation"
+      ],
+      "type": "object"
     },
     "PluginGrantParams": {
       "additionalProperties": false,

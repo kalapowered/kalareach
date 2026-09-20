@@ -192,10 +192,14 @@ impl CatalogueModule {
                             "the installed release is not in this repository's current generation",
                         )
                     })?;
+                let active = catalogue
+                    .active(&installation.repository)
+                    .map_err(ProtocolError::from)?;
+                let generation = active.map(|a| a.generation).unwrap_or(1);
                 encode(&wire::PluginCapabilitiesResult {
                     plugin: summary_of(&catalogue, &installation)?,
                     capabilities: grants(entry, &decisions)?,
-                    evidence: evidence(entry, &installation)?,
+                    evidence: evidence(entry, &installation, generation)?,
                 })
             }
             _ => Err(ProtocolError::new(
@@ -626,6 +630,7 @@ fn grants(
 fn evidence(
     entry: &kr_plugin_sdk::catalogue::IndexEntry,
     installation: &Installation,
+    generation: u64,
 ) -> Answer<Vec<wire::PluginCapabilityEvidence>> {
     let now = kr_protocol::scalars::TimestampMs::new(
         std::time::SystemTime::now()
@@ -633,12 +638,14 @@ fn evidence(
             .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0),
     );
+    let revision = kr_protocol::ids::CapabilityRevision::new(generation.max(1));
     let mut records = Vec::new();
     for qualification in &entry.qualification {
         match kr_plugin_runtime::catalogue::evidence::from_qualification(
             entry,
             installation,
             qualification,
+            revision,
             now,
         ) {
             Ok(record) => records.push(wire_evidence(&record)?),
@@ -647,6 +654,14 @@ fn evidence(
             // at all, and the person deciding whether to trust this package would not be told.
             Err(refusal) => records.push(wire::PluginCapabilityEvidence {
                 capability: qualification.capability_id.clone(),
+                capability_version: qualification.capability_version.to_string(),
+                revision,
+                subject: wire::PluginEvidenceSubject {
+                    environment_id: installation.environment_id,
+                    application: Nullable(Some(qualification.subject.to_string())),
+                    terminal: Nullable(None),
+                    desktop_generation: Nullable(None),
+                },
                 state: wire::PluginCapabilityState::NotTested,
                 source: wire::PluginEvidenceSource::SignedRecord,
                 package_digest: installation.package_digest.to_string(),
@@ -668,6 +683,7 @@ fn evidence(
             entry,
             installation,
             request.capability,
+            revision,
             now,
         )
         .map_err(ProtocolError::from)?;
@@ -682,6 +698,35 @@ fn wire_evidence(
     use kr_plugin_sdk::capability::{CapabilityState, EvidenceSource, InvalidationTrigger};
     Ok(wire::PluginCapabilityEvidence {
         capability: record.capability_id.clone(),
+        capability_version: record.capability_version.to_string(),
+        revision: record.revision,
+        subject: wire::PluginEvidenceSubject {
+            environment_id: record.subject.environment_id,
+            application: Nullable(
+                record
+                    .subject
+                    .application
+                    .0
+                    .as_ref()
+                    .map(|label| label.as_str().to_owned()),
+            ),
+            terminal: Nullable(
+                record
+                    .subject
+                    .terminal
+                    .0
+                    .as_ref()
+                    .map(|label| label.as_str().to_owned()),
+            ),
+            desktop_generation: Nullable(
+                record
+                    .subject
+                    .desktop_generation
+                    .0
+                    .as_ref()
+                    .map(|label| label.as_str().to_owned()),
+            ),
+        },
         state: match record.state {
             CapabilityState::QualifiedAvailable => wire::PluginCapabilityState::QualifiedAvailable,
             CapabilityState::VersionQualified => wire::PluginCapabilityState::VersionQualified,

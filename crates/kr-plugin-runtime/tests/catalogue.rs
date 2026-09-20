@@ -1572,16 +1572,17 @@ fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
     let good = QualificationResult {
         capability_id: evidence::capability_id(requested).expect("an identifier"),
         capability_version: PackageVersion::parse("1.0.0").expect("a valid version"),
-        subject: Label::new("Codex 1.4").expect("a valid label"),
+        subject: Label::new("ExternalApp 1.4").expect("a valid label"),
         state: CapabilityState::VersionQualified,
         source: EvidenceSource::SignedRecord,
         profile_digest: PayloadDigest::of(b"profile"),
-        statement: Summary::new("Qualified against Codex 1.4").expect("a valid statement"),
+        statement: Summary::new("Qualified against ExternalApp 1.4").expect("a valid statement"),
     };
     let record = evidence::from_qualification(
         &entry,
         &installation,
         &good,
+        kr_protocol::ids::CapabilityRevision::new(1),
         TimestampMs::new(1_760_000_000_000),
     )
     .expect("readable");
@@ -1609,6 +1610,7 @@ fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
             &entry,
             &installation,
             &inventing,
+            kr_protocol::ids::CapabilityRevision::new(1),
             TimestampMs::new(1_760_000_000_000)
         )
         .is_err()
@@ -1627,8 +1629,14 @@ fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
     let mut moved = installation;
     moved.package_digest = PayloadDigest::of(b"another release");
     assert!(
-        evidence::from_qualification(&entry, &moved, &good, TimestampMs::new(1_760_000_000_000))
-            .is_err()
+        evidence::from_qualification(
+            &entry,
+            &moved,
+            &good,
+            kr_protocol::ids::CapabilityRevision::new(1),
+            TimestampMs::new(1_760_000_000_000),
+        )
+        .is_err()
     );
 }
 

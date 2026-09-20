@@ -24,7 +24,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{CapabilityId, EnvironmentId, PluginId, RepositoryGeneration};
+use crate::ids::{CapabilityId, CapabilityRevision, EnvironmentId, PluginId, RepositoryGeneration};
 use crate::pairing::OwnerConfirmationProof;
 use crate::scalars::{Nullable, TimestampMs, U64};
 
@@ -390,6 +390,20 @@ pub struct PluginCapabilityGrant {
     pub reason: String,
 }
 
+/// What capability evidence is about.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PluginEvidenceSubject {
+    /// The environment the evidence was gathered in.
+    pub environment_id: EnvironmentId,
+    /// The application the evidence is about, where it is about one.
+    pub application: Nullable<String>,
+    /// The terminal profile the evidence is about, where it is about one.
+    pub terminal: Nullable<String>,
+    /// The desktop session generation the evidence is bound to, where it is bound to one.
+    pub desktop_generation: Nullable<String>,
+}
+
 /// What this host currently knows about one capability of one installed package.
 ///
 /// Evidence describes feasibility and never creates authority. An action still checks its grant,
@@ -399,6 +413,12 @@ pub struct PluginCapabilityGrant {
 pub struct PluginCapabilityEvidence {
     /// The capability, in the shared versioned namespace.
     pub capability: CapabilityId,
+    /// The capability version.
+    pub capability_version: String,
+    /// The current revision of this record.
+    pub revision: CapabilityRevision,
+    /// What the record is about.
+    pub subject: PluginEvidenceSubject,
     /// What the answer is.
     pub state: PluginCapabilityState,
     /// Where it came from.

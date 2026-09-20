@@ -79,6 +79,7 @@ pub fn from_qualification(
     entry: &IndexEntry,
     installation: &Installation,
     qualification: &QualificationResult,
+    revision: CapabilityRevision,
     observed_at: TimestampMs,
 ) -> CatalogueResult<CapabilityEvidence> {
     // The SDK's own rule: a catalogue result cannot claim a host outcome and comes from a signed
@@ -144,7 +145,7 @@ pub fn from_qualification(
         },
         // One revision per generation of the catalogue this came from: a record that changes when
         // the repository publishes again is a record every action can recheck.
-        revision: CapabilityRevision::new(u64::from(NAMESPACE_VERSION)),
+        revision,
         state: qualification.state,
         source: EvidenceSource::SignedRecord,
         invalidated_by: [
@@ -182,6 +183,7 @@ pub fn untested(
     entry: &IndexEntry,
     installation: &Installation,
     capability: PluginCapability,
+    revision: CapabilityRevision,
     observed_at: TimestampMs,
 ) -> CatalogueResult<CapabilityEvidence> {
     let evidence = CapabilityEvidence {
@@ -202,7 +204,7 @@ pub fn untested(
             profile_digest: Nullable(None),
             binding_revision: Nullable(None),
         },
-        revision: CapabilityRevision::new(u64::from(NAMESPACE_VERSION)),
+        revision,
         state: CapabilityState::NotTested,
         source: EvidenceSource::PackageDeclaration,
         invalidated_by: [
@@ -360,6 +362,7 @@ mod tests {
             &entry,
             &installation,
             &qualification(requested, CapabilityState::VersionQualified),
+            CapabilityRevision::new(1),
             now(),
         )
         .expect("a readable qualification");
@@ -384,6 +387,7 @@ mod tests {
             &entry,
             &installation,
             &qualification(unrequested, CapabilityState::VersionQualified),
+            CapabilityRevision::new(1),
             now(),
         )
         .expect_err("a capability the package never asked for");
@@ -404,6 +408,7 @@ mod tests {
             &entry,
             &installation,
             &qualification(requested, CapabilityState::QualifiedAvailable),
+            CapabilityRevision::new(1),
             now(),
         )
         .expect_err("a host claim");
@@ -420,6 +425,7 @@ mod tests {
             &entry,
             &installation,
             &qualification(requested, CapabilityState::VersionQualified),
+            CapabilityRevision::new(1),
             now(),
         )
         .expect_err("another release");
@@ -440,6 +446,7 @@ mod tests {
             &entry,
             &installation,
             &qualification(requested, CapabilityState::VersionQualified),
+            CapabilityRevision::new(1),
             now(),
         )
         .expect("a readable qualification");
@@ -464,6 +471,7 @@ mod tests {
             &entry,
             &installation,
             PluginCapability::TerminalStream,
+            CapabilityRevision::new(1),
             now(),
         )
         .expect("a buildable record");
