@@ -453,12 +453,23 @@ pub fn is_host_minted(id: &UpstreamRequestId) -> bool {
 }
 
 /// One resolution, as every authorised observer of the instance is told about it.
+///
+/// The sequence is the broker's own stream cursor, taken with the transition and written into the
+/// event row in the same transaction. It is what makes a stale delivery something an observer can
+/// see rather than something it has to believe: two transitions of one resource arrive in the
+/// order they were committed in, and their sequences say so.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceTransition {
+    /// This event's position in the broker's stream of transitions.
+    pub sequence: u64,
+    /// The event itself, which never changes and never repeats.
+    pub event_id: kr_protocol::scalars::Uuid,
     /// The instance the resource belongs to.
     pub application_instance_id: ApplicationInstanceId,
     /// The resource.
     pub resource_id: PendingResourceId,
+    /// The binding revision in force when it changed.
+    pub binding_revision: kr_protocol::ids::AgentBindingRevision,
     /// What it became.
     pub state: PendingState,
 }
@@ -479,8 +490,13 @@ impl Observations {
 /// Every connection that is watching, and the bounded queue each one reads.
 ///
 /// Section 12 fans resolutions out to every authorised observer. Who is authorised is the broker's
-/// answer — a connection observes the instance it was opened against — and this is the delivery:
-/// one bounded queue per connection, withdrawn rather than grown when an observer stops reading.
+/// answer (a connection observes the instance it was opened against) and this is the delivery: one
+/// bounded queue per connection, withdrawn rather than grown when an observer stops reading.
+///
+/// There is one of these per broker, held by the broker itself and handed out by
+/// [`Broker::observatory`](crate::broker::Broker::observatory). Every clone shares the one
+/// registry, so a second gateway subscribing its own connections adds to what the first is
+/// watching instead of taking delivery away from it.
 #[derive(Clone, Debug, Default)]
 pub struct Observatory {
     watching: Arc<
@@ -941,6 +957,12 @@ impl Duplex {
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
         self.stopping.notify_waiters();
+    }
+
+    /// Returns true when this owner has been asked to stop.
+    #[must_use]
+    pub fn stopping(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     /// Carries one frame the upstream sent.

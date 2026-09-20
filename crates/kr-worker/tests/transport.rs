@@ -23,7 +23,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     BoundEndpoint, Broker, BrokerTransport, Carried, Credential, Duplex, Framing, ManagedProcess,
-    Observatory, TransportHandle,
+    TransportHandle,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -50,12 +50,16 @@ fn process_identity() -> ProcessStartIdentity {
 }
 
 fn managed() -> ManagedProcess {
+    managed_for(instance())
+}
+
+fn managed_for(application_instance_id: ApplicationInstanceId) -> ManagedProcess {
     ManagedProcess::new(
-        instance(),
+        application_instance_id,
         process_identity(),
         TransportHandle {
             transport: BrokerTransport::PrivateSocket,
-            application_instance_id: instance(),
+            application_instance_id,
             executable_digest: Digest256::from_bytes([3; 32]),
             process: process_identity(),
         },
@@ -347,9 +351,7 @@ async fn duplex_watched(broker: &Arc<Broker>) -> Served {
     let (client_here, client_there) =
         tokio::net::UnixStream::pair().expect("a socket pair is made");
     let framing = Framing::new(NativeFraming::JsonLines);
-    let observatory = Observatory::new();
-    broker.observe_transitions(observatory.clone());
-    let observations = observatory.subscribe(GatewayConnectionId::new(1));
+    let observations = broker.observatory().subscribe(GatewayConnectionId::new(1));
     let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
     let (owner, writes) = Duplex::new(
         Arc::clone(broker),
@@ -1136,7 +1138,6 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
     let mut gateway = kr_worker::broker::NativeGateway::bind(
         Arc::clone(&broker),
         &directory,
-        Observatory::new(),
         launch_for(None, None),
     )
     .expect("the endpoint binds");
@@ -1225,11 +1226,7 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
         answered.contains("\"outcome\":\"allow\""),
         "the answer reached the agent: {answered}"
     );
-    let transition = tokio::time::timeout(std::time::Duration::from_secs(5), observations.next())
-        .await
-        .expect("an authorised observer is told")
-        .expect("the subscription is live");
-    assert_eq!(transition.resource_id, resource.resource_id);
+    let transition = settlement_of(&mut observations, resource.resource_id).await;
     assert_eq!(transition.state, PendingState::Resolved);
     assert_eq!(
         broker
@@ -1287,7 +1284,6 @@ async fn kr_req_11_43_a_wrong_credential_process_or_browser_origin_is_refused() 
         let gateway = kr_worker::broker::NativeGateway::bind(
             Arc::clone(&broker),
             &directory,
-            Observatory::new(),
             launch_for(Some(expected.clone()), None),
         )
         .expect("the endpoint binds");
@@ -1512,6 +1508,270 @@ fn is_host_minted_text(text: &str) -> bool {
     text.starts_with("\"kr-")
 }
 
+/// Waits for the event that says one resource reached a state nothing follows.
+///
+/// Every transition is announced, the claim an answer takes among them, so what a test about a
+/// settlement waits for is the settlement rather than the next thing this observer is told.
+async fn settlement_of(
+    observations: &mut kr_worker::broker::Observations,
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> kr_worker::broker::ResourceTransition {
+    loop {
+        let transition =
+            tokio::time::timeout(std::time::Duration::from_secs(5), observations.next())
+                .await
+                .expect("an authorised observer is told")
+                .expect("the subscription is live");
+        if transition.resource_id == resource_id && transition.state.is_terminal() {
+            return transition;
+        }
+    }
+}
+
+/// Drains everything an observer has been told, without waiting for more.
+async fn told(observations: &mut kr_worker::broker::Observations) -> Vec<(u64, PendingState)> {
+    let mut seen = Vec::new();
+    while let Ok(Some(transition)) =
+        tokio::time::timeout(std::time::Duration::from_millis(250), observations.next()).await
+    {
+        seen.push((transition.sequence, transition.state));
+    }
+    seen
+}
+
+/// KR-REQ-12.11, KR-REQ-12.13 and section 24: every transition is committed with the event that
+/// announces it, and every authorised observer is told in one order.
+///
+/// Two connections of one instance watch it and a connection of another instance watches that.
+/// Four transitions happen, two of them from tasks racing each other. What each authorised
+/// observer reads is the same events in the same order; what the outbox holds is those same
+/// events; and the unrelated observer reads none of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_in_one_order() {
+    let broker = broker();
+    // A second connection of the same instance, which is a second authorised observer, and one
+    // connection of an instance nothing here touches.
+    broker
+        .open_native_connection(
+            instance(),
+            &CREDENTIAL,
+            &process_identity(),
+            &package(),
+            "1",
+        )
+        .expect("a second connection of this instance is authenticated");
+    let elsewhere = ApplicationInstanceId::new(Uuid::from_bytes([8; 16]));
+    broker
+        .register_instance(
+            elsewhere,
+            IntegrationMode::Gateway,
+            None,
+            Some(managed_for(elsewhere)),
+        )
+        .expect("the other instance is registered");
+    broker
+        .pin_table(elsewhere, table(), rich())
+        .expect("its tables are pinned");
+    broker
+        .open_native_connection(elsewhere, &CREDENTIAL, &process_identity(), &package(), "1")
+        .expect("its connection is authenticated");
+    let served = duplex_watched(&broker).await;
+    let mut first = served.observations;
+    let mut second = broker.observatory().subscribe(GatewayConnectionId::new(2));
+    let mut unrelated = broker.observatory().subscribe(GatewayConnectionId::new(3));
+    let owner = Arc::clone(&served.owner);
+    let mut client = tokio::io::BufReader::new(served.client);
+
+    // Two requests of the upstream's, recorded.
+    for id in [41, 42] {
+        owner
+            .from_upstream(
+                format!(r#"{{"id":{id},"method":"session/request_permission","params":{{}}}}"#)
+                    .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut client).await;
+    }
+
+    // One is answered by the person and one is withdrawn by the upstream, from two tasks at once.
+    // Whatever order they take, every observer is told in the order the broker committed them.
+    let answering = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            owner
+                .from_client(
+                    br#"{"id":41,"result":{"outcome":"allow"}}"#,
+                    TimestampMs::new(3),
+                )
+                .await
+        })
+    };
+    let withdrawing = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            owner
+                .from_upstream(
+                    br#"{"id":42,"result":{"outcome":"deny"}}"#,
+                    TimestampMs::new(4),
+                )
+                .await
+        })
+    };
+    answering
+        .await
+        .expect("the task finished")
+        .expect("the answer goes");
+    withdrawing
+        .await
+        .expect("the task finished")
+        .expect("the withdrawal is carried");
+
+    let told_first = told(&mut first).await;
+    let told_second = told(&mut second).await;
+    assert_eq!(
+        told_first, told_second,
+        "both authorised observers of this instance read the same events in the same order"
+    );
+    assert!(
+        told(&mut unrelated).await.is_empty(),
+        "an observer of another instance is told nothing about this one"
+    );
+    assert!(
+        told_first.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "and each event follows the one before it: {told_first:?}"
+    );
+    let states: Vec<PendingState> = told_first.iter().map(|(_, state)| *state).collect();
+    assert!(
+        states.contains(&PendingState::Resolved),
+        "the person's answer resolved one: {states:?}"
+    );
+    assert!(
+        states.contains(&PendingState::Cancelled),
+        "the upstream withdrew the other: {states:?}"
+    );
+
+    // And the outbox holds exactly what was announced, because it was written with it.
+    let recorded = broker.transitions_after(0).expect("the outbox reads");
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|event| (event.sequence, event.state))
+            .collect::<Vec<_>>(),
+        told_first,
+        "a crash between the change and its event would have shown up here"
+    );
+    for event in &recorded {
+        assert_eq!(event.application_instance_id, instance());
+        assert_eq!(
+            event.binding_revision,
+            kr_protocol::ids::AgentBindingRevision::new(1),
+            "the revision in force when it changed"
+        );
+    }
+
+    served.drained.abort();
+}
+
+/// KR-REQ-12.11: a second gateway joins the observers of the first rather than replacing them.
+///
+/// The registry is the broker's, so binding another endpoint against the same broker adds its
+/// connections to the watchers instead of taking delivery away from the ones already there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_second_gateway_joins_the_observers_of_the_first() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let mut first = served.observations;
+    let owner = Arc::clone(&served.owner);
+    let mut client = tokio::io::BufReader::new(served.client);
+
+    let one = private_directory();
+    let another = private_directory();
+    let earlier =
+        kr_worker::broker::NativeGateway::bind(Arc::clone(&broker), &one, launch_for(None, None))
+            .expect("the first endpoint binds");
+    let later = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &another,
+        launch_for(None, None),
+    )
+    .expect("the second endpoint binds");
+    assert_ne!(
+        earlier.address(),
+        later.address(),
+        "two endpoints, one broker"
+    );
+
+    owner
+        .from_upstream(
+            br#"{"id":71,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut client).await;
+    owner
+        .from_upstream(
+            br#"{"id":71,"result":{"outcome":"deny"}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the upstream withdraws it");
+    assert!(
+        !told(&mut first).await.is_empty(),
+        "the observer that was already watching is still told"
+    );
+
+    served.drained.abort();
+    let _ = std::fs::remove_dir_all(&one);
+    let _ = std::fs::remove_dir_all(&another);
+}
+
+/// KR-REQ-12.11: an observer that has stopped reading is withdrawn, not grown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_an_observer_that_falls_behind_is_withdrawn_rather_than_grown() {
+    let broker = broker();
+    let mut watching = broker.observatory().subscribe(GatewayConnectionId::new(1));
+    let served = duplex_watched(&broker).await;
+    let owner = Arc::clone(&served.owner);
+    let mut client = tokio::io::BufReader::new(served.client);
+
+    // More transitions than one subscription may fall behind by, with nothing reading them.
+    let overflow = kr_worker::broker::MAX_QUEUED_OBSERVATIONS + 8;
+    for id in 0..overflow {
+        let id = id + 100;
+        owner
+            .from_upstream(
+                format!(r#"{{"id":{id},"method":"session/request_permission","params":{{}}}}"#)
+                    .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut client).await;
+        owner
+            .from_upstream(
+                format!(r#"{{"id":{id},"result":{{"outcome":"deny"}}}}"#).as_bytes(),
+                TimestampMs::new(3),
+            )
+            .await
+            .expect("the upstream withdraws it");
+    }
+    let seen = told(&mut watching).await;
+    assert!(
+        seen.len() <= kr_worker::broker::MAX_QUEUED_OBSERVATIONS,
+        "the queue is bounded: {}",
+        seen.len()
+    );
+    assert!(
+        broker.transitions_after(0).expect("the outbox reads").len() >= overflow,
+        "and every transition is still recorded, whatever any observer read"
+    );
+
+    served.drained.abort();
+}
+
 /// KR-REQ-11.30 and KR-REQ-12.13: the native client's own request goes through native admission,
 /// and an unclassified one suspends rich mutations before a byte of it is written.
 ///
@@ -1692,9 +1952,7 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
     let broker = broker();
     let (upstream_here, upstream_there) = tokio::io::duplex(8);
     let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
-    let observatory = Observatory::new();
-    broker.observe_transitions(observatory.clone());
-    let mut observations = observatory.subscribe(GatewayConnectionId::new(1));
+    let mut observations = broker.observatory().subscribe(GatewayConnectionId::new(1));
     let (owner, writes) = Duplex::new(
         Arc::clone(&broker),
         GatewayConnectionId::new(1),
@@ -1754,11 +2012,7 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
     );
     // What the observers are told is the uncertainty, not a resolution: every authorised watcher
     // of the instance learns the state the resource actually reached.
-    let transition = tokio::time::timeout(std::time::Duration::from_secs(5), observations.next())
-        .await
-        .expect("an authorised observer is told")
-        .expect("the subscription is live");
-    assert_eq!(transition.resource_id, resource.resource_id);
+    let transition = settlement_of(&mut observations, resource.resource_id).await;
     assert_eq!(transition.state, PendingState::Uncertain);
     drop(upstream_there);
     drained.abort();
@@ -1811,32 +2065,23 @@ async fn kr_req_07_67_an_intentional_native_exit_stops_the_dedicated_backend() {
 /// connection that closes while that terminal is still running does not.
 ///
 /// The backend of this instance is not one this host dedicated, so nothing is claimed or
-/// terminated as owned — which is section 7's other half, and what the assertion on `stopped`
-/// establishes. The grace period itself is proved against a real child process above.
+/// terminated as owned, which is section 7's other half. The grace period itself is proved against
+/// a real child process above, and a live dedicated backend below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_closing_does_not() {
     for exits in [true, false] {
         let directory = private_directory();
         let (broker, running) = broker_expecting_this_process();
         // A terminal of this host's own, as a real process the kernel names.
-        let mut terminal = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("while true; do sleep 1; done")
-            .current_dir(std::env::temp_dir())
-            .spawn()
-            .expect("the terminal starts");
+        let mut terminal = sleeper();
         let pid = terminal.id().expect("the terminal has an identifier");
         let identity =
             kr_ipc::identity::process_start_identity(pid).expect("the kernel names the terminal");
         let mut launch = launch_for(Some(running.clone()), Some(identity));
         launch.application_instance_id = instance();
-        let gateway = kr_worker::broker::NativeGateway::bind(
-            Arc::clone(&broker),
-            &directory,
-            Observatory::new(),
-            launch,
-        )
-        .expect("the endpoint binds");
+        let gateway =
+            kr_worker::broker::NativeGateway::bind(Arc::clone(&broker), &directory, launch)
+                .expect("the endpoint binds");
         let kr_worker::broker::ListenerAddress::PrivateSocket(path) = gateway.address().clone()
         else {
             panic!("this platform prefers a private socket");
@@ -1853,7 +2098,7 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
         });
         let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
         let (client_reads, client_writes) = tokio::io::split(client_here);
-        let attached = gateway
+        let mut attached = gateway
             .accept(client_reads, client_writes)
             .await
             .expect("the bridge is admitted");
@@ -1870,14 +2115,23 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
             .await
             .expect("the connection ends")
             .expect("its task is joined");
+        let watching = attached
+            .terminal
+            .take()
+            .expect("this host started a terminal");
         if exits {
             assert_eq!(
                 ended.closure,
                 kr_worker::broker::Closure::NativeExit,
                 "the terminal exiting is the intentional native exit"
             );
+            let stopped =
+                tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
+                    .await
+                    .expect("the supervision reports")
+                    .expect("its task is joined");
             assert!(
-                ended.stopped.is_none(),
+                stopped.is_none(),
                 "and a backend this host did not dedicate is never terminated as owned"
             );
             assert!(
@@ -1890,7 +2144,6 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
                 kr_worker::broker::Closure::Detached,
                 "an attachment closing is not an exit"
             );
-            assert!(ended.stopped.is_none(), "and it stops nothing");
             assert!(
                 matches!(
                     kr_ipc::identity::process_state(
@@ -1900,9 +2153,129 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
                 ),
                 "the terminal is still there"
             );
+            // End of file came first and the exit comes now, long after the connection was torn
+            // down. The supervision is still watching, so the exit is still the exit.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             terminal.kill().await.expect("the terminal is ended");
             let _ = terminal.wait().await;
+            let stopped =
+                tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
+                    .await
+                    .expect("the supervision is still watching after the socket has gone")
+                    .expect("its task is joined");
+            assert!(
+                stopped.is_none(),
+                "a backend this host did not dedicate is never terminated as owned"
+            );
+            assert!(
+                broker.binding_state(instance()).is_err(),
+                "and the instance the terminal was running ended with it"
+            );
         }
         let _ = std::fs::remove_dir_all(&directory);
     }
+}
+
+/// KR-REQ-07.67: a terminal exiting stops the live backend this host dedicated to it, whether or
+/// not anything about the connection has happened.
+///
+/// The connection stays open and the backend this host launched stays live for the whole of this
+/// test. The terminal exits well after any window a teardown could have waited, and the backend is
+/// stopped, because what is watched is the process rather than the socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_it() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let mut terminal = sleeper();
+    let terminal_pid = terminal.id().expect("the terminal has an identifier");
+    let terminal_identity = kr_ipc::identity::process_start_identity(terminal_pid)
+        .expect("the kernel names the terminal");
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, Some(terminal_identity)),
+    )
+    .expect("the endpoint binds");
+
+    // The backend is the process this host starts for this instance, which is what makes it
+    // dedicated. It is alive for the whole of this test until the terminal's exit stops it.
+    let intent = broker
+        .prepare_launch(
+            forwarder_profile(),
+            kr_worker::broker::ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let mut launched = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect("the agent is started");
+    broker
+        .pin_table(instance(), table(), rich())
+        .expect("the installed tables are pinned");
+    bind_component(&broker);
+    record_capabilities(&broker);
+
+    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (client_reads, client_writes) = tokio::io::split(client_here);
+    let mut attached = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        gateway.accept(client_reads, client_writes),
+    )
+    .await
+    .expect("the forwarder reaches the endpoint")
+    .expect("it is authenticated and admitted");
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&launched.process),
+            kr_ipc::identity::ProcessState::Running
+        ),
+        "the backend this host launched is serving"
+    );
+
+    // Nothing has happened to the connection, and nothing needs to: the terminal exits well after
+    // any window a teardown could have waited, and that is the event.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    terminal.kill().await.expect("the terminal is ended");
+    let _ = terminal.wait().await;
+
+    let watching = attached
+        .terminal
+        .take()
+        .expect("this host started a terminal");
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
+        .await
+        .expect("the supervision reports")
+        .expect("its task is joined")
+        .expect("a dedicated backend is stopped");
+    assert!(stopped.asked, "the backend was asked to stop");
+    assert!(stopped.ended, "and this host waited until it had");
+    let _ = launched.child.wait();
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&launched.process),
+            kr_ipc::identity::ProcessState::Ended
+        ),
+        "the backend has gone"
+    );
+    assert!(
+        broker.binding_state(instance()).is_err(),
+        "and the instance the terminal was running ended with it"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A real child process that does nothing until it is ended, on the internal disk.
+fn sleeper() -> tokio::process::Child {
+    tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("while true; do sleep 1; done")
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("the process starts")
 }

@@ -49,11 +49,13 @@ pub const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5
 /// How long a connection's own writes are given to finish once both ends have stopped reading.
 pub const TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a terminal that has closed its connection is given to end before this host decides.
+/// How often the native terminal this host started is read while it is still running.
 ///
-/// A socket reaching end of file and the process behind it exiting are two events, and the socket
-/// wins the race often enough that reading the process once would call an ordinary exit a detach.
-pub const EXIT_SETTLES_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// A socket reaching end of file and the process behind it exiting are two events in either order,
+/// and neither is a bound on the other: a terminal can close its connection and go on running for
+/// an hour, and a terminal whose connection stays open can exit at once. So the process is watched
+/// for as long as it runs rather than for a window after something else happened.
+pub const TERMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// What one launched agent's bridge must satisfy, and what its connection is read with.
 #[derive(Clone, Debug)]
@@ -115,35 +117,82 @@ struct Hello {
     headers: BTreeMap<String, String>,
 }
 
-/// What one connection's ending meant, and what it stopped.
+/// What one connection's ending meant, as the closure itself established it.
+///
+/// It says what the socket closing was, and nothing about what the terminal does afterwards: that
+/// belongs to [`TerminalWatch`], which is still running when this is returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ended {
     /// Why the connection ended.
     pub closure: Closure,
-    /// What stopping the dedicated backend did, where an intentional native exit stopped one.
-    pub stopped: Option<crate::broker::process::BackendStop>,
 }
 
-/// Decides what one connection's ending was, from the terminal this host started.
-async fn ended_as(terminal: Option<&ProcessStartIdentity>) -> Closure {
-    let Some(terminal) = terminal else {
-        // This host started no terminal of its own, so nothing about this connection is that
-        // terminal exiting. A bypassed or shared backend is never claimed or ended as owned.
-        return Closure::Detached;
-    };
-    let deadline = tokio::time::Instant::now() + EXIT_SETTLES_WITHIN;
+/// The supervision of the native terminal this host started.
+///
+/// Section 7 makes the terminal's own exit the intentional native exit that ends the instance and
+/// stops its dedicated backend. The connection is not that event and cannot stand in for it: the
+/// socket can close while the terminal runs on, and the terminal can exit long after any window a
+/// teardown could reasonably wait. So this watches the process itself, from the moment the
+/// connection is served until the process ends, and it is what stops the backend.
+#[derive(Debug)]
+pub struct TerminalWatch {
+    stopping: Arc<tokio::sync::Notify>,
+    watching: tokio::task::JoinHandle<Option<crate::broker::process::BackendStop>>,
+}
+
+impl TerminalWatch {
+    /// Waits for the terminal to exit and returns what stopping its dedicated backend did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UpstreamUnavailable`] when the supervising task could not be joined,
+    /// which leaves what became of the terminal unestablished.
+    pub async fn exited(self) -> Result<Option<crate::broker::process::BackendStop>> {
+        self.watching
+            .await
+            .map_err(|error| BrokerError::UpstreamUnavailable {
+                detail: format!("the terminal's supervision could not be joined: {error}"),
+            })
+    }
+
+    /// Ends the supervision without waiting for the terminal.
+    ///
+    /// Nothing is stopped and nothing is ended: this is the host giving up the watch, which is
+    /// what a session shutting down does.
+    pub fn stop(&self) {
+        self.stopping.notify_waiters();
+    }
+}
+
+/// Watches one terminal for as long as it runs, and stops what its exit stops.
+async fn supervise_terminal(
+    broker: Arc<Broker>,
+    application_instance_id: ApplicationInstanceId,
+    terminal: ProcessStartIdentity,
+    stopping: Arc<tokio::sync::Notify>,
+) -> Option<crate::broker::process::BackendStop> {
     loop {
         if matches!(
-            kr_ipc::identity::process_state(terminal),
+            kr_ipc::identity::process_state(&terminal),
             kr_ipc::identity::ProcessState::Ended
         ) {
-            return Closure::NativeExit;
+            return stop_what_ended(&broker, application_instance_id).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Closure::Detached;
+        tokio::select! {
+            () = tokio::time::sleep(TERMINAL_POLL) => {}
+            () = stopping.notified() => return None,
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Returns true when the terminal this host started has ended, read once.
+fn terminal_has_ended(terminal: Option<&ProcessStartIdentity>) -> bool {
+    terminal.is_some_and(|terminal| {
+        matches!(
+            kr_ipc::identity::process_state(terminal),
+            kr_ipc::identity::ProcessState::Ended
+        )
+    })
 }
 
 /// Ends the instance an intentional native exit ends, and stops the backend it stops.
@@ -170,6 +219,12 @@ pub struct Attached {
     pub owner: Arc<Duplex>,
     /// Where this connection's authorised observer reads resolutions.
     pub observations: Observations,
+    /// The supervision of the native terminal, where this host started one.
+    ///
+    /// It is already running and it outlives this connection. Closing the attachment does not end
+    /// it, because the terminal exiting is a different event from the socket closing and section 7
+    /// acts on the first.
+    pub terminal: Option<TerminalWatch>,
     /// The task driving the owner's own writes and reads.
     served: tokio::task::JoinHandle<Ended>,
 }
@@ -177,12 +232,15 @@ pub struct Attached {
 impl Attached {
     /// Waits for the connection to end and says why it did.
     ///
+    /// What it says is about the socket. The terminal is watched separately and goes on being
+    /// watched after this returns, so a terminal that exits later still stops its backend.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UpstreamUnavailable`] when the task that served the connection could
     /// not be joined, which leaves why it ended unestablished.
-    pub async fn served(self) -> Result<Ended> {
-        self.served
+    pub async fn served(&mut self) -> Result<Ended> {
+        (&mut self.served)
             .await
             .map_err(|error| BrokerError::UpstreamUnavailable {
                 detail: format!("the connection's own task could not be joined: {error}"),
@@ -194,7 +252,7 @@ impl Attached {
     /// # Errors
     ///
     /// Returns what [`Attached::served`] does.
-    pub async fn shutdown(self) -> Result<Ended> {
+    pub async fn shutdown(&mut self) -> Result<Ended> {
         self.owner.shutdown();
         self.served().await
     }
@@ -231,10 +289,13 @@ impl NativeGateway {
     pub fn bind(
         broker: Arc<Broker>,
         runtime_directory: &std::path::Path,
-        observatory: Observatory,
         launch: NativeLaunch,
     ) -> Result<Self> {
         let endpoint = BoundEndpoint::bind(runtime_directory)?;
+        // The broker's own registry, not one of this gateway's. Every settled resource of this
+        // broker reaches the observers watching its instance, and a second gateway's connections
+        // join them rather than replacing them.
+        let observatory = broker.observatory();
         // The registration is built from the address this host bound, never from one a caller
         // supplied. A launched process is told where to connect, and telling it anywhere but the
         // socket that exists is telling it nothing. Which process it will be is not known yet.
@@ -246,8 +307,6 @@ impl NativeGateway {
                 expected,
             )
         });
-        // Every settled resource of this broker reaches the observers watching its instance.
-        broker.observe_transitions(observatory.clone());
         Ok(Self {
             broker,
             endpoint,
@@ -541,11 +600,26 @@ impl NativeGateway {
             return Err(error);
         }
         let observations = self.observatory.subscribe(connection);
+        // The terminal is watched from here, and the watch is not this connection's to end.
+        // Section 7 acts on the terminal exiting, which is neither caused by nor bounded by the
+        // socket closing, so the supervision starts now and runs until the process ends.
+        let terminal = self.launch.native_terminal.clone().map(|terminal| {
+            let stopping = Arc::new(tokio::sync::Notify::new());
+            TerminalWatch {
+                stopping: Arc::clone(&stopping),
+                watching: tokio::spawn(supervise_terminal(
+                    Arc::clone(&self.broker),
+                    self.launch.application_instance_id,
+                    terminal,
+                    stopping,
+                )),
+            }
+        });
         let served = {
             let owner = Arc::clone(&owner);
             let broker = Arc::clone(&self.broker);
             let observatory = self.observatory.clone();
-            let terminal = self.launch.native_terminal.clone();
+            let watched = self.launch.native_terminal.clone();
             let application_instance_id = self.launch.application_instance_id;
             tokio::spawn(async move {
                 let reading = {
@@ -565,6 +639,7 @@ impl NativeGateway {
                 // race a frame that is still going out.
                 let mut writing = tokio::spawn(writes);
                 reading.await;
+                let asked_to_stop = owner.stopping();
                 owner.shutdown();
                 if tokio::time::timeout(TEARDOWN_DEADLINE, &mut writing)
                     .await
@@ -576,25 +651,27 @@ impl NativeGateway {
                     writing.abort();
                     let _ = (&mut writing).await;
                 }
-                let closure = ended_as(terminal.as_ref()).await;
                 broker.unbind_dispatch(application_instance_id, &carrying);
                 broker.close_connection(connection);
                 observatory.withdraw(connection);
-                // Section 7: only the native terminal's own exit ends the instance and stops its
-                // dedicated backend. A connection closing while that terminal is still running is
-                // an attachment closing, and that ends nothing.
-                let stopped = if closure == Closure::NativeExit {
-                    stop_what_ended(&broker, application_instance_id).await
+                // What the closure was, read once, from the process rather than from the socket.
+                // Nothing is stopped here: the terminal's own supervision owns that, and it is
+                // still running whichever of these this closure turns out to be.
+                let closure = if asked_to_stop {
+                    Closure::Shutdown
+                } else if terminal_has_ended(watched.as_ref()) {
+                    Closure::NativeExit
                 } else {
-                    None
+                    Closure::Detached
                 };
-                Ended { closure, stopped }
+                Ended { closure }
             })
         };
         Ok(Attached {
             connection,
             owner,
             observations,
+            terminal,
             served,
         })
     }

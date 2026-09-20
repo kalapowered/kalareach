@@ -27,6 +27,11 @@
 //! * **Client intents** are the requests the native terminal made of its own upstream, recorded
 //!   with their classification before their bytes go. A restart that found one of them unsettled
 //!   knows an operation it did not classify may already have changed upstream state.
+//! * **Transition events** are the outbox section 24 requires beside each state change: "commit
+//!   state transitions and a small event/outbox record in the same local transaction". A crash
+//!   between the two would lose the announcement of a change that happened, so there is no
+//!   between: one transaction carries both, and the sequence the row is keyed by is the order
+//!   every observer is told in.
 
 use kr_protocol::broker::{BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile};
 use kr_protocol::gateway::{EvidenceGap, NativeClassification, PendingResource, PendingState};
@@ -41,7 +46,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::broker::error::{BrokerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How long the ledger waits for another connection to finish writing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -131,6 +136,31 @@ pub struct ClientIntent {
     pub recorded_at: TimestampMs,
 }
 
+/// One resource transition, as the outbox records it beside the transition itself.
+///
+/// Section 24: events carry an immutable identifier, a stream cursor, the subject and its binding
+/// revision, and the content's classification. The sequence is that cursor, and it is the order
+/// every observer of this broker is told about transitions in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionEvent {
+    /// The position of this event in the broker's own stream.
+    pub sequence: u64,
+    /// The event itself, which never changes and never repeats.
+    pub event_id: Uuid,
+    /// The instance the resource belongs to.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The resource whose state changed.
+    pub resource_id: PendingResourceId,
+    /// The binding revision in force when it changed.
+    pub binding_revision: kr_protocol::ids::AgentBindingRevision,
+    /// What the resource became.
+    pub state: PendingState,
+    /// How the request behind the resource was classified.
+    pub classification: NativeClassification,
+    /// When the transition happened.
+    pub recorded_at: TimestampMs,
+}
+
 /// Reads one stored classification back.
 fn class_from(text: &str) -> Result<kr_protocol::gateway::NativeMethodClass> {
     kr_protocol::gateway::NativeMethodClass::ALL
@@ -138,6 +168,39 @@ fn class_from(text: &str) -> Result<kr_protocol::gateway::NativeMethodClass> {
         .copied()
         .find(|class| class.as_str() == text)
         .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored classification")))
+}
+
+/// Reads one stored pending state back.
+fn state_from(text: &str) -> Result<PendingState> {
+    PendingState::ALL
+        .iter()
+        .copied()
+        .find(|state| state.as_str() == text)
+        .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored state")))
+}
+
+/// Writes one transition event inside the transaction that commits the transition.
+fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO broker_events
+                 (sequence, event_id, application_instance_id, resource_id, binding_revision,
+                  state, class, declared, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                i64::try_from(event.sequence).unwrap_or(i64::MAX),
+                event.event_id.as_bytes().as_slice(),
+                event.application_instance_id.get().as_bytes().as_slice(),
+                event.resource_id.get().as_bytes().as_slice(),
+                i64::try_from(event.binding_revision.get()).unwrap_or(i64::MAX),
+                event.state.as_str(),
+                event.classification.class.as_str(),
+                i64::from(event.classification.declared),
+                i64::try_from(event.recorded_at.get()).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(BrokerError::ledger)?;
+    Ok(())
 }
 
 /// Reads one stored client-request outcome back.
@@ -260,7 +323,18 @@ impl Ledger {
                      recorded_at_ms          INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS broker_client_requests_by_instance
-                     ON broker_client_requests (application_instance_id);",
+                     ON broker_client_requests (application_instance_id);
+                 CREATE TABLE IF NOT EXISTS broker_events (
+                     sequence                INTEGER PRIMARY KEY,
+                     event_id                BLOB NOT NULL UNIQUE,
+                     application_instance_id BLOB NOT NULL,
+                     resource_id             BLOB NOT NULL,
+                     binding_revision        INTEGER NOT NULL,
+                     state                   TEXT NOT NULL,
+                     class                   TEXT NOT NULL,
+                     declared                INTEGER NOT NULL,
+                     recorded_at_ms          INTEGER NOT NULL
+                 );",
             )
             .map_err(BrokerError::ledger)?;
         let recorded: Option<i64> = self
@@ -635,9 +709,16 @@ impl Ledger {
         expected: PendingState,
         dispatched: bool,
         now: TimestampMs,
+        event: &TransitionEvent,
     ) -> Result<()> {
-        let updated = self
+        // One transaction for the change and for the record that announces it. Section 24 makes
+        // those one write because a crash between two writes loses an event about a change that
+        // did happen, and nothing later can tell that it did.
+        let transaction = self
             .connection
+            .unchecked_transaction()
+            .map_err(BrokerError::ledger)?;
+        let updated = transaction
             .execute(
                 "UPDATE broker_pending
                  SET state = ?3, durability = ?4, record = ?5,
@@ -656,23 +737,112 @@ impl Ledger {
                 ],
             )
             .map_err(BrokerError::ledger)?;
-        if updated == 1 {
-            return Ok(());
+        if updated != 1 {
+            transaction.rollback().map_err(BrokerError::ledger)?;
+            let held: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT state FROM broker_pending WHERE resource_id = ?1",
+                    params![resource.resource_id.get().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(BrokerError::ledger)?;
+            return Err(BrokerError::ledger(format!(
+                "pending resource {} is {} in the ledger and the write expected {expected}",
+                resource.resource_id,
+                held.unwrap_or_else(|| "absent".to_owned())
+            )));
         }
-        let held: Option<String> = self
+        write_event(&transaction, event)?;
+        transaction.commit().map_err(BrokerError::ledger)
+    }
+
+    /// Returns the highest event sequence this ledger holds.
+    ///
+    /// A restarted worker numbers its own events above everything it has already written, so one
+    /// stream of transitions runs across restarts rather than beginning again at the top.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn highest_event(&self) -> Result<u64> {
+        let highest: i64 = self
             .connection
             .query_row(
-                "SELECT state FROM broker_pending WHERE resource_id = ?1",
-                params![resource.resource_id.get().as_bytes().as_slice()],
+                "SELECT COALESCE(MAX(sequence), 0) FROM broker_events",
+                [],
                 |row| row.get(0),
             )
-            .optional()
             .map_err(BrokerError::ledger)?;
-        Err(BrokerError::ledger(format!(
-            "pending resource {} is {} in the ledger and the write expected {expected}",
-            resource.resource_id,
-            held.unwrap_or_else(|| "absent".to_owned())
-        )))
+        Ok(u64::try_from(highest).unwrap_or_default())
+    }
+
+    /// Reads the transitions recorded after one cursor, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails or a row is unreadable.
+    pub fn events_after(&self, sequence: u64) -> Result<Vec<TransitionEvent>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT sequence, event_id, application_instance_id, resource_id,
+                        binding_revision, state, class, declared, recorded_at_ms
+                 FROM broker_events WHERE sequence > ?1 ORDER BY sequence",
+            )
+            .map_err(BrokerError::ledger)?;
+        let rows = statement
+            .query_map(
+                params![i64::try_from(sequence).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .map_err(BrokerError::ledger)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(BrokerError::ledger)?;
+        rows.into_iter()
+            .map(
+                |(
+                    sequence,
+                    event_id,
+                    instance,
+                    resource,
+                    revision,
+                    state,
+                    class,
+                    declared,
+                    recorded,
+                )| {
+                    Ok(TransitionEvent {
+                        sequence: u64::try_from(sequence).unwrap_or_default(),
+                        event_id: uuid_from(&event_id)?,
+                        application_instance_id: ApplicationInstanceId::new(uuid_from(&instance)?),
+                        resource_id: PendingResourceId::new(uuid_from(&resource)?),
+                        binding_revision: kr_protocol::ids::AgentBindingRevision::new(
+                            u64::try_from(revision).unwrap_or_default(),
+                        ),
+                        state: state_from(&state)?,
+                        classification: NativeClassification {
+                            class: class_from(&class)?,
+                            declared: declared != 0,
+                        },
+                        recorded_at: TimestampMs::new(u64::try_from(recorded).unwrap_or_default()),
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Records that an answer to one resource has left this host.
@@ -1435,6 +1605,20 @@ mod tests {
         );
     }
 
+    /// One transition event, as a settle writes beside the change it records.
+    fn event(sequence: u64, resource: &PendingResource) -> TransitionEvent {
+        TransitionEvent {
+            sequence,
+            event_id: Uuid::from_bytes([u8::try_from(sequence % 251).unwrap_or(0); 16]),
+            application_instance_id: resource.application_instance_id,
+            resource_id: resource.resource_id,
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            state: resource.state,
+            classification: resource.classification,
+            recorded_at: resource.recorded_at,
+        }
+    }
+
     #[test]
     fn a_settle_built_from_a_stale_copy_is_refused() {
         let mut ledger = Ledger::open(None).expect("the ledger opens");
@@ -1451,17 +1635,39 @@ mod tests {
             .expect("admitted");
         let claimed = resource(7, "11", PendingState::Claimed);
         ledger
-            .settle_pending(&claimed, PendingState::Pending, false, TimestampMs::new(12))
+            .settle_pending(
+                &claimed,
+                PendingState::Pending,
+                false,
+                TimestampMs::new(12),
+                &event(1, &claimed),
+            )
             .expect("the claim is written");
         let resolved = resource(7, "11", PendingState::Resolved);
         ledger
-            .settle_pending(&resolved, PendingState::Claimed, true, TimestampMs::new(13))
+            .settle_pending(
+                &resolved,
+                PendingState::Claimed,
+                true,
+                TimestampMs::new(13),
+                &event(2, &resolved),
+            )
             .expect("the resolution is written");
         // A writer holding the older copy tries to put it back. The row has moved on, and the
         // write is refused rather than reversing a completed transition.
-        let stale =
-            ledger.settle_pending(&claimed, PendingState::Pending, false, TimestampMs::new(14));
+        let stale = ledger.settle_pending(
+            &claimed,
+            PendingState::Pending,
+            false,
+            TimestampMs::new(14),
+            &event(3, &claimed),
+        );
         assert!(stale.is_err());
+        assert_eq!(
+            ledger.events_after(0).expect("the outbox reads").len(),
+            2,
+            "a refused settle announces nothing, because nothing changed"
+        );
         assert_eq!(
             ledger
                 .pending(pending.resource_id)
@@ -1490,7 +1696,13 @@ mod tests {
                 )
                 .expect("admitted");
             ledger
-                .settle_pending(&claimed, PendingState::Pending, false, TimestampMs::new(12))
+                .settle_pending(
+                    &claimed,
+                    PendingState::Pending,
+                    false,
+                    TimestampMs::new(12),
+                    &event(1, &claimed),
+                )
                 .expect("claimed");
             let unresolved = ledger.unresolved().expect("the read succeeds");
             assert_eq!(unresolved.len(), 1);

@@ -82,11 +82,13 @@ use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 pub use crate::broker::arbitration::{
     Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
-pub use crate::broker::attach::{Attached, Ended, NativeGateway, NativeLaunch, hello_frame};
+pub use crate::broker::attach::{
+    Attached, Ended, Launched, NativeGateway, NativeLaunch, TerminalWatch, hello_frame,
+};
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{
-    Carried, Closure, Delivery, Dispatch, Duplex, Observations, Observatory, Queued,
-    ResourceTransition, Sink, UpstreamFailure, UpstreamReply,
+    Carried, Closure, Delivery, Dispatch, Duplex, MAX_QUEUED_OBSERVATIONS, Observations,
+    Observatory, Queued, ResourceTransition, Sink, UpstreamFailure, UpstreamReply,
 };
 pub use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 pub use crate::broker::error::{BrokerError, Result};
@@ -96,7 +98,7 @@ pub use crate::broker::gateway::{
     RichInvocation,
 };
 pub use crate::broker::ledger::{
-    BindingRecord, ClientIntent, ClientRequestOutcome, Ledger, UnresolvedRecord,
+    BindingRecord, ClientIntent, ClientRequestOutcome, Ledger, TransitionEvent, UnresolvedRecord,
 };
 pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
@@ -419,6 +421,17 @@ struct BrokerState {
     /// the connector publisher's semantic trust grant." A table presented at connection time is
     /// compared with this, so a package cannot open a connection with a table nobody installed.
     pinned_tables: BTreeMap<(ApplicationInstanceId, PluginId), PinnedTable>,
+    /// Every observer of this broker's transitions.
+    ///
+    /// One registry, the broker's own. A gateway asks for it rather than supplying one, so a
+    /// second gateway's connections join the observers of the first instead of replacing them.
+    watchers: crate::broker::duplex::Observatory,
+    /// The position the next transition event takes in this broker's stream.
+    ///
+    /// It continues above whatever the ledger already holds, so one stream of transitions runs
+    /// across restarts. A transition whose durable write fails leaves its number unused: the
+    /// cursor orders what did happen and never claims to count it.
+    next_event: u64,
 }
 
 /// The tables one installation was qualified with, as the installation pinned them.
@@ -439,12 +452,6 @@ pub struct PinnedTable {
 #[derive(Debug)]
 pub struct Broker {
     state: Mutex<BrokerState>,
-    /// Where a settled resource is announced, when this host has somewhere to announce it.
-    ///
-    /// It is outside the broker's lock on purpose: publication reads the connections of an
-    /// instance and then writes to bounded queues, and doing either under the lock would put a
-    /// slow observer in front of every other decision this broker makes.
-    watchers: Mutex<Option<crate::broker::duplex::Observatory>>,
 }
 
 impl Broker {
@@ -485,6 +492,9 @@ impl Broker {
         // And connection identifiers are numbered above everything this ledger has seen, so a new
         // connection never lands in an old one's namespace.
         let next_connection = ledger.highest_connection()?;
+        // And transition events are numbered above everything this ledger has recorded, so the
+        // stream a consumer follows has one order across a restart.
+        let next_event = ledger.highest_event()?.saturating_add(1);
         Ok(Self {
             state: Mutex::new(BrokerState {
                 session_id,
@@ -501,8 +511,9 @@ impl Broker {
                 drafts: None,
                 connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
+                watchers: crate::broker::duplex::Observatory::new(),
+                next_event,
             }),
-            watchers: Mutex::new(None),
         })
     }
 
@@ -1276,8 +1287,7 @@ impl Broker {
         // The marker before the bytes, exactly as the rich path does it. A crash between them
         // leaves a record saying an answer may already have gone, which is what stops a restart
         // from sending a second one.
-        state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition)?;
+        state.commit_transition(transition, now)?;
         state.volatile.note_native_response();
         Ok(NativeAnswer {
             request,
@@ -1298,7 +1308,6 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PendingResource> {
         self.settle_native(answer, PendingState::Resolved, now)
-            .map(|resource| self.announce(resource))
     }
 
     /// Commits the dispatch marker for one claim, immediately before its bytes go.
@@ -1333,7 +1342,6 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PendingResource> {
         self.settle_native(answer, PendingState::Uncertain, now)
-            .map(|resource| self.announce(resource))
     }
 
     fn settle_native(
@@ -1344,8 +1352,7 @@ impl Broker {
     ) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = state.arbitration.plan_native_settled(&answer.request, to)?;
-        state.write_transition(&transition, now)?;
-        state.arbitration.commit(transition)
+        state.commit_transition(transition, now)
     }
 
     /// Admits one native answer, forwards it and records what happened, in that order.
@@ -1788,13 +1795,9 @@ impl Broker {
     /// Returns [`BrokerError::Arbitration`] or [`BrokerError::PermissionDenied`] as the claim
     /// requires.
     fn resolve(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        let settled = {
-            let mut state = self.state();
-            let transition = state.arbitration.plan_resolve(claim)?;
-            state.write_transition(&transition, now)?;
-            state.arbitration.commit(transition)?
-        };
-        Ok(self.announce(settled))
+        let mut state = self.state();
+        let transition = state.arbitration.plan_resolve(claim)?;
+        state.commit_transition(transition, now)
     }
 
     /// Gives a claim back, because nothing was dispatched under it.
@@ -1806,8 +1809,7 @@ impl Broker {
     ///
     /// Returns [`BrokerError::Arbitration`] when an answer has already gone for the resource.
     fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        let released = self.state().release_claim_in(claim, now)?;
-        Ok(self.announce(released))
+        self.state().release_claim_in(claim, now)
     }
 
     /// Leaves a claimed resource uncertain: an answer went and nothing confirmed it.
@@ -1816,13 +1818,9 @@ impl Broker {
     ///
     /// Returns the same failures [`Broker::resolve`] does.
     fn uncertain(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        let settled = {
-            let mut state = self.state();
-            let transition = state.arbitration.plan_uncertain(claim)?;
-            state.write_transition(&transition, now)?;
-            state.arbitration.commit(transition)?
-        };
-        Ok(self.announce(settled))
+        let mut state = self.state();
+        let transition = state.arbitration.plan_uncertain(claim)?;
+        state.commit_transition(transition, now)
     }
 
     /// Records that the upstream answered or withdrew a request itself.
@@ -1836,13 +1834,9 @@ impl Broker {
         request: &DownstreamRequestId,
         now: TimestampMs,
     ) -> Result<PendingResource> {
-        let settled = {
-            let mut state = self.state();
-            let transition = state.arbitration.plan_upstream_resolved(request)?;
-            state.write_transition(&transition, now)?;
-            state.arbitration.commit(transition)?
-        };
-        Ok(self.announce(settled))
+        let mut state = self.state();
+        let transition = state.arbitration.plan_upstream_resolved(request)?;
+        state.commit_transition(transition, now)
     }
 
     /// Reconciles one upstream's records with what it still has pending.
@@ -2380,10 +2374,7 @@ impl Broker {
             return Ok(None);
         }
         let transition = state.arbitration.plan_upstream_resolved(&request)?;
-        state.write_transition(&transition, now)?;
-        let settled = state.arbitration.commit(transition)?;
-        drop(state);
-        Ok(Some(self.announce(settled)))
+        state.commit_transition(transition, now).map(Some)
     }
 
     /// Closes one gateway connection.
@@ -2441,39 +2432,31 @@ impl Broker {
         )
     }
 
-    /// Announces every settled resource of this broker to the observers that watch its instance.
+    /// Returns this broker's one registry of observers.
     ///
     /// Section 12 fans resolutions out to every authorised observer, and section 24 makes the
-    /// state transition and the event one contract. So this is bound once, and every transition
-    /// the broker commits goes through it rather than through whichever caller happened to make
-    /// it: a resolution a rich client caused and one the person caused in the terminal reach the
-    /// same watchers.
-    pub fn observe_transitions(&self, watchers: crate::broker::duplex::Observatory) {
-        *self
-            .watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(watchers);
+    /// state transition and the event one contract. Both hold only if there is one registry and
+    /// every transition goes through it, so a gateway asks for this rather than supplying one of
+    /// its own: a resolution a rich client caused and one the person caused in the terminal reach
+    /// the same watchers, and a second gateway joins them rather than replacing them.
+    #[must_use]
+    pub fn observatory(&self) -> crate::broker::duplex::Observatory {
+        self.state().watchers.clone()
     }
 
-    /// Announces one committed transition, outside the broker's own lock.
-    fn announce(&self, resource: PendingResource) -> PendingResource {
-        let watchers = self
-            .watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(watchers) = watchers {
-            let authorised = self.observers(resource.application_instance_id);
-            watchers.publish(
-                &authorised,
-                &crate::broker::duplex::ResourceTransition {
-                    application_instance_id: resource.application_instance_id,
-                    resource_id: resource.resource_id,
-                    state: resource.state,
-                },
-            );
-        }
-        resource
+    /// Reads the transitions this broker recorded after one cursor, in order.
+    ///
+    /// This is the outbox a consumer replays from after it has been away. What it returns is what
+    /// was committed with each transition, so nothing here was announced and not recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the records cannot be read.
+    pub fn transitions_after(
+        &self,
+        sequence: u64,
+    ) -> Result<Vec<crate::broker::ledger::TransitionEvent>> {
+        self.state().ledger.events_after(sequence)
     }
 
     /// Returns every connection that observes one instance, so a resolution is fanned out to all
@@ -2683,16 +2666,14 @@ impl BrokerState {
             .claim()
             .cloned()
             .ok_or_else(|| BrokerError::invalid("a claim transition carries a claim"))?;
-        self.write_transition(&transition, now)?;
-        self.arbitration.commit(transition)?;
+        self.commit_transition(transition, now)?;
         Ok(claim)
     }
 
     /// Gives a claim back. See [`Broker::release_claim`].
     fn release_claim_in(&mut self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let transition = self.arbitration.plan_release(claim)?;
-        self.write_transition(&transition, now)?;
-        self.arbitration.commit(transition)
+        self.commit_transition(transition, now)
     }
 
     /// Reserves one claimed resource's single transmission, and prepares the answer that will go.
@@ -2895,8 +2876,7 @@ impl BrokerState {
     ) -> Result<Reconciliation> {
         let (reconciliation, transitions) = self.arbitration.plan_reconcile(scope, still_open);
         for transition in transitions {
-            self.write_transition(&transition, now)?;
-            self.arbitration.commit(transition)?;
+            self.commit_transition(transition, now)?;
         }
         Ok(reconciliation)
     }
@@ -3068,11 +3048,95 @@ impl BrokerState {
         }
     }
 
+    /// Commits one planned transition and tells every authorised observer about it.
+    ///
+    /// Three things happen in one place because they are one fact. The transition and the event
+    /// that announces it are written in one ledger transaction, so a crash cannot leave a change
+    /// nobody was told about. The arbitration is then committed. And the observers are told while
+    /// this lock is still held.
+    ///
+    /// That last part is the ordering guarantee. Two tasks settling two resources of one instance
+    /// are serialised by this lock, so the order the observers are told in is the order the
+    /// transitions committed in. Publishing after the lock was given back can be overtaken, and an
+    /// observer would then read a `Pending` after the `Resolved` that replaced it. Publication
+    /// itself never blocks: each observer's queue is bounded and a subscriber that has stopped
+    /// reading is withdrawn rather than waited for.
+    fn commit_transition(
+        &mut self,
+        transition: Transition,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        let event = self.next_transition_event(&transition.resource, now);
+        self.write_transition(&transition, now, &event)?;
+        let settled = self.arbitration.commit(transition)?;
+        self.publish(&settled, &event);
+        Ok(settled)
+    }
+
+    /// Takes the next position in this broker's stream of transitions.
+    ///
+    /// A transition whose durable write then fails leaves its number unused. The cursor says what
+    /// order things happened in; it does not promise that every number was spent.
+    fn next_transition_event(
+        &mut self,
+        resource: &PendingResource,
+        now: TimestampMs,
+    ) -> crate::broker::ledger::TransitionEvent {
+        let sequence = self.next_event;
+        self.next_event = self.next_event.saturating_add(1);
+        let binding_revision = self
+            .instances
+            .get(&resource.application_instance_id)
+            .map_or_else(
+                || AgentBindingRevision::new(0),
+                |instance| instance.binding_revision,
+            );
+        crate::broker::ledger::TransitionEvent {
+            sequence,
+            event_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
+            application_instance_id: resource.application_instance_id,
+            resource_id: resource.resource_id,
+            binding_revision,
+            state: resource.state,
+            classification: resource.classification,
+            recorded_at: now,
+        }
+    }
+
+    /// Tells every authorised observer of one instance what its resource became.
+    ///
+    /// Who is authorised is this state's own answer: a connection observes the instance it was
+    /// opened against, and nothing else is told.
+    fn publish(&self, resource: &PendingResource, event: &crate::broker::ledger::TransitionEvent) {
+        let authorised: Vec<GatewayConnectionId> = self
+            .gateway
+            .observers(resource.application_instance_id)
+            .map(|connection| connection.connection)
+            .collect();
+        self.watchers.publish(
+            &authorised,
+            &crate::broker::duplex::ResourceTransition {
+                sequence: event.sequence,
+                event_id: event.event_id,
+                application_instance_id: resource.application_instance_id,
+                resource_id: resource.resource_id,
+                binding_revision: event.binding_revision,
+                state: resource.state,
+            },
+        );
+    }
+
     /// Writes one planned transition durably, conditional on the state it expects to find.
     ///
     /// A volatile record is not written: that is what volatile means, and writing it would be the
-    /// manufactured durable history section 11 forbids.
-    fn write_transition(&self, transition: &Transition, now: TimestampMs) -> Result<()> {
+    /// manufactured durable history section 11 forbids. The event goes with it or not at all, so
+    /// the outbox never records a transition the ledger does not hold.
+    fn write_transition(
+        &self,
+        transition: &Transition,
+        now: TimestampMs,
+        event: &crate::broker::ledger::TransitionEvent,
+    ) -> Result<()> {
         // What decides whether a write happens is whether the ledger can take one now, not the
         // evidence quality of the resource's own history. A resource that lived through a gap
         // keeps `durability = volatile` for ever, because that is what its history was; its later
@@ -3085,6 +3149,7 @@ impl BrokerState {
             transition.from,
             transition.sets_marker(),
             now,
+            event,
         )
     }
 
