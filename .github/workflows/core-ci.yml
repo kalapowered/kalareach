@@ -527,6 +527,11 @@ jobs:
           KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification
         run: |
           bash scripts/fetch-shell-stacks.sh
+          # An installation a person updates holds two builds. The identity is a digest of the
+          # build's inputs, so a flag that reaches the compiler makes a second package rather than
+          # a second copy of the first; the pinned build is put back afterwards.
+          CPPFLAGS="-DKR_QUALIFICATION_BUILD=1" bash scripts/build-shells.sh --zsh --no-upstream-tests
+          bash scripts/build-shells.sh --zsh --no-upstream-tests
           cargo test --locked -p kr-shell-integration --test qualification -- --test-threads=1
           cat /tmp/kr-shell-qualification/qualification-cases.tsv
 

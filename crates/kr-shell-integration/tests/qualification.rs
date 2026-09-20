@@ -2141,21 +2141,34 @@ fn a_live_session_keeps_the_package_it_started_with() {
     // that is current and one built before it are two packages a person could really have. With
     // only one build there is nothing to replace it with, and this says so rather than copying
     // the same bytes twice and calling them two packages.
+    // Two installations of one package is what a person has after an update, so this needs two
+    // builds. They cannot be made by copying the same bytes under another name, because that is
+    // the thing this case is about: `scripts/e2e-fence.sh` and the qualification job build a
+    // second one from different inputs before this runs.
     let Some(older) = another_build(&installed) else {
-        // Two installations of one package is what a person has after an update, and a host that
-        // has built the package once has one. A second identity needs a build from different
-        // inputs, which is the builder's business rather than this suite's: it cannot be made by
-        // copying the same bytes under another name, because that is the thing this case is
-        // about. A run without one says so here and in its own evidence.
         let reason = format!(
             "this host holds one build of the {} package, so there is no second one to install \
-             over it; a second identity comes from a build with different inputs",
+             over it; build one from different inputs, as scripts/e2e-fence.sh does",
             ShellKind::Zsh.as_str()
+        );
+        assert!(
+            std::env::var_os(shellpkg::REQUIRE).is_none(),
+            "{} is set and {reason}",
+            shellpkg::REQUIRE
         );
         println!("skipped: {reason}");
         shellpkg::record("no-replacement-to-install.txt", &format!("{reason}\n"));
         return;
     };
+    assert_ne!(
+        installed.identity, older.identity,
+        "the two builds carry one identity between them"
+    );
+    assert_ne!(
+        std::fs::read(&installed.executable).expect("a binary"),
+        std::fs::read(&older.executable).expect("a binary"),
+        "the two builds produced the same binary, so neither could be told from the other"
+    );
     let before = copy_installation(&shell, &installed, "aaaaaaaaaaaaaaaa", "before");
     let after = copy_installation(&shell, &older, "bbbbbbbbbbbbbbbb", "after");
     assert_ne!(
@@ -2163,8 +2176,9 @@ fn a_live_session_keeps_the_package_it_started_with() {
         "the two installations share a binary, so neither could be told from the other"
     );
     assert_ne!(
-        before.identity, after.identity,
-        "the two installations carry one identity between them"
+        std::fs::read(&before.executable).expect("a binary"),
+        std::fs::read(&after.executable).expect("a binary"),
+        "the two installations hold the same binary"
     );
     std::fs::write(shell.join("current"), "aaaaaaaaaaaaaaaa").expect("the pointer");
     assert_eq!(resolved_executable(root.path()), before.executable);

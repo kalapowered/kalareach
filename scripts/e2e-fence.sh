@@ -134,6 +134,23 @@ fi
 grep -E "is current, nothing changed|installed" "$run_root/build.log" || true
 cp "$run_root/build.log" "$artifacts/shell-packages-build.log"
 
+# A second build of one package, from inputs of its own. An installation a person updates holds
+# two builds, and the qualification's replacement case needs two that are really different: the
+# identity is a digest of the build's inputs, so a flag that reaches the compiler is a second
+# package rather than a second copy of the first. The ordinary build runs again afterwards, so
+# the installation this run then qualifies is the pinned one.
+if ! CPPFLAGS="${CPPFLAGS:+$CPPFLAGS }-DKR_QUALIFICATION_BUILD=1" \
+    bash scripts/build-shells.sh --zsh --no-upstream-tests > "$run_root/second-build.log" 2>&1; then
+  tail -20 "$run_root/second-build.log"
+  fail "a second build of the zsh package could not be made"
+fi
+grep -E "built zsh|is current, nothing changed" "$run_root/second-build.log" || true
+cp "$run_root/second-build.log" "$artifacts/shell-packages-second-build.log"
+if ! bash scripts/build-shells.sh --zsh --no-upstream-tests >> "$run_root/build.log" 2>&1; then
+  tail -20 "$run_root/build.log"
+  fail "the pinned zsh package could not be put back"
+fi
+
 for shell in zsh bash fish; do
   identity="$(cat "$packages/$shell/current" 2>/dev/null || true)"
   if [ -z "$identity" ]; then
