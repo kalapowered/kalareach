@@ -2546,3 +2546,101 @@ fn a_reference_file_under_a_folded_name_is_still_read() {
         record.exclusions
     );
 }
+
+/// Following references through nested repositories beyond `MAX_REFERENCE_HOPS` (64) refuses the
+/// capture rather than looping or descending indefinitely.
+#[test]
+fn following_more_than_the_reference_hop_limit_refuses_the_capture() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "hop-limit-tree");
+    let outside = fixture.work().join("hop-outside");
+    std::fs::create_dir_all(outside.join("chain_70")).expect("terminal dir");
+    for i in 0..70 {
+        let step = outside.join(format!("chain_{i}"));
+        std::fs::create_dir_all(&step).expect("chain dir");
+        std::os::unix::fs::symlink(format!("../chain_{}", i + 1), step.join("next"))
+            .expect("symlink");
+    }
+
+    let nested = path.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("nested repo directory");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    std::os::unix::fs::symlink("../../../hop-outside/chain_0", nested.join("entry"))
+        .expect("entry symlink");
+
+    let workspace = fixture.workspace("hop-limit-tree");
+    let outcome = fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    );
+    let refusal = outcome.expect_err("exceeding max reference hops refuses capture");
+    let said = refusal.to_string();
+    assert!(
+        said.contains("64 references deep"),
+        "the refusal names the hop limit: {said}"
+    );
+}
+
+/// Climbing more than `MAX_CLIMB_HOPS` (256) levels below the root of the filesystem refuses the
+/// capture rather than wandering arbitrarily far up the tree.
+#[test]
+fn climbing_more_than_max_climb_hops_to_root_refuses_the_capture() {
+    let fixture = Fixture::create();
+    let mut deep = fixture.work().to_path_buf();
+    for _ in 0..260 {
+        deep.push("d");
+    }
+    std::fs::create_dir_all(&deep).expect("deeply nested directory");
+    let path = ordinary_repository(&deep, "deep-tree");
+
+    std::fs::rename(path.join(".git"), path.join("common")).expect("the shared data");
+    std::fs::create_dir_all(path.join("meta")).expect("this worktree's own");
+    for name in ["HEAD", "index"] {
+        let from = path.join("common").join(name);
+        if from.exists() {
+            std::fs::copy(&from, path.join("meta").join(name)).expect("its own copy");
+        }
+    }
+    std::fs::write(path.join("meta/commondir"), b"../common\n").expect("naming the shared one");
+    let named = std::fs::canonicalize(path.join("meta")).expect("the name it would write");
+    std::fs::write(
+        path.join(".git"),
+        format!("gitdir: {}\n", named.display()).as_bytes(),
+    )
+    .expect("and the file that names it");
+    git_raw(&path, ["add", "--force", "meta"]);
+    git_raw(&path, ["commit", "--quiet", "-m", "its own configuration"]);
+
+    let project = fixture
+        .project()
+        .project_adopt(
+            &support::actor(),
+            &kr_protocol::project::ProjectAdoptParams {
+                destination: support::destination(fixture.environment_id(), &deep, "deep-tree"),
+                label: "deep-tree".to_owned(),
+                flow: kr_protocol::project::AdoptionFlow::ExistingCheckout,
+            },
+            Some(&support::action("project.adopt:deep-tree")),
+        )
+        .expect("the checkout is adopted")
+        .project
+        .project_repository_id;
+    let workspace = fixture.shared_workspace(project, "deep-tree");
+
+    let outcome = fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    );
+    let refusal = outcome.expect_err("exceeding max climb hops refuses capture");
+    let said = refusal.to_string();
+    assert!(
+        said.contains("256 levels below the root of its filesystem"),
+        "the refusal names the climb limit: {said}"
+    );
+}

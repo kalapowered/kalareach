@@ -1270,8 +1270,8 @@ fn nested_repositories<'a>(
     refused.insert((reported.device, reported.file_id));
     // Both administrative directories, reached from the tree's own `.git` rather than taken from
     // a pathname, and required to be the objects Git reported.
-    let (own, common) = administrative_directories(tree, repository)?;
-    for held in [&common, &own] {
+    let ((own, own_hops), (common, common_hops)) = administrative_directories(tree, repository)?;
+    for (held, hops) in [(&common, common_hops), (&own, own_hops)] {
         // Outside this working tree or inside it, the object is the object, and it goes in
         // unconditionally: what decides anything later is whether a directory this capture opens
         // **is** it, and holding one that nothing reaches costs nothing.
@@ -1299,7 +1299,7 @@ fn nested_repositories<'a>(
             &mut inspected,
             &mut budget,
             0,
-            1,
+            hops,
         )?;
     }
     // What this walk has already looked through for the repositories inside it, which is its own
@@ -1483,7 +1483,7 @@ fn nested_data(
             inspected,
             budget,
             0,
-            hops,
+            hops + 1,
         )?;
     }
     Ok(())
@@ -1610,6 +1610,16 @@ fn nested_trees(
                     "it names a target this host cannot read as text".to_owned(),
                 ));
             };
+            let hops = hops + 1;
+            if hops > MAX_REFERENCE_HOPS {
+                return Err(unsearchable(
+                    &below,
+                    format!(
+                        "following where these repositories say their own data is went more than \
+                         {MAX_REFERENCE_HOPS} references deep"
+                    ),
+                ));
+            }
             let reached = resolve_name(
                 clone_stack(stack.as_slice())?,
                 &below,
@@ -1619,14 +1629,7 @@ fn nested_trees(
             )?;
             if let Some(reached) = reached {
                 search_reached(
-                    tree,
-                    &below,
-                    reached,
-                    searched,
-                    refused,
-                    inspected,
-                    budget,
-                    hops + 1,
+                    tree, &below, reached, searched, refused, inspected, budget, hops,
                 )?;
             }
             continue;
@@ -1742,11 +1745,23 @@ fn search_link(
             "it names a target this host cannot read as text".to_owned(),
         ));
     };
+    let hops = 1;
+    if hops > MAX_REFERENCE_HOPS {
+        return Err(unsearchable(
+            link,
+            format!(
+                "following where these repositories say their own data is went more than \
+                 {MAX_REFERENCE_HOPS} references deep"
+            ),
+        ));
+    }
     let Some(reached) = resolve_name(clone_stack(&stack)?, link, target, tree, Elsewhere::Nothing)?
     else {
         return Ok(());
     };
-    search_reached(tree, link, reached, searched, refused, inspected, budget, 1)
+    search_reached(
+        tree, link, reached, searched, refused, inspected, budget, hops,
+    )
 }
 
 /// Looks through one directory a link named, and through the repositories inside it.
@@ -1863,7 +1878,7 @@ fn unsearchable(directory: &str, why: String) -> ChangeSetError {
 fn administrative_directories(
     tree: &AuthorisedDirectory,
     repository: &OpenedRepository,
-) -> Result<(AuthorisedDirectory, AuthorisedDirectory)> {
+) -> Result<((AuthorisedDirectory, usize), (AuthorisedDirectory, usize))> {
     let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
     let stack = match tree.probe(&administrative) {
         Ok(kr_transfer::authority::ObjectKind::Directory) => {
@@ -1888,18 +1903,19 @@ fn administrative_directories(
     if identity_of(own) != identity_of(repository.own_dir()) {
         return Err(unplaceable("this repository's own data"));
     }
+    let own_hops = 1;
     // And what every worktree of this repository shares, named by the private directory itself.
     let commondir = RelativeName::parse("commondir")?;
-    let common = match own.probe(&commondir) {
+    let (common, common_hops) = match own.probe(&commondir) {
         // It keeps everything in the one place.
-        Err(kr_transfer::Escape::NotFound { .. }) => clone_of(own)?,
+        Err(kr_transfer::Escape::NotFound { .. }) => (clone_of(own)?, own_hops),
         Ok(_) => {
             let reached = resolve_target(clone_stack(&stack)?, "commondir", own, &commondir, tree)?
                 .ok_or_else(|| unplaceable("this repository's own data"))?;
             let last = reached
                 .last()
                 .ok_or_else(|| unplaceable("this repository's own data"))?;
-            clone_of(last)?
+            (clone_of(last)?, own_hops + 1)
         }
         Err(_) => return Err(unplaceable("this repository's own data")),
     };
@@ -1913,7 +1929,7 @@ fn administrative_directories(
     let common = common
         .confined_to_one_mount()
         .map_err(|_| unplaceable("this repository's own data"))?;
-    Ok((own, common))
+    Ok(((own, own_hops), (common, common_hops)))
 }
 
 /// Adds the identity of every directory beneath one administrative directory, places every
@@ -1951,24 +1967,24 @@ fn administrative_descendants(
     depth: usize,
     hops: usize,
 ) -> Result<()> {
+    // Looked inside once, by what it **is** and the mount it was reached on, whether it was
+    // reached as a child of another administrative directory or named as one by a `.git` line
+    // somewhere. A repository whose data names itself would otherwise start this scan again at
+    // every turn, and nothing about the depth of one walk would ever end it.
+    let directory = stack
+        .last()
+        .ok_or_else(|| unreadable_data("this host could not read what is in it".to_owned()))?;
+    let key = (identity_of(directory), directory.mount());
+    if inspected.contains(&key) {
+        return Ok(());
+    }
     if depth >= MAX_WALK_DEPTH {
         return Err(unreadable_data(format!(
             "this repository's own data is more than {MAX_WALK_DEPTH} levels deep, which is \
              deeper than this host reads to know what is in it"
         )));
     }
-    // Looked inside once, by what it **is** and the mount it was reached on, whether it was
-    // reached as a child of another administrative directory or named as one by a `.git` line
-    // somewhere. A repository whose data names itself would otherwise start this scan again at
-    // every turn, and nothing about the depth of one walk would ever end it.
-    {
-        let directory = stack
-            .last()
-            .ok_or_else(|| unreadable_data("this host could not read what is in it".to_owned()))?;
-        if !inspected.insert((identity_of(directory), directory.mount())) {
-            return Ok(());
-        }
-    }
+    inspected.insert(key);
     // Whether the directory this scan is standing in is **another repository's tree**, kept
     // inside this one's data. Where that repository keeps its own data is a name this scan would
     // otherwise never read, and it can reach an ordinary directory of the working tree: excluding
