@@ -1119,7 +1119,7 @@ async fn a_result_produced_under_an_earlier_generation_is_not_published() {
 }
 
 #[tokio::test]
-async fn a_publication_whose_caller_walked_away_stays_outstanding_until_a_later_answer() {
+async fn a_publication_whose_caller_walked_away_stays_work_this_device_cannot_account_for() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(GatedService::new());
     let store = SyncStore::open(directory.path().join("one")).expect("a store");
@@ -1175,10 +1175,11 @@ async fn a_publication_whose_caller_walked_away_stays_outstanding_until_a_later_
     );
     assert_eq!(reopened.outstanding().expect("a count"), 1);
 
-    // What settles it is a later definite answer about the same object. This contract offers no
-    // way to ask what became of one request: a service takes a comparison and answers with a
-    // generation, and what it holds afterwards is a fact about the object rather than about any
-    // one write of it.
+    // Nothing settles it, and this client does not pretend otherwise. A later answer about the
+    // object says what the service holds; it does not say what became of this request, and one
+    // whose answer was lost can still be accepted afterwards. This contract offers no way to ask:
+    // a service takes a comparison and answers with a generation, and there is nothing to ask it
+    // about one write of an object.
     service.let_it_go();
     reopened.store().put_object(&mine).expect("stored");
     assert!(matches!(
@@ -1190,12 +1191,12 @@ async fn a_publication_whose_caller_walked_away_stays_outstanding_until_a_later_
     ));
     assert_eq!(
         reopened.outstanding().expect("a count"),
-        0,
-        "a later answer about the object retires the earlier dispatch"
+        1,
+        "an answer about the object settles that request and not another one"
     );
 
-    // What that earlier dispatch may have sent is kept, because it left this device and nothing
-    // here can say whether the service stored it.
+    // What it may have sent is named, because it left this device and nothing here can say whether
+    // the service stored it.
     let exported = reopened.exported().expect("exported");
     assert!(
         exported
@@ -1389,4 +1390,52 @@ async fn a_client_selection_is_a_position_rather_than_a_row() {
         .await
         .expect("fetched");
     assert_eq!(restored.object().body, SyncBody::ClientSelection(selection));
+}
+
+#[tokio::test]
+async fn a_cleanup_that_a_later_generation_overtook_is_refused() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // Privacy mode is enabled and then turned off again. A cleanup step of the older generation
+    // arriving now is refused rather than carried out: the generation in force has already decided
+    // what is retained, and the older step would delete what it admitted.
+    client.fence(5).expect("fenced");
+    client.resume(6).expect("resumed");
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+
+    assert!(matches!(
+        client.cancel_undispatched(5),
+        Err(SyncError::LateResult {
+            produced_under: 5,
+            current: 6
+        })
+    ));
+    assert!(matches!(
+        client.remove_retained(5),
+        Err(SyncError::LateResult {
+            produced_under: 5,
+            current: 6
+        })
+    ));
+    assert!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .is_some(),
+        "an overtaken cleanup reaches nothing the generation in force admitted"
+    );
+    assert_eq!(client.generation().expect("a record"), 6);
 }

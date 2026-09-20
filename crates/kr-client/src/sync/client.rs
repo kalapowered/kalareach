@@ -622,8 +622,8 @@ impl SyncClient {
     ///
     /// Returns [`SyncError::Storage`] when a staged file cannot be read or removed.
     pub fn cancel_undispatched(&self, generation: u64) -> Result<Cancelled> {
-        self.store.advance_privacy(generation)?;
-        let undispatched = self.store.take_back_undispatched()?;
+        self.own_generation(generation)?;
+        let undispatched = self.store.take_back_undispatched(generation)?;
         Ok(Cancelled {
             undispatched,
             in_flight: self.store.unsettled()?,
@@ -637,16 +637,35 @@ impl SyncClient {
     ///
     /// Work that has been dispatched is not removed. Its record is what says it may be out there,
     /// and deleting it would make [`Self::outstanding`] reach nought while the write was still
-    /// unaccounted for. Its result is refused by the generation rule instead of applied. Work
-    /// admitted under a later generation is another cleanup's and is left alone.
+    /// unaccounted for. Its result is refused by the generation rule instead of applied.
+    ///
+    /// A cleanup that has been overtaken by a later generation is refused rather than carried out,
+    /// so it cannot reach the copies, the notes or the work that the generation now in force
+    /// admitted.
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when a file cannot be removed.
     pub fn remove_retained(&self, generation: u64) -> Result<Removed> {
-        let privacy = self.store.advance_privacy(generation)?;
-        let (bytes, records) = self.store.remove_content(privacy.generation.get())?;
+        self.own_generation(generation)?;
+        let (bytes, records) = self.store.remove_content(generation)?;
         Ok(Removed { bytes, records })
+    }
+
+    /// Establishes that a cleanup step still owns the generation it was asked to clean.
+    ///
+    /// A step that was overtaken is refused rather than carried out. Two control steps can overlap,
+    /// and the later one has already decided what is retained; letting the earlier one finish would
+    /// delete work and copies that belong to the generation now in force.
+    fn own_generation(&self, generation: u64) -> Result<()> {
+        let privacy = self.store.advance_privacy(generation)?;
+        if privacy.generation.get() > generation {
+            return Err(SyncError::LateResult {
+                produced_under: generation,
+                current: privacy.generation.get(),
+            });
+        }
+        Ok(())
     }
 
     /// Returns how much dispatched work has no settled outcome.
@@ -657,12 +676,13 @@ impl SyncClient {
     /// cannot read counts too, because a record it could not open is not a record it can say was
     /// nothing.
     ///
-    /// **What makes it reach nought is a later definite answer about the same object.** This
-    /// contract gives a device no way to ask what became of one particular request: a service takes
-    /// a comparison and answers with a generation, and the value it holds afterwards is a fact
-    /// about the object rather than about any one write of it. So a publication that is accepted or
-    /// refused settles this device's earlier dispatches of that object as well, and what those may
-    /// have sent is kept in [`Self::exported`] rather than resolved.
+    /// **A dispatch whose answer was lost stays counted, and this contract cannot settle it.** A
+    /// service takes a comparison and answers with a generation; there is no way to ask afterwards
+    /// what became of one particular request, and the value the service holds later is a fact about
+    /// the object rather than about any one write of it. A device that lost an answer therefore
+    /// cannot establish whether its write landed, and this client says so rather than deciding.
+    /// [`Self::exported`] lists such work as content sent without an answer, which is what section
+    /// 24 asks of anything that may already have left.
     ///
     /// # Errors
     ///
@@ -743,8 +763,8 @@ impl SyncClient {
         // A dispatch with no answer may have reached the service, and this contract gives no way
         // to ask. Saying so is the honest entry: the content was sent, and whether it was stored is
         // not something this device can find out.
-        let uncertain = self.store.uncertain()?;
-        for record in uncertain.items {
+        let staged = self.store.staged()?;
+        for record in staged.items.into_iter().filter(|item| item.dispatched) {
             exported.push(Exported {
                 kind: format!("synchronised {}, sent without an answer", record.kind),
                 reference: format!(
@@ -752,11 +772,13 @@ impl SyncClient {
                     sync_collection(record.kind, record.object_id),
                     record.revision
                 ),
-                left_at_ms: record.recorded_at_ms,
+                // When this device sent it. It does not say the service stored it, and nothing
+                // here can find that out.
+                left_at_ms: TimestampMs::new(record.produced_under.get()),
                 deletable: false,
             });
         }
-        for path in uncertain.unreadable {
+        for path in staged.unreadable {
             exported.push(Exported {
                 kind: "work sent without an answer, which this device cannot describe".to_owned(),
                 reference: format!(

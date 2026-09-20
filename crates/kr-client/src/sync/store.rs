@@ -44,8 +44,6 @@ const STAGED_EXTENSION: &str = "staged";
 const CONFLICT_EXTENSION: &str = "conflict";
 /// The extension of the record that this device published a collection.
 const PUBLICATION_EXTENSION: &str = "published";
-/// The extension of a record of work that left with no answer to say what became of it.
-const UNCERTAIN_EXTENSION: &str = "uncertain";
 /// The extension of a file being written, which is not yet a file.
 const PARTIAL_EXTENSION: &str = "partial";
 /// The name of the store's lock.
@@ -185,7 +183,10 @@ pub enum Outcome {
         /// The generation the service assigned.
         generation: U64,
     },
-    /// It refused the comparison, so nothing was written and nothing left this device.
+    /// It refused the comparison, so this write stored nothing.
+    ///
+    /// The request carried its ciphertext to the service, so the content did leave the device; what
+    /// the refusal establishes is that the service kept no replacement from it.
     ///
     /// The refusal is settled on its own, before anything is fetched. What the service holds
     /// instead is brought down afterwards and kept beside this device's content; a fetch that fails
@@ -215,25 +216,6 @@ pub enum Settlement {
         /// The generation in force now.
         current: u64,
     },
-}
-
-/// One dispatch this device never learnt the outcome of.
-///
-/// It carries no content. A publication that was sent and never answered may have reached the
-/// service, and this contract cannot say: the service takes a comparison and answers with a
-/// generation, so there is nothing to ask afterwards about one particular request. What this
-/// device can say honestly is that the content was sent, and that is what this record is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Uncertain {
-    /// The object it was about.
-    pub object_id: SyncObjectId,
-    /// What kind of object it is.
-    pub kind: SyncObjectKind,
-    /// The revision that was sent.
-    pub revision: SyncRevisionId,
-    /// When this device recorded that it could no longer say what became of it.
-    pub recorded_at_ms: TimestampMs,
 }
 
 /// A label the person pinned.
@@ -758,6 +740,11 @@ impl SyncStore {
             let mut staged: Staged = self
                 .read_optional(&path)?
                 .ok_or(SyncError::Unknown { object_id })?;
+            // Already sent. Saying so again changes nothing, and it must not take the record
+            // away: that record is the only thing that says this work may be out there.
+            if staged.dispatched {
+                return Ok(());
+            }
             // The fence is checked here as well as at admission, because a fence can land between
             // the two. This work has not left, so the fence still reaches it: the record is taken
             // back rather than sent, which is exactly what the cancellation would have done to it.
@@ -783,12 +770,13 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when a record cannot be read or removed.
-    pub fn take_back_undispatched(&self) -> Result<u64> {
+    pub fn take_back_undispatched(&self, generation: u64) -> Result<u64> {
         let guard = self.lock()?;
         let outcome = (|| {
             let mut taken = 0_u64;
             for item in self.read_all::<Staged>(STAGED_EXTENSION)?.items {
-                if item.dispatched {
+                // Work admitted under a later generation belongs to a later cleanup, not this one.
+                if item.dispatched || item.produced_under.get() > generation {
                     continue;
                 }
                 self.remove_file(&self.named(item.work_id, STAGED_EXTENSION))?;
@@ -824,9 +812,10 @@ impl SyncStore {
     /// not. Under a late generation nothing else is written: the checkpoint would move on the
     /// strength of work privacy mode had already cancelled.
     ///
-    /// A definite answer about one object also retires this device's earlier dispatches of it. What
-    /// became of those is not knowable from here, and it is recorded as what may have left rather
-    /// than dropped.
+    /// It settles **this** request and nothing else. An answer about the object says what the
+    /// service holds; it does not say what became of another request that is still out, and a
+    /// request that had no answer can still be accepted afterwards. Retiring one on the strength of
+    /// the other would be claiming knowledge this contract cannot give.
     ///
     /// # Errors
     ///
@@ -867,7 +856,6 @@ impl SyncStore {
             }
 
             self.remove_file(&path)?;
-            self.supersede_dispatched(staged, now)?;
 
             Ok(if in_force {
                 Settlement::Published
@@ -880,28 +868,6 @@ impl SyncStore {
         })();
         drop(guard);
         settled
-    }
-
-    /// Retires this device's earlier dispatches of one object, keeping what they may have sent.
-    ///
-    /// The caller holds the lock.
-    fn supersede_dispatched(&self, settled: &Staged, now: TimestampMs) -> Result<()> {
-        for item in self.read_all::<Staged>(STAGED_EXTENSION)?.items {
-            if item.object_id != settled.object_id
-                || !item.dispatched
-                || item.work_id == settled.work_id
-            {
-                continue;
-            }
-            self.write_uncertain(&Uncertain {
-                object_id: item.object_id,
-                kind: item.kind,
-                revision: item.revision,
-                recorded_at_ms: now,
-            })?;
-            self.remove_file(&self.named(item.work_id, STAGED_EXTENSION))?;
-        }
-        Ok(())
     }
 
     /// Applies what a fetch brought down, under the late-result rule, in one step.
@@ -937,26 +903,6 @@ impl SyncStore {
         })();
         drop(guard);
         applied
-    }
-
-    /// Records that one dispatch may have left this device with no answer to say so.
-    ///
-    /// The caller holds the lock.
-    fn write_uncertain(&self, uncertain: &Uncertain) -> Result<()> {
-        let bytes = kr_cbor::to_canonical_vec(uncertain)?;
-        self.write_bytes(&self.named(self.fresh_id()?, UNCERTAIN_EXTENSION), &bytes)
-    }
-
-    /// Returns what this device dispatched without ever learning the outcome.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::Storage`] when the directory cannot be read.
-    pub fn uncertain(&self) -> Result<Listing<Uncertain>> {
-        let guard = self.lock()?;
-        let outcome = self.read_all(UNCERTAIN_EXTENSION);
-        drop(guard);
-        outcome
     }
 
     /// Removes one piece of staged work, and makes its absence durable.

@@ -154,8 +154,10 @@ the same compare-and-swap discipline and the same sealing seam.
   call and a restart, leaves a durable record saying it was sent. This contract offers no way to
   ask what became of one request: a service takes a comparison and answers with a generation, and
   what it holds afterwards is a fact about the object rather than about any one write of it. So a
-  later definite answer about that object retires the earlier dispatch, and what it may have sent
-  is listed by `exported` as content sent without an answer rather than resolved.
+  device that lost an answer cannot establish whether its write landed, and this client says so
+  rather than deciding: the work stays outstanding, and `exported` lists it as content sent without
+  an answer. Settling it needs the service to say what became of one request, which is a change to
+  the service contract rather than something a client can work out.
 
 `sync::StorageFeature` names the three parts of what section 18 offers: encrypted settings sync,
 which is this module; history backups; and recovery material, which is what a restore without
@@ -173,7 +175,7 @@ client never depends on a host crate:
 | `fence` | Stops production at the generation. A publication after it is refused. |
 | `cancel_undispatched` | Discards the staged ciphertext that was admitted and never sent, and counts what had already been dispatched, which cannot be taken back. |
 | `remove_retained` | Removes the conflict copies, the checkpoints and the staged work that never left, and reports the bytes and records it actually deleted. Work already dispatched keeps its record, because that record is what says it may be out there, and work admitted under a later generation is another cleanup's. |
-| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and a later definite answer about the same object is what gets it there. |
+| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought. A publication that was answered reaches nought; one whose answer was lost stays counted, because nothing in this contract can say what became of it. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
 | `exported` | What has already left, shown rather than claimed to be erased, including a write the service accepted after the fence: suppressing a result does not undo an upload. None of it is deletable from here, because a compare-and-exchange store takes a replacement and not a deletion. |
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
@@ -241,6 +243,6 @@ service client unconditionally and get an honest answer rather than a silent def
 | KR-REQ-17.14 | `a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |
-| KR-REQ-20.13 | `crates/kr-client/tests/sync.rs`, for this row's client half: per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The service half is closed by the storage service's own suite |
+| KR-REQ-20.13 | `crates/kr-client/tests/sync.rs` drives this row's client rules: per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The service half is closed by the storage service's own suite |
 | §24 privacy | `crates/kr-client/tests/sync.rs` drives the fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, and reconciliation of work whose caller walked away. Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | `the_service_holds_ciphertext_in_a_declared_bucket_and_never_a_setting` and `the_feature_names_its_three_parts_and_which_of_them_is_optional` in `crates/kr-client/tests/sync.rs`, for the encrypted settings sync part only. The history backup and recovery material parts are the recovery module's, and nothing here performs either |

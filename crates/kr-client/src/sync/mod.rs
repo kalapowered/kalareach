@@ -9,10 +9,10 @@
 //! for the person to choose from rather than resolved by whichever clock was further ahead.
 //!
 //! What this module does **not** hold is authority. There is no kind for host grants or revocation
-//! state, no body variant that names either, and no handle from here to any authority store, so
-//! nothing a restore brings down is read as authority. A setting is text, a number or a switch,
-//! which is a narrow shape rather than a promise about bytes: text is text, and what keeps a
-//! restore away from authority is that nothing here interprets one as authority.
+//! state, no body variant that names either, and no handle from here to any authority store. A
+//! setting is text, a number or a switch, which narrows the shape and not the bytes: anything can
+//! be written into text. What keeps a restore away from authority is that nothing here interprets
+//! a setting as authority and nothing here can reach a store that holds any.
 //!
 //! # What may be synchronised, and what may not
 //!
@@ -59,7 +59,7 @@ pub use client::{
 };
 pub use store::{
     ConflictCopy, Listing, Outcome, PinnedLabel, PrivacyRecord, Publication, Result, Settlement,
-    Staged, SyncCheckpoint, SyncError, SyncStore, Uncertain,
+    Staged, SyncCheckpoint, SyncError, SyncStore,
 };
 
 /// What section 18 bullet 5 offers, part by part.
