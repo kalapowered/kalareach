@@ -30,8 +30,14 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use crate::error::{ChangeSetError, Result};
 
-/// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 1;
+/// The storage format this build reads and writes.
+///
+/// Version 2 is the format that holds an apply's staging record — the name a temporary was staged
+/// under beside each destination and the object this host created there — and whose stored
+/// version records say whether a reservation held the workspace still for the capture. A store
+/// written at version 1 holds neither, and the rows it does hold cannot answer either question,
+/// so this build refuses it rather than reading around what is missing.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The directory, under the environment's state directory, that this service owns.
 pub const CHANGESETS_DIRECTORY: &str = "changesets";
@@ -452,13 +458,26 @@ impl Store {
                     .into(),
                 });
             }
-            Some(_) => {
-                transaction
-                    .execute(
-                        "UPDATE schema_version SET version = ?1",
-                        params![SCHEMA_VERSION],
+            Some(version) if version < SCHEMA_VERSION => {
+                // An earlier format, refused at the door rather than opened and found wanting
+                // later: the tables an earlier build made have none of the columns this one
+                // writes, and the records it stored cannot answer what this build reads out of
+                // them. Saying so here is the whole of the boundary, so a store that opens is one
+                // every query in this module can rely on.
+                return Err(ChangeSetError::StoreUnavailable {
+                    detail: format!(
+                        "this change-set store was written in storage format {version} and this \
+                         build reads {SCHEMA_VERSION}. What it holds cannot be read in this \
+                         format and there is no way to bring it forward: take this environment's \
+                         {CHANGESETS_DIRECTORY} directory away, keeping a copy if anything in it \
+                         still matters, and capture again"
                     )
-                    .map_err(ChangeSetError::store)?;
+                    .into(),
+                });
+            }
+            Some(_) => {
+                // Already this format. The row says what the tables above hold, so there is
+                // nothing to write.
             }
             None => {
                 transaction
@@ -2764,6 +2783,45 @@ mod tests {
             failure.to_string().contains("schema version"),
             "the refusal says why: {failure}"
         );
+    }
+
+    #[test]
+    fn a_store_an_earlier_format_wrote_is_refused_and_says_what_to_do() {
+        // The staging record and the reservation a version's policy records are both new columns,
+        // and `CREATE TABLE IF NOT EXISTS` adds neither to tables an earlier build made. A store
+        // that opened and then failed on the first query that reads one would be a store this
+        // build half understands, so the format boundary is decided at `open`.
+        let temporary = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = temporary.path().join("changesets.sqlite");
+        let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+        {
+            let store = Store::open(&path, environment_id).expect("a store");
+            drop(store);
+        }
+        let connection = Connection::open(&path).expect("the fixture opens the store");
+        connection
+            .execute("UPDATE schema_version SET version = ?1", params![1])
+            .expect("the fixture puts it back to the earlier format");
+        drop(connection);
+
+        let failure = Store::open(&path, environment_id).expect_err("an earlier format is refused");
+        let said = failure.to_string();
+        assert!(
+            said.contains("storage format 1") && said.contains(&SCHEMA_VERSION.to_string()),
+            "the refusal names both formats: {said}"
+        );
+        assert!(
+            said.contains(CHANGESETS_DIRECTORY),
+            "and says what to do about it: {said}"
+        );
+        // Refused, and left exactly as it was found: nothing of the earlier store is rewritten.
+        let connection = Connection::open(&path).expect("the fixture opens the store");
+        let recorded: i64 = connection
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("the row reads");
+        assert_eq!(recorded, 1, "the store this build refused is untouched");
     }
 
     #[test]
