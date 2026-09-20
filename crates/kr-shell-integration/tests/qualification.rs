@@ -125,7 +125,8 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
             // pinned set carries, an ordinary distribution one, or a native module.
             if case.covers.iter().any(|row| row == "KR-REQ-07.87") {
                 assert!(
-                    !case.requires.is_empty() || UNPINNED_STACKS.contains(&case.stack.as_str()),
+                    !case.requires.is_empty()
+                        || ["distribution", "native-module"].contains(&case.stack.as_str()),
                     "{} claims the plugin-stack row and installs no customisation",
                     case.id
                 );
@@ -825,9 +826,12 @@ fn the_package_is_the_one_the_record_names(
         // One package records where the shell searches and the module declares where it is, and
         // the two are the same tree read from different ends. A module that moved out of the
         // recorded tree fails here; which end of it a package names does not.
+        let declared_path = std::path::Path::new(&declared.1);
+        let recorded_path = std::path::Path::new(&recorded.1);
         assert!(
-            declared.1.starts_with(recorded.1.as_str())
-                || recorded.1.starts_with(declared.1.as_str()),
+            !declared.1.is_empty()
+                && (declared_path.starts_with(recorded_path)
+                    || recorded_path.starts_with(declared_path)),
             "{}: {} is declared at {} and recorded under {}",
             case.id,
             declared.0,
@@ -1874,6 +1878,21 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
             "the published update target does not say {phrase:?}"
         );
     }
+    // The people who consume a release read the release page, so the target is published there as
+    // well as here, and the two say the same thing.
+    let releases = std::fs::read_to_string(repository_root().join("docs/releases/packages.md"))
+        .expect("the release page is committed");
+    for phrase in [
+        "within one working day",
+        "within fourteen days",
+        "native_compat",
+        "docs/shell-integration/upstream.md",
+    ] {
+        assert!(
+            releases.contains(phrase),
+            "the release page does not carry the update target: no {phrase:?}"
+        );
+    }
 
     // Every pin the register names is the pin the builder uses, and the identity record the build
     // wrote beside the binary is read rather than left in the file.
@@ -2001,6 +2020,17 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
             ["released", "scheduled", "flagged", "not-affected"].contains(&status.as_str()),
             "{status:?} is not one of the statuses the register defines"
         );
+        if status == "released" {
+            // A package was published, so the record says which one: an identity is sixteen
+            // hexadecimal characters, and a claim that names none is a claim with no evidence.
+            assert!(
+                assessment.split_whitespace().any(|word| {
+                    let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                    word.len() == 16 && word.chars().all(|c| c.is_ascii_hexdigit())
+                }),
+                "the triage row of {date} says a package was released and names no identity"
+            );
+        }
         let due = as_date(target_release);
         if due < now && status == "scheduled" {
             panic!(
@@ -2081,12 +2111,28 @@ fn a_live_session_keeps_the_package_it_started_with() {
         .tempdir()
         .expect("an installation root on the internal disk");
     let shell = root.path().join("zsh");
+    // Two builds, not two copies of one: this host keeps every identity it has built, so the one
+    // that is current and one built before it are two packages a person could really have.
+    let older = another_build(&installed);
     let before = copy_installation(&shell, &installed, "aaaaaaaaaaaaaaaa", "before");
-    let after = copy_installation(&shell, &installed, "bbbbbbbbbbbbbbbb", "after");
+    let after = copy_installation(
+        &shell,
+        older.as_ref().unwrap_or(&installed),
+        "bbbbbbbbbbbbbbbb",
+        "after",
+    );
     assert_ne!(
         before.executable, after.executable,
         "the two installations share a binary, so neither could be told from the other"
     );
+    if let Some(older) = older.as_ref() {
+        assert_ne!(
+            std::fs::read(&before.executable).expect("a binary"),
+            std::fs::read(&after.executable).expect("a binary"),
+            "the two installations were built from the same inputs"
+        );
+        let _ = older;
+    }
     std::fs::write(shell.join("current"), "aaaaaaaaaaaaaaaa").expect("the pointer");
     assert_eq!(resolved_executable(root.path()), before.executable);
 
@@ -2123,9 +2169,84 @@ fn a_live_session_keeps_the_package_it_started_with() {
         !session.terminal_output().contains("=after"),
         "the live session reported the installation that replaced it"
     );
+    // The shell itself says which binary it is running, and it is still the one it started.
+    assert!(
+        session.run(
+            "echo kr-running=$ZSH_ARGZERO",
+            &format!("kr-running={}", before.executable.display())
+        ),
+        "the live session is running another binary than the one it started; the terminal \
+         showed:\n{}",
+        session.terminal_output()
+    );
     let (enter, fence) = session.fenced_after_a_command(30);
     assert_eq!(fence.prompt_generation, enter.prompt_generation);
     assert!(session.alive());
+    drop(session);
+
+    // A session started now takes the installation the pointer names, which is the other one.
+    let second = CaseSetup::prepare(&case, &after, &index);
+    let mut next = Session::start_for(&after, &case, &second);
+    next.first_prompt_within(STARTUP);
+    settle(&mut next, Duration::from_millis(300), REPLY);
+    assert!(
+        next.run("echo kr-live=$KR_TEST_LIVE", "kr-live=after"),
+        "a session started after the update did not take the installation the pointer names; \
+         the terminal showed:\n{}",
+        next.terminal_output()
+    );
+    assert!(next.alive());
+
+    // An installation whose record cannot be read is refused rather than substituted.
+    std::fs::write(shell.join("bbbbbbbbbbbbbbbb/kr-shell-identity.json"), "{").expect("the record");
+    assert!(
+        kr_shell_integration::host::package::PackageSet::discover(root.path()).is_err(),
+        "an installation whose record cannot be read was resolved anyway"
+    );
+}
+
+/// Another identity of the same package this host has built before, where it has one.
+///
+/// The build keeps every identity it produces, so a machine that has rebuilt the package has two
+/// real builds of it. Where it has only one, the test copies that one twice and says so by
+/// comparing the bytes only when there were two.
+fn another_build(current: &Package) -> Option<Package> {
+    let root = current
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)?;
+    let mut others: Vec<std::path::PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_dir()
+                && path.join("kr-shell-identity.json").is_file()
+                && path.file_name().map(std::ffi::OsStr::to_os_string)
+                    != std::path::Path::new(&current.identity)
+                        .file_name()
+                        .map(std::ffi::OsStr::to_os_string)
+        })
+        .collect();
+    others.sort();
+    let chosen = others.into_iter().next_back()?;
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(chosen.join("kr-shell-identity.json")).ok()?)
+            .ok()?;
+    let executable = std::path::PathBuf::from(record["shell"]["executable"].as_str()?);
+    if !executable.exists() {
+        return None;
+    }
+    Some(Package {
+        kind: current.kind,
+        identity: chosen.file_name()?.to_string_lossy().into_owned(),
+        executable,
+        startup_entry: chosen
+            .join("startup")
+            .join(current.startup_entry.file_name()?),
+        module_directory: chosen.join("modules"),
+        record,
+    })
 }
 
 /// What the product's own resolver would launch for a new session at this installation.
@@ -2295,10 +2416,15 @@ fn entered(prompt: u64, revision: u64, candidate: u8) -> Stimulus {
 }
 
 fn arrived(label: &str, bytes: u64) -> Stimulus {
+    arrived_under(label, bytes, 1)
+}
+
+/// A batch from the attachment that holds one epoch of the lease.
+fn arrived_under(label: &str, bytes: u64, epoch: u64) -> Stimulus {
     Stimulus::InputArrived(InputArrived {
         input: InputRef::new(label),
-        attachment_id: shellpkg::attachment_id(1),
-        epoch: shellpkg::epoch(1),
+        attachment_id: shellpkg::attachment_id(u8::try_from(epoch).expect("a small epoch")),
+        epoch: shellpkg::epoch(epoch),
         bytes: kr_protocol::scalars::U64::new(bytes),
     })
 }
@@ -2469,6 +2595,84 @@ fn the_hold_releases_what_it_held_in_order_with_one_editor_busy_and_no_refusal()
         other => panic!("the release is {other:?}"),
     }
     assert!(machine.held().is_empty(), "the hold still holds something");
+}
+
+/// KR-REQ-07.79, KR-REQ-07.82: a lease change inside a hold is acknowledged with what the worker
+/// itself is holding, and it does not restart the hold.
+///
+/// The lease change stands whatever the reader says, so the acknowledgement is what the takeover
+/// receipt is built from: the bytes the previous epoch lost and the batches behind them. The hold
+/// belongs to the input rather than to the reader, so the deadline the first batch started is the
+/// one the release happens at.
+#[test]
+fn a_lease_change_inside_a_hold_is_acknowledged_with_what_it_held() {
+    let (mut machine, published) = fenced_machine();
+    // Input arriving under a published fence is forwarded, so the hold this is about is the one a
+    // second exchange opens. The lease change is what opens it.
+    let opened = machine.apply(
+        at(published.get() + 10),
+        &Stimulus::LeaseChanged(kr_shell_integration::contract::fence::LeaseChanged {
+            lease: LeaseView::held(shellpkg::epoch(2), shellpkg::attachment_id(2)),
+            discarded_bytes: kr_protocol::scalars::U64::new(0),
+            candidate_fence: shellpkg::fence_id(2),
+        }),
+    );
+    assert!(
+        opened
+            .shapes()
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::InvalidateFence { .. })),
+        "the fence outlived the lease change: {:?}",
+        opened.shapes()
+    );
+    machine.apply(at(published.get() + 20), &arrived_under("first", 4, 2));
+    machine.apply(at(published.get() + 30), &arrived_under("second", 6, 2));
+
+    let changed = machine.apply(
+        at(published.get() + 40),
+        &Stimulus::LeaseChanged(kr_shell_integration::contract::fence::LeaseChanged {
+            lease: LeaseView::held(shellpkg::epoch(3), shellpkg::attachment_id(3)),
+            discarded_bytes: kr_protocol::scalars::U64::new(3),
+            candidate_fence: shellpkg::fence_id(3),
+        }),
+    );
+    match changed
+        .actions
+        .iter()
+        .find(|action| matches!(action.shape(), ActionShape::AcknowledgeLeaseChange { .. }))
+    {
+        Some(kr_shell_integration::contract::fence::Action::AcknowledgeLeaseChange(
+            acknowledgement,
+        )) => {
+            assert_eq!(
+                acknowledgement.lease,
+                LeaseView::held(shellpkg::epoch(3), shellpkg::attachment_id(3)),
+                "the acknowledgement names another lease than the one that took over"
+            );
+            assert_eq!(
+                acknowledgement.discarded_bytes,
+                kr_protocol::scalars::U64::new(13),
+                "the receipt does not account for the worker's own queue and the batches it held"
+            );
+            assert_eq!(
+                acknowledgement.discarded_input,
+                vec![InputRef::new("first"), InputRef::new("second")],
+                "the receipt does not name the batches the takeover cost"
+            );
+        }
+        other => panic!("the lease change was acknowledged with {other:?}"),
+    }
+    // The change stands whatever the reader says, and the exchange it starts has a bound of its
+    // own. What the receipt is about is the epoch that ended, which is what the count above says.
+    assert!(
+        machine.deadline().is_some(),
+        "the exchange the lease change started has no bound"
+    );
+    assert!(
+        machine.held().is_empty(),
+        "input from the epoch that ended was kept rather than discarded: {:?}",
+        machine.held()
+    );
 }
 
 /// KR-REQ-07.79: a retried fence waits for mixed queues to drain rather than discarding them.
@@ -2649,6 +2853,81 @@ fn a_launch_that_reaches_its_reservation_timeout_installs_no_command() {
         }
         other => panic!("the caller was answered with {other:?}"),
     }
+}
+
+/// KR-REQ-07.83: what a reader answers after its reservation ended is still the reader's word, and
+/// the session records that it came late.
+///
+/// The revocation and the install cross on the wire, so the worker cannot make the answer arrive
+/// sooner and cannot take a line out of an editor that already holds it. The published contract
+/// therefore gives the caller the reader's own outcome and records the late installation beside
+/// it: a caller told nothing was installed while the editor holds a command would be the worse
+/// answer of the two.
+#[test]
+fn a_launch_answered_after_its_reservation_ended_is_recorded_as_late() {
+    let (mut machine, published) = fenced_machine();
+    let transaction = kr_shell_integration::contract::requests::LaunchTransactionId::new(
+        kr_protocol::scalars::Uuid::from_bytes([0x18; 16]),
+    );
+    let fence = machine.fence().expect("a published fence").clone();
+    machine.apply(
+        at(published.get() + 5),
+        &Stimulus::LaunchRequested(LaunchRequested {
+            params: ShellLaunchParams {
+                session_id: race_session(),
+                command: kr_protocol::root::LaunchCommand::Arguments(vec!["printf".to_owned()]),
+                expected_prompt_generation: fence.prompt_generation,
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+            requester: shellpkg::attachment_id(1),
+            transaction,
+        }),
+    );
+    let deadline = machine.deadline().expect("a reservation has a deadline");
+    machine.apply(deadline, &Stimulus::HoldExpired);
+
+    let late = machine.apply(
+        at(deadline.get() + 40),
+        &Stimulus::LaunchDecided(
+            kr_shell_integration::contract::requests::LaunchDecision::Accepted(
+                kr_shell_integration::contract::requests::LaunchAccepted {
+                    transaction,
+                    installed: kr_protocol::root::LaunchCommand::Arguments(vec![
+                        "printf".to_owned(),
+                    ]),
+                    fence_id: fence.fence_id,
+                    prompt_generation: fence.prompt_generation,
+                    buffer_revision: EditorBufferRevision::new(2),
+                    reader_revision: fence.reader_revision,
+                },
+            ),
+        ),
+    );
+    let shapes = late.shapes();
+    assert!(
+        shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::LateInstallation { .. })),
+        "a command installed after the reservation ended was not recorded: {shapes:?}"
+    );
+    let late = shapes
+        .iter()
+        .position(|shape| matches!(shape, ActionShape::LateInstallation { .. }))
+        .expect("the record is there");
+    let installed = shapes
+        .iter()
+        .position(|shape| matches!(shape, ActionShape::InstallLaunch { .. }))
+        .unwrap_or_else(|| panic!("the caller was told nothing at all: {shapes:?}"));
+    assert!(
+        late < installed,
+        "the answer came before the record that it was late: {shapes:?}"
+    );
+    assert!(
+        !shapes
+            .iter()
+            .any(|shape| matches!(shape, ActionShape::RejectLaunch { .. })),
+        "the caller was both answered and refused: {shapes:?}"
+    );
 }
 
 /// What this qualification cannot reach, recorded rather than left out.

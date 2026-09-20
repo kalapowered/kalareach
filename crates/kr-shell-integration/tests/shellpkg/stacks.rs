@@ -202,6 +202,10 @@ pub struct QualificationCase {
     pub binding: String,
     /// What this case claims to prove.
     pub checks: Vec<String>,
+    /// The excluded states this customisation takes the key for, so they are not states of the
+    /// managed reader in this case.
+    #[serde(default)]
+    pub skip_exclusions: Vec<String>,
     /// What this case does not drive, and why, where that is not obvious from the checks.
     #[serde(default)]
     pub notes: Option<String>,

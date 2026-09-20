@@ -183,6 +183,23 @@ the digests differ, compare the two archives member by member before concluding 
 release: the record of what a release published is the `SHA512SUMS` attached to it, which is what a
 consumer verifies against.
 
+## The shell packages' update target
+
+The managed shell packages are upstream releases with KalaReach's own patch sets, so a security
+update to one of those upstream projects is a release of ours.
+
+Each is triaged within one working day of the advisory. The package it affects is rebuilt against
+the fixed upstream release, requalified against the whole corpus under `tests/shells/`, and
+published within fourteen days of that release. No binary is
+distributed before its requalification passes, and no package is swapped into a session that is
+already running: a session keeps the package identity it started with until it ends.
+
+A package whose fourteen days pass without a requalified build is flagged, and the flag names the
+choices rather than leaving a stale package as a silent default: keep the pinned package, run that
+shell in `native_compat` without the managed empty-prompt Ctrl-D and fenced launch, or run a
+different managed shell. `docs/shell-integration/upstream.md` is the register of the sources each
+package tracks, the triage record and those choices.
+
 ## What a version bump requires
 
 Both packages carry one version, and one tag publishes both.

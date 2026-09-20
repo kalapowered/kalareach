@@ -4,7 +4,7 @@
   "stack": "atuin",
   "title": "atuin, which replaces the history search and adds a pre-execution hook",
   "supported": true,
-  "notes": "This customisation takes the key the reader's own search is on and opens a reader of its own there, so the excluded states this corpus drives through that key are not states of the managed reader in this case. They are driven on the same shell in its plain and distribution cases.",
+  "notes": "This customisation takes the key the reader's own search is on and opens a reader of its own there, so the search state this corpus drives through that key is not a state of the managed reader in this case. Every other excluded state is driven here under the customisation, and the search is driven on the same shell in its plain and distribution cases.",
   "requires": [
     "atuin"
   ],
@@ -21,6 +21,7 @@
     "plugin_buffer",
     "user_bindings",
     "gesture_detaches",
+    "gesture_is_native_outside_the_condition",
     "escape_then_gesture_is_native"
   ],
   "plugin": {
@@ -29,6 +30,9 @@
     "operation": "echo kr-plugin=$(\"$KR_STACK_ATUIN/atuin\" search --cmd-only --limit 1 --search-mode prefix -- 'echo kr-atuin-stored')",
     "operation_marker": "kr-plugin=echo kr-atuin-stored"
   },
+  "skip_exclusions": [
+    "search"
+  ],
   "covers": [
     "KR-REQ-07.87",
     "KR-REQ-07.72",

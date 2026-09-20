@@ -27,8 +27,8 @@
   "plugin": {
     "probe": "echo kr-plugin=(set -q STARSHIP_SESSION_KEY; and echo on; or echo off)",
     "marker": "kr-plugin=on",
-    "operation": "test -n \"$STARSHIP_START_TIME\"; and echo kr-plugin=ran; or echo kr-plugin=no",
-    "operation_marker": "kr-plugin=ran"
+    "operation": "echo kr-plugin-(test -n \"$STARSHIP_START_TIME\"; and echo set; or echo unset)",
+    "operation_marker": "kr-plugin-set"
   },
   "covers": [
     "KR-REQ-07.87",
