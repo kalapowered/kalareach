@@ -3730,9 +3730,10 @@ impl Controller {
                 //
                 // The recovery pass is not. It opens the session's stores, so it runs only where
                 // the kernel confirms the death, and where it does not the store is left as it is
-                // and the archive reports an action with no ending when a reader asks. What stops
-                // a later read or migration reaching a store a worker may still own is the
-                // published descriptor, which a closure does not delete.
+                // and the archive reports an action with no ending when a reader asks. Writing
+                // the closure removes the worker row and retires the descriptor, so what stops a
+                // later read or migration is the closure's own record of a worker this host never
+                // saw end.
                 let archive = self.archive();
                 let validated = if let Ok(ownership) = archive.take_ownership(
                     row.session_id,
@@ -4847,7 +4848,7 @@ impl Controller {
     ///
     /// Returns an invalid-argument refusal naming what this host has not established.
     async fn refuse_if_live(self: &Arc<Self>, session_id: SessionId) -> Result<()> {
-        if self.a_worker_may_still_own(session_id).await {
+        if self.a_worker_may_still_own(session_id).await? {
             return Err(ControllerError::InvalidArgument(format!(
                 "session {session_id} has a worker this daemon has not confirmed ended"
             )));
@@ -4860,14 +4861,17 @@ impl Controller {
     /// This is the one question every read and every migration asks. It is deliberately
     /// pessimistic: a query the platform declines establishes nothing, and nothing is the answer
     /// that keeps a store shut.
-    async fn a_worker_may_still_own(self: &Arc<Self>, session_id: SessionId) -> bool {
+    async fn a_worker_may_still_own(self: &Arc<Self>, session_id: SessionId) -> Result<bool> {
         let (row, closure) = {
             let registry = self.registry.lock().await;
+            // A registry this host cannot read answers nothing, and nothing is not "no worker".
+            // Both reads are propagated rather than flattened away, because the caller refusing
+            // with the registry's own error is the safe end of that.
             let row = registry
-                .workers()
-                .ok()
-                .and_then(|rows| rows.into_iter().find(|row| row.session_id == session_id));
-            (row, registry.closure(session_id).ok().flatten())
+                .workers()?
+                .into_iter()
+                .find(|row| row.session_id == session_id);
+            (row, registry.closure(session_id)?)
         };
         if let Some(row) = row
             && !matches!(
@@ -4875,7 +4879,7 @@ impl Controller {
                 kr_ipc::identity::ProcessState::Ended
             )
         {
-            return true;
+            return Ok(true);
         }
         if let Some(closure) = closure
             && closure
@@ -4883,9 +4887,9 @@ impl Controller {
                 .iter()
                 .any(|resource| resource.kind == UNACCOUNTED_WORKER)
         {
-            return true;
+            return Ok(true);
         }
-        self.archive().a_worker_may_still_own(session_id)
+        Ok(self.archive().a_worker_may_still_own(session_id))
     }
 
     /// Reads what one session left behind, with the registry's own record beside it.
