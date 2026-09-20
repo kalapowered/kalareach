@@ -222,7 +222,7 @@ impl Fixture {
                 grant: &grant,
                 quiescence_declared: true,
                 required_consistency: None,
-                reservation: None,
+                quiescence: None,
             },
             pin: false,
             provenance: provenance(),
@@ -243,22 +243,22 @@ impl Fixture {
         change_set_id: Option<kr_protocol::ids::ChangeSetId>,
         required: Option<SourceConsistency>,
     ) -> kr_changeset::Result<ChangeSetVersionRecord> {
-        self.capture_with_reservation(workspace_id, policy, grant, change_set_id, required, None)
+        self.capture_with_authority(workspace_id, policy, grant, change_set_id, required, None)
     }
 
-    /// Captures one version, including an optional quiescence reservation.
+    /// Captures one version, asking the given authority to hold the workspace still.
     ///
     /// # Errors
     ///
     /// Returns whatever the capture returns.
-    pub fn capture_with_reservation(
+    pub fn capture_with_authority(
         &self,
         workspace_id: WorkspaceId,
         policy: &InclusionPolicy,
         grant: &FileGrant,
         change_set_id: Option<kr_protocol::ids::ChangeSetId>,
         required: Option<SourceConsistency>,
-        reservation: Option<&dyn kr_changeset::capture::QuiescenceReservation>,
+        authority: Option<&dyn kr_changeset::capture::QuiescenceAuthority>,
     ) -> kr_changeset::Result<ChangeSetVersionRecord> {
         let order = CaptureOrder {
             workspace_id,
@@ -269,7 +269,10 @@ impl Fixture {
                 grant,
                 quiescence_declared: false,
                 required_consistency: required,
-                reservation,
+                quiescence: authority.map(|authority| kr_changeset::capture::Quiescence {
+                    authority,
+                    workspace_id,
+                }),
             },
             pin: false,
             provenance: provenance(),

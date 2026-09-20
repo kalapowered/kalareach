@@ -2239,7 +2239,7 @@ fn capture_destination(
             grant: &grant,
             quiescence_declared: false,
             required_consistency: None,
-            reservation: None,
+            quiescence: None,
         },
         pin: false,
         provenance: Provenance {
@@ -2712,6 +2712,7 @@ pub fn destination_policy() -> (InclusionPolicy, CapturePolicy) {
                 secret_rules_applied: true,
             },
             quiescence_declared: false,
+            quiescence_held: false,
             required_consistency: Nullable(None),
         },
     )

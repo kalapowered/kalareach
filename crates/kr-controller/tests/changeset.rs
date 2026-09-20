@@ -345,7 +345,8 @@ async fn every_change_set_method_runs_end_to_end_through_the_daemon() {
         captured.version.content_digest
     );
 
-    // Requiring QuiescedCapture over the daemon path without a reservation returns INVALID_ARGUMENT.
+    // The daemon has nowhere to reserve a workspace from yet, so a caller that requires the
+    // quiesced class is told so rather than served a weaker class under that name.
     let err = control
         .mutate(
             Method::ChangesetCapture,
@@ -370,8 +371,9 @@ async fn every_change_set_method_runs_end_to_end_through_the_daemon() {
         .expect_err("requiring quiesced capture without reservation must fail");
     assert_eq!(err.code, ErrorCode::InvalidArgument);
     assert!(
+        err.message.contains("nowhere to reserve this workspace"),
+        "the refusal says what is missing: {}",
         err.message
-            .contains("no quiescence reservation was provided")
     );
 
     // A second capture is a second version, and both are visible.

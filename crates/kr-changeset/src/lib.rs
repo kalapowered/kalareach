@@ -11,6 +11,8 @@ pub mod service;
 pub mod store;
 pub mod version;
 
-pub use crate::capture::{CaptureRequest, QuiescenceReservation};
+pub use crate::capture::{
+    CaptureRequest, Quiescence, QuiescenceAuthority, QuiescenceLease, QuiescenceSubject,
+};
 pub use crate::error::{ChangeSetError, Result};
 pub use crate::service::ChangeSetService;

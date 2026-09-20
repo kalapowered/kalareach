@@ -4017,7 +4017,11 @@
           "description": "One decision per class of the working tree."
         },
         "quiescence_declared": {
-          "description": "True when the caller declared the working tree quiesced for the capture.\n\nA declaration alone never decides the consistency class: this host verifies that nothing it\nread changed, and a declaration that fails that verification is a per-file capture.",
+          "description": "True when the caller declared the working tree quiesced for the capture.\n\nThis is what the caller said, and nothing else. A declaration never decides the consistency\nclass: it describes the caller's own intentions and this host cannot check it.",
+          "type": "boolean"
+        },
+        "quiescence_held": {
+          "description": "True when a reservation held this workspace still for the whole of the read.\n\nThis is what actually happened, and it is the only thing that makes a capture a quiesced\ncapture. A capture with nowhere to ask for a reservation, one that was refused, and one\nwhose reservation stopped holding before the read finished all record `false` and are\nper-file captures.",
           "type": "boolean"
         },
         "required_consistency": {
@@ -4036,6 +4040,7 @@
         "inclusion",
         "grant",
         "quiescence_declared",
+        "quiescence_held",
         "required_consistency"
       ],
       "type": "object"
@@ -24919,7 +24924,7 @@
         },
         {
           "const": "quiesced_capture",
-          "description": "The caller declared the working tree quiesced and this host observed no change.\n\nThe declaration is the caller's; the verification is this host's. Every file's identity,\nsize and modification time are read before and after its content, and the selection is read\nagain at the end. What this class asserts is both facts together, and neither alone.",
+          "description": "A reservation held the working tree still for the whole of the read.\n\nThe reservation is granted over this very working tree before the first reading, and it is\nstill holding after the last one: the interval the capture read across is one nothing was\nallowed to write to. A declaration by the caller does not reach this class, and neither\ndoes a reading of which sessions hold the workspace, because both describe instants rather\nthan the interval between them.",
           "type": "string"
         },
         {

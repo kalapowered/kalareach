@@ -37,11 +37,12 @@
 //!   instant by construction rather than by timing. Nothing of the working tree is read at all. A
 //!   caller asks for it with `required_consistency`, and a policy that would include any
 //!   uncommitted work is refused rather than served a weaker class under the name it asked for.
-//! * [`SourceConsistency::QuiescedCapture`] needs three things together: the caller declared the
-//!   working tree quiesced, this host found **no live session and no live automation run holding
-//!   the workspace** before and after the read, and every per-file and selection check passed. The
-//!   declaration alone never decides it. What the class does not exclude is an editor outside
-//!   KalaReach, and the record says so.
+//! * [`SourceConsistency::QuiescedCapture`] needs a **reservation over this very working tree,
+//!   granted before the first reading and still holding after the last one**. The capture asks a
+//!   [`QuiescenceAuthority`] for it, compares what it was granted with what it asked for, and
+//!   watches the grant's own identity and its bound through the read. A declaration alone never
+//!   decides the class, and neither does a reading of who holds the workspace: both describe two
+//!   instants and say nothing about the interval between them.
 //! * [`SourceConsistency::PerFileCapture`] otherwise. Files read one at a time from a live tree,
 //!   with each file's identity, length and modification instant compared across its own read and
 //!   the whole selection compared across the capture. The captured tree is still immutable and
@@ -59,12 +60,13 @@ use kr_protocol::changeset::{
     CapturedPath, ContentOrigin, Exclusion, ExclusionReason, FileGrant, MAX_CAPTURE_BYTES,
     MAX_CAPTURE_RETRIES, MAX_PATH_RETRIES, PathClass, SourceConsistency,
 };
+use kr_protocol::ids::WorkspaceId;
 use kr_protocol::project::{
     ChangeKind, ContentClass, InclusionChoice, InclusionClass, InclusionPolicy,
 };
 use kr_protocol::scalars::{Digest256, Nullable, U64};
 use kr_transfer::authority::ObjectKind;
-use kr_transfer::{AuthorisedDirectory, ObjectPolicy, RelativeName};
+use kr_transfer::{AuthorisedDirectory, ObjectIdentity, ObjectPolicy, RelativeName};
 
 use crate::error::{ChangeSetError, Result};
 use crate::grant::{self, GrantDecision};
@@ -158,29 +160,168 @@ pub struct CaptureRequest<'a> {
     pub quiescence_declared: bool,
     /// The class the caller requires, when it requires one.
     pub required_consistency: Option<SourceConsistency>,
-    /// The quiescence reservation seam, when one is provided.
-    pub reservation: Option<&'a dyn QuiescenceReservation>,
+    /// Where to ask for this workspace to be held still, when the caller offers somewhere.
+    pub quiescence: Option<Quiescence<'a>>,
 }
 
-/// A reservation that holds a workspace still for a capture.
+/// Where a capture asks for a workspace to be held still, and which workspace that is.
+#[derive(Clone, Copy, Debug)]
+pub struct Quiescence<'a> {
+    /// Who grants the reservation.
+    pub authority: &'a dyn QuiescenceAuthority,
+    /// The workspace the caller resolved this repository from.
+    pub workspace_id: WorkspaceId,
+}
+
+/// Exactly what one reservation covers.
 ///
-/// This is the seam [`crate`] exposes and the workflow service (`T-038`) owns (D-083,
-/// KR-REQ-14.32).
-pub trait QuiescenceReservation: Send + Sync + std::fmt::Debug {
-    /// Attempts to take the reservation before readings begin.
+/// Both halves are compared with what the capture asked for: a grant over another workspace, or
+/// over another working tree of the same one, holds nothing of this read still. The working tree
+/// is named by its **identity**, read through the handle the capture is about to read every file
+/// through, so a second name for the same directory is the same subject and a different directory
+/// under the same path is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuiescenceSubject {
+    /// The workspace whose working tree this capture reads.
+    pub workspace_id: WorkspaceId,
+    /// That working tree, by identity rather than by name.
+    pub work_tree: ObjectIdentity,
+}
+
+/// Who holds a workspace still while a capture reads it.
+///
+/// This is the seam this crate exposes and the workflow service owns (D-083): a capture is the
+/// only thing here that asks for a reservation, and nothing here can grant one. It is what
+/// [`SourceConsistency::QuiescedCapture`] rests on, so an implementer owes the capture the whole
+/// of this contract:
+///
+/// * **Exclusion, continuously.** From the moment a grant is returned until it is released or its
+///   bound passes, every writer the implementer coordinates is kept off the workspace: the working
+///   tree, the index and the repository's own references alike. An advisory lock only KalaReach
+///   respects does not exclude an editor outside it, and an implementer that cannot exclude one
+///   refuses instead of granting.
+/// * **Now or not at all.** [`Self::reserve`] never waits. A workspace it cannot hold still at the
+///   moment it is asked is [`None`], and the capture goes on as the weaker class it can actually
+///   perform, or refuses when the caller required the stronger one.
+/// * **Nothing owned after a refusal.** A [`None`] or an error leaves the capture holding nothing,
+///   so there is nothing for it to release.
+pub trait QuiescenceAuthority: Send + Sync + std::fmt::Debug {
+    /// Holds `subject` still now, or refuses now.
     ///
-    /// Returns `Ok(true)` if the reservation was obtained, or `Ok(false)` if refused.
-    fn take_reservation(&self) -> Result<bool> {
-        Ok(self.is_valid())
+    /// # Errors
+    ///
+    /// Returns whatever the implementer returns when it cannot answer at all, which is not the
+    /// same as refusing: a refusal is `Ok(None)`.
+    fn reserve(&self, subject: QuiescenceSubject) -> Result<Option<Box<dyn QuiescenceLease + '_>>>;
+}
+
+/// One granted reservation, for as long as the capture holds it.
+///
+/// The implementer's duties do not end at the grant:
+///
+/// * **The bound is the implementer's own deadline**, not a hint to the capture. Whatever the
+///   capture is doing, the reservation releases the workspace when [`Self::bound`] passes, so a
+///   capture that stops without releasing cannot hold a workspace for ever.
+/// * **A lapse is permanent.** Once [`Self::holding`] answers false, this grant never holds again.
+///   A reservation taken afresh is a **different** grant with a different [`Self::grant_id`], and
+///   it says nothing about the interval this capture has already read.
+/// * **Release is idempotent and cannot fail.** The capture releases a grant however it ends,
+///   including on the error paths, and a release of something already released does nothing.
+pub trait QuiescenceLease: Send + Sync + std::fmt::Debug {
+    /// What this grant holds still.
+    fn subject(&self) -> QuiescenceSubject;
+
+    /// This grant's own identity, distinct from every other grant of the same subject.
+    fn grant_id(&self) -> u128;
+
+    /// The instant this grant releases the workspace whatever the capture is doing.
+    fn bound(&self) -> std::time::Instant;
+
+    /// Whether this grant has excluded every writer without interruption since it was granted.
+    fn holding(&self) -> bool;
+
+    /// Gives the workspace back.
+    fn release(&self);
+}
+
+/// The grant one capture holds, released however that capture ends.
+struct Granted<'a> {
+    lease: Box<dyn QuiescenceLease + 'a>,
+    /// The grant that was taken. A lease answering with another one is another grant, whatever it
+    /// says about holding.
+    grant_id: u128,
+    /// The deadline the grant was taken under, read once so a lease that moves its own bound
+    /// forward cannot extend what this capture relies on.
+    bound: std::time::Instant,
+}
+
+impl Drop for Granted<'_> {
+    fn drop(&mut self) {
+        self.lease.release();
+    }
+}
+
+impl Granted<'_> {
+    /// Whether this exact grant is still holding the workspace, by this host's clock as well.
+    fn holding(&self) -> bool {
+        std::time::Instant::now() < self.bound
+            && self.lease.grant_id() == self.grant_id
+            && self.lease.holding()
+    }
+}
+
+/// What the quiescence reservation came to, which is what decides the class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reservation {
+    /// The caller offered no authority to ask.
+    NotAsked,
+    /// The authority would not hold the workspace still at the moment it was asked.
+    Refused,
+    /// A grant was taken and has held through every reading so far.
+    Held,
+    /// A grant was taken and stopped holding before the read finished.
+    Lapsed,
+}
+
+impl Reservation {
+    /// Asks the grant whether it is still holding, once, at one point of the read.
+    ///
+    /// A lapse is recorded once and never reconsidered: a grant that stopped holding while this
+    /// host was reading leaves an interval nothing covered, and a reservation taken again after
+    /// that is a different grant over a different interval.
+    fn still_holding(&mut self, granted: Option<&Granted<'_>>) {
+        if *self == Self::Held && !granted.is_some_and(Granted::holding) {
+            *self = Self::Lapsed;
+        }
     }
 
-    /// Checks whether the held reservation is still valid and active.
-    fn is_valid(&self) -> bool;
-
-    /// Releases the reservation after readings finish.
-    fn release(&self) -> Result<()> {
-        Ok(())
+    /// Records that the tree changed under a grant that was supposed to be holding it still.
+    ///
+    /// The capture's own contradiction of the reservation: whatever the grant answers, a change
+    /// this host detected is one the reservation did not keep out.
+    fn changed_underneath(&mut self) {
+        if *self == Self::Held {
+            *self = Self::Lapsed;
+        }
     }
+}
+
+/// Why a grant that was taken stopped covering the read.
+const LAPSED: &str = "the reservation that was holding this workspace still stopped holding it \
+                      before the read finished";
+
+/// Why a grant this host was told it had did not do what a grant does.
+const CHANGED: &str = "the working tree changed while a reservation was supposed to be holding \
+                       it still, so nothing held it still";
+
+/// Refuses a capture whose caller required the class the reservation did not deliver.
+fn required_quiescence_refused(why: &str) -> ChangeSetError {
+    ChangeSetError::InvalidArgument(
+        format!(
+            "this request requires a quiesced_capture and this host did not perform one: {why}"
+        )
+        .into(),
+    )
 }
 
 /// What one capture established.
@@ -283,50 +424,55 @@ pub fn capture(
         };
         return snapshot(profile, repository, store, request);
     }
-    let mut reservation_held = false;
-    let mut reservation_refused = false;
-    let mut reservation_expired = false;
-    if let Some(res) = request.reservation {
-        if res.take_reservation()? {
-            reservation_held = true;
-        } else {
-            reservation_refused = true;
-            if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
-                return Err(ChangeSetError::InvalidArgument(
-                    "this capture's source was not quiesced because the reservation was refused: \
-                     the request requires a quiesced_capture"
+    // The reservation is taken **before the first reading** and given back after the last one.
+    // Everything between them is what the class is a claim about, so nothing is read before this.
+    let required_quiesced =
+        request.required_consistency == Some(SourceConsistency::QuiescedCapture);
+    let mut reservation = Reservation::NotAsked;
+    let mut granted = None;
+    if let Some(quiescence) = request.quiescence {
+        let subject = QuiescenceSubject {
+            workspace_id: quiescence.workspace_id,
+            work_tree: repository.identity().work_tree,
+        };
+        match quiescence.authority.reserve(subject)? {
+            Some(lease) => {
+                // A grant over anything but the working tree this capture has open holds none of
+                // this read still, whatever it says about itself.
+                if lease.subject() != subject {
+                    let found = lease.subject();
+                    lease.release();
+                    return Err(ChangeSetError::WrongState {
+                        detail: format!(
+                            "this host asked for workspace {} and working tree {} to be held \
+                             still, and was granted a reservation over workspace {} and working \
+                             tree {}, which holds nothing of this capture still",
+                            subject.workspace_id,
+                            subject.work_tree,
+                            found.workspace_id,
+                            found.work_tree
+                        )
                         .into(),
-                ));
-            }
-        }
-    } else if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
-        return Err(ChangeSetError::InvalidArgument(
-            "this capture's source was not quiesced because no quiescence reservation was \
-             provided: the request requires a quiesced_capture"
-                .into(),
-        ));
-    }
-
-    struct ReservationGuard<'a> {
-        reservation: Option<&'a dyn QuiescenceReservation>,
-        held: bool,
-    }
-
-    impl Drop for ReservationGuard<'_> {
-        fn drop(&mut self) {
-            if self.held {
-                if let Some(res) = self.reservation {
-                    let _ = res.release();
+                    });
                 }
-                self.held = false;
+                granted = Some(Granted {
+                    grant_id: lease.grant_id(),
+                    bound: lease.bound(),
+                    lease,
+                });
+                reservation = Reservation::Held;
             }
+            None => reservation = Reservation::Refused,
         }
     }
-
-    let mut guard = ReservationGuard {
-        reservation: request.reservation,
-        held: reservation_held,
-    };
+    if reservation != Reservation::Held && required_quiesced {
+        return Err(required_quiescence_refused(match reservation {
+            Reservation::Refused => {
+                "the reservation that would have held this workspace still was refused"
+            }
+            _ => "this request carries nowhere to reserve this workspace from",
+        }));
+    }
     let nothing = BTreeSet::new();
     let request = Scope {
         request,
@@ -342,21 +488,9 @@ pub fn capture(
             request.administrative_prefix,
         )?;
         let quiet_before = quiet()?;
-        if guard.held {
-            if let Some(res) = guard.reservation {
-                if !res.is_valid() {
-                    guard.held = false;
-                    reservation_expired = true;
-                    if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
-                        return Err(ChangeSetError::InvalidArgument(
-                            "this capture's source was not quiesced because the quiescence \
-                             reservation expired mid-read: the request requires a \
-                             quiesced_capture"
-                                .into(),
-                        ));
-                    }
-                }
-            }
+        reservation.still_holding(granted.as_ref());
+        if reservation == Reservation::Lapsed && required_quiesced {
+            return Err(required_quiescence_refused(LAPSED));
         }
         // Where every repository nested in this tree keeps its own data, worked out from the
         // directories this reading names. It has to be done before anything is planned, because a
@@ -372,25 +506,20 @@ pub fn capture(
             Ok(manifest) => manifest,
             Err(ChangeSetError::SourceChanged { detail }) if attempt < MAX_CAPTURE_RETRIES => {
                 last_change = detail.as_str().to_owned();
+                // A file that changed while a grant was supposed to be holding the tree still is
+                // this host's own evidence that it was not, so the retry runs without the class
+                // however the grant answers afterwards.
+                reservation.changed_underneath();
+                if required_quiesced {
+                    return Err(required_quiescence_refused(CHANGED));
+                }
                 continue;
             }
             Err(error) => return Err(error),
         };
-        if guard.held {
-            if let Some(res) = guard.reservation {
-                if !res.is_valid() {
-                    guard.held = false;
-                    reservation_expired = true;
-                    if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
-                        return Err(ChangeSetError::InvalidArgument(
-                            "this capture's source was not quiesced because the quiescence \
-                             reservation expired mid-read: the request requires a \
-                             quiesced_capture"
-                                .into(),
-                        ));
-                    }
-                }
-            }
+        reservation.still_holding(granted.as_ref());
+        if reservation == Reservation::Lapsed && required_quiesced {
+            return Err(required_quiescence_refused(LAPSED));
         }
         // Everything the selection was decided from is read again. A file this host did not touch
         // changing is exactly what a per-file capture cannot exclude, and what it must not
@@ -406,35 +535,22 @@ pub fn capture(
                 "the working tree changed while this host was reading it: {}",
                 before.difference(&after)
             );
+            reservation.changed_underneath();
+            if required_quiesced {
+                return Err(required_quiescence_refused(CHANGED));
+            }
             if attempt < MAX_CAPTURE_RETRIES {
                 continue;
             }
             return Err(changed(&last_change));
         }
         let quiet_after = quiet()?;
-        if guard.held {
-            if let Some(res) = guard.reservation {
-                if !res.is_valid() {
-                    guard.held = false;
-                    reservation_expired = true;
-                    if request.required_consistency == Some(SourceConsistency::QuiescedCapture) {
-                        return Err(ChangeSetError::InvalidArgument(
-                            "this capture's source was not quiesced because the quiescence \
-                             reservation expired mid-read: the request requires a \
-                             quiesced_capture"
-                                .into(),
-                        ));
-                    }
-                }
-            }
+        reservation.still_holding(granted.as_ref());
+        if reservation == Reservation::Lapsed && required_quiesced {
+            return Err(required_quiescence_refused(LAPSED));
         }
-        let (consistency, consistency_detail) = classify(
-            request,
-            guard.held,
-            reservation_refused,
-            reservation_expired,
-            quiet_before && quiet_after,
-        );
+        let (consistency, consistency_detail) =
+            classify(request, reservation, quiet_before && quiet_after);
         if let Some(required) = request.required_consistency
             && !consistency.satisfies(required)
         {
@@ -448,13 +564,10 @@ pub fn capture(
                 .into(),
             ));
         }
+        // Every reading is done, so the workspace goes back before this host spends any time on
+        // the manifest. What the class describes is the interval that has just ended.
+        drop(granted.take());
         let objects = distinct_objects(&manifest);
-        if guard.held {
-            guard.held = false;
-            if let Some(res) = guard.reservation {
-                res.release()?;
-            }
-        }
         return Ok(Captured {
             manifest,
             base_revision: before.revision,
@@ -3486,40 +3599,45 @@ pub fn classify_content(bytes: &[u8]) -> ContentClass {
 
 /// Decides the consistency class from what the capture actually did.
 ///
-/// A capture that read the live working tree without an active quiescence reservation is a
-/// **per-file capture**. [`SourceConsistency::QuiescedCapture`] requires a valid reservation
-/// that held the tree still for the read. A caller declaration without an active reservation
-/// records the declaration on the version's policy but does not change the class.
+/// [`SourceConsistency::QuiescedCapture`] is assigned for one reason and no other: a reservation
+/// over this very working tree was granted before the first reading and was still holding after
+/// the last one. Everything else a caller can say about quiescence is recorded beside the class
+/// rather than deciding it, because a declaration and a reading of who holds the workspace both
+/// describe instants and the class is a claim about an interval.
 fn classify(
     request: Scope<'_>,
-    reservation_held: bool,
-    reservation_refused: bool,
-    reservation_expired: bool,
+    reservation: Reservation,
     quiet: bool,
 ) -> (SourceConsistency, String) {
-    if reservation_held {
-        return (
-            SourceConsistency::QuiescedCapture,
-            "the working tree was captured under an active quiescence reservation that held the \
-             workspace still for the read"
-                .to_owned(),
-        );
-    }
-    if reservation_expired {
-        return (
-            SourceConsistency::PerFileCapture,
-            "the quiescence reservation expired during the capture; captured as a per-file \
-             capture with concurrent-change detection"
-                .to_owned(),
-        );
-    }
-    if reservation_refused {
-        return (
-            SourceConsistency::PerFileCapture,
-            "the caller requested quiescence, but the reservation was refused; captured as a \
-             per-file capture with concurrent-change detection"
-                .to_owned(),
-        );
+    match reservation {
+        Reservation::Held => {
+            return (
+                SourceConsistency::QuiescedCapture,
+                "a quiescence reservation over this working tree was granted before the first \
+                 reading and was still holding after the last one, so every file this host read \
+                 was read out of one tree that nothing was writing to"
+                    .to_owned(),
+            );
+        }
+        Reservation::Lapsed => {
+            return (
+                SourceConsistency::PerFileCapture,
+                "the quiescence reservation stopped holding this workspace before the read \
+                 finished, so the files were read one at a time from a live working tree with \
+                 concurrent-change detection instead"
+                    .to_owned(),
+            );
+        }
+        Reservation::Refused => {
+            return (
+                SourceConsistency::PerFileCapture,
+                "this workspace could not be reserved at the moment this host asked, so the \
+                 files were read one at a time from a live working tree with concurrent-change \
+                 detection instead"
+                    .to_owned(),
+            );
+        }
+        Reservation::NotAsked => {}
     }
     let mut detail = "files were read one at a time from a live working tree; each one was the \
                       same object of the same length written at the same instant after its read \
@@ -3621,7 +3739,7 @@ mod tests {
             grant: granted,
             quiescence_declared: false,
             required_consistency: None,
-            reservation: None,
+            quiescence: None,
         }
     }
 
@@ -4141,10 +4259,10 @@ mod tests {
     }
 
     #[test]
-    fn this_host_produces_no_quiesced_capture_at_all() {
+    fn only_a_reservation_that_held_makes_a_quiesced_capture() {
         // Section 14 forbids advertising a stronger source-consistency class without a real
-        // mechanism, and nothing this host can reach holds a working tree still for the whole of a
-        // read without an active quiescence reservation. A declaration alone is recorded beside the
+        // mechanism. The reservation is that mechanism, and it is the only thing that assigns the
+        // class: a declaration, and a reading of who holds the workspace, are recorded beside the
         // class rather than deciding it.
         let policy = InclusionPolicy::base_only();
         let granted = FileGrant::default();
@@ -4153,14 +4271,15 @@ mod tests {
             ..request(&policy, &granted)
         };
         for quiet in [true, false] {
-            let (class, detail) = classify(scope(&declared), false, false, false, quiet);
+            let (class, detail) = classify(scope(&declared), Reservation::NotAsked, quiet);
             assert_eq!(class, SourceConsistency::PerFileCapture);
             assert!(
                 detail.contains("detection rather than one instant"),
                 "the detail says what it is: {detail}"
             );
         }
-        let (class, detail) = classify(scope(&declared), false, false, false, true);
+        let (class, detail) = classify(scope(&declared), Reservation::NotAsked, true);
+        assert_eq!(class, SourceConsistency::PerFileCapture);
         assert!(
             detail.contains("it does not make this a quiesced capture"),
             "and says plainly that the declaration did not decide it: {detail}"
@@ -4168,29 +4287,31 @@ mod tests {
         // Without the declaration the detail says nothing about one.
         let (class_without, detail_without) = classify(
             scope(&request(&policy, &granted)),
-            false,
-            false,
-            false,
+            Reservation::NotAsked,
             true,
         );
         assert_eq!(class_without, SourceConsistency::PerFileCapture);
         assert!(!detail_without.contains("quiesced"));
-        assert_eq!(class, SourceConsistency::PerFileCapture);
 
-        // With an active reservation held, it produces QuiescedCapture.
-        let (class_held, detail_held) = classify(scope(&declared), true, false, false, true);
-        assert_eq!(class_held, SourceConsistency::QuiescedCapture);
-        assert!(detail_held.contains("active quiescence reservation"));
+        // A grant that held through every reading is the one case that assigns the class.
+        let (held, held_detail) = classify(scope(&declared), Reservation::Held, true);
+        assert_eq!(held, SourceConsistency::QuiescedCapture);
+        assert!(
+            held_detail.contains("still holding after the last one"),
+            "the detail says what held it: {held_detail}"
+        );
 
-        // With an expired reservation, it produces PerFileCapture.
-        let (class_exp, detail_exp) = classify(scope(&declared), false, false, true, true);
-        assert_eq!(class_exp, SourceConsistency::PerFileCapture);
-        assert!(detail_exp.contains("reservation expired"));
-
-        // With a refused reservation, it produces PerFileCapture.
-        let (class_ref, detail_ref) = classify(scope(&declared), false, true, false, true);
-        assert_eq!(class_ref, SourceConsistency::PerFileCapture);
-        assert!(detail_ref.contains("reservation was refused"));
+        // A grant that stopped holding, and a workspace nothing would hold, are both the weaker
+        // class, and neither detail describes one instant.
+        for (state, says) in [
+            (Reservation::Lapsed, "stopped holding"),
+            (Reservation::Refused, "could not be reserved"),
+        ] {
+            let (class, detail) = classify(scope(&declared), state, true);
+            assert_eq!(class, SourceConsistency::PerFileCapture);
+            assert!(detail.contains(says), "{state:?} says why: {detail}");
+            assert!(detail.contains("concurrent-change detection"));
+        }
     }
 
     #[test]

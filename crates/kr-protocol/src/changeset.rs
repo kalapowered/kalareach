@@ -80,11 +80,13 @@ pub enum SourceConsistency {
     /// claim about timing, and it is the only way a capture reaches this class here: no filesystem
     /// this host runs on offers an unprivileged atomic snapshot of a directory tree.
     AtomicSnapshot,
-    /// The caller declared the working tree quiesced and this host observed no change.
+    /// A reservation held the working tree still for the whole of the read.
     ///
-    /// The declaration is the caller's; the verification is this host's. Every file's identity,
-    /// size and modification time are read before and after its content, and the selection is read
-    /// again at the end. What this class asserts is both facts together, and neither alone.
+    /// The reservation is granted over this very working tree before the first reading, and it is
+    /// still holding after the last one: the interval the capture read across is one nothing was
+    /// allowed to write to. A declaration by the caller does not reach this class, and neither
+    /// does a reading of which sessions hold the workspace, because both describe instants rather
+    /// than the interval between them.
     QuiescedCapture,
     /// Files were read one at a time from a live working tree.
     ///
@@ -313,9 +315,16 @@ pub struct CapturePolicy {
     pub grant: FileGrant,
     /// True when the caller declared the working tree quiesced for the capture.
     ///
-    /// A declaration alone never decides the consistency class: this host verifies that nothing it
-    /// read changed, and a declaration that fails that verification is a per-file capture.
+    /// This is what the caller said, and nothing else. A declaration never decides the consistency
+    /// class: it describes the caller's own intentions and this host cannot check it.
     pub quiescence_declared: bool,
+    /// True when a reservation held this workspace still for the whole of the read.
+    ///
+    /// This is what actually happened, and it is the only thing that makes a capture a quiesced
+    /// capture. A capture with nowhere to ask for a reservation, one that was refused, and one
+    /// whose reservation stopped holding before the read finished all record `false` and are
+    /// per-file captures.
+    pub quiescence_held: bool,
     /// The class the caller required, when it required one.
     pub required_consistency: Nullable<SourceConsistency>,
 }

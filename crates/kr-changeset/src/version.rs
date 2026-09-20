@@ -209,6 +209,8 @@ pub struct Subject<'a> {
     pub excluded_paths: &'a [String],
     /// True when the caller declared the working tree quiesced.
     pub quiescence_declared: bool,
+    /// True when a reservation held the workspace still for the whole of the read.
+    pub quiescence_held: bool,
 }
 
 /// A digest built from length-prefixed fields.
@@ -262,7 +264,8 @@ pub fn identity_digest(subject: &Subject<'_>, manifest: &Manifest) -> Digest256 
         .number(subject.worktree_identity.file_id.get())
         .text(subject.base_revision)
         .text(subject.consistency.as_str())
-        .flag(subject.quiescence_declared);
+        .flag(subject.quiescence_declared)
+        .flag(subject.quiescence_held);
     for class in InclusionClass::EVERY {
         absorb.text(class.as_str());
         absorb
@@ -404,6 +407,7 @@ mod tests {
             included_paths: &[],
             excluded_paths: &[],
             quiescence_declared: false,
+            quiescence_held: false,
         }
     }
 

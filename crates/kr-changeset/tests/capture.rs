@@ -1887,8 +1887,8 @@ fn another_filesystem(beside: &std::path::Path) -> Option<tempfile::TempDir> {
     })
 }
 
-/// KR-REQ-14.32: a quiescence declaration without a reservation never decides the consistency
-/// class, and the version's policy records what was actually held rather than what was asked for.
+/// KR-REQ-14.32: a quiescence declaration is recorded as the caller's own word and decides
+/// nothing, and the policy says separately whether anything actually held the workspace still.
 #[test]
 fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
     let fixture = Fixture::create();
@@ -1903,7 +1903,14 @@ fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
         .capture_declaring_quiescence(workspace)
         .expect("the capture succeeds");
     assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
-    assert!(!record.policy.quiescence_declared);
+    assert!(
+        record.policy.quiescence_declared,
+        "what the caller said is recorded as the caller's own word"
+    );
+    assert!(
+        !record.policy.quiescence_held,
+        "and nothing held this workspace still, which is the separate fact that decides the class"
+    );
     assert!(
         record
             .consistency_detail
@@ -1923,7 +1930,8 @@ fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
         .capture_declaring_quiescence(workspace)
         .expect("the capture succeeds");
     assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
-    assert!(!record.policy.quiescence_declared);
+    assert!(record.policy.quiescence_declared);
+    assert!(!record.policy.quiescence_held);
     assert!(
         record
             .consistency_detail
@@ -1933,151 +1941,374 @@ fn a_quiescence_declaration_is_recorded_and_decides_nothing() {
     );
 }
 
-/// D-083 and KR-REQ-14.32: a capture with an active quiescence reservation produces a quiesced
-/// capture, releases the reservation after reading, and records quiescence held on the policy.
-#[test]
-fn a_capture_with_an_active_reservation_produces_a_quiesced_capture() {
-    let fixture = Fixture::create();
-    ordinary_repository(fixture.work(), "res");
-    let workspace = fixture.workspace("res");
+/// A quiescence authority the tests drive, and the grants it hands out.
+///
+/// Nothing here holds a real workspace still: what these fixtures exercise is what a capture does
+/// with what it is told, which is the whole of this crate's side of the seam.
+mod reservation {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
+    use kr_changeset::capture::{QuiescenceAuthority, QuiescenceLease, QuiescenceSubject};
+
+    /// What the authority does when a capture asks it for a workspace.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Behaviour {
+        /// Grants, and holds through every question.
+        Holds,
+        /// Will not hold the workspace at the moment it is asked.
+        Refuses,
+        /// Grants, and stops holding after this many questions.
+        LapsesAfter(usize),
+        /// Grants with a bound that has already passed.
+        BoundAlreadyPassed,
+        /// Grants, and then answers as a different grant of the same subject.
+        BecomesAnotherGrant,
+        /// Grants a reservation over another workspace altogether.
+        OverAnotherWorkspace,
+    }
+
+    /// The authority, with a count of everything a capture did to it.
     #[derive(Debug)]
-    struct ActiveRes {
-        released: std::sync::atomic::AtomicBool,
+    pub struct Authority {
+        behaviour: Behaviour,
+        asked: AtomicUsize,
+        granted: AtomicUsize,
+        released: AtomicUsize,
+        questions: AtomicUsize,
     }
-    impl kr_changeset::capture::QuiescenceReservation for ActiveRes {
-        fn is_valid(&self) -> bool {
-            true
+
+    impl Authority {
+        #[must_use]
+        pub const fn new(behaviour: Behaviour) -> Self {
+            Self {
+                behaviour,
+                asked: AtomicUsize::new(0),
+                granted: AtomicUsize::new(0),
+                released: AtomicUsize::new(0),
+                questions: AtomicUsize::new(0),
+            }
         }
-        fn release(&self) -> kr_changeset::Result<()> {
-            self.released
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+
+        /// How many times a capture asked for this workspace.
+        pub fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+
+        /// How many grants it handed out.
+        pub fn granted(&self) -> usize {
+            self.granted.load(Ordering::SeqCst)
+        }
+
+        /// How many times a grant was given back.
+        pub fn released(&self) -> usize {
+            self.released.load(Ordering::SeqCst)
+        }
+
+        /// How many times a capture asked a grant whether it was still holding.
+        pub fn questions(&self) -> usize {
+            self.questions.load(Ordering::SeqCst)
         }
     }
 
-    let res = ActiveRes {
-        released: std::sync::atomic::AtomicBool::new(false),
-    };
-    let policy = include_everything();
-    let grant = FileGrant::default();
+    impl QuiescenceAuthority for Authority {
+        fn reserve(
+            &self,
+            subject: QuiescenceSubject,
+        ) -> kr_changeset::Result<Option<Box<dyn QuiescenceLease + '_>>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            if self.behaviour == Behaviour::Refuses {
+                return Ok(None);
+            }
+            self.granted.fetch_add(1, Ordering::SeqCst);
+            let answers = if self.behaviour == Behaviour::OverAnotherWorkspace {
+                QuiescenceSubject {
+                    workspace_id: kr_protocol::ids::WorkspaceId::new(kr_ipc::new_uuid()),
+                    ..subject
+                }
+            } else {
+                subject
+            };
+            // A bound that has already passed is the instant of the grant itself: every question
+            // is asked after it.
+            let bound = if self.behaviour == Behaviour::BoundAlreadyPassed {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(600)
+            };
+            Ok(Some(Box::new(Lease {
+                authority: self,
+                subject: answers,
+                bound,
+            })))
+        }
+    }
+
+    /// One grant, which counts every question the capture asks it.
+    #[derive(Debug)]
+    struct Lease<'a> {
+        authority: &'a Authority,
+        subject: QuiescenceSubject,
+        bound: Instant,
+    }
+
+    impl QuiescenceLease for Lease<'_> {
+        fn subject(&self) -> QuiescenceSubject {
+            self.subject
+        }
+
+        fn grant_id(&self) -> u128 {
+            if self.authority.behaviour == Behaviour::BecomesAnotherGrant
+                && self.authority.questions() > 0
+            {
+                return 2;
+            }
+            1
+        }
+
+        fn bound(&self) -> Instant {
+            self.bound
+        }
+
+        fn holding(&self) -> bool {
+            let asked = self.authority.questions.fetch_add(1, Ordering::SeqCst);
+            match self.authority.behaviour {
+                Behaviour::LapsesAfter(held) => asked < held,
+                _ => true,
+            }
+        }
+
+        fn release(&self) {
+            self.authority.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// D-083 and KR-REQ-14.32: a reservation that was granted over this working tree and was still
+/// holding after the last reading is what makes a capture a quiesced capture, and the grant goes
+/// back exactly once.
+#[test]
+fn a_reservation_that_held_through_the_read_makes_a_quiesced_capture() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "held");
+    write(&path, "README.md", "the work in progress\n");
+    let workspace = fixture.workspace("held");
+    let authority = reservation::Authority::new(reservation::Behaviour::Holds);
+
     let record = fixture
-        .capture_with_reservation(workspace, &policy, &grant, None, None, Some(&res))
-        .expect("capture succeeds");
+        .capture_with_authority(
+            workspace,
+            &include_everything(),
+            &FileGrant::default(),
+            None,
+            None,
+            Some(&authority),
+        )
+        .expect("the capture runs");
+
     assert_eq!(record.consistency, SourceConsistency::QuiescedCapture);
-    assert!(record.policy.quiescence_declared);
+    assert!(
+        record.policy.quiescence_held,
+        "the policy records that something held the workspace still"
+    );
+    assert!(
+        !record.policy.quiescence_declared,
+        "and it does not put words in the caller's mouth: this caller declared nothing"
+    );
     assert!(
         record
             .consistency_detail
-            .contains("active quiescence reservation"),
-        "detail names the reservation: {}",
+            .contains("still holding after the last one"),
+        "the detail says what earned the class: {}",
         record.consistency_detail
     );
+    assert_eq!(authority.asked(), 1, "the workspace was asked for once");
+    assert_eq!(authority.granted(), 1);
+    assert_eq!(
+        authority.released(),
+        1,
+        "and it was given back after the readings, exactly once"
+    );
     assert!(
-        res.released.load(std::sync::atomic::Ordering::SeqCst),
-        "reservation was released after reading"
+        authority.questions() >= 3,
+        "the grant was questioned through the read rather than once at the start: {}",
+        authority.questions()
     );
 }
 
-/// D-083 and KR-REQ-14.32: a capture with a refused reservation falls back to a per-file capture.
+/// D-083 and KR-REQ-14.32: a workspace nothing will hold still is captured as the class this host
+/// actually performed, and no grant is left outstanding.
 #[test]
-fn a_capture_with_a_refused_reservation_falls_back_to_per_file_capture() {
+fn a_workspace_that_cannot_be_reserved_is_a_per_file_capture() {
     let fixture = Fixture::create();
     ordinary_repository(fixture.work(), "refused");
     let workspace = fixture.workspace("refused");
+    let authority = reservation::Authority::new(reservation::Behaviour::Refuses);
 
-    #[derive(Debug)]
-    struct RefusedRes;
-    impl kr_changeset::capture::QuiescenceReservation for RefusedRes {
-        fn take_reservation(&self) -> kr_changeset::Result<bool> {
-            Ok(false)
-        }
-        fn is_valid(&self) -> bool {
-            false
-        }
-    }
-
-    let res = RefusedRes;
-    let policy = include_everything();
-    let grant = FileGrant::default();
     let record = fixture
-        .capture_with_reservation(workspace, &policy, &grant, None, None, Some(&res))
-        .expect("capture succeeds");
+        .capture_with_authority(
+            workspace,
+            &include_everything(),
+            &FileGrant::default(),
+            None,
+            None,
+            Some(&authority),
+        )
+        .expect("the capture runs");
+
     assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
-    assert!(!record.policy.quiescence_declared);
+    assert!(!record.policy.quiescence_held);
     assert!(
         record
             .consistency_detail
-            .contains("reservation was refused"),
-        "detail names refusal: {}",
+            .contains("could not be reserved at the moment this host asked"),
+        "the detail says why: {}",
         record.consistency_detail
+    );
+    assert_eq!(authority.asked(), 1);
+    assert_eq!(authority.granted(), 0, "a refusal grants nothing");
+    assert_eq!(
+        authority.released(),
+        0,
+        "and there is nothing to give back after one"
     );
 }
 
-/// D-083 and KR-REQ-14.32: a capture whose reservation expires mid-read falls back to a per-file
-/// capture with concurrent-change detection.
+/// D-083 and KR-REQ-14.32: a grant that stops holding at **any** point of the read leaves a
+/// per-file capture, and the grant is still given back.
 #[test]
-fn a_capture_whose_reservation_expires_mid_read_falls_back_to_per_file_capture() {
+fn a_reservation_that_stops_holding_mid_read_is_not_a_quiesced_capture() {
+    // One case per point of the read the capture asks at: the first question, the one after the
+    // content, and the one after the selection was read again.
+    for held_for in [0_usize, 1, 2] {
+        let fixture = Fixture::create();
+        let path = ordinary_repository(fixture.work(), "lapsing");
+        write(&path, "README.md", "the work in progress\n");
+        let workspace = fixture.workspace("lapsing");
+        let authority = reservation::Authority::new(reservation::Behaviour::LapsesAfter(held_for));
+
+        let record = fixture
+            .capture_with_authority(
+                workspace,
+                &include_everything(),
+                &FileGrant::default(),
+                None,
+                None,
+                Some(&authority),
+            )
+            .expect("the capture runs");
+
+        assert_eq!(
+            record.consistency,
+            SourceConsistency::PerFileCapture,
+            "a grant that held for {held_for} question(s) is not a quiesced capture"
+        );
+        assert!(!record.policy.quiescence_held);
+        assert!(
+            record
+                .consistency_detail
+                .contains("stopped holding this workspace before the read finished"),
+            "the detail says what happened: {}",
+            record.consistency_detail
+        );
+        assert_eq!(
+            authority.released(),
+            1,
+            "a grant that lapsed is still this host's to give back (held for {held_for})"
+        );
+        assert_eq!(
+            authority.questions(),
+            held_for + 1,
+            "and it is not asked again once it has lapsed (held for {held_for})"
+        );
+    }
+}
+
+/// D-083 and KR-REQ-14.32: a grant whose bound has passed, and one that has become another grant,
+/// are both grants that stopped holding.
+#[test]
+fn a_grant_past_its_bound_or_replaced_by_another_holds_nothing() {
+    for behaviour in [
+        reservation::Behaviour::BoundAlreadyPassed,
+        reservation::Behaviour::BecomesAnotherGrant,
+    ] {
+        let fixture = Fixture::create();
+        let path = ordinary_repository(fixture.work(), "bounded");
+        write(&path, "README.md", "the work in progress\n");
+        let workspace = fixture.workspace("bounded");
+        let authority = reservation::Authority::new(behaviour);
+
+        let record = fixture
+            .capture_with_authority(
+                workspace,
+                &include_everything(),
+                &FileGrant::default(),
+                None,
+                None,
+                Some(&authority),
+            )
+            .expect("the capture runs");
+
+        assert_eq!(
+            record.consistency,
+            SourceConsistency::PerFileCapture,
+            "{behaviour:?} is not a quiesced capture"
+        );
+        assert!(!record.policy.quiescence_held);
+        assert_eq!(
+            authority.released(),
+            1,
+            "{behaviour:?} is still given back once"
+        );
+    }
+}
+
+/// D-083 and KR-REQ-14.32: a grant over another workspace holds nothing of this capture still, so
+/// the capture refuses rather than reading under it, and gives it straight back.
+#[test]
+fn a_reservation_over_another_workspace_refuses_the_capture() {
     let fixture = Fixture::create();
-    ordinary_repository(fixture.work(), "expired");
-    let workspace = fixture.workspace("expired");
+    ordinary_repository(fixture.work(), "elsewhere");
+    let workspace = fixture.workspace("elsewhere");
+    let authority = reservation::Authority::new(reservation::Behaviour::OverAnotherWorkspace);
 
-    #[derive(Debug)]
-    struct ExpiringRes {
-        taken: std::sync::atomic::AtomicBool,
-        released: std::sync::atomic::AtomicBool,
-    }
-    impl kr_changeset::capture::QuiescenceReservation for ExpiringRes {
-        fn take_reservation(&self) -> kr_changeset::Result<bool> {
-            self.taken.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(true)
-        }
-        fn is_valid(&self) -> bool {
-            false
-        }
-        fn release(&self) -> kr_changeset::Result<()> {
-            self.released
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
+    let error = fixture
+        .capture_with_authority(
+            workspace,
+            &include_everything(),
+            &FileGrant::default(),
+            None,
+            None,
+            Some(&authority),
+        )
+        .expect_err("a reservation over somewhere else is refused");
 
-    let res = ExpiringRes {
-        taken: std::sync::atomic::AtomicBool::new(false),
-        released: std::sync::atomic::AtomicBool::new(false),
-    };
-    let policy = include_everything();
-    let grant = FileGrant::default();
-    let record = fixture
-        .capture_with_reservation(workspace, &policy, &grant, None, None, Some(&res))
-        .expect("capture succeeds");
-    assert_eq!(record.consistency, SourceConsistency::PerFileCapture);
-    assert!(!record.policy.quiescence_declared);
+    assert_eq!(error.code(), ErrorCode::ResourceUnavailable);
     assert!(
-        record.consistency_detail.contains("reservation expired"),
-        "detail names expiry: {}",
-        record.consistency_detail
+        error.to_string().contains("holds nothing of this capture"),
+        "the refusal says why: {error}"
     );
-    assert!(
-        res.taken.load(std::sync::atomic::Ordering::SeqCst),
-        "reservation was taken before readings"
+    assert_eq!(
+        authority.released(),
+        1,
+        "and the grant this host did not want is given back at once"
     );
 }
 
-/// D-083 and KR-REQ-14.32: requiring quiesced_capture when reservation is absent, refused or
-/// expired refuses the capture with InvalidArgument.
+/// D-083 and KR-REQ-14.32: a caller that requires the stronger class is refused whenever this host
+/// did not perform it, and every grant it took on the way is given back.
 #[test]
-fn requiring_quiesced_capture_when_reservation_is_refused_or_expired_or_absent_refuses_the_capture()
-{
+fn requiring_the_quiesced_class_refuses_every_capture_that_did_not_perform_it() {
     let fixture = Fixture::create();
-    ordinary_repository(fixture.work(), "req");
-    let workspace = fixture.workspace("req");
+    let path = ordinary_repository(fixture.work(), "required");
+    write(&path, "README.md", "the work in progress\n");
+    let workspace = fixture.workspace("required");
     let policy = include_everything();
     let grant = FileGrant::default();
 
-    // 1. Absent reservation
-    let err = fixture
-        .capture_with_reservation(
+    // Nowhere to ask at all.
+    let error = fixture
+        .capture_with_authority(
             workspace,
             &policy,
             &grant,
@@ -2085,69 +2316,83 @@ fn requiring_quiesced_capture_when_reservation_is_refused_or_expired_or_absent_r
             Some(SourceConsistency::QuiescedCapture),
             None,
         )
-        .expect_err("absent reservation must fail when quiesced_capture required");
-    assert!(matches!(
-        err,
-        kr_changeset::ChangeSetError::InvalidArgument(_)
-    ));
+        .expect_err("a required class this host cannot perform is refused");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
     assert!(
-        err.to_string()
-            .contains("no quiescence reservation was provided")
+        error.to_string().contains("nowhere to reserve"),
+        "the refusal says what was missing: {error}"
     );
 
-    // 2. Refused reservation
-    #[derive(Debug)]
-    struct RefusedRes;
-    impl kr_changeset::capture::QuiescenceReservation for RefusedRes {
-        fn take_reservation(&self) -> kr_changeset::Result<bool> {
-            Ok(false)
-        }
-        fn is_valid(&self) -> bool {
-            false
-        }
-    }
-    let err = fixture
-        .capture_with_reservation(
+    // Asked, and refused.
+    let refuses = reservation::Authority::new(reservation::Behaviour::Refuses);
+    let error = fixture
+        .capture_with_authority(
             workspace,
             &policy,
             &grant,
             None,
             Some(SourceConsistency::QuiescedCapture),
-            Some(&RefusedRes),
+            Some(&refuses),
         )
-        .expect_err("refused reservation must fail when quiesced_capture required");
-    assert!(matches!(
-        err,
-        kr_changeset::ChangeSetError::InvalidArgument(_)
-    ));
-    assert!(err.to_string().contains("reservation was refused"));
+        .expect_err("a refused reservation refuses the capture");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("was refused"), "{error}");
+    assert_eq!(refuses.released(), 0);
 
-    // 3. Expired reservation
-    #[derive(Debug)]
-    struct ExpiringRes;
-    impl kr_changeset::capture::QuiescenceReservation for ExpiringRes {
-        fn take_reservation(&self) -> kr_changeset::Result<bool> {
-            Ok(true)
-        }
-        fn is_valid(&self) -> bool {
-            false
-        }
+    // Granted, and lapsed at each of the points the capture asks at.
+    for held_for in [0_usize, 1, 2] {
+        let authority = reservation::Authority::new(reservation::Behaviour::LapsesAfter(held_for));
+        let error = fixture
+            .capture_with_authority(
+                workspace,
+                &policy,
+                &grant,
+                None,
+                Some(SourceConsistency::QuiescedCapture),
+                Some(&authority),
+            )
+            .expect_err("a reservation that lapsed refuses the capture");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error.to_string().contains("stopped holding"),
+            "the refusal says what happened (held for {held_for}): {error}"
+        );
+        assert_eq!(
+            authority.released(),
+            1,
+            "and the grant is given back even though the capture refused (held for {held_for})"
+        );
     }
-    let err = fixture
-        .capture_with_reservation(
+}
+
+/// D-083: a capture that fails for a reason of its own still gives the grant back.
+#[test]
+fn a_capture_that_fails_gives_the_reservation_back() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "unborn");
+    let workspace = fixture.workspace("unborn");
+    // A branch with no commit on it has no base revision, so the capture refuses at its first
+    // reading, which is after it has taken the reservation.
+    git_raw(&path, ["update-ref", "-d", "HEAD"]);
+    let authority = reservation::Authority::new(reservation::Behaviour::Holds);
+
+    let error = fixture
+        .capture_with_authority(
             workspace,
-            &policy,
-            &grant,
+            &include_everything(),
+            &FileGrant::default(),
             None,
-            Some(SourceConsistency::QuiescedCapture),
-            Some(&ExpiringRes),
+            None,
+            Some(&authority),
         )
-        .expect_err("expired reservation must fail when quiesced_capture required");
-    assert!(matches!(
-        err,
-        kr_changeset::ChangeSetError::InvalidArgument(_)
-    ));
-    assert!(err.to_string().contains("reservation expired mid-read"));
+        .expect_err("a repository with no commit has nothing to capture against");
+
+    assert_eq!(authority.granted(), 1);
+    assert_eq!(
+        authority.released(),
+        1,
+        "the grant is given back however the capture ends: {error}"
+    );
 }
 
 /// KR-REQ-01.27: an independent clone is a workspace of its own repository, and capturing one

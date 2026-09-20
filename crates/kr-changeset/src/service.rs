@@ -380,6 +380,19 @@ impl ChangeSetService {
     /// Returns [`ChangeSetError::SourceChanged`] when the source kept changing past the bound, and
     /// whatever the project service or the store returns.
     pub fn capture(&self, order: &CaptureOrder<'_>) -> Result<(ChangeSetVersionRecord, bool)> {
+        // A reservation is only worth anything over the workspace this capture is about to read.
+        // The repository below is resolved from the order's workspace, so a request that asks for
+        // a different one to be held still is refused rather than served a grant that covers
+        // nothing of it.
+        if let Some(quiescence) = order.request.quiescence
+            && quiescence.workspace_id != order.workspace_id
+        {
+            return Err(ChangeSetError::InvalidArgument(
+                "this capture would read one workspace and reserve another, so the reservation \
+                 would hold nothing of it still"
+                    .into(),
+            ));
+        }
         let resolved = self.resolve(order.workspace_id)?;
         let repository = self.open_repository(&resolved)?;
         // A capture writes, so this is where the first observation of an independent clone's own
@@ -435,11 +448,15 @@ impl ChangeSetService {
         // The number is taken from a counter that only goes up, so a number a deleted version
         // used is never handed out again and two captures never choose the same one.
         let version = self.locked()?.reserve_version(change_set_id)?;
+        // Two different facts, recorded apart: what the caller said about its own work, and
+        // whether a reservation actually held this workspace still for the read. Only the second
+        // decides the class, and a reader is owed both.
         let quiescence_held = captured.consistency == SourceConsistency::QuiescedCapture;
         let policy = kr_protocol::changeset::CapturePolicy {
             inclusion: *order.request.policy,
             grant: crate::grant::recorded(order.request.grant),
-            quiescence_declared: quiescence_held,
+            quiescence_declared: order.request.quiescence_declared,
+            quiescence_held,
             required_consistency: Nullable(order.request.required_consistency),
         };
         let mut included = policy.grant.included_paths.clone();
@@ -458,7 +475,8 @@ impl ChangeSetService {
                 policy: order.request.policy,
                 included_paths: &included,
                 excluded_paths: &excluded,
-                quiescence_declared: quiescence_held,
+                quiescence_declared: order.request.quiescence_declared,
+                quiescence_held,
             },
             &captured.manifest,
         );
@@ -732,6 +750,12 @@ impl ChangeSetService {
         included.sort();
         let mut excluded = from.policy.grant.excluded_paths.clone();
         excluded.sort();
+        // A derived version is a reading of a materialisation this host did not hold still, so
+        // whatever held the workspace still for the capture it came from says nothing about it.
+        let policy = kr_protocol::changeset::CapturePolicy {
+            quiescence_held: false,
+            ..from.policy.clone()
+        };
         let digest = identity_digest(
             &Subject {
                 environment_id: self.environment_id,
@@ -744,7 +768,8 @@ impl ChangeSetService {
                 policy: &from.policy.inclusion,
                 included_paths: &included,
                 excluded_paths: &excluded,
-                quiescence_declared: from.policy.quiescence_declared,
+                quiescence_declared: policy.quiescence_declared,
+                quiescence_held: policy.quiescence_held,
             },
             manifest,
         );
@@ -764,7 +789,7 @@ impl ChangeSetService {
             base_reference: from.base_reference.clone(),
             consistency,
             consistency_detail,
-            policy: from.policy.clone(),
+            policy,
             provenance,
             summary: manifest.summary(),
             counts: manifest.counts(),

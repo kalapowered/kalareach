@@ -6174,10 +6174,19 @@ export interface CapturePolicy {
   /**
    * True when the caller declared the working tree quiesced for the capture.
    *
-   * A declaration alone never decides the consistency class: this host verifies that nothing it
-   * read changed, and a declaration that fails that verification is a per-file capture.
+   * This is what the caller said, and nothing else. A declaration never decides the consistency
+   * class: it describes the caller's own intentions and this host cannot check it.
    */
   quiescence_declared: boolean
+  /**
+   * True when a reservation held this workspace still for the whole of the read.
+   *
+   * This is what actually happened, and it is the only thing that makes a capture a quiesced
+   * capture. A capture with nowhere to ask for a reservation, one that was refused, and one
+   * whose reservation stopped holding before the read finished all record `false` and are
+   * per-file captures.
+   */
+  quiescence_held: boolean
   /**
    * The class the caller required, when it required one.
    */
