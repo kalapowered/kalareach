@@ -80,15 +80,19 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
         Some(text) => text
             .parse::<EnvironmentId>()
             .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))?,
-        None => match query_helper_identity(access_class, &target, &arguments.user, &arguments.helper).await {
-            Ok(id) => id,
-            Err(err) => {
-                return Err(CliError::Usage(format!(
-                    "could not obtain environment identity from the destination helper ({err}); \
+        None => {
+            match query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
+                .await
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    return Err(CliError::Usage(format!(
+                        "could not obtain environment identity from the destination helper ({err}); \
                      supply --environment-id <uuid> or start the environment with the helper installed"
-                )));
+                    )));
+                }
             }
-        },
+        }
     };
     let enrolment = EnvironmentEnrolment {
         environment_id,
@@ -153,7 +157,9 @@ async fn query_helper_identity(
     helper: &str,
 ) -> std::result::Result<EnvironmentId, String> {
     if !access.is_process_bridge() {
-        return Err("SSH and paired environments must be enrolled with --environment-id".to_owned());
+        return Err(
+            "SSH and paired environments must be enrolled with --environment-id".to_owned(),
+        );
     }
     let (program, arguments) = match access {
         EnvironmentAccess::WslDistribution => (
@@ -196,14 +202,15 @@ async fn query_helper_identity(
     let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_owned())?;
     let mut stdout = child.stdout.take().ok_or_else(|| "no stdout".to_owned())?;
 
-    let hello = kr_protocol::identity::BridgeFrame::Hello(Box::new(kr_protocol::identity::BridgeHello {
-        protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
-        build_id: crate::build_id(),
-        origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
-        origin_ingress: kr_protocol::actor::ActorIngress::LocalIpc,
-        already_bridged: false,
-        target: kr_protocol::identity::BridgeTarget::Controller,
-    }));
+    let hello =
+        kr_protocol::identity::BridgeFrame::Hello(Box::new(kr_protocol::identity::BridgeHello {
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            build_id: crate::build_id(),
+            origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+            origin_ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+            already_bridged: false,
+            target: kr_protocol::identity::BridgeTarget::Controller,
+        }));
     let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
         .encode_message(&hello)
         .map_err(|error| error.to_string())?;

@@ -538,7 +538,10 @@ async fn a_closed_session_target_returns_session_closed_when_targeted_by_bridge(
     let stub = stub_controller(
         endpoint,
         tree.environment_id(),
-        Err(ProtocolError::new(ErrorCode::SessionClosed, "that session is closed")),
+        Err(ProtocolError::new(
+            ErrorCode::SessionClosed,
+            "that session is closed",
+        )),
     )
     .await;
 

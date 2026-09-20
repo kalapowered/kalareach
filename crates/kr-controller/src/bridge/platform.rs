@@ -242,7 +242,10 @@ mod tests {
                        * Ubuntu-24.04    Running         2\n\
                          My Distro       Running         2\n\
                          Debian Work     Stopped         2\n";
-        assert_eq!(wsl_state(listing, "My Distro"), EnvironmentPresence::Running);
+        assert_eq!(
+            wsl_state(listing, "My Distro"),
+            EnvironmentPresence::Running
+        );
         assert_eq!(
             wsl_state(listing, "Debian Work"),
             EnvironmentPresence::EnvironmentStopped
@@ -251,14 +254,18 @@ mod tests {
 
     #[test]
     fn utf16_output_with_bom_is_decoded_faithfully() {
-        let text = "  NAME            STATE           VERSION\n* My Distro       Running         2\n";
+        let text =
+            "  NAME            STATE           VERSION\n* My Distro       Running         2\n";
         let mut bytes = vec![0xff, 0xfe]; // UTF-16LE BOM
         for c in text.encode_utf16() {
             bytes.extend_from_slice(&c.to_le_bytes());
         }
         let decoded = decode_output(&bytes);
         assert_eq!(decoded, text);
-        assert_eq!(wsl_state(&decoded, "My Distro"), EnvironmentPresence::Running);
+        assert_eq!(
+            wsl_state(&decoded, "My Distro"),
+            EnvironmentPresence::Running
+        );
     }
 
     #[test]
