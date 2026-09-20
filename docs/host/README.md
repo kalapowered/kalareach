@@ -1508,11 +1508,14 @@ snapshots at their own expiry. At startup the service resolves any publication a
 left between its two commits, so a handle never names a file this host has not found.
 
 Everything beneath an authorised root is reached through `AuthorisedDirectory` and
-`AuthorisedFile`, which hold descriptors rather than names, so nothing is resolved twice and
-nothing can be swapped between a check and its use. A file's own protection travels the same way:
-its mode bits, the user and group it belongs to and the access-control list beside them are read
-through its handle and put back on another file through that file's handle, which is how a change
-set replaces a destination without changing who may read it.
+`AuthorisedFile`, which hold descriptors rather than names: what a handle is asked about is the
+object it was opened on, and no answer depends on resolving a name a second time. A file's own
+protection is asked and set the same way: its mode bits, the user and group it belongs to and the
+access-control list beside them are read through its handle and put on another file through that
+file's handle, which is how a change set replaces a destination without changing who may read it.
+Publishing itself still names an entry in a directory this host holds open, and what stands at a
+name between one operation and the next is what the identity checks and the read-back after a
+write are for. `docs/transfer/` has the whole authority model.
 
 `docs/transfer/` has the protocol, the limits, the storage layout and the authority model.
 
