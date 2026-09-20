@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use kr_controller::push::{DeliveryModule, credentials::HeldCredentials};
-use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::service::net::devices::DeviceRecord;
+use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_delivery::destination::{
@@ -1544,14 +1544,12 @@ fn overlapping_rotation_is_refused_while_earlier_notifications_are_outstanding()
 
     // Second rotation while earlier notifications are unexpired is refused
     let key3 = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("key3");
-    let err = environment
-        .module
-        .update_preview_key(
-            &DestinationId::new("phone").expect("an identifier"),
-            *key3.public(),
-            3,
-            NOW + 1,
-        );
+    let err = environment.module.update_preview_key(
+        &DestinationId::new("phone").expect("an identifier"),
+        *key3.public(),
+        3,
+        NOW + 1,
+    );
     assert!(
         err.is_err(),
         "overlapping rotation must be refused while earlier notifications are unexpired"
@@ -1805,7 +1803,9 @@ async fn controller_startup_constructs_delivery_module_and_runs_pass() {
         enabled: true,
         configured_at_ms: TimestampMs::new(NOW),
     };
-    delivery.configure(&destination).expect("configure destination");
+    delivery
+        .configure(&destination)
+        .expect("configure destination");
 
     let notice = notice(1, "waiting for an approval");
     let taken = notice.taken(1).expect("an event record");
@@ -1815,7 +1815,13 @@ async fn controller_startup_constructs_delivery_module_and_runs_pass() {
                 .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
                 .expect("a page");
             producer
-                .produce(&notice, &[destination.clone()], &Granted(BTreeSet::new()), &[], NOW)
+                .produce(
+                    &notice,
+                    &[destination.clone()],
+                    &Granted(BTreeSet::new()),
+                    &[],
+                    NOW,
+                )
                 .expect("a decision");
             Ok(())
         })
@@ -1880,7 +1886,10 @@ async fn device_preview_key_update_via_controller() {
         enabled: true,
         configured_at_ms: TimestampMs::new(NOW),
     };
-    controller.delivery().configure(&push_dest).expect("configure push destination");
+    controller
+        .delivery()
+        .configure(&push_dest)
+        .expect("configure push destination");
 
     // Update preview key via controller.device_preview_key_update
     let new_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
@@ -1906,25 +1915,35 @@ async fn device_preview_key_update_via_controller() {
         .device_preview_key_update(&actor_id, &mutation)
         .await
         .expect("update succeeds");
-    let result: kr_protocol::sharing::DevicePreviewKeyUpdateResult =
-        result_val.to_typed().unwrap();
+    let result: kr_protocol::sharing::DevicePreviewKeyUpdateResult = result_val.to_typed().unwrap();
     assert_eq!(result.device_id, device_id);
     assert_eq!(result.revision, DeviceKeyRevision::new(2));
     assert_eq!(result.notification_preview, *new_key.public());
 
     // Verify device record updated in DeviceDirectory
-    let stored = controller.devices().record_for_device(device_id).unwrap().unwrap();
+    let stored = controller
+        .devices()
+        .record_for_device(device_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.notification_preview, Some(*new_key.public()));
     assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(2));
 
     // Verify delivery module push destination preview_keys updated
-    controller.delivery().with(|producer| {
-        let dest = producer.journal().destination(&destination_id).unwrap().unwrap();
-        let push = dest.as_push().unwrap();
-        assert_eq!(push.preview_keys.current, *new_key.public());
-        assert_eq!(push.preview_keys.revision, 2);
-        Ok(())
-    }).unwrap();
+    controller
+        .delivery()
+        .with(|producer| {
+            let dest = producer
+                .journal()
+                .destination(&destination_id)
+                .unwrap()
+                .unwrap();
+            let push = dest.as_push().unwrap();
+            assert_eq!(push.preview_keys.current, *new_key.public());
+            assert_eq!(push.preview_keys.revision, 2);
+            Ok(())
+        })
+        .unwrap();
 
     // Verify stale revision is refused
     let stale_params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
@@ -1944,7 +1963,12 @@ async fn device_preview_key_update_via_controller() {
         requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
         params: ParamsValue::from_typed(&stale_params).unwrap(),
     };
-    assert!(controller.device_preview_key_update(&actor_id, &stale_mutation).await.is_err());
+    assert!(
+        controller
+            .device_preview_key_update(&actor_id, &stale_mutation)
+            .await
+            .is_err()
+    );
 
     // Verify another device cannot rotate
     let other_device_id = DeviceId::new(uuid(77));
@@ -1965,5 +1989,10 @@ async fn device_preview_key_update_via_controller() {
         requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
         params: ParamsValue::from_typed(&forbidden_params).unwrap(),
     };
-    assert!(controller.device_preview_key_update(&actor_id, &forbidden_mutation).await.is_err());
+    assert!(
+        controller
+            .device_preview_key_update(&actor_id, &forbidden_mutation)
+            .await
+            .is_err()
+    );
 }

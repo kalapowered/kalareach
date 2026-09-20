@@ -336,7 +336,8 @@ mod tests {
     }
 
     #[test]
-    fn twenty_one_requests_at_time_zero_puts_burst_into_debt_so_three_seconds_later_is_still_collapsed() {
+    fn twenty_one_requests_at_time_zero_puts_burst_into_debt_so_three_seconds_later_is_still_collapsed()
+     {
         let mut budget = Budget::fresh(0);
         spend_the_burst(&mut budget, 0);
         let stopped = budget.admit(0, || update(21));

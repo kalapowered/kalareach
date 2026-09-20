@@ -3016,7 +3016,8 @@ impl Controller {
                         "a device belongs to this host, not to one session".to_owned(),
                     ));
                 }
-                let _: kr_protocol::sharing::DevicePreviewKeyUpdateParams = parse(&mutation.params)?;
+                let _: kr_protocol::sharing::DevicePreviewKeyUpdateParams =
+                    parse(&mutation.params)?;
             }
             _ if crate::voice::VoiceModule::serves(method) => {
                 crate::voice::VoiceModule::check_subject(method, mutation)?;

@@ -546,7 +546,9 @@ impl Producer {
                 }
                 Err(error) => {
                     let detail = error.to_string();
-                    produced.refused.push((destination.id.clone(), detail.clone()));
+                    produced
+                        .refused
+                        .push((destination.id.clone(), detail.clone()));
                     records.push(DeliveryRecord {
                         notification_id: preview::fresh_notification_id(),
                         event: notice.event.clone(),
@@ -707,20 +709,14 @@ impl Producer {
         } else {
             notice.alert
         };
-        let (request, staged) = match self.build_request(
-            notice,
-            &push,
-            &destination.id,
-            identifier,
-            alert,
-            now_ms,
-        ) {
-            Ok((request, staged)) => (request, staged),
-            Err(error) => {
-                budget.release_collapse_window(&identifier);
-                return Err(error);
-            }
-        };
+        let (request, staged) =
+            match self.build_request(notice, &push, &destination.id, identifier, alert, now_ms) {
+                Ok((request, staged)) => (request, staged),
+                Err(error) => {
+                    budget.release_collapse_window(&identifier);
+                    return Err(error);
+                }
+            };
         let content = preview::encode_request(&request)?;
         let payload_bytes = preview::provider_payload_bytes(&request)?;
         Ok((
@@ -1738,8 +1734,7 @@ mod tests {
     #[test]
     fn an_oversized_notification_commits_its_encrypted_object_in_the_production_transaction() {
         let mut producer = producer();
-        let device_mailbox =
-            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair");
+        let device_mailbox = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair");
         let (destination, device_preview, _) =
             push_destination_with_keys("phone", true, Some(device_mailbox));
         producer
@@ -1762,13 +1757,9 @@ mod tests {
         let request: kr_protocol::push::PushDeliveryRequest =
             serde_json::from_slice(&record.content.expect("content")).expect("request");
         let sealed = request.preview.as_ref().expect("a preview envelope");
-        let opened = preview::open_preview(
-            &device_preview,
-            producer.preview_public(),
-            sealed,
-            1_000,
-        )
-        .expect("opened preview");
+        let opened =
+            preview::open_preview(&device_preview, producer.preview_public(), sealed, 1_000)
+                .expect("opened preview");
         let detail_id = opened.detail_object.as_ref().expect("detail envelope id");
         let object_bytes = producer
             .journal()
