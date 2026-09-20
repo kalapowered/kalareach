@@ -374,7 +374,7 @@ fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
             vec![
                 OsStr::new("update-ref"),
                 OsStr::new("refs/heads/main"),
-                OsStr::new("newoid"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
             ],
             "requires an expected old value",
         ),
@@ -398,6 +398,66 @@ fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
                 OsStr::new("old"),
             ],
             "not an argument this service passes",
+        ),
+        // A deletion written as a three-argument update: Git removes a reference whose new value
+        // is the null object, so the shape alone does not make a vector an update.
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new("0000000000000000000000000000000000000000"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+            ],
+            "deletes or creates a reference",
+        ),
+        // And a creation written the same way: the null object as the expected old value asserts
+        // the reference does not exist, which is not a compare-and-swap on one that does.
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+                OsStr::new("0000000000000000000000000000000000000000"),
+            ],
+            "deletes or creates a reference",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef0"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+            ],
+            "is not the new value as a full object name",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+                OsStr::new("HEAD"),
+            ],
+            "is not the expected old value as a full object name",
+        ),
+        // A short name is resolved by Git against its own search rules, which is a different
+        // reference from the one the caller named.
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("main"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+                OsStr::new("0123456789abcdef0123456789abcdef01234567"),
+            ],
+            "is not a full reference name",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/../../HEAD"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+                OsStr::new("0123456789abcdef0123456789abcdef01234567"),
+            ],
+            "is not a full reference name",
         ),
     ] {
         let err = check_arguments(&refused).expect_err("refused");
@@ -1261,23 +1321,69 @@ fn reference_update_with_expected_old_value_performs_compare_and_swap_bounded_to
     let oid_second = head_second.expect("second commit exists");
     assert_ne!(oid_first, oid_second);
 
-    // Mismatched old value fails CAS
+    // A reference holding something else does not move: the comparison is what makes it a
+    // compare-and-swap rather than an assignment.
     let failure = repository.update_ref(
         profile,
         "refs/heads/main",
         &oid_first,
-        "0000000000000000000000000000000000000000",
+        "0123456789abcdef0123456789abcdef01234567",
         false,
     );
-    assert!(failure.is_err(), "mismatched old value fails CAS");
+    assert!(
+        failure.is_err(),
+        "an old value that differs does not move it"
+    );
+    let (unmoved, _) = repository.head(profile).expect("the head reads");
+    assert_eq!(unmoved.as_deref(), Some(oid_second.as_str()));
 
-    // Correct old value updates ref via CAS
+    // A deletion written as an update of the right shape is refused before Git runs, and the
+    // reference still holds what it held. Git removes a reference whose new value is the null
+    // object, so this is the one vector the argument count alone would have admitted.
+    let deletion = repository.update_ref(
+        profile,
+        "refs/heads/main",
+        "0000000000000000000000000000000000000000",
+        &oid_second,
+        false,
+    );
+    assert!(
+        deletion
+            .expect_err("the null object as the new value is refused")
+            .to_string()
+            .contains("deletes or creates a reference"),
+        "a deletion is refused for what it is"
+    );
+    let (kept, _) = repository.head(profile).expect("the head reads");
+    assert_eq!(
+        kept.as_deref(),
+        Some(oid_second.as_str()),
+        "the reference is still there"
+    );
+    // And a creation: the null object as the expected old value asserts the reference does not
+    // exist, which is not a compare-and-swap on one that does.
+    assert!(
+        repository
+            .update_ref(
+                profile,
+                "refs/heads/main",
+                &oid_first,
+                "0000000000000000000000000000000000000000",
+                false,
+            )
+            .expect_err("the null object as the expected old value is refused")
+            .to_string()
+            .contains("deletes or creates a reference")
+    );
+
+    // The expected old value the reference holds moves it, in one step.
     repository
         .update_ref(profile, "refs/heads/main", &oid_first, &oid_second, false)
-        .expect("CAS succeeds");
-    let (head_after, _) = repository.head(profile).expect("head after CAS");
+        .expect("the compare-and-swap holds");
+    let (head_after, _) = repository.head(profile).expect("head after the update");
     assert_eq!(head_after.as_deref(), Some(oid_first.as_str()));
 
-    // Working tree is untouched (extra.txt is still there)
+    // The working tree is not written by it: the update is bounded to the Git common directory,
+    // and a reference update does not atomically update a dirty working tree.
     assert!(path.join("extra.txt").exists());
 }

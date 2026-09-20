@@ -261,6 +261,71 @@ const FORBIDDEN_LONG: &[&str] = &[
     "--work-tree",
 ];
 
+/// The object name Git reads as "no object", which is how a reference is deleted.
+const NULL_OBJECT: &str = "0000000000000000000000000000000000000000";
+
+/// Refuses anything but a full reference name for a reference this service moves.
+///
+/// A short name would be resolved by Git against its own search rules, which is a different
+/// reference from the one the caller named.
+fn check_reference_name(name: &str) -> Result<()> {
+    let refused = !name.starts_with("refs/")
+        || name.len() <= "refs/".len()
+        || name.ends_with('/')
+        || name.contains("//")
+        || name.contains("..")
+        || name.contains('@')
+        || name.contains('\\')
+        || name.contains('~')
+        || name.contains('^')
+        || name.contains(':')
+        || name.contains('?')
+        || name.contains('*')
+        || name.contains('[')
+        || name
+            .chars()
+            .any(|character| character.is_control() || character == ' ');
+    if refused {
+        return Err(ProjectError::InvalidArgument(
+            format!(
+                "{} is not a full reference name; this service moves a reference named in full,                  as refs/...",
+                redact(name)
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses anything but a full object name, and refuses the null object.
+///
+/// The null object is how `git update-ref` spells a deletion and a creation: as the new value it
+/// removes the reference, and as the expected old value it asserts the reference does not exist.
+/// This service moves a reference that exists to another object that exists, so neither position
+/// takes it.
+fn check_object_name(name: &str, position: &str) -> Result<()> {
+    if name.len() != NULL_OBJECT.len()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        return Err(ProjectError::InvalidArgument(
+            format!("{} is not {} as a full object name", redact(name), position).into(),
+        ));
+    }
+    if name == NULL_OBJECT {
+        return Err(ProjectError::InvalidArgument(
+            format!(
+                "the null object as {} deletes or creates a reference; this service moves one \
+                 reference that exists to one object that exists",
+                position
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses an argument vector this service does not run.
 ///
 /// # Errors
@@ -381,6 +446,16 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
                 ));
             }
             positional_count += 1;
+            // The three positional arguments are a reference and two object names, and each is
+            // checked for what it is rather than counted. Git deletes a reference when the *new*
+            // value is the null object, so a vector of the right shape carrying that value is a
+            // deletion written another way: counting three arguments would admit it.
+            match positional_count {
+                1 => check_reference_name(&text)?,
+                2 => check_object_name(&text, "the new value")?,
+                3 => check_object_name(&text, "the expected old value")?,
+                _ => {}
+            }
         }
         if positional_count < 3 {
             return Err(ProjectError::InvalidArgument(
