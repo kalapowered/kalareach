@@ -42,6 +42,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::bridge::launch::{self, BridgeCommand, LaunchError};
 
+/// How long this host waits for a destination to say anything before it gives up on the bridge.
+///
+/// A helper that stopped answering would otherwise hold the caller, and the daemon's own task, for
+/// as long as it stayed silent. Every wait below is bounded by this, and the helper is ended with
+/// the bridge, so a destination that goes quiet costs one refusal rather than a stuck refresh.
+pub const SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Why this host will not open a bridge for a request, or will not go on using one.
 ///
 /// Each variant is one cause, and each says what happened. A person reading a connection
@@ -105,6 +112,11 @@ pub enum Refusal {
     Destination(ProtocolError),
     /// The targeted session has closed.
     SessionClosed,
+    /// The destination said nothing for long enough that this host gave up.
+    Silent {
+        /// How long it was given.
+        waited: std::time::Duration,
+    },
 }
 
 impl core::fmt::Display for Refusal {
@@ -154,6 +166,11 @@ impl core::fmt::Display for Refusal {
                 error.message
             ),
             Self::SessionClosed => formatter.write_str("that session is closed"),
+            Self::Silent { waited } => write!(
+                formatter,
+                "the destination said nothing for {} seconds",
+                waited.as_secs()
+            ),
         }
     }
 }
@@ -182,7 +199,8 @@ impl From<Refusal> for crate::error::ControllerError {
             | Refusal::Unreadable { .. }
             | Refusal::NotAnAcknowledgement
             | Refusal::ProtocolMajor { .. }
-            | Refusal::WrongRole { .. } => Self::supervision(refusal.to_string()),
+            | Refusal::WrongRole { .. }
+            | Refusal::Silent { .. } => Self::supervision(refusal.to_string()),
         }
     }
 }
@@ -382,13 +400,20 @@ impl Invocation {
     /// Returns [`Refusal::Stream`] when the helper could not be waited for.
     pub async fn close(mut self) -> Result<(), Refusal> {
         drop(self.stdin);
-        self.child
-            .wait()
-            .await
-            .map(|_status| ())
-            .map_err(|error| Refusal::Stream {
+        match tokio::time::timeout(SILENCE_LIMIT, self.child.wait()).await {
+            Ok(Ok(_status)) => Ok(()),
+            Ok(Err(error)) => Err(Refusal::Stream {
                 detail: error.to_string(),
-            })
+            }),
+            // A helper that will not end on its own is ended here rather than left running: the
+            // caller asked for one exchange, and it is over.
+            Err(_elapsed) => {
+                let _ = self.child.kill().await;
+                Err(Refusal::Silent {
+                    waited: SILENCE_LIMIT,
+                })
+            }
+        }
     }
 
     /// Writes one frame and reads until the answer to `request_id` arrives.
@@ -432,6 +457,21 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     sink: &mut W,
     frame: &BridgeFrame,
 ) -> Result<(), Refusal> {
+    tokio::time::timeout(SILENCE_LIMIT, write_frame_unbounded(sink, frame))
+        .await
+        .unwrap_or(Err(Refusal::Silent {
+            waited: SILENCE_LIMIT,
+        }))
+}
+
+/// Writes one bridge frame, waiting as long as the stream takes.
+///
+/// Every caller reaches this through [`write_frame`], which bounds the wait: a destination that
+/// never reads would otherwise hold this host as surely as one that never answers.
+async fn write_frame_unbounded<W: AsyncWrite + Unpin>(
+    sink: &mut W,
+    frame: &BridgeFrame,
+) -> Result<(), Refusal> {
     let bytes = FrameCodec::new(StreamKind::Control)
         .encode_message(frame)
         .map_err(|error| Refusal::Unreadable {
@@ -453,6 +493,19 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 /// buffer exists, so a destination that declares a large frame is refused rather than served with
 /// the memory it asked for.
 async fn read_frame<R: AsyncRead + Unpin>(source: &mut R) -> Result<BridgeFrame, Refusal> {
+    tokio::time::timeout(SILENCE_LIMIT, read_frame_unbounded(source))
+        .await
+        .unwrap_or(Err(Refusal::Silent {
+            waited: SILENCE_LIMIT,
+        }))
+}
+
+/// Reads one bridge frame, waiting as long as the stream takes.
+///
+/// Every caller reaches this through [`read_frame`], which bounds the wait.
+async fn read_frame_unbounded<R: AsyncRead + Unpin>(
+    source: &mut R,
+) -> Result<BridgeFrame, Refusal> {
     let mut prefix = [0_u8; FRAME_LENGTH_PREFIX_LEN];
     source
         .read_exact(&mut prefix)
@@ -742,6 +795,38 @@ mod tests {
         assert_eq!(read, original);
     }
 
+    #[tokio::test(start_paused = true)]
+    #[cfg(unix)]
+    async fn a_helper_that_says_nothing_is_given_up_on_rather_than_waited_for() {
+        // `sleep` stands in for a helper that started and then went quiet. The bridge ends on the
+        // silence bound, and the process ends with it.
+        let opening = Opening {
+            command: BridgeCommand {
+                program: "/bin/sleep".to_owned(),
+                arguments: vec!["600".to_owned()],
+            },
+            environment_id: here(),
+            hello: BridgeHello {
+                protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+                build_id: build(),
+                origin_environment_id: here(),
+                origin_ingress: ActorIngress::LocalIpc,
+                already_bridged: false,
+                target: BridgeTarget::Controller,
+            },
+        };
+        // Nothing is read from a sleeping child, so the wait ends on the bound rather than on a
+        // stream failure. The clock is the test's own, so this costs no real time.
+        let refusal = opening.launch().await.expect_err("a refusal");
+        assert_eq!(
+            refusal,
+            Refusal::Silent {
+                waited: SILENCE_LIMIT
+            },
+            "{refusal}"
+        );
+    }
+
     #[test]
     fn every_failure_class_says_something_different() {
         // A diagnostic that named two causes the same way would send whoever reads it to the wrong
@@ -782,6 +867,9 @@ mod tests {
                 "the destination said no",
             )),
             Refusal::SessionClosed,
+            Refusal::Silent {
+                waited: SILENCE_LIMIT,
+            },
         ];
         let mut messages: Vec<String> = refusals.iter().map(ToString::to_string).collect();
         messages.sort();
