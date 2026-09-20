@@ -162,8 +162,16 @@ export interface RunningCall {
   readonly capture: CaptureState
   /** Whether the model's voice is coming out of this device. */
   readonly playing: boolean
-  /** Whether the control socket is carrying requests. */
+  /** Whether the control socket to the voice service is carrying requests. */
   readonly brokerReachable: boolean
+  /**
+   * Whether this device's connection to the host is carrying requests.
+   *
+   * A different connection from the control socket, and the difference matters: cancelling a turn
+   * is a typed request to a host, so it survives a voice service that has stopped answering and
+   * fails when the host is the thing that is gone.
+   */
+  readonly hostReachable: boolean
   readonly delegations: readonly Delegation[]
   readonly requests: readonly ContextRequest[]
   /** Milliseconds from the answer being applied to the first remote audio. KR-PERF-010. */
@@ -231,10 +239,13 @@ export type VoiceControl = (typeof LOCAL_ONLY_CONTROLS)[number] | 'cancel_task' 
 /**
  * Whether a control can be used right now.
  *
- * The three local ones are available whenever a call is running, whatever the broker is doing. The
- * two that reach something else are not.
+ * The three local ones are available whenever a call is running, whatever else is reachable. The
+ * other two each depend on the one connection they actually use: sending context needs the voice
+ * service, and cancelling a turn needs the host. Treating those two as one availability would
+ * disable a cancellation because a voice service stopped answering, which is the opposite of what
+ * section 15 paragraph 10 asks for.
  */
 export function controlAvailable(control: VoiceControl, call: RunningCall): boolean {
   if ((LOCAL_ONLY_CONTROLS as readonly string[]).includes(control)) return true
-  return call.brokerReachable
+  return control === 'cancel_task' ? call.hostReachable : call.brokerReachable
 }

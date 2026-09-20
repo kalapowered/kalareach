@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 
 import { VoiceSurface, type VoiceSurfaceActions } from './VoiceSurface'
 import {
@@ -60,6 +60,7 @@ export function VoiceRoute({
         : 'capturing'
 
     const brokerReachable = params.get('broker') !== 'unreachable'
+    const hostReachable = params.get('host') !== 'unreachable'
     const playing = params.get('playing') !== 'false'
 
     return {
@@ -70,13 +71,32 @@ export function VoiceRoute({
       capture,
       playing,
       brokerReachable,
+      hostReachable,
       delegations: [],
       requests: [],
-      firstAudioMs: 410
+      firstAudioMs: null
     }
   }, [params])
 
   const [call, setCall] = useState<RunningCall | null>(initialCall)
+
+  /**
+   * The platform's own touch target, resolved where the tokens look for it.
+   *
+   * `--target` is 44 on iOS and 48 on Android, and `styles/mobile.css` sets both from
+   * `:root[data-surface]`. This screen is reached without the mobile shell around it, so it names
+   * the surface on the root element itself; without that a phone would draw desktop-sized controls.
+   */
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const root = document.documentElement
+    const previous = root.dataset.surface
+    root.dataset.surface = surface
+    return () => {
+      if (previous === undefined) delete root.dataset.surface
+      else root.dataset.surface = previous
+    }
+  }, [surface])
 
   const choice = useMemo<ProviderChoice>(() => {
     if (params.get('over_cap') === '1') {
@@ -102,9 +122,10 @@ export function VoiceRoute({
           capture: 'capturing',
           playing: true,
           brokerReachable: true,
+          hostReachable: true,
           delegations: [],
           requests: [],
-          firstAudioMs: 410
+          firstAudioMs: null
         })
       },
       setMicrophoneMuted: (muted: boolean) => {

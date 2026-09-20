@@ -43,9 +43,10 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     capture: 'capturing',
     playing: true,
     brokerReachable: true,
+    hostReachable: true,
     delegations: [],
     requests: [],
-    firstAudioMs: 410,
+    firstAudioMs: null,
     ...over
   }
 }
@@ -184,7 +185,70 @@ describe('while a call is running', () => {
     expect(acted.stopPlayback).toHaveBeenCalledTimes(1)
     expect(acted.hangUp).toHaveBeenCalledTimes(1)
 
+    // The cancellation goes to the host over a different connection, so the voice service being
+    // gone does not take it away.
+    expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeEnabled()
+  })
+
+  // KR-REQ-15.22: the cancellation path needs the host, and only the host.
+  it('refuses a cancellation when the host is the connection that is gone', () => {
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={call({ hostReachable: false })}
+        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        actions={actions()}
+      />
+    )
     expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Mute microphone' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
+  })
+
+  // KR-REQ-15.22, KR-ACC-014: a confirmation names one turn. If the host moves on while the
+  // question is on screen, the answer must not land on the turn that replaced it.
+  it('voids an open confirmation when the host moves to another turn', async () => {
+    const acted = actions()
+    const person = userEvent.setup()
+    const { rerender } = render(
+      <VoiceSurface
+        choice={choice()}
+        call={call()}
+        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        actions={acted}
+      />
+    )
+    await person.click(screen.getByRole('button', { name: 'Cancel the current turn' }))
+    expect(screen.getByRole('button', { name: 'Cancel this turn' })).toBeInTheDocument()
+
+    rerender(
+      <VoiceSurface
+        choice={choice()}
+        call={call()}
+        currentTurn={{ sessionId: 's-1', turnId: 't-10' }}
+        actions={acted}
+      />
+    )
+    expect(screen.queryByRole('button', { name: 'Cancel this turn' })).not.toBeInTheDocument()
+    expect(acted.cancelTask).not.toHaveBeenCalled()
+  })
+
+  // Section 13 line 879: focus follows the question and returns to the control that asked it.
+  it('moves focus into the confirmation and back again', async () => {
+    const person = userEvent.setup()
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={call()}
+        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        actions={actions()}
+      />
+    )
+    await person.click(screen.getByRole('button', { name: 'Cancel the current turn' }))
+    expect(screen.getByRole('button', { name: 'Cancel this turn' })).toHaveFocus()
+
+    await person.click(screen.getByRole('button', { name: 'Keep it running' }))
+    expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toHaveFocus()
   })
 
   // KR-REQ-15.17: an append acknowledgement is shown as admission, never as execution.

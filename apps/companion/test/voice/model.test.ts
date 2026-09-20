@@ -11,6 +11,8 @@ import {
   speechCouldHaveBeenHeard,
   withinCap,
   type CaptureState,
+  type ContextOutcome,
+  type ContextRequest,
   type ProviderChoice,
   type RunningCall,
   type VoiceControl
@@ -34,6 +36,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     capture: 'capturing',
     playing: true,
     brokerReachable: true,
+    hostReachable: true,
     delegations: [],
     requests: [],
     firstAudioMs: null,
@@ -125,22 +128,27 @@ describe('stopping playback and cancelling a task', () => {
 
 describe('what still works when the broker does not', () => {
   // KR-REQ-15.17: local microphone and speaker mute and transport closure remain available.
-  it('keeps the three local controls available with the broker unreachable', () => {
-    const cut = call({ brokerReachable: false })
+  it('keeps the three local controls available with both connections gone', () => {
+    const cut = call({ brokerReachable: false, hostReachable: false })
     for (const control of LOCAL_ONLY_CONTROLS) {
       expect(controlAvailable(control, cut), `${control} is local`).toBe(true)
     }
   })
 
-  it('does not offer the controls that need the broker', () => {
-    const cut = call({ brokerReachable: false })
-    for (const control of ['cancel_task', 'send_context'] as VoiceControl[]) {
-      expect(controlAvailable(control, cut), `${control} needs the host or the broker`).toBe(false)
-    }
+  it('withdraws only the control whose own connection is gone', () => {
+    const noBroker = call({ brokerReachable: false })
+    expect(controlAvailable('send_context', noBroker)).toBe(false)
+    // KR-REQ-15.22: a cancellation is a typed request to the host, so a voice service that has
+    // stopped answering must not take it away.
+    expect(controlAvailable('cancel_task', noBroker)).toBe(true)
+
+    const noHost = call({ hostReachable: false })
+    expect(controlAvailable('cancel_task', noHost)).toBe(false)
+    expect(controlAvailable('send_context', noHost)).toBe(true)
   })
 
-  it('offers all of them again once the broker answers', () => {
-    const live = call({ brokerReachable: true })
+  it('offers both again once both answer', () => {
+    const live = call()
     for (const control of ['cancel_task', 'send_context'] as VoiceControl[]) {
       expect(controlAvailable(control, live)).toBe(true)
     }
@@ -156,8 +164,19 @@ describe('what an append acknowledgement means', () => {
   })
 
   it('has no outcome that means the host ran something', () => {
-    const outcomes = ['sent', 'accepted', 'admitted', 'refused']
-    expect(outcomes).not.toContain('executed')
-    expect(outcomes).not.toContain('done')
+    // The outcomes the model actually defines, read from a request of each kind rather than from a
+    // list written here: a list written here would pass however the model changed.
+    const outcomes: ContextOutcome[] = ['sent', 'accepted', 'admitted', 'refused']
+    const requests: readonly ContextRequest[] = outcomes.map((outcome, index) => ({
+      id: `req_${index}`,
+      command: 'thinking',
+      outcome
+    }))
+    const admitted = requests.filter((request) => request.outcome === 'admitted')
+    expect(admitted).toHaveLength(1)
+    // Admission is the furthest any request can get on this socket. Nothing here promotes it.
+    for (const request of requests) {
+      expect(String(request.outcome)).not.toMatch(/executed|done|ran|receipted/i)
+    }
   })
 })

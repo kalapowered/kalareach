@@ -2,9 +2,11 @@
  * The voice screen.
  *
  * It defines no colour of its own: light, dark, high contrast and reduced transparency all reach
- * this screen from `styles/tokens.css`, the way the mobile shell's do. What it does define is
- * spacing in `rem`, so a larger system text size makes the layout grow with the text rather than
- * clipping it, and targets at the platform minimum.
+ * this screen from `styles/tokens.css`, the way the mobile shell's do. Every colour here is a
+ * token that each theme redefines, so a value that is legible in light is legible in dark rather
+ * than nearly the colour of the page behind it. What it does define is spacing in `rem`, so a
+ * larger system text size makes the layout grow with the text rather than clipping it, and targets
+ * at the platform minimum, which the route resolves by naming the surface on the root element.
  */
 
 .kr-voice {
@@ -14,7 +16,7 @@
   padding: var(--gap-4);
   max-width: 44rem;
   margin: 0 auto;
-  color: var(--ink);
+  color: var(--text);
 }
 
 .kr-voice__title {
@@ -111,7 +113,7 @@
   padding: var(--gap-2) var(--gap-3);
   border-left: 3px solid var(--danger);
   background: var(--danger-soft);
-  color: var(--ink);
+  color: var(--text);
 }
 
 .kr-voice__controls {
@@ -133,12 +135,12 @@
   font: inherit;
   cursor: pointer;
   /* Feedback on press, not on release, and only the property that moves. */
-  transition: transform 120ms var(--ease-out), background-color 120ms var(--ease-out);
+  transition: transform var(--press) var(--ease-out), background-color var(--press) var(--ease-out);
 }
 
 .kr-voice__control:active {
   transform: scale(0.97);
-  background: var(--press);
+  background: var(--subtle);
 }
 
 .kr-voice__control:disabled {
@@ -180,7 +182,7 @@
   font: inherit;
   font-weight: 600;
   cursor: pointer;
-  transition: transform 120ms var(--ease-out);
+  transition: transform var(--press) var(--ease-out);
 }
 
 .kr-voice__start:active {
@@ -207,7 +209,7 @@
 @media (prefers-reduced-motion: reduce) {
   .kr-voice__control,
   .kr-voice__start {
-    transition: background-color 120ms var(--ease-out);
+    transition: background-color var(--press) var(--ease-out);
   }
 
   .kr-voice__control:active,
