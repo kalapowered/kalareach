@@ -394,6 +394,44 @@ describe('the sheet', () => {
     }
   })
 
+  it('comes back to rest after a hold the closing outlived, without travelling', async () => {
+    // Reduced motion, where the surface does not travel and a timer is what says it has arrived.
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query.includes('prefers-reduced-motion'),
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false
+    }))
+    try {
+      start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+      await userEvent.click(await screen.findByTestId('open-settings'))
+      const sheet = await screen.findByTestId('sheet')
+      await waitFor(() => {
+        expect(sheet).toHaveAttribute('data-presentation', 'here')
+      })
+
+      // Held when the surface was closed, so the release lands on nothing at all. The surface that
+      // opens next must still come to rest rather than inheriting a finger that is long gone.
+      screen.getByTestId('sheet-grip').dispatchEvent(gesture('pointerdown', 200, 1_000))
+      await userEvent.keyboard('{Escape}')
+      await waitFor(() => {
+        expect(screen.queryByTestId('sheet')).toBeNull()
+      })
+
+      await userEvent.click(screen.getByTestId('open-settings'))
+      const again = await screen.findByTestId('sheet')
+      await waitFor(() => {
+        expect(again).toHaveAttribute('data-presentation', 'here')
+      })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('dismisses on a downward flick', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('open-settings'))

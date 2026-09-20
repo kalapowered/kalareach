@@ -464,7 +464,12 @@ export function Sheet({
   }, [onClose])
 
   useEffect(() => {
-    if (!mounted) return
+    if (!mounted) {
+      // No surface, so no grab: a finger that was on one when it was taken away never gets its
+      // release, and a grab that outlived its surface must not decide anything about the next one.
+      dragStart.current = null
+      return
+    }
     const sheet = sheetRef.current
     if (!sheet) return
     const height = sheet.offsetHeight || 1

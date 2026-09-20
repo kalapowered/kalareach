@@ -18,9 +18,10 @@ afterEach(cleanup)
 //
 // Neither of these is an estimate of how long the interface takes, and nothing in these tests waits
 // for a length of time: every wait below is a condition, and it costs what it always did when it is
-// met. They are here because some of what is waited for is motion. A sheet arrives and leaves over
-// a fixed number of animation frames, so what it costs is a count of frames, and how long a frame
-// lasts is the machine's answer rather than this application's: the flick that dismisses one spends
+// met. They are here because some of what is waited for is motion. A sheet arrives and leaves one
+// animation frame at a time, and a frame advances it by at most a frame's worth of its own time, so
+// what it costs is frames rather than seconds and how long a frame lasts is the machine's answer
+// rather than this application's: the flick that dismisses one spends
 // three quarters of the library's own one-second default on an idle machine, and a machine running
 // several builds at once would lose to it while nothing at all was wrong. These two are the chosen
 // liveness limits: a machine can always be slow enough to pass any fixed figure, so they are the
