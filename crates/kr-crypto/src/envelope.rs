@@ -179,6 +179,50 @@ pub(crate) fn unpadded_len(opened: &[u8]) -> Result<usize> {
     Ok(content_len)
 }
 
+/// Pads a notification preview's canonical plaintext to its declared size bucket, ISO/IEC 7816-4.
+///
+/// Section 20 rounds notifications to 1 KiB buckets up to 16 KiB. It is the padding every
+/// envelope gets, [`pad_to_bucket`], behind the one bound only a notification preview has.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::TooLarge`] for a plaintext past the 16 KiB band, where the notification
+/// rule and the mailbox rule stop agreeing and a reader with only the padded length could not tell
+/// which produced it.
+pub fn pad_notification_preview(plaintext: &[u8]) -> Result<(Vec<u8>, u64)> {
+    let content_len = plaintext.len() as u64;
+    if content_len > SMALL_MAILBOX_PLAINTEXT_BYTES {
+        return Err(CryptoError::TooLarge {
+            what: "a notification preview",
+            limit: SMALL_MAILBOX_PLAINTEXT_BYTES as usize,
+            actual: content_len as usize,
+        });
+    }
+    // The padding clears what it is given. The caller's plaintext stays the caller's, so what is
+    // padded, and cleared, is a copy.
+    let mut copy = plaintext.to_vec();
+    pad_to_bucket(&mut copy)
+}
+
+/// Removes ISO/IEC 7816-4 padding from a notification preview's padded plaintext.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::Authentication`] when the padding is malformed,
+/// [`CryptoError::BindingMismatch`] when the length is not a valid declared size bucket or does
+/// not match the content's bucket, and [`CryptoError::TooLarge`] for content past the 16 KiB band.
+pub fn unpad_notification_preview(padded: &[u8]) -> Result<&[u8]> {
+    let content_len = unpadded_len(padded)?;
+    if content_len as u64 > SMALL_MAILBOX_PLAINTEXT_BYTES {
+        return Err(CryptoError::TooLarge {
+            what: "a notification preview",
+            limit: SMALL_MAILBOX_PLAINTEXT_BYTES as usize,
+            actual: content_len,
+        });
+    }
+    Ok(&padded[..content_len])
+}
+
 /// Opens one envelope against a previously paired sender key.
 ///
 /// `verify_payload` is called for any payload type that carries authority. It returns the issuer's
@@ -590,5 +634,50 @@ mod tests {
         let mut restored = ReplayLedger::restore(persisted);
         assert_eq!(restored.len(), 1);
         assert!(restored.admit(&plaintext, 2_000).is_err());
+    }
+
+    #[test]
+    fn the_padding_is_the_one_libsodium_removes() {
+        let host = StoredEnvelopeKeyPair::generate().expect("a keypair");
+        let device = StoredEnvelopeKeyPair::generate().expect("a keypair");
+        let plaintext = EnvelopePlaintext {
+            version: EnvelopeVersion::V1,
+            envelope_id: EnvelopeId::new(Uuid::from_bytes([1; 16])),
+            sender_key_id: host.key_id(),
+            recipient_key_id: device.key_id(),
+            created_at_ms: TimestampMs::new(1_000),
+            expires_at_ms: TimestampMs::new(2_000),
+            payload_type: MailboxPayloadType::NotificationPreview,
+            grant_id: Nullable::null(),
+            environment_id: Nullable::null(),
+            session_id: Nullable::null(),
+            session_epoch: Nullable::null(),
+            thread_id: Nullable::null(),
+            payload: Bytes::new(b"a reference".to_vec()),
+        };
+        let encoded = kr_cbor::to_canonical_vec(&plaintext).expect("canonical bytes");
+        let (padded, bucket) = pad_notification_preview(&encoded).expect("a padded plaintext");
+        let (nonce, ciphertext) =
+            sealed::seal_stored_envelope(&host, device.public(), &padded).expect("a ciphertext");
+        let envelope = SealedEnvelope {
+            routing: EnvelopeRouting {
+                envelope_id: plaintext.envelope_id,
+                recipient_key_id: plaintext.recipient_key_id,
+                sender_key_id: plaintext.sender_key_id,
+                expires_at_ms: plaintext.expires_at_ms,
+                payload_type: plaintext.payload_type,
+                thread_id: plaintext.thread_id,
+                size_bucket_bytes: U64::new(bucket),
+            },
+            nonce,
+            ciphertext: Bytes::new(ciphertext),
+        };
+        let opened = open_envelope(&device, host.public(), &envelope, 1_500, |_| Ok(()))
+            .expect("libsodium unpads what this module padded");
+        assert_eq!(opened.payload.as_slice(), b"a reference");
+        assert_eq!(
+            unpad_notification_preview(&padded).expect("the plaintext"),
+            encoded.as_slice()
+        );
     }
 }

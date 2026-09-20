@@ -54,9 +54,9 @@
 //!
 //! Section 20 pads a preview to a declared kibibyte bucket before it is encrypted, with
 //! ISO/IEC 7816-4 padding inside the box, so a ciphertext length describes a bucket rather than a
-//! message. [`pad_to_bucket`] is that rule, and the crate's own test seals a padded plaintext and
-//! opens it through `kr_crypto::envelope::open_envelope`, which unpads with libsodium: the two
-//! agree byte for byte or that test fails.
+//! message. [`kr_crypto::envelope::pad_notification_preview`] is that rule, and `kr_crypto`'s
+//! own test seals a padded plaintext and opens it through `kr_crypto::envelope::open_envelope`,
+//! which unpads with libsodium: the two agree byte for byte or that test fails.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -65,8 +65,7 @@ use kr_crypto::keys::{NotificationPreviewKeyPair, key_id};
 use kr_protocol::ids::{EnvelopeId, EnvironmentId, NotificationId, SessionId};
 use kr_protocol::mailbox::{
     EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MailboxPayloadType, SEAL_OVERHEAD_BYTES,
-    SMALL_MAILBOX_PLAINTEXT_BYTES, granularity_for_bucket, mailbox_granularity,
-    mailbox_size_bucket, notification_granularity,
+    granularity_for_bucket, mailbox_granularity, mailbox_size_bucket, notification_granularity,
 };
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::push::{
@@ -76,9 +75,6 @@ use kr_protocol::push::{
 use kr_protocol::scalars::{Bytes, NotificationPreviewKey, Nullable, TimestampMs, U64};
 
 use crate::error::{DeliveryError, Result};
-
-/// The ISO/IEC 7816-4 padding marker: the first byte of the padding is `0x80`.
-const PAD_MARKER: u8 = 0x80;
 
 /// What a preview carries inside the seal.
 ///
@@ -156,49 +152,6 @@ pub fn check_preview_bound(plaintext: &EnvelopePlaintext) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-/// Pads a canonical plaintext to its declared size bucket, ISO/IEC 7816-4.
-///
-/// The bucket is strictly larger than the plaintext, so there is always at least one padding byte
-/// and the marker can be removed unambiguously.
-///
-/// # Errors
-///
-/// Returns [`DeliveryError::PreviewTooLarge`] for a plaintext past the 16 KiB band, where the
-/// notification rule and the mailbox rule stop agreeing and a reader with only the padded length
-/// could not tell which produced it. `kr_crypto` refuses the same length for the same reason.
-pub fn pad_to_bucket(plaintext: &[u8]) -> Result<(Vec<u8>, u64)> {
-    let content_len = plaintext.len() as u64;
-    if content_len > SMALL_MAILBOX_PLAINTEXT_BYTES {
-        return Err(DeliveryError::PreviewTooLarge {
-            limit: SMALL_MAILBOX_PLAINTEXT_BYTES,
-            actual: content_len,
-        });
-    }
-    let bucket = mailbox_size_bucket(content_len);
-    let mut padded = Vec::with_capacity(bucket as usize);
-    padded.extend_from_slice(plaintext);
-    padded.push(PAD_MARKER);
-    padded.resize(bucket as usize, 0);
-    Ok((padded, bucket))
-}
-
-/// Removes ISO/IEC 7816-4 padding from a plaintext of `bucket` bytes.
-///
-/// # Errors
-///
-/// Returns [`DeliveryError::JournalUnreadable`] when the buffer carries no marker, which is a
-/// buffer that was not padded by this rule.
-pub fn unpad(padded: &[u8]) -> Result<&[u8]> {
-    let marker = padded
-        .iter()
-        .rposition(|byte| *byte != 0)
-        .filter(|position| padded[*position] == PAD_MARKER)
-        .ok_or(DeliveryError::JournalUnreadable(
-            "a padded plaintext carries no ISO/IEC 7816-4 marker",
-        ))?;
-    Ok(&padded[..marker])
-}
-
 /// One preview, sealed and measured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedPreview {
@@ -259,7 +212,7 @@ pub fn seal_preview(
     };
     let encoded = check_preview_bound(&plaintext)?;
     let plaintext_bytes = encoded.len() as u64;
-    let (padded, bucket) = pad_to_bucket(&encoded)?;
+    let (padded, bucket) = kr_crypto::envelope::pad_notification_preview(&encoded)?;
     let (nonce, ciphertext) =
         kr_crypto::sealed::seal_notification_preview(sender, &target.recipient, &padded)?;
     Ok(SealedPreview {
@@ -329,7 +282,7 @@ pub fn open_preview(
             "a preview's declared size bucket is not the length that was sealed",
         ));
     }
-    let unpadded = unpad(padded)?;
+    let unpadded = kr_crypto::envelope::unpad_notification_preview(padded)?;
     if mailbox_size_bucket(unpadded.len() as u64) != bucket {
         return Err(DeliveryError::JournalUnreadable(
             "a preview's declared size bucket is not the one its plaintext rounds to",
@@ -545,7 +498,6 @@ pub fn fresh_notification_id() -> NotificationId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_crypto::keys::StoredEnvelopeKeyPair;
     use kr_protocol::scalars::Uuid;
 
     fn body(summary: &str) -> PreviewBody {
@@ -687,59 +639,6 @@ mod tests {
             preview.envelope.routing.payload_type,
             MailboxPayloadType::NotificationPreview
         );
-    }
-
-    #[test]
-    fn the_padding_is_the_one_libsodium_removes() {
-        // The cross-check that keeps this module's padding and `kr_crypto`'s the same rule: a
-        // plaintext padded here, sealed with the stored-envelope primitive and opened through
-        // `kr_crypto::envelope::open_envelope`, which unpads with libsodium. A disagreement of one
-        // byte fails here rather than on a device.
-        let host = StoredEnvelopeKeyPair::generate().expect("a keypair");
-        let device = StoredEnvelopeKeyPair::generate().expect("a keypair");
-        let plaintext = EnvelopePlaintext {
-            version: EnvelopeVersion::V1,
-            envelope_id: envelope_id(),
-            sender_key_id: key_id(KeyPurpose::StoredEnvelope, host.public().as_bytes()),
-            recipient_key_id: key_id(KeyPurpose::StoredEnvelope, device.public().as_bytes()),
-            payload_type: MailboxPayloadType::StateReference,
-            created_at_ms: TimestampMs::new(1_000),
-            expires_at_ms: TimestampMs::new(2_000),
-            grant_id: Nullable::null(),
-            environment_id: Nullable::null(),
-            session_id: Nullable::null(),
-            session_epoch: Nullable::null(),
-            thread_id: Nullable::null(),
-            payload: Bytes::new(b"a reference".to_vec()),
-        };
-        let encoded = kr_cbor::to_canonical_vec(&plaintext).expect("canonical bytes");
-        let (padded, bucket) = pad_to_bucket(&encoded).expect("a padded plaintext");
-        let (nonce, ciphertext) =
-            kr_crypto::sealed::seal_stored_envelope(&host, device.public(), &padded)
-                .expect("a ciphertext");
-        let envelope = kr_protocol::mailbox::SealedEnvelope {
-            routing: EnvelopeRouting {
-                envelope_id: plaintext.envelope_id,
-                recipient_key_id: plaintext.recipient_key_id,
-                sender_key_id: plaintext.sender_key_id,
-                expires_at_ms: plaintext.expires_at_ms,
-                payload_type: plaintext.payload_type,
-                thread_id: Nullable::null(),
-                size_bucket_bytes: U64::new(bucket),
-            },
-            nonce,
-            ciphertext: Bytes::new(ciphertext),
-        };
-        let opened = kr_crypto::envelope::open_envelope(
-            &device,
-            host.public(),
-            &envelope,
-            1_500,
-            |_| Ok(()),
-        )
-        .expect("libsodium unpads what this module padded");
-        assert_eq!(opened.payload.as_slice(), b"a reference");
-        assert_eq!(unpad(&padded).expect("the plaintext"), encoded.as_slice());
     }
 
     #[test]
