@@ -31,7 +31,9 @@ pub enum DeliveryError {
     #[error("{0} has no explicit rule or grant admitting this content")]
     NotAuthorised(String),
     /// The preview plaintext is over section 16's 1,800-byte bound.
-    #[error("a preview carries {actual} bytes of text and inner metadata, over the {limit}-byte bound")]
+    #[error(
+        "a preview carries {actual} bytes of text and inner metadata, over the {limit}-byte bound"
+    )]
     PreviewTooLarge {
         /// The bound, in bytes.
         limit: u64,
@@ -68,7 +70,9 @@ pub enum DeliveryError {
     #[error("privacy mode has fenced this environment's delivery outbox")]
     Fenced,
     /// A result was produced under a generation that is not the one in force.
-    #[error("a result produced under generation {produced_under} is not publishable under {in_force}")]
+    #[error(
+        "a result produced under generation {produced_under} is not publishable under {in_force}"
+    )]
     LateResult {
         /// The generation the result was produced under.
         produced_under: u64,

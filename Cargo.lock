@@ -4160,6 +4160,7 @@ name = "kr-delivery"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "hmac 0.13.0",
  "kr-attention",
  "kr-cbor",
  "kr-crypto",
@@ -4168,6 +4169,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",

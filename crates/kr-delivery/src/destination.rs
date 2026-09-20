@@ -4,9 +4,9 @@
 //! destination is a paired device: the preview is sealed to a key only that device holds, and the
 //! gateway and the provider forward bytes they cannot read. An **external** destination is a
 //! webhook, Slack, email, Discord or Telegram: the service and its recipients read what arrives.
-//! Section 19 says so in one sentence - *external delivery sends content to the named service and
-//! its recipients and cannot inherit a claim that only encrypted KalaReach endpoints can read it*
-//! - and this module is built so that the sentence cannot be forgotten: every external message
+//! Section 19 says so in one sentence, that external delivery sends content to the named service
+//! and its recipients and cannot inherit a claim that only encrypted KalaReach endpoints can read
+//! it, and this module is built so that the sentence cannot be forgotten: every external message
 //! carries it, and there is no constructor that omits it.
 //!
 //! Both kinds need the same two things before anything leaves, and section 25 names them
@@ -407,12 +407,17 @@ mod tests {
         let keys = PreviewKeys::only(key(1), 1);
         let mut rotated = keys.rotated(key(2), 2, Some(TimestampMs::new(5_000)));
         assert_eq!(
-            rotated.retained_previous(4_999).map(|previous| previous.key),
+            rotated
+                .retained_previous(4_999)
+                .map(|previous| previous.key),
             Some(key(1))
         );
         assert_eq!(rotated.retained_previous(5_000), None);
         rotated.forget_expired(5_000);
-        assert_eq!(rotated.previous, None, "the key is dropped, not just hidden");
+        assert_eq!(
+            rotated.previous, None,
+            "the key is dropped, not just hidden"
+        );
     }
 
     #[test]
