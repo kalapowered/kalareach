@@ -1283,6 +1283,64 @@ fn both_administrative_directories_a_repository_reports_are_excluded() {
     }
 }
 
+/// KR-REQ-14.33 and D-087h: a repository whose own data is named in full, inside its own tree.
+///
+/// The name is absolute, so nothing about it says it leads back into the tree this host is
+/// reading. What decides is the object: the moment the walk stands on the working tree, the rest
+/// of it is the tree's own walk, compared with the tree's mount at every step like any content
+/// read. Otherwise a full name would be the one way into the tree that nothing checked.
+#[test]
+fn a_repository_that_names_its_own_data_in_full_is_still_read_as_this_tree() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "named-in-full");
+    std::fs::rename(path.join(".git"), path.join("common")).expect("the shared data");
+    std::fs::create_dir_all(path.join("meta")).expect("this worktree's own");
+    for name in ["HEAD", "index"] {
+        let from = path.join("common").join(name);
+        if from.exists() {
+            std::fs::copy(&from, path.join("meta").join(name)).expect("its own copy");
+        }
+    }
+    std::fs::write(path.join("meta/commondir"), b"../common\n").expect("naming the shared one");
+    std::fs::write(
+        path.join("meta/config.worktree"),
+        b"[remote]\n\turl = a-secret\n",
+    )
+    .expect("something only this worktree has");
+    // The whole name, as Git writes it for a repository made with `--separate-git-dir`: the name
+    // with nothing left in it to resolve, which is what this host will walk.
+    let named = std::fs::canonicalize(path.join("meta")).expect("the name it would write");
+    std::fs::write(
+        path.join(".git"),
+        format!("gitdir: {}\n", named.display()).as_bytes(),
+    )
+    .expect("and the file that names it");
+    git_raw(&path, ["add", "--force", "meta/config.worktree"]);
+    git_raw(&path, ["commit", "--quiet", "-m", "its own configuration"]);
+
+    let workspace = fixture.workspace("named-in-full");
+    let record = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect("a repository that names its own data in full is captured");
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    for entry in &manifest.paths {
+        assert!(
+            !entry.path.starts_with("meta/") && !entry.path.starts_with("common/"),
+            "neither of this repository's own directories is in its own version: {}",
+            entry.path
+        );
+    }
+}
+
 /// KR-REQ-14.33 and D-087a: a linked worktree's two directories, built by Git itself.
 #[test]
 fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {
