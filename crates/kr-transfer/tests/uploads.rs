@@ -2751,18 +2751,29 @@ fn a_copy_of_one_finish_action_whose_upload_ended_reads_the_ending() {
     let claim = action(&harness, "upload.finish", &bytes);
 
     let (staged_path, _) = payload_paths(&harness, transfer_id, "ended_race.bin");
+    // The claim the other copy of this action left open: the transfer it acts on and no result.
+    let claim_copy = kr_transfer::store::RetainedAction {
+        actor_id: claim.actor_id.clone(),
+        action_id: claim.action_id,
+        method: claim.method.clone(),
+        payload_digest: claim.payload_digest,
+        subject: Some(transfer_id),
+        result: None,
+        recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+    };
     harness
         .service
         .set_staged_open_race_hook(move |store, tid| {
             if tid == transfer_id {
-                // What the cancellation does: it closes the row and takes the payload away.
+                // What the cancellation does: it claims the action, closes the row and takes the
+                // payload away, leaving the claim for this copy to answer.
                 store
                     .close_upload(
                         tid,
                         UploadState::Cancelled,
                         None,
                         kr_protocol::scalars::TimestampMs::new(support::START_MS + 5),
-                        None,
+                        Some(&claim_copy),
                     )
                     .expect("closes the upload");
                 std::fs::remove_file(&staged_path).expect("removes the payload");
@@ -2779,9 +2790,77 @@ fn a_copy_of_one_finish_action_whose_upload_ended_reads_the_ending() {
         "the answer is what ended the upload: {refusal}"
     );
 
-    // The claim carries that refusal, so the other copy of the action is owed the same one.
+    // The claim carries that refusal, so the other copy of the action reads it rather than
+    // working one out again: the same code and the same words, off the record.
     let repeat = harness
         .finish_as(transfer_id, &bytes, Some(&claim))
         .expect_err("the repeat reads the recorded refusal");
     assert_eq!(repeat.code(), refusal.code());
+    assert_eq!(repeat.to_string(), refusal.to_string());
+}
+
+/// KR-REQ-24.09: an upload that ends while its file is being read is answered by the ending.
+///
+/// Verifying a file takes long enough for a cancellation, an expiry or an invalidation to land,
+/// and the copy that comes back from the read finds a row that has ended. What ended it is the
+/// answer, recorded on the action's own claim, so a second copy reads the same one instead of a
+/// refusal that says only that the state was wrong.
+#[test]
+fn an_upload_that_ends_while_its_file_is_read_is_answered_by_the_ending() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "ended_verify.bin")
+        .expect("reserves upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends chunks");
+    let transfer_id = begun.transfer_id;
+    let claim = action(&harness, "upload.finish", &bytes);
+    let claim_copy = kr_transfer::store::RetainedAction {
+        actor_id: claim.actor_id.clone(),
+        action_id: claim.action_id,
+        method: claim.method.clone(),
+        payload_digest: claim.payload_digest,
+        subject: Some(transfer_id),
+        result: None,
+        recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+    };
+    harness
+        .service
+        .set_post_verification_race_hook(move |store, tid| {
+            if tid == transfer_id {
+                store
+                    .close_upload(
+                        tid,
+                        UploadState::Invalidated,
+                        Some("the bytes this upload staged were not the bytes it declared"),
+                        kr_protocol::scalars::TimestampMs::new(support::START_MS + 5),
+                        Some(&claim_copy),
+                    )
+                    .expect("closes the upload");
+            }
+        });
+
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("an upload that ended is not finished");
+    harness.service.clear_post_verification_race_hook();
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::AttachmentIntegrity,
+        "an invalidated upload answers with what invalidated it: {refusal}"
+    );
+    assert!(
+        refusal
+            .to_string()
+            .contains("were not the bytes it declared"),
+        "the answer carries the reason the row recorded: {refusal}"
+    );
+
+    let repeat = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("the repeat reads the recorded refusal");
+    assert_eq!(repeat.code(), refusal.code());
+    assert_eq!(repeat.to_string(), refusal.to_string());
 }

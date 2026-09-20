@@ -1037,6 +1037,17 @@ impl TransferService {
             drop(payloads);
             return self.finish_publishing(actor, params, action, now);
         }
+        if matches!(
+            row.state,
+            UploadState::Cancelled | UploadState::Invalidated | UploadState::Expired
+        ) {
+            // The upload ended while this call was reading the file. What ended it is the answer,
+            // recorded on this action's own claim, so a copy of this action reads the same one
+            // rather than a refusal in another category.
+            drop(store);
+            drop(payloads);
+            return self.refuse_publication(action, publication_refusal(&row));
+        }
         if !row.state.accepts_chunks() {
             return Err(TransferError::WrongState {
                 transfer: row.transfer_id.to_string(),
