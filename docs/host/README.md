@@ -2382,6 +2382,22 @@ nothing new may hold one whose removal has begun.
 `docs/project/` has the ten methods, the identity model, the staged publication, the credential rule
 and the restricted Git execution profile.
 
+## The automation service
+
+The daemon hosts the environment's automation service, which manages workflow definitions,
+runs, and causal budgets.
+
+Workflows execute as versioned directed acyclic graphs of registered action nodes. Each run is
+bound to an explicit grant, an immutable causal root, and a causal budget. The workflow journal
+is an environment SQLite store in the daemon's runtime directory that commits triggers, runs,
+and budget reservations transactionally before execution dispatches.
+
+Admission limits enforce per-workflow concurrency, host-wide rates, and per-grant quotas.
+Breaching a causal budget pauses the chain with error code `CAUSAL_LIMIT`, rejects further
+descendants, and emits an attention event to `kr_attention`.
+
+`docs/automation/` has the five methods, graph validation, the budget model, and source workflow coordination.
+
 ## The host time contract
 
 `kr_worker::action::time` holds this host's time contract. It rests on three anchors and concludes
