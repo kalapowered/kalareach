@@ -141,8 +141,18 @@ function Connect-KrEndpoint {
         if ($IsWindows) {
             # A named pipe is the platform's own owner-only endpoint. Running the module on Windows
             # is qualified separately from this package's own tests.
+            #
+            # The bootstrap address holds the full `\\.\pipe\` path an external client connects to.
+            # NamedPipeClientStream expects the pipe name alone and supplies the server and
+            # namespace itself, so connecting with the prefix passes it twice and fails. Strip the
+            # prefix for the connection while preserving the full address in the handshake proof.
+            $name = if ($Path -like '\\.\pipe\*') {
+                $Path.Substring(9)
+            } else {
+                $Path
+            }
             $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
-                '.', $Path, [System.IO.Pipes.PipeDirection]::InOut,
+                '.', $name, [System.IO.Pipes.PipeDirection]::InOut,
                 [System.IO.Pipes.PipeOptions]::Asynchronous)
             $pipe.Connect(2000)
             return $pipe
