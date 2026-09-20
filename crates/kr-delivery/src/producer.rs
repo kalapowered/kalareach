@@ -191,6 +191,49 @@ pub trait RecipientAuthority: std::fmt::Debug {
     fn scope_for(&self, rule: &DeliveryRule) -> Option<(ViewerScope, BTreeSet<SessionId>)>;
 }
 
+/// A digest of the authority one notification was admitted under.
+///
+/// Section 19 intersects the content policy with the recipient's own authority, so the dispatch
+/// has to be able to ask again and see whether the answer has changed. A digest is what makes that
+/// one comparison rather than a second copy of the grant in this journal.
+///
+/// A push destination has no viewer scope: the recipient is the paired device and the content is
+/// sealed to its own key, so the rule is the whole of it. An external destination has both,
+/// because the grant decides which sessions' lines may be in the message at all.
+///
+/// The scope is digested through its debug rendering, which is the only total view of it this
+/// crate has and is stable for a build: what matters is that two scopes that differ anywhere
+/// produce two digests.
+#[must_use]
+pub fn authority_digest(
+    rule: &DeliveryRule,
+    scope: Option<(&ViewerScope, &BTreeSet<SessionId>)>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut input = format!(
+        "rule={};grant={};",
+        rule.name,
+        rule.grant_id
+            .map_or_else(|| "-".to_owned(), |grant| grant.to_string())
+    );
+    match scope {
+        Some((scope, sessions)) => {
+            let _ = write!(input, "scope={scope:?};sessions=");
+            for session in sessions {
+                let _ = write!(input, "{session},");
+            }
+        }
+        None => input.push_str("scope=-;"),
+    }
+    kr_cbor::sha256(input.as_bytes())
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
 /// What producing from one page did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Produced {
@@ -508,7 +551,9 @@ impl Producer {
             .clone();
         // Section 25's first half applies to a paired device too: a destination with no rule is a
         // destination nobody decided to send to.
-        destination.require_rule()?;
+        let rule = destination.require_rule()?;
+        let destination_digest = destination.binding_digest();
+        let authority_digest = authority_digest(rule, None);
 
         let notification_id = preview::fresh_notification_id();
         let mut budget = self
@@ -529,6 +574,8 @@ impl Producer {
                         destination_id: destination.id.clone(),
                         state: DeliveryState::Collapsed,
                         privacy_generation: generation,
+                        destination_digest,
+                        authority_digest,
                         content: None,
                         payload_bytes: 0,
                         expires_at_ms: notice.expires_at_ms,
@@ -567,6 +614,8 @@ impl Producer {
                 destination_id: destination.id.clone(),
                 state: DeliveryState::Admitted,
                 privacy_generation: generation,
+                destination_digest,
+                authority_digest,
                 content: Some(content),
                 payload_bytes,
                 expires_at_ms: notice.expires_at_ms,
@@ -727,6 +776,8 @@ impl Producer {
         let (scope, sessions) = authority
             .scope_for(rule)
             .ok_or_else(|| DeliveryError::NotAuthorised(destination.id.to_string()))?;
+        let destination_digest = destination.binding_digest();
+        let authority_digest = authority_digest(rule, Some((&scope, &sessions)));
         let notification_id = preview::fresh_notification_id();
         let message = external::compose(
             external_destination.kind,
@@ -745,6 +796,8 @@ impl Producer {
             destination_id: destination.id.clone(),
             state: DeliveryState::Admitted,
             privacy_generation: generation,
+            destination_digest,
+            authority_digest,
             content: Some(content),
             payload_bytes,
             expires_at_ms: notice.expires_at_ms,

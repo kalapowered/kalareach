@@ -374,6 +374,18 @@ pub struct DeliveryRecord {
     pub state: DeliveryState,
     /// The privacy generation it was admitted under.
     pub privacy_generation: u64,
+    /// The destination this was built for, as it stood at admission.
+    ///
+    /// [`DestinationRecord::binding_digest`] covers everything that decides where content goes.
+    /// A claim compares it with the destination configured now, so an endpoint edited after
+    /// admission receives nothing and the record says why.
+    pub destination_digest: String,
+    /// The recipient's authority as it stood at admission.
+    ///
+    /// Section 19 intersects the content policy with the recipient's own authority, and an
+    /// authority that has since changed is not the one the content was admitted under. The
+    /// dispatch asks again and compares.
+    pub authority_digest: String,
     /// The exact bytes that leave this host, until privacy mode or settlement removes them.
     ///
     /// `None` is content this journal no longer holds: removed by privacy mode, or never retained
@@ -475,6 +487,8 @@ pub struct ClaimedDelivery {
     pub expires_at_ms: TimestampMs,
     /// The privacy generation it was admitted under.
     pub privacy_generation: u64,
+    /// The recipient's authority as it stood at admission, for the caller to ask about again.
+    pub authority_digest: String,
     /// The bytes to send.
     pub content: Vec<u8>,
 }
@@ -488,8 +502,13 @@ pub struct ClaimedDelivery {
 pub enum Claim {
     /// The row is this caller's, and is on the wire until it records what happened.
     Taken(Box<ClaimedDelivery>),
-    /// The expiry had passed, so the row was settled as expired instead of being sent.
-    Expired,
+    /// The claim settled the record instead of taking it, and this is what it settled as.
+    ///
+    /// Two things settle here rather than being handed to a sender: an expiry that has passed,
+    /// and a destination that is no longer the one the record was admitted for. Both are answers
+    /// the store already holds, and settling them inside the claim is what stops a caller acting
+    /// on a reading that has gone stale.
+    Settled(DeliveryState),
     /// Nothing was claimed, and the reason is one a person reading the journal can act on.
     Refused(ClaimRefusal),
 }
@@ -1171,11 +1190,22 @@ impl DeliveryJournal {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        type Row = (String, String, i64, i64, i64, Option<Vec<u8>>, Option<i64>);
+        type Row = (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<Vec<u8>>,
+            Option<i64>,
+            String,
+            String,
+        );
         let row: Option<Row> = transaction
             .query_row(
                 "SELECT n.destination_id, n.state, n.attempts, n.expires_at_ms,
-                        n.privacy_generation, n.content, o.due_at_ms
+                        n.privacy_generation, n.content, o.due_at_ms,
+                        n.destination_digest, n.authority_digest
                    FROM delivery_notifications n
                    LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
                   WHERE n.notification_id = ?1",
@@ -1189,11 +1219,23 @@ impl DeliveryJournal {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((destination, state, attempts, expires, record_generation, content, due_at)) = row
+        let Some((
+            destination,
+            state,
+            attempts,
+            expires,
+            record_generation,
+            content,
+            due_at,
+            destination_digest,
+            authority_digest,
+        )) = row
         else {
             return Ok(Claim::Refused(ClaimRefusal::Missing));
         };
@@ -1216,9 +1258,42 @@ impl DeliveryJournal {
             // Section 16 stops at expiry. Settling it here, in the transaction that would
             // otherwise have handed it to a sender, is what makes that true of a pass whose clock
             // moved on while it was blocked.
-            settle_expiry_in(&transaction, &identifier, as_u64(attempts), now_ms)?;
+            settle_in(
+                &transaction,
+                &identifier,
+                as_u64(attempts),
+                now_ms,
+                DeliveryState::Expired,
+                "the notification expired before this attempt could be made",
+            )?;
             transaction.commit()?;
-            return Ok(Claim::Expired);
+            return Ok(Claim::Settled(DeliveryState::Expired));
+        }
+        // The destination this was built for, as it stood at admission, against the destination
+        // configured now. An endpoint edited after admission is another recipient, and content
+        // admitted for the first one is not admitted for it.
+        let configured: Option<DestinationRecord> = transaction
+            .query_row(
+                &format!("{DESTINATION_COLUMNS} WHERE destination_id = ?1"),
+                params![destination],
+                decode_destination,
+            )
+            .optional()?
+            .transpose()?;
+        match configured {
+            Some(configured) if configured.binding_digest() == destination_digest => {}
+            _ => {
+                settle_in(
+                    &transaction,
+                    &identifier,
+                    as_u64(attempts),
+                    now_ms,
+                    DeliveryState::Revoked,
+                    "the destination this was admitted for is not the destination configured now",
+                )?;
+                transaction.commit()?;
+                return Ok(Claim::Settled(DeliveryState::Revoked));
+            }
         }
         if as_u64(due_at) > now_ms {
             return Ok(Claim::Refused(ClaimRefusal::NotDue));
@@ -1252,6 +1327,7 @@ impl DeliveryJournal {
             attempt,
             expires_at_ms: TimestampMs::new(as_u64(expires)),
             privacy_generation: as_u64(record_generation),
+            authority_digest,
             content,
         })))
     }
@@ -1884,8 +1960,8 @@ const DESTINATION_COLUMNS: &str = "SELECT destination_id, kind, enabled, configu
 
 const NOTIFICATION_COLUMNS: &str = "SELECT notification_id, event_key, destination_id, state, \
      privacy_generation, content, payload_bytes, expires_at_ms, admitted_at_ms, attempts, \
-     suppression_reason, suppression_into, suppression_count, suppression_next_ms, detail \
-     FROM delivery_notifications";
+     suppression_reason, suppression_into, suppression_count, suppression_next_ms, detail, \
+     destination_digest, authority_digest FROM delivery_notifications";
 
 type DestinationRow = (
     String,
@@ -2046,6 +2122,8 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
     let count: Option<i64> = row.get(12)?;
     let next: Option<i64> = row.get(13)?;
     let detail: Option<String> = row.get(14)?;
+    let destination_digest: String = row.get(15)?;
+    let authority_digest: String = row.get(16)?;
     Ok((|| {
         let source = event
             .split_once(':')
@@ -2086,6 +2164,8 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
                 "a stored delivery state is not one this build writes",
             ))?,
             privacy_generation: as_u64(generation),
+            destination_digest,
+            authority_digest,
             content,
             payload_bytes: as_u64(payload_bytes),
             expires_at_ms: TimestampMs::new(as_u64(expires)),
@@ -2123,8 +2203,8 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
              (notification_id, event_key, destination_id, state, privacy_generation,
               content, payload_bytes, expires_at_ms, admitted_at_ms, attempts,
               suppression_reason, suppression_into, suppression_count,
-              suppression_next_ms, detail)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?13, ?14, ?10)",
+              suppression_next_ms, detail, destination_digest, authority_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?13, ?14, ?10, ?15, ?16)",
         params![
             record.notification_id.to_string(),
             record.event.stored(),
@@ -2140,6 +2220,8 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
             into,
             count,
             next,
+            record.destination_digest.as_str(),
+            record.authority_digest.as_str(),
         ],
     );
     match written {
@@ -2168,33 +2250,41 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
     Ok(())
 }
 
-/// Settles one record as expired inside a transaction the caller owns.
+/// Settles one record inside a transaction the caller owns, without it ever having been sent.
 ///
-/// It is the answer to a claim whose expiry has already passed: the record is finished, the outbox
-/// row goes and the bytes go with it, and the attempt row says which attempt found it too late.
-fn settle_expiry_in(
+/// It is the answer to a claim the store itself can refuse: an expiry that has passed, or a
+/// destination that is no longer the one the record was admitted for. The record is finished, the
+/// outbox row goes and the bytes go with it, and the attempt row says which attempt found it.
+fn settle_in(
     transaction: &rusqlite::Transaction<'_>,
     identifier: &str,
     attempts: u64,
     now_ms: u64,
+    state: DeliveryState,
+    detail: &str,
 ) -> Result<()> {
-    const DETAIL: &str = "the notification expired before this attempt could be made";
     let attempt = attempts.saturating_add(1);
     transaction.execute(
         "INSERT INTO delivery_attempts
              (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
-         VALUES (?1, ?2, ?3, ?3, 'expired', ?4)
+         VALUES (?1, ?2, ?3, ?3, ?5, ?4)
          ON CONFLICT (notification_id, attempt) DO UPDATE SET
              settled_at_ms = excluded.settled_at_ms,
              outcome = excluded.outcome,
              detail = excluded.detail",
-        params![identifier, as_i64(attempt), as_i64(now_ms), DETAIL],
+        params![
+            identifier,
+            as_i64(attempt),
+            as_i64(now_ms),
+            detail,
+            state.as_str()
+        ],
     )?;
     transaction.execute(
         "UPDATE delivery_notifications
-            SET state = 'expired', attempts = MAX(attempts, ?2), content = NULL, detail = ?3
+            SET state = ?4, attempts = MAX(attempts, ?2), content = NULL, detail = ?3
           WHERE notification_id = ?1",
-        params![identifier, as_i64(attempt), DETAIL],
+        params![identifier, as_i64(attempt), detail, state.as_str()],
     )?;
     transaction.execute(
         "DELETE FROM delivery_outbox WHERE notification_id = ?1",
@@ -2397,6 +2487,8 @@ const SCHEMA: &str = "
         suppression_count INTEGER,
         suppression_next_ms INTEGER,
         detail TEXT,
+        destination_digest TEXT NOT NULL DEFAULT '',
+        authority_digest TEXT NOT NULL DEFAULT '',
         UNIQUE (event_key, destination_id)
     );
     CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -2493,13 +2585,15 @@ mod tests {
         }
     }
 
-    fn delivery(byte: u8, event: EventKey, destination: &str) -> DeliveryRecord {
+    fn delivery(byte: u8, event: EventKey, destination_id: &str) -> DeliveryRecord {
         DeliveryRecord {
             notification_id: NotificationId::new(uuid(byte)),
             event,
-            destination_id: DestinationId::new(destination).expect("an identifier"),
+            destination_id: DestinationId::new(destination_id).expect("an identifier"),
             state: DeliveryState::Admitted,
             privacy_generation: 0,
+            destination_digest: destination(destination_id).binding_digest(),
+            authority_digest: String::new(),
             content: Some(b"{}".to_vec()),
             payload_bytes: 2,
             expires_at_ms: TimestampMs::new(100_000),
@@ -2653,7 +2747,7 @@ mod tests {
             journal
                 .claim(NotificationId::new(uuid(9)), 100_000)
                 .expect("a claim"),
-            Claim::Expired
+            Claim::Settled(DeliveryState::Expired)
         );
         let record = journal
             .delivery(NotificationId::new(uuid(9)))

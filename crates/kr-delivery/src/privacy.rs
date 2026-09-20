@@ -170,6 +170,24 @@ mod tests {
         EventSource::WorkerOutbox.consumer("session-1")
     }
 
+    /// The one external destination these tests send to.
+    fn hook() -> DestinationRecord {
+        DestinationRecord {
+            id: DestinationId::new("hook").expect("an identifier"),
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Webhook,
+                endpoint: "https://example.invalid/hook".to_owned(),
+                idempotency: Idempotency::Unsupported,
+            }),
+            rule: Some(DeliveryRule {
+                name: "on failure".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        }
+    }
+
     /// Claims one delivery the way a pass does, so the record is really on the wire.
     fn claim(journal: &mut DeliveryJournal, byte: u8, now_ms: u64) {
         assert!(
@@ -189,20 +207,7 @@ mod tests {
             .register_consumer(&consumer(), 1)
             .expect("registration");
         journal
-            .configure_destination(&DestinationRecord {
-                id: DestinationId::new("hook").expect("an identifier"),
-                destination: Destination::External(ExternalDestination {
-                    kind: DestinationKind::Webhook,
-                    endpoint: "https://example.invalid/hook".to_owned(),
-                    idempotency: Idempotency::Unsupported,
-                }),
-                rule: Some(DeliveryRule {
-                    name: "on failure".to_owned(),
-                    grant_id: None,
-                }),
-                enabled: true,
-                configured_at_ms: TimestampMs::new(1),
-            })
+            .configure_destination(&hook())
             .expect("a destination");
         for byte in 1..=3u8 {
             journal
@@ -225,6 +230,8 @@ mod tests {
                     destination_id: DestinationId::new("hook").expect("an identifier"),
                     state: DeliveryState::Admitted,
                     privacy_generation: 0,
+                    destination_digest: hook().binding_digest(),
+                    authority_digest: String::new(),
                     content: Some(vec![b'x'; 100]),
                     payload_bytes: 100,
                     expires_at_ms: TimestampMs::new(1_000_000),

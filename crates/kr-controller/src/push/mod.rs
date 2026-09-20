@@ -289,6 +289,7 @@ impl DeliveryModule {
         sender: &dyn PushSender,
         credentials: &dyn SenderCredentials,
         external: &dyn ExternalSender,
+        authority: &dyn RecipientAuthority,
         clock: &dyn Clock,
     ) -> Result<usize> {
         let selected: Vec<DueDelivery> = self.with(|producer| {
@@ -311,9 +312,10 @@ impl DeliveryModule {
             })?;
             let claimed = match claim {
                 Claim::Taken(claimed) => *claimed,
-                // Expired rows settled themselves inside the claim, and a refusal is a record
-                // something else moved: neither is this pass's work any more.
-                Claim::Expired | Claim::Refused(_) => continue,
+                // A record the claim settled - expired, or admitted for a destination that is not
+                // the one configured now - and a refusal are both records this pass has finished
+                // with. Neither is sent.
+                Claim::Settled(_) | Claim::Refused(_) => continue,
             };
             let record = self.with(|producer| {
                 producer
@@ -330,6 +332,18 @@ impl DeliveryModule {
                 )?;
                 continue;
             };
+            // Section 19 intersects the content policy with the recipient's own authority, and
+            // that authority is asked again here rather than trusted from admission. A grant
+            // revoked after the message was built stops it now.
+            if !self.authority_still_holds(&record, &claimed, authority) {
+                self.settle(
+                    &claimed,
+                    DeliveryState::Revoked,
+                    "the recipient's authority is not the one this was admitted under",
+                    clock.now_ms(),
+                )?;
+                continue;
+            }
             attempted += 1;
             if record.as_push().is_some() {
                 self.attempt_push(&claimed, &record, sender, credentials, now_ms, clock)?;
@@ -338,6 +352,31 @@ impl DeliveryModule {
             }
         }
         Ok(attempted)
+    }
+
+    /// Whether the authority a claimed delivery was admitted under is still the authority now.
+    ///
+    /// A push destination's recipient is the paired device, so the rule is the whole of it. An
+    /// external destination's is the grant, and the grant decides which sessions' lines may be in
+    /// the message at all, so it is asked again and the answer compared.
+    fn authority_still_holds(
+        &self,
+        record: &DestinationRecord,
+        claimed: &ClaimedDelivery,
+        authority: &dyn RecipientAuthority,
+    ) -> bool {
+        let Ok(rule) = record.require_rule() else {
+            return false;
+        };
+        let now = if record.as_push().is_some() {
+            kr_delivery::producer::authority_digest(rule, None)
+        } else {
+            let Some((scope, sessions)) = authority.scope_for(rule) else {
+                return false;
+            };
+            kr_delivery::producer::authority_digest(rule, Some((&scope, &sessions)))
+        };
+        now == claimed.authority_digest
     }
 
     fn settle(

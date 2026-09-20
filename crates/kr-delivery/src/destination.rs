@@ -359,6 +359,75 @@ pub struct DestinationRecord {
 }
 
 impl DestinationRecord {
+    /// A digest of everything about this destination that decides where content goes.
+    ///
+    /// It is bound to every notification admitted for the destination and compared again when the
+    /// notification is claimed. Section 25 needs a configured destination *and* an explicit rule
+    /// before content leaves, and both can change after a notification has been built: an endpoint
+    /// edited to another address would otherwise receive content authorised for the first one, and
+    /// a rule removed after admission would not stop the send it authorised. A digest rather than
+    /// a counter, so the binding changes exactly when the destination does and survives a restart
+    /// without anything having to remember a number.
+    ///
+    /// `configured_at_ms` is left out: re-writing an unchanged record is not a change of
+    /// destination.
+    #[must_use]
+    pub fn binding_digest(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut input = String::new();
+        let _ = write!(input, "id={};enabled={};", self.id, self.enabled);
+        match &self.rule {
+            Some(rule) => {
+                let _ = write!(input, "rule={};", rule.name);
+                match rule.grant_id {
+                    Some(grant) => {
+                        let _ = write!(input, "grant={grant};");
+                    }
+                    None => input.push_str("grant=-;"),
+                }
+            }
+            None => input.push_str("rule=-;"),
+        }
+        match &self.destination {
+            Destination::Push(push) => {
+                let _ = write!(
+                    input,
+                    "push;installation={};sender={};previews={};revision={};key={};previous={};mailbox={};",
+                    push.installation_id,
+                    push.sender_record_id,
+                    push.previews_enabled,
+                    push.preview_keys.revision,
+                    hex(push.preview_keys.current.as_bytes()),
+                    push.preview_keys.previous.as_ref().map_or_else(
+                        || "-".to_owned(),
+                        |previous| format!(
+                            "{}:{}",
+                            previous.revision,
+                            hex(previous.key.as_bytes())
+                        )
+                    ),
+                    push.mailbox_key
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), |key| hex(key.as_bytes())),
+                );
+            }
+            Destination::External(external) => {
+                let _ = write!(
+                    input,
+                    "external;kind={};endpoint={};idempotency={};",
+                    external.kind.as_str(),
+                    external.endpoint,
+                    match &external.idempotency {
+                        Idempotency::Supported { field } => field.as_str(),
+                        Idempotency::Unsupported => "-",
+                    },
+                );
+            }
+        }
+        hex(&kr_cbor::sha256(input.as_bytes()))
+    }
+
     /// Returns the rule, or the refusal section 25 requires when there is none.
     ///
     /// # Errors
@@ -388,6 +457,16 @@ impl DestinationRecord {
             Destination::Push(_) => None,
         }
     }
+}
+
+/// Renders bytes as lowercase hexadecimal, for a digest input that has to be unambiguous.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 #[cfg(test)]

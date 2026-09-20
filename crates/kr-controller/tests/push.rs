@@ -381,7 +381,13 @@ fn a_provider_that_queued_it_is_recorded_as_queued() {
     assert_eq!(
         environment
             .module
-            .run_due(&gateway, &credentials, &external, &at(NOW))
+            .run_due(
+                &gateway,
+                &credentials,
+                &external,
+                &Granted(BTreeSet::new()),
+                &at(NOW)
+            )
             .expect("a pass"),
         1
     );
@@ -422,6 +428,7 @@ fn what_reaches_the_gateway_carries_no_command_text_and_no_project_name() {
             &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
             &at(NOW),
         )
         .expect("a pass");
@@ -478,6 +485,7 @@ fn a_destination_with_previews_disabled_still_gets_the_alert() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
             &at(NOW),
         )
         .expect("a pass");
@@ -558,6 +566,7 @@ fn a_rejected_token_disables_the_destination() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
             &at(NOW),
         )
         .expect("a pass");
@@ -596,6 +605,7 @@ fn a_delivery_whose_expiry_arrives_during_the_pass_is_settled_without_sending() 
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
             &ticking(NOW, NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1),
         )
         .expect("a pass");
@@ -639,6 +649,7 @@ fn an_unknown_outcome_is_recorded_and_left_alone() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
             &at(NOW),
         )
         .expect("a pass");
@@ -662,6 +673,7 @@ fn an_unknown_outcome_is_recorded_and_left_alone() {
                 &gateway,
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &ExternalDouble::answering(Vec::new()),
+                &Granted(BTreeSet::new()),
                 &at(NOW + 60_000),
             )
             .expect("a pass"),
@@ -693,6 +705,7 @@ fn a_credential_close_to_expiry_is_renewed_before_it_is_used() {
             &GatewayDouble::queued(),
             &credentials,
             &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
             &at(NOW),
         )
         .expect("a pass");
@@ -728,6 +741,7 @@ fn a_refused_credential_is_renewed_rather_than_presented_again() {
             &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
             &at(NOW),
         )
         .expect("a pass");
@@ -956,6 +970,7 @@ fn an_external_message_never_claims_to_be_private() {
             &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
+            &Granted([session()].into_iter().collect()),
             &at(NOW),
         )
         .expect("a pass");
@@ -1003,6 +1018,7 @@ fn a_destination_without_an_idempotent_identifier_is_not_sent_to_twice() {
             &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
+            &Granted([session()].into_iter().collect()),
             &at(NOW),
         )
         .expect("a pass");
@@ -1021,6 +1037,134 @@ fn a_destination_without_an_idempotent_identifier_is_not_sent_to_twice() {
         })
         .expect("a read");
     assert_eq!(external.sent().len(), 1, "it is not sent again");
+}
+
+/// KR-REQ-18.08: an endpoint edited after admission is another recipient, and content admitted
+/// for the first one does not reach it.
+#[test]
+fn a_destination_whose_endpoint_changed_after_admission_is_not_sent_to() {
+    let environment = environment();
+    let destination = webhook(Idempotency::Unsupported);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let notice = notice(1, "a command failed");
+    environment
+        .module
+        .with(|producer| {
+            let taken = notice.taken(1).expect("an event record");
+            producer
+                .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
+                .expect("a page");
+            producer
+                .produce(
+                    &notice,
+                    std::slice::from_ref(&destination),
+                    &Granted([session()].into_iter().collect()),
+                    &[],
+                    NOW,
+                )
+                .expect("a message");
+            Ok(())
+        })
+        .expect("the producer");
+    // Somebody points the same configured destination at another address.
+    let mut moved = destination.clone();
+    moved.destination = Destination::External(ExternalDestination {
+        kind: DestinationKind::Webhook,
+        endpoint: "https://elsewhere.invalid/hook".to_owned(),
+        idempotency: Idempotency::Unsupported,
+    });
+    environment.module.configure(&moved).expect("a destination");
+    let external = ExternalDouble::answering(Vec::new());
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::queued(),
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &external,
+            &Granted([session()].into_iter().collect()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    assert!(
+        external.sent().is_empty(),
+        "nothing reaches an address the message was not admitted for"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Revoked);
+            assert!(
+                record
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("not the destination configured now"))
+            );
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-18.08 and section 19: the recipient's authority is asked again at dispatch, so a grant
+/// revoked after the message was composed stops it.
+#[test]
+fn an_external_delivery_whose_grant_changed_after_admission_sends_nothing() {
+    let environment = environment();
+    let destination = webhook(Idempotency::Unsupported);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let notice = notice(1, "a command failed");
+    environment
+        .module
+        .with(|producer| {
+            let taken = notice.taken(1).expect("an event record");
+            producer
+                .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
+                .expect("a page");
+            producer
+                .produce(
+                    &notice,
+                    std::slice::from_ref(&destination),
+                    &Granted([session()].into_iter().collect()),
+                    &[],
+                    NOW,
+                )
+                .expect("a message");
+            Ok(())
+        })
+        .expect("the producer");
+    let external = ExternalDouble::answering(Vec::new());
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::queued(),
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &external,
+            // The grant no longer names that session.
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    assert!(external.sent().is_empty(), "the message does not leave");
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Revoked);
+            assert!(
+                record
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("not the one this was admitted under"))
+            );
+            Ok(())
+        })
+        .expect("a read");
 }
 
 /// KR-REQ-16.11: a preview key rotates through the paired channel and the old one is bounded.
@@ -1216,6 +1360,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                 &GatewayDouble::queued(),
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &ExternalDouble::answering(Vec::new()),
+                &Granted(BTreeSet::new()),
                 &at(NOW + 2),
             )
             .expect("a pass"),
