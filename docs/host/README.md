@@ -1411,29 +1411,28 @@ recover from. Exclusive creation is also what stops a second admission of the sa
 writing over ciphertext the first is still accounting for, and that second admission is refused
 outright.
 
-Two limits are stated rather than implied. **On Windows nothing flushes a directory entry**: there
+One limit is stated rather than implied. **On Windows nothing flushes a directory entry**: there
 is no portable way to do it, and opening a directory as a file fails outright, so a staging write
 that tried would fail after the ciphertext was already on the disk. The contents are written and
 flushed on every platform, so a reader never sees a file half written; what a Windows host does not
-get is the guarantee that a *name* survives losing power. And **a crash between the file and the
-row leaves ciphertext nothing claims**. Nothing sweeps it: startup reconciliation and privacy
-cleanup both read the database, so a staged file with no row is invisible to them, and the
-generation it belonged to cannot be admitted again until it is removed by hand.
+get is the guarantee that a *name* survives losing power.
+
+A crash between the file and the row leaves ciphertext no row claims, and the staging directory is
+walked for exactly that. The daemon owns that directory alone, so a file in it that no object row
+names is ciphertext a stop left behind: privacy cleanup writes down a walk of it as one of the
+things a fence owes, and each file the walk finds becomes a removal of its own before the walk is
+finished with. A directory it cannot read leaves the walk owed rather than reported empty.
 
 ### What a restart resolves
 
-Reconciliation runs before anything can add to the store. It looks at settled generations for two
-reasons. **Staged ciphertext a removal has not reached is a removal this host owes**, whether the
-generation was cancelled or published, and the obligation is written down before anything else is: a stop between the cancellation and the removal
-leaves the staged copies here with nothing else to say so, and an obligation recorded afterwards is
-one that stop would lose. A store that will not record it leaves the settlement undone as well, so
-the outbox entry that was counting the cleanup stays where it is and the next reconciliation tries
-again; what must never happen is a store saying nothing is outstanding over a disk that still holds
-the ciphertext. **A settled generation whose outbox is not empty** is what a cancellation
-over work that had already left this host leaves behind, and that wait ends at the restart: nothing
-in the new process can receive the old one's answers, so a dispatched publication makes the outcome
-**unknown** and anything else is **cleared** with the state it settled in, rather than holding
-privacy-mode cleanup open for ever. For everything still unfinished there are four answers.
+Reconciliation runs before anything can add to the store. A generation that has already settled is
+left exactly as it is: what privacy mode is owed was written down when its fence went up, one row
+per target, and a restart reads those rows back rather than working the answer out again. An
+attempt of it that had left this host and was never answered is **not** ended here either. It is
+listed as unanswered and nothing about it changes, because reopening a store says nothing about
+what a service did with bytes that reached it, and a wait ended on that basis would be a cleanup
+reported over work still out there. Only an answer, or the caller establishing that the transfer
+stopped, settles such an attempt. For everything still unfinished there are four answers.
 
 * A generation whose *publication* was dispatched and never answered is recorded as **unknown**,
   and that is decided first. The service may hold it and may not, and a host that wrote either
@@ -1442,8 +1441,10 @@ privacy-mode cleanup open for ever. For everything still unfinished there are fo
 * A generation whose writer this host no longer holds an enrolment **for that archive** is
   **cancelled**. Authority is the pair: an enrolment for one collection does not authorise
   unfinished work for another.
-* A generation left where privacy mode fenced it stays **fenced**. A restart does not un-fence work
-  a fence stopped; turning privacy mode off is what decides what becomes of it.
+* A generation still producing while this host is stopped by privacy mode stays **fenced**. That is
+  a generation admitted before a request whose fence has not gone up yet: a raised fence has
+  already prohibited production for everything it covers. A restart does not un-fence either of
+  them; raising the fence, and then turning privacy mode off, is what decides what becomes of it.
 * Everything else **resumes**, dispatched uploads included. The same object under the same identity
   and hash is the same object, so sending it again is not a second publication.
 
@@ -1528,28 +1529,55 @@ unless explicitly cleared and excluded from later sync while privacy mode is on.
 claimed a functioning durable control system wrote no state at all would be claiming something
 untrue.
 
-Backup production is fenced where it is accounted for. The backup service records the privacy
-generation it is fenced at **durably**, and the record is what stops the work: while a fence is
-recorded, no generation is admitted, no outbox entry is dispatched, and a restart's reconciliation
-leaves fenced work where it is rather than putting it back in hand. The fence also takes back every
-undispatched outbox entry, settles every generation still producing, and removes the staged
-ciphertext this host holds. A generation whose work had already left is settled too, and says so:
-its record is cancelled while its dispatched entry stays, because the entry is what says the
-cleanup is not finished and the settled record is what stops the transfer's end becoming a late
-publication. When that transfer does end, the entry goes and nothing takes its place. An object the
-service acknowledged before privacy mode removed its staged copy still counts as an object that
-arrived, so a generation whose transfers have all finished is not left waiting on one of them.
+Backup production is fenced where it is accounted for, and the fence writes down everything it
+implies in the same breath as raising itself.
 
-It reports only what it actually removed. A file it could not unlink stays in the accounting, and
-the failure becomes a **durable obligation**, named for the step that owed it: it is counted as
-work outstanding, a restart comes back owing what it owed, and the step's own next success clears
-it, so privacy mode cannot report complete over a cleanup that did not happen. A store that will
-not answer at all is itself an obligation, so an unreadable store reports something outstanding
-rather than nothing. A repeated cleanup reports what it actually removed, which over a generation whose
-bytes have already gone is nothing. Three kinds of generation keep their record once their
-bytes have gone: one already published, because it has left and is shown rather than pretended
-away; one whose outcome this host could not establish, for the same reason; and one with work still
-in flight, because its outbox entry is what says the cleanup is not finished.
+The request comes first and on its own. Privacy mode asking this host to stop is committed as a
+**request** before any fence is attempted, together with the single obligation to raise that fence.
+From that moment no generation is admitted and no outbox entry is dispatched, whatever happens
+next: an activation that then fails leaves the request and its obligation behind, so the host is
+stopped, counts the work, and cannot report a fence it did not raise. Only the activation's own
+retry ends it. A store that will not accept even the request leaves no row at all, which is why the
+enabling reports failure and the caller keeps the request to replay: nothing can persist a request
+in the database that would not take it.
+
+Raising the fence is one transaction, and it is the only one that raises a fence. It records the
+fence, moves the privacy generation forward without ever moving it back, prohibits further
+production for every generation still producing, and writes down **one row per piece of cleanup**
+that fence implies: a removal for every staged copy still on this host, a cancellation for every
+outbox entry admitted and never sent, a resolution for every attempt that had already left, the
+bookkeeping each generation still needs, and one walk of the staging directory. It reads the rows
+as they are rather than any summary, so a generation that is staging, uploading, cancelled,
+published or of unknown outcome is covered on the same terms: if its ciphertext is here, its
+removal is written down.
+
+From there a piece of cleanup ends exactly one way. The effect and the row that discharges it
+commit together, in the transaction that records the result, and there is no call anywhere that
+clears one on its own. A removal reads its obligation, unlinks the file, flushes the directory
+entry where the platform allows it, and commits the file's absence and the discharge as one thing;
+a stop in between leaves the obligation, and the retry finds the file already gone, which is
+exactly what it expects. A file this host could not unlink keeps its own row, with the reason
+written beside it as a diagnostic: the attempt count and the error message are never the identity
+and never the clearance condition, so failing to write them changes nothing. There is no count of
+cleanup held in memory and no obligation named by a string, because what is owed *is* the set of
+rows and what is complete is the absence of them.
+
+A generation's bookkeeping is finished by whichever transaction makes the last thing it waits on
+true, rather than by a step somebody has to remember to take. It waits for the staging walk, for
+every removal of its own, and for every attempt of it to be settled; only then are its rows taken,
+and only for a generation that has nothing to show. Two kinds keep their record: one already
+published, because it has left and is shown rather than pretended away, and one whose outcome this
+host could not establish, for the same reason. What a cleanup pass reports is what it actually did
+— bytes it unlinked and rows it deleted — so a pass over a generation whose bytes have already
+gone reports nothing, and a pass that keeps a published generation's record reports its bytes and
+no records at all.
+
+An acknowledgement that arrives late ends its own attempt and nothing else. It does not put a file
+back: where the ciphertext is and what the service holds are separate facts, so an object privacy
+mode has already removed stays removed and still counts as an object that arrived. It enqueues no
+publication while a fence stands. And removing the local copy is not evidence about the transfer:
+an attempt that left this host keeps its obligation until an answer arrives or the caller
+establishes that the transfer stopped.
 
 A publication is recorded only under the generation *this host admitted the work under*, which it
 reads from its own store rather than taking from the caller. A result from an earlier generation is
@@ -1557,8 +1585,15 @@ refused, and so is one relabelled with the generation in force. What stops a pub
 reaching a service is the dispatch gate rather than this: recording a refusal cannot recall
 something already sent, which is why the fence stops the send.
 
-Turning privacy mode off releases the fence, under a generation of its own. Nothing the fence
-cancelled comes back; what is admitted afterwards is admitted under the new generation.
+Turning privacy mode off releases the fence, under a generation of its own, and only when nothing
+is owed under it. The release names both generations — the fence to bring down and the one
+production resumes under — so it can neither clear a newer fence nor move the generation in force
+backwards, and it is refused outright while that fence still has cleanup outstanding: new backup
+content does not enter a scope this host has not finished clearing, and the caller is told the
+resumption is still pending. The rule lives in the database as well as in the code, so a writer
+that went round the store cannot release such a fence or delete it instead, and cannot add cleanup
+to a fence already released. Nothing the fence cancelled comes back; what is admitted afterwards is
+admitted under the new generation.
 
 What has already left the host is shown rather than erased. An uploaded archive is listed by its
 archive and generation, and so is one whose outcome this host could not establish, because a copy
