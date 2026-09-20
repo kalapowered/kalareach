@@ -2429,19 +2429,47 @@ fn two_concurrent_copies_of_one_cancel_action_release_once() {
     );
 }
 
-/// D-114.9: upload_finish when already in Publishing state waits for or resolves publication
-/// and returns the attachment handle rather than throwing ResourceUnavailable.
+/// D-114.9: upload_finish when state transitions to Publishing between initial read and lock
+/// waits for or resolves publication and returns the attachment handle rather than throwing
+/// ResourceUnavailable.
 #[test]
-fn upload_finish_when_already_publishing_resolves_and_succeeds() {
+fn upload_finish_transition_to_publishing_before_lock_resolves_and_succeeds() {
     let harness = Harness::create();
     let bytes = pattern(256);
-    let (transfer_id, _staged) = interrupted_publication(&harness, &bytes, "in_flight.bin", None);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "race_publishing.bin")
+        .expect("reserves upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends chunks");
+    let transfer_id = begun.transfer_id;
 
-    // Now call upload_finish on the in-flight publication. Under the lock it finds Publishing.
-    // It must resolve the publication and succeed without throwing RESOURCE_UNAVAILABLE.
+    let (staged_path, _) = payload_paths(&harness, transfer_id, "race_publishing.bin");
+    let bytes_copy = bytes.clone();
+    harness.service.set_finish_race_hook(move |store, tid| {
+        if tid == transfer_id {
+            let staged_id = identity_of(&staged_path);
+            store
+                .begin_publish(
+                    tid,
+                    &kr_transfer::store::Publication {
+                        content_digest: digest(&bytes_copy),
+                        payload_identity: staged_id,
+                        preview: None,
+                        preview_unavailable: None,
+                    },
+                    kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                    None,
+                )
+                .expect("records intent to publish");
+        }
+    });
+
+    // upload_finish starts while state is Incomplete, initial check sees Incomplete, then hook
+    // moves it to Publishing before the lock. It must resolve and succeed, not fail as unavailable.
     let result = harness
         .finish_as(transfer_id, &bytes, None)
-        .expect("upload_finish on Publishing state resolves and succeeds");
+        .expect("upload_finish on Publishing transition resolves and succeeds");
     assert_eq!(result.handle.content_digest, digest(&bytes));
 
     let status = harness
@@ -2449,34 +2477,112 @@ fn upload_finish_when_already_publishing_resolves_and_succeeds() {
         .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
         .expect("reads status");
     assert_eq!(status.state, UploadState::Published);
+    harness.service.clear_finish_race_hook();
 }
 
-/// D-114.9: upload_finish when already in Published state returns the handle without throwing
-/// ResourceUnavailable.
+/// D-114.9: upload_finish when state transitions to Published between initial read and lock
+/// returns the handle without throwing ResourceUnavailable.
 #[test]
-fn upload_finish_when_already_published_returns_handle_without_unavailable_error() {
+fn upload_finish_transition_to_published_before_lock_returns_handle() {
     let harness = Harness::create();
     let bytes = pattern(256);
     let begun = harness
-        .begin(&bytes, "application/octet-stream", "published.bin")
+        .begin(&bytes, "application/octet-stream", "race_published.bin")
         .expect("reserves upload");
     harness
         .send_all(begun.transfer_id, &bytes)
         .expect("sends chunks");
+    let transfer_id = begun.transfer_id;
 
-    // First finish publishes the attachment.
-    let first = harness
-        .finish_as(begun.transfer_id, &bytes, None)
-        .expect("first finish succeeds");
-    assert!(!first.already_published);
+    let (staged_path, published_path) = payload_paths(&harness, transfer_id, "race_published.bin");
+    let bytes_copy = bytes.clone();
+    harness.service.set_finish_race_hook(move |store, tid| {
+        if tid == transfer_id {
+            std::fs::rename(&staged_path, &published_path).expect("moves to complete");
+            let published_id = identity_of(&published_path);
+            store
+                .begin_publish(
+                    tid,
+                    &kr_transfer::store::Publication {
+                        content_digest: digest(&bytes_copy),
+                        payload_identity: published_id,
+                        preview: None,
+                        preview_unavailable: None,
+                    },
+                    kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                    None,
+                )
+                .expect("records begin publish");
+            store
+                .complete_publish(
+                    tid,
+                    kr_protocol::scalars::TimestampMs::new(support::START_MS + 10),
+                    kr_protocol::scalars::TimestampMs::new(support::START_MS + 100_000),
+                )
+                .expect("records complete publish");
+        }
+    });
 
-    // Second finish on the already published upload under lock must return already_published: true
-    // and the same handle, rather than throwing RESOURCE_UNAVAILABLE.
-    let second = harness
-        .finish_as(begun.transfer_id, &bytes, None)
+    // upload_finish starts while state is Incomplete, initial check sees Incomplete, then hook
+    // publishes the upload before the lock. It must return already_published: true, not fail as unavailable.
+    let result = harness
+        .finish_as(transfer_id, &bytes, None)
         .expect("second finish on Published upload succeeds");
-    assert!(second.already_published);
-    assert_eq!(second.handle, first.handle);
+    assert!(result.already_published);
+    assert_eq!(result.handle.content_digest, digest(&bytes));
+    harness.service.clear_finish_race_hook();
+}
+
+/// D-114.9: upload_finish when state transitions to Publishing during file verification resolves
+/// publication and returns the attachment handle rather than throwing ResourceUnavailable.
+#[test]
+fn upload_finish_transition_to_publishing_after_verification_resolves() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "race_post_verify.bin")
+        .expect("reserves upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends chunks");
+    let transfer_id = begun.transfer_id;
+
+    let (staged_path, _) = payload_paths(&harness, transfer_id, "race_post_verify.bin");
+    let bytes_copy = bytes.clone();
+    harness
+        .service
+        .set_post_verification_race_hook(move |store, tid| {
+            if tid == transfer_id {
+                let staged_id = identity_of(&staged_path);
+                store
+                    .begin_publish(
+                        tid,
+                        &kr_transfer::store::Publication {
+                            content_digest: digest(&bytes_copy),
+                            payload_identity: staged_id,
+                            preview: None,
+                            preview_unavailable: None,
+                        },
+                        kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                        None,
+                    )
+                    .expect("records intent to publish");
+            }
+        });
+
+    // upload_finish verifies file, but before taking lock another caller moved state to Publishing.
+    // It must resolve and succeed, not fail with WrongState / ResourceUnavailable.
+    let result = harness
+        .finish_as(transfer_id, &bytes, None)
+        .expect("upload_finish on post-verification Publishing resolves and succeeds");
+    assert_eq!(result.handle.content_digest, digest(&bytes));
+
+    let status = harness
+        .service
+        .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+        .expect("reads status");
+    assert_eq!(status.state, UploadState::Published);
+    harness.service.clear_post_verification_race_hook();
 }
 
 /// D-114.9: an expired upload claim settled by resolve_claims unifies with check_live and

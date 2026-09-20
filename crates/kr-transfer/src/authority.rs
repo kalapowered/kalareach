@@ -436,6 +436,9 @@ pub enum ObjectPolicy {
     ReadableFile,
 }
 
+#[cfg(target_os = "macos")]
+pub use crate::apple::AppleAcl;
+
 /// An access-control list read from or applied to a file descriptor.
 ///
 /// Each platform stores an access-control list differently. On Apple platforms it lives beside
@@ -446,9 +449,9 @@ pub enum ObjectPolicy {
 pub enum AccessControl {
     /// The file carries no access-control list beyond its mode bits.
     None,
-    /// An Apple extended access-control list native binary representation.
+    /// An Apple extended access-control list validated native binary representation.
     #[cfg(target_os = "macos")]
-    Apple(Vec<u8>),
+    Apple(AppleAcl),
     /// A POSIX access-control list raw attribute bytes on Linux.
     #[cfg(target_os = "linux")]
     Posix(Vec<u8>),
@@ -466,11 +469,11 @@ impl AccessControl {
     /// Note that on unsupported platforms, this returns `false` because no access-control entries
     /// could be parsed, not because the underlying file is guaranteed to carry no access control.
     #[must_use]
-    pub const fn has_entries(&self) -> bool {
+    pub fn has_entries(&self) -> bool {
         match self {
             Self::None => false,
             #[cfg(target_os = "macos")]
-            Self::Apple(_) => true,
+            Self::Apple(acl) => acl.has_entries() || acl.has_flags(),
             #[cfg(target_os = "linux")]
             Self::Posix(_) => true,
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1233,7 +1236,7 @@ impl AuthorisedFile {
             use std::os::fd::AsFd as _;
 
             match crate::apple::read_access_control(self.file.as_fd())? {
-                Some(bytes) => Ok(AccessControl::Apple(bytes)),
+                Some(acl) => Ok(AccessControl::Apple(acl)),
                 None => Ok(AccessControl::None),
             }
         }
@@ -1264,8 +1267,8 @@ impl AuthorisedFile {
 
             match acl {
                 AccessControl::None => crate::apple::set_access_control(self.file.as_fd(), None),
-                AccessControl::Apple(bytes) => {
-                    crate::apple::set_access_control(self.file.as_fd(), Some(bytes))
+                AccessControl::Apple(apple_acl) => {
+                    crate::apple::set_access_control(self.file.as_fd(), Some(apple_acl))
                 }
             }
         }

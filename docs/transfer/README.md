@@ -349,12 +349,13 @@ inside the service's own owner-only private directory, where anything able to sw
 name could already have tampered with the bytes before they were verified.
 
 A byte copy of a source this service does not own is not an atomic snapshot (Residual 6). Two
-uncoordinated reads without coordinated locking do not constitute an atomic snapshot across multiple
-files. It refuses every change the host can observe: the source's identity, its size, its modification
-time, and the digest of a second bounded read compared with the copy. A writer that reproduces the same
-interleaving in both reads is not excluded. Where the filesystem offers a clone, `cloned_snapshot` has
-the property outright, and a caller that needs it on a filesystem without one coordinates with the
-writer or copies the file itself.
+uncoordinated reads without coordinated locking do not constitute an atomic snapshot, whether for
+a single file being rewritten concurrently or across multiple files. It refuses every change the
+host can observe: the source's identity, its size, its modification time, and the digest of a second
+bounded read compared with the copy. A writer that reproduces the same interleaving in both reads is
+not excluded. Where the filesystem offers a clone, `cloned_snapshot` has the property outright, and
+a caller that needs it on a filesystem without one coordinates with the writer or copies the file
+itself.
 
 ### What this does not promise
 
@@ -395,6 +396,12 @@ platforms. `cap-std`'s own documentation is the authority on what that leaves op
 Residual 4 (native Windows qualification): the Windows cross-compilation and check gates pass under
 `x86_64-pc-windows-gnu`. Native Windows runtime qualification is assigned to worker T-025, respecting
 lead ruling D-114.8 (T-024b holds the Windows host during current qualification passes).
+
+D-114.10: The `kr-ipc` shared check is owned by worker T-024b and is not modified in this follow-up.
+
+D-081 residual 8: The create-and-open primitive for materialisations is intentionally not built
+(documented system limitation); materialisation directories are created and subsequently opened
+through descriptors, bounded by the emptiness check.
 
 Under KR-REQ-14.29, `AuthorisedFile` exposes descriptor-bound access-control list inspection
 (`access_control`), restoration (`set_access_control`), and clearing (`clear_access_control`), used

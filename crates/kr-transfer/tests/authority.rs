@@ -590,10 +590,17 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
         !file.carries_access_control(),
         "a file whose protection is its mode bits alone carries no list"
     );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     assert_eq!(
         file.access_control().expect("reads access control"),
         kr_transfer::AccessControl::None,
         "ordinary file has no access-control list"
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    assert_eq!(
+        file.access_control().expect("reads access control"),
+        kr_transfer::AccessControl::Unsupported,
+        "ordinary file reports Unsupported on non-Apple non-Linux platform"
     );
     drop(file);
 
@@ -616,10 +623,7 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
             .status();
         match (s1, s2) {
             (Ok(a), Ok(b)) if a.success() && b.success() => Ok(a),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "chmod failed",
-            )),
+            _ => Err(std::io::Error::other("chmod failed")),
         }
     } else {
         std::process::Command::new("setfacl")
@@ -939,4 +943,55 @@ fn mount_race() {
         );
         println!("{read} reads resolved, {refused} were refused, over {mounts} mounts");
     });
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_macos_access_control_list_preserves_acl_level_flags() {
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("flagged.txt").expect("a name");
+    std::fs::write(root.path().join("flagged.txt"), b"flagged\n").expect("a file");
+
+    let file = authority.open_write(&name).expect("opens write");
+
+    // Construct an AppleAcl carrying an entry and an ACL-level flag (e.g. ACL_FLAG_DEFER_INHERIT = 1).
+    // Validate that setting and re-reading preserves both the entry and the flags independently.
+    let mut raw = vec![0_u8; 68];
+    // Magic: 0x012cc16d
+    raw[0..4].copy_from_slice(&0x012c_c16d_u32.to_ne_bytes());
+    // Entry count: 1 at offset 36
+    raw[36..40].copy_from_slice(&1_u32.to_ne_bytes());
+    // Flags: 1 (ACL_FLAG_DEFER_INHERIT) at offset 40
+    raw[40..44].copy_from_slice(&1_u32.to_ne_bytes());
+    // An ACE entry (24 bytes) at offset 44..68
+    raw[44..68].copy_from_slice(&[
+        0x01, 0x00, 0x00, 0x00, // tag type
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // qualifier
+        0x01, 0x00, 0x00, 0x00, // permissions
+        0x00, 0x00, 0x00, 0x00, // flags
+    ]);
+    let acl = kr_transfer::AppleAcl::from_bytes(&raw).expect("valid flagged acl");
+    assert_eq!(acl.entry_count(), 1);
+    assert_eq!(acl.flags(), 1);
+    assert!(acl.has_flags());
+
+    file.set_access_control(&kr_transfer::AccessControl::Apple(acl.clone()))
+        .expect("sets flagged acl");
+    drop(file);
+
+    let read_back = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("opens read");
+    assert!(read_back.carries_access_control());
+    let read_acl = read_back.access_control().expect("reads acl");
+    match read_acl {
+        kr_transfer::AccessControl::Apple(read_apple) => {
+            assert_eq!(read_apple.flags(), 1, "ACL-level flags are preserved");
+            assert_eq!(read_apple.entry_count(), 1, "ACE entries are preserved");
+            assert_eq!(read_apple, acl, "exact binary ACL matches");
+        }
+        _ => panic!("expected Apple ACL"),
+    }
 }

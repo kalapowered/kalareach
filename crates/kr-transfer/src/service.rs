@@ -310,6 +310,17 @@ pub enum RetainedOutcome {
     },
 }
 
+pub(crate) type RaceHookCallback = dyn Fn(&mut Store, TransferId) + Send + Sync;
+
+#[derive(Clone)]
+pub(crate) struct RaceHook(pub(crate) Arc<RaceHookCallback>);
+
+impl core::fmt::Debug for RaceHook {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RaceHook(..)")
+    }
+}
+
 /// The transfer service of one environment.
 #[derive(Debug)]
 pub struct TransferService {
@@ -327,6 +338,8 @@ pub struct TransferService {
     pub(crate) clock: Arc<dyn Clock>,
     /// Set to stage every snapshot by copying its bytes, even where the filesystem clones.
     pub(crate) copy_snapshots: std::sync::atomic::AtomicBool,
+    pub(crate) finish_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
+    pub(crate) post_verification_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
 }
 
 impl TransferService {
@@ -365,7 +378,41 @@ impl TransferService {
             payloads: Mutex::new(()),
             clock,
             copy_snapshots: std::sync::atomic::AtomicBool::new(false),
+            finish_race_hook: Arc::new(std::sync::RwLock::new(None)),
+            post_verification_race_hook: Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn set_finish_race_hook<F>(&self, hook: F)
+    where
+        F: Fn(&mut Store, TransferId) + Send + Sync + 'static,
+    {
+        *self.finish_race_hook.write().expect("not poisoned") = Some(RaceHook(Arc::new(hook)));
+    }
+
+    #[doc(hidden)]
+    pub fn clear_finish_race_hook(&self) {
+        *self.finish_race_hook.write().expect("not poisoned") = None;
+    }
+
+    #[doc(hidden)]
+    pub fn set_post_verification_race_hook<F>(&self, hook: F)
+    where
+        F: Fn(&mut Store, TransferId) + Send + Sync + 'static,
+    {
+        *self
+            .post_verification_race_hook
+            .write()
+            .expect("not poisoned") = Some(RaceHook(Arc::new(hook)));
+    }
+
+    #[doc(hidden)]
+    pub fn clear_post_verification_race_hook(&self) {
+        *self
+            .post_verification_race_hook
+            .write()
+            .expect("not poisoned") = None;
     }
 
     /// Stages every snapshot by copying its bytes, even where the filesystem offers a clone.
@@ -805,6 +852,13 @@ impl TransferService {
                 _ => {}
             }
         }
+        {
+            let hook = self.finish_race_hook.read().expect("not poisoned").clone();
+            if let Some(hook) = hook {
+                let mut store = self.locked()?;
+                (hook.0)(&mut store, params.transfer_id);
+            }
+        }
         let row = {
             let mut store = self.locked()?;
             let row = upload_of(&store, params.transfer_id, actor)?;
@@ -911,6 +965,17 @@ impl TransferService {
             }
             None => None,
         };
+        {
+            let hook = self
+                .post_verification_race_hook
+                .read()
+                .expect("not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                let mut store = self.locked()?;
+                (hook.0)(&mut store, params.transfer_id);
+            }
+        }
         // Taken before the journal's lock, and held over both commits, so a cancellation, a
         // sweep or a recovery cannot act on this payload between them.
         let payloads = self.payloads.lock().map_err(|_| poisoned())?;

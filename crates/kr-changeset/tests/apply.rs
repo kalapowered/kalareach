@@ -567,19 +567,23 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
                     ))
                 );
                 let staged_path = racing.join(temporary);
-                if cfg!(target_os = "macos") {
-                    let _ = std::process::Command::new("/bin/chmod")
+                let status = if cfg!(target_os = "macos") {
+                    std::process::Command::new("/bin/chmod")
                         .arg("+a")
                         .arg(format!("{who} allow read"))
                         .arg(&staged_path)
-                        .status();
+                        .status()
                 } else {
-                    let _ = std::process::Command::new("setfacl")
+                    std::process::Command::new("setfacl")
                         .arg("-m")
                         .arg(format!("u:{who}:r"))
                         .arg(&staged_path)
-                        .status();
-                }
+                        .status()
+                };
+                assert!(
+                    status.expect("tampering command ran").success(),
+                    "tampering staged ACL succeeded"
+                );
             }
         })),
         stop: false,
@@ -597,31 +601,24 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
         &limitations,
     );
     let result = apply::apply(fixture.service(), &order).expect("the apply runs");
-    // If chmod/setfacl succeeded during staging, the verification must fail.
-    let authority = kr_transfer::AuthorisedDirectory::open_root(
-        fixture.service().environment_id(),
-        &destination,
-    )
-    .expect("opens authority");
-    let name = kr_transfer::RelativeName::parse("README.md").expect("valid name");
-    if let Ok(file) = authority.open_read(&name, kr_transfer::ObjectPolicy::ReadableFile) {
-        if file.carries_access_control() {
-            assert_ne!(result.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
-            assert_eq!(result.unresolved_paths, vec!["README.md".to_owned()]);
-            let row = result
-                .progress
-                .iter()
-                .find(|row| row.path == "README.md")
-                .expect("the path is named");
-            assert_eq!(row.state, PathProgressState::Unresolved);
-            assert!(
-                row.detail
-                    .contains("under permissions this host did not set on it"),
-                "the row says what happened: {}",
-                row.detail
-            );
-        }
-    }
+    assert_ne!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "tampered staged ACL must not report Applied"
+    );
+    assert_eq!(result.unresolved_paths, vec!["README.md".to_owned()]);
+    let row = result
+        .progress
+        .iter()
+        .find(|row| row.path == "README.md")
+        .expect("the path is named");
+    assert_eq!(row.state, PathProgressState::Unresolved);
+    assert!(
+        row.detail
+            .contains("under permissions this host did not set on it"),
+        "the row says what happened: {}",
+        row.detail
+    );
 }
 
 /// KR-REQ-14.28: a direct apply is not chosen until its limitation has been shown.

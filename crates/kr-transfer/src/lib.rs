@@ -77,6 +77,8 @@ pub mod store;
 )]
 mod apple;
 
+#[cfg(target_os = "macos")]
+pub use crate::apple::AppleAcl;
 pub use crate::authority::{
     AccessControl, AuthorisedDirectory, AuthorisedFile, Escape, MountId, ObjectIdentity,
     ObjectPolicy, Privacy, RelativeName,
