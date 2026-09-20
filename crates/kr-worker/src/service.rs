@@ -5098,10 +5098,13 @@ mod tests {
     /// This fills a peer's socket to put a writer mid-frame, which is a property of the socket
     /// rather than of the code under test. A Windows named pipe does not fill the way a Unix
     /// domain socket does - the same frame goes straight into it - so the arrangement never
-    /// happens there and the test fails at its own setup rather than at what it is for. What it
-    /// checks holds on Windows too; establishing that needs an arrangement this test does not
-    /// have, and nobody has written one.
-    #[cfg(unix)]
+    /// happens there and the test fails at its own setup rather than at what it is for. Whether
+    /// what it checks holds on Windows is **not** established by skipping it; establishing that
+    /// needs an arrangement this test does not have, and nobody has written one.
+    #[cfg_attr(
+        windows,
+        ignore = "a Windows named pipe does not fill the way this test's own setup needs"
+    )]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_protected_write_waiting_for_a_peer_ends_at_the_withdrawal() {
         let (_temp, writable, writer, _reader) = connected().await;

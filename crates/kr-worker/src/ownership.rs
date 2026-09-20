@@ -685,6 +685,41 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn an_answer_the_boundary_gave_is_the_answer_it_keeps() {
+        // The case a cache is for: the first ask succeeds, and by the time the second would run
+        // the boundary has gone. Without the cache the closure would read complete coverage from
+        // the resources and incomplete from the coverage, and the receipt would carry a reason it
+        // was built before.
+        let job =
+            std::sync::Arc::new(crate::windows::job::SessionJob::create().expect("a job object"));
+        let root = 0xFFFF_FFF3;
+        crate::windows::job::record(root, &job);
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::JobObject { root },
+            identity(u64::from(u32::MAX) + 1),
+        );
+
+        // Asked once here, while the job is there and empty.
+        let resources = owned.surviving_resources();
+        assert!(resources.is_empty(), "{resources:?}");
+
+        // And now it has gone, which is what a second ask would find.
+        drop(job);
+        assert!(crate::windows::job::holding(root).is_none());
+        assert_eq!(
+            owned.coverage(),
+            OwnershipCoverage::Complete,
+            "the coverage is the answer the boundary gave, not one taken afterwards"
+        );
+        assert!(
+            owned.unestablished().is_empty(),
+            "and nothing was recorded after the receipt was built: {:?}",
+            owned.unestablished()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn the_boundary_is_asked_once_however_many_times_the_answer_is_read() {
         // A closure reads the surviving resources and then the coverage. Both need the boundary's
         // answer, and two observations could disagree: a reason the second produced would be

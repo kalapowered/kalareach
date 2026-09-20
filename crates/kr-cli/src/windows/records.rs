@@ -33,6 +33,9 @@ use windows_sys::Win32::System::Console::{
 
 use crate::error::{CliError, Result};
 
+/// The Tab key, whose shifted form is a sequence rather than the character the console reports.
+const VK_TAB: u16 = 0x09;
+
 /// How many records one read asks the console for.
 ///
 /// A held key, a paste and an IME commit all arrive as runs of records, so a read that asked for
@@ -405,8 +408,10 @@ fn flush_text(units: &mut Vec<u16>, out: &mut Vec<u8>) {
 ///
 /// * a record with no Control held. Shift and Tab carries a control character too, and it is the
 ///   key it is rather than a tab;
-/// * a record with Shift held as well. Ctrl, Shift and Tab is a chord the legacy encoding has no
-///   spelling for, and sending a plain tab for it would be a different key;
+/// * Ctrl, Shift and Tab. The console reports a tab for it, and this encoding has no spelling for
+///   the chord; sending a plain tab would be a different key. Shift alone does not disqualify a
+///   record - Ctrl, Shift and Return is still a line feed, and Ctrl, Shift and Space is still the
+///   code a byte cannot otherwise carry;
 /// * AltGr, which is how a layout produces a character rather than a chord.
 ///
 /// Alt held with Control **is** read this way, and reported, because the escape prefix an
@@ -419,7 +424,9 @@ fn console_control(record: &KeyRecord) -> Option<(u8, bool)> {
         & (control_keys::LEFT_CTRL_PRESSED | control_keys::RIGHT_CTRL_PRESSED)
         != 0;
     let shift = record.control_keys & control_keys::SHIFT_PRESSED != 0;
-    if !control || shift || record.is_alt_graph() {
+    // Tab is the one key whose shifted form this encoding spells differently, and the console's
+    // own character does not say so. Everything else with Shift held keeps the console's answer.
+    if !control || record.is_alt_graph() || (shift && record.virtual_key == VK_TAB) {
         return None;
     }
     let alt = record.control_keys
@@ -691,6 +698,19 @@ mod tests {
             repeat: 1,
         };
         assert_eq!(reader.legacy_input(&[ctrl_space]), b"\0");
+
+        // Shift held with either of them changes neither: the console's translation is still the
+        // answer, and only Tab's shifted form is spelled differently.
+        let shifted_enter = KeyRecord {
+            control_keys: control_keys::LEFT_CTRL_PRESSED | control_keys::SHIFT_PRESSED,
+            ..ctrl_enter
+        };
+        assert_eq!(reader.legacy_input(&[shifted_enter]), b"\n");
+        let shifted_space = KeyRecord {
+            control_keys: control_keys::LEFT_CTRL_PRESSED | control_keys::SHIFT_PRESSED,
+            ..ctrl_space
+        };
+        assert_eq!(reader.legacy_input(&[shifted_space]), b"\0");
     }
 
     #[test]

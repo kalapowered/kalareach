@@ -192,10 +192,11 @@ jobs:
       - name: Compile the workspace and its tests
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # What has been qualified on this platform, and only that. The terminal engine, the
-      # repository boundary and the local attach client pass here whole; so does the worker's own
-      # library and the suite that drives a real pseudo-console, a real PowerShell and a real job
-      # object.
+      # What has been qualified on this platform, and only that: the terminal engine, the
+      # repository boundary, the attach client, the worker's own library, and the suite that
+      # drives a real pseudo-console, a real PowerShell and a real job object. "The attach client"
+      # means the part of it that runs here - `crates/kr-cli/tests/attach.rs` is a Unix file, so
+      # what passes is that crate's library and its path tests rather than a real attachment.
       #
       # The worker's other integration suites are **not** run here. They drive a session the way a
       # Unix pseudo-terminal behaves - a process group, a shell that answers a signal, a stream
@@ -210,11 +211,19 @@ jobs:
       # tests open a console of their own and drive it, which works here; what needs a real machine
       # is the release matrix - Windows Terminal, an IME, a physical keyboard and a GUI logon - and
       # `docs/host/README.md` has that procedure for the Windows test machine.
-      - name: Test the platform crates
-        run: |
-          cargo test --locked -p kr-term -p kr-project -p kr-cli
-          cargo test --locked -p kr-worker --lib
-          cargo test --locked -p kr-worker --test windows
+      # One command per step. Three in one script would run under a shell that carries on after a
+      # native command fails, and the step would then report whatever the last one returned: a
+      # failure in the first two could pass.
+      - name: Test the terminal engine, the repository boundary and the attach client
+        run: cargo test --locked -p kr-term -p kr-project -p kr-cli
+
+      - name: Test the worker's library
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --lib
+
+      - name: Drive a pseudo-console, PowerShell and the session job object
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test windows
 
       # The repository boundary refuses every operation on this platform and names what it cannot
       # hold. Run again on its own so a pass or a failure names this system.

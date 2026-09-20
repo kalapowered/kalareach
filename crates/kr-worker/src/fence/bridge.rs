@@ -232,14 +232,7 @@ async fn write_outbound(
     }
 }
 
-/// Both of these drive a whole session - a real terminal, a real shell, a real endpoint - to put
-/// a reader in the state the connection has to end from.
-///
-/// Unix only, and not because the property is. On Windows neither finishes: each was seen still
-/// running after a minute with its shell alive, on a machine where every other suite in this
-/// workspace passed. What holds them has not been established, so they are not run there rather
-/// than run and believed. `tasks/T-024-handoff.md` carries it as an open Windows gap.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
@@ -296,6 +289,10 @@ mod tests {
     /// write fails; its read waits for a frame that is never coming. Nothing else would report the
     /// loss, so every caller waiting on a launch would wait with it.
     ///
+    #[cfg_attr(
+        windows,
+        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where every other suite in this workspace passed, and what holds it has not been established"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_ends_when_the_writer_it_shares_a_connection_with_does() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -369,6 +366,10 @@ mod tests {
     /// The read waits in a different arm of the same choice when a deadline is set, and a writer
     /// that stopped has to end the connection from either one.
     ///
+    #[cfg_attr(
+        windows,
+        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where every other suite in this workspace passed, and what holds it has not been established"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_with_a_deadline_armed_ends_with_its_writer_too() {
         let temp = kr_ipc::testing::TempHost::create();
