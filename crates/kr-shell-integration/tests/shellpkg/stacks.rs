@@ -869,12 +869,17 @@ impl Session {
             unreachable!("the predicate accepted an idle report")
         };
         let probe = held.editor.buffer_revision.get();
+        let prompt = held.prompt_generation.get();
         self.clear_line();
+        // The same prompt, a later buffer and nothing queued: the prompt keeps a report of an
+        // older line out, the revision keeps the report this probe answered out, and what is left
+        // is the reader at the line the clear took away, waiting for the next key.
         self.expect_event("the reader at the line the clear took away", |event| {
             matches!(
                 event,
                 BridgeEvent::ReaderIdle(idle)
-                    if idle.editor.buffer_empty
+                    if idle.prompt_generation.get() == prompt
+                        && idle.editor.buffer_empty
                         && idle.editor.buffer_revision.get() > probe
                         && idle.snapshot.queued_keys == U64::ZERO
                         && idle.snapshot.pending_bytes == U64::ZERO
