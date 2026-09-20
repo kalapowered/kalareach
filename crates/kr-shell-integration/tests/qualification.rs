@@ -1187,6 +1187,11 @@ fn the_states_that_need_a_command_first(
             "{}: the continuation reader did not close",
             case.id
         );
+        // The gesture makes one of these shells abandon the unfinished command outright, so the
+        // line that would have closed the continuation starts another one instead. Whatever this
+        // drive left open, the reader is put back at a prompt of its own before the next drive
+        // types anything: a line typed into a command the shell is still reading is not a command.
+        session.recover();
     }
 
     if let Some(command) = shellpkg::read_builtin_command(case.shell) {
