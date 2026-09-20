@@ -54,7 +54,7 @@ pub const RECIPIENTS_CAN_READ: &str = "Anyone who can read this message's destin
      this message. KalaReach's encrypted routing does not make it private.";
 
 /// One line of content a message may carry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContentLine {
     /// The session it came from, when it came from one.
     ///

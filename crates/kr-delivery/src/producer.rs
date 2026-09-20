@@ -81,6 +81,24 @@ pub struct Notice {
     pub expires_at_ms: TimestampMs,
 }
 
+/// Everything this journal needs to produce from one taken event.
+///
+/// It is what travels into the event row, and it is why the cursor may move: the whole of what a
+/// notification is built from is committed with the cursor, so a host that stops afterwards
+/// finishes the work rather than losing it. Committing the cursor with less than this - an event
+/// identity, or a notice without the lines that go in the message - would move the cursor past
+/// something nothing could rebuild, and the source will not offer it again.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Production {
+    /// What the notification is about.
+    pub notice: Notice,
+    /// The lines an external message carries, already selected by the caller.
+    ///
+    /// Empty for a push destination, which carries a summary and no lines.
+    #[serde(default)]
+    pub lines: Vec<ContentLine>,
+}
+
 impl Notice {
     /// Builds a notice from one attention announcement.
     ///
@@ -119,12 +137,29 @@ impl Notice {
     ///
     /// Returns [`DeliveryError::Encoding`] when the notice cannot be represented in KR-CBOR-1.
     pub fn taken(&self, source_cursor: u64) -> Result<TakenEvent> {
+        self.taken_with(source_cursor, Vec::new())
+    }
+
+    /// The event record this notice and the lines it will be composed with are taken under.
+    ///
+    /// An external message is composed from lines, and lines that were not committed with the
+    /// cursor are lines a recovery pass cannot get back: the source has moved on. So they travel
+    /// with the notice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::Encoding`] when the production cannot be represented in KR-CBOR-1.
+    pub fn taken_with(&self, source_cursor: u64, lines: Vec<ContentLine>) -> Result<TakenEvent> {
+        let production = Production {
+            notice: self.clone(),
+            lines,
+        };
         Ok(TakenEvent {
             key: self.event.clone(),
             source_cursor,
             session_id: self.session_id,
             recorded_at_ms: self.observed_at_ms,
-            notice: kr_cbor::to_canonical_vec(self)?,
+            notice: kr_cbor::to_canonical_vec(&production)?,
         })
     }
 }
@@ -234,6 +269,12 @@ pub fn authority_digest(
         })
 }
 
+/// What a caller answers for one worker outbox record: what to notify about, and what to say.
+///
+/// `None` is a record worth taking and nobody's notification, which is most of them.
+pub type ProductionOf<'a> =
+    &'a dyn Fn(&kr_worker::persistence::outbox::OutboxRecord) -> Option<(Notice, Vec<ContentLine>)>;
+
 /// What producing from one page did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Produced {
@@ -340,13 +381,18 @@ impl Producer {
     /// registered has no claim on what collection removes. The acknowledgement comes after the
     /// local transaction, for the same reason the attention settlement does.
     ///
-    /// Every record is taken, and only the ones a caller turns into a [`Notice`] produce anything.
-    /// That is what makes this journal a registered consumer of the whole stream rather than of
-    /// the part it happens to notify about.
+    /// Every record is taken, which is what makes this journal a registered consumer of the whole
+    /// stream rather than of the part it happens to notify about. What decides whether a record
+    /// becomes a notification is `production`, and it is asked **before** the cursor moves: what
+    /// it answers is committed with the cursor, so a host that stops immediately afterwards has
+    /// everything it needs to finish the notification. A record it answers `None` for is committed
+    /// as decided - taken, nothing to produce - so a recovery pass never has to guess whether an
+    /// empty notice means silence or a notice that was never written.
     ///
     /// # Errors
     ///
-    /// Returns [`DeliveryError::Source`] when the worker's journal cannot be read or told, and
+    /// Returns [`DeliveryError::Source`] when the worker's journal cannot be read or told,
+    /// [`DeliveryError::Encoding`] when a production cannot be encoded, and
     /// [`DeliveryError::JournalUnavailable`] when this journal cannot be written.
     pub fn take_from_outbox(
         &mut self,
@@ -354,6 +400,7 @@ impl Producer {
         scope: &str,
         session_id: Option<SessionId>,
         now_ms: u64,
+        production: ProductionOf<'_>,
     ) -> Result<Vec<(EventKey, kr_worker::persistence::outbox::OutboxRecord)>> {
         let consumer = EventSource::WorkerOutbox.consumer(scope);
         self.journal.register_consumer(&consumer, now_ms)?;
@@ -375,12 +422,16 @@ impl Producer {
         let mut highest = cursor;
         for record in page {
             let key = EventKey::outbox(&record.event.event_id);
-            events.push(observed(
-                key.clone(),
-                record.cursor,
-                session_id,
-                record.event.recorded_at_ms,
-            ));
+            let event = match production(&record) {
+                Some((notice, lines)) => notice.taken_with(record.cursor, lines)?,
+                None => observed(
+                    key.clone(),
+                    record.cursor,
+                    session_id,
+                    record.event.recorded_at_ms,
+                ),
+            };
+            events.push(event);
             highest = highest.max(record.cursor);
             taken.push((key, record));
         }
@@ -521,14 +572,17 @@ impl Producer {
         let mut total = Produced::default();
         for pending in self.journal.pending_events(MAX_PENDING_PER_PASS)? {
             if pending.notice.is_empty() {
-                // An event worth recording and nobody's notification. Marking it produced is what
+                // An event taken with nothing to produce is recorded as decided when it is taken,
+                // so this is a store written before that rule or one whose notice privacy mode
+                // removed. Either way there is nothing to build, and marking it produced is what
                 // takes it out of the recovery pass.
                 self.journal.produce(&pending.key, &[], &[])?;
                 continue;
             }
-            let Ok(notice) =
-                kr_cbor::from_canonical_slice::<Notice>(&pending.notice, &kr_cbor::Limits::DEFAULT)
-            else {
+            let Ok(production) = kr_cbor::from_canonical_slice::<Production>(
+                &pending.notice,
+                &kr_cbor::Limits::DEFAULT,
+            ) else {
                 // A notice this build cannot read is left where it is rather than dropped: the
                 // event stays unproduced and says so, which is a state a person can look at.
                 total
@@ -536,7 +590,8 @@ impl Producer {
                     .push((DestinationId::new("-")?, pending.key.stored()));
                 continue;
             };
-            let produced = self.produce(&notice, destinations, authority, &[], now_ms)?;
+            let Production { notice, lines } = production;
+            let produced = self.produce(&notice, destinations, authority, &lines, now_ms)?;
             total.admitted += produced.admitted;
             total.collapsed += produced.collapsed;
             total.refused.extend(produced.refused);
@@ -1072,6 +1127,105 @@ mod tests {
         producer
             .take(EventSource::Attention, SCOPE, &[taken], 7, 1_000)
             .expect("a page");
+    }
+
+    /// An external message is composed from lines, and a recovery pass cannot ask the source for
+    /// them again: the cursor has moved. So they are committed with the cursor and the message is
+    /// still complete after a crash.
+    #[test]
+    fn a_host_that_stopped_before_producing_an_external_message_still_has_its_lines() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        let destination = webhook("hook");
+        let notice = notice(1_000);
+        let lines = vec![ContentLine {
+            session_id: Some(session(1)),
+            produced_at_ms: Some(900),
+            text: "the build failed".to_owned(),
+        }];
+        {
+            let mut producer = Producer::new(
+                DeliveryJournal::open(&path).expect("a journal"),
+                NotificationPreviewKeyPair::generate().expect("a keypair"),
+                kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            )
+            .expect("a producer");
+            producer
+                .journal_mut()
+                .configure_destination(&destination)
+                .expect("a destination");
+            let taken = notice
+                .taken_with(7, lines.clone())
+                .expect("an event record");
+            producer
+                .take(EventSource::Attention, SCOPE, &[taken], 7, 1_000)
+                .expect("a page");
+            // and then this host stops, before it produced anything.
+        }
+        let mut producer = Producer::new(
+            DeliveryJournal::open(&path).expect("a journal"),
+            NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        )
+        .expect("a producer");
+        let finished = producer
+            .finish_pending(
+                std::slice::from_ref(&destination),
+                &Everything([session(1)].into_iter().collect()),
+                2_000,
+            )
+            .expect("a recovery pass");
+        assert_eq!(finished.admitted, 1);
+        let record = producer.journal().deliveries().expect("a read").remove(0);
+        let body = String::from_utf8(record.content.expect("the message")).expect("text");
+        assert!(
+            body.contains("the build failed"),
+            "the lines committed with the cursor are the lines the message carries: {body}"
+        );
+    }
+
+    /// A worker event nobody notifies about is decided as it is taken, and one that does notify
+    /// commits what it will be built from before the cursor moves past it.
+    #[test]
+    fn a_worker_event_is_decided_or_committed_with_everything_it_needs() {
+        let mut producer = producer();
+        let notice = notice(1_000);
+        let quiet = EventKey::outbox(&Uuid::from_bytes([8; 16]));
+        producer
+            .take(
+                EventSource::WorkerOutbox,
+                SCOPE,
+                &[
+                    observed(quiet.clone(), 1, None, TimestampMs::new(900)),
+                    notice
+                        .taken_with(
+                            2,
+                            vec![ContentLine {
+                                session_id: None,
+                                produced_at_ms: Some(900),
+                                text: "a line".to_owned(),
+                            }],
+                        )
+                        .expect("an event record"),
+                ],
+                2,
+                1_000,
+            )
+            .expect("a page");
+        let pending = producer.journal().pending_events(10).expect("a read");
+        assert_eq!(pending.len(), 1, "only the one with something to produce");
+        assert_eq!(pending[0].key, notice.event);
+        let production = kr_cbor::from_canonical_slice::<Production>(
+            &pending[0].notice,
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("the production inputs");
+        assert_eq!(production.notice, notice);
+        assert_eq!(production.lines.len(), 1);
+        assert!(
+            producer.journal().has_event(&quiet).expect("a read"),
+            "the quiet event is still taken, and still holds the cursor's claim"
+        );
     }
 
     #[test]
