@@ -515,6 +515,45 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
     );
     assert_eq!(change_sets.version.provenance.method, "changeset.capture");
 
+    // A second workflow materialises the exact version the first one captured. Its node's
+    // parameters are `changeset.materialize`'s own, so what installs is what runs.
+    host.issue(grant_id(10), &[ActionRight::WorkspaceManage]);
+    let materialise_params = kr_protocol::changeset::ChangesetMaterializeParams {
+        change_set_id: change_sets.version.change_set_id,
+        version: change_sets.version.version,
+        purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
+        label: "the run's own copy".to_owned(),
+    };
+    let materialise_document = definition(
+        workflow_id(10),
+        grant_id(10),
+        "materialise-for-tests",
+        WorkflowNode {
+            node_id: "materialise".to_owned(),
+            action_kind: "materialize_changeset".to_owned(),
+            action_params: serde_json::to_string(&materialise_params)
+                .expect("the node's typed parameters"),
+            declared_environment: Nullable::null(),
+        },
+    );
+    install(&mut control, &host, &materialise_document).await;
+    enable(&mut control, &host, &materialise_document).await;
+    let materialised: WorkflowRunResult = typed(
+        &start(
+            &mut control,
+            &host,
+            &materialise_document,
+            "evt-materialise",
+        )
+        .await
+        .expect("the materialisation run succeeds"),
+    );
+    assert_eq!(
+        materialised.status,
+        WorkflowRunStatus::Completed,
+        "{materialised:?}"
+    );
+
     // `workflow.pause` stops the revision, and a later trigger is refused for that reason.
     let paused: WorkflowPauseResult = typed(
         &control

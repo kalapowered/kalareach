@@ -213,6 +213,18 @@ fn materialise_version(
         version: asked.version,
     };
     match materialise::materialise(changesets, named, asked.purpose, &asked.label) {
+        // A materialisation that could not write every path the version holds is not the version.
+        // A later node reading it on a success edge would be reading something else, so a partial
+        // result fails and names how much is missing.
+        Ok(record) if !record.unapplied.is_empty() => ActionOutcome::Failed {
+            error: format!(
+                "materialisation {} of change set {} version {} left {} of its paths unwritten",
+                record.materialisation_id,
+                named.change_set_id,
+                named.version,
+                record.unapplied.len()
+            ),
+        },
         Ok(record) => ActionOutcome::Success {
             output: format!(
                 "materialised change set {} version {} as {}",

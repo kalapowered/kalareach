@@ -29,7 +29,11 @@ use crate::error::{AutomationError, Result};
 pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 
 /// The schema version this build reads and writes.
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
+///
+/// It covers the rows as well as the tables. Version 2 keys a workflow's attention records to the
+/// revision that raised them, and a version-1 record carries no revision, so a journal at version
+/// 1 is refused by name rather than read as if its records said what this build expects.
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 2;
 
 /// The columns [`WorkflowStore::parse_run_record`] expects, in order.
 const RUN_RECORD_QUERY: &str = "SELECT run_id, workflow_id, revision, causal_root_id, generation,
@@ -312,10 +316,9 @@ impl WorkflowStore {
                 source_name TEXT PRIMARY KEY,
                 sequence INTEGER NOT NULL
             );
-
-            PRAGMA user_version = 1;
             ",
         )?;
+        tx.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
     }
@@ -785,6 +788,48 @@ impl WorkflowStore {
             ],
         )?;
         Ok(claimed > 0)
+    }
+
+    /// Pauses one node and its run because the host refused to dispatch it, in one transaction.
+    ///
+    /// Cancellation is terminal and a refusal never undoes it. A node that has already settled,
+    /// a cancelled node among them, keeps the status it settled with, and a run that was
+    /// cancelled stays cancelled: the host stopped asking, which is a different thing from the
+    /// host refusing to go on.
+    pub fn pause_on_refusal(
+        &self,
+        run_id: WorkflowRunId,
+        node_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE node_receipts SET status = ?1, error_json = ?2, ended_at_ms = ?3
+             WHERE run_id = ?4 AND node_id = ?5 AND status IN (?6, ?7)",
+            params![
+                NodeStatus::Paused.as_str(),
+                reason,
+                now_ms as i64,
+                run_id.to_string(),
+                node_id,
+                NodeStatus::Pending.as_str(),
+                NodeStatus::Running.as_str(),
+            ],
+        )?;
+        tx.execute(
+            "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
+             WHERE run_id = ?3 AND status <> ?4",
+            params![
+                WorkflowRunStatus::Paused.as_str(),
+                now_ms as i64,
+                run_id.to_string(),
+                WorkflowRunStatus::Cancelled.as_str(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Reports whether a workflow revision is currently paused.

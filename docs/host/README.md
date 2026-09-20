@@ -2401,7 +2401,7 @@ right its effect needs.
 
 Admission limits enforce per-workflow concurrency, host-wide rates, and per-grant quotas.
 Breaching a causal budget pauses the chain with error code `CAUSAL_LIMIT`, rejects further
-descendants, and emits an attention event to `kr_attention`.
+descendants, and commits one attention record in the same transaction as the pause.
 
 `docs/automation/` has the five methods, graph validation, the budget model, and source workflow coordination.
 

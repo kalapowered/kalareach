@@ -92,7 +92,8 @@ the unit it derives them for.
   else. The host reads the root, the depth and the budget generation from its own journal, so
   event content cannot mint a root, claim a depth or place a trigger in a chain it did not earn.
   A parent run this host never recorded, a parent node with no receipt, and a claimed root that
-  is not the parent's are each refused.
+  is not the parent's are each refused. What the host establishes is the parent: that this run
+  exists, that this node of it has a receipt, and what chain that run belongs to.
 * **Descendant isolation.** A workflow cannot retrigger on its own descendants. Only a definition
   installed with explicit recurrence may, and even then the root stays the parent's: recurrence
   buys another turn in the chain, never a fresh budget.
@@ -106,9 +107,10 @@ the unit it derives them for.
   chain's durable budget in one transaction with the refusal it may produce, so two concurrent
   dispatches cannot both take the last of an allowance.
 * **Budget exhaustion.** Breaching any ceiling pauses the chain with error code `CAUSAL_LIMIT`,
-  refuses every further descendant, and commits exactly one attention record. The record is
-  delivered to the attention engine (`kr_attention`) and settled there, so a chain that ran out
-  raises one item however many refusals follow and whatever restarts intervene.
+  refuses every further descendant, and commits exactly one attention record in the same
+  transaction as the pause. The record outlives a restart and is settled only once the host's
+  attention state has written its own, so a chain that ran out owes one item however many
+  refusals follow and whatever restarts intervene.
 * **Re-arming.** Only an authorised re-arm establishes a new budget. It advances the chain's
   generation and resets its counters without anybody raising a ceiling, and a descendant of a run
   from the previous generation carries that earlier generation and is refused as late.
@@ -150,9 +152,11 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
   that arrives while an earlier node is running still stops the next one. Nothing is claimed about
   an external side effect an already dispatched action may have had.
 * **Attention delivery.** Attention records are committed with the pause that caused them and
-  settled only after the host's attention state has written its own. Each record is delivered
-  under its own journal row number, so a redelivery after an interrupted settle replays a
-  sequence the attention state has already consumed and changes nothing.
+  settled only after the host's attention state has written its own. Each record carries its own
+  journal row number as its delivery cursor, so a redelivery after an interrupted settle replays
+  a sequence the attention state has already consumed and changes nothing. The delivery source
+  belongs to this journal alone: the numbers are its rows, and sharing the source with another
+  producer would make them mean two things.
 
 ## Source workflow and evidence binding
 

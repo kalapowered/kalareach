@@ -338,6 +338,19 @@ impl WorkflowEngine {
                         return self.pause_on_refusal(run_id, &node.node_id, err, dispatch_time_ms);
                     }
 
+                    // The claim, the pause check and the reservations each waited on the journal,
+                    // and a revocation can land in any of those waits. The grant is therefore
+                    // read once more here, with nothing left between this and the dispatch but
+                    // the call itself.
+                    let final_check_ms = self.clock.now_ms();
+                    if let Err(error) = self
+                        .authority
+                        .grant(definition.grant_reference, final_check_ms)
+                        .and_then(|grant| authority::check_node(&grant, definition, node))
+                    {
+                        return self.pause_on_refusal(run_id, &node.node_id, error, final_check_ms);
+                    }
+
                     let dispatch = Dispatch {
                         run_id,
                         definition,
@@ -445,6 +458,9 @@ impl WorkflowEngine {
     /// The node is paused rather than failed: nothing was dispatched, so there is no failure to
     /// report about the action itself. Returning the error preserves `CAUSAL_LIMIT` all the way
     /// out to the caller instead of turning an exhausted chain into an ordinary paused run.
+    ///
+    /// A node or a run that has already been cancelled keeps its cancellation: the journal's own
+    /// transaction decides that, so a refusal racing a cancellation cannot overwrite it.
     fn pause_on_refusal(
         &self,
         run_id: WorkflowRunId,
@@ -452,16 +468,8 @@ impl WorkflowEngine {
         error: crate::error::AutomationError,
         now_ms: u64,
     ) -> Result<WorkflowRunStatus> {
-        self.store.update_node_receipt(
-            run_id,
-            node_id,
-            NodeStatus::Paused,
-            None,
-            Some(&error.to_string()),
-            Some(now_ms),
-        )?;
         self.store
-            .update_run_status(run_id, WorkflowRunStatus::Paused, Some(now_ms))?;
+            .pause_on_refusal(run_id, node_id, &error.to_string(), now_ms)?;
         Err(error)
     }
 

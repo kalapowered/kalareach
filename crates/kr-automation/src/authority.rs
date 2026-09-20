@@ -137,6 +137,20 @@ pub fn check_node(
             node.node_id, grant.grant_id
         )));
     }
+    // A node that reads a workspace names the one it reads, and a definition scoped to a
+    // workspace may not contain a node that reaches another. The declared scope is what a person
+    // reviewing the definition read; a node acting outside it would make that reading false.
+    if let (Some(declared), Some(target)) = (
+        definition.resource_scope.workspace_id.0,
+        crate::definition::node_workspace(node),
+    ) && declared != target
+    {
+        return Err(AutomationError::PermissionDenied(format!(
+            "node {} acts on workspace {target}, and workflow {} is scoped to workspace \
+             {declared}",
+            node.node_id, definition.workflow_id
+        )));
+    }
     Ok(())
 }
 

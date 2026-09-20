@@ -275,3 +275,178 @@ async fn a_revocation_between_two_nodes_stops_the_second() {
         "the second node was never dispatched"
     );
 }
+
+/// A runner that cancels the run and withdraws its grant while the first node runs.
+///
+/// Both land in the window the engine has to survive: the run is cancelled, and the authority
+/// the next node would need is gone. Cancellation is the terminal state, and a refusal that
+/// arrives afterwards must not write over it.
+#[derive(Debug)]
+struct CancelsAndRevokes {
+    table: Arc<GrantTable>,
+    grant_id: GrantId,
+    store: std::sync::Mutex<Option<Arc<kr_automation::WorkflowStore>>>,
+    run_id: std::sync::Mutex<Option<kr_protocol::ids::WorkflowRunId>>,
+}
+
+impl ActionRunner for CancelsAndRevokes {
+    fn execute(
+        &self,
+        dispatch: &kr_automation::Dispatch<'_>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
+    > {
+        if dispatch.node.node_id == "first" {
+            *self.run_id.lock().unwrap() = Some(dispatch.run_id);
+            if let Some(store) = self.store.lock().unwrap().as_ref() {
+                kr_automation::WorkflowEngine::with_clock(
+                    Arc::clone(store),
+                    Arc::new(MockActionRunner::new()),
+                    Arc::clone(&self.table) as Arc<dyn kr_automation::AuthoritySource>,
+                    Arc::new(ManualClock::new(1_500)),
+                )
+                .cancel_run(dispatch.run_id, 1_500)
+                .expect("the run is cancelled");
+            }
+            self.table.restand(self.grant_id, GrantStanding::Revoked);
+        }
+        let output = format!("ran {}", dispatch.node.node_id);
+        Box::pin(async move { Ok(ActionOutcome::Success { output }) })
+    }
+}
+
+/// A refusal that arrives after a cancellation does not overwrite it.
+///
+/// Cancelled says the host stopped asking. Paused says the host would go on once something is
+/// resolved. Writing the second over the first would tell a reader a run is waiting for them
+/// when nobody is going to run it.
+#[tokio::test]
+async fn a_refusal_after_a_cancellation_leaves_the_cancellation_standing() {
+    let grant_id = test_grant_id(6);
+    let table = common::standing(grant_id, GrantStanding::Active);
+    let definition = create_workflow_definition(
+        test_wf_id(6),
+        1,
+        "cancelled-then-refused",
+        grant_id,
+        vec![node("first", "run_tests"), node("second", "run_tests")],
+        vec![WorkflowEdge {
+            from_node: "first".to_owned(),
+            to_node: "second".to_owned(),
+            condition: EdgeCondition::Success,
+        }],
+    );
+
+    let runner = Arc::new(CancelsAndRevokes {
+        table: Arc::clone(&table),
+        grant_id,
+        store: std::sync::Mutex::new(None),
+        run_id: std::sync::Mutex::new(None),
+    });
+    let service = service(
+        Arc::clone(&runner) as Arc<dyn ActionRunner>,
+        Arc::clone(&table),
+    );
+    *runner.store.lock().unwrap() = Some(Arc::clone(service.store()));
+    service
+        .install(&install_params(&definition), 1_000)
+        .expect("the definition installs");
+    service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("the revision enables");
+
+    let _ = service.run(&run_params(&definition, "evt-1"), 1_000).await;
+
+    let run_id = runner.run_id.lock().unwrap().expect("the run started");
+    let receipts = service
+        .store()
+        .list_node_receipts(run_id)
+        .expect("the receipts");
+    let second = receipts
+        .iter()
+        .find(|receipt| receipt.node_id == "second")
+        .expect("the second node");
+    assert_eq!(
+        second.status,
+        NodeStatus::Cancelled,
+        "a refusal does not undo a cancellation"
+    );
+    let run = service
+        .store()
+        .list_runs(Some(definition.workflow_id))
+        .expect("the journal")
+        .into_iter()
+        .find(|summary| summary.run_id == run_id)
+        .expect("the run");
+    assert_eq!(
+        run.status,
+        kr_protocol::automation::WorkflowRunStatus::Cancelled
+    );
+}
+
+/// A node may not reach a workspace the definition's declared scope excludes.
+#[tokio::test]
+async fn a_capture_node_outside_the_declared_workspace_is_refused() {
+    use kr_protocol::automation::WorkflowResourceScope;
+    use kr_protocol::changeset::{ChangesetCaptureParams, FileGrant};
+    use kr_protocol::ids::WorkspaceId;
+    use kr_protocol::project::{InclusionChoice, InclusionPolicy};
+
+    let grant_id = test_grant_id(7);
+    let declared = WorkspaceId::new(Uuid::from_bytes([30; 16]));
+    let elsewhere = WorkspaceId::new(Uuid::from_bytes([31; 16]));
+    let params = ChangesetCaptureParams {
+        workspace_id: elsewhere,
+        change_set_id: Nullable::null(),
+        label: "another tree".to_owned(),
+        policy: InclusionPolicy {
+            dirty_files: InclusionChoice::Include,
+            untracked_files: InclusionChoice::Exclude,
+            submodules: InclusionChoice::Exclude,
+            binary_files: InclusionChoice::Exclude,
+            generated_artefacts: InclusionChoice::Exclude,
+        },
+        grant: FileGrant::default(),
+        quiescence_declared: false,
+        required_consistency: Nullable::null(),
+        pin: false,
+        session_id: Nullable::null(),
+        workflow_run_id: Nullable::null(),
+        note: String::new(),
+    };
+    let mut definition = create_workflow_definition(
+        test_wf_id(7),
+        1,
+        "scoped-capture",
+        grant_id,
+        vec![WorkflowNode {
+            node_id: "capture".to_owned(),
+            action_kind: "capture_changeset".to_owned(),
+            action_params: serde_json::to_string(&params).expect("typed parameters"),
+            declared_environment: Nullable::null(),
+        }],
+        vec![],
+    );
+    definition.resource_scope = WorkflowResourceScope {
+        workspace_id: Nullable::some(declared),
+        ..WorkflowResourceScope::default()
+    };
+
+    let service = service(
+        Arc::new(MockActionRunner::new()),
+        common::holding(grant_id, &[ActionRight::ChangesetCreate]),
+    );
+    let refusal = service
+        .install(&install_params(&definition), 1_000)
+        .expect_err("a node outside the declared scope is refused");
+    assert!(
+        refusal.to_string().contains("scoped to workspace"),
+        "{refusal}"
+    );
+}

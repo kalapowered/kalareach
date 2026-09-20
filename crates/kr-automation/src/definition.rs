@@ -228,19 +228,15 @@ fn validate_typed_action_params(node_id: &str, action_kind: &str, params_json: &
                 )));
             }
         }
+        // A change-set node asks for exactly what the change-set method asks for, so its
+        // parameters are that method's own typed parameters and they are checked against that
+        // type here. A node that would be refused when it ran is refused when it is installed.
         "materialize_changeset" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} materialize_changeset params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            if obj.get("changeset_id").and_then(|v| v.as_str()).is_none() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {} materialize_changeset requires string 'changeset_id'",
-                    node_id
-                )));
-            }
+            typed_params::<kr_protocol::changeset::ChangesetMaterializeParams>(
+                node_id,
+                action_kind,
+                &parsed,
+            )?;
         }
         "apply_diff" => {
             let obj = parsed.as_object().ok_or_else(|| {
@@ -257,23 +253,43 @@ fn validate_typed_action_params(node_id: &str, action_kind: &str, params_json: &
             }
         }
         "capture_changeset" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} capture_changeset params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            if obj.get("workspace_id").and_then(|v| v.as_str()).is_none() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {} capture_changeset requires string 'workspace_id'",
-                    node_id
-                )));
-            }
+            typed_params::<kr_protocol::changeset::ChangesetCaptureParams>(
+                node_id,
+                action_kind,
+                &parsed,
+            )?;
         }
         _ => {}
     }
 
     Ok(())
+}
+
+/// Decodes one node's parameters into the exact wire type its action kind is dispatched with.
+fn typed_params<T: serde::de::DeserializeOwned>(
+    node_id: &str,
+    action_kind: &str,
+    parsed: &serde_json::Value,
+) -> Result<T> {
+    serde_json::from_value(parsed.clone()).map_err(|error| {
+        AutomationError::InvalidArgument(format!(
+            "node {node_id} does not carry the parameters {action_kind} takes: {error}"
+        ))
+    })
+}
+
+/// Returns the workspace a node acts on, when its action kind names one.
+///
+/// A capture reads one workspace. That is the resource the node's effect touches, so it is the
+/// one a definition's declared scope and the grant's own selectors have to admit.
+#[must_use]
+pub fn node_workspace(node: &WorkflowNode) -> Option<kr_protocol::ids::WorkspaceId> {
+    if node.action_kind != "capture_changeset" {
+        return None;
+    }
+    serde_json::from_str::<kr_protocol::changeset::ChangesetCaptureParams>(&node.action_params)
+        .ok()
+        .map(|params| params.workspace_id)
 }
 
 /// Recursively checks that no JSON value contains arbitrary template code or script interpolation.
