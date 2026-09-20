@@ -846,6 +846,9 @@ impl Session {
         // offered again once; what the binding writes is the same text either way.
         for attempt in 0..3 {
             self.ensure_reading();
+            // The clear that `ensure_reading` ends with is an operation of the editor's own, and
+            // a chord sent while it is still redrawing is read at whatever it redraws into.
+            std::thread::sleep(Duration::from_millis(250));
             self.type_bytes(USER_BINDING_KEY);
             let within = if attempt < 2 {
                 Duration::from_secs(6)
