@@ -92,7 +92,9 @@ pub const MAX_WALK_DEPTH: usize = 64;
 /// The furthest this capture climbs to reach a directory named from above where it started.
 ///
 /// Deeper than any filesystem this host is asked about, and finite, which is what matters: the
-/// directory a handle is in can be changed under the walk, so the walk has an end of its own.
+/// directory a handle is in can be changed under the walk, so the walk has an end of its own. It
+/// counts the levels the climb goes up, so a tree exactly this many levels below the root of its
+/// filesystem is still reached; the open that confirms the root is not one of them.
 pub const MAX_CLIMB_HOPS: usize = 256;
 
 /// Largest single file one capture reads, in bytes.
@@ -1948,16 +1950,9 @@ fn resolve_target(
         let mut stood_on: BTreeSet<((u64, u64), Option<kr_transfer::MountId>)> = BTreeSet::new();
         stood_on.insert((identity_of(&root), below));
         loop {
-            // Bounded twice, because the directory a handle is in is not something this host can
-            // hold still: an account that can rename two directories above this one can hand the
-            // climb a new parent for as long as it likes. A climb that goes further than any
-            // ancestry this host is asked about, or that arrives where it has already stood, is
-            // one it refuses rather than one it keeps taking.
-            climbed += 1;
-            if climbed > MAX_CLIMB_HOPS {
-                return Err(unplaceable(directory));
-            }
-            let above = root.parent().map_err(|_| unplaceable(directory))?;
+            let above = root.parent().map_err(|_| {
+                unplaceable_because(directory, "this host could not open the directory above it")
+            })?;
             let above_mount = mount_reading(&above)?;
             // The root of a filesystem is the one directory that **is** what it is in, on the
             // mount it is on. The object alone would not do: a directory mounted over itself has
@@ -1966,10 +1961,30 @@ fn resolve_target(
             if identity_of(&above) == identity_of(&root) && above_mount == below {
                 break;
             }
+            // Bounded twice, because the directory a handle is in is not something this host can
+            // hold still: an account that can rename two directories above this one can hand the
+            // climb a new parent for as long as it likes. A climb that goes further than any
+            // ancestry this host is asked about, or that arrives where it has already stood, is
+            // one it refuses rather than one it keeps taking. The count is of the levels this
+            // climb actually goes up, so an ancestry of exactly that many levels is reached: the
+            // open that confirms the root is not one of them.
+            climbed += 1;
+            if climbed > MAX_CLIMB_HOPS {
+                return Err(unplaceable_because(
+                    directory,
+                    &format!(
+                        "it is more than {MAX_CLIMB_HOPS} levels below the root of its filesystem"
+                    ),
+                ));
+            }
             // Asked after the root, so an ordinary root — which is what it is in — ends the climb
             // rather than being taken for a repeat.
             if !stood_on.insert((identity_of(&above), above_mount)) {
-                return Err(unplaceable(directory));
+                return Err(unplaceable_because(
+                    directory,
+                    "the climb to the root of its filesystem arrived where it had already stood, \
+                     which is what a directory renamed under it looks like",
+                ));
             }
             root = above;
             below = above_mount;
@@ -2036,7 +2051,11 @@ fn resolve_target(
                 // than choosing between them.
                 if identity_of(&next) == identity_of(tree) {
                     if mount_reading(&next)? != tree.mount() {
-                        return Err(unplaceable(directory));
+                        return Err(unplaceable_because(
+                            directory,
+                            "the name arrives at this working tree on another mount, which holds \
+                             different children under the same object",
+                        ));
                     }
                     stack.push(clone_of(tree)?);
                 } else {
@@ -2101,6 +2120,22 @@ fn unplaceable(directory: &str) -> ChangeSetError {
         detail: format!(
             "a repository nested at {} keeps its own data somewhere this host could not reach by \
              descending to it, so it did not read the tree at all",
+            kr_project::git::redact(directory)
+        )
+        .into(),
+    }
+}
+
+/// The same refusal, saying which step of the descent ended it.
+///
+/// Every one of these is "this host could not reach it", and which of them it was is what tells
+/// somebody holding an ordinary repository whether they have hit a limit or a layout this host
+/// will not read.
+fn unplaceable_because(directory: &str, why: &str) -> ChangeSetError {
+    ChangeSetError::Unsupported {
+        detail: format!(
+            "a repository nested at {} keeps its own data somewhere this host could not reach by \
+             descending to it ({why}), so it did not read the tree at all",
             kr_project::git::redact(directory)
         )
         .into(),
