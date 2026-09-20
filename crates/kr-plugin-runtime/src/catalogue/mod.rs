@@ -1088,13 +1088,25 @@ impl Catalogue {
             // Anything else would make a matching application enough to pull bytes nobody asked
             // this host to hold.
             FetchReason::AuthorisedActivation => {
+                // An unnamed environment or package hash would make this reason its own authority:
+                // any enabled installation of the plugin anywhere would answer for the one the
+                // caller has. The activation names the exact installation it claims, or it is not
+                // an authorised activation at all.
+                let (Some(environment), Some(hash)) = (environment_id, package_hash) else {
+                    return Err(CatalogueError::InvalidArgument {
+                        detail: format!(
+                            "an already-authorised activation of {plugin_id} {version} names the \
+                             environment and the exact package hash it was authorised for"
+                        ),
+                    });
+                };
                 let authorised = self.installations.all().into_iter().any(|installation| {
                     installation.repository == *id
                         && installation.plugin_id.as_str() == plugin_id.as_str()
                         && installation.version == *version
                         && installation.enabled
-                        && environment_id.is_none_or(|env| installation.environment_id == env)
-                        && package_hash.is_none_or(|hash| installation.package_digest == hash)
+                        && installation.environment_id == environment
+                        && installation.package_digest == hash
                 });
                 if authorised {
                     Ok(())
@@ -1520,7 +1532,6 @@ impl Catalogue {
     /// is not here.
     pub fn capabilities(
         &self,
-        id: &RepositoryId,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
     ) -> CatalogueResult<Vec<CapabilityDecision>> {
@@ -1530,12 +1541,16 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{plugin_id} is not installed in this environment"),
             })?;
+        // The ceiling is the one the package was installed from, taken from the installation
+        // rather than from the caller. A caller that could name the repository could name a wider
+        // one and be told this package may do what that other repository permits.
+        //
         // What the installed package asks for was recorded when it was installed. Reading the
         // current index instead would make an answer about an installed package depend on a
         // generation that may no longer carry it, which is the opposite of usable offline.
         Ok(ceiling::decide(
             &installation.requested,
-            &self.state(id)?.enrolment.ceiling,
+            &self.state(&installation.repository)?.enrolment.ceiling,
             &installation.grant,
         ))
     }
@@ -1547,12 +1562,11 @@ impl Catalogue {
     /// Returns what [`Self::capabilities`] returns.
     pub fn effective_capabilities(
         &self,
-        id: &RepositoryId,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
     ) -> CatalogueResult<BTreeSet<PluginCapability>> {
         Ok(self
-            .capabilities(id, environment_id, plugin_id)?
+            .capabilities(environment_id, plugin_id)?
             .into_iter()
             .filter(|decision| decision.permitted)
             .map(|decision| decision.capability)

@@ -278,10 +278,9 @@ pub async fn verify(
                 && bytes != enrolment.root
                 && let Ok(new_signed) =
                     serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&bytes)
-                && let Ok(old_signed) =
-                    serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(
-                        &enrolment.root,
-                    )
+                && let Ok(old_signed) = serde_json::from_slice::<
+                    tough::schema::Signed<tough::schema::Root>,
+                >(&enrolment.root)
                 && new_signed.signed.version > old_signed.signed.version
             {
                 on_root_rotated(bytes)?;

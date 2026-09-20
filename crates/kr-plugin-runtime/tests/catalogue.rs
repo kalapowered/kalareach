@@ -543,10 +543,12 @@ async fn kr_req_11_05_a_matching_application_alone_authorises_no_fetch() {
 
     // Nothing is installed, so an activation has nothing to be an activation of.
     let refusal = catalogue
-        .activate_package(
+        .activate_package_scoped(
             &repository(),
+            Some(environment()),
             &plugin(),
             &version(),
+            Some(generation.manifest_digest()),
             FetchReason::AuthorisedActivation,
         )
         .await
@@ -554,6 +556,23 @@ async fn kr_req_11_05_a_matching_application_alone_authorises_no_fetch() {
     assert_eq!(refusal.code(), ErrorCode::PackageUnavailableOffline);
     assert!(
         refusal.to_string().contains("does not authorise"),
+        "{refusal}"
+    );
+
+    // An activation that names neither the environment nor the package hash claims an authority
+    // it has not identified, and is refused before any installation is looked at.
+    let refusal = catalogue
+        .activate_package(
+            &repository(),
+            &plugin(),
+            &version(),
+            FetchReason::AuthorisedActivation,
+        )
+        .await
+        .expect_err("an activation that names no installation");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+    assert!(
+        refusal.to_string().contains("exact package hash"),
         "{refusal}"
     );
 
@@ -610,7 +629,7 @@ async fn kr_req_11_09_an_installed_package_is_enabled_without_its_repository() {
     assert!(enabled.enabled);
     // And what it may do is answered from what was recorded at installation.
     let decisions = catalogue
-        .capabilities(&repository(), environment(), &plugin())
+        .capabilities(environment(), &plugin())
         .expect("readable offline");
     assert!(!decisions.is_empty());
 }
@@ -1269,7 +1288,7 @@ async fn kr_req_11_11_the_default_ceiling_permits_the_three_passive_capabilities
         .expect("granted");
 
     let decisions = catalogue
-        .capabilities(&repository(), environment(), &plugin())
+        .capabilities(environment(), &plugin())
         .expect("readable");
     for decision in &decisions {
         use kr_plugin_runtime::catalogue::GrantRequirement as Requirement;
@@ -1287,6 +1306,85 @@ async fn kr_req_11_11_the_default_ceiling_permits_the_three_passive_capabilities
             decision.capability, decision.requirement
         );
     }
+}
+
+#[tokio::test]
+async fn kr_req_11_11_a_capability_answer_uses_the_ceiling_the_package_came_from() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: vec![
+                PluginCapability::MetadataMatch,
+                PluginCapability::DeclarativePresentation,
+                PluginCapability::BrokerSemanticEvents,
+                PluginCapability::TranscriptTail,
+            ],
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+
+    // A second enrolment of the same generation, trusted with more: a transcript tail needs a
+    // repository grant, and this repository has one.
+    let wider = RepositoryId::new("wide").expect("a valid repository identifier");
+    let enrolment = Enrolment::new(
+        wider.clone(),
+        RepositoryKind::Community,
+        generation.metadata_url(),
+        generation.targets_url(),
+        generation.root_bytes(),
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::with([PluginCapability::TranscriptTail]),
+    )
+    .expect("an enrollable repository");
+    catalogue
+        .enrol(enrolment, true)
+        .expect("the owner adopted the root");
+
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::with([PluginCapability::TranscriptTail]),
+        )
+        .await
+        .expect("installable");
+
+    // The owner withdraws the grant. Under the narrow repository's ceiling that leaves the
+    // transcript tail unpermitted, and the wider enrolment beside it does not answer for this
+    // installation: the ceiling is the one the package came from.
+    catalogue
+        .set_grant(environment(), &plugin(), InstallationGrant::none())
+        .expect("an owner may withdraw what they granted");
+    let tail = catalogue
+        .capabilities(environment(), &plugin())
+        .expect("readable")
+        .into_iter()
+        .find(|decision| decision.capability == PluginCapability::TranscriptTail)
+        .expect("the package asks for a transcript tail");
+    assert!(
+        !tail.permitted,
+        "another repository's ceiling answered for this installation"
+    );
+    assert!(
+        catalogue.repository(&wider).is_some(),
+        "the wider repository is enrolled all the same"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

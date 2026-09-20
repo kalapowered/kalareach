@@ -375,11 +375,7 @@ impl CatalogueModule {
                 let installation =
                     installation_of(&catalogue, params.environment_id, &params.plugin_id)?;
                 let decisions = catalogue
-                    .capabilities(
-                        &installation.repository,
-                        params.environment_id,
-                        &params.plugin_id,
-                    )
+                    .capabilities(params.environment_id, &params.plugin_id)
                     .map_err(ProtocolError::from)?;
                 let active = catalogue
                     .active(&installation.repository)
@@ -704,7 +700,7 @@ impl CatalogueModule {
                     .await
                     .map_err(ProtocolError::from)?;
                 let decisions = catalogue
-                    .capabilities(&id, params.environment_id, &params.plugin_id)
+                    .capabilities(params.environment_id, &params.plugin_id)
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginInstallResult {
                     plugin: summary_of(catalogue, &installation)?,
@@ -801,11 +797,7 @@ impl CatalogueModule {
                     )
                     .map_err(ProtocolError::from)?;
                 let decisions = catalogue
-                    .capabilities(
-                        &installation.repository,
-                        params.environment_id,
-                        &params.plugin_id,
-                    )
+                    .capabilities(params.environment_id, &params.plugin_id)
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginGrantResult {
                     plugin: summary_of(catalogue, &installation)?,
