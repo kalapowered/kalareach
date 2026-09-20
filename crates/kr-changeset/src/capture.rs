@@ -281,6 +281,8 @@ enum Reservation {
     Held,
     /// A grant was taken and stopped holding before the read finished.
     Lapsed,
+    /// A grant said it was holding and this host read a file that was being written anyway.
+    Contradicted,
 }
 
 impl Reservation {
@@ -298,10 +300,12 @@ impl Reservation {
     /// Records that the tree changed under a grant that was supposed to be holding it still.
     ///
     /// The capture's own contradiction of the reservation: whatever the grant answers, a change
-    /// this host detected is one the reservation did not keep out.
+    /// this host detected is one the reservation did not keep out. A change a later attempt read
+    /// past counts exactly as one that exhausted this host's retries: both are readings of a tree
+    /// something was writing to.
     fn changed_underneath(&mut self) {
         if *self == Self::Held {
-            *self = Self::Lapsed;
+            *self = Self::Contradicted;
         }
     }
 }
@@ -501,7 +505,26 @@ pub fn capture(
             ..request
         };
         let planned = plan(&before, request);
-        let read = read_content(profile, repository, store, &planned, request);
+        let mut rewritten = false;
+        let read = read_content(
+            profile,
+            repository,
+            store,
+            &planned,
+            request,
+            &mut rewritten,
+        );
+        // A file that was written while this host read it and whose next attempt read it whole.
+        // The content is a complete reading, so the capture carries on; what it cannot be is a
+        // reading of a tree nothing was writing. The class goes down here rather than at the
+        // retry bound, because a change a retry read past is the same contradiction of the
+        // reservation as one that exhausted the retries.
+        if rewritten {
+            reservation.changed_underneath();
+            if required_quiesced {
+                return Err(required_quiescence_refused(CHANGED));
+            }
+        }
         let manifest = match read {
             Ok(manifest) => manifest,
             Err(ChangeSetError::SourceChanged { detail }) if attempt < MAX_CAPTURE_RETRIES => {
@@ -2942,6 +2965,7 @@ fn read_content(
     store: &ObjectStore,
     planned: &BTreeMap<String, Plan>,
     request: Scope<'_>,
+    rewritten: &mut bool,
 ) -> Result<Manifest> {
     // Every read of a Git object counts, whichever plan asks for it: a deletion reads the base's
     // own blob so the version can restore it, exactly as a path the policy takes from the commit
@@ -3034,60 +3058,64 @@ fn read_content(
                 base_object_id,
                 base_mode,
                 index_mode,
-            } => match read_working_tree(repository, path)? {
-                // The status said the path was there and it is not any more. That is a deletion
-                // the working tree holds, recorded with whatever the base has for it.
-                WorkingRead::Gone => {
-                    let content_digest = store_base_content(
-                        profile,
-                        repository,
-                        store,
-                        &mut budget,
-                        base_object_id.as_deref(),
-                        base_mode.as_deref(),
-                    )?;
-                    manifest.deletions.push(crate::version::DeletedPath {
-                        path: path.clone(),
-                        base_object_id: base_object_id.clone(),
-                        base_mode: base_mode.clone(),
-                        content_digest,
-                    });
-                }
-                WorkingRead::Unsupported(detail) => manifest.exclusions.push(Exclusion {
-                    path: path.clone(),
-                    reason: ExclusionReason::Unsupported,
-                    detail,
-                }),
-                WorkingRead::Unreadable(detail) => manifest.exclusions.push(Exclusion {
-                    path: path.clone(),
-                    reason: ExclusionReason::Unreadable,
-                    detail,
-                }),
-                WorkingRead::Content { bytes, executable } => {
-                    let content = classify_content(&bytes);
-                    if leave_out_binary(request, *class, content) {
-                        manifest.exclusions.push(binary_exclusion(path));
-                        continue;
+            } => {
+                let reading = read_working_tree(repository, path)?;
+                *rewritten |= reading.changed_while_reading;
+                match reading.read {
+                    // The status said the path was there and it is not any more. That is a deletion
+                    // the working tree holds, recorded with whatever the base has for it.
+                    WorkingRead::Gone => {
+                        let content_digest = store_base_content(
+                            profile,
+                            repository,
+                            store,
+                            &mut budget,
+                            base_object_id.as_deref(),
+                            base_mode.as_deref(),
+                        )?;
+                        manifest.deletions.push(crate::version::DeletedPath {
+                            path: path.clone(),
+                            base_object_id: base_object_id.clone(),
+                            base_mode: base_mode.clone(),
+                            content_digest,
+                        });
                     }
-                    budget.charge(bytes.len() as u64)?;
-                    let digest = store.put(&bytes)?;
-                    manifest.paths.push(CapturedPath {
+                    WorkingRead::Unsupported(detail) => manifest.exclusions.push(Exclusion {
                         path: path.clone(),
-                        content_digest: digest,
-                        byte_len: U64::new(bytes.len() as u64),
-                        // The bit the file actually has. A platform with none answers from the
-                        // mode Git records, which is the only thing there is to answer from.
-                        executable: executable
-                            .unwrap_or_else(|| index_mode.as_deref() == Some("100755")),
-                        content,
-                        origin: ContentOrigin::WorkingTree,
-                        class: *class,
-                        change: *change,
-                        base_object_id: Nullable(base_object_id.clone()),
-                        base_mode: Nullable(base_mode.clone()),
-                    });
+                        reason: ExclusionReason::Unsupported,
+                        detail,
+                    }),
+                    WorkingRead::Unreadable(detail) => manifest.exclusions.push(Exclusion {
+                        path: path.clone(),
+                        reason: ExclusionReason::Unreadable,
+                        detail,
+                    }),
+                    WorkingRead::Content { bytes, executable } => {
+                        let content = classify_content(&bytes);
+                        if leave_out_binary(request, *class, content) {
+                            manifest.exclusions.push(binary_exclusion(path));
+                            continue;
+                        }
+                        budget.charge(bytes.len() as u64)?;
+                        let digest = store.put(&bytes)?;
+                        manifest.paths.push(CapturedPath {
+                            path: path.clone(),
+                            content_digest: digest,
+                            byte_len: U64::new(bytes.len() as u64),
+                            // The bit the file actually has. A platform with none answers from the
+                            // mode Git records, which is the only thing there is to answer from.
+                            executable: executable
+                                .unwrap_or_else(|| index_mode.as_deref() == Some("100755")),
+                            content,
+                            origin: ContentOrigin::WorkingTree,
+                            class: *class,
+                            change: *change,
+                            base_object_id: Nullable(base_object_id.clone()),
+                            base_mode: Nullable(base_mode.clone()),
+                        });
+                    }
                 }
-            },
+            }
         }
     }
     manifest.canonicalise();
@@ -3143,6 +3171,43 @@ pub enum WorkingRead {
     Unreadable(String),
 }
 
+/// One reading of one working-tree path, and what this host saw while it read.
+pub struct WorkingReading {
+    /// What the path held, as far as this host could read it.
+    pub read: WorkingRead,
+    /// True when the file changed while this host was reading it and a later attempt read it
+    /// whole.
+    ///
+    /// The content is then a complete reading of one version of the file. What it is not is
+    /// evidence that the file was still: something wrote it during the capture, and a capture
+    /// that would otherwise call its source a quiesced one has to know that its own reading
+    /// contradicts the reservation.
+    pub changed_while_reading: bool,
+}
+
+/// What a test runs immediately after one path's content has been read and before this host reads
+/// its metadata back, named by that path and given the attempt.
+///
+/// A file written in that window is what a change under a capture looks like from inside the
+/// read: this attempt is discarded and the next one reads the file whole. Both readings go
+/// through one open handle, so nothing outside this host can reach between them.
+#[cfg(feature = "fault-injection")]
+pub type WhileReading = std::sync::Arc<dyn Fn(&str, u32) + Send + Sync>;
+
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static WHILE_READING: std::cell::RefCell<Option<WhileReading>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` on this thread inside every working-tree read, until it is taken away again.
+///
+/// Compiled with the fault-injection feature; nothing in the service sets it.
+#[cfg(feature = "fault-injection")]
+pub fn interpose_working_tree_reads(hook: Option<WhileReading>) {
+    WHILE_READING.with(|installed| *installed.borrow_mut() = hook);
+}
+
 /// Reads one path from the working tree through the authorised handle.
 ///
 /// The file's identity, length and modification instant are read before and after its content. A
@@ -3150,27 +3215,43 @@ pub enum WorkingRead {
 /// and then rejected, because a captured tree that held half of one version and half of another
 /// would be a tree that never existed.
 ///
+/// A change a later attempt read past is reported as well as retried: the content is whole, and
+/// the file was written while this host was reading the tree. Only the caller knows what that
+/// means for the class it is about to record.
+///
 /// # Errors
 ///
 /// Returns [`ChangeSetError::SourceChanged`] when the file kept changing past the bound, and
 /// [`ChangeSetError::QuotaExceeded`] when it is larger than [`MAX_CAPTURE_FILE_BYTES`].
-pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<WorkingRead> {
+pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<WorkingReading> {
     let Ok(name) = RelativeName::parse(path) else {
-        return Ok(WorkingRead::Unsupported(
-            "this host cannot name this path beneath the working tree's own handle, so it cannot \
-             read it and does not guess at it"
-                .to_owned(),
-        ));
+        return Ok(WorkingReading {
+            read: WorkingRead::Unsupported(
+                "this host cannot name this path beneath the working tree's own handle, so it \
+                 cannot read it and does not guess at it"
+                    .to_owned(),
+            ),
+            changed_while_reading: false,
+        });
     };
     let tree = confined_tree(repository)?;
+    let mut changed_while_reading = false;
     for attempt in 0..=MAX_PATH_RETRIES {
         let mut file = match tree.open_read(&name, ObjectPolicy::ReadableFile) {
             Ok(file) => file,
-            Err(kr_transfer::Escape::NotFound { .. }) => return Ok(WorkingRead::Gone),
+            Err(kr_transfer::Escape::NotFound { .. }) => {
+                return Ok(WorkingReading {
+                    read: WorkingRead::Gone,
+                    changed_while_reading,
+                });
+            }
             Err(
                 error @ (kr_transfer::Escape::Link { .. } | kr_transfer::Escape::WrongKind { .. }),
             ) => {
-                return Ok(WorkingRead::Unsupported(error.to_string()));
+                return Ok(WorkingReading {
+                    read: WorkingRead::Unsupported(error.to_string()),
+                    changed_while_reading,
+                });
             }
             // A mount where this path was an ordinary file or directory when the capture looked.
             // It is not excluded and read around: what is under it is not what the tree's own
@@ -3185,7 +3266,12 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                     .into(),
                 });
             }
-            Err(error) => return Ok(WorkingRead::Unreadable(error.to_string())),
+            Err(error) => {
+                return Ok(WorkingReading {
+                    read: WorkingRead::Unreadable(error.to_string()),
+                    changed_while_reading,
+                });
+            }
         };
         let before_identity = file.identity();
         let before_len = file.byte_len();
@@ -3205,7 +3291,19 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
         // refused rather than read without end.
         let mut bounded = file.handle_mut().take(MAX_CAPTURE_FILE_BYTES + 1);
         if let Err(error) = bounded.read_to_end(&mut bytes) {
-            return Ok(WorkingRead::Unreadable(error.to_string()));
+            return Ok(WorkingReading {
+                read: WorkingRead::Unreadable(error.to_string()),
+                changed_while_reading,
+            });
+        }
+        // The one window a test cannot reach from outside: both readings of this file's metadata
+        // go through the handle already open above.
+        #[cfg(feature = "fault-injection")]
+        {
+            let hook = WHILE_READING.with(|installed| installed.borrow().clone());
+            if let Some(hook) = hook {
+                hook(path, attempt);
+            }
         }
         if bytes.len() as u64 > MAX_CAPTURE_FILE_BYTES {
             return Err(ChangeSetError::QuotaExceeded {
@@ -3222,15 +3320,27 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
         // neither the identity nor the length and is exactly the change a reader would miss.
         let after_len = match file.revalidate() {
             Ok(length) => length,
-            Err(error) => return Ok(WorkingRead::Unreadable(error.to_string())),
+            Err(error) => {
+                return Ok(WorkingReading {
+                    read: WorkingRead::Unreadable(error.to_string()),
+                    changed_while_reading,
+                });
+            }
         };
         if file.identity() == before_identity
             && after_len == before_len
             && after_len == bytes.len() as u64
             && modified_at(&file) == before_written
         {
-            return Ok(WorkingRead::Content { bytes, executable });
+            return Ok(WorkingReading {
+                read: WorkingRead::Content { bytes, executable },
+                changed_while_reading,
+            });
         }
+        // Whatever the next attempt reads, this file was written while this host was reading the
+        // tree. A reading that is discarded is still a reading, and it is the only evidence this
+        // host has that something was writing here.
+        changed_while_reading = true;
         if attempt == MAX_PATH_RETRIES {
             return Err(ChangeSetError::SourceChanged {
                 detail: format!(
@@ -3625,6 +3735,16 @@ fn classify(
                 "the quiescence reservation stopped holding this workspace before the read \
                  finished, so the files were read one at a time from a live working tree with \
                  concurrent-change detection instead"
+                    .to_owned(),
+            );
+        }
+        Reservation::Contradicted => {
+            return (
+                SourceConsistency::PerFileCapture,
+                "a file of this working tree was written while this host was reading it, \
+                 although a reservation was supposed to be holding the tree still, so nothing \
+                 held it still and the files were read one at a time from a live working tree \
+                 with concurrent-change detection instead"
                     .to_owned(),
             );
         }
@@ -4305,6 +4425,10 @@ mod tests {
         // class, and neither detail describes one instant.
         for (state, says) in [
             (Reservation::Lapsed, "stopped holding"),
+            (
+                Reservation::Contradicted,
+                "was written while this host was reading it",
+            ),
             (Reservation::Refused, "could not be reserved"),
         ] {
             let (class, detail) = classify(scope(&declared), state, true);

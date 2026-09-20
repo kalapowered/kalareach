@@ -3202,3 +3202,126 @@ fn an_authority_withdrawn_before_a_new_change_set_leaves_none_behind() {
         1
     );
 }
+
+/// KR-REQ-14.32: a file this host read while something was writing it contradicts the
+/// reservation, and a retry that reads the file whole does not take that back.
+///
+/// One failed read followed by a successful one: the file is written exactly once, in the window
+/// between this host reading its content and reading its metadata back, so the first attempt is
+/// discarded and the second reads it whole. The content is complete and the capture succeeds; the
+/// class is the weaker one, because the tree was not still.
+#[test]
+fn a_file_written_during_its_read_is_not_a_quiesced_capture_even_when_the_retry_succeeds() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "rewritten");
+    write(&path, "README.md", "the work in progress\n");
+    let workspace = fixture.workspace("rewritten");
+    let authority = reservation::Authority::new(reservation::Behaviour::Holds);
+
+    // Written once, inside the read of README.md's own content. Every later attempt reads a file
+    // nothing is touching.
+    let writes = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&writes);
+    let target = path.clone();
+    kr_changeset::capture::interpose_working_tree_reads(Some(Arc::new(move |read: &str, _| {
+        if read == "README.md" && counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::fs::write(target.join("README.md"), "written under the reservation\n")
+                .expect("the fixture writes the file this host is reading");
+        }
+    })));
+    let record = fixture.capture_with_authority(
+        workspace,
+        &include_everything(),
+        &FileGrant::default(),
+        None,
+        None,
+        Some(&authority),
+    );
+    kr_changeset::capture::interpose_working_tree_reads(None);
+    let record = record.expect("the capture reads the file whole on its second attempt");
+
+    assert!(
+        writes.load(Ordering::SeqCst) > 1,
+        "the file was read again after it was written"
+    );
+    assert_eq!(
+        record.consistency,
+        SourceConsistency::PerFileCapture,
+        "a tree something wrote to is not one that was held still: {}",
+        record.consistency_detail
+    );
+    assert!(
+        !record.policy.quiescence_held,
+        "and the policy records that nothing held it"
+    );
+    assert!(
+        record
+            .consistency_detail
+            .contains("was written while this host was reading it"),
+        "the detail says what contradicted the reservation: {}",
+        record.consistency_detail
+    );
+    // The content is the whole of the second reading rather than half of each.
+    let readme = record
+        .changes
+        .iter()
+        .find(|entry| entry.path == "README.md")
+        .expect("the file is in the version");
+    assert_eq!(
+        readme.content_digest,
+        kr_changeset::objects::digest_of(b"written under the reservation\n")
+    );
+}
+
+/// KR-REQ-14.32: the same reading, under a request that requires the stronger class, is refused
+/// rather than served the weaker one.
+#[test]
+fn requiring_the_quiesced_class_refuses_a_capture_whose_file_was_written_under_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "required");
+    write(&path, "README.md", "the work in progress\n");
+    let workspace = fixture.workspace("required");
+    let authority = reservation::Authority::new(reservation::Behaviour::Holds);
+
+    let counted = Arc::new(AtomicUsize::new(0));
+    let writes = Arc::clone(&counted);
+    let target = path.clone();
+    kr_changeset::capture::interpose_working_tree_reads(Some(Arc::new(move |read: &str, _| {
+        if read == "README.md" && writes.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::fs::write(target.join("README.md"), "written under the reservation\n")
+                .expect("the fixture writes the file this host is reading");
+        }
+    })));
+    let outcome = fixture.capture_with_authority(
+        workspace,
+        &include_everything(),
+        &FileGrant::default(),
+        None,
+        Some(SourceConsistency::QuiescedCapture),
+        Some(&authority),
+    );
+    kr_changeset::capture::interpose_working_tree_reads(None);
+
+    let refusal = outcome.expect_err("the required class was not performed");
+    let said = refusal.to_string();
+    assert!(
+        said.contains("requires a quiesced_capture"),
+        "the refusal names what was required: {said}"
+    );
+    assert!(
+        said.contains("so nothing held it still"),
+        "and what contradicted it: {said}"
+    );
+    assert_eq!(
+        counted.load(Ordering::SeqCst),
+        2,
+        "the file was read once, written, and read whole once more; the capture then refused \
+         rather than reading the whole tree again"
+    );
+}

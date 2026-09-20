@@ -249,15 +249,15 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
     for entry in &status {
         // Each path is opened once. Reading it again for its length and again for its content
         // class would let three readings describe three different files.
-        let (content_digest, byte_len, content) = match read_working_tree(&repository, &entry.path)?
-        {
-            WorkingRead::Content { bytes, .. } => (
-                Some(digest_of(&bytes)),
-                Some(U64::new(bytes.len() as u64)),
-                crate::capture::classify_content(&bytes),
-            ),
-            _ => (None, None, ContentClass::Unknown),
-        };
+        let (content_digest, byte_len, content) =
+            match read_working_tree(&repository, &entry.path)?.read {
+                WorkingRead::Content { bytes, .. } => (
+                    Some(digest_of(&bytes)),
+                    Some(U64::new(bytes.len() as u64)),
+                    crate::capture::classify_content(&bytes),
+                ),
+                _ => (None, None, ContentClass::Unknown),
+            };
         let read = DiffEntry {
             path: entry.path.clone(),
             class: class_of(entry.class),
@@ -570,7 +570,7 @@ fn observe(
 ) -> Result<BTreeMap<String, Observed>> {
     let mut found = BTreeMap::new();
     for entry in affected {
-        let worktree_digest = match read_working_tree(repository, &entry.path)? {
+        let worktree_digest = match read_working_tree(repository, &entry.path)?.read {
             WorkingRead::Content { bytes, .. } => Some(digest_of(&bytes)),
             WorkingRead::Gone => None,
             WorkingRead::Unsupported(detail) | WorkingRead::Unreadable(detail) => {
@@ -1341,7 +1341,7 @@ fn run_operations(
             .affected
             .iter()
             .find(|affected| affected.path == *path);
-        let before_digest = match read_working_tree(repository, path)? {
+        let before_digest = match read_working_tree(repository, path)?.read {
             WorkingRead::Content { bytes, .. } => Some(digest_of(&bytes)),
             _ => None,
         };
