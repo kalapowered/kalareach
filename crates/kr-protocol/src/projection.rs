@@ -730,6 +730,75 @@ pub const PROJECTION_DELTA_EVENT: &str = "session.projection.delta";
 /// The event type one settled agent resource is published under.
 pub const AGENT_RESOURCE_EVENT: &str = "session.agent.resource";
 
+/// What class of content an agent resource holds, as section 24 classifies it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentResourceContentClass {
+    /// Operation metadata: identifiers, revisions, states, digests and counts.
+    Metadata,
+    /// Terminal output bytes, as the application produced them.
+    TerminalContent,
+    /// Text a person wrote or an agent asked for.
+    AuthoredContent,
+    /// An untrusted notice an application asked the terminal to deliver.
+    ApplicationNotice,
+    /// Key material.
+    Secret,
+}
+
+impl AgentResourceContentClass {
+    /// Returns the stable string for this content class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::TerminalContent => "terminal",
+            Self::AuthoredContent => "authored",
+            Self::ApplicationNotice => "notice",
+            Self::Secret => "secret",
+        }
+    }
+}
+
+/// Which of the broker's paths decided an agent resource transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentResourceCause {
+    /// The resource was recorded as it arrived.
+    Recorded,
+    /// A decoder's verified interpretation made it answerable.
+    Interpreted,
+    /// A rich client claimed it, or gave the claim back.
+    RichClaim,
+    /// An answer left this host for it.
+    Dispatched,
+    /// A rich client's answer settled it.
+    RichAnswer,
+    /// The native terminal's own answer settled it.
+    NativeAnswer,
+    /// The upstream answered or withdrew its own request.
+    Upstream,
+    /// A reconciliation after a reconnection or a recovery settled it.
+    Reconciliation,
+}
+
+impl AgentResourceCause {
+    /// Returns the stable string for this cause.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Interpreted => "interpreted",
+            Self::RichClaim => "rich_claim",
+            Self::Dispatched => "dispatched",
+            Self::RichAnswer => "rich_answer",
+            Self::NativeAnswer => "native_answer",
+            Self::Upstream => "upstream",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
 /// One committed broker transition, as an attached view is told about it.
 ///
 /// Section 12 fans resolutions out to every authorised observer and section 24 makes the
@@ -747,8 +816,16 @@ pub struct AgentResourceEvent {
     pub resource_id: crate::ids::PendingResourceId,
     /// What it became.
     pub state: crate::gateway::PendingState,
+    /// What class of content the resource holds, which is section 24's content classification.
+    pub content: AgentResourceContentClass,
     /// Whether its history is durable or lived through an evidence gap.
     pub durability: crate::session::Durability,
+    /// Which of the broker's paths decided it.
+    pub cause: AgentResourceCause,
+    /// The actor whose action caused it, where one did.
+    pub actor_id: Nullable<crate::ids::ActorId>,
+    /// The upstream request this resource belongs to, which is the root of its causal chain.
+    pub causal_root: String,
     /// The binding revision in force when it changed.
     pub binding_revision: crate::ids::AgentBindingRevision,
     /// This event's position in the broker's ordered stream of transitions.

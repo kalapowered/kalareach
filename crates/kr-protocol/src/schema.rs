@@ -103,7 +103,10 @@ use crate::project::{
     WorkspaceReadParams, WorkspaceReadResult, WorkspaceRemoveParams, WorkspaceRemoveResult,
     WorkspaceSummary,
 };
-use crate::projection::{ProjectionDelta, ProjectionReset, ProjectionRowPage, ProjectionSnapshot};
+use crate::projection::{
+    AgentResourceCause, AgentResourceContentClass, AgentResourceEvent, ProjectionDelta,
+    ProjectionReset, ProjectionRowPage, ProjectionSnapshot,
+};
 use crate::push::{
     PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
     PushRegistrationAnswer, PushRegistrationChallenge, PushRequest, PushSenderRecord,
@@ -222,6 +225,9 @@ pub fn protocol_schema() -> Value {
         "agent_commands_result" => AgentCommandsResult,
         "agent_mutation_result" => AgentMutationResult,
         "agent_prompt_params" => AgentPromptParams,
+        "agent_resource_cause" => AgentResourceCause,
+        "agent_resource_content_class" => AgentResourceContentClass,
+        "agent_resource_event" => AgentResourceEvent,
         "agent_snapshot_params" => AgentSnapshotParams,
         "agent_snapshot_result" => AgentSnapshotResult,
         "agent_steer_params" => AgentSteerParams,

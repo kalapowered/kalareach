@@ -3472,6 +3472,40 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
         "a settlement names the event before it"
     );
 
+    // Section 24: verify every received view notification against its corresponding outbox record.
+    let outbox = broker.transitions_after(0).expect("outbox events");
+    assert!(!seen.is_empty(), "views received notifications");
+    for event in &seen {
+        let record = outbox
+            .iter()
+            .find(|entry| entry.event_id == event.event_id)
+            .expect("the received notification exists in the outbox");
+        assert_eq!(event.sequence.get(), record.sequence);
+        assert_eq!(event.resource_id, record.resource_id);
+        assert_eq!(
+            event.application_instance_id,
+            record.application_instance_id
+        );
+        assert_eq!(event.state, record.state);
+        assert_eq!(event.durability, record.durability);
+        assert_eq!(event.causal_root, record.causal_root);
+        assert_eq!(event.actor_id.0, record.actor_id);
+        assert_eq!(
+            event.parent_sequence.0.map(|s| s.get()),
+            record.parent_sequence
+        );
+        assert_eq!(
+            event.content.as_str(),
+            record.content.as_str(),
+            "content class matches outbox"
+        );
+        assert_eq!(
+            event.cause.as_str(),
+            record.cause.as_str(),
+            "cause matches outbox"
+        );
+    }
+
     carrying.abort();
     served.drained.abort();
 }

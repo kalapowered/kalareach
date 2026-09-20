@@ -72,6 +72,42 @@ pub enum ContentClass {
     Secret,
 }
 
+impl ContentClass {
+    /// Every class, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::Metadata,
+        Self::TerminalContent,
+        Self::AuthoredContent,
+        Self::ApplicationNotice,
+        Self::Secret,
+    ];
+
+    /// Returns the stable stored name of this content class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::TerminalContent => "terminal",
+            Self::AuthoredContent => "authored",
+            Self::ApplicationNotice => "notice",
+            Self::Secret => "secret",
+        }
+    }
+
+    /// Parses a stored name back into a content class.
+    #[must_use]
+    pub fn from_stored(name: &str) -> Option<Self> {
+        match name {
+            "metadata" => Some(Self::Metadata),
+            "terminal" => Some(Self::TerminalContent),
+            "authored" => Some(Self::AuthoredContent),
+            "notice" => Some(Self::ApplicationNotice),
+            "secret" => Some(Self::Secret),
+            _ => None,
+        }
+    }
+}
+
 /// Who removes what a store no longer needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Cleanup {
@@ -375,6 +411,126 @@ pub static STORES: &[StoreDescriptor] = &[
         evictable_under_history_cap: false,
         served_by_archive: true,
     },
+    StoreDescriptor {
+        name: "broker_schema",
+        holds: "the broker ledger's schema version",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_bindings",
+        holds: "the broker's binding revisions for active applications",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_decoder_entries",
+        holds: "verified decoder proposals, their source bytes and interpreted projections",
+        durability: Durability::CrashDurable,
+        retention: Retention::Period(RECEIPT_RETENTION),
+        content: ContentClass::AuthoredContent,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_consumed_sources",
+        holds: "consumed source frame digests to prevent replay",
+        durability: Durability::CrashDurable,
+        retention: Retention::Period(RECEIPT_RETENTION),
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_pending",
+        holds: "pending broker resources waiting for resolution or answer",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::UnfinishedDispatchesResolved,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_profiles",
+        holds: "launch profiles and associated capability evidence",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_gaps",
+        holds: "recorded broker evidence gaps",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_checkpoints",
+        holds: "stream cursor checkpoints for observer replay",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_client_requests",
+        holds: "forwarded native client requests awaiting upstream response",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::UnfinishedDispatchesResolved,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "broker_events",
+        holds: "ordered broker transition events for attached views and outbox replay",
+        durability: Durability::CrashDurable,
+        retention: Retention::Period(RECEIPT_RETENTION),
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
 ];
 
 /// How long receipts are budgeted for, separately from output history.
@@ -401,6 +557,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn content_class_round_trips_through_stored_name() {
+        for class in ContentClass::ALL {
+            let stored = class.as_str();
+            let parsed = ContentClass::from_stored(stored);
+            assert_eq!(parsed, Some(*class));
+        }
+        assert_eq!(ContentClass::from_stored("unknown"), None);
+    }
+
+    #[test]
     fn authority_and_dispatch_data_is_exempt_from_the_history_byte_cap() {
         for name in [
             "receipts",
@@ -417,6 +583,16 @@ mod tests {
             "privacy",
             "closure",
             "journal_gaps",
+            "broker_schema",
+            "broker_bindings",
+            "broker_decoder_entries",
+            "broker_consumed_sources",
+            "broker_pending",
+            "broker_profiles",
+            "broker_gaps",
+            "broker_checkpoints",
+            "broker_client_requests",
+            "broker_events",
         ] {
             let store = store(name).expect("every named store is declared");
             assert!(

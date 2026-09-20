@@ -32,13 +32,13 @@ use std::sync::Arc;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, GatewayConnectionId, PluginId};
 
-use crate::broker::Broker;
 use crate::broker::duplex::{Closure, Duplex, Observations, Observatory};
 use crate::broker::endpoint::{Accepted, BoundEndpoint, Stream};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
 use crate::broker::listener::{BridgeHello, ListenerAddress, Registration, reject_browser_origin};
 use crate::broker::process::{Credential, ManagedProcess};
+use crate::broker::{Broker, ResourceTransition};
 
 /// How long a connecting bridge has to say who it is.
 ///
@@ -220,6 +220,109 @@ async fn stop_what_ended(
     )
 }
 
+fn map_content_class(
+    class: crate::persistence::stores::ContentClass,
+) -> kr_protocol::projection::AgentResourceContentClass {
+    match class {
+        crate::persistence::stores::ContentClass::Metadata => {
+            kr_protocol::projection::AgentResourceContentClass::Metadata
+        }
+        crate::persistence::stores::ContentClass::TerminalContent => {
+            kr_protocol::projection::AgentResourceContentClass::TerminalContent
+        }
+        crate::persistence::stores::ContentClass::AuthoredContent => {
+            kr_protocol::projection::AgentResourceContentClass::AuthoredContent
+        }
+        crate::persistence::stores::ContentClass::ApplicationNotice => {
+            kr_protocol::projection::AgentResourceContentClass::ApplicationNotice
+        }
+        crate::persistence::stores::ContentClass::Secret => {
+            kr_protocol::projection::AgentResourceContentClass::Secret
+        }
+    }
+}
+
+fn map_cause(
+    cause: crate::broker::ledger::TransitionCause,
+) -> kr_protocol::projection::AgentResourceCause {
+    match cause {
+        crate::broker::ledger::TransitionCause::Recorded => {
+            kr_protocol::projection::AgentResourceCause::Recorded
+        }
+        crate::broker::ledger::TransitionCause::Interpreted => {
+            kr_protocol::projection::AgentResourceCause::Interpreted
+        }
+        crate::broker::ledger::TransitionCause::RichClaim => {
+            kr_protocol::projection::AgentResourceCause::RichClaim
+        }
+        crate::broker::ledger::TransitionCause::Dispatched => {
+            kr_protocol::projection::AgentResourceCause::Dispatched
+        }
+        crate::broker::ledger::TransitionCause::RichAnswer => {
+            kr_protocol::projection::AgentResourceCause::RichAnswer
+        }
+        crate::broker::ledger::TransitionCause::NativeAnswer => {
+            kr_protocol::projection::AgentResourceCause::NativeAnswer
+        }
+        crate::broker::ledger::TransitionCause::Upstream => {
+            kr_protocol::projection::AgentResourceCause::Upstream
+        }
+        crate::broker::ledger::TransitionCause::Reconciliation => {
+            kr_protocol::projection::AgentResourceCause::Reconciliation
+        }
+    }
+}
+
+fn to_agent_resource_event(
+    session_id: kr_protocol::ids::SessionId,
+    transition: ResourceTransition,
+) -> kr_protocol::projection::AgentResourceEvent {
+    kr_protocol::projection::AgentResourceEvent {
+        session_id,
+        application_instance_id: transition.application_instance_id,
+        resource_id: transition.resource_id,
+        state: transition.state,
+        content: map_content_class(transition.content),
+        durability: transition.durability,
+        cause: map_cause(transition.cause),
+        actor_id: kr_protocol::scalars::Nullable(transition.actor_id),
+        causal_root: transition.causal_root,
+        binding_revision: transition.binding_revision,
+        sequence: kr_protocol::scalars::U64::new(transition.sequence),
+        event_id: transition.event_id,
+        parent_sequence: kr_protocol::scalars::Nullable(
+            transition
+                .parent_sequence
+                .map(kr_protocol::scalars::U64::new),
+        ),
+    }
+}
+
+fn from_transition_event(
+    session_id: kr_protocol::ids::SessionId,
+    transition: crate::broker::ledger::TransitionEvent,
+) -> kr_protocol::projection::AgentResourceEvent {
+    kr_protocol::projection::AgentResourceEvent {
+        session_id,
+        application_instance_id: transition.application_instance_id,
+        resource_id: transition.resource_id,
+        state: transition.state,
+        content: map_content_class(transition.content),
+        durability: transition.durability,
+        cause: map_cause(transition.cause),
+        actor_id: kr_protocol::scalars::Nullable(transition.actor_id),
+        causal_root: transition.causal_root,
+        binding_revision: transition.binding_revision,
+        sequence: kr_protocol::scalars::U64::new(transition.sequence),
+        event_id: transition.event_id,
+        parent_sequence: kr_protocol::scalars::Nullable(
+            transition
+                .parent_sequence
+                .map(kr_protocol::scalars::U64::new),
+        ),
+    }
+}
+
 /// Carries every transition this connection observes to the views attached to a session.
 ///
 /// It is the production consumer of the broker's own published transitions: the broker commits
@@ -242,21 +345,7 @@ pub async fn deliver_to_views(
                     continue;
                 }
                 last_sequence = transition.sequence;
-                let event = kr_protocol::projection::AgentResourceEvent {
-                    session_id,
-                    application_instance_id: transition.application_instance_id,
-                    resource_id: transition.resource_id,
-                    state: transition.state,
-                    durability: transition.durability,
-                    binding_revision: transition.binding_revision,
-                    sequence: kr_protocol::scalars::U64::new(transition.sequence),
-                    event_id: transition.event_id,
-                    parent_sequence: kr_protocol::scalars::Nullable(
-                        transition
-                            .parent_sequence
-                            .map(kr_protocol::scalars::U64::new),
-                    ),
-                };
+                let event = to_agent_resource_event(session_id, transition);
                 runtime.session().publish_agent_resource(&event);
             }
             None => {
@@ -274,21 +363,7 @@ pub async fn deliver_to_views(
                                 continue;
                             }
                             last_sequence = transition.sequence;
-                            let event = kr_protocol::projection::AgentResourceEvent {
-                                session_id,
-                                application_instance_id: transition.application_instance_id,
-                                resource_id: transition.resource_id,
-                                state: transition.state,
-                                durability: transition.durability,
-                                binding_revision: transition.binding_revision,
-                                sequence: kr_protocol::scalars::U64::new(transition.sequence),
-                                event_id: transition.event_id,
-                                parent_sequence: kr_protocol::scalars::Nullable(
-                                    transition
-                                        .parent_sequence
-                                        .map(kr_protocol::scalars::U64::new),
-                                ),
-                            };
+                            let event = from_transition_event(session_id, transition);
                             runtime.session().publish_agent_resource(&event);
                         }
                     }

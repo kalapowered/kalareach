@@ -1125,6 +1125,169 @@
       ],
       "type": "object"
     },
+    "AgentResourceCause": {
+      "description": "Which of the broker's paths decided an agent resource transition.",
+      "oneOf": [
+        {
+          "const": "recorded",
+          "description": "The resource was recorded as it arrived.",
+          "type": "string"
+        },
+        {
+          "const": "interpreted",
+          "description": "A decoder's verified interpretation made it answerable.",
+          "type": "string"
+        },
+        {
+          "const": "rich_claim",
+          "description": "A rich client claimed it, or gave the claim back.",
+          "type": "string"
+        },
+        {
+          "const": "dispatched",
+          "description": "An answer left this host for it.",
+          "type": "string"
+        },
+        {
+          "const": "rich_answer",
+          "description": "A rich client's answer settled it.",
+          "type": "string"
+        },
+        {
+          "const": "native_answer",
+          "description": "The native terminal's own answer settled it.",
+          "type": "string"
+        },
+        {
+          "const": "upstream",
+          "description": "The upstream answered or withdrew its own request.",
+          "type": "string"
+        },
+        {
+          "const": "reconciliation",
+          "description": "A reconciliation after a reconnection or a recovery settled it.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentResourceContentClass": {
+      "description": "What class of content an agent resource holds, as section 24 classifies it.",
+      "oneOf": [
+        {
+          "const": "metadata",
+          "description": "Operation metadata: identifiers, revisions, states, digests and counts.",
+          "type": "string"
+        },
+        {
+          "const": "terminal_content",
+          "description": "Terminal output bytes, as the application produced them.",
+          "type": "string"
+        },
+        {
+          "const": "authored_content",
+          "description": "Text a person wrote or an agent asked for.",
+          "type": "string"
+        },
+        {
+          "const": "application_notice",
+          "description": "An untrusted notice an application asked the terminal to deliver.",
+          "type": "string"
+        },
+        {
+          "const": "secret",
+          "description": "Key material.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentResourceEvent": {
+      "additionalProperties": false,
+      "description": "One committed broker transition, as an attached view is told about it.\n\nSection 12 fans resolutions out to every authorised observer and section 24 makes the\ntransition and its event one record. This is the shape that record takes on the way to a view:\nwhat changed, what it became, and where the change sits in the broker's own ordered stream, so\na view that missed one can see that it did.",
+      "properties": {
+        "actor_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActorId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The actor whose action caused it, where one did."
+        },
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The instance whose resource changed."
+        },
+        "binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision",
+          "description": "The binding revision in force when it changed."
+        },
+        "causal_root": {
+          "description": "The upstream request this resource belongs to, which is the root of its causal chain.",
+          "type": "string"
+        },
+        "cause": {
+          "$ref": "#/$defs/AgentResourceCause",
+          "description": "Which of the broker's paths decided it."
+        },
+        "content": {
+          "$ref": "#/$defs/AgentResourceContentClass",
+          "description": "What class of content the resource holds, which is section 24's content classification."
+        },
+        "durability": {
+          "$ref": "#/$defs/Durability",
+          "description": "Whether its history is durable or lived through an evidence gap."
+        },
+        "event_id": {
+          "$ref": "#/$defs/Uuid",
+          "description": "The event itself, which never changes and never repeats."
+        },
+        "parent_sequence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The previous event about this same resource, where there is one."
+        },
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The resource."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "This event's position in the broker's ordered stream of transitions."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the instance belongs to."
+        },
+        "state": {
+          "$ref": "#/$defs/PendingState",
+          "description": "What it became."
+        }
+      },
+      "required": [
+        "session_id",
+        "application_instance_id",
+        "resource_id",
+        "state",
+        "content",
+        "durability",
+        "cause",
+        "actor_id",
+        "causal_root",
+        "binding_revision",
+        "sequence",
+        "event_id",
+        "parent_sequence"
+      ],
+      "type": "object"
+    },
     "AgentSnapshotEntry": {
       "additionalProperties": false,
       "description": "One entry of a bound agent's shared state.",
@@ -28136,6 +28299,15 @@
     },
     "agent_prompt_params": {
       "$ref": "#/$defs/AgentPromptParams"
+    },
+    "agent_resource_cause": {
+      "$ref": "#/$defs/AgentResourceCause"
+    },
+    "agent_resource_content_class": {
+      "$ref": "#/$defs/AgentResourceContentClass"
+    },
+    "agent_resource_event": {
+      "$ref": "#/$defs/AgentResourceEvent"
     },
     "agent_snapshot_params": {
       "$ref": "#/$defs/AgentSnapshotParams"

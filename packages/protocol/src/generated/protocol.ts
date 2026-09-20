@@ -107,6 +107,27 @@ export type ApplicationInstanceId = string
  */
 export type PromptText = string
 /**
+ * Which of the broker's paths decided an agent resource transition.
+ */
+export type AgentResourceCause =
+  | 'recorded'
+  | 'interpreted'
+  | 'rich_claim'
+  | 'dispatched'
+  | 'rich_answer'
+  | 'native_answer'
+  | 'upstream'
+  | 'reconciliation'
+/**
+ * What class of content an agent resource holds, as section 24 classifies it.
+ */
+export type AgentResourceContentClass =
+  'metadata' | 'terminal_content' | 'authored_content' | 'application_notice' | 'secret'
+/**
+ * A stable host-issued principal for one verified actor. The caller cannot assert it.
+ */
+export type ActorId = string
+/**
  * One change an installation makes, with its inverse implied by its kind.
  */
 export type ChangeOperation =
@@ -617,10 +638,6 @@ export type ActionTokenId = string
  * A host-issued action window identifier, bound to one authenticated connection and host boot.
  */
 export type ActionWindowId = string
-/**
- * A stable host-issued principal for one verified actor. The caller cannot assert it.
- */
-export type ActorId = string
 /**
  * One backup archive. The service sees only this opaque identifier.
  */
@@ -1368,6 +1385,9 @@ export interface KalaReachProtocol {
   agent_draft_add_attachment_result?: AgentDraftAddAttachmentResult
   agent_mutation_result?: AgentMutationResult1
   agent_prompt_params?: AgentPromptParams
+  agent_resource_cause?: AgentResourceCause
+  agent_resource_content_class?: AgentResourceContentClass
+  agent_resource_event?: AgentResourceEvent
   agent_snapshot_params?: AgentSnapshotParams
   agent_snapshot_result?: AgentSnapshotResult
   agent_steer_params?: AgentSteerParams
@@ -2992,6 +3012,76 @@ export interface AgentMutationTarget2 {
   subject: AgentSubject
 }
 /**
+ * One committed broker transition, as an attached view is told about it.
+ *
+ * Section 12 fans resolutions out to every authorised observer and section 24 makes the
+ * transition and its event one record. This is the shape that record takes on the way to a view:
+ * what changed, what it became, and where the change sits in the broker's own ordered stream, so
+ * a view that missed one can see that it did.
+ */
+export interface AgentResourceEvent {
+  /**
+   * The actor whose action caused it, where one did.
+   */
+  actor_id: ActorId | null
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * The upstream request this resource belongs to, which is the root of its causal chain.
+   */
+  causal_root: string
+  /**
+   * Which of the broker's paths decided it.
+   */
+  cause:
+    | 'recorded'
+    | 'interpreted'
+    | 'rich_claim'
+    | 'dispatched'
+    | 'rich_answer'
+    | 'native_answer'
+    | 'upstream'
+    | 'reconciliation'
+  /**
+   * What class of content the resource holds, which is section 24's content classification.
+   */
+  content: 'metadata' | 'terminal_content' | 'authored_content' | 'application_notice' | 'secret'
+  /**
+   * Whether its history is durable or lived through an evidence gap.
+   */
+  durability: 'durable' | 'volatile'
+  /**
+   * The event itself, which never changes and never repeats.
+   */
+  event_id: string
+  /**
+   * The previous event about this same resource, where there is one.
+   */
+  parent_sequence: U64 | null
+  /**
+   * The resource.
+   */
+  resource_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * What it became.
+   */
+  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+}
+/**
  * Parameters of `agent.snapshot`.
  */
 export interface AgentSnapshotParams {
@@ -3460,7 +3550,7 @@ export interface Alert1 {
  */
 export interface AnswerRecord {
   /**
-   * The host-verified principal that answered. A caller never asserts its own.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   /**
@@ -3885,7 +3975,7 @@ export interface AttentionAcknowledgeResult {
    */
   acknowledged: AttentionKey[]
   /**
-   * The actor the acknowledgement belongs to.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   /**
@@ -4218,7 +4308,7 @@ export interface PossiblyExecutedAction {
    */
   action_id: string
   /**
-   * The actor that submitted it.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   /**
@@ -4243,7 +4333,7 @@ export interface FencedAction {
    */
   action_id: string
   /**
-   * The actor whose action it was.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
 }
@@ -16286,7 +16376,7 @@ export interface ReviewAcknowledgeParams {
  */
 export interface ReviewAcknowledgeResult {
   /**
-   * The actor the acknowledgement belongs to.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   review: ReviewState
@@ -16376,7 +16466,7 @@ export interface ReviewReadParams {
  */
 export interface ReviewReadResult {
   /**
-   * The actor this state belongs to.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   /**
@@ -19569,7 +19659,7 @@ export interface VisitAcknowledgeResult {
    */
   acknowledged_cursor: string
   /**
-   * The actor the visit belongs to.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   /**
@@ -19599,7 +19689,7 @@ export interface VisitChangedParams {
  */
 export interface VisitChangedResult {
   /**
-   * The actor this view belongs to.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   /**

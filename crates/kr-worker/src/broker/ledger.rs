@@ -171,9 +171,10 @@ pub enum TransitionCause {
 /// ([`crate::persistence::stores::ContentClass`]), not a second vocabulary. It is a different
 /// question from [`NativeClassification`], which says what a method may *do*.
 ///
-/// No broker row holds the content itself. A native request's bytes stay in the retained source
-/// frame they arrived in, and the resource names that frame; this says what a consumer would be
-/// reading if it followed the name back, so it is the widest class the content can be:
+/// While `DecoderLedgerEntry` retains the source bytes and the verified projection, a native
+/// request's raw bytes stay in the retained source frame they arrived in, and the resource itself
+/// names that frame; this says what a consumer would be reading if it followed the name back, so
+/// it is the widest class the content can be:
 ///
 /// * a recorded native request, approval or reverse operation alike, is the connector's own
 ///   frame, and the widest thing a frame can quote is the application's own output, so it is
@@ -192,20 +193,6 @@ pub const fn content_class(resource: &PendingResource) -> ContentClass {
                 ContentClass::TerminalContent
             }
         }
-    }
-}
-
-/// Returns the stable stored name of one content class.
-///
-/// The names are the journal's, because the classes are one vocabulary and a reader of either
-/// store has to find the same word for the same thing.
-const fn class_text(class: ContentClass) -> &'static str {
-    match class {
-        ContentClass::Metadata => "metadata",
-        ContentClass::TerminalContent => "terminal",
-        ContentClass::AuthoredContent => "authored",
-        ContentClass::ApplicationNotice => "notice",
-        ContentClass::Secret => "secret",
     }
 }
 
@@ -293,16 +280,8 @@ fn class_from(text: &str) -> Result<kr_protocol::gateway::NativeMethodClass> {
 
 /// Reads one stored content class back.
 fn content_from(text: &str) -> Result<ContentClass> {
-    match text {
-        "metadata" => Ok(ContentClass::Metadata),
-        "terminal" => Ok(ContentClass::TerminalContent),
-        "authored" => Ok(ContentClass::AuthoredContent),
-        "notice" => Ok(ContentClass::ApplicationNotice),
-        "secret" => Ok(ContentClass::Secret),
-        other => Err(BrokerError::ledger(format!(
-            "{other} is not a stored content class"
-        ))),
-    }
+    ContentClass::from_stored(text)
+        .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored content class")))
 }
 
 /// Reads one stored pending state back.
@@ -332,7 +311,7 @@ fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent)
                 event.state.as_str(),
                 event.classification.class.as_str(),
                 i64::from(event.classification.declared),
-                class_text(event.content),
+                event.content.as_str(),
                 event.durability.as_str(),
                 event.cause.as_str(),
                 event
