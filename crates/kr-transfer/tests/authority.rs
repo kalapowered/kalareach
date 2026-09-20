@@ -778,7 +778,10 @@ fn give_an_access_control_list(
 }
 
 /// Returns nothing: this platform keeps its access-control lists where this host cannot write one.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+///
+/// It stands in on the Unix hosts that are neither Apple's nor Linux. The case that calls it is a
+/// Unix one, so nothing else needs it.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn give_an_access_control_list(
     _authority: &AuthorisedDirectory,
     _name: &RelativeName,
