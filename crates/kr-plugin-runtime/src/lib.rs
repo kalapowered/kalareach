@@ -5,10 +5,11 @@
 //! It holds the component engine, the per-instance bounds, the compiled-code cache, the binding
 //! lifecycle, and the client and protocol of the per-environment service that owns the instances.
 //!
-//! # The two halves
+//! # What each module owns
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | [`catalogue`] | Repository enrolment and budgets, the signed metadata snapshot and its verification, offline search, package activation and what an installed package may do |
 //! | [`runtime`] | The engine, the generated bindings, the four host imports, the limiter, fuel and deadlines, the fault counter, the cache, lazy compilation and the binding lifecycle |
 //! | [`service`] | The protocol a worker speaks to the plugin-host process, both ends of it, and the launcher that starts the host |
 //!
@@ -67,6 +68,7 @@
 //! # }
 //! ```
 
+pub mod catalogue;
 pub mod runtime;
 pub mod service;
 

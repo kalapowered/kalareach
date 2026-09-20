@@ -37,6 +37,10 @@ repository = "https://github.com/kalapowered/kalareach"
 publish = false
 
 [workspace.dependencies]
+# The signing and verification primitives `tough` is built on. Declared here because the catalogue
+# tests build their own trust roots and generations, which needs the same random source and key
+# pair types that crate signs with.
+aws-lc-rs = "=1.18.1"
 base64 = "=0.23.1"
 boot-time = "=0.1.3"
 cap-fs-ext = "=4.0.3"
@@ -61,6 +65,8 @@ iroh-base = { version = "=1.2.0", default-features = false, features = ["key", "
 iroh-mainline-address-lookup = "=0.5.0"
 iroh-mdns-address-lookup = "=0.5.0"
 iroh-relay = { version = "=1.2.0", default-features = false }
+# The calendar and instant types `tough` states metadata expiry in.
+jiff = { version = "=0.2.37", features = ["serde"] }
 keyring = "=4.2.0"
 kr-attention = { path = "crates/kr-attention", version = "=0.1.0" }
 kr-automation = { path = "crates/kr-automation", version = "=0.1.0" }
@@ -149,6 +155,9 @@ thread-priority = "=3.1.1"
 # leave that file's other settings, its ordering and its comments exactly as they were.
 toml_edit = "=0.25.15"
 tokio-rustls = { version = "=0.26.5", default-features = false, features = ["logging", "ring", "tls12"] }
+# The Update Framework client. The same exact release the catalogue publishing pipeline signs with,
+# so the end that writes a generation and the end that verifies one run the same code.
+tough = "=0.24.0"
 tokio-util = "=0.7.18"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
