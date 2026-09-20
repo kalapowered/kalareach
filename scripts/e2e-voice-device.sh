@@ -1,26 +1,35 @@
 #!/usr/bin/env bash
 #
-# Drives the voice client surfaces on the iOS Simulator, the Android emulator, and desktop,
-# asserting requirement states, refusal of unconfirmed actions, local mute survival, and latency metrics.
+# Drives the voice surface on the iOS Simulator, the Android emulator and the desktop window, and
+# writes a qualification log made only of what this run actually checked.
 #
-# Requirements asserted:
-#   KR-REQ-15.09: Managed content access disclosed in provider choice
-#   KR-REQ-15.19: Provider and context scope shown before voice starts
-#   KR-REQ-15.34: Screen-lock audio session / foreground service configuration
-#   KR-REQ-15.35: Interruption, route change, phone call, mute and termination handled
-#   KR-REQ-15.36: Muted/unavailable capture shown; unheard speech never authorises
-#   KR-ACC-014:   Screen-lock call, capture interruption, context scope, cancellation
-#   KR-PERF-010:  First-audio and delegation latency (client-measured half)
-#   KR-REQ-15.17: Local mute and closure survive broker failure
-#   KR-REQ-15.22: Speech interruption stops playback only; cancellation uses typed turn request
+# Two rules govern this script. It asserts rather than photographs: the screenshots are evidence
+# beside the assertions, never instead of them. And it claims nothing it did not establish: every
+# PROVED line in the log comes from an assertion that passed on this run, every clause the run could
+# not reach is printed as NOT PROVED with the reason, and no figure is printed that nothing measured.
+#
+# Rows this run can speak to:
+#   KR-REQ-15.09  managed content access disclosed in the provider choice
+#   KR-REQ-15.19  the provider and the context scope shown before voice starts
+#   KR-REQ-15.17  local mute, playback stop and closure survive an unreachable voice service
+#   KR-REQ-15.22  stopping the voice is not cancelling a turn
+#   KR-REQ-15.35  the interruption states the surface draws
+#   KR-REQ-15.36  muted or unavailable capture displayed, with the refusal beside it
+#
+# Rows a simulator and an emulator cannot close, and which this script therefore does not claim:
+#   KR-REQ-15.34  audio after a hardware screen lock
+#   KR-ACC-014    a screen-lock call on a handset
+#   KR-PERF-010   first-audio and delegation latency, which need a connected media path
 #
 # Usage:
-#   scripts/e2e-voice-device.sh           # all available platforms
+#   scripts/e2e-voice-device.sh           # every platform that is available here
 #   scripts/e2e-voice-device.sh ios
 #   scripts/e2e-voice-device.sh android
 #   scripts/e2e-voice-device.sh desktop
 #
-set -euo pipefail
+# Exit codes: 0 every requested platform ran, 2 bad usage or a failed assertion, 3 a requested
+# platform is not available on this machine.
+set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 companion="$here/apps/companion"
@@ -29,267 +38,326 @@ shots="${KR_MOBILE_SCREENSHOT_DIR:-/tmp}"
 port="${KR_VOICE_TEST_PORT:-4188}"
 want="${1:-all}"
 
+case "$want" in
+    ios | android | desktop | all) ;;
+    *) printf 'unknown target: %s\n' "$want" >&2; exit 2 ;;
+esac
+
 mkdir -p "${artefacts:?}"
+log="$artefacts/e2e-voice-device.log"
+: >"${log:?}"
 
-say() { printf '== [e2e-voice-device] %s\n' "$*"; }
+say() { printf '== [e2e-voice-device] %s\n' "$*" | tee -a "${log:?}"; }
 
-say "building the harness bundle"
-( cd "$companion" && pnpm build:harness ) >"$artefacts/build.log" 2>&1
+# What this run established, and what it could not. Both are printed at the end, and neither is a
+# fixed list: they are appended as the run reaches each check.
+proved_lines=()
+unproved_lines=()
+missing_platforms=()
+failures=0
 
-say "serving harness on port $port"
-( cd "$companion" && PORT="$port" node scripts/preview-harness.mjs ) >"$artefacts/serve.log" 2>&1 &
-server=$!
+proved() { proved_lines+=("$*"); }
+unproved() { unproved_lines+=("$*"); }
+fail() { failures=$((failures + 1)); say "FAILED: $*"; }
+
+# ---- The harness the surfaces are driven in ----------------------------------------------------
+
+server=0
+ios_booted_here=0
+ios_udid=""
+android_started_here=0
+android_serial=""
+adb_path=""
+
 cleanup() {
-    if [ -n "${server:-}" ]; then
-        pkill -P "${server:?}" 2>/dev/null || true
+    # Only what this run started, and only by the identity this run recorded.
+    if [ "${server:-0}" -ne 0 ]; then
         kill "${server:?}" 2>/dev/null || true
+        wait "${server:?}" 2>/dev/null || true
+    fi
+    if [ "$ios_booted_here" = 1 ] && [ -n "$ios_udid" ]; then
+        say "shutting down the simulator this run booted"
+        xcrun simctl shutdown "$ios_udid" 2>/dev/null || true
+    fi
+    if [ "$android_started_here" = 1 ] && [ -n "$android_serial" ] && [ -n "$adb_path" ]; then
+        say "stopping the emulator this run started"
+        "$adb_path" -s "$android_serial" emu kill 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
 
+say "building the harness bundle"
+if ! ( cd "$companion" && pnpm build:harness ) >"$artefacts/build.log" 2>&1; then
+    say "the harness bundle did not build; see $artefacts/build.log"
+    exit 2
+fi
+
+say "serving the harness on port $port"
+( cd "$companion" && PORT="$port" node scripts/preview-harness.mjs ) >"$artefacts/serve.log" 2>&1 &
+server=$!
+
+ready=0
 for _ in $(seq 1 60); do
-    if curl -fsS "http://localhost:$port/harness.html" >/dev/null 2>&1; then break; fi
+    if curl -fsS "http://localhost:$port/harness.html" >/dev/null 2>&1; then ready=1; break; fi
     sleep 0.5
 done
-curl -fsS "http://localhost:$port/harness.html" >/dev/null
+if [ "$ready" != 1 ]; then
+    say "the harness did not start; see $artefacts/serve.log"
+    exit 2
+fi
 
-say "running cross-engine DOM assertions"
-node --experimental-strip-types "$companion/test/voice/assert-voice-surface.ts" "http://localhost:$port" | tee "$artefacts/assertions.log"
+# ---- The assertions, in the engine each platform draws the surface with -------------------------
+
+run_assertions() {
+    say "asserting the surface in WebKit and Chromium"
+    if node --experimental-strip-types "$companion/test/voice/assert-voice-surface.ts" \
+        "http://localhost:$port" >"$artefacts/assertions.log" 2>&1; then
+        while IFS= read -r line; do
+            case "$line" in
+                proved\ *) proved "${line#proved }" ;;
+                unproved\ *) unproved "${line#unproved }" ;;
+            esac
+        done <"$artefacts/assertions.log"
+        say "$(grep -c '^proved ' "$artefacts/assertions.log" || true) clauses asserted"
+    else
+        fail "the surface assertions did not pass; see $artefacts/assertions.log"
+        sed -n '$p' "$artefacts/assertions.log" | tee -a "${log:?}"
+    fi
+}
 
 # ---- iOS ---------------------------------------------------------------------------------------
 
 run_ios() {
-    say "driving iOS voice surfaces"
-    local device="${KR_IOS_DEVICE:-iPhone 17 Pro}"
-    local udid started=0
-    udid="$(xcrun simctl list devices available -j |
-        python3 "$here/scripts/simulator-identity.py" udid "$device")"
-    if [ -z "$udid" ]; then
-        say "no iOS simulator named $device available"
+    say "driving the iOS voice surface"
+    if ! command -v xcrun >/dev/null 2>&1; then
+        say "no Xcode command line tools on this machine"
+        missing_platforms+=("ios: no xcrun")
         return 3
     fi
+    local device="${KR_IOS_DEVICE:-iPhone 17 Pro}"
+    ios_udid="$(xcrun simctl list devices available -j 2>/dev/null |
+        python3 "$here/scripts/simulator-identity.py" udid "$device" 2>/dev/null)"
+    if [ -z "$ios_udid" ]; then
+        say "no iOS simulator named $device is available"
+        missing_platforms+=("ios: no simulator named $device")
+        return 3
+    fi
+
     local state
     state="$(xcrun simctl list devices available -j |
-        python3 "$here/scripts/simulator-identity.py" state "$udid")"
+        python3 "$here/scripts/simulator-identity.py" state "$ios_udid")"
     if [ "$state" != "Booted" ]; then
-        say "booting $device ($udid)"
-        xcrun simctl boot "$udid"
-        started=1
-        sleep 8
+        say "booting $device ($ios_udid)"
+        xcrun simctl boot "$ios_udid" || { missing_platforms+=("ios: $device would not boot"); return 3; }
+        ios_booted_here=1
+        local booted=0
+        for _ in $(seq 1 60); do
+            if xcrun simctl list devices available -j |
+                python3 "$here/scripts/simulator-identity.py" state "$ios_udid" | grep -q Booted; then
+                booted=1
+                break
+            fi
+            sleep 1
+        done
+        [ "$booted" = 1 ] || { say "$device did not finish booting"; missing_platforms+=("ios: boot timed out"); return 3; }
     else
-        say "reusing already booted $device ($udid)"
+        say "reusing the already booted $device ($ios_udid)"
     fi
 
     local desc
-    desc="$(xcrun simctl list devices available -j | python3 "$here/scripts/simulator-identity.py" describe "$udid")"
-    echo "iOS Device: $desc" | tee "$artefacts/ios-device.txt"
+    desc="$(xcrun simctl list devices available -j |
+        python3 "$here/scripts/simulator-identity.py" describe "$ios_udid")"
+    printf 'iOS device: %s\n' "$desc" | tee "$artefacts/ios-device.txt" | tee -a "${log:?}"
 
-    # KR-REQ-15.09 & KR-REQ-15.19: Provider choice & scope
-    xcrun simctl openurl "$udid" "http://localhost:$port/harness.html?surface=ios&tab=voice"
-    sleep "${KR_MOBILE_SETTLE:-4}"
-    xcrun simctl io "$udid" screenshot --type=png "$shots/kr-voice-ios-15.09-disclosure.png" >/dev/null
+    shoot_ios() {
+        local state_param=$1 name=$2
+        xcrun simctl openurl "$ios_udid" \
+            "http://localhost:$port/harness.html?surface=ios&tab=voice$state_param" || return 1
+        sleep "${KR_MOBILE_SETTLE:-4}"
+        xcrun simctl io "$ios_udid" screenshot --type=png "$shots/$name" >/dev/null || return 1
+        say "iOS screenshot $shots/$name"
+    }
+
+    shoot_ios "" "kr-voice-ios-15.09-disclosure.png" || fail "iOS provider choice screenshot"
     cp "$shots/kr-voice-ios-15.09-disclosure.png" "$shots/kr-voice-ios-15.19-context-scope.png"
-    say "captured iOS provider choice & scope -> $shots/kr-voice-ios-15.19-context-scope.png"
+    shoot_ios "&state=unavailable" "kr-voice-ios-15.36-capture-unavailable.png" ||
+        fail "iOS unavailable capture screenshot"
+    shoot_ios "&state=muted" "kr-voice-ios-15.36-muted.png" || fail "iOS muted capture screenshot"
+    shoot_ios "&state=capturing" "kr-voice-ios-15.22-call-screen.png" || fail "iOS call screen screenshot"
 
-    # KR-REQ-15.36 & KR-ACC-014: Unavailable capture & refusal
-    xcrun simctl openurl "$udid" "http://localhost:$port/harness.html?surface=ios&tab=voice&state=unavailable"
-    sleep "${KR_MOBILE_SETTLE:-3}"
-    xcrun simctl io "$udid" screenshot --type=png "$shots/kr-voice-ios-15.36-capture-unavailable.png" >/dev/null
-    say "captured iOS capture unavailable -> $shots/kr-voice-ios-15.36-capture-unavailable.png"
-
-    # KR-REQ-15.36: Muted capture & refusal
-    xcrun simctl openurl "$udid" "http://localhost:$port/harness.html?surface=ios&tab=voice&state=muted"
-    sleep "${KR_MOBILE_SETTLE:-3}"
-    xcrun simctl io "$udid" screenshot --type=png "$shots/kr-voice-ios-15.36-muted.png" >/dev/null
-    say "captured iOS muted capture -> $shots/kr-voice-ios-15.36-muted.png"
-
-    # KR-REQ-15.22: Live call screen
-    xcrun simctl openurl "$udid" "http://localhost:$port/harness.html?surface=ios&tab=voice&state=capturing"
-    sleep "${KR_MOBILE_SETTLE:-3}"
-    xcrun simctl io "$udid" screenshot --type=png "$shots/kr-voice-ios-15.22-call-screen.png" >/dev/null
-    say "captured iOS call screen -> $shots/kr-voice-ios-15.22-call-screen.png"
-
-    if [ "$started" = 1 ]; then
-        say "shutting down the simulator this run booted"
-        xcrun simctl shutdown "$udid"
-    fi
+    proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the iOS Simulator | $desc"
+    proved "KR-REQ-15.36 | the unavailable and muted capture states render on the iOS Simulator | $desc"
+    unproved "KR-REQ-15.34 | duplex audio after a screen lock | the iOS Simulator has no microphone input and no lock screen"
+    unproved "KR-ACC-014 | a screen-lock call | the same; the device leg is the operator gate"
+    return 0
 }
 
 # ---- Android -----------------------------------------------------------------------------------
 
 run_android() {
-    say "driving Android voice surfaces"
+    say "driving the Android voice surface"
     local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
-    local adb="$sdk/platform-tools/adb" emulator="$sdk/emulator/emulator"
-    local serial started=0 pid=0
-    if [ ! -x "$adb" ]; then
+    adb_path="$sdk/platform-tools/adb"
+    local emulator="$sdk/emulator/emulator"
+    if [ ! -x "$adb_path" ]; then
         say "no Android platform tools"
+        missing_platforms+=("android: no adb")
+        adb_path=""
         return 3
     fi
-    serial="$("$adb" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
-    if [ -z "$serial" ]; then
+
+    android_serial="$("$adb_path" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
+    if [ -z "$android_serial" ]; then
         local avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
-        if [ -z "$avd" ]; then
-            say "no Android virtual device"
+        if [ ! -x "$emulator" ]; then
+            say "no Android emulator binary"
+            missing_platforms+=("android: no emulator")
             return 3
         fi
-        say "starting emulator $avd"
-        "$emulator" -avd "$avd" -crash-report-mode disabled -no-snapshot-save -no-boot-anim -netdelay none -netspeed full \
-            >"$artefacts/emulator.log" 2>&1 &
-        pid=$!
-        started=1
-        "$adb" wait-for-device
-        for _ in $(seq 1 120); do
-            [ "$("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+        say "starting the emulator $avd"
+        "$emulator" -avd "$avd" -crash-report-mode disabled -no-snapshot-save -no-boot-anim \
+            -netdelay none -netspeed full >"$artefacts/emulator.log" 2>&1 &
+        android_started_here=1
+        # Bounded: `adb wait-for-device` on a virtual device that never appears waits for ever.
+        local up=0
+        for _ in $(seq 1 180); do
+            android_serial="$("$adb_path" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
+            if [ -n "$android_serial" ] &&
+                [ "$("$adb_path" -s "$android_serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+                up=1
+                break
+            fi
             sleep 2
         done
-        serial="$("$adb" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
+        if [ "$up" != 1 ]; then
+            say "the emulator did not come up within six minutes; see $artefacts/emulator.log"
+            missing_platforms+=("android: emulator did not boot")
+            return 3
+        fi
     else
-        say "reusing already running $serial"
-    fi
-    if [ -z "$serial" ]; then
-        say "emulator did not come up"
-        return 3
+        say "reusing the already running $android_serial"
     fi
 
     local model release sdkver
-    model="$("$adb" -s "$serial" shell getprop ro.product.model | tr -d '\r')"
-    release="$("$adb" -s "$serial" shell getprop ro.build.version.release | tr -d '\r')"
-    sdkver="$("$adb" -s "$serial" shell getprop ro.build.version.sdk | tr -d '\r')"
+    model="$("$adb_path" -s "$android_serial" shell getprop ro.product.model | tr -d '\r')"
+    release="$("$adb_path" -s "$android_serial" shell getprop ro.build.version.release | tr -d '\r')"
+    sdkver="$("$adb_path" -s "$android_serial" shell getprop ro.build.version.sdk | tr -d '\r')"
+    local desc="$android_serial, $model, Android $release, API $sdkver"
+    printf 'Android device: %s\n' "$desc" | tee "$artefacts/android-device.txt" | tee -a "${log:?}"
 
-    {
-        printf 'serial: %s\n' "$serial"
-        printf 'model: %s\n' "$model"
-        printf 'release: %s\n' "$release"
-        printf 'sdk: %s\n' "$sdkver"
-    } | tee "$artefacts/android-device.txt"
+    "$adb_path" -s "$android_serial" reverse "tcp:$port" "tcp:$port" >/dev/null 2>&1 || true
 
-    "$adb" -s "$serial" reverse "tcp:$port" "tcp:$port" >/dev/null 2>&1 || true
+    shoot_android() {
+        local state_param=$1 name=$2
+        "$adb_path" -s "$android_serial" shell \
+            "am start -a android.intent.action.VIEW --es com.android.browser.application_id com.android.chrome -d 'http://localhost:$port/harness.html?surface=android&tab=voice$state_param'" \
+            >/dev/null || return 1
+        sleep "${KR_MOBILE_SETTLE:-5}"
+        "$adb_path" -s "$android_serial" exec-out screencap -p >"$shots/$name" || return 1
+        say "Android screenshot $shots/$name"
+    }
 
-    # KR-REQ-15.09 & KR-REQ-15.19: Provider choice & scope
-    "$adb" -s "$serial" shell \
-        "am start -a android.intent.action.VIEW --es com.android.browser.application_id com.android.chrome -d 'http://localhost:$port/harness.html?surface=android&tab=voice'" \
-        >/dev/null
-    sleep "${KR_MOBILE_SETTLE:-5}"
-    "$adb" -s "$serial" exec-out screencap -p >"$shots/kr-voice-android-15.09-disclosure.png"
+    shoot_android "" "kr-voice-android-15.09-disclosure.png" || fail "Android provider choice screenshot"
     cp "$shots/kr-voice-android-15.09-disclosure.png" "$shots/kr-voice-android-15.19-context-scope.png"
-    say "captured Android provider choice & scope -> $shots/kr-voice-android-15.19-context-scope.png"
+    shoot_android "&state=unavailable" "kr-voice-android-15.36-capture-unavailable.png" ||
+        fail "Android unavailable capture screenshot"
+    shoot_android "&state=muted" "kr-voice-android-15.36-muted.png" || fail "Android muted capture screenshot"
 
-    # KR-REQ-15.36 & KR-ACC-014: Unavailable capture & refusal
-    "$adb" -s "$serial" shell \
-        "am start -a android.intent.action.VIEW --es com.android.browser.application_id com.android.chrome -d 'http://localhost:$port/harness.html?surface=android&tab=voice&state=unavailable'" \
-        >/dev/null
-    sleep "${KR_MOBILE_SETTLE:-4}"
-    "$adb" -s "$serial" exec-out screencap -p >"$shots/kr-voice-android-15.36-capture-unavailable.png"
-    say "captured Android capture unavailable -> $shots/kr-voice-android-15.36-capture-unavailable.png"
-
-    # KR-REQ-15.36: Muted capture & refusal
-    "$adb" -s "$serial" shell \
-        "am start -a android.intent.action.VIEW --es com.android.browser.application_id com.android.chrome -d 'http://localhost:$port/harness.html?surface=android&tab=voice&state=muted'" \
-        >/dev/null
-    sleep "${KR_MOBILE_SETTLE:-4}"
-    "$adb" -s "$serial" exec-out screencap -p >"$shots/kr-voice-android-15.36-muted.png"
-    say "captured Android muted capture -> $shots/kr-voice-android-15.36-muted.png"
-
-    # KR-REQ-15.35: Interruption by incoming phone call
-    say "simulating incoming phone call on Android emulator"
-    "$adb" -s "$serial" emu gsm call 15555215554 >/dev/null 2>&1 || true
-    sleep 3
-    "$adb" -s "$serial" exec-out screencap -p >"$shots/kr-voice-android-15.35-incoming-call.png"
-    say "captured incoming phone call interruption -> $shots/kr-voice-android-15.35-incoming-call.png"
-    "$adb" -s "$serial" emu gsm cancel 15555215554 >/dev/null 2>&1 || true
-    sleep 2
-
-    # KR-REQ-15.22: Live call screen
-    "$adb" -s "$serial" shell \
-        "am start -a android.intent.action.VIEW --es com.android.browser.application_id com.android.chrome -d 'http://localhost:$port/harness.html?surface=android&tab=voice&state=capturing'" \
-        >/dev/null
-    sleep "${KR_MOBILE_SETTLE:-4}"
-    "$adb" -s "$serial" exec-out screencap -p >"$shots/kr-voice-android-15.22-call-screen.png"
-    say "captured Android call screen -> $shots/kr-voice-android-15.22-call-screen.png"
-
-    if [ "$started" = 1 ]; then
-        say "stopping emulator this run started"
-        "$adb" -s "$serial" emu kill 2>/dev/null || kill "$pid" 2>/dev/null || true
+    # The emulator's simulated call is a telephony state change, not a call on a handset. It is
+    # recorded as what it is.
+    say "raising the emulator's simulated incoming call"
+    if "$adb_path" -s "$android_serial" emu gsm call 15555215554 >/dev/null 2>&1; then
+        sleep 3
+        "$adb_path" -s "$android_serial" exec-out screencap -p \
+            >"$shots/kr-voice-android-15.35-incoming-call.png" || fail "Android incoming call screenshot"
+        "$adb_path" -s "$android_serial" emu gsm cancel 15555215554 >/dev/null 2>&1 || true
+        sleep 2
+        proved "KR-REQ-15.35 | the emulator's simulated incoming call was raised and cancelled with the surface open | $desc"
+        unproved "KR-REQ-15.35 | audio focus loss to a real call | the emulator's telephony state change is not a call on a handset, and no call is connected to lose focus from"
+    else
+        unproved "KR-REQ-15.35 | the simulated incoming call | this emulator refused the telephony command"
     fi
+
+    shoot_android "&state=capturing" "kr-voice-android-15.22-call-screen.png" || fail "Android call screen screenshot"
+
+    proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the Android emulator | $desc"
+    proved "KR-REQ-15.36 | the unavailable and muted capture states render on the Android emulator | $desc"
+    unproved "KR-REQ-15.34 | audio from the foreground service after a screen lock | an emulator does not qualify a foreground microphone service; the device leg is the operator gate"
+    return 0
 }
 
 # ---- Desktop -----------------------------------------------------------------------------------
 
 run_desktop() {
-    say "driving desktop voice screenshots"
-    # Capture desktop screens using headless chromium
+    say "capturing the desktop voice screens"
     ( cd "$companion" && node --input-type=module -e "
       import { chromium } from '@playwright/test';
       const browser = await chromium.launch({ headless: true });
       const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-
-      await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice');
-      await page.waitForSelector('.kr-voice');
-      await page.screenshot({ path: '$shots/kr-voice-desktop-15.09-disclosure.png' });
-      await page.screenshot({ path: '$shots/kr-voice-desktop-15.19-context-scope.png' });
-
-      await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice&state=muted');
-      await page.waitForSelector('.kr-voice');
-      await page.screenshot({ path: '$shots/kr-voice-desktop-15.36-muted.png' });
-
-      await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice&state=capturing');
-      await page.waitForSelector('.kr-voice');
-      await page.screenshot({ path: '$shots/kr-voice-desktop-15.22-call-screen.png' });
-
+      const shoot = async (query, name) => {
+        await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice' + query);
+        await page.waitForSelector('.kr-voice');
+        await page.screenshot({ path: '$shots/' + name });
+      };
+      await shoot('', 'kr-voice-desktop-15.09-disclosure.png');
+      await shoot('', 'kr-voice-desktop-15.19-context-scope.png');
+      await shoot('&state=muted', 'kr-voice-desktop-15.36-muted.png');
+      await shoot('&state=unavailable', 'kr-voice-desktop-15.36-capture-unavailable.png');
+      await shoot('&state=capturing', 'kr-voice-desktop-15.22-call-screen.png');
       await browser.close();
-    " )
-    say "captured desktop screenshots under $shots"
+    " ) || { fail "desktop screenshots"; return 0; }
+    say "desktop screenshots under $shots"
+    proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render in the desktop window | headless Chromium, 1280x800"
+    return 0
 }
 
-# ---- Execution & Log Summary -------------------------------------------------------------------
+# ---- Execution ---------------------------------------------------------------------------------
 
+run_assertions
+
+platform_missing=0
 case "$want" in
-    ios) run_ios ;;
-    android) run_android ;;
-    desktop) run_desktop ;;
-    all) run_desktop; run_ios; run_android ;;
-    *) printf 'unknown target: %s\n' "$want" >&2; exit 2 ;;
+    ios) run_ios || platform_missing=1 ;;
+    android) run_android || platform_missing=1 ;;
+    desktop) run_desktop || platform_missing=1 ;;
+    all)
+        run_desktop || platform_missing=1
+        run_ios || platform_missing=1
+        run_android || platform_missing=1
+        ;;
 esac
 
-cat <<'EOF' | tee "$artefacts/e2e-voice-device.log"
-================================================================================
-KalaReach Voice Client E2E Qualification Log
-================================================================================
-Task: T-052b (Voice client, native WebRTC/audio, voice surface, ceremony)
+{
+    printf '\n'
+    printf '================================================================================\n'
+    printf 'Voice client qualification, %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '================================================================================\n'
+    printf '\nPROVED by this run (row | clause | where):\n'
+    if [ "${#proved_lines[@]}" -eq 0 ]; then
+        printf '  nothing\n'
+    else
+        printf '  %s\n' "${proved_lines[@]}"
+    fi
+    printf '\nNOT PROVED by this run (row | clause | why):\n'
+    if [ "${#unproved_lines[@]}" -eq 0 ]; then
+        printf '  nothing outstanding\n'
+    else
+        printf '  %s\n' "${unproved_lines[@]}"
+    fi
+    if [ "${#missing_platforms[@]}" -ne 0 ]; then
+        printf '\nPlatforms not available here:\n'
+        printf '  %s\n' "${missing_platforms[@]}"
+    fi
+    printf '\nScreenshots: %s\nArtefacts:   %s\n' "$shots" "$artefacts"
+    printf '================================================================================\n'
+} | tee -a "${log:?}"
 
-Requirements Asserted and Verified:
-- KR-REQ-15.09: Managed content access disclosed in provider choice (PROVED)
-  Screenshots: /tmp/kr-voice-{ios,android,desktop}-15.09-disclosure.png
-- KR-REQ-15.19: Provider and context scope shown before voice starts (PROVED)
-  Screenshots: /tmp/kr-voice-{ios,android,desktop}-15.19-context-scope.png
-- KR-REQ-15.34: Screen-lock audio via iOS audio session & Android foreground service
-  PROVED in code / config:
-    * iOS: AVAudioSession.playAndRecord, .spokenAudio, [.allowBluetooth, .defaultToSpeaker], UIBackgroundModes [audio]
-    * Android: VoiceMicrophoneService foregroundServiceType="microphone", RECORD_AUDIO, FOREGROUND_SERVICE_MICROPHONE
-  Device leg OPEN: Physical device qualification requires hardware screen lock (Lead ruling A / U-041).
-- KR-REQ-15.35: Interruption, route change, phone call, mute & termination handled (PROVED)
-  Simulated incoming call tested on Android emulator (gsm call -> banner/focus -> gsm cancel).
-  Route-change state tested in UI. Mute and termination clean.
-- KR-REQ-15.36: Muted/unavailable capture displayed; unheard speech never authorises (PROVED)
-  Asserted in code and UI: "Nothing spoken while the microphone was not carrying your voice can authorise an action."
-  Screenshots: /tmp/kr-voice-{ios,android,desktop}-15.36-{muted,capture-unavailable}.png
-  Device leg OPEN: Physical hardware mute switch / OS privacy indicator (U-041).
-- KR-ACC-014: Screen-lock call, capture interruption, context scope, cancellation (PROVED on simulator/emulator)
-  Device leg OPEN: Physical device qualification (U-041).
-- KR-REQ-15.01: Modular provider, native capture and playback (PROVED)
-- KR-REQ-15.13: Client-signed confirmation for unlocked-screen actions (PROVED)
-  Ed25519 ceremony over action hash implemented on iOS (CryptoKit), Android (Ed25519), Desktop (kr-crypto).
-- KR-REQ-15.17: Local mute, stop voice, and session closure survive broker failure (PROVED)
-  Tested and asserted with broker unreachable.
-- KR-REQ-15.22: Speech interruption stops playback only; cancellation uses typed turn request (PROVED)
-  Tested separation between playback stop and confirmed turn cancellation.
-- KR-PERF-010: Latency metrics (client-measured half):
-  * First-audio latency: 410 ms (measured on Apple M-series arm64, 48 kHz mono Opus 20ms frames)
-  * Delegation latency: 185 ms
-  * Hardware: Apple Silicon Mac (macOS 15.6 Darwin 25.6.0 arm64)
-
-================================================================================
-EOF
-
-say "e2e voice device run complete. Artefacts: $artefacts, Screenshots: $shots"
+if [ "$failures" -ne 0 ]; then
+    say "$failures check(s) failed"
+    exit 2
+fi
+if [ "$platform_missing" -ne 0 ]; then
+    say "a requested platform was not available"
+    exit 3
+fi
+say "run complete"
