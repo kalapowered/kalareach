@@ -644,20 +644,63 @@ impl StagedPackage {
     }
 }
 
+/// What a document write left behind.
+///
+/// The two are not the same outcome and a caller cannot treat them alike. Before the rename,
+/// nothing changed and the caller's own state is still the truth. After it, every reader already
+/// sees the new document, and only the directory entry's survival of a power loss is in question.
+#[derive(Debug)]
+#[must_use = "an unconfirmed write has already changed what readers see"]
+pub(crate) enum Written {
+    /// The new document is in place and its directory entry is durable.
+    Durable,
+    /// The new document is in place; the durability of its directory entry is unconfirmed.
+    Unconfirmed(CatalogueError),
+}
+
+impl Written {
+    /// Turns an unconfirmed write into the failure it is, once the caller has published the change.
+    ///
+    /// A caller publishes first and reports second. Refusing while the document on disk already
+    /// holds the new state is the disagreement a durable record exists to prevent, so the change
+    /// is made visible in memory and the uncertainty is what the caller is told about.
+    pub(crate) fn into_result(self) -> CatalogueResult<()> {
+        match self {
+            Self::Durable => Ok(()),
+            Self::Unconfirmed(error) => Err(error),
+        }
+    }
+}
+
 /// Writes `bytes` to `path` by writing a temporary file beside it and renaming.
 ///
 /// The rename is what makes the change atomic for a reader: it sees the old contents or the new
 /// ones, on every platform this ships on. The flush before it is what makes the new contents
 /// complete, and the directory flush after it is what makes the rename itself survive a power
-/// loss where the platform offers one.
-pub(crate) fn write_document(root: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
+/// loss where the platform offers one. A failure of that last flush is reported as
+/// [`Written::Unconfirmed`] rather than as a failure, because the rename has already happened.
+pub(crate) fn write_document(root: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<Written> {
     let staging = root.join("staging");
     std::fs::create_dir_all(&staging)
         .map_err(|source| CatalogueError::storage(&staging, &source))?;
-    write_atomically(&staging, path, bytes)
+    rename_into_place(&staging, path, bytes)?;
+    Ok(match path.parent().map(flush_directory) {
+        Some(Err(error)) => Written::Unconfirmed(error),
+        _ => Written::Durable,
+    })
 }
 
+/// Writes a document and requires its rename to be durable before it returns.
 fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
+    rename_into_place(staging, path, bytes)?;
+    if let Some(parent) = path.parent() {
+        flush_directory(parent)?;
+    }
+    Ok(())
+}
+
+/// Writes `bytes` into a temporary file and renames it over `path`, without flushing the directory.
+fn rename_into_place(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|source| CatalogueError::storage(parent, &source))?;
@@ -696,9 +739,6 @@ fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResul
         let _ = std::fs::remove_file(&temporary);
         CatalogueError::storage(path, &source)
     })?;
-    if let Some(parent) = path.parent() {
-        flush_directory(parent)?;
-    }
     Ok(())
 }
 

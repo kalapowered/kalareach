@@ -29,7 +29,7 @@ use kr_plugin_sdk::limits::RepositoryBudgets;
 use kr_plugin_sdk::text::{Label, Summary};
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::EnvironmentId;
+use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use support::{Generation, GenerationSpec, KeySet};
@@ -2406,6 +2406,154 @@ async fn old_installed_package_must_enable_after_index_drops_it() {
         .set_enabled(environment(), &plugin(), true)
         .await
         .expect("verified local v1 must stay usable");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Repository changes are durable before they are published
+// ---------------------------------------------------------------------------------------------
+
+/// A pin is published only once the state that carries it is on disk.
+///
+/// The admission is checked again immediately before the commit, because everything between the
+/// first check and the write can wait: for the repository's lock and for the disk. A host that
+/// kept the changed pin after refusing the action would disagree with itself after a restart.
+#[tokio::test]
+async fn a_pin_refused_at_the_commit_changes_neither_memory_nor_disk() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+
+    let mut checks = 0u32;
+    let refused = catalogue.pin_with_admission(
+        &repository(),
+        Some(RepositoryGeneration::new(1)),
+        &mut || {
+            checks += 1;
+            // The first check admits the action; the second is the one immediately before the
+            // commit, which is where a revocation during the wait shows up.
+            if checks >= 2 {
+                return Err(CatalogueError::PermissionDenied {
+                    detail: "the authority behind this action was withdrawn".to_owned(),
+                });
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        matches!(refused, Err(CatalogueError::PermissionDenied { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(checks, 2, "the commit has its own check");
+    assert_eq!(
+        catalogue
+            .repository(&repository())
+            .expect("still enrolled")
+            .pinned_generation,
+        None,
+        "the refused pin is not in memory"
+    );
+
+    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    assert_eq!(
+        reopened
+            .repository(&repository())
+            .expect("still enrolled")
+            .pinned_generation,
+        None,
+        "and it is not on disk either"
+    );
+}
+
+/// A repository leaves memory only once the state that no longer names it is on disk.
+#[tokio::test]
+async fn a_removal_refused_at_the_commit_leaves_the_repository_enrolled() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+
+    let mut checks = 0u32;
+    let refused = catalogue.remove_repository_with_admission(&repository(), &mut || {
+        checks += 1;
+        if checks >= 2 {
+            return Err(CatalogueError::PermissionDenied {
+                detail: "the authority behind this action was withdrawn".to_owned(),
+            });
+        }
+        Ok(())
+    });
+    assert!(
+        matches!(refused, Err(CatalogueError::PermissionDenied { .. })),
+        "{refused:?}"
+    );
+    assert!(
+        catalogue.repository(&repository()).is_some(),
+        "the refused removal leaves the repository in memory"
+    );
+    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    assert!(reopened.repository(&repository()).is_some(), "and on disk");
+}
+
+/// A state write that fails before its rename leaves the catalogue exactly as it was.
+///
+/// The document is written into a staging directory beside the state and renamed over it. A
+/// staging path that cannot be a directory fails before the rename, which is the case where
+/// nothing a reader can see has changed and the old pin is still the truth.
+#[tokio::test]
+async fn a_pin_whose_state_cannot_be_written_is_not_published() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+
+    // The state's staging directory cannot be made, because a file of that name is in the way.
+    let staging = home.path().join("catalogue").join("staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).expect("removable");
+    }
+    std::fs::write(&staging, b"not a directory").expect("a file in the way");
+
+    let refused = catalogue.pin(&repository(), Some(RepositoryGeneration::new(1)));
+    assert!(
+        matches!(refused, Err(CatalogueError::StorageUnavailable { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        catalogue
+            .repository(&repository())
+            .expect("still enrolled")
+            .pinned_generation,
+        None,
+        "a write that did not happen publishes nothing"
+    );
+
+    std::fs::remove_file(&staging).expect("removable");
+    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    assert_eq!(
+        reopened
+            .repository(&repository())
+            .expect("still enrolled")
+            .pinned_generation,
+        None
+    );
 }
 
 fn url(text: &str) -> url::Url {

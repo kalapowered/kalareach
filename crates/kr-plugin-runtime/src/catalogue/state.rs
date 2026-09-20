@@ -164,10 +164,15 @@ impl CatalogueState {
 
     /// Writes the state beside the repositories.
     ///
+    /// An error means the state on disk is still the previous one. A
+    /// [`Written::Unconfirmed`](crate::catalogue::store::Written::Unconfirmed) result means the new
+    /// state is already what a reader sees, and only its survival of a power loss is in question:
+    /// the caller publishes the change and reports the uncertainty.
+    ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
-    pub fn write(&self, root: &Path) -> CatalogueResult<()> {
+    pub(crate) fn write(&self, root: &Path) -> CatalogueResult<crate::catalogue::store::Written> {
         let bytes = serde_json::to_vec_pretty(self).map_err(|source| {
             CatalogueError::StorageUnavailable {
                 detail: format!("the catalogue state could not be rendered: {source}"),

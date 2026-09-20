@@ -78,6 +78,7 @@ pub use crate::catalogue::state::{CatalogueState, capability_from_str};
 pub use crate::catalogue::store::{ActiveGeneration, Store};
 pub use crate::catalogue::trust::{MetadataVersions, VerifiedGeneration};
 
+use crate::catalogue::store::Written;
 use crate::catalogue::trust::{PACKAGE_PREFIX, TargetRecord};
 
 /// Why a payload is being fetched.
@@ -216,10 +217,12 @@ impl Catalogue {
     {
         let mut proposed = self.installations.snapshot();
         change(&mut proposed);
-        CatalogueState::of(&self.repositories(), &proposed.all(), proposed.policy())
+        let written = CatalogueState::of(&self.repositories(), &proposed.all(), proposed.policy())
             .write(&self.root)?;
+        // Published before the outcome is reported. A write whose rename happened is what every
+        // reader already sees, so the uncertainty travels as the error and the change does not.
         self.installations = proposed;
-        Ok(())
+        written.into_result()
     }
 
     /// Writes the enrolments and installations that survive a restart.
@@ -233,12 +236,38 @@ impl Catalogue {
             &self.installations.all(),
             self.installations.policy(),
         )
+        .write(&self.root)?
+        .into_result()
+    }
+
+    /// Writes the state one repository change would leave, before that change is published.
+    ///
+    /// The durable record is the commit. A host that answered an error while carrying on with the
+    /// changed enrolments would disagree with itself after a restart, so the write happens first
+    /// and what follows it in memory cannot fail.
+    fn write_repositories(&self, proposed: &[Enrolment]) -> CatalogueResult<Written> {
+        let borrowed: Vec<&Enrolment> = proposed.iter().collect();
+        CatalogueState::of(
+            &borrowed,
+            &self.installations.all(),
+            self.installations.policy(),
+        )
         .write(&self.root)
     }
 
-    /// Attaches one enrolment's store and budget ledger without writing anything new.
-    fn attach(&mut self, enrolment: Enrolment) -> CatalogueResult<()> {
-        let store = Store::open(&self.root, &enrolment.id)?;
+    /// The enrolments this catalogue holds, as values a proposed change can be applied to.
+    fn enrolments(&self) -> Vec<Enrolment> {
+        self.repositories
+            .values()
+            .map(|state| state.enrolment.clone())
+            .collect()
+    }
+
+    /// Builds one enrolment's store and budget ledger without publishing them.
+    ///
+    /// Counting what a repository already holds reads its directory and can fail. Doing it before
+    /// anything is published is what lets that failure leave the catalogue as it was.
+    fn prepare(store: Store, enrolment: Enrolment) -> CatalogueResult<RepositoryState> {
         let mut ledger = BudgetLedger::new(enrolment.budgets);
         for size in store.cached_payloads()?.values() {
             ledger.add_payload_bytes(*size);
@@ -250,14 +279,19 @@ impl Catalogue {
                 .unwrap_or(0);
             ledger.accept_metadata(active.index_bytes, entries);
         }
-        self.repositories.insert(
-            enrolment.id.clone(),
-            RepositoryState {
-                enrolment,
-                store,
-                ledger,
-            },
-        );
+        Ok(RepositoryState {
+            enrolment,
+            store,
+            ledger,
+        })
+    }
+
+    /// Attaches one enrolment's store and budget ledger without writing anything new.
+    fn attach(&mut self, enrolment: Enrolment) -> CatalogueResult<()> {
+        let store = Store::open(&self.root, &enrolment.id)?;
+        let id = enrolment.id.clone();
+        let state = Self::prepare(store, enrolment)?;
+        self.repositories.insert(id, state);
         Ok(())
     }
 
@@ -384,9 +418,15 @@ impl Catalogue {
         // The adopted root is written into the repository's own directory, which is where a
         // generation carries one and where the client reads it from.
         store.reset_trust(&enrolment.root)?;
-        self.attach(enrolment)?;
+        let prepared = Self::prepare(store, enrolment.clone())?;
+        let mut proposed = self.enrolments();
+        proposed.push(enrolment.clone());
+        // The last check before the commit, and the commit is the durable write. What follows it
+        // is the publication, which cannot fail and cannot be refused.
         admission()?;
-        self.persist()
+        let written = self.write_repositories(&proposed)?;
+        self.repositories.insert(enrolment.id, prepared);
+        written.into_result()
     }
 
     /// Changes an enrolment, asking the owner for a new root or wider trust.
@@ -400,31 +440,36 @@ impl Catalogue {
         proposed: Enrolment,
         confirmed: bool,
     ) -> CatalogueResult<()> {
-        let state =
-            self.repositories
-                .get_mut(&proposed.id)
-                .ok_or_else(|| CatalogueError::NotFound {
-                    detail: format!("{} is not enrolled", proposed.id),
-                })?;
-        let _lock = state.store.lock()?;
-        state.enrolment.check_change(&proposed, confirmed)?;
-        state.ledger = {
+        let (_lock, ledger) = {
+            let state = self.state(&proposed.id)?;
+            let lock = state.store.lock()?;
+            state.enrolment.check_change(&proposed, confirmed)?;
+            if state.enrolment.root != proposed.root {
+                // The owner adopted a different root. Datastore and active index are cleared, and
+                // the new root is written where the client reads one from, so a restart verifies
+                // against what was adopted rather than what was replaced.
+                state.store.reset_trust(&proposed.root)?;
+            }
+            // The ledger the new budgets give, carrying what this repository already holds.
             let mut ledger = BudgetLedger::new(proposed.budgets);
             ledger.accept_metadata(
                 state.ledger.metadata_bytes(),
                 state.ledger.metadata_entries(),
             );
             ledger.add_payload_bytes(state.ledger.payload_bytes());
-            ledger
+            (lock, ledger)
         };
-        if state.enrolment.root != proposed.root {
-            // The owner adopted a different root. Datastore and active index are cleared, and the
-            // new root is written where the client reads one from, so a restart verifies against
-            // what was adopted rather than what was replaced.
-            state.store.reset_trust(&proposed.root)?;
+        let mut enrolments = self.enrolments();
+        for enrolment in &mut enrolments {
+            if enrolment.id == proposed.id {
+                enrolment.clone_from(&proposed);
+            }
         }
+        let written = self.write_repositories(&enrolments)?;
+        let state = self.state_mut(&proposed.id)?;
+        state.ledger = ledger;
         state.enrolment = proposed;
-        self.persist()
+        written.into_result()
     }
 
     /// Pins a repository to one generation, or removes its pin.
@@ -449,35 +494,42 @@ impl Catalogue {
         generation: Option<RepositoryGeneration>,
         admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
     ) -> CatalogueResult<()> {
-        let state = self
-            .repositories
-            .get_mut(id)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{id} is not enrolled"),
-            })?;
-        let _lock = state.store.lock()?;
-        admission()?;
-        if let Some(generation) = generation {
-            let active = state
-                .store
-                .active()?
-                .ok_or_else(|| CatalogueError::InvalidArgument {
-                    detail: format!("{id} has no activated generation to pin"),
-                })?;
-            if active.generation != generation.get() {
-                return Err(CatalogueError::InvalidArgument {
-                    detail: format!(
-                        "{id} is on generation {} and the pin names {}; pinning operates on the \
-                         generation that is active",
-                        active.generation,
-                        generation.get()
-                    ),
-                });
+        let _lock = {
+            let state = self.state(id)?;
+            let lock = state.store.lock()?;
+            admission()?;
+            if let Some(generation) = generation {
+                let active =
+                    state
+                        .store
+                        .active()?
+                        .ok_or_else(|| CatalogueError::InvalidArgument {
+                            detail: format!("{id} has no activated generation to pin"),
+                        })?;
+                if active.generation != generation.get() {
+                    return Err(CatalogueError::InvalidArgument {
+                        detail: format!(
+                            "{id} is on generation {} and the pin names {}; pinning operates on \
+                             the generation that is active",
+                            active.generation,
+                            generation.get()
+                        ),
+                    });
+                }
+            }
+            lock
+        };
+        let mut proposed = self.enrolments();
+        for enrolment in &mut proposed {
+            if enrolment.id == *id {
+                enrolment.pinned_generation = generation;
             }
         }
-        state.enrolment.pinned_generation = generation;
+        // The last check before the commit, and the pin is published only once it is durable.
         admission()?;
-        self.persist()
+        let written = self.write_repositories(&proposed)?;
+        self.state_mut(id)?.enrolment.pinned_generation = generation;
+        written.into_result()
     }
 
     /// Removes a repository and stops trusting its root.
@@ -504,6 +556,15 @@ impl Catalogue {
             state.store.lock()?
         };
         admission()?;
+        let proposed: Vec<Enrolment> = self
+            .enrolments()
+            .into_iter()
+            .filter(|enrolment| enrolment.id != *id)
+            .collect();
+        // The last check before the commit. The repository leaves memory only once the state that
+        // no longer names it is durable, so a failure here leaves it enrolled on both sides.
+        admission()?;
+        let written = self.write_repositories(&proposed)?;
         let enrolment = self
             .repositories
             .remove(id)
@@ -511,8 +572,7 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{id} is not enrolled"),
             })?;
-        admission()?;
-        self.persist()?;
+        written.into_result()?;
         Ok(enrolment)
     }
 
