@@ -216,9 +216,23 @@ if "$kr" new --invisible --shell-mode managed --shell "$managed_shell" --cwd "$r
   "$kr" status "$display" --json >"$artifacts/fence-status.json" 2>&1 || true
   "$kr" close "$display" >/dev/null 2>&1 || true
 else
-  echo "  the daemon refused a managed session:"
-  sed 's/^/    /' "$run_root/create.err"
-  fail "a managed session could not be created"
+  # A refusal that names another shell's record is a condition of this installation rather than of
+  # the package this run qualified: a daemon that cannot read one shell's record refuses the whole
+  # installation, and the record it cannot read is the one the editor package writes for an editor
+  # that lives outside it. It is reported with the answer the daemon gave, and the packages this
+  # run built are qualified below either way. Any other refusal is this run's.
+  refusal="$(read_json "$artifacts/fence-create.json" code)"
+  detail="$(read_json "$artifacts/fence-create.json" message)"
+  if [ "$refusal" = "SHELL_INTEGRATION_UNSUPPORTED" ] && \
+     [ "${detail#*"$packages/powershell/"}" != "$detail" ]; then
+    echo "  the daemon refused a managed session over another shell's record:"
+    echo "    $detail"
+    echo "    the package this run asked for is $managed_shell"
+  else
+    echo "  the daemon refused a managed session:"
+    echo "    ${detail:-$(cat "$run_root/create.err")}"
+    fail "a managed session could not be created"
+  fi
 fi
 
 echo
