@@ -235,7 +235,7 @@ pub fn capture(
             request.grant,
             administrative.as_deref(),
         )?;
-        let nested = nested_repositories(repository, &reading)?;
+        let nested = nested_repositories(repository, reading_paths(&reading))?;
         let request = Scope {
             request,
             administrative_prefix: administrative.as_deref(),
@@ -261,7 +261,7 @@ pub fn capture(
         // Where every repository nested in this tree keeps its own data, worked out from the
         // directories this reading names. It has to be done before anything is planned, because a
         // path under one of them is never content whatever else decides about it.
-        let nested = nested_repositories(repository, &before)?;
+        let nested = nested_repositories(repository, reading_paths(&before))?;
         let request = Scope {
             nested: &nested,
             ..request
@@ -1131,18 +1131,11 @@ fn store_base_content(
 ///
 /// What a reading does not name, this does not find: a repository in a directory no path of this
 /// capture goes near is one the capture never reaches either.
-fn nested_repositories(
+fn nested_repositories<'a>(
     repository: &OpenedRepository,
-    reading: &Reading,
+    paths: impl Iterator<Item = &'a str>,
 ) -> Result<BTreeSet<String>> {
     let mut directories: BTreeSet<&str> = BTreeSet::new();
-    let paths = reading
-        .index
-        .keys()
-        .chain(reading.differences.keys())
-        .chain(reading.staged.keys())
-        .map(String::as_str)
-        .chain(reading.status.iter().map(|entry| entry.path.as_str()));
     for path in paths {
         let path = path.trim_end_matches('/');
         directories.insert(path);
@@ -1233,20 +1226,13 @@ fn nested_repositories(
         .try_clone()
         .and_then(AuthorisedDirectory::confined_to_one_mount)
         .map_err(|_| unplaceable("this repository's own data"))?;
-    // And this worktree's own directory, when that is a different object. Nothing records it, so
-    // the reported one is used only when this host can reach the same object through a handle it
-    // has already established.
-    let own = if identity_of(repository.own_dir()) == identity_of(&common) {
-        None
-    } else {
-        Some(private_directory(
-            tree,
-            &common,
-            repository.own_dir(),
-            &mut budget,
-        )?)
-    };
-    for held in std::iter::once(&common).chain(own.iter()) {
+    // And this worktree's own directory, which nothing records. This host reaches it itself, from
+    // the tree's own `.git`, and requires what it reached to be the object Git reported: two
+    // answers about where this worktree keeps its data, agreeing. It is seeded whether or not it
+    // is the same object as the common one, because the seed is what this host reached rather
+    // than what it was handed.
+    let own = own_directory(tree, repository.own_dir())?;
+    for held in [&common, &own] {
         // Outside this working tree or inside it, the object is the object, and it goes in
         // unconditionally: what decides anything later is whether a directory this capture opens
         // **is** it, and holding one that nothing reaches costs nothing.
@@ -1336,87 +1322,61 @@ fn nested_repositories(
     Ok(found)
 }
 
-/// Returns this working tree's **own** administrative directory, reached through a handle this
-/// host has already established, and refuses the capture when it cannot reach it that way.
+/// Returns this working tree's **own** administrative directory, reached by this host rather than
+/// taken from a path, and refuses the capture when the two answers about it disagree.
 ///
 /// The common directory needs none of this: it is the object this repository's recorded identity
-/// names, and an open that reached anything else refused before a capture began. Nothing records
-/// this worktree's own directory, and Git reports it as a path. A directory mounted over that path
-/// between Git's answer and this host's open would then be the object a scan accounted for, while
-/// the data it covered went unexamined and its files were captured as ordinary content.
+/// names, so an open that reached anything else refused before a capture began. Nothing records
+/// this worktree's own directory, and Git reports it as a path. A directory covered by a mount
+/// while that path was opened would then be the object a scan accounted for, while the data it
+/// covered went unexamined and its files were captured as ordinary content.
 ///
-/// So the reported object is accepted only when the same object is reachable another way: through
-/// the working tree's own `.git`, which is where a repository that keeps its own directory inside
-/// its tree keeps it, or among the directories the recorded common directory keeps for its linked
-/// worktrees. Each of those descents carries the mount comparison, so a directory covered by a
-/// mount is refused rather than followed, and the handle this returns is the one that was reached
-/// rather than the one that was reported.
-fn private_directory(
+/// So this host reaches the directory from the tree's own `.git`: the directory itself where a
+/// repository keeps it there, the directory that file names where it names one inside the tree,
+/// and where it names one outside the tree, the object at that name. Whichever it reaches has to
+/// be the object Git reported, and anything else refuses. Two answers taken at different moments
+/// agreeing is what a cover cannot arrange: a cover in place for only one of them makes them
+/// differ, and one still in place while this capture reads the tree is refused by the mount
+/// comparison every read of the tree carries.
+fn own_directory(
     tree: &AuthorisedDirectory,
-    common: &AuthorisedDirectory,
     reported: &AuthorisedDirectory,
-    budget: &mut usize,
 ) -> Result<AuthorisedDirectory> {
-    let wanted = identity_of(reported);
     let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
-    match tree.probe(&administrative) {
-        // It is inside the tree, under the name every repository uses.
+    let reached = match tree.probe(&administrative) {
+        // Where a repository keeps its own data beside its tree.
         Ok(kr_transfer::authority::ObjectKind::Directory) => {
-            if let Ok(held) = open_beneath(tree, &administrative, ".git")?
-                && identity_of(&held) == wanted
-            {
-                return Ok(held);
-            }
+            open_beneath(tree, &administrative, ".git")?
+                .map_err(|_| unplaceable("this repository's own data"))?
         }
-        // Or named by the file that stands in for it, descended one component at a time from the
-        // tree. A target this host cannot follow from here, an absolute one among them, is not the
-        // end of it: the directory may still be one the common directory keeps.
+        // Or wherever the file that stands in for it says.
         Ok(kr_transfer::authority::ObjectKind::File) => {
-            let from = vec![clone_of(tree)?];
-            if let Ok(Some(stack)) = resolve_target(from, ".git", tree, &administrative)
-                && let Some(last) = stack.last()
-                && identity_of(last) == wanted
-            {
-                return clone_of(last);
+            let target = read_target(".git", tree, &administrative)?;
+            if std::path::Path::new(&target).is_absolute() {
+                // Named from outside this tree, which no descent from this handle reaches. The
+                // object at that name is opened and then required to be the reported one.
+                AuthorisedDirectory::open_root(tree.environment_id(), std::path::Path::new(&target))
+                    .and_then(AuthorisedDirectory::confined_to_one_mount)
+                    .map_err(|_| unplaceable("this repository's own data"))?
+            } else {
+                let from = vec![clone_of(tree)?];
+                let stack = resolve_target(from, ".git", tree, &administrative)?
+                    .ok_or_else(|| unplaceable("this repository's own data"))?;
+                let last = stack
+                    .last()
+                    .ok_or_else(|| unplaceable("this repository's own data"))?;
+                clone_of(last)?
             }
         }
-        _ => {}
+        // A tree whose own data this host cannot find from the tree is one it does not read
+        // around: it would be excluding what it was handed rather than what is there.
+        _ => return Err(unplaceable("this repository's own data")),
+    };
+    if identity_of(&reached) == identity_of(reported) {
+        Ok(reached)
+    } else {
+        Err(unplaceable("this repository's own data"))
     }
-    let worktrees = RelativeName::parse("worktrees")?;
-    if matches!(
-        common.probe(&worktrees),
-        Ok(kr_transfer::authority::ObjectKind::Directory)
-    ) && let Ok(held) = open_beneath(common, &worktrees, "worktrees")?
-    {
-        let entries = held
-            .handle()
-            .entries()
-            .map_err(|_| unplaceable("this repository's own data"))?;
-        for entry in entries {
-            let entry = entry.map_err(|_| unplaceable("this repository's own data"))?;
-            *budget = budget
-                .checked_sub(1)
-                .ok_or_else(|| ChangeSetError::QuotaExceeded {
-                    detail: format!(
-                        "this repository keeps more than {MAX_WALK_ENTRIES} worktree directories, \
-                         which is more than this host reads to find its own"
-                    )
-                    .into(),
-                })?;
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            let Ok(name) = RelativeName::parse(&name) else {
-                continue;
-            };
-            if let Ok(each) = open_beneath(&held, &name, "worktrees")?
-                && identity_of(&each) == wanted
-            {
-                return Ok(each);
-            }
-        }
-    }
-    Err(unplaceable("this repository's own data"))
 }
 
 /// Adds the identity of every directory beneath one administrative directory, and refuses a
@@ -1605,6 +1565,78 @@ fn descend_to(tree: &AuthorisedDirectory, directory: &str) -> Result<Vec<Authori
     Ok(stack)
 }
 
+/// Returns every path one reading names, in the tree's own spelling.
+fn reading_paths(reading: &Reading) -> impl Iterator<Item = &str> {
+    reading
+        .index
+        .keys()
+        .chain(reading.differences.keys())
+        .chain(reading.staged.keys())
+        .map(String::as_str)
+        .chain(reading.status.iter().map(|entry| entry.path.as_str()))
+}
+
+/// Returns which of these paths **this** repository holds its own administrative data at, or a
+/// repository nested in this tree does.
+///
+/// A path is content or administrative data because of the tree it is in, not because of the
+/// version it came from: a directory that is ordinary content in the workspace a version was
+/// captured from can be a repository's own data in the workspace it is applied to. A caller that
+/// writes into a tree asks this about the tree it is writing to.
+///
+/// # Errors
+///
+/// Returns whatever this host's own accounting of the tree refuses.
+pub fn administrative_here(repository: &OpenedRepository, paths: &[String]) -> Result<Vec<String>> {
+    let nested = nested_repositories(repository, paths.iter().map(String::as_str))?;
+    Ok(paths
+        .iter()
+        .filter(|path| {
+            crate::grant::is_administrative(path)
+                || nested.iter().any(|prefix| grant::under(path, prefix))
+        })
+        .cloned()
+        .collect())
+}
+
+/// Returns what one of Git's own files names, exactly as Git wrote it.
+///
+/// One line, with the line ending taken off and nothing else touched: trimming by what a language
+/// calls whitespace would change the name, because a filename may hold characters a trim would
+/// take away.
+fn read_target(
+    directory: &str,
+    holder: &AuthorisedDirectory,
+    file: &RelativeName,
+) -> Result<String> {
+    use std::io::Read as _;
+
+    let mut open = holder
+        .open_read(file, ObjectPolicy::ReadableFile)
+        .map_err(|_| unplaceable(directory))?;
+    if open.byte_len() > MAX_GIT_FILE_BYTES {
+        return Err(unplaceable(directory));
+    }
+    let mut text = String::new();
+    open.handle_mut()
+        .take(MAX_GIT_FILE_BYTES)
+        .read_to_string(&mut text)
+        .map_err(|_| unplaceable(directory))?;
+    let line = text
+        .strip_suffix('\n')
+        .unwrap_or(&text)
+        .strip_suffix('\r')
+        .unwrap_or_else(|| text.strip_suffix('\n').unwrap_or(&text));
+    let target = match line.strip_prefix("gitdir:") {
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+        None => line,
+    };
+    if target.is_empty() {
+        return Err(unplaceable(directory));
+    }
+    Ok(target.to_owned())
+}
+
 /// Returns a second set of handles over the same directories.
 fn clone_stack(stack: &[AuthorisedDirectory]) -> Result<Vec<AuthorisedDirectory>> {
     stack.iter().map(clone_of).collect()
@@ -1628,32 +1660,8 @@ fn resolve_target(
     holder: &AuthorisedDirectory,
     file: &RelativeName,
 ) -> Result<Option<Vec<AuthorisedDirectory>>> {
-    use std::io::Read as _;
-
-    let mut open = holder
-        .open_read(file, ObjectPolicy::ReadableFile)
-        .map_err(|_| unplaceable(directory))?;
-    if open.byte_len() > MAX_GIT_FILE_BYTES {
-        return Err(unplaceable(directory));
-    }
-    let mut text = String::new();
-    open.handle_mut()
-        .take(MAX_GIT_FILE_BYTES)
-        .read_to_string(&mut text)
-        .map_err(|_| unplaceable(directory))?;
-    // Exactly what Git writes, and no more: one line, with the line ending taken off and nothing
-    // else touched. Trimming by what a language calls whitespace would change the name, because a
-    // filename may hold characters a trim would take away.
-    let line = text
-        .strip_suffix('\n')
-        .unwrap_or(&text)
-        .strip_suffix('\r')
-        .unwrap_or_else(|| text.strip_suffix('\n').unwrap_or(&text));
-    let target = match line.strip_prefix("gitdir:") {
-        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
-        None => line,
-    };
-    if target.is_empty() || std::path::Path::new(target).is_absolute() {
+    let target = read_target(directory, holder, file)?;
+    if std::path::Path::new(&target).is_absolute() {
         return Err(unplaceable(directory));
     }
     let mut stack = from;

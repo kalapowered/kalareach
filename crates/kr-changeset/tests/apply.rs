@@ -1066,3 +1066,63 @@ fn a_preflight_returns_the_limitations_a_direct_apply_then_requires() {
     let applied = apply::apply(fixture.service(), &order).expect("the apply runs");
     assert_eq!(applied.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
 }
+
+/// KR-REQ-14.28 and KR-REQ-14.33: a path is content or administrative data because of the tree it
+/// is being written to, not because of the tree it was captured from.
+///
+/// The version below holds an ordinary file of its own workspace. At the destination the same path
+/// is inside that repository's own administrative data, which every capture excludes — so an apply
+/// that wrote it would replace bytes neither recovery version holds. It is refused before anything
+/// is read or written, and the destination is left exactly as it was.
+#[test]
+fn an_apply_never_writes_what_the_destination_keeps_its_own_data_in() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "ordinary-source");
+    write(
+        &source,
+        "meta/config.worktree",
+        "[remote]\n\turl = the-change\n",
+    );
+    let source_workspace = fixture.workspace("ordinary-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    // The destination keeps its own administrative data at `meta`, which is a shape Git accepts.
+    let destination = ordinary_repository(fixture.work(), "split-destination");
+    std::fs::rename(destination.join(".git"), destination.join("common")).expect("the shared data");
+    std::fs::create_dir_all(destination.join("meta")).expect("this worktree's own");
+    for name in ["HEAD", "index"] {
+        let from = destination.join("common").join(name);
+        if from.exists() {
+            std::fs::copy(&from, destination.join("meta").join(name)).expect("its own copy");
+        }
+    }
+    std::fs::write(destination.join("meta/commondir"), b"../common\n").expect("naming the shared");
+    std::fs::write(
+        destination.join("meta/config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+    )
+    .expect("something only this worktree has");
+    std::fs::write(destination.join(".git"), b"gitdir: meta\n").expect("the file that names it");
+
+    let workspace = fixture.workspace("split-destination");
+    let affected = expectations(&destination, &["meta/config.worktree"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let refusal = apply::apply(fixture.service(), &order)
+        .expect_err("an apply into a repository's own data is refused");
+    assert!(
+        refusal.to_string().contains("own administrative data"),
+        "the refusal says what the destination keeps there: {refusal}"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "meta/config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+        "and the destination holds exactly what it held"
+    );
+}

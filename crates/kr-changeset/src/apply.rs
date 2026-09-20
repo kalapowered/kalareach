@@ -644,6 +644,28 @@ fn preflight(
     };
     let resolved = service.resolve(workspace_id)?;
     let repository = service.open_repository(&resolved)?;
+    // What a path **is** depends on the tree it is in. A directory that was ordinary content where
+    // a version was captured can be a repository's own data here, and writing a file into that
+    // would put bytes where this host excludes them from every capture it takes: the recovery
+    // versions this apply records would hold none of what it replaced. So the destination's own
+    // answer is asked before anything is read or written, and a path it calls administrative ends
+    // the apply while it is still true that nothing has been written.
+    let named: Vec<String> = order
+        .affected
+        .iter()
+        .map(|affected| affected.path.clone())
+        .chain(carried.iter().map(|entry| entry.path.clone()))
+        .collect();
+    if let Some(path) = crate::capture::administrative_here(&repository, &named)?.first() {
+        return Err(ChangeSetError::Unsupported {
+            detail: format!(
+                "{} is this repository's own administrative data at this destination, or the tree \
+                 of a repository nested in it, and this host writes into neither",
+                kr_project::git::redact(path)
+            )
+            .into(),
+        });
+    }
     let index = read_index(service.project().profile(), &repository)?;
     // Every path this apply would write has to be one the request says what it expects to find at,
     // because a path the request does not name is a path the preflight cannot check.
