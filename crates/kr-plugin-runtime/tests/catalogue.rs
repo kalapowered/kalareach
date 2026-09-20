@@ -2068,6 +2068,151 @@ fn an_explicit_selection_wins_a_conflict() {
     }
 }
 
+#[tokio::test]
+async fn failed_index_fetch_must_keep_rotated_root() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("initial sync");
+    let new_root = generation.rotate_root_to_v2(&KeySet::generate()).await;
+    std::fs::remove_file(generation.targets_dir().join("index.json")).expect("removed index");
+    assert!(catalogue.sync(&repository()).await.is_err());
+    let actual: serde_json::Value = serde_json::from_slice(
+        &catalogue.repository(&repository()).expect("enrolled").root,
+    )
+    .expect("json");
+    let expected: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
+    assert_eq!(
+        actual["signed"]["version"], expected["signed"]["version"],
+        "rotation must survive later index failure"
+    );
+}
+
+#[tokio::test]
+async fn failed_index_fetch_must_reject_subsequent_old_keys() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("initial sync");
+    generation.rotate_root_to_v2(&KeySet::generate()).await;
+    std::fs::remove_file(generation.targets_dir().join("index.json")).expect("removed index");
+    assert!(catalogue.sync(&repository()).await.is_err());
+    generation.rewrite_as(3).await;
+    generation.withhold_root_v2();
+    assert!(
+        catalogue.sync(&repository()).await.is_err(),
+        "metadata signed by replaced keys must be refused"
+    );
+}
+
+#[tokio::test]
+async fn installed_hash_must_not_authorise_another_version() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("sync");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            first.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installed");
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("enabled");
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    first.replace_with(&second);
+    catalogue.sync(&repository()).await.expect("sync 2");
+    let result = catalogue
+        .activate_package_scoped(
+            &repository(),
+            Some(environment()),
+            &plugin(),
+            &PackageVersion::parse("0.2.0").expect("version"),
+            Some(first.manifest_digest()),
+            FetchReason::AuthorisedActivation,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an installed v1 hash authorised v2 fetch: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn old_installed_package_must_enable_after_index_drops_it() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("sync");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            first.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installed");
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    first.replace_with(&second);
+    catalogue.sync(&repository()).await.expect("sync 2");
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("verified local v1 must stay usable");
+}
+
 fn url(text: &str) -> url::Url {
     url::Url::parse(text).expect("a parsable location")
 }

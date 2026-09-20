@@ -486,7 +486,20 @@ impl Catalogue {
         };
         self.check_reachable(&enrolment)?;
 
-        let verified = trust::verify(&enrolment, &datastore, &ledger, &self.transport).await?;
+        let transport = Arc::clone(&self.transport);
+        let verified = trust::verify(
+            &enrolment,
+            &datastore,
+            &ledger,
+            &transport,
+            &mut |new_root| {
+                let state = self.state_mut(id)?;
+                state.store.write_root(&new_root)?;
+                state.enrolment.root = new_root;
+                self.persist()
+            },
+        )
+        .await?;
 
         // If root rotated during verification, write the rotated root and update enrolment
         // immediately so that an interrupted sync or mirror failure still retains the rotated root.
@@ -630,7 +643,12 @@ impl Catalogue {
         // Which of the three reasons section 11 names this is, and whether it holds. A package is
         // not fetched because something matched; it is fetched because somebody installed it,
         // enabled it, or already did both and an application it recognises started.
-        self.check_reason(id, environment_id, plugin_id, package_hash, reason)?;
+        self.check_reason(id, environment_id, plugin_id, version, package_hash, reason)?;
+        if let Some(hash) = package_hash {
+            if self.state(id)?.store.has_package(hash) {
+                return Ok(hash);
+            }
+        }
         let index = self.index(id)?;
         let entry =
             index
@@ -639,6 +657,17 @@ impl Catalogue {
                 .ok_or_else(|| CatalogueError::NotFound {
                     detail: format!("{plugin_id} {version} is not in this repository's index"),
                 })?;
+        if let Some(expected_hash) = package_hash {
+            if entry.manifest_digest != expected_hash {
+                return Err(CatalogueError::UnavailableOffline {
+                    detail: format!(
+                        "the requested package hash {expected_hash} does not match {plugin_id} \
+                         {version} ({}) in the active catalogue generation",
+                        entry.manifest_digest
+                    ),
+                });
+            }
+        }
         if self.state(id)?.store.has_package(entry.manifest_digest) {
             return Ok(entry.manifest_digest);
         }
@@ -849,7 +878,8 @@ impl Catalogue {
         // this too. What it may not do is admit a different generation: a payload is fetched out
         // of the generation this host accepted, and one the repository has moved on from is an
         // absence rather than a quiet substitution.
-        let verified = trust::verify(&enrolment, &datastore, &ledger, &self.transport).await?;
+        let verified =
+            trust::verify(&enrolment, &datastore, &ledger, &self.transport, &mut |_| Ok(())).await?;
         let index_digest = verified
             .index
             .digest()
@@ -897,6 +927,7 @@ impl Catalogue {
         id: &RepositoryId,
         environment_id: Option<EnvironmentId>,
         plugin_id: &PluginId,
+        version: &PackageVersion,
         package_hash: Option<PayloadDigest>,
         reason: FetchReason,
     ) -> CatalogueResult<()> {
@@ -923,6 +954,7 @@ impl Catalogue {
                 let authorised = self.installations.all().into_iter().any(|installation| {
                     installation.repository == *id
                         && installation.plugin_id.as_str() == plugin_id.as_str()
+                        && installation.version == *version
                         && installation.enabled
                         && environment_id.is_none_or(|env| installation.environment_id == env)
                         && package_hash.is_none_or(|hash| installation.package_digest == hash)
@@ -932,9 +964,9 @@ impl Catalogue {
                 } else {
                     Err(CatalogueError::UnavailableOffline {
                         detail: format!(
-                            "{plugin_id} is not installed and enabled for {id} in the requested \
-                             environment on this package hash, so a matching application does not \
-                             authorise fetching its payloads"
+                            "{plugin_id} {version} is not installed and enabled for {id} in the \
+                             requested environment on this package hash, so a matching application \
+                             does not authorise fetching its payloads"
                         ),
                     })
                 }

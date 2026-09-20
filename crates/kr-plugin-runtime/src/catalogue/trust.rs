@@ -238,6 +238,7 @@ pub async fn verify(
     datastore: &Path,
     ledger: &BudgetLedger,
     transport: &std::sync::Arc<dyn tough::Transport + Send + Sync>,
+    on_root_rotated: &mut (dyn FnMut(Vec<u8>) -> CatalogueResult<()> + Send),
 ) -> CatalogueResult<VerifiedGeneration> {
     std::fs::create_dir_all(datastore)
         .map_err(|source| CatalogueError::storage(datastore, &source))?;
@@ -282,6 +283,9 @@ pub async fn verify(
         serde_json::to_vec(repository.root()).map_err(|source| CatalogueError::Untrusted {
             detail: format!("the trusted root could not be recorded: {source}"),
         })?;
+    if root != enrolment.root {
+        on_root_rotated(root.clone())?;
+    }
 
     let delegations = scope_delegations(&repository.targets().signed)?;
 
