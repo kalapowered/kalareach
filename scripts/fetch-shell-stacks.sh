@@ -111,33 +111,60 @@ for stack in lock["stacks"]:
 PYTHON
 )"
 
-# A digest of an installed tree, over every path in it. The pinned digest says what was unpacked;
-# this says that what was unpacked is still what is there, which is the part a run that unpacked
-# nothing would otherwise take on trust.
+# A digest of an installed tree, over the paths the archive delivered.
+#
+# The pinned digest says which bytes were unpacked; this says that what was unpacked is still what
+# is there, which is the part a run that unpacked nothing would otherwise take on trust. The list
+# of paths is written when the tree is unpacked and the digest covers exactly those: a
+# customisation that compiles a cache beside its own sources when it runs has added something of
+# its own rather than changed what this pins, and a path that has gone or whose bytes differ
+# changes the digest.
+#
+#   tree_digest <tree> record    walk the tree, write <tree>.paths, print the digest
+#   tree_digest <tree> check     digest the paths <tree>.paths names, print the digest
 tree_digest() {
     /usr/bin/env python3 -c '
 import hashlib, os, sys
 
-root = sys.argv[1]
+root, mode = sys.argv[1], sys.argv[2]
+listing = root + ".paths"
+
+if mode == "record":
+    paths = []
+    for base, directories, files in os.walk(root):
+        directories.sort()
+        linked = [name for name in directories if os.path.islink(os.path.join(base, name))]
+        for name in sorted(files + linked):
+            paths.append(os.path.relpath(os.path.join(base, name), root))
+    paths.sort()
+    with open(listing, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(paths) + "\n" if paths else "")
+else:
+    try:
+        with open(listing, encoding="utf-8") as handle:
+            paths = [line for line in handle.read().splitlines() if line]
+    except OSError:
+        print("")
+        raise SystemExit(0)
+
 digest = hashlib.sha256()
-for base, directories, files in os.walk(root):
-    directories.sort()
-    linked = [name for name in directories if os.path.islink(os.path.join(base, name))]
-    for name in sorted(files + linked):
-        path = os.path.join(base, name)
-        digest.update(os.path.relpath(path, root).encode("utf-8"))
-        digest.update(b"\0")
-        if os.path.islink(path):
-            digest.update(b"l")
-            digest.update(os.readlink(path).encode("utf-8"))
-        else:
-            digest.update(b"x" if os.access(path, os.X_OK) else b"-")
-            with open(path, "rb") as handle:
-                for block in iter(lambda: handle.read(1 << 20), b""):
-                    digest.update(block)
-        digest.update(b"\0")
+for relative in paths:
+    path = os.path.join(root, relative)
+    digest.update(relative.encode("utf-8"))
+    digest.update(b"\0")
+    if os.path.islink(path):
+        digest.update(b"l")
+        digest.update(os.readlink(path).encode("utf-8"))
+    elif os.path.isfile(path):
+        digest.update(b"x" if os.access(path, os.X_OK) else b"-")
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    else:
+        digest.update(b"gone")
+    digest.update(b"\0")
 print(digest.hexdigest())
-' "$1"
+' "$1" "$2"
 }
 
 records=()
@@ -169,7 +196,7 @@ while IFS=$'\t' read -r id version role program entry url sha strip; do
     if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] && [ -d "$target" ] \
        && { [ -z "$entry" ] || [ -e "$target/$entry" ]; } \
        && { [ -z "$program" ] || [ -x "$target/$program" ]; }; then
-        if [ -f "$target.tree" ] && [ "$(tree_digest "$target")" = "$(cat "$target.tree")" ]; then
+        if [ -f "$target.tree" ] && [ "$(tree_digest "$target" check)" = "$(cat "$target.tree")" ]; then
             echo "  $id $version: installed"
             record "$id" "$version" "installed" "$target" "$executable" "$url" "$sha" ""
             continue
@@ -242,7 +269,7 @@ while IFS=$'\t' read -r id version role program entry url sha strip; do
     rm -rf "${target:?}"
     mv "$work/tree" "$target"
     printf '%s' "$sha" > "$stamp"
-    tree_digest "$target" > "$target.tree"
+    tree_digest "$target" record > "$target.tree"
     rm -rf "${work:?}"
     echo "    installed at $target"
     record "$id" "$version" "installed" "$target" "$executable" "$url" "$sha" ""
