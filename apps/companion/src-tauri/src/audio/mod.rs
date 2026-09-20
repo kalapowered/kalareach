@@ -9,8 +9,8 @@
 //! - a bounded PCM ring buffer at 120 ms target depth, dropping the oldest on overrun ([`buffer`]);
 //! - Opus encoding, decoding and packet-loss concealment at 48 kHz mono ([`codec`]);
 //! - the macOS `VoiceProcessingIO` unit, and a refusal on Linux and Windows ([`device`]);
-//! - the control frames' own rules: what each frame must carry, what is refused, and the
-//!   heartbeat's interval ([`control`]). Nothing opens a socket yet;
+//! - the control frames' own rules: what each frame must carry, what is refused, the heartbeat's
+//!   interval, and which delegations one call may be asked about ([`control`]);
 //! - the unlocked-screen ceremony and the signature over the host's challenge ([`ceremony`]).
 
 pub mod buffer;

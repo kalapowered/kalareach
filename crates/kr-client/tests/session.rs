@@ -129,6 +129,16 @@ struct HostScript {
     refuse_reads_with: Mutex<Option<(ErrorCode, u32)>>,
     /// Answer every mutation with a correlated protocol error instead of a receipt.
     refuse_mutations_with: Mutex<Option<ErrorCode>>,
+    /// Answer this many of the next mutations with the method's own result instead of a receipt.
+    ///
+    /// That is what a host does when it will not act until it has more: it answers the request it
+    /// was sent with what it still needs, rather than with a receipt for work it has accepted.
+    answer_mutations_with_result: Mutex<u32>,
+    /// Answer nothing at all to this many of the next mutations.
+    ///
+    /// A host that took the frame and said nothing is what leaves an action whose outcome nobody
+    /// knows, which is the state section 9 forbids forgetting.
+    swallow_mutations: Mutex<u32>,
 }
 
 /// Serves one connection: handshake, then control frames until the client goes away.
@@ -236,6 +246,31 @@ fn spawn_host(
                                 .lock()
                                 .await
                                 .push(mutation.action_window_id.to_string());
+                            {
+                                let mut swallow = script.swallow_mutations.lock().await;
+                                if *swallow > 0 {
+                                    *swallow -= 1;
+                                    continue;
+                                }
+                            }
+                            {
+                                let mut left = script.answer_mutations_with_result.lock().await;
+                                if *left > 0 {
+                                    *left -= 1;
+                                    drop(left);
+                                    let answer = ControlFrame::Response(Response {
+                                        request_id: mutation.request_id,
+                                        outcome: Outcome::Ok(
+                                            ParamsValue::from_typed(&Empty {})
+                                                .expect("an empty result"),
+                                        ),
+                                    });
+                                    if writer.lock().await.write_message(&answer).await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            }
                             ControlFrame::Receipt(Box::new(kr_protocol::receipt::ReceiptResponse {
                                 request_id: mutation.request_id,
                                 receipt: Receipt {
@@ -393,11 +428,14 @@ async fn evidence_a_host_asked_for_comes_back_as_the_action_it_asked_about() {
     let host = side(1, true).await;
     let client = side(2, false).await;
     let script = Arc::new(HostScript::default());
+    // The first mutation is answered the way a host answers when it will not act yet: with what it
+    // still needs, correlated to the request, rather than with a receipt.
+    *script.answer_mutations_with_result.lock().await = 1;
     let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
     let session = connect(&client, &host).await;
 
     let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
-    let asked_about = session
+    let asked = session
         .mutate(
             Method::SessionCreate,
             target.clone(),
@@ -407,13 +445,15 @@ async fn evidence_a_host_asked_for_comes_back_as_the_action_it_asked_about() {
             DurationMs::new(120_000),
         )
         .await
-        .expect("a settlement")
-        .receipt()
-        .expect("this host answers with a receipt")
-        .action_id;
+        .expect("a settlement");
+    assert!(
+        asked.result().is_some(),
+        "this host answered by asking for more, not with a receipt"
+    );
+    let asked_about = script.actions.lock().await[0];
 
-    // A host that answers by naming what else it needs binds that demand to the action it was
-    // asked about, so the answer has to arrive as the same action.
+    // The evidence comes back as the action the host asked about, so the host finds the request it
+    // challenged rather than a second intent.
     let continued = session
         .mutate_continuing(
             asked_about,
@@ -432,6 +472,24 @@ async fn evidence_a_host_asked_for_comes_back_as_the_action_it_asked_about() {
             .expect("this host answers with a receipt")
             .action_id,
         asked_about
+    );
+
+    // That action now has a receipt, and a receipt is something this client must go on reporting.
+    // Continuing it again would replace the record that names it.
+    let replaced = session
+        .mutate_continuing(
+            asked_about,
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await;
+    assert!(
+        matches!(replaced, Err(ClientError::Host(_))),
+        "an action with a receipt cannot carry another request"
     );
 
     // Anything that is not a continuation is still a separate intent with its own identity.
@@ -453,6 +511,58 @@ async fn evidence_a_host_asked_for_comes_back_as_the_action_it_asked_about() {
 
     let actions = script.actions.lock().await;
     assert_eq!(actions.as_slice(), [asked_about, asked_about, separate]);
+
+    session.close();
+    serving.abort();
+}
+
+#[tokio::test]
+async fn an_action_whose_outcome_is_unknown_cannot_carry_another_request() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    // A host that takes the frame and says nothing, so the action stays on the unresolved list.
+    let script = Arc::new(HostScript::default());
+    *script.swallow_mutations.lock().await = 1;
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let mutation = session.mutate(
+        Method::InputInterrupt,
+        target.clone(),
+        None,
+        &Empty {},
+        &Empty {},
+        DurationMs::new(120_000),
+    );
+    // Dropping the future before it resolves leaves the action submitted and unanswered, which is
+    // exactly the state a person has to be able to ask about.
+    let cancelled = tokio::time::timeout(Duration::from_millis(50), mutation).await;
+    assert!(cancelled.is_err(), "the host answers nothing here");
+
+    let submitted = session.submitted_actions().await;
+    assert_eq!(submitted.len(), 1);
+    let unknown = submitted[0].action_id;
+
+    // Continuing it would overwrite the intent that names it and leave two requests settling one
+    // action, so it is refused before anything reaches the wire.
+    let replaced = session
+        .mutate_continuing(
+            unknown,
+            Method::SessionCreate,
+            target,
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await;
+    assert!(
+        matches!(replaced, Err(ClientError::Host(_))),
+        "an action whose outcome is unknown cannot carry another request"
+    );
+    assert_eq!(session.submitted_actions().await.len(), 1);
+    assert_eq!(script.actions.lock().await.len(), 1);
 
     session.close();
     serving.abort();

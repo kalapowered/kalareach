@@ -128,7 +128,7 @@ impl DesktopVoiceCall {
         }
 
         Err(CommandError::unavailable(
-            "this desktop build cannot open a voice call yet; use an iOS or Android device",
+            "this desktop application cannot open a voice call",
         ))
     }
 
@@ -351,10 +351,15 @@ mod tests {
     #[tokio::test]
     async fn an_answer_to_a_call_that_negotiated_nothing_is_refused() {
         let call = DesktopVoiceCall::new().expect("call creates");
-        let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
+        let refusal = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await.expect_err("there is nothing to complete");
+        assert_eq!(
+            refusal.code,
+            kr_protocol::error::ErrorCode::ResourceUnavailable
+        );
         assert!(
-            result.is_err(),
-            "must refuse an answer with nothing to complete"
+            refusal.message.contains("negotiated no connection"),
+            "refused for the wrong reason: {}",
+            refusal.message
         );
     }
 
@@ -364,8 +369,13 @@ mod tests {
         call.stop();
         assert!(call.is_stopped());
 
-        let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
-        assert!(result.is_err(), "must refuse answer on stopped call");
+        let refusal = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await.expect_err("a stopped call refuses");
+        // Named, so this test fails if the stop guard goes and another refusal covers for it.
+        assert!(
+            refusal.message.contains("already been stopped"),
+            "refused for the wrong reason: {}",
+            refusal.message
+        );
     }
 
     #[tokio::test]
@@ -373,7 +383,12 @@ mod tests {
         let call = DesktopVoiceCall::new().expect("call creates");
         call.set_closes_at_ms(1); // Expired timestamp
 
-        let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
-        assert!(result.is_err(), "must refuse answer on expired call");
+        let refusal = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await.expect_err("an expired call refuses");
+        // Named, so this test fails if the deadline guard goes and another refusal covers for it.
+        assert!(
+            refusal.message.contains("expired"),
+            "refused for the wrong reason: {}",
+            refusal.message
+        );
     }
 }

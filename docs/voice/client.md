@@ -12,7 +12,8 @@ The native client implements media directly:
 - **Desktop (macOS)**: `apps/companion/src-tauri/src/audio/` uses `AudioUnit` with
   `kAudioUnitSubType_VoiceProcessingIO` for echo cancellation, automatic gain control, and voice
   isolation. Audio samples are framed as 20ms Opus frames (48 kHz mono) and buffered in a ring buffer
-  with 120ms target depth. WebRTC SDP negotiation and data channels are handled in native Rust.
+  with 120ms target depth. Opening a desktop call refuses, and says so, rather than answering with
+  an offer no transport on this platform could carry.
 - **iOS**: `apps/companion/native/ios/` uses `AVAudioSession` configured with `.playAndRecord`,
   `.spokenAudio`, `[.allowBluetooth, .defaultToSpeaker, .mixWithOthers]`, and native WebRTC via the
   pinned `stasel/WebRTC` framework.
@@ -52,9 +53,10 @@ Whenever capture is in any state other than `capturing`, the UI displays:
 
 ## Append acknowledgements and context admission
 
-The client sends selected context and host results over the control socket as bounded context requests
-(`VOICE_CONTEXT_BYTES = 500`). When the service answers with `context_admitted`, the UI shows this as
-**admission**, never as execution (KR-REQ-15.17):
+Selected context and host results travel from the paired device to the managed service as bounded
+context requests, and a request over `VOICE_CONTEXT_BYTES` (500) is refused before it is sent rather
+than truncated. A request the service answers with `context_admitted` is shown as **admission**,
+never as execution (KR-REQ-15.17):
 > "The model received this. It is not evidence that anything ran on a host; the host's own receipt is
 > what says that."
 

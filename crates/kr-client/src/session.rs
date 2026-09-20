@@ -148,6 +148,35 @@ pub struct SubmittedAction {
     pub request_id: RequestId,
 }
 
+/// Whose identity a mutation is submitted under.
+///
+/// A first submission is a new intent and takes a new identifier. A continuation answers a demand
+/// the host made about one action it has already settled by asking, and so has to carry that
+/// action's own identifier: the host bound its demand to it, and anything else is a request it
+/// never made.
+#[derive(Clone, Copy, Debug)]
+enum Continuation {
+    /// A new intent.
+    None,
+    /// The action a host asked about, and whose answer this is.
+    Of(ActionId),
+}
+
+impl Continuation {
+    /// The identifier this submission goes out under.
+    fn action_id(self) -> Result<ActionId> {
+        match self {
+            Self::None => Ok(ActionId::new(kr_transport::random::fresh_uuid_v4()?)),
+            Self::Of(action_id) => Ok(action_id),
+        }
+    }
+
+    /// Whether this submission reuses an identifier rather than minting one.
+    const fn is_continuation(self) -> bool {
+        matches!(self, Self::Of(_))
+    }
+}
+
 /// What this client knows about its own mutations.
 ///
 /// `correlations` is what lets the reader settle an action whose caller has gone: a correlated
@@ -165,6 +194,26 @@ impl Outcomes {
         if let Some(action_id) = self.correlations.remove(&request_id) {
             self.submitted.remove(&action_id);
         }
+    }
+
+    /// Refuses to reuse an identifier that still stands for something this client must report.
+    ///
+    /// Two records would otherwise share one identifier: the intent already submitted and the one
+    /// arriving now. The book holds one record per action, so the first would be lost, and both
+    /// requests would stay correlated to the same action, so whichever answered first would settle
+    /// the other's submission as well. Section 9 forbids forgetting an action, and an action whose
+    /// outcome is unknown or whose receipt has not finished is exactly one that must not be lost.
+    fn refuse_replacement(&self, action_id: ActionId) -> Result<()> {
+        let unknown = self.submitted.contains_key(&action_id);
+        let receipted = self.receipts.get(&action_id).is_some();
+        if unknown || receipted {
+            return Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::InvalidArgument,
+                "that action is one this client is still accounting for, so it cannot carry \
+                 another request",
+            )));
+        }
+        Ok(())
     }
 
     /// Records one submission, or refuses when too many are already unresolved.
@@ -484,9 +533,8 @@ impl Session {
         P: Serialize + ?Sized,
         E: Serialize + ?Sized,
     {
-        let action_id = ActionId::new(kr_transport::random::fresh_uuid_v4()?);
         self.submit_mutation(
-            action_id,
+            Continuation::None,
             method,
             target,
             grant_id,
@@ -510,12 +558,20 @@ impl Session {
     /// host checks: the host still compares the evidence against the action it issued the demand
     /// for, and a caller that names a different action is refused there.
     ///
+    /// Only an action this client has already heard about can be continued. One whose outcome is
+    /// still unknown is refused: its record is the only thing that can name the intent a person
+    /// must be able to ask about, and replacing it with a second set of parameters would lose that
+    /// intent while leaving two requests correlated to one action, either of whose answers would
+    /// then settle the other. One whose receipt this client already holds is refused for the same
+    /// reason. Section 9 forbids forgetting an action, and this is where that would happen.
+    ///
     /// In every other respect this is [`Session::mutate`], including the outstanding bound and the
     /// uncertainty an interrupted send leaves behind.
     ///
     /// # Errors
     ///
-    /// The same as [`Session::mutate`].
+    /// The same as [`Session::mutate`], and a refusal when `continues` names an action this client
+    /// is still waiting on or already holds a receipt for.
     #[allow(clippy::too_many_arguments)]
     pub async fn mutate_continuing<P, E>(
         &self,
@@ -532,7 +588,7 @@ impl Session {
         E: Serialize + ?Sized,
     {
         self.submit_mutation(
-            continues,
+            Continuation::Of(continues),
             method,
             target,
             grant_id,
@@ -546,7 +602,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     async fn submit_mutation<P, E>(
         &self,
-        action_id: ActionId,
+        identity: Continuation,
         method: Method,
         target: ActionTarget,
         grant_id: Option<GrantId>,
@@ -585,6 +641,7 @@ impl Session {
             window.action_window_id.clone()
         };
 
+        let action_id = identity.action_id()?;
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
         let target_record = target.clone();
@@ -620,13 +677,22 @@ impl Session {
         // Recorded before the send: once the frame is on the wire the host may dispatch it, and a
         // client that cannot name the action cannot ask what happened to it. The correlation goes
         // in at the same time, so the reader can settle this action even if this caller goes away.
-        self.state.outcomes.lock().await.submit(SubmittedAction {
-            action_id,
-            method,
-            target: target_record,
-            params: params_record,
-            request_id,
-        })?;
+        //
+        // A continuation is checked against the same book under the same lock, so nothing can
+        // submit the action between the check and the record.
+        {
+            let mut outcomes = self.state.outcomes.lock().await;
+            if identity.is_continuation() {
+                outcomes.refuse_replacement(action_id)?;
+            }
+            outcomes.submit(SubmittedAction {
+                action_id,
+                method,
+                target: target_record,
+                params: params_record,
+                request_id,
+            })?;
+        }
         if self.transport.send(&frame).await.is_err() {
             // The frame may or may not have reached the host, so the action stays on the pending
             // list and the caller is told the outcome is unknown.

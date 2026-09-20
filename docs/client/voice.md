@@ -12,38 +12,51 @@ The voice surface is hosted in `apps/companion/src/voice/`:
 - `voice.css`: Accessible layout honoring platform minimum touch targets (44pt iOS, 48dp Android),
   high-contrast modes, dynamic type scaling, and reduced motion.
 
-## Flow of a voice call
+## What the person is shown before a call (KR-REQ-15.19, KR-REQ-15.09)
 
-1. **Before voice starts (KR-REQ-15.19, KR-REQ-15.09)**:
-   The person is presented with:
-   - The selected voice model (e.g. `gpt-live-1`) and broker origin.
-   - The deployed service's exact managed content access disclosure.
-   - The selected context scope (items, estimated tokens, and token cap).
-   - What speaking will be allowed to do (the standing voice grant).
-   - Plain statement that model statements do not constitute confirmation.
-   If estimated tokens exceed the 8,000-token cap, starting the session is disabled.
+The provider choice screen states the voice model and the service that brokers the call, the
+managed content access in the deployed service's own words, the context the host has selected with
+its estimated token count against the host's cap, and what speaking would be allowed to do. It also
+states plainly that a statement from the model that you confirmed something is not a confirmation.
+A selection over the cap leaves the start control disabled.
 
-2. **Call initiation**:
-   The native client generates a WebRTC SDP offer and requests a managed session from KalaReach.
-   The broker returns the SDP answer and session ID. Media flows directly between the native client
-   and OpenAI via WebRTC; audio does not pass through KalaReach servers.
+## What the person holds during a call
 
-3. **During a call**:
-   - The client streams microphone audio (48 kHz mono Opus).
-   - Provider audio plays through the device speaker.
-   - Provider events on the read-only data channel are mapped to delegations.
-   - The control socket carries periodic 20-second heartbeats and bounded context requests (<= 500 bytes).
+The call screen puts the capture state first, because that is what decides whether anything spoken
+counted. Muting the microphone, silencing the voice and ending the session act on this device and
+are never withheld for an unreachable service. Cancelling what the agent is doing is a separate
+control, under its own heading, with its own confirmation, and it names the turn it was opened for.
+Sending context needs the voice service; cancelling a turn needs the host; the screen says which is
+which when one of them is unreachable.
 
-4. **Ending a call**:
-   Hanging up ends the media streams and immediately revokes the session-bound voice grant on the host.
+A context request the service acknowledges is shown as admitted, with what admission does not mean
+beside it: the model received it, and the host's own receipt is what says anything ran.
 
-## Platform implementations
+## The components underneath
 
-| Platform | Audio capture / playback | WebRTC stack | Unlocked-screen ceremony |
+`apps/companion/src-tauri/src/audio/` holds the desktop half: Opus encoding and decoding with
+packet-loss concealment at 48 kHz mono, a bounded PCM ring buffer at a 120 ms target depth, the
+macOS `VoiceProcessingIO` unit, the rules every control frame is held to, and the unlocked-screen
+ceremony. Opening a desktop call refuses, and says so, rather than answering with an offer no
+transport here could carry.
+
+`apps/companion/native/ios/` and `apps/companion/native/android/` hold the phone's half: the
+platform's own WebRTC stack, the audio session and audio focus, Android's microphone foreground
+service with its notification, and each platform's device-owner ceremony.
+
+## The unlocked-screen ceremony (KR-REQ-15.13)
+
+Each platform authenticates the device owner and then signs the host's own challenge with the
+paired device's identity key: `LAContext` on macOS, `LocalAuthentication` on iOS, `BiometricPrompt`
+with a device-credential fallback on Android. A platform with no such ceremony refuses rather than
+answering that the owner was present. The signature covers the exact action the host named, so a
+confirmation for one action authorises nothing else, and no provider text can produce one.
+
+| Platform | Capture and playback | Media stack | Device-owner ceremony |
 | --- | --- | --- | --- |
-| macOS | VoiceProcessingIO AudioUnit | Native Rust WebRTC | `LAContext` + Ed25519 |
-| iOS | `AVAudioSession` (.playAndRecord) | `stasel/WebRTC` framework | `LocalAuthentication` + CryptoKit Ed25519 |
-| Android | `AudioRecord` / `AudioTrack` | `io.github.webrtc-sdk:android` | `BiometricPrompt` + Ed25519 |
+| macOS | `VoiceProcessingIO` unit | `webrtc` (Rust) | `LAContext`, Ed25519 |
+| iOS | `AVAudioSession` (`.playAndRecord`) | `stasel/WebRTC` | `LocalAuthentication`, Ed25519 |
+| Android | `AudioRecord` and `AudioTrack` | `io.github.webrtc-sdk:android` | `BiometricPrompt`, Ed25519 |
 
 ## Testing and verification
 
