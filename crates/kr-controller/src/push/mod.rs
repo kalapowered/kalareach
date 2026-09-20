@@ -268,8 +268,9 @@ impl DeliveryModule {
         now_ms: u64,
     ) -> Result<usize> {
         self.with(|producer| {
-            producer
-                .journal_mut()
+            let journal = producer.journal_mut();
+            journal.expire_overdue(now_ms).map_err(unavailable)?;
+            journal
                 .forget_expired_preview_keys(now_ms)
                 .map_err(unavailable)?;
             producer
@@ -359,17 +360,18 @@ impl DeliveryModule {
                 now_ms,
                 record.expires_at_ms,
             );
+            // A receipt carries the same answers a send does, so it carries the same consequences:
+            // a token the provider rejected goes out of service here as well, or the destination
+            // would keep its token until something happened to ask again.
+            if decision.disable_destination {
+                let mut disabled = destination.clone();
+                disabled.enabled = false;
+                self.configure(&disabled)?;
+            }
             let settled = self.with(|producer| {
                 producer
                     .journal_mut()
-                    .settle_receipt(
-                        record.notification_id,
-                        decision.state,
-                        decision.next,
-                        decision.next_attempt_at_ms,
-                        &decision.detail,
-                        now_ms,
-                    )
+                    .settle_receipt(record.notification_id, &decision, now_ms)
                     .map_err(unavailable)
             })?;
             resolved += usize::from(settled && decision.state.is_settled());
@@ -404,8 +406,12 @@ impl DeliveryModule {
     ) -> Result<usize> {
         let now_ms = clock.now_ms();
         self.with(|producer| {
-            producer
-                .journal_mut()
+            let journal = producer.journal_mut();
+            // An expiry that passed while this host was stopped leaves a queued row nothing will
+            // ever select, so the pass settles those first and then selects what is still worth
+            // sending.
+            journal.expire_overdue(now_ms).map_err(unavailable)?;
+            journal
                 .forget_expired_preview_keys(now_ms)
                 .map_err(unavailable)
         })?;
@@ -434,21 +440,32 @@ impl DeliveryModule {
                 // with. Neither is sent.
                 Claim::Settled(_) | Claim::Refused(_) => continue,
             };
-            let record = self.with(|producer| {
-                producer
-                    .journal()
-                    .destination(&claimed.destination_id)
-                    .map_err(unavailable)
-            })?;
-            let Some(record) = record.filter(|record| record.enabled) else {
+            // The destination is the one the claim validated inside its own transaction, not one
+            // read again afterwards: what is sent has to go where the claim said it may go.
+            let record = claimed.destination.clone();
+            // Deciding whether to send waits - on this host's own locks, and on whatever the
+            // recipient's authority has to be asked - and section 16 stops at expiry, so the
+            // deadline is read against the clock as it stands rather than against the reading the
+            // claim was made with.
+            let now_ms = clock.now_ms().max(now_ms);
+            if now_ms >= claimed.expires_at_ms.get() {
+                self.settle(
+                    &claimed,
+                    DeliveryState::Expired,
+                    "the notification expired while this pass was deciding whether to send it",
+                    now_ms,
+                )?;
+                continue;
+            }
+            if !record.enabled {
                 self.settle(
                     &claimed,
                     DeliveryState::Revoked,
                     "the destination is no longer configured or enabled",
-                    clock.now_ms(),
+                    now_ms,
                 )?;
                 continue;
-            };
+            }
             // Section 19 intersects the content policy with the recipient's own authority, and
             // that authority is asked again here rather than trusted from admission. A grant
             // revoked after the message was built stops it now.
@@ -457,7 +474,7 @@ impl DeliveryModule {
                     &claimed,
                     DeliveryState::Revoked,
                     "the recipient's authority is not the one this was admitted under",
-                    clock.now_ms(),
+                    clock.now_ms().max(now_ms),
                 )?;
                 continue;
             }
@@ -615,6 +632,18 @@ impl DeliveryModule {
         } else {
             held
         };
+        // A renewal is a call to the gateway, so it waits, and a notification whose expiry passed
+        // during that wait is not presented: section 16 stops at expiry rather than at the moment
+        // the pass last looked at a clock.
+        let now_ms = clock.now_ms().max(now_ms);
+        if now_ms >= delivery.expires_at_ms.get() {
+            return self.settle(
+                delivery,
+                DeliveryState::Expired,
+                "the notification expired while the credential was being renewed",
+                now_ms,
+            );
+        }
         let outcome = if delivery.next == NextAction::Receipt {
             // The gateway is holding this notification and retrying the provider itself. Asking
             // what became of it is a read; presenting it as new work would be a second

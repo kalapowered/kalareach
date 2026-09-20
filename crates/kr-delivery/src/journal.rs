@@ -364,6 +364,19 @@ impl DeliveryState {
             Self::Accepted | Self::DuplicateUncertain | Self::OutcomeUnknown
         )
     }
+
+    /// Returns true when a notification in this state may still reach the person.
+    ///
+    /// It is what a collapse window rests on. Section 16 collapses excess notifications into one
+    /// attention update, and every request suppressed into that update is a request whose content
+    /// the person sees only through it. A window is therefore held open only while the update it
+    /// names can still arrive: an update the gateway refused, one an expiry overtook and one an
+    /// authorisation ended will never be shown, and holding the window for it would suppress
+    /// everything that followed into a notification nobody will ever see.
+    #[must_use]
+    pub const fn may_still_arrive(self) -> bool {
+        !self.is_settled() || self.has_left_this_host() || matches!(self, Self::Duplicate)
+    }
 }
 
 impl std::fmt::Display for DeliveryState {
@@ -521,6 +534,14 @@ pub struct ClaimedDelivery {
     pub expires_at_ms: TimestampMs,
     /// The privacy generation it was admitted under.
     pub privacy_generation: u64,
+    /// The destination this is sent to, as the claim validated it.
+    ///
+    /// The claim reads it inside the transaction that takes the row and compares it with the
+    /// destination the notification was admitted for, so it travels with the claim rather than
+    /// being read again afterwards. A second read would be a second answer: an endpoint edited
+    /// between the claim and it would receive content that was admitted for the address it
+    /// replaced, and the claim's comparison would have proved nothing.
+    pub destination: DestinationRecord,
     /// The recipient's authority as it stood at admission, for the caller to ask about again.
     pub authority_digest: String,
     /// What this attempt is: a send, a read of a decision already recorded, or a renewal first.
@@ -1426,8 +1447,8 @@ impl DeliveryJournal {
             )
             .optional()?
             .transpose()?;
-        match configured {
-            Some(configured) if configured.binding_digest() == destination_digest => {}
+        let admitted_for = match configured {
+            Some(configured) if configured.binding_digest() == destination_digest => configured,
             _ => {
                 settle_in(
                     &transaction,
@@ -1440,7 +1461,7 @@ impl DeliveryJournal {
                 transaction.commit()?;
                 return Ok(Claim::Settled(DeliveryState::Revoked));
             }
-        }
+        };
         if as_u64(due_at) > now_ms {
             return Ok(Claim::Refused(ClaimRefusal::NotDue));
         }
@@ -1473,6 +1494,7 @@ impl DeliveryJournal {
             attempt,
             expires_at_ms: TimestampMs::new(as_u64(expires)),
             privacy_generation: as_u64(record_generation),
+            destination: admitted_for,
             authority_digest,
             next: next_action
                 .as_deref()
@@ -1587,7 +1609,10 @@ impl DeliveryJournal {
                 )?;
             }
         }
-        if transition.state.is_settled() && !transition.left_this_host {
+        // A window is released as soon as the update it names can no longer arrive. Reaching the
+        // gateway is not arriving: a refusal, a revocation and an expiry all reach it and none of
+        // them is ever shown, so the state rather than the attempt decides this.
+        if !transition.state.may_still_arrive() {
             transaction.execute(
                 "UPDATE delivery_budget
                  SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
@@ -2240,6 +2265,79 @@ impl DeliveryJournal {
         Ok(true)
     }
 
+    /// Settles every queued delivery whose expiry has passed, and returns how many it settled.
+    ///
+    /// Section 16 stops at expiry, and [`DeliveryJournal::due`] keeps that rule by leaving an
+    /// expired row out of every selection. A row nothing selects is a row nothing settles, so a
+    /// host that was stopped over the expiry would otherwise hold the content, the outbox entry
+    /// and the state of a notification that can never go anywhere. This is where that is
+    /// finished: a pass calls it before it selects.
+    ///
+    /// What each row becomes depends on whether it ever left. One nothing dispatched is
+    /// [`DeliveryState::Expired`] and its bytes go. One that reached the gateway is
+    /// [`DeliveryState::OutcomeUnknown`]: an expiry this host observed says when this host stopped
+    /// waiting, not what became of a notification somebody else is holding, and the request bytes
+    /// stay so a receipt read can still answer it.
+    ///
+    /// A row an attempt is on the wire for is left alone: the pass that claimed it owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn expire_overdue(&mut self, now_ms: u64) -> Result<usize> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let overdue: Vec<(String, i64, i64)> = {
+            let mut statement = transaction.prepare(
+                "SELECT n.notification_id, n.attempts, n.dispatched
+                   FROM delivery_outbox o JOIN delivery_notifications n
+                     ON n.notification_id = o.notification_id
+                  WHERE n.expires_at_ms <= ?1
+                    AND n.state IN ('admitted', 'retrying')
+                  ORDER BY n.admitted_at_ms",
+            )?;
+            let rows = statement.query_map(params![as_i64(now_ms)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            let mut overdue = Vec::new();
+            for row in rows {
+                overdue.push(row?);
+            }
+            overdue
+        };
+        let settled = overdue.len();
+        for (identifier, attempts, dispatched) in overdue {
+            if dispatched == 0 {
+                settle_in(
+                    &transaction,
+                    &identifier,
+                    as_u64(attempts),
+                    now_ms,
+                    DeliveryState::Expired,
+                    "the notification expired before it was dispatched",
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE delivery_notifications SET state = ?2, detail = ?3
+                      WHERE notification_id = ?1",
+                    params![
+                        identifier,
+                        DeliveryState::OutcomeUnknown.as_str(),
+                        "the notification expired while the gateway was holding it, so what \
+                         became of it is unknown"
+                    ],
+                )?;
+                transaction.execute(
+                    "DELETE FROM delivery_outbox WHERE notification_id = ?1",
+                    params![identifier],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(settled)
+    }
+
     /// Settles one record whose outcome nobody knew, from the receipt that answered it.
     ///
     /// It applies only to a record already settled as an unknown outcome: this is the resolution
@@ -2252,12 +2350,19 @@ impl DeliveryJournal {
     pub fn settle_receipt(
         &mut self,
         notification_id: NotificationId,
-        state: DeliveryState,
-        next: crate::push::NextAction,
-        next_attempt_at_ms: Option<TimestampMs>,
-        detail: &str,
+        decision: &crate::push::Decision,
         now_ms: u64,
     ) -> Result<bool> {
+        let crate::push::Decision {
+            state,
+            next,
+            next_attempt_at_ms,
+            detail,
+            suppression,
+            ..
+        } = decision;
+        let (state, next, next_attempt_at_ms) = (*state, *next, *next_attempt_at_ms);
+        let detail = detail.as_str();
         let identifier = notification_id.to_string();
         let transaction = self
             .connection
@@ -2301,6 +2406,14 @@ impl DeliveryJournal {
                 "DELETE FROM delivery_outbox WHERE notification_id = ?1",
                 params![identifier],
             )?;
+            if !state.may_still_arrive() {
+                transaction.execute(
+                    "UPDATE delivery_budget
+                     SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
+                     WHERE collapse_into = ?1",
+                    params![identifier],
+                )?;
+            }
         } else {
             transaction.execute(
                 "INSERT INTO delivery_attempts
@@ -2339,6 +2452,19 @@ impl DeliveryJournal {
                     ],
                 )?;
             }
+        }
+        // What a receipt reports about suppression is what the destination said, and section 16
+        // asks this host to report suppression locally whether it learned of it from the answer to
+        // a send or from the answer to a receipt.
+        let (reason, into, count, next_ms) = suppression_columns(suppression.as_ref());
+        if reason.is_some() {
+            transaction.execute(
+                "UPDATE delivery_notifications
+                    SET suppression_reason = ?2, suppression_into = ?3,
+                        suppression_count = ?4, suppression_next_ms = ?5
+                  WHERE notification_id = ?1",
+                params![identifier, reason, into, count, next_ms],
+            )?;
         }
         transaction.commit()?;
         Ok(true)
@@ -3417,6 +3543,248 @@ mod tests {
         );
         assert!(journal.due(2_999, 10).expect("a read").is_empty());
         assert_eq!(journal.due(3_000, 10).expect("a read").len(), 1);
+    }
+
+    /// The claim validates the destination inside its own transaction and hands it to the sender,
+    /// so what is sent goes to the destination that was validated. A configuration edited after
+    /// the claim reaches the next claim, which refuses it, and never the message already claimed.
+    #[test]
+    fn a_claim_carries_the_destination_it_validated_and_a_later_edit_does_not_reach_it() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let claimed = claim(&mut journal, 9, 2_000);
+        assert_eq!(
+            claimed
+                .destination
+                .as_external()
+                .expect("an external destination")
+                .endpoint,
+            "https://example.invalid/hook",
+            "the claim carries the destination it compared, not an identifier to look up later"
+        );
+        let mut moved = destination("hook");
+        moved.destination = Destination::External(ExternalDestination {
+            kind: DestinationKind::Webhook,
+            endpoint: "https://elsewhere.invalid/hook".to_owned(),
+            idempotency: Idempotency::Unsupported,
+        });
+        journal.configure_destination(&moved).expect("the edit");
+        assert_eq!(
+            claimed
+                .destination
+                .as_external()
+                .expect("an external destination")
+                .endpoint,
+            "https://example.invalid/hook",
+            "an address edited after the claim is not where this message may go"
+        );
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: claimed.attempt,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                next: crate::push::NextAction::Send,
+                detail: Some("nothing was dispatched".to_owned()),
+                suppression: None,
+                keep_content: true,
+                left_this_host: false,
+            })
+            .expect("a transition");
+        assert!(
+            matches!(
+                journal
+                    .claim(NotificationId::new(uuid(9)), 3_000)
+                    .expect("a claim"),
+                Claim::Settled(DeliveryState::Revoked)
+            ),
+            "and the next claim refuses the edited destination outright"
+        );
+    }
+
+    /// A host that was stopped over a notification's expiry finds a queued row nothing will ever
+    /// select. The expiry pass settles it, and what it settles it as depends on whether anything
+    /// was ever sent.
+    #[test]
+    fn a_delivery_that_expired_while_nothing_ran_is_settled_by_the_expiry_pass() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        assert!(
+            journal.due(100_000, 10).expect("a read").is_empty(),
+            "an expired row is never selected, which is why it needs settling"
+        );
+        assert_eq!(journal.expire_overdue(100_000).expect("a pass"), 1);
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::Expired);
+        assert_eq!(record.content, None, "nothing left, so nothing is kept");
+        assert_eq!(
+            journal.expire_overdue(100_000).expect("a second pass"),
+            0,
+            "a settled row is not settled again"
+        );
+    }
+
+    /// The other half: a notification the gateway is holding outlives this host's own deadline, so
+    /// the expiry this host observed is not an outcome and the request bytes stay for the receipt.
+    #[test]
+    fn a_dispatched_delivery_that_expired_keeps_its_uncertainty_and_its_request() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        claim(&mut journal, 9, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                next: crate::push::NextAction::Receipt,
+                detail: Some("the gateway is holding it".to_owned()),
+                suppression: None,
+                keep_content: true,
+                left_this_host: true,
+            })
+            .expect("a transition");
+        assert_eq!(journal.expire_overdue(100_000).expect("a pass"), 1);
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+        assert!(
+            record.content.is_some(),
+            "the receipt can only be read with the same request"
+        );
+        assert_eq!(journal.outstanding().expect("a count"), 1);
+    }
+
+    /// Section 16 collapses excess notifications into one attention update. An update the gateway
+    /// refused is one nobody will ever see, so the window it opened is released whether or not the
+    /// request reached the gateway; otherwise every later request would be suppressed into a
+    /// notification that does not exist.
+    #[test]
+    fn a_refused_attention_update_releases_the_window_it_opened() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let update = NotificationId::new(uuid(9)).to_string();
+        journal
+            .record_budget(
+                &DestinationId::new("hook").expect("an identifier"),
+                &StoredBudget {
+                    burst_scaled: 0,
+                    sustained_scaled: 0,
+                    refilled_at_ms: 1_000,
+                    collapse_into: Some(update.clone()),
+                    collapse_opened_at_ms: Some(1_000),
+                    collapse_count: 3,
+                },
+            )
+            .expect("a budget");
+        claim(&mut journal, 9, 2_000);
+        assert!(
+            journal
+                .record_attempt(&Transition {
+                    notification_id: NotificationId::new(uuid(9)),
+                    attempt: 1,
+                    state: DeliveryState::Refused,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_010)),
+                    next_attempt_at_ms: None,
+                    next: crate::push::NextAction::None,
+                    detail: Some("the provider refused it".to_owned()),
+                    suppression: None,
+                    keep_content: false,
+                    // The gateway answered, so the request did reach it.
+                    left_this_host: true,
+                })
+                .expect("a transition")
+        );
+        let budget = journal
+            .budget(&DestinationId::new("hook").expect("an identifier"))
+            .expect("a read")
+            .expect("the budget");
+        assert_eq!(
+            budget.collapse_into, None,
+            "the update will never arrive, so nothing may collapse into it"
+        );
+        assert_eq!(budget.collapse_count, 0);
+    }
+
+    /// The other half of the same rule: an update the gateway queued is on its way, and the window
+    /// stays open so the five-minute collapse still means one notification.
+    #[test]
+    fn an_accepted_attention_update_keeps_its_window_open() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let update = NotificationId::new(uuid(9)).to_string();
+        journal
+            .record_budget(
+                &DestinationId::new("hook").expect("an identifier"),
+                &StoredBudget {
+                    burst_scaled: 0,
+                    sustained_scaled: 0,
+                    refilled_at_ms: 1_000,
+                    collapse_into: Some(update.clone()),
+                    collapse_opened_at_ms: Some(1_000),
+                    collapse_count: 3,
+                },
+            )
+            .expect("a budget");
+        claim(&mut journal, 9, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: 1,
+                state: DeliveryState::Accepted,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("queued".to_owned()),
+                suppression: None,
+                keep_content: false,
+                left_this_host: true,
+            })
+            .expect("a transition");
+        assert_eq!(
+            journal
+                .budget(&DestinationId::new("hook").expect("an identifier"))
+                .expect("a read")
+                .expect("the budget")
+                .collapse_into,
+            Some(update)
+        );
     }
 
     #[test]

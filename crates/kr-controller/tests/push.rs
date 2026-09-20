@@ -22,7 +22,7 @@ use kr_delivery::destination::{
 use kr_delivery::external::{ExternalMessage, ExternalOutcome, ExternalSender};
 use kr_delivery::journal::{DeliveryState, EventSource};
 use kr_delivery::producer::{DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority};
-use kr_delivery::push::{PushSender, SendOutcome};
+use kr_delivery::push::{PushSender, SendOutcome, SenderCredentials};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
@@ -117,6 +117,7 @@ impl PushSender for GatewayDouble {
 struct ExternalDouble {
     answers: Mutex<Vec<ExternalOutcome>>,
     sent: Mutex<Vec<ExternalMessage>>,
+    endpoints: Mutex<Vec<String>>,
 }
 
 impl ExternalDouble {
@@ -124,6 +125,7 @@ impl ExternalDouble {
         Self {
             answers: Mutex::new(answers),
             sent: Mutex::new(Vec::new()),
+            endpoints: Mutex::new(Vec::new()),
         }
     }
 
@@ -135,12 +137,26 @@ impl ExternalDouble {
     }
 }
 
+impl ExternalDouble {
+    /// The addresses this double was asked to send to, in order.
+    fn endpoints(&self) -> Vec<String> {
+        self.endpoints
+            .lock()
+            .expect("the double is not poisoned")
+            .clone()
+    }
+}
+
 impl ExternalSender for ExternalDouble {
     fn send(
         &self,
-        _destination: &ExternalDestination,
+        destination: &ExternalDestination,
         message: &ExternalMessage,
     ) -> ExternalOutcome {
+        self.endpoints
+            .lock()
+            .expect("the double is not poisoned")
+            .push(destination.endpoint.clone());
         self.sent
             .lock()
             .expect("the double is not poisoned")
@@ -150,6 +166,26 @@ impl ExternalSender for ExternalDouble {
             return ExternalOutcome::Delivered;
         }
         answers.remove(0)
+    }
+}
+
+/// A credential store whose renewal succeeds, which is what a host with a reachable gateway has.
+#[derive(Debug)]
+struct RenewingCredentials {
+    held: PushDeliveryCredential,
+    renewed: PushDeliveryCredential,
+}
+
+impl SenderCredentials for RenewingCredentials {
+    fn current(&self, _sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential> {
+        Some(self.held.clone())
+    }
+
+    fn renew(
+        &self,
+        _sender_record_id: PushSenderRecordId,
+    ) -> Result<PushDeliveryCredential, kr_delivery::DeliveryError> {
+        Ok(self.renewed.clone())
     }
 }
 
@@ -685,6 +721,135 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
                 .expect("the record");
             assert_eq!(record.state, DeliveryState::Accepted);
             assert_eq!(record.content, None, "nothing needs to ask again");
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-16.13: a receipt carries the same answers a send does, so it carries the same
+/// consequences. A token the provider rejected goes out of service whichever call learned of it,
+/// and what the answer says was suppressed is recorded either way.
+#[test]
+fn a_receipt_that_reports_a_rejected_token_takes_the_destination_out_of_service() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![
+        SendOutcome::Unknown {
+            detail: "the connection was reset".to_owned(),
+        },
+        SendOutcome::Decided(Box::new(PushDeliveryAck {
+            decided_at_ms: TimestampMs::new(NOW + 120_000),
+            notification_id: NotificationId::new(Uuid::NIL),
+            state: PushDeliveryState::TokenDisabled,
+            suppression: Nullable::null(),
+        })),
+    ]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    environment
+        .module
+        .read_receipts(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &at(NOW + 120_000),
+        )
+        .expect("a reconciliation");
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::TokenDisabled);
+            let configured = producer
+                .journal()
+                .destination(&DestinationId::new("phone").expect("an identifier"))
+                .expect("a read")
+                .expect("the destination");
+            assert!(
+                !configured.enabled,
+                "the token is out of service until a native registration proves receipt again"
+            );
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// Section 16 stops at expiry, and a renewal is a call that waits. A notification whose deadline
+/// passed while the credential was being renewed is settled rather than presented.
+#[test]
+fn a_notification_that_expires_during_a_renewal_is_not_presented() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::queued();
+    let readings = std::sync::atomic::AtomicUsize::new(0);
+    // Three readings take the pass up to the renewal; the fourth is the one it takes after the
+    // renewal has returned, and by then the notification has expired.
+    let clock = || {
+        if readings.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            NOW
+        } else {
+            NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1
+        }
+    };
+    // A credential inside its renewal window, so the pass renews before it presents anything.
+    let credentials = RenewingCredentials {
+        held: credential(NOW + 60_000),
+        renewed: credential(NOW + 30 * 24 * 60 * 60 * 1000),
+    };
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &credentials,
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &clock,
+        )
+        .expect("a pass");
+    assert!(
+        gateway.sent().is_empty(),
+        "nothing is presented after the deadline it was admitted under"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Expired);
+            assert!(!record.dispatched);
+            assert!(
+                record
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("renew")),
+                "the record says which wait overtook it"
+            );
             Ok(())
         })
         .expect("a read");
@@ -1551,6 +1716,60 @@ fn a_destination_whose_endpoint_changed_after_admission_is_not_sent_to() {
             Ok(())
         })
         .expect("a read");
+}
+
+/// The claim is what admits a dispatch, so the destination it validated is the destination the
+/// message goes to. A configuration edited while the pass is running reaches the next claim, which
+/// refuses it; it never redirects the message this pass already claimed.
+#[test]
+fn a_pass_sends_to_the_destination_its_claim_validated() {
+    let environment = environment();
+    let destination = webhook(Idempotency::Unsupported);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "a command failed"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let external = ExternalDouble::answering(Vec::new());
+    let readings = std::sync::atomic::AtomicUsize::new(0);
+    // The third reading is the one the pass takes after it has claimed the row and before it
+    // sends, which is exactly the window an edit would have to land in.
+    let clock = || {
+        if readings.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 2 {
+            let mut moved = webhook(Idempotency::Unsupported);
+            moved.destination = Destination::External(ExternalDestination {
+                kind: DestinationKind::Webhook,
+                endpoint: "https://elsewhere.invalid/hook".to_owned(),
+                idempotency: Idempotency::Unsupported,
+            });
+            environment.module.configure(&moved).expect("the edit");
+        }
+        NOW
+    };
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::queued(),
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &external,
+            &Granted(BTreeSet::new()),
+            &clock,
+        )
+        .expect("a pass");
+    assert_eq!(
+        external.endpoints(),
+        vec!["https://example.invalid/hook".to_owned()],
+        "the message went where the claim said it may go"
+    );
+    assert!(
+        readings.load(std::sync::atomic::Ordering::Relaxed) > 2,
+        "the edit landed in the window it was aimed at"
+    );
 }
 
 /// KR-REQ-18.08 and section 19: the recipient's authority is asked again at dispatch, so a grant
