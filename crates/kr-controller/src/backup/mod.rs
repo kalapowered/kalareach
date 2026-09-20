@@ -370,12 +370,17 @@ impl BackupService {
             .unpersisted_obligations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owed_in_memory = !unpersisted.is_empty();
         unpersisted.retain(|item| !item.contains(step));
-        if unpersisted.is_empty() {
-            // The marker stands in for work this host could not write down. Nothing is left
-            // unwritten now, and this very call wrote to the store, so the condition it reported
-            // has passed. Left behind it would be a host owing something it could never name and
-            // never clear, which is privacy cleanup that can never report complete.
+        if owed_in_memory && unpersisted.is_empty() {
+            // The marker stands in for work *this process* could not write down, and this was the
+            // last of it. The condition it reported has passed, so it goes with the work.
+            //
+            // Only when this process is the one that could not write. A marker left by an earlier
+            // process stands for a step whose name that process could not record either, and
+            // nothing here can establish that it was ever done: an empty list after a restart is
+            // an empty list, not evidence. Clearing it on the strength of some other step's
+            // success would report a cleanup nobody performed.
             let _ = store.clear_obligation(FAILED_TO_RECORD);
         }
     }
