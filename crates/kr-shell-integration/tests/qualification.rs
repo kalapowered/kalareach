@@ -1247,7 +1247,6 @@ fn the_states_that_need_a_command_first(
         let _ = session.next_prompt();
         settle(session, Duration::from_millis(200), REPLY);
         session.forget_events();
-        session.ensure_reading();
         // The key the person pressed is not the gesture; what the reader is reading is the macro
         // this binding pushed back, and a character from there is not a gesture either.
         session.type_bytes(shellpkg::CTRL_T);
@@ -1279,7 +1278,6 @@ fn the_states_that_need_a_command_first(
         let _ = session.next_prompt();
         settle(session, Duration::from_millis(300), REPLY);
         session.forget_events();
-        session.ensure_reading();
         session.type_bytes(shellpkg::ESCAPE);
         std::thread::sleep(Duration::from_millis(120));
         session.type_bytes(b"d");
