@@ -423,8 +423,8 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
     // second time this terminal is attached and watching, which is the only way to see what an
     // attachment is sent.
     let host = host(
-        "printf '\\033[c'; read -r _; printf '\\033[c'; read -r _; printf 'kr-asked.\\n'; \
-         read -r _",
+        "printf '\\033[c'; read -r _; printf 'kr-joined.\\n'; read -r _; \
+         printf '\\033[c'; read -r _; printf 'kr-asked.\\n'; read -r _",
     )
     .await;
     produced(&host.runtime, b"[?62;22c").await;
@@ -436,6 +436,12 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
         Some(TerminalPresentationMode::Direct),
         "the terminal is the session's size"
     );
+    // One line, released before the second question, that ends the run carrying the screen this
+    // terminal was drawn. What follows it is live, so the answer found there is an answer this
+    // attachment was sent rather than one it was shown a picture of.
+    keys.release(&host.runtime);
+    let drawn = collect_until(&mut client, b"kr-joined.").await;
+
     // The second question, and then a line that follows it. The run ends on that line rather than
     // on the answer, so what it carries is everything the question produced: a host that forwarded
     // the question would have put it in this same stream, in front of its own answer.
@@ -445,7 +451,7 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
     let seen = collect_until(&mut client, b"kr-asked.").await;
     let text = String::from_utf8_lossy(&seen).into_owned();
     assert!(
-        !text.contains("\u{1b}[c"),
+        !text.contains("\u{1b}[c") && !String::from_utf8_lossy(&drawn).contains("\u{1b}[c"),
         "the question never reaches an attached terminal: {text:?}"
     );
     assert!(
