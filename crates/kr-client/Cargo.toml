@@ -20,11 +20,20 @@ kr-protocol.workspace = true
 # Only the projected screen needs it, and only a client with a local terminal to paint has one.
 kr-term = { workspace = true, optional = true }
 kr-transport.workspace = true
+# The managed-service transport, with the feature set the workspace cuts it to.
+reqwest.workspace = true
+# Named so this client installs the TLS provider it means to use rather than whichever one another
+# library in the process happened to install first.
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# A request address is compared with the configured gateway origin as a parsed scheme, host and
+# port, because two spellings of one address are one origin and text comparison would say they are
+# not.
+url.workspace = true
 zeroize.workspace = true
 
 [features]
@@ -45,8 +54,14 @@ iroh = { workspace = true, features = ["test-utils"] }
 # A disposable owner-only host tree, so a local endpoint in a test lives on the internal disk and
 # disappears with the test.
 kr-ipc = { workspace = true, features = ["testing"] }
+# The transport's contract is checked against a TLS server the test starts on loopback, so the
+# test issues that server's certificates and answers the handshake itself.
+rcgen.workspace = true
 # The draft store writes to a caller-supplied directory, so its tests supply a disposable one.
 tempfile.workspace = true
+# The loopback server listens and reads, which the library itself has no need to do.
+tokio = { workspace = true, features = ["io-util", "net"] }
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

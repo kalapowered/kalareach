@@ -6,14 +6,17 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and two modules hold the managed
+//! The traits and one null implementation live here, and three modules hold the managed
 //! implementations this crate carries. [`relay`] is the relay-lease client, because a lease is the
 //! one managed resource a client cannot do without and still use a relay at all. [`voice`] is the
 //! voice broker, because a managed call is created by one request whose exact shape both the host
-//! and the companion have to agree on. A self-hosted deployment supplies its own, and a client
-//! with no managed service configured is a complete client: direct connections, local sessions,
-//! plugins, local descriptions and user-operated alternatives need none of these.
+//! and the companion have to agree on. [`http`] is the exchange underneath them: one gateway
+//! origin, finite deadlines, bounded answers and no retry of its own. A self-hosted deployment
+//! supplies its own, and a client with no managed service configured is a complete client: direct
+//! connections, local sessions, plugins, local descriptions and user-operated alternatives need
+//! none of these.
 
+pub mod http;
 pub mod relay;
 pub mod voice;
 
@@ -25,6 +28,7 @@ use kr_protocol::scalars::EndpointKey;
 
 use crate::error::{ClientError, Result};
 
+pub use http::{HttpDeadlines, HttpService, ResponseLimits};
 pub use relay::{
     ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayWarning, ServiceHttp,
