@@ -25,6 +25,7 @@
 //! | [`ipc`] | The local socket or named pipe, with the host-stamped freshness context |
 //! | [`projection`] | The screen a projected client holds, and the renderer that draws it |
 //! | [`session`] | Requests, receipts, events and the action window |
+//! | [`sync`] | Encrypted settings sync, its compare-and-swap client and its privacy hook |
 //! | [`cursors`] | Cursors, receipts and the order state is restored in |
 //! | [`reconnect`] | The reconnect loop and what it refuses to carry across |
 //! | [`retry`] | What a failure means for the request, and what it means for the person |
@@ -55,6 +56,7 @@ pub mod reconnect;
 pub mod retry;
 pub mod services;
 pub mod session;
+pub mod sync;
 pub mod transport;
 pub mod uploads;
 pub mod viewport;
