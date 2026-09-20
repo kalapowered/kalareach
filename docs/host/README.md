@@ -2732,8 +2732,9 @@ recipient's own authority rather than assumed from the address.
 
 Privacy mode fences the delivery outbox at once, takes back what was never dispatched, removes the
 queued content, and does not report complete while a send is still on the wire. Notifications that
-already reached a provider are shown as retained artifacts with a separate deletion action; this
-host does not claim it can recall them.
+already reached a provider are shown as retained artifacts, each saying that this host holds no way
+to recall it: there is no deletion action for a copy that is on somebody else's device or in
+somebody else's service, and the listing says so rather than offering one that would do nothing.
 
 `docs/delivery/README.md` is the whole of it.
 
