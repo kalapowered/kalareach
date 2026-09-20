@@ -112,7 +112,8 @@ has already learnt. A refused comparison is an answer rather than a failure: wha
 comes down **beside** the local draft under a fresh identity, never over it, and the person chooses.
 Reconnecting never replaces their text.
 
-Sealing is the caller's: `drafts::DraftSealer` is the seam, and nothing in the library sees a key.
+Sealing goes through `drafts::DraftSealer`. `sync::CollectionSealer` is the implementation this
+crate carries; a client that seals differently supplies its own.
 
 ## Settings sync
 
@@ -163,6 +164,29 @@ the same compare-and-swap discipline and the same sealing seam.
 which is this module; history backups; and recovery material, which is what a restore without
 another device needs. The last two are optional, which is what sections 18 and 20 call them, and
 each part carries what a person does without it.
+
+### The key a collection is sealed under
+
+The service holds ciphertext and no keys, so the key is the device's. It is not one of the device's
+own four keypairs: those identify the device, and this one is shared by every device permitted to
+read the collection. `sync::CollectionKeys` is where a sealer gets it, named by the collection and
+by the key epoch, because section 20 requires a mutable shared collection to be re-keyed when the
+set of devices that may read it changes, and a device keeps the key of an epoch it still has
+objects from beside the key it writes under.
+
+A key that is not held is an error. Nothing in that interface makes one: a key drawn in place of a
+missing one would seal content the other devices cannot read, and from the device that drew it
+would look exactly like success.
+
+| Implementation | Where the key is |
+| --- | --- |
+| `sync::StoredCollectionKeys` | The device's own secret store, through `kr_crypto::store::StoreSelection`: the operating system's credential store, or the owner-only directory section 10 offers in its place, whose directory is 0700 and whose files are 0600 |
+| `sync::MemoryCollectionKeys` | This process, for a demonstration or a bench. Keys are put in deliberately and reach no store |
+
+`sync::CollectionSealer` is the sealing itself: `kr-sync-object/1` authenticated encryption, padded
+to section 20's declared size buckets, producing the sealed object the service stores. It asks for
+the key on every call, so a key that has been withdrawn stops working at the next call rather than
+at the next restart.
 
 ### Privacy mode
 
@@ -218,8 +242,22 @@ that it should not have is a control the host then refuses.
 
 `services` holds one trait per managed service section 17 names (account login, relay leases, push,
 encrypted sync and backup, managed inference), and `ServiceClients` holds one optional
-implementation of each. `services::relay` is the one managed implementation this crate carries,
-because a lease is the one managed resource a client cannot do without and still use a relay at all.
+implementation of each. `services::relay` is the relay-lease client, because a lease is the one
+managed resource a client cannot do without and still use a relay at all, and `services::voice` is
+the voice broker.
+
+`services::http` is the exchange underneath them: `HttpService` addresses one gateway origin, which
+it compares as a parsed scheme, host and port before it makes contact, and refuses an address that
+carries credentials or that uses plain HTTP anywhere but loopback. Certificate and hostname
+verification stay on. Connect, read and total deadlines are finite and the total one covers reading
+the answer, so a call either has an answer or a failure. An answer is read under the bound its
+operation states, measured as the bytes arrive rather than from the length the sender claimed, and
+an answer past it is refused rather than truncated. It follows no redirect, keeps no cookie, asks
+for no compression, finds no proxy of its own and retries nothing: `retry` decides whether a request
+is sent again. A failure that happened before the connection was established says the request was
+not carried out; every other failure says the outcome is unknown, because the service may have acted
+on a request this client cannot see the answer to. Nothing here writes a credential or a body
+anywhere.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
