@@ -3548,6 +3548,9 @@ impl Controller {
         if retained.is_none() && crate::project::ProjectModule::serves(method) {
             retained = self.project.retained(actor_id, &mutation, method).await;
         }
+        if retained.is_none() && crate::catalogue::CatalogueModule::serves(method) {
+            retained = self.catalogue.retained(actor_id, &mutation, method).await;
+        }
         if retained.is_none() && crate::changeset::ChangeSetModule::serves(method) {
             retained = self.changesets.retained(actor_id, &mutation, method).await;
         }
@@ -3955,29 +3958,25 @@ impl Controller {
             );
         }
         if crate::catalogue::CatalogueModule::serves(method) {
-            // Everything between the envelope check and this point can wait, so the admission is
-            // checked here rather than earlier: an action whose accepted deadline passed while it
-            // queued does not go on to change a trust root or install a package.
-            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
-                return respond(
-                    mutation.request_id,
-                    Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
-                );
-            }
-            if let Err(error) = self.authorised(connection_id) {
+            let Some(admitted_revision) = admitted else {
                 return error_reply(
                     mutation.request_id,
                     ErrorCode::PermissionDenied,
-                    error.to_string(),
+                    "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection",
                 );
-            }
-            // The owner's ceremony, where this host has an enrolled owner. A host without one
-            // refuses the two confirmed methods rather than performing them under the caller's
-            // operating-system identity.
+            };
+            let carried = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline: accepted.map(|accepted| accepted.deadline),
+            };
+            let controller = Arc::clone(self);
+            let admission = move || {
+                controller
+                    .check_registration(&carried)
+                    .map_err(|error| error.to_protocol_error())
+            };
             let pairing = self
                 .network
                 .get()
@@ -3988,7 +3987,7 @@ impl Controller {
                 .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
             return self
                 .catalogue
-                .write_frame(mutation, method, confirmations)
+                .write_frame(actor_id, mutation, method, confirmations, admission)
                 .await;
         }
         if crate::project::ProjectModule::serves(method) {

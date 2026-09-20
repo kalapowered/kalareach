@@ -296,6 +296,12 @@ impl Catalogue {
         })
     }
 
+    /// Returns this host's root directory for the catalogue.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Returns the installations and bindings this host holds.
     #[must_use]
     pub const fn installations(&self) -> &Installations {

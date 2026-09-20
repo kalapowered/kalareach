@@ -18,7 +18,7 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    ActionId, ActionWindowId, EnvironmentId, PluginId, RepositoryGeneration, RequestId,
+    ActionId, ActionWindowId, ActorId, EnvironmentId, PluginId, RepositoryGeneration, RequestId,
 };
 use kr_protocol::method::{Method, MethodName, MethodVersion};
 use kr_protocol::pairing::{ConfirmationChannel, OwnerConfirmationProof, SensitiveAction};
@@ -350,7 +350,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
 
     let added: wire::CatalogueAddResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueAdd,
                 host.environment_id,
@@ -374,7 +374,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
 
     let synced: wire::CatalogueSyncResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueSync,
                 host.environment_id,
@@ -422,7 +422,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
 
     let pinned: wire::CataloguePinResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CataloguePin,
                 host.environment_id,
@@ -444,7 +444,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
     // A pin that names a generation this host is not on is refused.
     let refused = refusal(
         host.module
-            .write_frame(
+            .write_frame_admitted(
                 &mutation(
                     Method::CataloguePin,
                     host.environment_id,
@@ -463,7 +463,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
 
     let removed: wire::CatalogueRemoveResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueRemove,
                 host.environment_id,
@@ -486,7 +486,7 @@ async fn kr_req_23_28_a_second_enrolment_of_one_root_is_refused() {
     let params = add_params(&host);
     let _: wire::CatalogueAddResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(Method::CatalogueAdd, host.environment_id, &params),
             Method::CatalogueAdd,
             Some(host.confirmations()),
@@ -495,7 +495,7 @@ async fn kr_req_23_28_a_second_enrolment_of_one_root_is_refused() {
     let params2 = add_params(&host);
     let refused = refusal(
         host.module
-            .write_frame(
+            .write_frame_admitted(
                 &mutation(Method::CatalogueAdd, host.environment_id, &params2),
                 Method::CatalogueAdd,
                 Some(host.confirmations()),
@@ -531,7 +531,7 @@ async fn a_location_that_is_a_version_control_branch_is_refused() {
     params.metadata_url = "git+https://example.invalid/plugins.git".to_owned();
     let refused = refusal(
         host.module
-            .write_frame(
+            .write_frame_admitted(
                 &mutation(Method::CatalogueAdd, host.environment_id, &params),
                 Method::CatalogueAdd,
                 Some(host.confirmations()),
@@ -554,7 +554,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
     let host = host();
     let _: wire::CatalogueAddResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueAdd,
                 host.environment_id,
@@ -566,7 +566,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
         .await);
     let _: wire::CatalogueSyncResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueSync,
                 host.environment_id,
@@ -598,7 +598,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
     // A hash the caller did not read is refused: pinning and rollback are on immutable hashes.
     let wrong = refusal(
         host.module
-            .write_frame(
+            .write_frame_admitted(
                 &mutation(
                     Method::PluginInstall,
                     host.environment_id,
@@ -620,7 +620,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let installed: wire::PluginInstallResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::PluginInstall,
                 host.environment_id,
@@ -647,7 +647,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let enabled: wire::PluginEnableResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::PluginEnable,
                 host.environment_id,
@@ -664,7 +664,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let pinned: wire::PluginPinResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::PluginPin,
                 host.environment_id,
@@ -730,7 +730,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
     // A capability the repository's ceiling does not reach is refused, by name.
     let refused = refusal(
         host.module
-            .write_frame(
+            .write_frame_admitted(
                 &mutation(
                     Method::PluginGrant,
                     host.environment_id,
@@ -750,7 +750,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let disabled: wire::PluginEnableResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::PluginDisable,
                 host.environment_id,
@@ -767,7 +767,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let removed: wire::PluginRemoveResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::PluginRemove,
                 host.environment_id,
@@ -789,7 +789,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
     let host = host();
     let _: wire::CatalogueAddResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueAdd,
                 host.environment_id,
@@ -801,7 +801,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
         .await);
     let _: wire::CatalogueSyncResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueSync,
                 host.environment_id,
@@ -831,7 +831,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
     };
     let _: wire::PluginInstallResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::PluginInstall,
                 host.environment_id,
@@ -851,7 +851,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
 
     let removed: wire::CatalogueRemoveResult = ok(host
         .module
-        .write_frame(
+        .write_frame_admitted(
             &mutation(
                 Method::CatalogueRemove,
                 host.environment_id,
@@ -1137,4 +1137,103 @@ fn kr_req_23_28_and_23_29_every_method_has_one_exhaustive_authority_entry() {
         .find(|entry| entry.name == "plugin.grant")
         .expect("registered");
     assert_eq!(grant.confirmation, ConfirmationRequirement::Always);
+}
+
+#[tokio::test]
+async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
+    let host = host();
+    let actor = ActorId::new("kr:actor:test").expect("valid actor");
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+
+    let params = add_params(&host);
+    let mut req = mutation(Method::CatalogueAdd, host.environment_id, &params);
+    req.action_id = action_id;
+
+    // First execution succeeds.
+    let outcome1 = host
+        .module
+        .write_frame(
+            &actor,
+            &req,
+            Method::CatalogueAdd,
+            Some(host.confirmations()),
+            || Ok(()),
+        )
+        .await;
+    let added1: wire::CatalogueAddResult = ok(outcome1);
+    assert_eq!(added1.catalogue.catalogue_id, "development");
+
+    // Repeating the same mutation with the same action_id returns the retained result.
+    let outcome2 = host
+        .module
+        .write_frame(
+            &actor,
+            &req,
+            Method::CatalogueAdd,
+            Some(host.confirmations()),
+            || Ok(()),
+        )
+        .await;
+    let added2: wire::CatalogueAddResult = ok(outcome2);
+    assert_eq!(added2.catalogue.catalogue_id, "development");
+
+    // Retained lookup via module.retained(...) returns the frame directly.
+    let retained = host
+        .module
+        .retained(&actor, &req, Method::CatalogueAdd)
+        .await
+        .expect("retained frame exists");
+    let added3: wire::CatalogueAddResult = ok(retained);
+    assert_eq!(added3.catalogue.catalogue_id, "development");
+
+    // Reusing the same action_id with different parameters produces IdConflict.
+    let mut different_params = params.clone();
+    different_params.catalogue_id = "other".to_owned();
+    let mut conflicting_req =
+        mutation(Method::CatalogueAdd, host.environment_id, &different_params);
+    conflicting_req.action_id = action_id;
+
+    let conflict = refusal(
+        host.module
+            .write_frame(
+                &actor,
+                &conflicting_req,
+                Method::CatalogueAdd,
+                Some(host.confirmations()),
+                || Ok(()),
+            )
+            .await,
+    );
+    assert_eq!(conflict.code, ErrorCode::IdConflict);
+
+    // Admission failure refuses the mutation before any effect occurs.
+    let fresh_action = ActionId::new(kr_ipc::new_uuid());
+    let mut req_expired = mutation(
+        Method::CataloguePin,
+        host.environment_id,
+        &wire::CataloguePinParams {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            generation: Nullable(Some(RepositoryGeneration::new(1))),
+        },
+    );
+    req_expired.action_id = fresh_action;
+
+    let expired = refusal(
+        host.module
+            .write_frame(
+                &actor,
+                &req_expired,
+                Method::CataloguePin,
+                None,
+                || {
+                    Err(kr_protocol::error::ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "window expired",
+                    ))
+                },
+            )
+            .await,
+    );
+    assert_eq!(expired.code, ErrorCode::PermissionDenied);
 }

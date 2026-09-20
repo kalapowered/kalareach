@@ -38,15 +38,147 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{EnvironmentId, PluginId, RepositoryGeneration, RequestId};
+use kr_protocol::ids::{ActionId, ActorId, EnvironmentId, PluginId, RepositoryGeneration, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
-use kr_protocol::scalars::{Nullable, U64};
+use kr_protocol::scalars::{Digest256, Nullable, U64};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
 use crate::sharing::{ConfirmedAction, OwnerConfirmations};
 
 /// What a catalogue call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ActionRecord {
+    digest: String,
+    state: String,
+    result: Option<String>,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
+}
+
+fn action_path(root: &Path, actor_id: &ActorId, action_id: ActionId) -> PathBuf {
+    root.join("actions").join(format!(
+        "{}-{action_id}.json",
+        hex(&kr_cbor::sha256(actor_id.as_str().as_bytes())[..8])
+    ))
+}
+
+fn read_action_record(
+    root: &Path,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    digest: &Digest256,
+) -> Answer<Option<ParamsValue>> {
+    let path = action_path(root, actor_id, action_id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let record: ActionRecord = serde_json::from_str(&text)
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+    if record.digest != hex(digest.as_bytes()) {
+        return Err(ProtocolError::new(
+            ErrorCode::IdConflict,
+            format!("action {action_id} was already used with different parameters"),
+        ));
+    }
+    match (record.state.as_str(), record.result) {
+        ("applied", Some(result_hex)) => {
+            let bytes = unhex(&result_hex).ok_or_else(|| {
+                ProtocolError::new(ErrorCode::StorageUnavailable, "unreadable retained result")
+            })?;
+            let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+                .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+            Ok(Some(ParamsValue::new(value)))
+        }
+        ("applied", None) => Ok(Some(ParamsValue::empty())),
+        ("dispatching", _) => Err(ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            format!("action {action_id} is in progress or was interrupted; read status before retrying"),
+        )),
+        _ => Err(ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            format!("action {action_id} was recorded in unknown state"),
+        )),
+    }
+}
+
+fn write_action_record(
+    root: &Path,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    record: &ActionRecord,
+) -> Answer<()> {
+    let path = action_path(root, actor_id, action_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let text = serde_json::to_string_pretty(record)
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))
+}
+
+fn mark_dispatching(
+    root: &Path,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    digest: &Digest256,
+) -> Answer<()> {
+    write_action_record(
+        root,
+        actor_id,
+        action_id,
+        &ActionRecord {
+            digest: hex(digest.as_bytes()),
+            state: "dispatching".to_owned(),
+            result: None,
+        },
+    )
+}
+
+fn settle_action(
+    root: &Path,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    digest: &Digest256,
+    result: &ParamsValue,
+) -> Answer<()> {
+    let encoded = hex(&kr_cbor::encode(result.as_value()));
+    write_action_record(
+        root,
+        actor_id,
+        action_id,
+        &ActionRecord {
+            digest: hex(digest.as_bytes()),
+            state: "applied".to_owned(),
+            result: Some(encoded),
+        },
+    )
+}
+
+fn discard_action(root: &Path, actor_id: &ActorId, action_id: ActionId) {
+    let path = action_path(root, actor_id, action_id);
+    let _ = std::fs::remove_file(path);
+}
 
 /// The catalogue, as the daemon holds it.
 #[derive(Debug)]
@@ -153,6 +285,29 @@ impl CatalogueModule {
                 "the method is not in the registry",
             ));
         };
+        match kr_protocol::method::decide(
+            request.method.as_str(),
+            request.method_version,
+            kr_protocol::actor::ActorIngress::LocalIpc,
+        ) {
+            kr_protocol::authority::AuthorityDecision::Listed(_) => {}
+            kr_protocol::authority::AuthorityDecision::Denied(reason) => {
+                return Err(match reason.error_code() {
+                    ErrorCode::UnsupportedSchema => ProtocolError::new(
+                        ErrorCode::UnsupportedSchema,
+                        format!(
+                            "{} is not implemented at version {}",
+                            request.method.as_str(),
+                            request.method_version
+                        ),
+                    ),
+                    _ => ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        format!("{} is not a read this daemon serves", request.method.as_str()),
+                    ),
+                });
+            }
+        }
         let catalogue = self.catalogue.lock().await;
         match method {
             Method::CatalogueList => {
@@ -181,25 +336,52 @@ impl CatalogueModule {
                         &params.plugin_id,
                     )
                     .map_err(ProtocolError::from)?;
-                let index = catalogue
-                    .index(&installation.repository)
-                    .map_err(ProtocolError::from)?;
-                let entry = index
-                    .find(&plugin_id_of(&installation)?, &installation.version)
-                    .ok_or_else(|| {
-                        ProtocolError::new(
-                            ErrorCode::ResourceUnavailable,
-                            "the installed release is not in this repository's current generation",
-                        )
-                    })?;
                 let active = catalogue
                     .active(&installation.repository)
                     .map_err(ProtocolError::from)?;
                 let generation = active.map(|a| a.generation).unwrap_or(1);
+                let evidence_records = if let Ok(index) = catalogue.index(&installation.repository)
+                    && let Some(entry) = index.find(&plugin_id_of(&installation)?, &installation.version)
+                {
+                    evidence(entry, &installation, generation)?
+                } else {
+                    let now = kr_protocol::scalars::TimestampMs::new(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+                            .unwrap_or(0),
+                    );
+                    let revision = kr_protocol::ids::CapabilityRevision::new(generation.max(1));
+                    installation
+                        .requested
+                        .iter()
+                        .map(|request| {
+                            let id = capability_id(request.capability)?;
+                            Ok(wire::PluginCapabilityEvidence {
+                                capability: id,
+                                capability_version: installation.version.to_string(),
+                                revision,
+                                subject: wire::PluginEvidenceSubject {
+                                    environment_id: installation.environment_id,
+                                    application: Nullable::null(),
+                                    terminal: Nullable::null(),
+                                    desktop_generation: Nullable::null(),
+                                },
+                                state: wire::PluginCapabilityState::NotTested,
+                                source: wire::PluginEvidenceSource::PackageDeclaration,
+                                package_digest: installation.package_digest.to_string(),
+                                profile_digest: Nullable::null(),
+                                invalidated_by: Vec::new(),
+                                disabled_reason: Nullable(Some("the package is installed offline and the catalogue has no qualification data for it".to_owned())),
+                                observed_at_ms: now,
+                            })
+                        })
+                        .collect::<Answer<Vec<_>>>()?
+                };
                 encode(&wire::PluginCapabilitiesResult {
                     plugin: summary_of(&catalogue, &installation)?,
-                    capabilities: grants(entry, &decisions)?,
-                    evidence: evidence(entry, &installation, generation)?,
+                    capabilities: grants(&installation.requested, &decisions)?,
+                    evidence: evidence_records,
                 })
             }
             _ => Err(ProtocolError::new(
@@ -209,18 +391,57 @@ impl CatalogueModule {
         }
     }
 
+    /// Returns the answer a retained catalogue or plugin mutation is owed.
+    #[must_use]
+    pub async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        _method: Method,
+    ) -> Option<ControlFrame> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        let catalogue = self.catalogue.lock().await;
+        match read_action_record(catalogue.root(), actor_id, mutation.action_id, &digest) {
+            Ok(Some(result)) => Some(ControlFrame::Response(Response {
+                request_id: mutation.request_id,
+                outcome: Outcome::Ok(result),
+            })),
+            Ok(None) => None,
+            Err(error) => Some(frame(mutation.request_id, Err(error))),
+        }
+    }
+
     /// Serves one catalogue or plugin mutation and returns the frame it answers with.
     #[must_use]
-    pub async fn write_frame(
+    pub async fn write_frame<A>(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        confirmations: Option<&dyn OwnerConfirmations>,
+        admission: A,
+    ) -> ControlFrame
+    where
+        A: Fn() -> Answer<()>,
+    {
+        frame(
+            mutation.request_id,
+            self.write(actor_id, mutation, method, confirmations, admission)
+                .await,
+        )
+    }
+
+    /// Serves one catalogue or plugin mutation with automatic admission and a default actor.
+    #[must_use]
+    pub async fn write_frame_admitted(
         &self,
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
     ) -> ControlFrame {
-        frame(
-            mutation.request_id,
-            self.write(mutation, method, confirmations).await,
-        )
+        let actor = ActorId::new("kr:local").expect("a default actor");
+        self.write_frame(&actor, mutation, method, confirmations, || Ok(()))
+            .await
     }
 
     /// Serves one catalogue or plugin mutation.
@@ -232,13 +453,48 @@ impl CatalogueModule {
     /// # Errors
     ///
     /// Returns the refusal the catalogue decided, under the catalogue's own code.
-    pub async fn write(
+    pub async fn write<A>(
         &self,
+        actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
-    ) -> Answer<ParamsValue> {
+        admission: A,
+    ) -> Answer<ParamsValue>
+    where
+        A: Fn() -> Answer<()>,
+    {
         let mut catalogue = self.catalogue.lock().await;
+        admission()?;
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        if let Some(retained) = read_action_record(catalogue.root(), actor_id, mutation.action_id, &digest)? {
+            return Ok(retained);
+        }
+        mark_dispatching(catalogue.root(), actor_id, mutation.action_id, &digest)?;
+        let outcome = self
+            .perform_write(&mut catalogue, mutation, method, confirmations, &admission)
+            .await;
+        match outcome {
+            Ok(result) => {
+                settle_action(catalogue.root(), actor_id, mutation.action_id, &digest, &result)?;
+                Ok(result)
+            }
+            Err(error) => {
+                discard_action(catalogue.root(), actor_id, mutation.action_id);
+                Err(error)
+            }
+        }
+    }
+
+    async fn perform_write(
+        &self,
+        catalogue: &mut Catalogue,
+        mutation: &MutationRequest,
+        method: Method,
+        confirmations: Option<&dyn OwnerConfirmations>,
+        admission: &impl Fn() -> Answer<()>,
+    ) -> Answer<ParamsValue> {
         match method {
             Method::CatalogueAdd => {
                 let params: wire::CatalogueAddParams = typed(&mutation.params)?;
@@ -271,10 +527,11 @@ impl CatalogueModule {
                 // Again, immediately before the effect. A confirmation has a short lifetime, and
                 // the checks and the store's lock between the acceptance and here take time.
                 recheck(confirmations, &confirmed, plan.action_digest(), "enrolment")?;
+                admission()?;
                 catalogue
                     .enrol(enrolment, true)
                     .map_err(ProtocolError::from)?;
-                let catalogues = summaries(&catalogue)?;
+                let catalogues = summaries(catalogue)?;
                 let catalogue_summary = catalogues
                     .into_iter()
                     .find(|summary| summary.catalogue_id == id.as_str())
@@ -292,6 +549,7 @@ impl CatalogueModule {
                 let params: wire::CatalogueSyncParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let id = repository_id(&params.catalogue_id)?;
+                admission()?;
                 let outcome = catalogue.sync(&id).await.map_err(ProtocolError::from)?;
                 encode(&wire::CatalogueSyncResult {
                     generation: outcome.generation,
@@ -312,10 +570,11 @@ impl CatalogueModule {
                 let params: wire::CataloguePinParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let id = repository_id(&params.catalogue_id)?;
+                admission()?;
                 catalogue
                     .pin(&id, params.generation.0)
                     .map_err(ProtocolError::from)?;
-                let summary = summaries(&catalogue)?
+                let summary = summaries(catalogue)?
                     .into_iter()
                     .find(|summary| summary.catalogue_id == id.as_str())
                     .ok_or_else(|| {
@@ -340,6 +599,7 @@ impl CatalogueModule {
                     .filter(|installation| installation.repository == id)
                     .map(plugin_id_of)
                     .collect::<Answer<Vec<_>>>()?;
+                admission()?;
                 catalogue
                     .remove_repository(&id)
                     .map_err(ProtocolError::from)?;
@@ -355,6 +615,7 @@ impl CatalogueModule {
                 let version = version(&params.version)?;
                 let digest = digest(&params.package_digest)?;
                 let grant = grant_from(&params.grant)?;
+                admission()?;
                 let installation = catalogue
                     .install(
                         &id,
@@ -366,26 +627,18 @@ impl CatalogueModule {
                     )
                     .await
                     .map_err(ProtocolError::from)?;
-                let index = catalogue.index(&id).map_err(ProtocolError::from)?;
-                let entry = index
-                    .find(&plugin_id_of(&installation)?, &version)
-                    .ok_or_else(|| {
-                        ProtocolError::new(
-                            ErrorCode::ResourceUnavailable,
-                            "the installed release left the generation during the install",
-                        )
-                    })?;
                 let decisions = catalogue
                     .capabilities(&id, params.environment_id, &params.plugin_id)
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginInstallResult {
-                    plugin: summary_of(&catalogue, &installation)?,
-                    capabilities: grants(entry, &decisions)?,
+                    plugin: summary_of(catalogue, &installation)?,
+                    capabilities: grants(&installation.requested, &decisions)?,
                 })
             }
             Method::PluginRemove => {
                 let params: wire::PluginRemoveParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
+                admission()?;
                 let closed = catalogue
                     .uninstall(params.environment_id, &params.plugin_id)
                     .map_err(ProtocolError::from)?;
@@ -398,16 +651,18 @@ impl CatalogueModule {
                 let params: wire::PluginPinParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let pin = params.package_digest.0.as_deref().map(digest).transpose()?;
+                admission()?;
                 let installation = catalogue
                     .pin_package(params.environment_id, &params.plugin_id, pin)
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginPinResult {
-                    plugin: summary_of(&catalogue, &installation)?,
+                    plugin: summary_of(catalogue, &installation)?,
                 })
             }
             Method::PluginEnable | Method::PluginDisable => {
                 let params: wire::PluginEnableParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
+                admission()?;
                 let installation = catalogue
                     .set_enabled(
                         params.environment_id,
@@ -417,7 +672,7 @@ impl CatalogueModule {
                     .await
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginEnableResult {
-                    plugin: summary_of(&catalogue, &installation)?,
+                    plugin: summary_of(catalogue, &installation)?,
                 })
             }
             Method::PluginGrant => {
@@ -428,7 +683,7 @@ impl CatalogueModule {
                 // on is a different decision, so the digest is checked before the confirmation is
                 // even read rather than the change being applied to whatever is installed now.
                 let installed =
-                    installation_of(&catalogue, params.environment_id, &params.plugin_id)?;
+                    installation_of(catalogue, params.environment_id, &params.plugin_id)?;
                 let named = digest(&params.package_digest)?;
                 if installed.package_digest != named {
                     return Err(ProtocolError::new(
@@ -454,20 +709,10 @@ impl CatalogueModule {
                     "grant",
                 )?;
                 recheck(confirmations, &confirmed, plan.action_digest(), "grant")?;
+                admission()?;
                 let installation = catalogue
                     .set_grant(params.environment_id, &params.plugin_id, grant)
                     .map_err(ProtocolError::from)?;
-                let index = catalogue
-                    .index(&installation.repository)
-                    .map_err(ProtocolError::from)?;
-                let entry = index
-                    .find(&plugin_id_of(&installation)?, &installation.version)
-                    .ok_or_else(|| {
-                        ProtocolError::new(
-                            ErrorCode::ResourceUnavailable,
-                            "the installed release is not in this repository's current generation",
-                        )
-                    })?;
                 let decisions = catalogue
                     .capabilities(
                         &installation.repository,
@@ -476,8 +721,8 @@ impl CatalogueModule {
                     )
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginGrantResult {
-                    plugin: summary_of(&catalogue, &installation)?,
-                    capabilities: grants(entry, &decisions)?,
+                    plugin: summary_of(catalogue, &installation)?,
+                    capabilities: grants(&installation.requested, &decisions)?,
                 })
             }
             _ => Err(ProtocolError::new(
@@ -605,14 +850,13 @@ fn installation_of(
 }
 
 fn grants(
-    entry: &kr_plugin_sdk::catalogue::IndexEntry,
+    requested: &[kr_plugin_sdk::capability::CapabilityRequest],
     decisions: &[kr_plugin_runtime::catalogue::CapabilityDecision],
 ) -> Answer<Vec<wire::PluginCapabilityGrant>> {
     decisions
         .iter()
         .map(|decision| {
-            let reason = entry
-                .capabilities
+            let reason = requested
                 .iter()
                 .find(|request| request.capability == decision.capability)
                 .map(|request| request.reason.as_str().to_owned())
