@@ -711,6 +711,39 @@ fn a_pin_recorded_while_a_deletion_reads_the_pins_lands_after_that_reading_not_i
     );
     assert_eq!(after[0].workspace_id, workspace_id);
     assert_eq!(after[0].change_set_id, change_set);
+
+    // The other half of the protocol: a pin whose version is gone is not recorded at all. The
+    // caller's question is asked inside the same hold the deletion's reading takes, so a version
+    // deleted after the question cannot be pinned by this write.
+    let gone = ChangeSetId::new(Uuid::from_bytes([67; 16]));
+    let refusal = service
+        .retain_pin(
+            workspace_id,
+            &RetainedRow {
+                kind: RetainedKind::PinnedChangeSet,
+                detail: "a version this host no longer holds".to_owned(),
+                change_set_id: Some(gone),
+            },
+            || false,
+        )
+        .expect_err("a pin against a version that is gone is refused");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+    assert!(
+        service.pins(gone).expect("the pins read").is_empty(),
+        "and nothing was written"
+    );
+    service
+        .retain_pin(
+            workspace_id,
+            &RetainedRow {
+                kind: RetainedKind::PinnedChangeSet,
+                detail: "a version this host holds".to_owned(),
+                change_set_id: Some(gone),
+            },
+            || true,
+        )
+        .expect("a pin against a version that is there is recorded");
+    assert_eq!(service.pins(gone).expect("the pins read").len(), 1);
 }
 
 #[test]

@@ -2372,6 +2372,45 @@ impl ProjectService {
         self.locked()?.retained(workspace_id)
     }
 
+    /// Records a pin under a check the caller makes inside this journal's hold.
+    ///
+    /// The other half of [`Self::with_pins`], and the reason the two together are a protocol
+    /// rather than two readings. A deletion reads the pins with this journal held and removes the
+    /// version inside that hold. A pin written without the same hold could be recorded against a
+    /// version the deletion has already taken away, because this journal knows nothing about
+    /// versions and cannot tell. Here the caller's own question — is the version still there —
+    /// and the write of the pin happen inside one hold, and the deletion's reading takes the same
+    /// lock, so the two cannot be interleaved.
+    ///
+    /// `still_there` answers false for a version that is gone **and** for a store the caller could
+    /// not read: an unreadable store is not a version this host found, and refusing the pin is the
+    /// answer that loses nothing.
+    ///
+    /// **The lock order is this journal first, the caller's store inside it**, which is
+    /// [`Self::with_pins`]'s order. Nothing is awaited inside `still_there`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::WrongState`] when `still_there` answers false, and whatever
+    /// [`Self::retain`] returns otherwise.
+    pub fn retain_pin(
+        &self,
+        workspace_id: WorkspaceId,
+        item: &RetainedRow,
+        still_there: impl FnOnce() -> bool,
+    ) -> Result<()> {
+        let mut store = self.writable()?;
+        if !still_there() {
+            return Err(ProjectError::WrongState {
+                detail: "the version this pin names is not one this host holds, so nothing is \
+                         pinned against the workspace"
+                    .to_owned()
+                    .into(),
+            });
+        }
+        store.retain(workspace_id, item)
+    }
+
     /// Returns every pin held against one change set, in this whole environment.
     ///
     /// # Errors

@@ -815,7 +815,7 @@ work is the one a caller gets by asking for it plainly.
 | Class | What it is |
 | --- | --- |
 | `proposal` | Two immutable versions and no write to any working tree: what the destination holds now, and what it would hold. A person decides |
-| `versioned_reference` | Reference compare-and-swap. The apply reads the reference and compares it with the value the request expects; a value that differs is `DRAFT_CONFLICT`, and nothing is written. The move is the expected-old-value update described under the restricted profile above, performed under a write grant for the repository's Git common directory and nothing wider. It does **not** atomically update a dirty working tree: what moves is the reference, and a tree with uncommitted work in it is unchanged by one. The apply returns the comparison and that statement rather than moving the reference itself; the update is performed by the project service, whose restricted profile runs it |
+| `versioned_reference` | Reference compare-and-swap. The apply reads the reference and compares it with the value the request expects; a value that differs is `DRAFT_CONFLICT`, and nothing is written. The move is the expected-old-value update described under the restricted profile above, performed under a write grant for the repository's Git common directory and nothing wider. It does **not** atomically update a dirty working tree: what moves is the reference, and a tree with uncommitted work in it is unchanged by one. A preflight returns the comparison and that statement; an apply of this class returns `UNSUPPORTED` rather than moving the reference. The project service's restricted profile is what runs an expected-old-value update, and this apply path does not call it |
 | `shared_existing` | The user's own working tree, written in place. Best-effort conflict detection, not universal no-clobber compare-and-swap |
 
 An apply carries **operations**, not only content: a path the version holds is installed, and a
@@ -986,9 +986,11 @@ invocation, writes to no working tree and removes nothing. `commit`, `push`, `re
 
 ### Retention
 
-A version is not deleted while anything names it: a materialisation that has not been released, a
-review acknowledgement or any other evidence, a later version derived from it, a recorded result, an
-apply that names it on either side, or a pin the project service holds against the workspace. The
+A version is not deleted while anything the change-set store holds names it: a materialisation that
+has not been released, a review acknowledgement or any other evidence, a later version derived from
+it, a recorded result, or an apply that names it on either side. A pin the project service holds
+against the workspace is read before the deletion and refuses it, and the paragraph after this one
+says what that reading is and what is left. The
 counting and the removal are one transaction inside the change-set store, and a materialisation, a
 result with both the version it attests and the reading it carries beside it, a derived version and
 an apply with every version it names on either side are each written under a check, in the same
@@ -996,10 +998,12 @@ transaction, that those versions are still there — so a holder recorded while 
 deciding is either counted or refused, and never left pointing at something that is gone.
 
 The project service's pin lives in another store, and the two stores do not share a transaction.
-What the project service offers instead is a **guarded reading**: the pins against one change set
-are read with the project journal held, and whatever the caller does with them happens inside that
-hold. Recording a pin takes the same lock, so a pin is either recorded before the reading, where it
-is counted, or after the caller has finished. The pins are found by the change set they name rather
+What the project service offers instead is a pair of **guarded** operations that take one lock in
+one order. The pins against a change set are read with the project journal held, and whatever the
+caller does with them happens inside that hold; a pin is recorded with the same journal held, under
+the caller's own answer to "is this version still there", asked inside that hold. So a pin is
+either recorded before the reading, where it is counted, or refused because the version it names
+has gone. The pins are found by the change set they name rather
 than through the workspace that holds them, so the reading does not depend on knowing which
 workspaces to ask about: recording one pin twice is one pin, and two pins whose reasons read alike
 are two pins.
