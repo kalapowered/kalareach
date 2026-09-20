@@ -830,9 +830,11 @@ impl Session {
     ///
     /// The line the probe leaves is then taken away, and the reader's own word for that is what
     /// this waits on: the reader reports itself idle at each of its key boundaries, and the report
-    /// carries the buffer and the queues it read at that instant. Two reports decide it. The first
-    /// holds the probe, which is what makes it this probe's report rather than one from the prompt
-    /// before it, and the second holds an empty line at a later buffer revision with nothing queued
+    /// carries the buffer and the queues it read at that instant. Everything the reader said
+    /// before the probe was drawn is put behind a barrier first, because a check that has already
+    /// typed and cleared a line left reports that look exactly like the two this is about to wait
+    /// for. After that barrier, two reports decide it: the first holds the probe, and the second
+    /// holds an empty line, at the same prompt, at a later buffer revision, with nothing queued
     /// behind it, which is the clear having run and the reader being back at a key wait. A length
     /// of silence would be a guess at the same thing.
     ///
@@ -856,6 +858,29 @@ impl Session {
             "the editor drew nothing for a key typed at its prompt:\n{}",
             self.terminal_output()
         );
+        // Everything the reader said before this moment is about a line that is gone, and some of
+        // it looks exactly like what this is about to ask for: a check that typed a character and
+        // cleared it leaves a report of a held line and a report of an empty one behind it. A
+        // request of this session's own is the barrier. The reader reads its mailbox in order, so
+        // an answer to this request is every report the reader wrote before it having arrived too,
+        // and what is dropped here is all of it. Whether the reader acknowledges or says it has
+        // moved on does not matter: either is the answer this waits for.
+        let barrier = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
+            session_id: self.session_id,
+            fence_id: fence_id(200),
+            prompt_generation: self.last_entry.as_ref().map_or_else(
+                || kr_protocol::root::PromptGeneration::new(0),
+                |entry| entry.prompt_generation,
+            ),
+            reader_revision: self.last_entry.as_ref().map_or_else(
+                || kr_protocol::root::ReaderRevision::new(0),
+                |entry| entry.reader_revision,
+            ),
+            deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+            cause: FenceCause::Retry,
+        }));
+        let _ = self.answer(barrier);
+        self.forget_events();
         // The probe character is the editor's own insertion, which this package does not sit in
         // front of, so the reader is given one key it does have a binding for: the cursor moves,
         // nothing else of the line changes, and the boundary that key ends at is where the reader
@@ -919,7 +944,9 @@ impl Session {
                 // here abandons what it is part way through on this key, which is what a person
                 // does before pressing theirs again.
                 self.type_bytes(CTRL_G);
-                settled = self.quiet_for(Duration::from_millis(150), Duration::from_secs(2));
+                // Every wait counts, not the last one: one that ran out is what the failure below
+                // says, whether or not a later one went quiet.
+                settled &= self.quiet_for(Duration::from_millis(150), Duration::from_secs(2));
             }
             // This ends at the reader's own report that it is at an empty line and waiting for a
             // key, so the chord below is offered to a reader that is there to read it.
