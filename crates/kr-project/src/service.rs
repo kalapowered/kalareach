@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::{
-    ActionId, ActorId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
+    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::project::{
@@ -48,8 +48,8 @@ use crate::operation::{
     stage_init,
 };
 use crate::store::{
-    Action, OperationRow, OperationUpdate, ProjectRow, RetainedOutcome, RetainedRow, Store,
-    WorkspaceRow, WorkspaceUpdate, outcome_of,
+    Action, OperationRow, OperationUpdate, PinnedRow, ProjectRow, RetainedOutcome, RetainedRow,
+    Store, WorkspaceRow, WorkspaceUpdate, outcome_of,
 };
 use crate::workspace::{
     PathOutcome, PreviewRequest, Survey, check_choice, copy_included, outcome_text, survey,
@@ -2358,6 +2358,45 @@ impl ProjectService {
     /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read.
     pub fn retained(&self, workspace_id: WorkspaceId) -> Result<Vec<RetainedRow>> {
         self.locked()?.retained(workspace_id)
+    }
+
+    /// Returns every pin held against one change set, in this whole environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read. A journal this
+    /// host could not read is never an absence of pins.
+    pub fn pins(&self, change_set_id: ChangeSetId) -> Result<Vec<PinnedRow>> {
+        self.locked()?.pins(change_set_id)
+    }
+
+    /// Reads every pin held against one change set and keeps the journal shut while a caller acts
+    /// on them.
+    ///
+    /// The change-set store counts what holds a version and removes it in one transaction, so
+    /// nothing recorded in between is lost. A pin is not in that store, and reading it first would
+    /// leave the window this closes: a pin recorded between the reading and the removal would be a
+    /// pin the removal never saw. Here the reading and the caller's own transaction are inside one
+    /// hold on this journal, and [`Self::retain`] takes that same lock, so a pin either lands
+    /// before the reading and is counted or waits until the removal has happened and is refused by
+    /// the workspace state.
+    ///
+    /// **The lock order is this journal first, the caller's store inside it.** A caller that
+    /// already holds its own store's lock does not call this: the pin's own path takes them the
+    /// other way round, and two callers taking one pair of locks in two orders wait for each
+    /// other. Nothing is awaited inside `act`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read.
+    pub fn with_pins<T>(
+        &self,
+        change_set_id: ChangeSetId,
+        act: impl FnOnce(&[PinnedRow]) -> T,
+    ) -> Result<T> {
+        let store = self.locked()?;
+        let pinned = store.pins(change_set_id)?;
+        Ok(act(&pinned))
     }
 
     /// Returns one action's retained outcome, when this service has one.

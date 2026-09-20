@@ -635,6 +635,85 @@ fn a_shared_workspaces_removal_never_touches_the_users_tree() {
 }
 
 #[test]
+fn a_pin_recorded_while_a_deletion_reads_the_pins_lands_after_that_reading_not_inside_it() {
+    // KR-REQ-14.36: retention accounts for every pin before a version is deleted. The pin is in
+    // this store and the version is in the change-set store, so a deletion that read the pins and
+    // then removed the version would leave a window: a pin recorded in between would be a pin the
+    // deletion never saw. `with_pins` closes it by holding this journal across the caller's own
+    // transaction, and the pin's own path takes the same lock.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "pinned");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "pinned".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "pinned-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 61)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let change_set = ChangeSetId::new(Uuid::from_bytes([62; 16]));
+    let item = RetainedRow {
+        kind: RetainedKind::PinnedChangeSet,
+        detail: "version 1 is pinned against this workspace".to_owned(),
+        change_set_id: Some(change_set),
+    };
+    let service = fixture.service();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let (recorded, landed) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|threads| {
+        threads.spawn(move || {
+            wait.recv().expect("the reading has begun");
+            service
+                .retain(workspace_id, &item)
+                .expect("the pin is recorded");
+            recorded.send(()).expect("the reading is still waiting");
+        });
+        let decided = service
+            .with_pins(change_set, |pinned| {
+                assert!(pinned.is_empty(), "nothing holds it yet: {pinned:?}");
+                // The other thread now asks to record one. It cannot, because this reading holds
+                // the journal, so the decision this closure is making stays true while it is made.
+                go.send(()).expect("the recorder is waiting");
+                assert!(
+                    landed
+                        .recv_timeout(std::time::Duration::from_millis(250))
+                        .is_err(),
+                    "a pin recorded while the pins are being read waits for the reading"
+                );
+                "deleted"
+            })
+            .expect("the pins read");
+        assert_eq!(decided, "deleted");
+        landed
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("and lands once the reading has finished");
+    });
+    let after = service.pins(change_set).expect("the pins read again");
+    assert_eq!(
+        after.len(),
+        1,
+        "the pin that waited is recorded, not lost: {after:?}"
+    );
+    assert_eq!(after[0].workspace_id, workspace_id);
+    assert_eq!(after[0].change_set_id, change_set);
+}
+
+#[test]
 fn a_workspace_record_its_pins_and_its_partial_progress_survive_the_daemons_death() {
     // KR-REQ-24.08: immutable versions and partial progress survive controller death, and cleanup
     // respects pins.

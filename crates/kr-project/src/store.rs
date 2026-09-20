@@ -227,6 +227,23 @@ pub struct RetainedRow {
     pub change_set_id: Option<ChangeSetId>,
 }
 
+/// One pin held against a change set, wherever in this environment it was recorded.
+///
+/// A pin is a retained row like any other, and a workspace's removal accounts for it through
+/// [`Store::retained`]. This is the other question about the same row, asked by the deletion that
+/// counts what still holds a version: not *what does this workspace hold* but *who holds this
+/// change set*. The change set it names is what the row is found by, so the answer does not depend
+/// on a workspace being named first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedRow {
+    /// The workspace holding it.
+    pub workspace_id: WorkspaceId,
+    /// The change set it pins.
+    pub change_set_id: ChangeSetId,
+    /// What it is, in the host's own words.
+    pub detail: String,
+}
+
 /// One staging path an operation left behind or removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagingPathRow {
@@ -422,6 +439,9 @@ impl Store {
                      ON workspace_retained (
                          workspace_id, kind, detail, COALESCE(change_set_id, x'')
                      );
+                 CREATE INDEX IF NOT EXISTS workspace_retained_pin
+                     ON workspace_retained (change_set_id, workspace_id)
+                     WHERE change_set_id IS NOT NULL;
                  CREATE TABLE IF NOT EXISTS operations (
                      action_id             BLOB PRIMARY KEY,
                      actor_id              TEXT NOT NULL,
@@ -1707,6 +1727,61 @@ impl Store {
         Ok(rows)
     }
 
+    /// Returns every pin held against one change set, in this whole environment.
+    ///
+    /// This is the reading a deletion of that change set's versions needs. It asks the pin's own
+    /// question — which workspaces hold this change set — rather than reading one workspace's
+    /// holdings and filtering them, so a pin is found by the change set it names whatever the
+    /// caller knows about workspaces. Ordered by workspace and then by reason, so two callers
+    /// reading the same rows read them in the same order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read. A store this host
+    /// could not read is never an absence of pins: the failure is returned rather than an empty
+    /// list, because a deletion that took one for the other would delete pinned work.
+    pub fn pins(&self, change_set_id: ChangeSetId) -> Result<Vec<PinnedRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT workspace_id, detail FROM workspace_retained
+                  WHERE change_set_id = ?1 AND kind = ?2
+                  ORDER BY workspace_id, detail",
+            )
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(
+                params![
+                    change_set_id.get().as_bytes().to_vec(),
+                    retained_kind_text(RetainedKind::PinnedChangeSet)
+                ],
+                |row| {
+                    let workspace: Vec<u8> = row.get(0)?;
+                    Ok((workspace, detail_column(row, 1)?))
+                },
+            )
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            let (workspace, detail) = row.map_err(ProjectError::store)?;
+            // A row whose workspace this build cannot read is not skipped. It is a pin, and the
+            // deletion that asks has to be told there is one rather than shown a shorter list.
+            let workspace_id = uuid_of(&workspace).map(WorkspaceId::new).ok_or_else(|| {
+                ProjectError::StoreUnavailable {
+                    detail: "a pin names a workspace this build cannot read"
+                        .to_owned()
+                        .into(),
+                }
+            })?;
+            rows.push(PinnedRow {
+                workspace_id,
+                change_set_id,
+                detail,
+            });
+        }
+        Ok(rows)
+    }
+
     /// Removes everything a workspace held, once the user approved it.
     ///
     /// # Errors
@@ -2252,12 +2327,18 @@ fn rebuild_retained_items(transaction: &Transaction<'_>) -> Result<()> {
     }
     transaction
         .execute_batch(
+            // Both indexes are recreated here, because dropping the table dropped them: the
+            // rebuilt table has to be the shape this build creates from nothing, not a table that
+            // happens to hold the right rows.
             "DROP TABLE workspace_retained;
              ALTER TABLE workspace_retained_rebuilt RENAME TO workspace_retained;
              CREATE UNIQUE INDEX workspace_retained_item
                  ON workspace_retained (
                      workspace_id, kind, detail, COALESCE(change_set_id, x'')
-                 );",
+                 );
+             CREATE INDEX workspace_retained_pin
+                 ON workspace_retained (change_set_id, workspace_id)
+                 WHERE change_set_id IS NOT NULL;",
         )
         .map_err(ProjectError::store)?;
     Ok(())
@@ -3401,6 +3482,135 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_is_found_by_the_change_set_it_names_wherever_it_was_recorded() {
+        // The deletion that counts what holds a version asks the pin's own question: who holds
+        // this change set. It knows the change set and not the workspaces, so a reading that
+        // needed a workspace named first would answer only for the workspaces the caller thought
+        // of.
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let pinned = ChangeSetId::new(Uuid::from_bytes([80; 16]));
+        let other = ChangeSetId::new(Uuid::from_bytes([81; 16]));
+        let first = WorkspaceId::new(Uuid::from_bytes([82; 16]));
+        let second = WorkspaceId::new(Uuid::from_bytes([83; 16]));
+        let elsewhere = WorkspaceId::new(Uuid::from_bytes([84; 16]));
+        for id in [82, 83, 84] {
+            let mut row = workspace_row(id);
+            row.state = WorkspaceState::Ready;
+            store
+                .begin_workspace(&row, None)
+                .expect("the workspace is written");
+        }
+        // The same version pinned against two workspaces, in the same words both times.
+        for workspace in [first, second] {
+            store
+                .retain(
+                    workspace,
+                    &RetainedRow {
+                        kind: RetainedKind::PinnedChangeSet,
+                        detail: "version 2 is pinned against this workspace".to_owned(),
+                        change_set_id: Some(pinned),
+                    },
+                )
+                .expect("the pin is recorded");
+        }
+        // A pin of something else, and evidence that is not a pin at all: neither is an answer to
+        // the question this reading asks.
+        store
+            .retain(
+                elsewhere,
+                &RetainedRow {
+                    kind: RetainedKind::PinnedChangeSet,
+                    detail: "version 2 is pinned against this workspace".to_owned(),
+                    change_set_id: Some(other),
+                },
+            )
+            .expect("the other pin is recorded");
+        store
+            .retain(
+                first,
+                &RetainedRow {
+                    kind: RetainedKind::ReviewEvidence,
+                    detail: "a review acknowledged version 2".to_owned(),
+                    change_set_id: Some(pinned),
+                },
+            )
+            .expect("the evidence is recorded");
+        let held = store.pins(pinned).expect("the pins read");
+        assert_eq!(
+            held.iter().map(|pin| pin.workspace_id).collect::<Vec<_>>(),
+            vec![first, second],
+            "two workspaces hold it, and alike reasons stay two pins: {held:?}"
+        );
+        assert!(
+            held.iter().all(|pin| pin.change_set_id == pinned),
+            "every row answers the change set that was asked about: {held:?}"
+        );
+        assert_eq!(
+            store.pins(other).expect("the other pins read").len(),
+            1,
+            "a pin of another change set is that change set's"
+        );
+        assert!(
+            store
+                .pins(ChangeSetId::new(Uuid::from_bytes([85; 16])))
+                .expect("a change set nothing pins reads")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recording_one_pin_twice_changes_nothing_and_two_change_sets_stay_two_pins() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let workspace = WorkspaceId::new(Uuid::from_bytes([86; 16]));
+        let mut row = workspace_row(86);
+        row.state = WorkspaceState::Ready;
+        store
+            .begin_workspace(&row, None)
+            .expect("the workspace is written");
+        let pinned = ChangeSetId::new(Uuid::from_bytes([87; 16]));
+        let later = ChangeSetId::new(Uuid::from_bytes([88; 16]));
+        let item = RetainedRow {
+            kind: RetainedKind::PinnedChangeSet,
+            detail: "this version is pinned".to_owned(),
+            change_set_id: Some(pinned),
+        };
+        store.retain(workspace, &item).expect("the pin is recorded");
+        store
+            .retain(workspace, &item)
+            .expect("recording it again is not a failure");
+        assert_eq!(
+            store.pins(pinned).expect("the pins read").len(),
+            1,
+            "one pin recorded twice is one pin"
+        );
+        // The same words about a different change set are a different pin, and both are held: a
+        // deletion of either has to find its own.
+        store
+            .retain(
+                workspace,
+                &RetainedRow {
+                    change_set_id: Some(later),
+                    ..item
+                },
+            )
+            .expect("the second pin is recorded");
+        assert_eq!(store.pins(pinned).expect("the first reads").len(), 1);
+        assert_eq!(store.pins(later).expect("the second reads").len(), 1);
+        assert_eq!(
+            store.retained(workspace).expect("the holdings read").len(),
+            2,
+            "two pins whose reasons read alike stay two pins"
+        );
+        // And the removal's own account is unchanged: releasing what the workspace held releases
+        // the pins with it.
+        store
+            .release_retained(workspace)
+            .expect("the user approves the removal");
+        assert!(store.pins(pinned).expect("the first reads").is_empty());
+        assert!(store.pins(later).expect("the second reads").is_empty());
+    }
+
+    #[test]
     fn a_store_written_by_an_earlier_build_gains_the_columns_it_is_missing() {
         // The tables are created only when they are absent, so a store an earlier build wrote has
         // the tables and not the columns added since. Opening it has to add them: a replacement
@@ -3673,6 +3883,30 @@ mod tests {
             4,
             "one more item, not one more row each: {held:?}"
         );
+        // The rebuild drops the table, so the index the pins are found by has to come back with
+        // it. A store an earlier build wrote answers the change set's own question like any other.
+        let indexes: Vec<String> = store
+            .connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params!["workspace_retained"], |row| row.get(0))
+                    .and_then(Iterator::collect)
+            })
+            .expect("the index list reads");
+        assert!(
+            indexes.iter().any(|name| name == "workspace_retained_pin"),
+            "the rebuilt table is the shape this build creates: {indexes:?}"
+        );
+        let found = store
+            .pins(ChangeSetId::new(Uuid::from_bytes([32; 16])))
+            .expect("the pins read");
+        assert_eq!(
+            found.len(),
+            1,
+            "the pin the earlier build wrote is found by its change set: {found:?}"
+        );
+        assert_eq!(found[0].detail, protected);
     }
 
     #[test]
