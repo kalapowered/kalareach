@@ -1026,43 +1026,109 @@ impl BackupStore {
         now_ms: TimestampMs,
         attempts_ended: bool,
     ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        apply_settlement(
+            &transaction,
+            archive_id,
+            backup_generation,
+            state,
+            detail,
+            now_ms,
+            attempts_ended,
+        )?;
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Records that the service accepted one generation's publication.
+    ///
+    /// Every condition is read inside the transaction that records the result, and every one of
+    /// them is this store's rather than the caller's. The caller says which privacy generation the
+    /// work it is reporting on was produced under; the store says which generation it admitted the
+    /// work under and which is in force, and a caller cannot relabel work privacy mode has already
+    /// drawn a line under by naming a different one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the result belongs to another privacy generation
+    /// or a fence stands, and [`ControllerError::RegistryUnavailable`] when the store refuses the
+    /// write.
+    pub fn note_published(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        produced_under: u64,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
         let archive = archive_id.get().as_bytes().to_vec();
         let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
-                 WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![archive, generation, state.as_str(), millis(now_ms), detail,],
+        let admitted_under: Option<i64> = transaction
+            .query_row(
+                "SELECT privacy_generation FROM generations
+                  WHERE archive_id = ?1 AND backup_generation = ?2",
+                params![archive, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        let Some(admitted_under) = admitted_under else {
+            return Err(ControllerError::registry(
+                "that backup generation is not one this host admitted",
+            ));
+        };
+        let admitted_under = u64::try_from(admitted_under).unwrap_or(0);
+        if admitted_under != produced_under {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!(
+                    "that backup result claims privacy generation {produced_under}, and this \
+                     host admitted the work under {admitted_under}"
+                ),
+            });
+        }
+        if let Some(fenced_at) = inhibited_at(&transaction)? {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!(
+                    "backup production is fenced at privacy generation {fenced_at}, so no \
+                     publication is recorded"
+                ),
+            });
+        }
+        let current: i64 = transaction
+            .query_row(
+                "SELECT current_generation FROM privacy_state WHERE id = 0",
+                [],
+                |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        let sequences: Vec<i64> = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT sequence FROM outbox
-                      WHERE archive_id = ?1 AND backup_generation = ?2
-                        AND (?3 = 1 OR dispatched = 0)",
-                )
-                .map_err(ControllerError::registry)?;
-            let rows = statement
-                .query_map(
-                    params![archive, generation, i64::from(attempts_ended)],
-                    |row| row.get(0),
-                )
-                .map_err(ControllerError::registry)?;
-            let mut collected = Vec::new();
-            for row in rows {
-                collected.push(row.map_err(ControllerError::registry)?);
-            }
-            collected
-        };
-        for sequence in sequences {
-            settle_attempt(&transaction, sequence)?;
+        let current = u64::try_from(current).unwrap_or(0);
+        if admitted_under != current {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!(
+                    "that backup result was produced under privacy generation \
+                     {admitted_under}, and this host is at {current}"
+                ),
+            });
         }
-        try_finish_generation(&transaction, archive_id, backup_generation)?;
+        apply_settlement(
+            &transaction,
+            archive_id,
+            backup_generation,
+            GenerationState::Published,
+            None,
+            now_ms,
+            // The service answered, so that publication attempt is over: its row and whatever
+            // obligation named it end with the settlement.
+            true,
+        )?;
         transaction.commit().map_err(ControllerError::registry)
     }
 
@@ -2145,6 +2211,56 @@ fn settle_attempt(transaction: &rusqlite::Transaction<'_>, sequence: i64) -> Res
     transaction
         .execute("DELETE FROM outbox WHERE sequence = ?1", params![sequence])
         .map_err(ControllerError::registry)?;
+    Ok(())
+}
+
+/// Writes where one generation ended up, inside a transaction the caller owns.
+///
+/// `attempts_ended` says whether the caller has established that work which had already left this
+/// host is over. When it has not, such an attempt keeps its row and whatever obligation names it:
+/// a record written here says nothing about what a service did.
+fn apply_settlement(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+    state: GenerationState,
+    detail: Option<&str>,
+    now_ms: TimestampMs,
+    attempts_ended: bool,
+) -> Result<()> {
+    let archive = archive_id.get().as_bytes().to_vec();
+    let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+    transaction
+        .execute(
+            "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
+             WHERE archive_id = ?1 AND backup_generation = ?2",
+            params![archive, generation, state.as_str(), millis(now_ms), detail],
+        )
+        .map_err(ControllerError::registry)?;
+    let sequences: Vec<i64> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT sequence FROM outbox
+                  WHERE archive_id = ?1 AND backup_generation = ?2
+                    AND (?3 = 1 OR dispatched = 0)",
+            )
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map(
+                params![archive, generation, i64::from(attempts_ended)],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let mut collected = Vec::new();
+        for row in rows {
+            collected.push(row.map_err(ControllerError::registry)?);
+        }
+        collected
+    };
+    for sequence in sequences {
+        settle_attempt(transaction, sequence)?;
+    }
+    try_finish_generation(transaction, archive_id, backup_generation)?;
     Ok(())
 }
 

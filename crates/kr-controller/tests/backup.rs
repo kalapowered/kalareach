@@ -970,14 +970,12 @@ fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
             TimestampMs::new(5_100),
         )
         .expect("the generation is admitted");
-    let mode = PrivacyMode::new();
     environment
         .service()
         .note_published(
             archive_id(),
             BackupGeneration::new(2),
             PrivacyGeneration::INITIAL,
-            &mode,
             TimestampMs::new(5_200),
         )
         .expect("the second generation is published");
@@ -1139,7 +1137,7 @@ fn dispatched_backup_work_keeps_reconciliation_open_until_it_is_settled() {
 
 #[test]
 fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_under() {
-    let environment = Environment::open();
+    let mut environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -1158,22 +1156,27 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
         )
         .expect("the generation is admitted");
 
-    let mut mode = PrivacyMode::new();
-    let now = mode.open_generation(TimestampMs::new(6_000));
+    // Privacy mode is enabled. The boundary is the store's own: raising the fence is what moves
+    // the generation in force, so nothing a caller says can put the line somewhere else.
+    environment.service.fence(PrivacyGeneration::new(1));
 
-    // The answer to work admitted before privacy mode was enabled comes back afterwards. It is
-    // refused under the generation it was really admitted under.
+    // The answer to work admitted before privacy mode was enabled comes back afterwards. While the
+    // fence stands it is refused because this host is stopped, which is the first fact about it.
     let refusal = environment
         .service()
         .note_published(
             archive_id(),
             BackupGeneration::new(1),
             PrivacyGeneration::INITIAL,
-            &mode,
             TimestampMs::new(7_000),
         )
         .expect_err("a late old-generation result");
-    assert!(refusal.to_string().contains("privacy generation 0"));
+    assert!(
+        refusal
+            .to_string()
+            .contains("fenced at privacy generation 1"),
+        "{refusal}"
+    );
 
     // And relabelling it does not help: the generation the work was admitted under is the store's,
     // not the caller's, so a caller that could name it could not name its way past the boundary.
@@ -1182,8 +1185,7 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
         .note_published(
             archive_id(),
             BackupGeneration::new(1),
-            now,
-            &mode,
+            PrivacyGeneration::new(1),
             TimestampMs::new(7_000),
         )
         .expect_err("a result relabelled with the generation in force");
@@ -1204,8 +1206,41 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
     );
 
     // Work admitted under the generation in force publishes. Privacy mode is off again here,
-    // because a host in privacy mode admits no content-bearing backup work at all.
-    let resumed = mode.disable(TimestampMs::new(8_000));
+    // because a host in privacy mode admits no content-bearing backup work at all, and the fence
+    // comes down only once the cleanup it wrote down is finished.
+    environment
+        .service
+        .cancel_undispatched(PrivacyGeneration::new(1));
+    environment
+        .service
+        .remove_retained(PrivacyGeneration::new(1));
+    assert_eq!(
+        environment
+            .service()
+            .release_fence(
+                PrivacyGeneration::new(1),
+                PrivacyGeneration::new(2),
+                TimestampMs::new(8_000),
+            )
+            .expect("a release"),
+        FenceRelease::Released
+    );
+    // With the fence down, the work it cancelled is not there to publish at all: its ciphertext
+    // went and its bookkeeping went with the last thing it was waiting on.
+    let stale = environment
+        .service()
+        .note_published(
+            archive_id(),
+            BackupGeneration::new(1),
+            PrivacyGeneration::INITIAL,
+            TimestampMs::new(8_500),
+        )
+        .expect_err("a result from before the private interval");
+    assert!(
+        stale.to_string().contains("not one this host admitted"),
+        "{stale}"
+    );
+
     let second = producer.seal(2, &objects);
     environment
         .service()
@@ -1213,7 +1248,7 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
             &second,
             &objects,
             producer.writer.key_id(),
-            resumed.generation,
+            PrivacyGeneration::new(2),
             TimestampMs::new(9_000),
         )
         .expect("the generation is admitted");
@@ -1222,8 +1257,7 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
         .note_published(
             archive_id(),
             BackupGeneration::new(2),
-            resumed.generation,
-            &mode,
+            PrivacyGeneration::new(2),
             TimestampMs::new(10_000),
         )
         .expect("a result from the generation in force");
@@ -1233,6 +1267,55 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
         .expect("a read")
         .expect("the generation");
     assert_eq!(record.state, GenerationState::Published);
+}
+
+#[test]
+fn a_publication_is_not_recorded_while_a_fence_stands() {
+    let environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    environment
+        .service()
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            PrivacyGeneration::INITIAL,
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+
+    // The request is accepted and the fence does not go up. The host is stopped all the same, so
+    // an answer arriving now records no publication.
+    environment
+        .service()
+        .accept_privacy_request(PrivacyGeneration::new(1), TimestampMs::new(6_000))
+        .expect("the request is accepted");
+    let refusal = environment
+        .service()
+        .note_published(
+            archive_id(),
+            BackupGeneration::new(1),
+            PrivacyGeneration::INITIAL,
+            TimestampMs::new(7_000),
+        )
+        .expect_err("a publication while this host is stopped");
+    assert!(
+        refusal
+            .to_string()
+            .contains("fenced at privacy generation 1"),
+        "{refusal}"
+    );
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_ne!(record.state, GenerationState::Published);
 }
 
 #[test]
@@ -2147,14 +2230,12 @@ fn an_acknowledgement_repeated_after_publication_still_says_the_upload_had_finis
         .service()
         .note_dispatched(publication[0].sequence)
         .expect("the publication is in flight");
-    let mode = PrivacyMode::new();
     environment
         .service()
         .note_published(
             archive_id(),
             BackupGeneration::new(1),
             PrivacyGeneration::INITIAL,
-            &mode,
             TimestampMs::new(6_500),
         )
         .expect("the service accepted it");
@@ -2368,13 +2449,11 @@ fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reache
         service
             .note_dispatched(publication[0].sequence)
             .expect("the publication is in flight");
-        let mode = PrivacyMode::new();
         service
             .note_published(
                 archive_id(),
                 BackupGeneration::new(1),
                 PrivacyGeneration::INITIAL,
-                &mode,
                 TimestampMs::new(6_500),
             )
             .expect("the service accepted it");

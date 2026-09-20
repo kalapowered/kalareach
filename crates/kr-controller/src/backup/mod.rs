@@ -867,63 +867,26 @@ impl BackupService {
     /// Records that the service accepted a generation's publication.
     ///
     /// `produced_under` is the privacy generation the work that produced this result was admitted
-    /// under. A result from before the generation in force is refused rather than published, which
-    /// is T-040's late-result rule applied where the publication actually happens: the comparison
-    /// is `PrivacyMode::accepts_result`'s, not a second one written here.
+    /// under, as the caller reports it. Every other term of the decision is the store's, read
+    /// inside the transaction that records the result: the generation this host actually admitted
+    /// the work under, the privacy generation in force, and whether a fence stands. A caller that
+    /// could supply those could relabel work privacy mode had already drawn a line under, which is
+    /// the one thing the late-result rule exists to stop.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::Refused`] when the result was produced under another generation,
-    /// and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    /// Returns [`ControllerError::Refused`] when the result belongs to another privacy generation
+    /// or a fence stands, and [`ControllerError::RegistryUnavailable`] when the store refuses the
+    /// write.
     pub fn note_published(
         &self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         produced_under: PrivacyGeneration,
-        mode: &kr_worker::privacy::PrivacyMode,
         now_ms: TimestampMs,
     ) -> Result<()> {
-        let mut store = self.store();
-        // The generation the work was admitted under is the store's, not the caller's. A caller
-        // that could name it could relabel work privacy mode had already drawn a line under, which
-        // is the one thing the late-result rule exists to stop.
-        let record = store
-            .generation(archive_id, backup_generation)?
-            .ok_or_else(|| {
-                ControllerError::registry("that backup generation is not one this host admitted")
-            })?;
-        let admitted_under = PrivacyGeneration::new(record.privacy_generation);
-        if admitted_under != produced_under {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: format!(
-                    "that backup result claims privacy generation {}, and this host admitted the \
-                     work under {}",
-                    produced_under.get(),
-                    admitted_under.get()
-                ),
-            });
-        }
-        if !mode.accepts_result(admitted_under) {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: format!(
-                    "that backup result was produced under privacy generation {}, and this host is \
-                     at {}",
-                    admitted_under.get(),
-                    mode.generation().get()
-                ),
-            });
-        }
-        // The service answered, so that publication attempt is over: its row and the obligation
-        // that named it end with the settlement.
-        store.settle_ended_attempts(
-            archive_id,
-            backup_generation,
-            GenerationState::Published,
-            None,
-            now_ms,
-        )
+        self.store()
+            .note_published(archive_id, backup_generation, produced_under.get(), now_ms)
     }
 
     /// Records that a generation's work stopped and this host cannot establish what became of it.
