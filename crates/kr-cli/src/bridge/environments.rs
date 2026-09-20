@@ -15,6 +15,8 @@ use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
+use kr_controller::bridge::launch::CONTAINER_RUNTIME as RUNTIME;
+
 use crate::cli::{
     BridgeEnrolArguments, BridgeForgetArguments, BridgeListArguments, BridgeRefreshArguments,
 };
@@ -80,18 +82,26 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
         Some(text) => text
             .parse::<EnvironmentId>()
             .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))?,
-        None => {
-            match query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
+        // Asking a destination which environment it is means running the helper inside it, and
+        // running anything inside a stopped distribution starts it. Section 3 leaves starting to
+        // refresh, create and attach, so this happens only when the person asked for it by name.
+        None if arguments.probe => {
+            query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
                 .await
-            {
-                Ok(id) => id,
-                Err(err) => {
-                    return Err(CliError::Usage(format!(
-                        "could not obtain environment identity from the destination helper ({err}); \
-                     supply --environment-id <uuid> or start the environment with the helper installed"
-                    )));
-                }
-            }
+                .map_err(|error| {
+                    CliError::Usage(format!(
+                        "the destination did not say which environment it is ({error}); pass \
+                         --environment-id <uuid> instead"
+                    ))
+                })?
+        }
+        None => {
+            return Err(CliError::Usage(
+                "an enrolment records the environment's own identity: pass --environment-id \
+                 <uuid>, or pass --probe to ask the destination, which starts it when it is \
+                 stopped"
+                    .to_owned(),
+            ));
         }
     };
     let enrolment = EnvironmentEnrolment {
@@ -125,127 +135,82 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
         .map_err(|error| CliError::Other(format!("the host's answer is not an enrolment: {error}")))
 }
 
-/// Resolves a container target to a full container identifier.
+/// Resolves what a person typed to the identifier the container runtime issued.
+///
+/// Section 3: a reused human container name is not an identity, and neither is a short prefix of
+/// one, because a runtime resolves a prefix to whichever container carries it now. So every target
+/// is put to the runtime and the identifier it answers with is what the record keeps. A name that
+/// happens to be hexadecimal takes the same path as any other name.
 fn resolve_container_target(target: &str) -> Result<String> {
-    if kr_protocol::identity::is_container_identifier(target) {
-        return Ok(target.to_owned());
-    }
-    // Attempt to resolve reusable human name to full container ID
-    let output = std::process::Command::new("podman")
-        .args(["container", "inspect", "--format", "{{.Id}}", target])
+    let output = std::process::Command::new(RUNTIME)
+        .args(["container", "inspect", "--format", "{{.Id}}", "--", target])
         .stdin(std::process::Stdio::null())
-        .output();
-    if let Ok(output) = output
-        && output.status.success()
-    {
-        let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if kr_protocol::identity::is_container_identifier(&id) {
-            return Ok(id);
-        }
+        .output()
+        .map_err(|error| {
+            CliError::Usage(format!(
+                "{RUNTIME} could not be run to resolve {target} to a container identifier \
+                 ({error}); pass the identifier the runtime issued"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Usage(format!(
+            "{RUNTIME} knows no container {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
-    Err(CliError::Usage(format!(
-        "'{target}' is a container name rather than a container identifier, and could not be \
-         resolved to a container ID; pass the container identifier"
-    )))
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !kr_protocol::identity::is_container_identifier(&resolved) {
+        return Err(CliError::Usage(format!(
+            "{RUNTIME} answered {resolved:?} for {target}, which is not the whole identifier a \
+             container carries"
+        )));
+    }
+    Ok(resolved)
 }
 
-/// Queries the destination helper to obtain its verified environment identity.
+/// Asks the destination which environment it is.
+///
+/// The helper runs inside the destination and acknowledges with that environment's own identity,
+/// the user it runs as and the role it serves. The invoker checks the protocol major and the role;
+/// the identity is what is being learned here, so there is nothing yet to compare it against. An
+/// SSH or paired environment has no process bridge, and is enrolled with the identity its owner
+/// already knows.
 async fn query_helper_identity(
     access: EnvironmentAccess,
     target: &str,
     user: &str,
     helper: &str,
 ) -> std::result::Result<EnvironmentId, String> {
-    if !access.is_process_bridge() {
-        return Err(
-            "SSH and paired environments must be enrolled with --environment-id".to_owned(),
-        );
-    }
-    let (program, arguments) = match access {
-        EnvironmentAccess::WslDistribution => (
-            "wsl.exe".to_owned(),
-            vec![
-                "--distribution".to_owned(),
-                target.to_owned(),
-                "--user".to_owned(),
-                user.to_owned(),
-                "--exec".to_owned(),
-                helper.to_owned(),
-                "bridge".to_owned(),
-                "--stdio".to_owned(),
-            ],
-        ),
-        EnvironmentAccess::Container => (
-            "podman".to_owned(),
-            vec![
-                "exec".to_owned(),
-                "--interactive".to_owned(),
-                "--user".to_owned(),
-                user.to_owned(),
-                "--".to_owned(),
-                target.to_owned(),
-                helper.to_owned(),
-                "bridge".to_owned(),
-                "--stdio".to_owned(),
-            ],
-        ),
-        _ => return Err("not a process bridge".to_owned()),
+    let command = kr_controller::bridge::launch::helper_command(access, target, user, helper)
+        .map_err(|error| error.to_string())?;
+    let hello = kr_protocol::identity::BridgeHello {
+        protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+        build_id: crate::build_id(),
+        origin_environment_id: origin_environment_id(),
+        // This is a person at this host's own command line. Nothing else may reach a bridge.
+        origin_ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        already_bridged: false,
+        target: kr_protocol::identity::BridgeTarget::Controller,
     };
-    let mut child = tokio::process::Command::new(&program)
-        .args(&arguments)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| format!("failed to start helper: {error}"))?;
-
-    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_owned())?;
-    let mut stdout = child.stdout.take().ok_or_else(|| "no stdout".to_owned())?;
-
-    let hello =
-        kr_protocol::identity::BridgeFrame::Hello(Box::new(kr_protocol::identity::BridgeHello {
-            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
-            build_id: crate::build_id(),
-            origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
-            origin_ingress: kr_protocol::actor::ActorIngress::LocalIpc,
-            already_bridged: false,
-            target: kr_protocol::identity::BridgeTarget::Controller,
-        }));
-    let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
-        .encode_message(&hello)
-        .map_err(|error| error.to_string())?;
-    tokio::io::AsyncWriteExt::write_all(&mut stdin, &encoded)
+    let acknowledgement = kr_controller::bridge::invoke::discover(&command, &hello)
         .await
-        .map_err(|error| error.to_string())?;
-    tokio::io::AsyncWriteExt::flush(&mut stdin)
-        .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|refusal| refusal.to_string())?;
+    Ok(acknowledgement.environment_id)
+}
 
-    let mut prefix = [0_u8; 4];
-    tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut prefix)
-        .await
-        .map_err(|error| error.to_string())?;
-    let len = u32::from_be_bytes(prefix) as usize;
-    if len > kr_protocol::frame::StreamKind::Control.max_payload_len() {
-        return Err("oversized frame from helper".to_owned());
-    }
-    let mut payload = vec![0_u8; len];
-    tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut payload)
-        .await
-        .map_err(|error| error.to_string())?;
-    let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
-        &payload,
-        &kr_protocol::frame::StreamKind::Control.cbor_limits(),
-    )
-    .map_err(|error| error.to_string())?;
-
-    let _ = child.kill().await;
-
-    match frame {
-        kr_protocol::identity::BridgeFrame::HelloAck(ack) => Ok(ack.environment_id),
-        kr_protocol::identity::BridgeFrame::Refused(err) => Err(err.to_string()),
-        _ => Err("unexpected frame from helper".to_owned()),
-    }
+/// The environment the invocation is made from, for the opening frame.
+///
+/// The destination records where a request came from, so the opening names this installation
+/// rather than a value made up for the occasion. A host that has no environment of its own yet
+/// still opens bridges, and says so with the nil identity rather than inventing one.
+fn origin_environment_id() -> EnvironmentId {
+    kr_ipc::paths::HostPaths::discover()
+        .ok()
+        .and_then(|paths| resolve::select(&paths, None).ok())
+        .map_or_else(
+            || EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16])),
+            |known| known.environment_id,
+        )
 }
 
 /// Removes one enrolled environment.
@@ -299,10 +264,11 @@ pub async fn refresh(arguments: &BridgeRefreshArguments) -> Result<EnvironmentRe
         .map_err(|error| CliError::Other(format!("the host's answer is not a refresh: {error}")))
 }
 
-/// Resolves the label a person typed to the identity the record carries.
+/// Resolves what a person typed to the identity the record carries.
 ///
-/// A label selects a record; the identity is what every later step compares. Two records that
-/// share a label are refused rather than resolved to the first of them.
+/// A label selects a record; so does the environment identifier, which is how two records that
+/// share a label are told apart. Either way the identity is what every later step compares, and a
+/// selector that matches two records is refused rather than resolved to the first of them.
 async fn labelled(client: &mut kr_ipc::client::LocalClient, label: &str) -> Result<EnvironmentId> {
     let answer = client
         .request(

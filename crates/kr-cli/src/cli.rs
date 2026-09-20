@@ -138,6 +138,10 @@ pub struct BridgeEnrolArguments {
     /// The environment identity this record names, when it is already known.
     #[arg(long)]
     pub environment_id: Option<String>,
+    /// Ask the destination which environment it is, instead of naming it. This runs the helper
+    /// inside the destination, which starts a stopped one.
+    #[arg(long)]
+    pub probe: bool,
 }
 
 /// `kr bridge forget`.

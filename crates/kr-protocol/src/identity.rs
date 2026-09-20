@@ -286,10 +286,18 @@ impl core::fmt::Display for EnrolmentError {
     }
 }
 
-/// Returns whether `target` is a container identifier (hexadecimal, 12 to 64 digits).
+/// The length of the identifier a container runtime issues, in hexadecimal digits.
+pub const CONTAINER_IDENTIFIER_LEN: usize = 64;
+
+/// Returns whether `target` is the identifier a container runtime issued.
+///
+/// Section 3: a reused human container name is not an identity. Nor is a short prefix of one: a
+/// runtime resolves a prefix to whichever container carries it now, which is the same weakness a
+/// name has. So a record carries the whole identifier the runtime issued, and anything else is
+/// resolved to one before it is recorded.
 #[must_use]
 pub fn is_container_identifier(target: &str) -> bool {
-    (12..=64).contains(&target.len()) && target.chars().all(|c| c.is_ascii_hexdigit())
+    target.len() == CONTAINER_IDENTIFIER_LEN && target.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 impl std::error::Error for EnrolmentError {}
@@ -304,29 +312,51 @@ impl EnvironmentEnrolment {
         if self.label.trim().is_empty() {
             return Err(EnrolmentError::EmptyLabel);
         }
-        if self.target.trim().is_empty() {
-            return Err(EnrolmentError::EmptyTarget);
-        }
-        if self.os_user.trim().is_empty() {
-            return Err(EnrolmentError::EmptyUser);
-        }
-        if !helper_path_is_absolute(&self.helper_path) {
-            return Err(EnrolmentError::HelperPathNotAbsolute);
-        }
-        if self.access == EnvironmentAccess::Container && !is_container_identifier(&self.target) {
-            return Err(EnrolmentError::ContainerTargetNotIdentifier);
-        }
-        Ok(())
+        validate_destination(self.access, &self.target, &self.os_user, &self.helper_path)
     }
 
-    /// Returns true when `label` selects this record.
+    /// Returns true when `selector` selects this record.
     ///
-    /// A label selects; it never identifies. The caller still compares [`Self::environment_id`]
-    /// against what the environment itself reports before it acts on anything.
+    /// A person types the label; the environment identifier selects the one record that carries
+    /// it, which is how two records that share a label are told apart. Neither is authority: the
+    /// caller still compares [`Self::environment_id`] against what the environment itself reports
+    /// before it acts on anything.
     #[must_use]
-    pub fn selected_by(&self, label: &str) -> bool {
-        self.label == label
+    pub fn selected_by(&self, selector: &str) -> bool {
+        self.label == selector || self.environment_id.to_string() == selector
     }
+}
+
+/// Checks the destination a process bridge is started against.
+///
+/// This is the part of an enrolment that names where the helper runs: the platform identity, the
+/// operating-system user inside it and the absolute helper path. Enrolment discovery has those
+/// three before it has an identity for the record, so the check lives here rather than only on the
+/// whole record.
+///
+/// # Errors
+///
+/// Returns [`EnrolmentError`] naming the first field that is missing, not absolute, or a reusable
+/// container name where an identifier is required.
+pub fn validate_destination(
+    access: EnvironmentAccess,
+    target: &str,
+    os_user: &str,
+    helper_path: &str,
+) -> Result<(), EnrolmentError> {
+    if target.trim().is_empty() {
+        return Err(EnrolmentError::EmptyTarget);
+    }
+    if os_user.trim().is_empty() {
+        return Err(EnrolmentError::EmptyUser);
+    }
+    if !helper_path_is_absolute(helper_path) {
+        return Err(EnrolmentError::HelperPathNotAbsolute);
+    }
+    if access == EnvironmentAccess::Container && !is_container_identifier(target) {
+        return Err(EnrolmentError::ContainerTargetNotIdentifier);
+    }
+    Ok(())
 }
 
 /// Whether a helper path names an absolute location in the target environment.
@@ -799,24 +829,35 @@ mod tests {
     fn a_container_enrolment_rejects_reusable_human_names_as_identities() {
         let mut enrolment = wsl_enrolment();
         enrolment.access = EnvironmentAccess::Container;
-        enrolment.target = "build".to_owned();
-        assert_eq!(
-            enrolment.validate().expect_err("rejected"),
-            EnrolmentError::ContainerTargetNotIdentifier
-        );
+        for name in [
+            "build",
+            "my-container",
+            // A name may be hexadecimal, and a short identifier is a prefix a runtime resolves to
+            // whichever container carries it now. Neither is the identity of one container.
+            "deadbeefcafe",
+            "8f3c1d2e4a5b",
+        ] {
+            enrolment.target = name.to_owned();
+            assert_eq!(
+                enrolment.validate().expect_err("rejected"),
+                EnrolmentError::ContainerTargetNotIdentifier,
+                "{name}"
+            );
+        }
 
-        enrolment.target = "my-container".to_owned();
-        assert_eq!(
-            enrolment.validate().expect_err("rejected"),
-            EnrolmentError::ContainerTargetNotIdentifier
-        );
+        // The identifier the runtime issued, whole.
+        enrolment.target = "a".repeat(CONTAINER_IDENTIFIER_LEN);
+        enrolment.validate().expect("the whole identifier is one");
+    }
 
-        // A valid 64-character container ID is accepted.
-        enrolment.target = "a".repeat(64);
-        assert!(enrolment.validate().is_ok());
-
-        // A valid 12-character short container ID is accepted.
-        enrolment.target = "8f3c1d2e4a5b".to_owned();
-        assert!(enrolment.validate().is_ok());
+    #[test]
+    fn an_environment_identifier_selects_the_record_a_shared_label_cannot() {
+        let first = wsl_enrolment();
+        let mut second = wsl_enrolment();
+        second.environment_id = EnvironmentId::new(crate::scalars::Uuid::from_bytes([9; 16]));
+        // Both answer to the label they share, and each answers to its own identity alone.
+        assert!(first.selected_by(&first.environment_id.to_string()));
+        assert!(!first.selected_by(&second.environment_id.to_string()));
+        assert!(second.selected_by(&second.environment_id.to_string()));
     }
 }

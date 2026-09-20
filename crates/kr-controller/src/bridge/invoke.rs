@@ -224,75 +224,17 @@ impl Opening {
     /// failing, a frame this host cannot read, a protocol major, a role, an identity that is not
     /// the enrolled one, or the destination's own refusal, including a closed session.
     pub async fn launch(self) -> Result<Invocation, Refusal> {
-        let mut child = tokio::process::Command::new(&self.command.program)
-            .args(&self.command.arguments)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            // Section 3 keeps standard error diagnostic. It belongs to whoever ran the command.
-            .stderr(std::process::Stdio::inherit())
-            // A handshake this host refuses ends the helper with it rather than leaving a
-            // distribution or a container process running behind a failed connection.
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| Refusal::NotStarted {
-                program: self.command.program.clone(),
-                detail: error.to_string(),
-            })?;
-
-        let mut stdin = child.stdin.take().ok_or_else(|| Refusal::NotStarted {
-            program: self.command.program.clone(),
-            detail: "its standard input is not a pipe".to_owned(),
-        })?;
-        let mut stdout = child.stdout.take().ok_or_else(|| Refusal::NotStarted {
-            program: self.command.program.clone(),
-            detail: "its standard output is not a pipe".to_owned(),
-        })?;
-
-        write_frame(
-            &mut stdin,
-            &BridgeFrame::Hello(Box::new(self.hello.clone())),
-        )
-        .await?;
-        let acknowledgement = match read_frame(&mut stdout).await? {
-            BridgeFrame::HelloAck(acknowledgement) => *acknowledgement,
-            BridgeFrame::Refused(error) => {
-                return Err(
-                    if error.code == kr_protocol::error::ErrorCode::SessionClosed {
-                        Refusal::SessionClosed
-                    } else {
-                        Refusal::Destination(error)
-                    },
-                );
-            }
-            _ => return Err(Refusal::NotAnAcknowledgement),
-        };
-
-        let invoker = self.hello.protocol_version.major;
-        if acknowledgement.protocol_version.major != invoker {
-            return Err(Refusal::ProtocolMajor {
-                destination: acknowledgement.protocol_version.major,
-                invoker,
-            });
-        }
-        let expected = match self.hello.target {
-            BridgeTarget::Controller => LocalRole::Controller,
-            BridgeTarget::Session { .. } => LocalRole::Worker,
-        };
-        if acknowledgement.role != expected {
-            return Err(Refusal::WrongRole {
-                expected,
-                answered: acknowledgement.role,
-            });
-        }
+        let (child, stdin, stdout, acknowledgement) =
+            start_and_acknowledge(&self.command, &self.hello).await?;
         // The enrolment is a record of one installation. An environment that answers with another
-        // identity is another installation, whatever name it was reached by.
+        // identity is another installation, whatever name it was reached by: a distribution
+        // registered again under the name it had, or a container recreated under a reused one.
         if acknowledgement.environment_id != self.environment_id {
             return Err(Refusal::IdentityMismatch {
                 enrolled: self.environment_id,
                 answered: acknowledgement.environment_id,
             });
         }
-
         Ok(Invocation {
             child,
             stdin,
@@ -300,6 +242,100 @@ impl Opening {
             acknowledgement,
         })
     }
+}
+
+/// Asks a destination which environment it is, before there is a record naming it.
+///
+/// Enrolment is the one caller: the identity is exactly what it is learning, so there is nothing
+/// yet to compare the acknowledgement against. Everything else is still checked, and the helper is
+/// ended as soon as it has answered, because discovery carries no request.
+///
+/// # Errors
+///
+/// As [`Opening::launch`], less the identity check.
+pub async fn discover(
+    command: &BridgeCommand,
+    hello: &BridgeHello,
+) -> Result<BridgeHelloAck, Refusal> {
+    let (mut child, stdin, stdout, acknowledgement) = start_and_acknowledge(command, hello).await?;
+    drop(stdin);
+    drop(stdout);
+    // The child is killed on drop, and waiting for it here keeps the process from being reaped by
+    // the runtime after this function has already returned.
+    let _ = child.kill().await;
+    Ok(acknowledgement)
+}
+
+/// Starts the helper, exchanges the opening frames, and checks the version and the role.
+async fn start_and_acknowledge(
+    command: &BridgeCommand,
+    hello: &BridgeHello,
+) -> Result<
+    (
+        tokio::process::Child,
+        tokio::process::ChildStdin,
+        tokio::process::ChildStdout,
+        BridgeHelloAck,
+    ),
+    Refusal,
+> {
+    let mut child = tokio::process::Command::new(&command.program)
+        .args(&command.arguments)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // Section 3 keeps standard error diagnostic. It belongs to whoever ran the command.
+        .stderr(std::process::Stdio::inherit())
+        // A handshake this host refuses ends the helper with it rather than leaving a distribution
+        // or a container process running behind a failed connection.
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| Refusal::NotStarted {
+            program: command.program.clone(),
+            detail: error.to_string(),
+        })?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| Refusal::NotStarted {
+        program: command.program.clone(),
+        detail: "its standard input is not a pipe".to_owned(),
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| Refusal::NotStarted {
+        program: command.program.clone(),
+        detail: "its standard output is not a pipe".to_owned(),
+    })?;
+
+    write_frame(&mut stdin, &BridgeFrame::Hello(Box::new(hello.clone()))).await?;
+    let acknowledgement = match read_frame(&mut stdout).await? {
+        BridgeFrame::HelloAck(acknowledgement) => *acknowledgement,
+        BridgeFrame::Refused(error) => {
+            return Err(
+                if error.code == kr_protocol::error::ErrorCode::SessionClosed {
+                    Refusal::SessionClosed
+                } else {
+                    Refusal::Destination(error)
+                },
+            );
+        }
+        _ => return Err(Refusal::NotAnAcknowledgement),
+    };
+
+    let invoker = hello.protocol_version.major;
+    if acknowledgement.protocol_version.major != invoker {
+        return Err(Refusal::ProtocolMajor {
+            destination: acknowledgement.protocol_version.major,
+            invoker,
+        });
+    }
+    let expected = match hello.target {
+        BridgeTarget::Controller => LocalRole::Controller,
+        BridgeTarget::Session { .. } => LocalRole::Worker,
+    };
+    if acknowledgement.role != expected {
+        return Err(Refusal::WrongRole {
+            expected,
+            answered: acknowledgement.role,
+        });
+    }
+    Ok((child, stdin, stdout, acknowledgement))
 }
 
 impl Invocation {

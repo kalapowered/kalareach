@@ -73,18 +73,44 @@ pub const CONTAINER_RUNTIME: &str = "podman";
 /// helper path.
 pub fn command(enrolment: &EnvironmentEnrolment) -> Result<BridgeCommand, LaunchError> {
     enrolment.validate().map_err(LaunchError::Incomplete)?;
-    match enrolment.access {
+    helper_command(
+        enrolment.access,
+        &enrolment.target,
+        &enrolment.os_user,
+        &enrolment.helper_path,
+    )
+}
+
+/// Builds the helper command for a destination that has no record yet.
+///
+/// Enrolment asks the destination which environment it is before there is a record to name it, so
+/// the command is built from the three values that describe where the helper runs. Everything the
+/// built command guarantees is the same: values cross as elements of a vector, `--exec` keeps the
+/// far side from parsing them again, and `--` ends the runtime's own options.
+///
+/// # Errors
+///
+/// As [`command`].
+pub fn helper_command(
+    access: EnvironmentAccess,
+    target: &str,
+    os_user: &str,
+    helper_path: &str,
+) -> Result<BridgeCommand, LaunchError> {
+    kr_protocol::identity::validate_destination(access, target, os_user, helper_path)
+        .map_err(LaunchError::Incomplete)?;
+    match access {
         EnvironmentAccess::WslDistribution => Ok(BridgeCommand {
             program: "wsl.exe".to_owned(),
             arguments: vec![
                 "--distribution".to_owned(),
-                enrolment.target.clone(),
+                target.to_owned(),
                 "--user".to_owned(),
-                enrolment.os_user.clone(),
+                os_user.to_owned(),
                 // Everything after `--exec` is an argument vector for the program named next. It
                 // is not handed to a shell, so no value in it is parsed a second time.
                 "--exec".to_owned(),
-                enrolment.helper_path.clone(),
+                helper_path.to_owned(),
                 HELPER_ARGUMENTS[0].to_owned(),
                 HELPER_ARGUMENTS[1].to_owned(),
             ],
@@ -95,12 +121,12 @@ pub fn command(enrolment: &EnvironmentEnrolment) -> Result<BridgeCommand, Launch
                 "exec".to_owned(),
                 "--interactive".to_owned(),
                 "--user".to_owned(),
-                enrolment.os_user.clone(),
+                os_user.to_owned(),
                 // `--` ends the runtime's own options, so a container identifier or a helper path
                 // that begins with a dash is a value rather than a flag.
                 "--".to_owned(),
-                enrolment.target.clone(),
-                enrolment.helper_path.clone(),
+                target.to_owned(),
+                helper_path.to_owned(),
                 HELPER_ARGUMENTS[0].to_owned(),
                 HELPER_ARGUMENTS[1].to_owned(),
             ],
@@ -284,9 +310,11 @@ mod tests {
 
     #[test]
     fn a_container_is_started_by_its_identifier_and_the_options_are_ended_first() {
+        // The whole identifier a runtime issues: sixty-four hexadecimal digits.
+        let identifier = "8f3c1d2e4a5b6c7d".repeat(4);
         let command = command(&enrolment(
             EnvironmentAccess::Container,
-            "8f3c1d2e4a5b",
+            &identifier,
             "kala",
         ))
         .expect("a command");
@@ -299,7 +327,7 @@ mod tests {
                 "--user",
                 "kala",
                 "--",
-                "8f3c1d2e4a5b",
+                identifier.as_str(),
                 "/usr/local/bin/kr",
                 "bridge",
                 "--stdio",
@@ -310,12 +338,12 @@ mod tests {
             .iter()
             .position(|argument| argument == "--")
             .expect("the options end");
-        let identifier = command
+        let carried = command
             .arguments
             .iter()
-            .position(|argument| argument == "8f3c1d2e4a5b")
+            .position(|argument| *argument == identifier)
             .expect("the identifier is carried");
-        assert!(separator < identifier);
+        assert!(separator < carried);
     }
 
     #[test]
@@ -356,7 +384,7 @@ mod tests {
 
         let container = observe(&enrolment(
             EnvironmentAccess::Container,
-            "8f3c1d2e4a5b",
+            &"8f3c1d2e4a5b6c7d".repeat(4),
             "kala",
         ))
         .expect("a command");
