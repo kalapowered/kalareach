@@ -231,6 +231,24 @@ impl WorkflowEngine {
                 }
 
                 if can_run {
+                    // The journal, not the snapshot this loop started from, decides whether the
+                    // node still has a dispatch owed to it, and the claim comes first so that a
+                    // node nobody owes anything to spends none of the chain's allowance.
+                    // Reading its status and moving it to running is one statement, so a
+                    // cancellation that arrives while an earlier node was running either gets
+                    // there first and this node is never dispatched, or finds it already
+                    // running and leaves it alone.
+                    if !self.store.claim_node_for_dispatch(run_id, &node.node_id)? {
+                        let recorded = self.store.node_status(run_id, &node.node_id)?;
+                        node_statuses.insert(
+                            node.node_id.clone(),
+                            recorded.unwrap_or(NodeStatus::Cancelled),
+                        );
+                        progress = true;
+                        continue;
+                    }
+                    node_statuses.insert(node.node_id.clone(), NodeStatus::Running);
+
                     // A workflow paused since this run started dispatches nothing further. The
                     // run itself stays where it is, for whoever enables the workflow again.
                     if self
@@ -269,22 +287,6 @@ impl WorkflowEngine {
                     ) {
                         return self.pause_on_refusal(run_id, &node.node_id, err, dispatch_time_ms);
                     }
-
-                    // The journal, not the snapshot this loop started from, decides whether
-                    // the node still has a dispatch owed to it. Reading its status and moving
-                    // it to running is one statement, so a cancellation that arrives while an
-                    // earlier node was running either gets there first and this node is never
-                    // dispatched, or finds it already running and leaves it alone.
-                    if !self.store.claim_node_for_dispatch(run_id, &node.node_id)? {
-                        let recorded = self.store.node_status(run_id, &node.node_id)?;
-                        node_statuses.insert(
-                            node.node_id.clone(),
-                            recorded.unwrap_or(NodeStatus::Cancelled),
-                        );
-                        progress = true;
-                        continue;
-                    }
-                    node_statuses.insert(node.node_id.clone(), NodeStatus::Running);
 
                     let action_id = node_actions[&node.node_id];
                     let outcome_res = self.runner.execute(node, action_id, dispatch_time_ms).await;
@@ -361,16 +363,18 @@ impl WorkflowEngine {
             }
         }
 
-        // The run is only as settled as its least settled node. A cancelled node means the run
-        // was cancelled; a paused or unknown one means it is waiting on a person.
-        if node_statuses.values().any(|&s| s == NodeStatus::Cancelled) {
+        // The run is only as settled as its least settled node, and what the nodes are is read
+        // back from the journal rather than from this loop's snapshot: a cancellation that
+        // landed while the loop was running is in the journal and not in the snapshot.
+        let settled = self.store.list_node_receipts(run_id)?;
+        if settled.iter().any(|r| r.status == NodeStatus::Cancelled) {
             run_status = WorkflowRunStatus::Cancelled;
-        } else if node_statuses
-            .values()
-            .any(|&s| s == NodeStatus::Paused || s == NodeStatus::Unknown)
+        } else if settled
+            .iter()
+            .any(|r| r.status == NodeStatus::Paused || r.status == NodeStatus::Unknown)
         {
             run_status = WorkflowRunStatus::Paused;
-        } else if node_statuses.values().any(|&s| s == NodeStatus::Failed) {
+        } else if settled.iter().any(|r| r.status == NodeStatus::Failed) {
             run_status = WorkflowRunStatus::Failed;
         }
 

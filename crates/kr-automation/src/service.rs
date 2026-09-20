@@ -298,6 +298,20 @@ impl AutomationService {
             .expect("the admission controller")
             .admit_run(params.workflow_id, def.grant_reference, now_ms, None, None);
         if let Err(breach) = admitted {
+            // Two copies of one event can both reach this point. The one that lost is still a
+            // duplicate, not load, so the journal is asked again before the breach is allowed
+            // to pause anything.
+            if self.store.trigger_is_recorded(
+                params.workflow_id,
+                params.revision.get(),
+                &params.event_id,
+            )? {
+                return Err(AutomationError::DuplicateTrigger {
+                    workflow_id: params.workflow_id,
+                    revision: params.revision.get(),
+                    event_id: params.event_id.clone(),
+                });
+            }
             self.store.pause_workflow_on_breach(
                 params.workflow_id,
                 params.revision.get(),
@@ -420,11 +434,17 @@ impl AutomationService {
         // A budget is answered only for a root the rest of this request actually covers, so a
         // reader asking about one workflow is not handed another chain's remaining allowance.
         let remaining_causal_budget = match params.causal_root_id.0 {
-            Some(root_id) if runs.iter().any(|run| run.causal_root_id == root_id) => self
-                .store
-                .get_budget(root_id)?
-                .map(|budget| budget.to_summary(now_ms))
-                .into(),
+            Some(root_id)
+                if runs.iter().any(|run| {
+                    run.causal_root_id == root_id
+                        && params.run_id.0.is_none_or(|named| run.run_id == named)
+                }) =>
+            {
+                self.store
+                    .get_budget(root_id)?
+                    .map(|budget| budget.to_summary(now_ms))
+                    .into()
+            }
             _ => Nullable::null(),
         };
 

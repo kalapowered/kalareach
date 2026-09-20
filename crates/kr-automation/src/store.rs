@@ -76,15 +76,26 @@ pub const ATTENTION_WORKFLOW_RESUMED: &str = "attention.workflow_resumed";
 pub enum AttentionSubject {
     /// A causal chain whose budget ran out.
     CausalRoot(CausalRootId),
-    /// A workflow paused because one of its own limits was breached.
-    Workflow(WorkflowId),
+    /// A workflow revision paused because one of its own limits was breached.
+    ///
+    /// The revision is part of the identity: two revisions of one workflow can be paused for
+    /// different reasons, and enabling one must not clear the other's item.
+    Workflow {
+        /// The workflow.
+        workflow_id: WorkflowId,
+        /// The revision that was paused.
+        revision: u64,
+    },
 }
 
 impl std::fmt::Display for AttentionSubject {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CausalRoot(root) => write!(formatter, "automation.causal_budget.{root}"),
-            Self::Workflow(workflow) => write!(formatter, "automation.workflow.{workflow}"),
+            Self::Workflow {
+                workflow_id,
+                revision,
+            } => write!(formatter, "automation.workflow.{workflow_id}.{revision}"),
         }
     }
 }
@@ -125,10 +136,13 @@ fn parse_attention_subject(value: &str) -> Option<AttentionSubject> {
             .ok()
             .map(|id| AttentionSubject::CausalRoot(CausalRootId::new(id)));
     }
-    let workflow = value.strip_prefix("automation.workflow.")?;
-    crate::parse_uuid(workflow)
-        .ok()
-        .map(|id| AttentionSubject::Workflow(WorkflowId::new(id)))
+    let (workflow, revision) = value
+        .strip_prefix("automation.workflow.")?
+        .rsplit_once('.')?;
+    Some(AttentionSubject::Workflow {
+        workflow_id: WorkflowId::new(crate::parse_uuid(workflow).ok()?),
+        revision: revision.parse().ok()?,
+    })
 }
 
 /// Writes one attention record into the journal's outbox, inside the caller's transaction.
@@ -192,9 +206,13 @@ impl WorkflowStore {
     /// version with statements meant for this one would fail later, somewhere unhelpful, so the
     /// refusal happens here and says what it found.
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let found: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let empty: bool = conn.query_row(
+        let mut conn = self.conn.lock().unwrap();
+        // The version is read, the decision is made and the schema is written under one write
+        // lock, so two processes opening a new journal at the same time cannot have one of them
+        // see the other's half-written state and refuse the journal it is about to share.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let found: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let empty: bool = tx.query_row(
             "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'",
             [],
             |row| row.get(0),
@@ -207,10 +225,8 @@ impl WorkflowStore {
             )));
         }
 
-        conn.execute_batch(
+        tx.execute_batch(
             "
-            BEGIN IMMEDIATE;
-
             CREATE TABLE IF NOT EXISTS workflow_definitions (
                 workflow_id TEXT NOT NULL,
                 revision INTEGER NOT NULL,
@@ -298,10 +314,9 @@ impl WorkflowStore {
             );
 
             PRAGMA user_version = 1;
-
-            COMMIT;
             ",
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -681,8 +696,11 @@ impl WorkflowStore {
             record_attention_tx(
                 &tx,
                 ATTENTION_WORKFLOW_RESUMED,
-                &AttentionSubject::Workflow(workflow_id),
-                "the workflow was enabled again",
+                &AttentionSubject::Workflow {
+                    workflow_id,
+                    revision,
+                },
+                "the workflow revision was enabled again",
                 now_ms,
             )?;
         }
@@ -713,7 +731,10 @@ impl WorkflowStore {
             record_attention_tx(
                 &tx,
                 ATTENTION_WORKFLOW_PAUSED,
-                &AttentionSubject::Workflow(workflow_id),
+                &AttentionSubject::Workflow {
+                    workflow_id,
+                    revision,
+                },
                 reason,
                 now_ms,
             )?;

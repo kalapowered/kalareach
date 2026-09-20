@@ -14,8 +14,10 @@ and per-grant admission limits.
 | `workflow.run` | Explicitly triggers an execution run of an enabled workflow | `workflow.manage` |
 | `workflow.read` | Reads workflow definitions, revision states, runs, and budgets | `workflow.read` |
 
-All mutation methods require an explicit workflow-management grant and the exact definition revision.
-Every method has an exhaustive authority entry in `kr_protocol::method::REGISTRY`.
+Every method has an exhaustive authority entry in `kr_protocol::method::REGISTRY` naming its
+effect class, the ingress an actor may reach it through, the rights it requires, its resource
+selectors, its freshness and its idempotency. Each method names the exact definition revision it
+acts on, and a request whose revision does not match the document it carries is refused.
 
 ## Definitions and graph validation
 
@@ -41,8 +43,9 @@ Install-time validation enforces:
 
 ## Causal roots and budgets
 
-Every session, action, and derived trigger created by a workflow keeps its host-verified causal
-identity: the root, the depth and the parent.
+Every session, action, and derived trigger created by a workflow keeps its causal identity: the
+root, the depth and the parent. The host derives all three from its own journal, and a run is
+the unit it derives them for.
 
 * **The host derives the ancestry.** A request names a parent run and a parent node, and nothing
   else. The host reads the root, the depth and the budget generation from its own journal, so

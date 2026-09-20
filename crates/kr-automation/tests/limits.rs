@@ -213,7 +213,13 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
 
     let pending = service.store().pending_attention().expect("the outbox");
     assert_eq!(pending.len(), 1, "one pause owes one item");
-    assert_eq!(pending[0].subject, AttentionSubject::Workflow(workflow_id));
+    assert_eq!(
+        pending[0].subject,
+        AttentionSubject::Workflow {
+            workflow_id,
+            revision: definition.revision.get(),
+        }
+    );
     assert!(!pending[0].ends_condition);
 
     // Enabling the revision again is what clears the pause, and the record that ends the
