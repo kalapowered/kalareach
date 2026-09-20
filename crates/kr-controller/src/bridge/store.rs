@@ -276,16 +276,30 @@ impl Store {
     ///
     /// Returns a not-found failure when nothing is enrolled under that identity, and a supervision
     /// failure when the record cannot be written.
-    pub fn scope_channel(&mut self, environment_id: EnvironmentId, now_ms: u64) -> Result<()> {
-        let enrolment = self.enrolment(environment_id).ok_or_else(|| {
-            ControllerError::InvalidArgument(format!(
-                "this host has no enrolled environment {environment_id}"
-            ))
-        })?;
+    pub fn scope_channel(
+        &mut self,
+        environment_id: EnvironmentId,
+        answered: &EnvironmentEnrolment,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let Some(enrolment) = self.enrolment(environment_id) else {
+            // The record went away while the bridge was open. Nothing is established about an
+            // environment this host no longer records.
+            return Ok(false);
+        };
+        // The answer came from the destination the record named when the bridge opened. If the
+        // record has been changed or replaced since, it names another destination, and this answer
+        // says nothing about that one.
+        if enrolment.target != answered.target
+            || enrolment.os_user != answered.os_user
+            || enrolment.helper_path != answered.helper_path
+        {
+            return Ok(false);
+        }
         let established = ScopedChannel {
-            target: enrolment.target.clone(),
-            os_user: enrolment.os_user.clone(),
-            helper_path: enrolment.helper_path.clone(),
+            target: answered.target.clone(),
+            os_user: answered.os_user.clone(),
+            helper_path: answered.helper_path.clone(),
             at_ms: now_ms,
         };
         if self
@@ -294,6 +308,27 @@ impl Store {
             .insert(environment_id.to_string(), established.clone())
             .as_ref()
             != Some(&established)
+        {
+            self.write()?;
+        }
+        Ok(true)
+    }
+
+    /// Forgets what an earlier bridge established about one environment's scoped local channel.
+    ///
+    /// A bridge that could not be opened, or one that reached another installation, leaves this
+    /// host with no current evidence. Keeping the old result would report an integration as ready
+    /// on the strength of an answer that is no longer being given.
+    ///
+    /// # Errors
+    ///
+    /// Returns a supervision failure when the record cannot be written.
+    pub fn unscope_channel(&mut self, environment_id: EnvironmentId) -> Result<()> {
+        if self
+            .record
+            .scoped_channels
+            .remove(&environment_id.to_string())
+            .is_some()
         {
             self.write()?;
         }
@@ -540,9 +575,11 @@ mod tests {
         assert!(!before[0].readiness.is_ready());
         assert!(before[0].readiness.detail.contains("forwarding a socket"));
 
-        store
-            .scope_channel(record.environment_id, 100)
-            .expect("scoped");
+        assert!(
+            store
+                .scope_channel(record.environment_id, &record, 100)
+                .expect("scoped")
+        );
         let after = store.list(None, 100);
         assert!(after[0].readiness.is_ready());
     }
@@ -553,7 +590,7 @@ mod tests {
         let record = enrolment(1, "ubuntu");
         store.enrol(record.clone(), 100).expect("enrolled");
         store
-            .scope_channel(record.environment_id, 100)
+            .scope_channel(record.environment_id, &record, 100)
             .expect("scoped");
         assert!(store.list(None, 100)[0].readiness.is_ready());
 
@@ -572,7 +609,7 @@ mod tests {
         let record = enrolment(1, "ubuntu");
         store.enrol(record.clone(), 100).expect("enrolled");
         store
-            .scope_channel(record.environment_id, 100)
+            .scope_channel(record.environment_id, &record, 100)
             .expect("scoped");
         assert!(store.forget(record.environment_id).expect("forgotten"));
         store.enrol(record.clone(), 300).expect("enrolled again");
@@ -580,6 +617,41 @@ mod tests {
             !store.list(None, 300)[0].readiness.channel_scoped,
             "a record enrolled again starts with nothing established"
         );
+    }
+
+    #[test]
+    fn an_answer_from_a_destination_that_was_replaced_meanwhile_establishes_nothing() {
+        // The bridge answers after the record it was opened for has been changed. The answer came
+        // from the old destination, so it says nothing about the new one.
+        let (_directory, mut store) = store();
+        let opened_for = enrolment(1, "ubuntu");
+        store.enrol(opened_for.clone(), 100).expect("enrolled");
+        let mut replaced = opened_for.clone();
+        replaced.target = "Ubuntu-24.04-again".to_owned();
+        store.enrol(replaced, 200).expect("enrolled again");
+
+        assert!(
+            !store
+                .scope_channel(opened_for.environment_id, &opened_for, 300)
+                .expect("recorded"),
+            "the answer belongs to the destination that was enrolled when the bridge opened"
+        );
+        assert!(!store.list(None, 300)[0].readiness.channel_scoped);
+    }
+
+    #[test]
+    fn a_bridge_that_failed_takes_back_what_an_earlier_one_established() {
+        let (_directory, mut store) = store();
+        let record = enrolment(1, "ubuntu");
+        store.enrol(record.clone(), 100).expect("enrolled");
+        store
+            .scope_channel(record.environment_id, &record, 100)
+            .expect("scoped");
+        assert!(store.list(None, 100)[0].readiness.channel_scoped);
+        store
+            .unscope_channel(record.environment_id)
+            .expect("forgotten");
+        assert!(!store.list(None, 200)[0].readiness.channel_scoped);
     }
 
     #[test]

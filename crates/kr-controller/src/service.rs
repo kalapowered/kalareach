@@ -5122,9 +5122,10 @@ impl Controller {
                             .to_owned(),
                     )
                 } else {
+                    let opened_for = row.enrolment.clone();
                     match crate::bridge::verify::through_bridge(
                         actor,
-                        &row.enrolment,
+                        &opened_for,
                         self.paths.environment_id(),
                         self.build_id.clone(),
                     )
@@ -5133,25 +5134,54 @@ impl Controller {
                         Ok(verification) => {
                             // The destination answered on its own local channel, inside its own
                             // environment. That is section 25's scoped channel, established rather
-                            // than assumed, so the record keeps it.
+                            // than assumed, so the record keeps it — against the enrolment the
+                            // bridge was opened for, which another caller may have changed since.
                             let scoping = state_dir.clone();
-                            tokio::task::spawn_blocking(move || {
+                            let established = tokio::task::spawn_blocking(move || {
                                 crate::bridge::store::Store::with_locked(&scoping, |store| {
-                                    store.scope_channel(environment_id, now_ms)
+                                    store.scope_channel(environment_id, &opened_for, now_ms)
                                 })
                             })
                             .await
                             .map_err(|error| ControllerError::supervision(error.to_string()))??;
-                            row.readiness.channel_scoped = true;
-                            row.readiness.detail =
-                                "the helper and the scoped channel are both recorded".to_owned();
-                            let detail = format!(
-                                "environment {} answered as {} over its own local channel",
-                                verification.environment_id, verification.os_user
-                            );
+                            row.readiness.channel_scoped = established;
+                            if established {
+                                row.readiness.detail =
+                                    "the helper and the scoped channel are both recorded"
+                                        .to_owned();
+                            }
+                            let detail = if established {
+                                format!(
+                                    "environment {} answered as {} over its own local channel",
+                                    verification.environment_id, verification.os_user
+                                )
+                            } else {
+                                "this environment's record changed while the bridge was open, so \
+                                 what answered says nothing about what is recorded now"
+                                    .to_owned()
+                            };
                             (Nullable::some(verification), detail)
                         }
-                        Err(refusal) => (Nullable::null(), refusal.to_string()),
+                        Err(refusal) => {
+                            // Nothing answered. What an earlier bridge established is not evidence
+                            // about this environment any more, so it is taken back rather than
+                            // left standing beside a failure.
+                            let scoping = state_dir.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::bridge::store::Store::with_locked(&scoping, |store| {
+                                    store.unscope_channel(environment_id)
+                                })
+                            })
+                            .await
+                            .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                            row.readiness.channel_scoped = false;
+                            row.readiness.detail = format!(
+                                "give {} its own scoped local channel; forwarding a socket does \
+                                 not install one",
+                                row.enrolment.label
+                            );
+                            (Nullable::null(), refusal.to_string())
+                        }
                     }
                 };
                 encode(&EnvironmentRefreshResult {
