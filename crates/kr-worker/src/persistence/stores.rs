@@ -508,6 +508,18 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: false,
     },
     StoreDescriptor {
+        name: "broker_stream",
+        holds: "the generation of the broker's transition stream, advanced on every start",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
         name: "broker_client_requests",
         holds: "forwarded native client requests awaiting upstream response",
         durability: Durability::CrashDurable,
@@ -591,6 +603,7 @@ mod tests {
             "broker_profiles",
             "broker_gaps",
             "broker_checkpoints",
+            "broker_stream",
             "broker_client_requests",
             "broker_events",
         ] {

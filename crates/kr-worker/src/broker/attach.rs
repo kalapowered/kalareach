@@ -275,6 +275,7 @@ fn map_cause(
 
 fn to_agent_resource_event(
     session_id: kr_protocol::ids::SessionId,
+    stream_generation: u64,
     transition: ResourceTransition,
 ) -> kr_protocol::projection::AgentResourceEvent {
     kr_protocol::projection::AgentResourceEvent {
@@ -288,6 +289,7 @@ fn to_agent_resource_event(
         actor_id: kr_protocol::scalars::Nullable(transition.actor_id),
         causal_root: transition.causal_root,
         binding_revision: transition.binding_revision,
+        stream_generation: kr_protocol::scalars::U64::new(stream_generation),
         sequence: kr_protocol::scalars::U64::new(transition.sequence),
         event_id: transition.event_id,
         parent_sequence: kr_protocol::scalars::Nullable(
@@ -300,6 +302,7 @@ fn to_agent_resource_event(
 
 fn from_transition_event(
     session_id: kr_protocol::ids::SessionId,
+    stream_generation: u64,
     transition: crate::broker::ledger::TransitionEvent,
 ) -> kr_protocol::projection::AgentResourceEvent {
     kr_protocol::projection::AgentResourceEvent {
@@ -313,6 +316,7 @@ fn from_transition_event(
         actor_id: kr_protocol::scalars::Nullable(transition.actor_id),
         causal_root: transition.causal_root,
         binding_revision: transition.binding_revision,
+        stream_generation: kr_protocol::scalars::U64::new(stream_generation),
         sequence: kr_protocol::scalars::U64::new(transition.sequence),
         event_id: transition.event_id,
         parent_sequence: kr_protocol::scalars::Nullable(
@@ -327,54 +331,90 @@ fn from_transition_event(
 ///
 /// It is the production consumer of the broker's own published transitions: the broker commits
 /// them in order and publishes them in that order, and this reads that one stream and hands each
-/// one to the session pipeline, which delivers it to every attached view. If an observation
-/// subscription is withdrawn (for example due to queue overflow), it reconnects and replays the
-/// outbox transitions or requests view resynchronisation. It ends when the connection is closed.
+/// one to the session pipeline, which delivers it to every attached view.
+///
+/// The interesting half is what happens when the queue ends, because it ends for two reasons and
+/// this must not confuse them. An observer that fell behind lost its queue and the resolutions in
+/// it; a connection that was torn down has no further resolutions to lose. Either way what this
+/// has not delivered is recovered before delivery stops: a fresh queue is taken first, so nothing
+/// committed during the recovery is missed, and the outbox is then replayed from the last position
+/// the views were told about. What the outbox cannot return — a transition announced while the
+/// journal was faulted — is reported to the views as a gap, so a view is never left believing a
+/// history with a hole in it is complete.
 pub async fn deliver_to_views(
     mut observations: Observations,
-    connection: GatewayConnectionId,
     broker: Arc<Broker>,
     session_id: kr_protocol::ids::SessionId,
     runtime: Arc<crate::runtime::SessionRuntime>,
 ) {
-    let mut last_sequence = 0_u64;
+    let mut cursor = broker.stream_start();
     loop {
         match observations.next().await {
             Some(transition) => {
-                if transition.sequence <= last_sequence {
+                if transition.sequence <= cursor.sequence {
                     continue;
                 }
-                last_sequence = transition.sequence;
-                let event = to_agent_resource_event(session_id, transition);
+                cursor.sequence = transition.sequence;
+                let event = to_agent_resource_event(session_id, cursor.generation, transition);
                 runtime.session().publish_agent_resource(&event);
             }
             None => {
-                // If the connection is no longer held by the broker, teardown has completed.
-                if broker.connection(connection).is_none() {
+                // The fresh queue is taken before the outbox is read, so a transition committed
+                // during the recovery is queued rather than falling between the two. Taking it is
+                // also what says whether this connection goes on: the registry decides that with
+                // the withdrawal, under one lock.
+                let continuing = observations.resubscribe();
+                recover_views(&broker, &runtime, session_id, &mut cursor).await;
+                if !continuing {
                     break;
-                }
-                // Subscription closed (e.g. queue overflow). Re-subscribe.
-                observations = broker.observatory().subscribe(connection);
-                // Replay missed transitions from the broker's ledger outbox.
-                match broker.transitions_after(last_sequence) {
-                    Ok(missed) => {
-                        for transition in missed {
-                            if transition.sequence <= last_sequence {
-                                continue;
-                            }
-                            last_sequence = transition.sequence;
-                            let event = from_transition_event(session_id, transition);
-                            runtime.session().publish_agent_resource(&event);
-                        }
-                    }
-                    Err(_) => {
-                        runtime
-                            .session()
-                            .resync_all_views(kr_protocol::recovery::ResyncReason::SendQueueFull);
-                    }
                 }
             }
         }
+    }
+}
+
+/// Replays what the views have not been told about, in bounded pages.
+///
+/// The broker's lock is taken for one page at a time, so a connection that is far behind recovers
+/// without holding every other caller behind its read.
+async fn recover_views(
+    broker: &Arc<Broker>,
+    runtime: &Arc<crate::runtime::SessionRuntime>,
+    session_id: kr_protocol::ids::SessionId,
+    cursor: &mut crate::broker::ReplayCursor,
+) {
+    loop {
+        let replay = match broker.replay_after(*cursor) {
+            Ok(replay) => replay,
+            Err(_) => {
+                // The outbox cannot be read at all, so nothing here can establish what the views
+                // missed. They are told to install a fresh state rather than left with a partial
+                // one that looks whole.
+                runtime
+                    .session()
+                    .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
+                return;
+            }
+        };
+        if replay.reset || replay.gap {
+            runtime
+                .session()
+                .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
+        }
+        for transition in replay.events {
+            if transition.sequence <= cursor.sequence && !replay.reset {
+                continue;
+            }
+            let event = from_transition_event(session_id, replay.cursor.generation, transition);
+            runtime.session().publish_agent_resource(&event);
+        }
+        *cursor = replay.cursor;
+        if !replay.more {
+            return;
+        }
+        // The lock has been given back between pages; yielding lets whatever was waiting for it
+        // run before the next one is read.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -420,11 +460,9 @@ impl Attached {
                 .ok_or_else(|| BrokerError::PreconditionFailed {
                     detail: "this attachment's transitions are already being read".to_owned(),
                 })?;
-        let connection = self.connection;
         let broker = Arc::clone(&self.broker);
         Ok(tokio::spawn(deliver_to_views(
             observations,
-            connection,
             broker,
             session_id,
             runtime,

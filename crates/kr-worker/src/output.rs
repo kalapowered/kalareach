@@ -685,6 +685,7 @@ mod tests {
             actor_id: kr_protocol::scalars::Nullable(None),
             causal_root: "req-1".to_owned(),
             binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            stream_generation: U64::new(1),
             sequence: U64::new(1),
             event_id: Uuid::from_bytes([4; 16]),
             parent_sequence: kr_protocol::scalars::Nullable(None),

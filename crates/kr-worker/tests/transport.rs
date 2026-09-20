@@ -282,6 +282,37 @@ fn broker() -> Arc<Broker> {
     broker_with_rich(rich())
 }
 
+/// Every transition the outbox holds, read the way a recovery reads it: one page at a time.
+fn outbox(broker: &Broker) -> Vec<kr_worker::broker::TransitionEvent> {
+    let mut cursor = broker.stream_start();
+    let mut recorded = Vec::new();
+    loop {
+        let replay = broker.replay_after(cursor).expect("the outbox reads");
+        recorded.extend(replay.events);
+        cursor = replay.cursor;
+        if !replay.more {
+            return recorded;
+        }
+    }
+}
+
+/// Everything recorded after one position of this broker's current stream.
+fn outbox_after(broker: &Broker, sequence: u64) -> Vec<kr_worker::broker::TransitionEvent> {
+    let mut cursor = kr_worker::broker::ReplayCursor {
+        generation: broker.stream_generation(),
+        sequence,
+    };
+    let mut recorded = Vec::new();
+    loop {
+        let replay = broker.replay_after(cursor).expect("the outbox reads");
+        recorded.extend(replay.events);
+        cursor = replay.cursor;
+        if !replay.more {
+            return recorded;
+        }
+    }
+}
+
 /// The same broker over a journal on disk, which is what a restart reads back.
 ///
 /// The connection comes back with it: a restart numbers its connections above everything the
@@ -302,6 +333,13 @@ fn broker_with_rich(rich: RichMethodTable) -> Arc<Broker> {
 }
 
 fn broker_from(broker: Broker, rich: RichMethodTable) -> (Arc<Broker>, GatewayConnectionId) {
+    let broker = Arc::new(broker);
+    let connection = prepare_broker(&broker, rich);
+    (broker, connection)
+}
+
+/// Registers the instance, pins its tables and opens one native connection on a broker.
+fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnectionId {
     broker
         .register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
         .expect("the instance is registered");
@@ -329,8 +367,8 @@ fn broker_from(broker: Broker, rich: RichMethodTable) -> (Arc<Broker>, GatewayCo
             "1",
         )
         .expect("the native connection is authenticated");
-    record_capabilities(&broker);
-    (Arc::new(broker), connection)
+    record_capabilities(broker);
+    connection
 }
 
 /// Builds one connection's owner over two real socket pairs and returns the ends a test drives.
@@ -1792,7 +1830,7 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
         .collect();
 
     // And the outbox holds exactly what was announced, because it was written with it.
-    let recorded = broker.transitions_after(0).expect("the outbox reads");
+    let recorded = outbox(&broker);
     // Each resource's own events form a chain: the first names no parent and every later one
     // names the event before it, so a consumer can see that it has read them in order.
     for resource_id in [contested.resource_id] {
@@ -1939,7 +1977,7 @@ async fn kr_req_11_27_a_claim_is_given_back_when_the_upstream_resolves_underneat
 
     // The chain says the same: a claim that was taken was given back or carried into the
     // settlement, and the last event about the resource is the terminal one.
-    let recorded = broker.transitions_after(0).expect("the outbox reads");
+    let recorded = outbox(&broker);
     let chain: Vec<&kr_worker::broker::TransitionEvent> = recorded
         .iter()
         .filter(|event| event.resource_id == resource_id)
@@ -2083,7 +2121,7 @@ async fn kr_req_12_11_an_observer_that_falls_behind_is_withdrawn_rather_than_gro
         "a subscription that overflowed is withdrawn rather than resumed"
     );
     assert!(
-        broker.transitions_after(0).expect("the outbox reads").len() >= overflow,
+        outbox(&broker).len() >= overflow,
         "and every transition is still recorded, whatever any observer read"
     );
 
@@ -2268,7 +2306,7 @@ async fn kr_req_12_11_every_event_says_what_class_of_content_its_resource_holds(
         !opaque.interpretation_verified,
         "nothing has interpreted it yet"
     );
-    let recorded = broker.transitions_after(0).expect("the outbox reads");
+    let recorded = outbox(&broker);
     let first = recorded
         .iter()
         .find(|event| event.resource_id == opaque.resource_id)
@@ -2294,9 +2332,7 @@ async fn kr_req_12_11_every_event_says_what_class_of_content_its_resource_holds(
             TimestampMs::new(3),
         )
         .expect("the interpretation is verified");
-    let after = broker
-        .transitions_after(first.sequence)
-        .expect("the outbox reads");
+    let after = outbox_after(&broker, first.sequence);
     let interpreted = after
         .iter()
         .find(|event| event.cause == kr_worker::broker::TransitionCause::Interpreted)
@@ -2353,7 +2389,7 @@ async fn kr_req_12_11_a_restart_goes_on_from_the_event_it_last_announced() {
                 TimestampMs::new(2),
             )
             .expect("the request is forwarded");
-        broker.transitions_after(0).expect("the outbox reads")
+        outbox(&broker)
     };
     let last = recorded.last().expect("the recording").clone();
     assert_eq!(
@@ -2374,9 +2410,7 @@ async fn kr_req_12_11_a_restart_goes_on_from_the_event_it_last_announced() {
     restarted
         .upstream_resolved(&restored.request, TimestampMs::new(4))
         .expect("the upstream withdraws its own request");
-    let after = restarted
-        .transitions_after(last.sequence)
-        .expect("the outbox reads");
+    let after = outbox_after(&restarted, last.sequence);
     let settlement = after
         .iter()
         .find(|event| event.resource_id == last.resource_id)
@@ -2393,70 +2427,156 @@ async fn kr_req_12_11_a_restart_goes_on_from_the_event_it_last_announced() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// KR-REQ-12.11: a saved volatile cursor cannot hide later durable events across restart.
+/// KR-REQ-12.11 and section 24: a position from an earlier run is not read as a position now.
 ///
-/// If an observer observed volatile events before a restart and saved a cursor beyond the
-/// durable log boundary, replaying on the restarted broker must not silently exclude subsequent
-/// durable events whose sequences are <= that saved cursor. Under the cursor-reset contract,
-/// a cursor beyond the highest durable event resets to the start of the stream, ensuring all
-/// later durable events are delivered.
+/// A transition announced while the journal is faulted spends a number nothing records, and the
+/// next run of the host numbers from what it did record — so the same numbers are handed out
+/// twice. Comparing a saved number with this run's numbers would therefore hide real events: the
+/// one recorded here as sequence 2 is a different event from the one the first run announced as
+/// sequence 2. What makes the position readable is the generation beside it. This proves the
+/// whole of that: real volatile events before the restart, the same numbers recorded after it,
+/// and a replay that resets instead of skipping — before, at and after the point where the new
+/// durable maximum passes the saved position.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_12_11_a_saved_volatile_cursor_cannot_hide_later_durable_events() {
+async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() {
     let directory = private_directory();
     let journal = directory.join("broker.sqlite3");
 
-    // Phase 1: Broker records durable event 1.
-    let (broker1, connection1) = broker_at(&journal);
-    let gen1 = broker1.stream_generation();
-    assert_eq!(gen1, 1);
-
-    broker1
+    // One durable transition, then a journal that cannot be written. Everything the first run
+    // announces from here on is published and not recorded.
+    let (first_run, first_connection) = broker_at(&journal);
+    assert_eq!(first_run.stream_generation(), 1);
+    first_run
         .forward_native(
-            connection1,
+            first_connection,
             br#"{"id":101,"method":"session/request_permission","params":{}}"#,
             TimestampMs::new(2),
         )
-        .expect("durable request 1 is forwarded");
-    let recorded1 = broker1.transitions_after(0).expect("outbox reads");
-    let highest_durable = recorded1.last().expect("durable event").sequence;
-    assert_eq!(highest_durable, 1);
-
-    // Simulate an observer that saw volatile events up to sequence 10 (beyond durable log).
-    let saved_volatile_cursor = 10_u64;
-
-    // Drop broker 1 (simulating crash/restart).
-    drop(broker1);
-
-    // Phase 2: Restart broker over the same journal.
-    let (broker2, connection2) = broker_at(&journal);
-    let gen2 = broker2.stream_generation();
-    assert_eq!(gen2, 2, "stream generation advances on restart");
-
-    // Broker 2 records a new durable event after restart.
-    broker2
-        .forward_native(
-            connection2,
-            br#"{"id":102,"method":"session/request_permission","params":{}}"#,
-            TimestampMs::new(4),
-        )
-        .expect("durable request 2 is forwarded");
-
-    // The observer reconnects and supplies its saved volatile cursor (10).
-    // Under the cursor-reset contract, the cursor beyond highest durable event does NOT
-    // hide the new durable events:
-    let replayed = broker2
-        .transitions_after(saved_volatile_cursor)
-        .expect("transitions_after succeeds under cursor-reset contract");
-
-    assert!(
-        !replayed.is_empty(),
-        "saved volatile cursor must not hide durable events"
+        .expect("the first request is forwarded");
+    let durable = outbox(&first_run);
+    assert_eq!(
+        durable.len(),
+        1,
+        "one transition was recorded before the journal faulted"
     );
-    let new_event = replayed
-        .iter()
-        .find(|event| event.sequence == 2)
-        .expect("the post-restart durable event (sequence 2) must be returned");
-    assert_eq!(new_event.sequence, 2);
+    assert_eq!(durable[0].sequence, 1);
+
+    first_run
+        .enter_volatile("the journal could not be written", TimestampMs::new(3))
+        .expect("the gateway enters volatile-native mode");
+    for (id, at) in [(102, 4), (103, 5)] {
+        first_run
+            .forward_native(
+                first_connection,
+                format!(r#"{{"id":{id},"method":"session/request_permission","params":{{}}}}"#)
+                    .as_bytes(),
+                TimestampMs::new(at),
+            )
+            .expect("a volatile request is forwarded");
+    }
+    let volatile_cursor = kr_worker::broker::ReplayCursor {
+        generation: first_run.stream_generation(),
+        sequence: 3,
+    };
+    assert_eq!(
+        outbox(&first_run).len(),
+        1,
+        "the volatile transitions were announced and not recorded"
+    );
+    let announced = first_run
+        .replay_after(kr_worker::broker::ReplayCursor {
+            generation: first_run.stream_generation(),
+            sequence: 1,
+        })
+        .expect("the outbox reads");
+    assert!(
+        announced.gap,
+        "and the run that announced them says so to anyone reading from before them"
+    );
+    drop(first_run);
+
+    // The second run numbers from what was recorded, so it hands out 2 and 3 again.
+    let (second_run, second_connection) = broker_at(&journal);
+    assert_eq!(
+        second_run.stream_generation(),
+        2,
+        "a new run is a new generation"
+    );
+    for (id, at) in [(104, 6), (105, 7)] {
+        second_run
+            .forward_native(
+                second_connection,
+                format!(r#"{{"id":{id},"method":"session/request_permission","params":{{}}}}"#)
+                    .as_bytes(),
+                TimestampMs::new(at),
+            )
+            .expect("a durable request is forwarded");
+    }
+    let recorded = outbox(&second_run);
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the same numbers the first run announced are now recorded for other events"
+    );
+
+    // The observer reconnects with the position it held. It names the first run, so the whole
+    // stream is replayed and the observer is told to start again rather than continue.
+    let replayed = second_run
+        .replay_after(volatile_cursor)
+        .expect("the outbox reads");
+    assert!(
+        replayed.reset,
+        "a position from an earlier run is not comparable with this run's numbers"
+    );
+    assert_eq!(
+        replayed
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "so the stream is replayed from its start and nothing recorded is hidden"
+    );
+    assert_eq!(replayed.cursor.generation, 2);
+    assert_eq!(replayed.cursor.sequence, 3);
+
+    // The same holds before and at the point where the new maximum passes the saved position:
+    // the answer never depends on how far this run has got.
+    for sequence in [2_u64, 3, 4] {
+        let replayed = second_run
+            .replay_after(kr_worker::broker::ReplayCursor {
+                generation: 1,
+                sequence,
+            })
+            .expect("the outbox reads");
+        assert!(replayed.reset, "position {sequence} is from another run");
+        assert_eq!(
+            replayed.events.len(),
+            3,
+            "and the whole recorded stream comes back for it"
+        );
+    }
+
+    // A position from this run is compared, not reset.
+    let continuing = second_run
+        .replay_after(kr_worker::broker::ReplayCursor {
+            generation: 2,
+            sequence: 2,
+        })
+        .expect("the outbox reads");
+    assert!(!continuing.reset);
+    assert_eq!(
+        continuing
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3],
+        "a position of this run continues from where it names"
+    );
 
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -3604,6 +3724,150 @@ async fn session_runtime_and_stream(
     (runtime, stream)
 }
 
+/// The same session, served over the worker's own endpoint, with a client attached to it.
+///
+/// A view is a client on a socket, and what it is actually told is a frame. A test that reads the
+/// session's own queue proves the delivery inside this process and nothing about what a view
+/// receives, so the recovery tests below run over this: a real service, a real connection, and the
+/// notifications a client decodes.
+async fn service_and_attached_client(
+    session_id: SessionId,
+    host: &kr_ipc::testing::TempHost,
+    shell: &str,
+    send_queue_bytes: usize,
+) -> (
+    Arc<kr_worker::service::WorkerService>,
+    Arc<kr_worker::runtime::SessionRuntime>,
+    kr_ipc::client::LocalClient,
+    kr_protocol::ids::AttachmentId,
+) {
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    let display = kr_protocol::session::DisplayNumber::new(1);
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = Arc::new(
+        kr_ipc::verify::WorkerIdentity::generate(
+            session_id,
+            kr_protocol::ids::SessionEpoch::V1,
+            boot.clone(),
+            process,
+            kr_protocol::hello::PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
+    let controller =
+        kr_ipc::verify::ControllerIdentity::initialise(store.store.as_ref(), environment_id)
+            .expect("a controller identity");
+    let config = kr_worker::session::SessionConfig {
+        session_id,
+        session_epoch: kr_protocol::ids::SessionEpoch::V1,
+        environment_id,
+        display_number: display,
+        shell: kr_worker::testing::posix_script(shell),
+        shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        desktop: kr_protocol::identity::DesktopBinding::none(),
+        dimensions: kr_protocol::session::Dimensions::new(80, 24),
+        journal_path: Some(environment.journal_database(session_id)),
+        spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
+        send_queue_bytes,
+        resident_bytes: 1024 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+    };
+    let mut session = kr_worker::session::Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let runtime = Arc::new(
+        kr_worker::runtime::SessionRuntime::start(
+            session,
+            Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    let endpoint = environment.worker_endpoint(display).expect("an endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+    let service = Arc::new(
+        kr_worker::service::WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            kr_worker::service::ServiceBinding {
+                environment_id,
+                boot_identity: boot,
+                controller_public_key: *controller.public_key(),
+                controller_generation: kr_protocol::ids::ControllerGeneration::new(1),
+                journal_path: None,
+                build_id: kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+            },
+        )
+        .expect("a worker service"),
+    );
+    tokio::spawn(Arc::clone(&service).serve(listener));
+    let mut client = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+    )
+    .await
+    .expect("connects");
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            kr_protocol::method::Method::SessionAttach,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            kr_protocol::envelope::ActionTarget {
+                environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds")
+        .to_typed()
+        .expect("decodes");
+    (service, runtime, client, attached.attachment.attachment_id)
+}
+
+/// Subscribes one attachment to its session's events and returns what the worker answered.
+async fn subscribe(
+    client: &mut kr_ipc::client::LocalClient,
+    session_id: SessionId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+) -> kr_protocol::recovery::EventsSubscribeResult {
+    let mut streams = kr_protocol::scalars::CanonicalSet::new();
+    streams.insert(kr_protocol::recovery::EventStream::Output);
+    client
+        .request(
+            kr_protocol::method::Method::EventsSubscribe,
+            &kr_protocol::recovery::EventsSubscribeParams {
+                session_id,
+                attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the subscription succeeds")
+        .to_typed()
+        .expect("decodes")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
     let broker = broker();
@@ -3619,7 +3883,6 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
 
     let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
         observations,
-        GatewayConnectionId::new(1),
         Arc::clone(&broker),
         session(),
         Arc::clone(&runtime),
@@ -3690,7 +3953,7 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
     );
 
     // Section 24: verify every received view notification against its corresponding outbox record.
-    let outbox = broker.transitions_after(0).expect("outbox events");
+    let outbox = outbox(&broker);
     assert!(!seen.is_empty(), "views received notifications");
     for event in &seen {
         let record = outbox
@@ -3727,81 +3990,262 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
     served.drained.abort();
 }
 
+/// KR-REQ-12.11 and section 12: an observer that overflows recovers what its queue lost.
+///
+/// The queue between the broker and this session is bounded, and an observer that is not read
+/// loses it. What must not be lost with it is the resolution: the one event a person is waiting
+/// for is exactly the one most likely to arrive while a queue is full. So this forces a real
+/// overflow — more transitions than the queue holds, with nothing reading it — settles a resource
+/// inside the interval the overflow swallowed, and then starts delivery. The settlement cannot
+/// reach the view except by replay, because the queue that would have carried it is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_12_11_subscription_overflow_replays_transitions_to_attached_views() {
+async fn kr_req_12_11_an_overflowed_observer_replays_what_its_queue_lost() {
     let broker = broker();
     let served = duplex_watched(&broker).await;
     let observations = served.observations;
     let owner = Arc::clone(&served.owner);
-    let mut client = tokio::io::BufReader::new(served.client);
+    let mut upstream_client = tokio::io::BufReader::new(served.client);
 
     let host = kr_ipc::testing::TempHost::create();
     let (runtime, mut stream) = session_runtime_and_stream(session(), &host).await;
 
+    // Nothing is reading the observation queue yet. Each forwarded request commits one transition,
+    // and the queue holds a bounded number of them, so this fills it and then goes past it.
+    let overflow = kr_worker::broker::MAX_QUEUED_OBSERVATIONS + 8;
+    for index in 0..overflow {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":{},"method":"session/request_permission","params":{{}}}}"#,
+                    900 + index
+                )
+                .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut upstream_client).await;
+    }
+
+    // The resource settled here is inside the stretch the overflow swallowed: the queue that would
+    // have carried its transition was dropped before it committed.
+    let resource = broker
+        .pending_resources()
+        .into_iter()
+        .next_back()
+        .expect("a resource is held");
+    broker
+        .upstream_resolved(&resource.request, TimestampMs::new(3))
+        .expect("the upstream withdraws its own request");
+    let settlement = outbox(&broker)
+        .into_iter()
+        .rfind(|event| event.resource_id == resource.resource_id)
+        .expect("the settlement is recorded");
+    assert!(
+        settlement.state.is_terminal(),
+        "the resource settled while nothing was reading the queue"
+    );
+
+    // Delivery starts now. It drains what the queue still holds, finds it closed, takes a fresh
+    // one and recovers the rest from the outbox.
     let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
         observations,
-        GatewayConnectionId::new(1),
         Arc::clone(&broker),
         session(),
         Arc::clone(&runtime),
     ));
 
-    owner
-        .from_upstream(
-            br#"{"id":82,"method":"session/request_permission","params":{}}"#,
-            TimestampMs::new(2),
-        )
-        .await
-        .expect("the request is carried");
-    let _ = next_line(&mut client).await;
-
-    // Simulate an observation overflow by withdrawing the subscription in the observatory
-    // while the connection stays alive in the broker.
-    broker.observatory().withdraw(GatewayConnectionId::new(1));
-
-    // Answer request while observation channel is closed - broker commits event to outbox.
-    owner
-        .from_client(
-            br#"{"id":82,"result":{"outcome":"allow"}}"#,
-            TimestampMs::new(3),
-        )
-        .await
-        .expect("the person answers");
-
-    let resource = broker
-        .pending_resources()
-        .into_iter()
-        .next()
-        .expect("the resource is held");
-    settled_within(
-        &broker,
-        resource.resource_id,
-        std::time::Duration::from_secs(20),
-    )
-    .await
-    .expect("the answer settles it");
-
-    // deliver_to_views detects the closed observation channel, resubscribes, replays
-    // transitions_after, and delivers to the attached view.
     let mut seen = Vec::new();
     while let Ok(Some(delivery)) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv()).await
+        tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await
     {
         if let kr_worker::output::OutputDelivery::AgentResource { event, bytes } = delivery {
             stream.written(bytes);
-            let state = event.state;
+            let settled = event.event_id == settlement.event_id;
             seen.push(*event);
-            if state.is_terminal() {
+            if settled {
                 break;
             }
         }
     }
 
     assert!(
-        seen.iter().any(|event| event.state.is_terminal()),
-        "the replayed transitions reached the attached view: {seen:?}"
+        seen.iter()
+            .any(|event| event.event_id == settlement.event_id),
+        "the settlement the overflow swallowed reached the view: {} events seen",
+        seen.len()
+    );
+    assert!(
+        seen.windows(2)
+            .all(|pair| pair[0].sequence.get() < pair[1].sequence.get()),
+        "and the recovery keeps the broker's own order"
+    );
+    let recorded = outbox(&broker);
+    for event in &seen {
+        let record = recorded
+            .iter()
+            .find(|entry| entry.event_id == event.event_id)
+            .expect("every delivered event is one the outbox holds");
+        assert_eq!(event.sequence.get(), record.sequence);
+        assert_eq!(event.state, record.state);
+    }
+
+    carrying.abort();
+    served.drained.abort();
+}
+
+/// KR-REQ-12.11 and KR-REQ-12.13: a view that lost its place is given the broker's state back.
+///
+/// This is the other half of recovery, and it runs over a real service connection because what it
+/// is about is what a client receives. The view's own queue is filled until the worker tells it to
+/// resynchronise. A resource then settles while the view is holding nothing — those events are not
+/// queued for it at all, by design. What the view is given when it subscribes again is the state
+/// as it now stands, at the position it stands at: the resource that settled is gone from it, the
+/// ones still open are in it, and the position says which later events it must still apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_position() {
+    let host = kr_ipc::testing::TempHost::create();
+    // A queue small enough that a moment of output passes it, and an application that produces
+    // steadily rather than in one burst: a view that stops reading reaches its bound either way,
+    // and a burst would be a race with the subscription.
+    let (service, runtime, mut client, attachment_id) = service_and_attached_client(
+        session(),
+        &host,
+        "while true; do printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'; done",
+        2048,
+    )
+    .await;
+    // The broker this view's own service holds, which is the one a subscription is answered from.
+    let broker = Arc::clone(service.broker());
+    let connection = prepare_broker(&broker, rich());
+    let served = duplex_watched_on(&broker, connection).await;
+    let owner = Arc::clone(&served.owner);
+    let mut upstream_client = tokio::io::BufReader::new(served.client);
+
+    let first = subscribe(&mut client, session(), attachment_id).await;
+    assert!(
+        first.agent_resources.resources.is_empty(),
+        "nothing is pending before anything is forwarded"
+    );
+
+    let carrying = tokio::spawn(kr_worker::broker::attach::deliver_to_views(
+        served.observations,
+        Arc::clone(&broker),
+        session(),
+        Arc::clone(&runtime),
+    ));
+
+    // Some resources this view is told about while it is still keeping up.
+    for index in 0..4_u64 {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":{},"method":"session/request_permission","params":{{}}}}"#,
+                    800 + index
+                )
+                .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+        let _ = next_line(&mut upstream_client).await;
+    }
+
+    // The view stops reading. Its queue passes its bound, and the worker tells it to discard what
+    // it held rather than holding the session for it. Nothing after this is queued for it.
+    let told_to_resynchronise = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        wait_for_resync(&mut client),
+    )
+    .await
+    .expect("the worker tells a view that has fallen behind");
+    assert_eq!(
+        told_to_resynchronise.reason,
+        kr_protocol::recovery::ResyncReason::SendQueueFull
+    );
+
+    // A resource settles while the view holds nothing. This is the event a view could not recover
+    // from its queue, because it has no queue.
+    let settling = broker
+        .pending_resources()
+        .into_iter()
+        .next_back()
+        .expect("a resource is held");
+    broker
+        .upstream_resolved(&settling.request, TimestampMs::new(3))
+        .expect("the upstream withdraws its own request");
+    let held = broker.pending_resources();
+    assert!(
+        held.iter()
+            .any(|resource| resource.resource_id == settling.resource_id
+                && resource.state.is_terminal()),
+        "the resource the upstream withdrew is settled"
+    );
+
+    // Subscribing again is how a view installs a fresh state, and the state it installs is the
+    // broker's own.
+    let again = subscribe(&mut client, session(), attachment_id).await;
+    let restored: std::collections::BTreeMap<_, _> = again
+        .agent_resources
+        .resources
+        .iter()
+        .map(|resource| (resource.resource_id, resource.state))
+        .collect();
+    assert_eq!(
+        restored.get(&settling.resource_id).copied(),
+        Some(settling_state(&held, settling.resource_id)),
+        "what settled while the view was away is installed as settled, not as still waiting"
+    );
+    assert!(
+        restored
+            .get(&settling.resource_id)
+            .is_some_and(|state| state.is_terminal()),
+        "a view that installs this does not offer a resolved resource as an answerable one"
+    );
+    for resource in &held {
+        assert_eq!(
+            restored.get(&resource.resource_id).copied(),
+            Some(resource.state),
+            "every resource the broker holds is in the state the view installs, as it stands"
+        );
+    }
+    assert_eq!(
+        again.agent_resources.stream_generation.get(),
+        broker.stream_generation(),
+        "the position names the run it belongs to"
+    );
+    assert!(
+        again.agent_resources.cursor.get() >= u64::try_from(held.len()).unwrap_or(0),
+        "and it is the position the broker had reached, not the start of the stream"
     );
 
     carrying.abort();
     served.drained.abort();
+}
+
+/// What one resource's state is, as the broker holds it.
+fn settling_state(
+    held: &[kr_protocol::gateway::PendingResource],
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> kr_protocol::gateway::PendingState {
+    held.iter()
+        .find(|resource| resource.resource_id == resource_id)
+        .expect("the broker holds it")
+        .state
+}
+
+/// Reads frames until the worker tells this client to resynchronise.
+async fn wait_for_resync(
+    client: &mut kr_ipc::client::LocalClient,
+) -> kr_protocol::recovery::ResyncRequired {
+    loop {
+        match client.recv().await.expect("the worker is serving") {
+            kr_protocol::envelope::ControlFrame::Notification(notification)
+                if notification.event_type.as_str() == "session.resync" =>
+            {
+                return notification.payload.to_typed().expect("decodes");
+            }
+            _ => {}
+        }
+    }
 }

@@ -1388,6 +1388,7 @@ export interface KalaReachProtocol {
   agent_resource_cause?: AgentResourceCause
   agent_resource_content_class?: AgentResourceContentClass
   agent_resource_event?: AgentResourceEvent
+  agent_resource_snapshot?: AgentResourceSnapshot
   agent_snapshot_params?: AgentSnapshotParams
   agent_snapshot_result?: AgentSnapshotResult
   agent_steer_params?: AgentSteerParams
@@ -3080,6 +3081,114 @@ export interface AgentResourceEvent {
    * What it became.
    */
   state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stream_generation: string
+}
+/**
+ * The agent resources a view installs when it starts or resynchronises.
+ *
+ * A view is told what changed, one transition at a time, and a view whose queue overflowed was
+ * told to discard what it held. Neither of those is a way back to the truth on its own: the
+ * events it missed are gone from its queue, and what it still holds is a partial history. This is
+ * the way back. It is taken at one position of the broker's stream, and it holds every resource
+ * the broker is still arbitrating at that position.
+ *
+ * The two fit together at exactly one place. Everything this describes happened at or before
+ * `cursor`; every event delivered after this snapshot was taken carries a higher position. So a
+ * view installs the resources here, then applies the events whose `sequence` is above `cursor`
+ * and ignores the rest, and has the whole stream with nothing counted twice.
+ */
+export interface AgentResourceSnapshot {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * Every resource the broker is still arbitrating.
+   */
+  resources: PendingResource[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stream_generation: string
+}
+/**
+ * One pending resource, as the broker publishes it.
+ */
+export interface PendingResource {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  classification: NativeClassification
+  /**
+   * The upstream's own deadline, where it stated one.
+   */
+  deadline_ms: TimestampMs | null
+  /**
+   * Whether the record of this resource is durable or only in memory.
+   */
+  durability: 'durable' | 'volatile'
+  /**
+   * True when its interpretation has been verified under a granted decoder.
+   *
+   * Section 11: "A pending opaque request is not an actionable approval UI until its
+   * interpretation is verified under the granted decoder."
+   */
+  interpretation_verified: boolean
+  /**
+   * What kind of thing it is.
+   */
+  kind: 'approval' | 'reverse_rpc' | 'upstream_action'
+  /**
+   * The upstream method that produced it.
+   */
+  method: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at: string
+  request: DownstreamRequestId
+  /**
+   * This resource's identity.
+   */
+  resource_id: string
+  /**
+   * The source frame generation the request arrived in.
+   */
+  source_generation: string
+  /**
+   * Its current state.
+   */
+  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+}
+/**
+ * How the table classified that method, and whether it said so.
+ */
+export interface NativeClassification {
+  /**
+   * What the request is taken to do.
+   */
+  class: 'observation' | 'mutation' | 'credential_or_configuration' | 'unsupported'
+  /**
+   * True when the table listed the method; false when the class was presumed.
+   */
+  declared: boolean
+}
+/**
+ * The namespaced downstream identifier the upstream used.
+ */
+export interface DownstreamRequestId {
+  /**
+   * The connection the identifier belongs to.
+   */
+  connection: string
+  /**
+   * An upstream JSON-RPC request identifier, in its JSON form: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.
+   */
+  upstream: string
 }
 /**
  * Parameters of `agent.snapshot`.
@@ -9733,6 +9842,7 @@ export interface EventsSubscribeParams {
  * The result of `events.subscribe`.
  */
 export interface EventsSubscribeResult {
+  agent_resources: AgentResourceSnapshot1
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9750,6 +9860,28 @@ export interface EventsSubscribeResult {
    * The stream identifier notifications will carry.
    */
   stream_id: string
+}
+/**
+ * The agent resources this subscription starts from.
+ *
+ * It is taken with the subscription rather than fetched beside it, and that is what makes it
+ * usable: the queue this call returns begins at the same moment, so a resolution is either in
+ * the state described here or in the events that follow, never in neither. A view applies the
+ * events whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.
+ */
+export interface AgentResourceSnapshot1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * Every resource the broker is still arbitrating.
+   */
+  resources: PendingResource[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stream_generation: string
 }
 /**
  * A range of output the worker can no longer replay.
@@ -12163,82 +12295,6 @@ export interface PairStatusResult {
           reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
         }
       }
-}
-/**
- * One pending resource, as the broker publishes it.
- */
-export interface PendingResource {
-  /**
-   * One foreground application within a terminal session.
-   */
-  application_instance_id: string
-  classification: NativeClassification
-  /**
-   * The upstream's own deadline, where it stated one.
-   */
-  deadline_ms: TimestampMs | null
-  /**
-   * Whether the record of this resource is durable or only in memory.
-   */
-  durability: 'durable' | 'volatile'
-  /**
-   * True when its interpretation has been verified under a granted decoder.
-   *
-   * Section 11: "A pending opaque request is not an actionable approval UI until its
-   * interpretation is verified under the granted decoder."
-   */
-  interpretation_verified: boolean
-  /**
-   * What kind of thing it is.
-   */
-  kind: 'approval' | 'reverse_rpc' | 'upstream_action'
-  /**
-   * An upstream method name, as a connector's declarative or rich table names it.
-   */
-  method: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  recorded_at: string
-  request: DownstreamRequestId
-  /**
-   * This resource's identity.
-   */
-  resource_id: string
-  /**
-   * The source frame generation the request arrived in.
-   */
-  source_generation: string
-  /**
-   * Its current state.
-   */
-  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
-}
-/**
- * How the table classified that method, and whether it said so.
- */
-export interface NativeClassification {
-  /**
-   * What the request is taken to do.
-   */
-  class: 'observation' | 'mutation' | 'credential_or_configuration' | 'unsupported'
-  /**
-   * True when the table listed the method; false when the class was presumed.
-   */
-  declared: boolean
-}
-/**
- * The namespaced downstream identifier the upstream used.
- */
-export interface DownstreamRequestId {
-  /**
-   * The connection the identifier belongs to.
-   */
-  connection: string
-  /**
-   * An upstream JSON-RPC request identifier, in its JSON form: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.
-   */
-  upstream: string
 }
 /**
  * Parameters of `plugin.action.invoke`.
@@ -16248,7 +16304,7 @@ export interface ResyncRequired {
   /**
    * Why.
    */
-  reason: 'send_queue_full' | 'history_evicted' | 'projection_reset'
+  reason: 'send_queue_full' | 'history_evicted' | 'projection_reset' | 'agent_stream_gap'
 }
 /**
  * One retained log view, with the gap retention left in it.

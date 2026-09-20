@@ -971,15 +971,51 @@ pub struct ResourceTransition {
 }
 
 /// Where one authorised observer reads the resolutions of the instance it watches.
+///
+/// Its queue ends for two different reasons and the difference is the whole contract. An observer
+/// that fell behind has its queue taken away and may take another one, because the resolutions it
+/// missed are still the session's to deliver. A connection that has been torn down has its
+/// observation ended, and no later queue may be registered for it: one that was would be a queue
+/// nothing produces into and nothing closes, held for as long as the process runs.
 #[derive(Debug)]
 pub struct Observations {
+    connection: GatewayConnectionId,
     events: tokio::sync::mpsc::Receiver<ResourceTransition>,
+    /// Set when this connection's observation has been ended for good.
+    ///
+    /// It is shared with the registry's own entry, and the registry sets it while it holds its
+    /// lock. That is what makes [`Observations::resubscribe`] a decision rather than a race: a
+    /// withdrawal that happened before it is seen here, and one that happens after it finds the
+    /// new queue and closes it.
+    ended: Arc<std::sync::atomic::AtomicBool>,
+    registry: Observatory,
 }
 
 impl Observations {
-    /// Waits for the next resolution, or ends when the subscription is withdrawn.
+    /// Waits for the next resolution, or ends when this queue is taken away.
     pub async fn next(&mut self) -> Option<ResourceTransition> {
         self.events.recv().await
+    }
+
+    /// Takes a fresh queue for the same connection, unless its observation has ended.
+    ///
+    /// Returns false when the connection has been torn down, which is the signal to stop
+    /// delivering rather than an error.
+    pub fn resubscribe(&mut self) -> bool {
+        let Some(events) = self
+            .registry
+            .reinstate(self.connection, &Arc::clone(&self.ended))
+        else {
+            return false;
+        };
+        self.events = events;
+        true
+    }
+
+    /// Returns the connection whose resolutions this reads.
+    #[must_use]
+    pub const fn connection(&self) -> GatewayConnectionId {
+        self.connection
     }
 }
 
@@ -995,11 +1031,19 @@ impl Observations {
 /// watching instead of taking delivery away from it.
 #[derive(Clone, Debug, Default)]
 pub struct Observatory {
-    watching: Arc<
-        std::sync::Mutex<
-            BTreeMap<GatewayConnectionId, tokio::sync::mpsc::Sender<ResourceTransition>>,
-        >,
-    >,
+    watching: Arc<std::sync::Mutex<BTreeMap<GatewayConnectionId, Watcher>>>,
+}
+
+/// One connection's place in the registry.
+#[derive(Debug)]
+struct Watcher {
+    /// Where its resolutions go, while it has a queue.
+    ///
+    /// Absent between falling behind and taking a fresh queue: the entry stays so that a
+    /// withdrawal in that interval still finds the connection and ends it.
+    sender: Option<tokio::sync::mpsc::Sender<ResourceTransition>>,
+    /// Set when this connection's observation has ended for good.
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Observatory {
@@ -1013,39 +1057,84 @@ impl Observatory {
     #[must_use]
     pub fn subscribe(&self, connection: GatewayConnectionId) -> Observations {
         let (sender, events) = tokio::sync::mpsc::channel(MAX_QUEUED_OBSERVATIONS);
-        self.held().insert(connection, sender);
-        Observations { events }
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.held().insert(
+            connection,
+            Watcher {
+                sender: Some(sender),
+                ended: Arc::clone(&ended),
+            },
+        );
+        Observations {
+            connection,
+            events,
+            ended,
+            registry: self.clone(),
+        }
     }
 
-    /// Withdraws one connection's subscription.
+    /// Ends one connection's observation.
+    ///
+    /// This is teardown, not a queue that filled: nothing may observe this connection again. The
+    /// mark is set before the entry goes, and it is the same mark the holder of the subscription
+    /// reads, so an observer that is in the middle of taking a fresh queue is refused one.
     pub fn withdraw(&self, connection: GatewayConnectionId) {
-        self.held().remove(&connection);
+        let mut held = self.held();
+        if let Some(watcher) = held.remove(&connection) {
+            watcher
+                .ended
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Gives one connection a fresh queue, unless its observation has ended.
+    ///
+    /// The check and the registration are one step under this lock, so a withdrawal cannot land
+    /// between them and leave a queue behind that nothing will ever close.
+    fn reinstate(
+        &self,
+        connection: GatewayConnectionId,
+        ended: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<tokio::sync::mpsc::Receiver<ResourceTransition>> {
+        let mut held = self.held();
+        if ended.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let (sender, events) = tokio::sync::mpsc::channel(MAX_QUEUED_OBSERVATIONS);
+        held.insert(
+            connection,
+            Watcher {
+                sender: Some(sender),
+                ended: Arc::clone(ended),
+            },
+        );
+        Some(events)
     }
 
     /// Delivers one transition to every authorised observer of its instance.
     ///
     /// Who is authorised is the broker's answer and the broker passes it: a connection is told
-    /// about an instance only if it is one of that instance's own connections. A subscriber that has fallen [`MAX_QUEUED_OBSERVATIONS`]
-    /// behind is withdrawn rather than allowed to grow, because a queue that cannot be bounded is
-    /// a queue that ends the session it belongs to.
+    /// about an instance only if it is one of that instance's own connections. A subscriber that
+    /// has fallen [`MAX_QUEUED_OBSERVATIONS`] behind loses its queue rather than being allowed to
+    /// grow, because a queue that cannot be bounded is a queue that ends the session it belongs
+    /// to. Its place in the registry stays, because losing a queue is not the end of the
+    /// connection: what it missed is recovered from the outbox when it takes a fresh one.
     pub fn publish(&self, authorised: &[GatewayConnectionId], transition: &ResourceTransition) {
         let mut held = self.held();
         for connection in authorised {
-            let Some(sender) = held.get(connection) else {
+            let Some(watcher) = held.get_mut(connection) else {
+                continue;
+            };
+            let Some(sender) = watcher.sender.as_ref() else {
                 continue;
             };
             if sender.try_send(transition.clone()).is_err() {
-                held.remove(connection);
+                watcher.sender = None;
             }
         }
     }
 
-    fn held(
-        &self,
-    ) -> std::sync::MutexGuard<
-        '_,
-        BTreeMap<GatewayConnectionId, tokio::sync::mpsc::Sender<ResourceTransition>>,
-    > {
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<GatewayConnectionId, Watcher>> {
         self.watching
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

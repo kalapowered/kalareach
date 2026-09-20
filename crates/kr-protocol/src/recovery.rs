@@ -87,6 +87,13 @@ pub struct EventsSubscribeResult {
     /// Present when the requested cursor was already evicted, so the client must discard its
     /// partial state and install a new snapshot.
     pub gap: Nullable<HistoryGap>,
+    /// The agent resources this subscription starts from.
+    ///
+    /// It is taken with the subscription rather than fetched beside it, and that is what makes it
+    /// usable: the queue this call returns begins at the same moment, so a resolution is either in
+    /// the state described here or in the events that follow, never in neither. A view applies the
+    /// events whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.
+    pub agent_resources: crate::projection::AgentResourceSnapshot,
 }
 
 /// A range of output the worker can no longer replay.
@@ -221,6 +228,9 @@ pub enum ResyncReason {
     HistoryEvicted,
     /// The canonical grid was replaced, for instance by a buffer switch.
     ProjectionReset,
+    /// Transitions the subscriber had not seen were announced and never recorded, so no replay
+    /// can return them and the only complete state is a fresh snapshot.
+    AgentStreamGap,
 }
 
 impl ResyncReason {
@@ -231,6 +241,7 @@ impl ResyncReason {
             Self::SendQueueFull => "send_queue_full",
             Self::HistoryEvicted => "history_evicted",
             Self::ProjectionReset => "projection_reset",
+            Self::AgentStreamGap => "agent_stream_gap",
         }
     }
 }

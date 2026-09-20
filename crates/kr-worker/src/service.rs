@@ -4010,6 +4010,11 @@ impl WorkerService {
         // been created, so it is charged to that subscriber's own bound. It is the first thing in
         // the queue and therefore still the first thing the client receives.
         session.install_projection(params.attachment_id)?;
+        // The broker's own state, taken while this session's lock is still held. Delivery to views
+        // runs under that lock, so no transition can be published between the queue starting above
+        // and this snapshot: a resolution is in the state described here or in the events that
+        // follow it, and the cursor says which.
+        let agent_resources = self.broker.resource_snapshot();
         let oldest = session.snapshot().oldest_retained_cursor.get();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is
@@ -4032,6 +4037,11 @@ impl WorkerService {
             from_cursor: U64::new(cursor),
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
+            agent_resources: kr_protocol::projection::AgentResourceSnapshot {
+                stream_generation: U64::new(agent_resources.cursor.generation),
+                cursor: U64::new(agent_resources.cursor.sequence),
+                resources: agent_resources.resources,
+            },
         })
     }
 

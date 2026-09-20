@@ -828,12 +828,43 @@ pub struct AgentResourceEvent {
     pub causal_root: String,
     /// The binding revision in force when it changed.
     pub binding_revision: crate::ids::AgentBindingRevision,
+    /// Which run of the broker's stream this event's position belongs to.
+    ///
+    /// Positions are unique inside one generation and are not comparable across two: a transition
+    /// announced while the journal was faulted spends a position that was never written down, and
+    /// the next run of the host numbers from what it did write. A view compares sequences only
+    /// with those of the same generation, and treats a change of generation as the instruction to
+    /// discard what it held and install a fresh [`AgentResourceSnapshot`].
+    pub stream_generation: U64,
     /// This event's position in the broker's ordered stream of transitions.
     pub sequence: U64,
     /// The event itself, which never changes and never repeats.
     pub event_id: crate::scalars::Uuid,
     /// The previous event about this same resource, where there is one.
     pub parent_sequence: Nullable<U64>,
+}
+
+/// The agent resources a view installs when it starts or resynchronises.
+///
+/// A view is told what changed, one transition at a time, and a view whose queue overflowed was
+/// told to discard what it held. Neither of those is a way back to the truth on its own: the
+/// events it missed are gone from its queue, and what it still holds is a partial history. This is
+/// the way back. It is taken at one position of the broker's stream, and it holds every resource
+/// the broker is still arbitrating at that position.
+///
+/// The two fit together at exactly one place. Everything this describes happened at or before
+/// `cursor`; every event delivered after this snapshot was taken carries a higher position. So a
+/// view installs the resources here, then applies the events whose `sequence` is above `cursor`
+/// and ignores the rest, and has the whole stream with nothing counted twice.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResourceSnapshot {
+    /// Which run of the broker's stream `cursor` belongs to.
+    pub stream_generation: U64,
+    /// The position this state is current at.
+    pub cursor: U64,
+    /// Every resource the broker is still arbitrating.
+    pub resources: Vec<crate::gateway::PendingResource>,
 }
 
 /// One thing a projected attachment is sent, in the order the session produced it.

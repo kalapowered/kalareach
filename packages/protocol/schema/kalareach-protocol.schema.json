@@ -1269,6 +1269,10 @@
         "state": {
           "$ref": "#/$defs/PendingState",
           "description": "What it became."
+        },
+        "stream_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "Which run of the broker's stream this event's position belongs to.\n\nPositions are unique inside one generation and are not comparable across two: a transition\nannounced while the journal was faulted spends a position that was never written down, and\nthe next run of the host numbers from what it did write. A view compares sequences only\nwith those of the same generation, and treats a change of generation as the instruction to\ndiscard what it held and install a fresh [`AgentResourceSnapshot`]."
         }
       },
       "required": [
@@ -1282,9 +1286,37 @@
         "actor_id",
         "causal_root",
         "binding_revision",
+        "stream_generation",
         "sequence",
         "event_id",
         "parent_sequence"
+      ],
+      "type": "object"
+    },
+    "AgentResourceSnapshot": {
+      "additionalProperties": false,
+      "description": "The agent resources a view installs when it starts or resynchronises.\n\nA view is told what changed, one transition at a time, and a view whose queue overflowed was\ntold to discard what it held. Neither of those is a way back to the truth on its own: the\nevents it missed are gone from its queue, and what it still holds is a partial history. This is\nthe way back. It is taken at one position of the broker's stream, and it holds every resource\nthe broker is still arbitrating at that position.\n\nThe two fit together at exactly one place. Everything this describes happened at or before\n`cursor`; every event delivered after this snapshot was taken carries a higher position. So a\nview installs the resources here, then applies the events whose `sequence` is above `cursor`\nand ignores the rest, and has the whole stream with nothing counted twice.",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The position this state is current at."
+        },
+        "resources": {
+          "description": "Every resource the broker is still arbitrating.",
+          "items": {
+            "$ref": "#/$defs/PendingResource"
+          },
+          "type": "array"
+        },
+        "stream_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "Which run of the broker's stream `cursor` belongs to."
+        }
+      },
+      "required": [
+        "stream_generation",
+        "cursor",
+        "resources"
       ],
       "type": "object"
     },
@@ -10161,6 +10193,10 @@
       "additionalProperties": false,
       "description": "The result of `events.subscribe`.",
       "properties": {
+        "agent_resources": {
+          "$ref": "#/$defs/AgentResourceSnapshot",
+          "description": "The agent resources this subscription starts from.\n\nIt is taken with the subscription rather than fetched beside it, and that is what makes it\nusable: the queue this call returns begins at the same moment, so a resolution is either in\nthe state described here or in the events that follow, never in neither. A view applies the\nevents whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest."
+        },
         "from_cursor": {
           "$ref": "#/$defs/U64",
           "description": "The cursor the subscription starts from."
@@ -10189,7 +10225,8 @@
         "stream_id",
         "from_cursor",
         "oldest_retained_cursor",
-        "gap"
+        "gap",
+        "agent_resources"
       ],
       "type": "object"
     },
@@ -21686,6 +21723,11 @@
           "const": "projection_reset",
           "description": "The canonical grid was replaced, for instance by a buffer switch.",
           "type": "string"
+        },
+        {
+          "const": "agent_stream_gap",
+          "description": "Transitions the subscriber had not seen were announced and never recorded, so no replay\ncan return them and the only complete state is a fresh snapshot.",
+          "type": "string"
         }
       ]
     },
@@ -28308,6 +28350,9 @@
     },
     "agent_resource_event": {
       "$ref": "#/$defs/AgentResourceEvent"
+    },
+    "agent_resource_snapshot": {
+      "$ref": "#/$defs/AgentResourceSnapshot"
     },
     "agent_snapshot_params": {
       "$ref": "#/$defs/AgentSnapshotParams"

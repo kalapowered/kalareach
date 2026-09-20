@@ -269,6 +269,35 @@ pub struct TransitionEvent {
     pub recorded_at: TimestampMs,
 }
 
+/// One bounded page of recorded transitions, and whether the backlog continues past it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventPage {
+    /// The events this page carries, in stream order.
+    pub events: Vec<TransitionEvent>,
+    /// Whether more events remain after the last one here.
+    pub more: bool,
+}
+
+/// What one recovered event counts against a page's byte bound.
+///
+/// It measures the row rather than the frame the event is eventually encoded into: this bound is
+/// on what a recovery allocates while it reads, and the queue the event then goes to has its own
+/// bound on what it costs a subscriber. The fixed part covers the identifiers, the states and the
+/// timestamps, which are the same size in every row; the variable part is the causal root, which
+/// is the only field an upstream decides the length of.
+fn event_bytes(event: &TransitionEvent) -> usize {
+    /// Identifiers, revisions, states, classes, timestamps and the two sequences.
+    const FIXED: usize = 192;
+    FIXED
+        .saturating_add(event.causal_root.len())
+        .saturating_add(
+            event
+                .actor_id
+                .as_ref()
+                .map_or(0, |actor| actor.as_str().len()),
+        )
+}
+
 /// Reads one stored classification back.
 fn class_from(text: &str) -> Result<kr_protocol::gateway::NativeMethodClass> {
     kr_protocol::gateway::NativeMethodClass::ALL
@@ -507,6 +536,11 @@ impl Ledger {
                      application_instance_id BLOB PRIMARY KEY,
                      consumed_cursor         INTEGER NOT NULL,
                      updated_at_ms           INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS broker_stream (
+                     id            INTEGER PRIMARY KEY CHECK (id = 0),
+                     generation    INTEGER NOT NULL,
+                     advanced_at_ms INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS broker_client_requests (
                      intent_id               BLOB PRIMARY KEY,
@@ -1001,32 +1035,41 @@ impl Ledger {
         Ok(latest)
     }
 
-    /// Reads the transitions recorded after one cursor, in order.
+    /// Reads one bounded page of the transitions recorded after one cursor, in order.
     ///
-    /// Section 13 / 24: if the requested sequence is greater than the highest event recorded in
-    /// the ledger, the cursor is out of bounds (for example, from an uncommitted volatile sequence
-    /// or evidence gap in a previous process instance). Under the cursor-reset contract, the effective
-    /// cursor is reset to 0 so that subsequent durable events are never hidden from reconnecting
-    /// observers.
+    /// A page is what one read allocates and one recovery carries, so it is bounded twice: by the
+    /// number of events and by what they measure. A backlog larger than a page is read as several
+    /// pages, and the caller continues from the cursor the page ends at, so neither the memory a
+    /// recovery takes nor the time this holds the broker is a function of how far behind one
+    /// observer fell.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the read fails or a row is unreadable.
-    pub fn events_after(&self, sequence: u64) -> Result<Vec<TransitionEvent>> {
-        let highest = self.highest_event()?;
-        let effective_sequence = if sequence > highest { 0 } else { sequence };
+    pub fn events_after(
+        &self,
+        sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<EventPage> {
+        // One row over the page, so a full page is distinguished from a page that ends the
+        // backlog without a second read.
+        let wanted = max_events.saturating_add(1);
         let mut statement = self
             .connection
             .prepare(
                 "SELECT sequence, event_id, application_instance_id, resource_id,
                         binding_revision, state, class, declared, content, durability, cause,
                         actor_id, causal_root, parent_sequence, recorded_at_ms
-                 FROM broker_events WHERE sequence > ?1 ORDER BY sequence",
+                 FROM broker_events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
             )
             .map_err(BrokerError::ledger)?;
         let rows = statement
             .query_map(
-                params![i64::try_from(effective_sequence).unwrap_or(i64::MAX)],
+                params![
+                    i64::try_from(sequence).unwrap_or(i64::MAX),
+                    i64::try_from(wanted).unwrap_or(i64::MAX)
+                ],
                 |row| {
                     Ok(StoredEvent {
                         sequence: row.get(0)?,
@@ -1050,37 +1093,53 @@ impl Ledger {
             .map_err(BrokerError::ledger)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(BrokerError::ledger)?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(TransitionEvent {
-                    sequence: u64::try_from(row.sequence).unwrap_or_default(),
-                    event_id: uuid_from(&row.event_id)?,
-                    application_instance_id: ApplicationInstanceId::new(uuid_from(&row.instance)?),
-                    resource_id: PendingResourceId::new(uuid_from(&row.resource)?),
-                    binding_revision: kr_protocol::ids::AgentBindingRevision::new(
-                        u64::try_from(row.revision).unwrap_or_default(),
-                    ),
-                    state: state_from(&row.state)?,
-                    classification: NativeClassification {
-                        class: class_from(&row.class)?,
-                        declared: row.declared != 0,
-                    },
-                    content: content_from(&row.content)?,
-                    durability: durability_from(&row.durability)?,
-                    cause: cause_from(&row.cause)?,
-                    actor_id: row
-                        .actor_id
-                        .map(kr_protocol::ids::ActorId::new)
-                        .transpose()
-                        .map_err(|error| BrokerError::ledger(format!("a stored actor: {error}")))?,
-                    causal_root: row.causal_root,
-                    parent_sequence: row
-                        .parent_sequence
-                        .map(|sequence| u64::try_from(sequence).unwrap_or_default()),
-                    recorded_at: TimestampMs::new(u64::try_from(row.recorded).unwrap_or_default()),
-                })
-            })
-            .collect()
+        let mut more = rows.len() > max_events;
+        let mut events = Vec::with_capacity(rows.len().min(max_events));
+        let mut measured = 0_usize;
+        for row in rows.into_iter().take(max_events) {
+            let event = Self::event_from(row)?;
+            let cost = event_bytes(&event);
+            // The first event of a page is carried whatever it measures: a page that refused it
+            // would never advance, and an observer would wait for a recovery that cannot begin.
+            if !events.is_empty() && measured.saturating_add(cost) > max_bytes {
+                more = true;
+                break;
+            }
+            measured = measured.saturating_add(cost);
+            events.push(event);
+        }
+        Ok(EventPage { events, more })
+    }
+
+    /// Reads one stored event row back.
+    fn event_from(row: StoredEvent) -> Result<TransitionEvent> {
+        Ok(TransitionEvent {
+            sequence: u64::try_from(row.sequence).unwrap_or_default(),
+            event_id: uuid_from(&row.event_id)?,
+            application_instance_id: ApplicationInstanceId::new(uuid_from(&row.instance)?),
+            resource_id: PendingResourceId::new(uuid_from(&row.resource)?),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(
+                u64::try_from(row.revision).unwrap_or_default(),
+            ),
+            state: state_from(&row.state)?,
+            classification: NativeClassification {
+                class: class_from(&row.class)?,
+                declared: row.declared != 0,
+            },
+            content: content_from(&row.content)?,
+            durability: durability_from(&row.durability)?,
+            cause: cause_from(&row.cause)?,
+            actor_id: row
+                .actor_id
+                .map(kr_protocol::ids::ActorId::new)
+                .transpose()
+                .map_err(|error| BrokerError::ledger(format!("a stored actor: {error}")))?,
+            causal_root: row.causal_root,
+            parent_sequence: row
+                .parent_sequence
+                .map(|sequence| u64::try_from(sequence).unwrap_or_default()),
+            recorded_at: TimestampMs::new(u64::try_from(row.recorded).unwrap_or_default()),
+        })
     }
 
     /// Records that an answer to one resource has left this host.
@@ -1588,36 +1647,38 @@ impl Ledger {
 
     // -- adapter checkpoints ------------------------------------------------------------------
 
-    /// Advances and returns the stream generation for this ledger instance.
+    /// Advances and returns the generation of this broker's stream of transitions.
     ///
-    /// Every broker restart advances the generation counter so reconnecting consumers
-    /// can distinguish event sequence domains.
+    /// Sequence numbers are unique inside one generation and are not comparable across two. A
+    /// stretch the journal could not take is announced and not recorded, so the numbers it spent
+    /// are not in the outbox, and the next process resumes the numbering above what *was*
+    /// recorded — which hands the same numbers to different events. The generation is what makes
+    /// that safe to read: it advances once, here, each time the broker opens, so a cursor that
+    /// names an earlier generation is known to belong to another sequence domain and is replayed
+    /// from the start of the stream instead of being compared with numbers it does not share.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the read or write fails.
-    pub fn stream_generation(&self) -> Result<u64> {
-        let key = [0xFF_u8; 16];
+    pub fn advance_stream_generation(&self) -> Result<u64> {
         let current: Option<i64> = self
             .connection
             .query_row(
-                "SELECT consumed_cursor FROM broker_checkpoints WHERE application_instance_id = ?1",
-                params![key.as_slice()],
+                "SELECT generation FROM broker_stream WHERE id = 0",
+                [],
                 |row| row.get(0),
             )
             .optional()
             .map_err(BrokerError::ledger)?;
-        let next = current.map_or(1, |c| c.saturating_add(1));
+        let next = current.map_or(1, |generation| generation.saturating_add(1));
         self.connection
             .execute(
-                "INSERT INTO broker_checkpoints
-                     (application_instance_id, consumed_cursor, updated_at_ms)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT (application_instance_id) DO UPDATE SET
-                     consumed_cursor = excluded.consumed_cursor,
-                     updated_at_ms = excluded.updated_at_ms",
+                "INSERT INTO broker_stream (id, generation, advanced_at_ms)
+                 VALUES (0, ?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET
+                     generation = excluded.generation,
+                     advanced_at_ms = excluded.advanced_at_ms",
                 params![
-                    key.as_slice(),
                     next,
                     i64::try_from(kr_ipc::now_ms().get()).unwrap_or(i64::MAX)
                 ],
@@ -1714,7 +1775,7 @@ fn uuid_from(bytes: &[u8]) -> Result<Uuid> {
 mod tests {
     use super::*;
     use crate::broker::process::{BrokerTransport, ManagedProcess, TransportHandle};
-    use crate::broker::{Broker, Credential};
+    use crate::broker::{Broker, Credential, MAX_REPLAY_BYTES, MAX_REPLAY_EVENTS};
     use kr_protocol::broker::{
         BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, IntegrationMode,
         OfferedDecision,
@@ -1997,7 +2058,7 @@ mod tests {
             .expect("the request is forwarded");
         assert!(forwarded.request.is_some());
         assert!(recorded.is_some());
-        let initial_events = broker.transitions_after(0).expect("outbox reads");
+        let initial_events = outbox_of(&broker);
         assert_eq!(initial_events.len(), 1);
         let first_seq = initial_events[0].sequence;
         assert_eq!(initial_events[0].parent_sequence, None);
@@ -2023,7 +2084,7 @@ mod tests {
             "an event the outbox will not take rolls back the transition"
         );
 
-        let outbox_after_failure = broker.transitions_after(0).expect("outbox reads");
+        let outbox_after_failure = outbox_of(&broker);
         assert_eq!(
             outbox_after_failure.len(),
             1,
@@ -2047,7 +2108,7 @@ mod tests {
             .expect("the retry succeeds");
         assert!(retried.is_some());
 
-        let outbox = broker.transitions_after(0).expect("outbox reads");
+        let outbox = outbox_of(&broker);
         assert_eq!(outbox.len(), 2);
         assert_eq!(
             outbox[1].parent_sequence,
@@ -2058,6 +2119,20 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(path.parent().expect("parent dir"));
+    }
+
+    /// Everything the outbox holds, read the way a recovery reads it.
+    fn outbox_of(broker: &crate::broker::Broker) -> Vec<TransitionEvent> {
+        let mut cursor = broker.stream_start();
+        let mut recorded = Vec::new();
+        loop {
+            let replay = broker.replay_after(cursor).expect("the outbox reads");
+            recorded.extend(replay.events);
+            cursor = replay.cursor;
+            if !replay.more {
+                return recorded;
+            }
+        }
     }
 
     /// One transition event, as a settle writes beside the change it records.
@@ -2128,7 +2203,11 @@ mod tests {
         );
         assert!(stale.is_err());
         assert_eq!(
-            ledger.events_after(0).expect("the outbox reads").len(),
+            ledger
+                .events_after(0, MAX_REPLAY_EVENTS, MAX_REPLAY_BYTES)
+                .expect("the outbox reads")
+                .events
+                .len(),
             4,
             "the record, the interpretation, the claim and the resolution, and nothing for the \
              refused settle"

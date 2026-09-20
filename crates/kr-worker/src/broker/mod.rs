@@ -394,6 +394,51 @@ pub struct StopOutcome {
     pub attachments_remaining: usize,
 }
 
+/// How many transitions one replay page carries at most.
+pub const MAX_REPLAY_EVENTS: usize = 256;
+
+/// How many bytes of transition one replay page carries at most.
+pub const MAX_REPLAY_BYTES: usize = 1024 * 1024;
+
+/// Where a consumer of this broker's transitions is, and which stream those numbers belong to.
+///
+/// A sequence alone is not a position. It is unique inside one generation and reused across two,
+/// because a stretch the journal could not take spends numbers that the next process hands out
+/// again. Carrying the generation with the sequence is what makes a saved position readable after
+/// a restart: the same generation means the number can be compared, and a different one means the
+/// consumer is holding a position in a stream that no longer exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayCursor {
+    /// The generation those sequence numbers were issued in.
+    pub generation: u64,
+    /// The last position the consumer accounted for.
+    pub sequence: u64,
+}
+
+/// One bounded page of what a consumer missed, and what it must do about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionReplay {
+    /// The recovered transitions, in stream order.
+    pub events: Vec<crate::broker::ledger::TransitionEvent>,
+    /// Where this page ends, to continue from.
+    pub cursor: ReplayCursor,
+    /// True when the cursor named another generation and this page starts the stream again.
+    pub reset: bool,
+    /// True when something after the cursor was announced and never recorded, so it is lost.
+    pub gap: bool,
+    /// True when the backlog continues after this page.
+    pub more: bool,
+}
+
+/// What this broker holds now, with the position that state is current at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceSnapshot {
+    /// The position the state below is current at.
+    pub cursor: ReplayCursor,
+    /// Every resource the broker is still arbitrating.
+    pub resources: Vec<PendingResource>,
+}
+
 /// The broker's whole state and its ledger, behind one lock.
 #[derive(Debug)]
 struct BrokerState {
@@ -438,6 +483,13 @@ struct BrokerState {
     next_event: u64,
     /// The generation of this broker stream instance, advanced on every restart.
     stream_generation: u64,
+    /// The highest position this broker announced and could not record.
+    ///
+    /// A transition made while the journal is faulted is published and not written, so no replay
+    /// can return it. Keeping the highest of those is what lets a recovery say that something
+    /// after a consumer's cursor is gone, rather than handing back a shorter history and letting
+    /// the consumer believe it is complete.
+    unrecorded_after: u64,
 }
 
 /// The tables one installation was qualified with, as the installation pinned them.
@@ -503,7 +555,10 @@ impl Broker {
         // last announced under comes back with it, so the next event about one this host was
         // already answering names that event as its parent rather than starting a second chain.
         let next_event = ledger.highest_event()?.saturating_add(1);
-        let stream_generation = ledger.stream_generation()?;
+        // One generation per open. Sequence numbers are unique inside a generation and mean
+        // nothing across two, because a stretch the journal could not take spends numbers that the
+        // next process hands out again.
+        let stream_generation = ledger.advance_stream_generation()?;
         let announced: BTreeMap<PendingResourceId, u64> =
             ledger.latest_events()?.into_iter().collect();
         Ok(Self {
@@ -526,6 +581,7 @@ impl Broker {
                 announced,
                 next_event,
                 stream_generation,
+                unrecorded_after: 0,
             }),
         })
     }
@@ -1153,6 +1209,8 @@ impl Broker {
         );
         if state.volatile.writes_are_durable() {
             state.ledger.record_opaque(&resource, &event)?;
+        } else {
+            state.announced_without_record(&event);
         }
         state.remember(&event);
         state.publish(&resource, &event);
@@ -2519,25 +2577,89 @@ impl Broker {
         self.state().watchers.clone()
     }
 
-    /// Reads the transitions this broker recorded after one cursor, in order.
+    /// Reads one bounded page of the transitions this broker recorded after one cursor.
     ///
-    /// This is the outbox a consumer replays from after it has been away. What it returns is what
-    /// was committed with each transition, so nothing here was announced and not recorded.
+    /// This is the outbox a consumer replays from after it has been away, and what it returns says
+    /// three things beyond the events themselves.
+    ///
+    /// * **Where the cursor belongs.** A cursor names the generation its numbers came from. One
+    ///   that names an earlier generation is not comparable with this stream's numbers, so the
+    ///   page is read from the start of the stream and marked `reset`: the consumer discards what
+    ///   it held rather than continuing a count that means something else now.
+    /// * **What cannot be recovered.** A transition announced while the journal was faulted was
+    ///   never written, so no read can return it. When one of those falls after the cursor the
+    ///   page is marked `gap`, and the consumer tells its views to resynchronise rather than
+    ///   presenting a history with a hole in it.
+    /// * **Where to continue.** The page ends at `cursor`, and `more` says whether the backlog
+    ///   continues. The broker's lock is taken for one page and given back, so a consumer that is
+    ///   far behind does not hold every other caller behind its own read.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the records cannot be read.
-    pub fn transitions_after(
-        &self,
-        sequence: u64,
-    ) -> Result<Vec<crate::broker::ledger::TransitionEvent>> {
-        self.state().ledger.events_after(sequence)
+    pub fn replay_after(&self, cursor: ReplayCursor) -> Result<TransitionReplay> {
+        let state = self.state();
+        let generation = state.stream_generation;
+        let reset = cursor.generation != generation;
+        let from = if reset { 0 } else { cursor.sequence };
+        let page = state
+            .ledger
+            .events_after(from, MAX_REPLAY_EVENTS, MAX_REPLAY_BYTES)?;
+        // An announcement the journal could not take spends a number that no read returns. The
+        // highest of those is enough to answer the only question a consumer asks: was anything
+        // after my cursor lost for good?
+        let gap = state.unrecorded_after > from;
+        let sequence = page.events.last().map_or(from, |event| event.sequence);
+        Ok(TransitionReplay {
+            events: page.events,
+            cursor: ReplayCursor {
+                generation,
+                sequence,
+            },
+            reset,
+            gap,
+            more: page.more,
+        })
     }
 
-    /// Returns the stream generation for this broker instance, advanced on every restart.
+    /// Returns where a consumer that has seen nothing of this broker's stream starts.
+    #[must_use]
+    pub fn stream_start(&self) -> ReplayCursor {
+        ReplayCursor {
+            generation: self.state().stream_generation,
+            sequence: 0,
+        }
+    }
+
+    /// Returns the generation of this broker's stream, advanced on every restart.
     #[must_use]
     pub fn stream_generation(&self) -> u64 {
         self.state().stream_generation
+    }
+
+    /// Returns the resources this broker still holds, as a consumer installs them.
+    ///
+    /// This is what a view that lost its place restores from. It is taken under the broker's own
+    /// lock with the cursor it is current at, so the two agree: every transition this broker had
+    /// committed when the snapshot was taken is in the state it describes, and every one after it
+    /// carries a sequence above the cursor. A view that installs this and then ignores the events
+    /// it has already accounted for has the whole stream and no duplicates.
+    #[must_use]
+    pub fn resource_snapshot(&self) -> ResourceSnapshot {
+        let state = self.state();
+        ResourceSnapshot {
+            cursor: ReplayCursor {
+                generation: state.stream_generation,
+                // The position of the last event this broker announced. `next_event` is the
+                // position the next one will take.
+                sequence: state.next_event.saturating_sub(1),
+            },
+            resources: state
+                .arbitration
+                .iter()
+                .map(|pending| pending.resource.clone())
+                .collect(),
+        }
     }
 
     /// Returns every connection that observes one instance, so a resolution is fanned out to all
@@ -3222,6 +3344,14 @@ impl BrokerState {
         }
     }
 
+    /// Notes one position that was announced and could not be written.
+    ///
+    /// No read returns it, so a consumer reading from below it is told that something after its
+    /// cursor is lost rather than handed a shorter history it would take for a complete one.
+    fn announced_without_record(&mut self, event: &crate::broker::ledger::TransitionEvent) {
+        self.unrecorded_after = self.unrecorded_after.max(event.sequence);
+    }
+
     /// Records one written event as the latest about its resource, so the next names it.
     ///
     /// A resource that has reached a state nothing follows has no next event, so it stops being
@@ -3269,7 +3399,7 @@ impl BrokerState {
     /// manufactured durable history section 11 forbids. The event goes with it or not at all, so
     /// the outbox never records a transition the ledger does not hold.
     fn write_transition(
-        &self,
+        &mut self,
         transition: &Transition,
         now: TimestampMs,
         event: &crate::broker::ledger::TransitionEvent,
@@ -3279,6 +3409,7 @@ impl BrokerState {
         // keeps `durability = volatile` for ever, because that is what its history was; its later
         // transitions are still written down.
         if !self.volatile.writes_are_durable() {
+            self.announced_without_record(event);
             return Ok(());
         }
         self.ledger.settle_pending(
