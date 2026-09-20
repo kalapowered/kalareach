@@ -773,33 +773,37 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
 
     // An enrolment signed by somebody who is not the collection's owner.
     assert!(
-        RestoreRequest {
-            archive_id: archive_id(),
-            publication: &publication,
-            descriptor_len: sealed.descriptor_bytes.len(),
-            enrolment: &enrolment,
-            owner_key: impostor.owner.public(),
-            writer_key: producer.writer.public(),
-            generation: GenerationExpectation::Unverified,
-        }
-        .verify()
-        .is_err(),
+        matches!(
+            RestoreRequest {
+                archive_id: archive_id(),
+                publication: &publication,
+                descriptor_len: sealed.descriptor_bytes.len(),
+                enrolment: &enrolment,
+                owner_key: impostor.owner.public(),
+                writer_key: producer.writer.public(),
+                generation: GenerationExpectation::Unverified,
+            }
+            .verify(),
+            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
+        ),
         "the enrolment is verified against the owner's own key"
     );
 
     // A writer key that is not the one the owner enrolled.
     assert!(
-        RestoreRequest {
-            archive_id: archive_id(),
-            publication: &publication,
-            descriptor_len: sealed.descriptor_bytes.len(),
-            enrolment: &enrolment,
-            owner_key: producer.owner.public(),
-            writer_key: impostor.writer.public(),
-            generation: GenerationExpectation::Unverified,
-        }
-        .verify()
-        .is_err(),
+        matches!(
+            RestoreRequest {
+                archive_id: archive_id(),
+                publication: &publication,
+                descriptor_len: sealed.descriptor_bytes.len(),
+                enrolment: &enrolment,
+                owner_key: producer.owner.public(),
+                writer_key: impostor.writer.public(),
+                generation: GenerationExpectation::Unverified,
+            }
+            .verify(),
+            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
+        ),
         "a writer the bundle supplied is checked against the owner's enrolment"
     );
 
@@ -809,33 +813,37 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
         signature: impostor.publish(&sealed).signature,
     };
     assert!(
-        RestoreRequest {
-            archive_id: archive_id(),
-            publication: &forged,
-            descriptor_len: sealed.descriptor_bytes.len(),
-            enrolment: &enrolment,
-            owner_key: producer.owner.public(),
-            writer_key: producer.writer.public(),
-            generation: GenerationExpectation::Unverified,
-        }
-        .verify()
-        .is_err(),
+        matches!(
+            RestoreRequest {
+                archive_id: archive_id(),
+                publication: &forged,
+                descriptor_len: sealed.descriptor_bytes.len(),
+                enrolment: &enrolment,
+                owner_key: producer.owner.public(),
+                writer_key: producer.writer.public(),
+                generation: GenerationExpectation::Unverified,
+            }
+            .verify(),
+            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
+        ),
         "the publication's own signature is verified under the enrolled writer"
     );
 
     // A publication for another archive than the one being restored.
     assert!(
-        RestoreRequest {
-            archive_id: ArchiveId::new(Uuid::from_bytes([0x99; 16])),
-            publication: &publication,
-            descriptor_len: sealed.descriptor_bytes.len(),
-            enrolment: &enrolment,
-            owner_key: producer.owner.public(),
-            writer_key: producer.writer.public(),
-            generation: GenerationExpectation::Unverified,
-        }
-        .verify()
-        .is_err(),
+        matches!(
+            RestoreRequest {
+                archive_id: ArchiveId::new(Uuid::from_bytes([0x99; 16])),
+                publication: &publication,
+                descriptor_len: sealed.descriptor_bytes.len(),
+                enrolment: &enrolment,
+                owner_key: producer.owner.public(),
+                writer_key: producer.writer.public(),
+                generation: GenerationExpectation::Unverified,
+            }
+            .verify(),
+            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
+        ),
         "the caller's own expectation is checked before any signature"
     );
 
@@ -860,7 +868,7 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
     assert!(refusal.to_string().contains("generation 4"));
 
     // A descriptor over section 20's byte limit fails before anything else.
-    assert!(
+    assert!(matches!(
         RestoreRequest {
             archive_id: archive_id(),
             publication: &publication,
@@ -870,9 +878,9 @@ fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
             writer_key: producer.writer.public(),
             generation: GenerationExpectation::Unverified,
         }
-        .verify()
-        .is_err()
-    );
+        .verify(),
+        Err(kr_controller::error::ControllerError::PermissionDenied { .. })
+    ));
 }
 
 /// The table's answers, which are the decision a restore acts on rather than a gate over bytes.
@@ -1252,4 +1260,85 @@ fn unpersisted_obligations_keep_outstanding_nonzero_when_store_cannot_write() {
             .any(|item| item.contains("record the backup fence")),
         "the unpersisted obligation is reported: {obligations:?}"
     );
+}
+
+#[test]
+fn a_late_upload_acknowledgement_while_fenced_does_not_enqueue_publication() {
+    let mut environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let admitted = environment
+        .service()
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            PrivacyGeneration::new(0),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+
+    // The upload outbox entry is dispatched to the service.
+    environment
+        .service()
+        .note_dispatched(admitted.sequence)
+        .expect("dispatched");
+
+    // Privacy mode is enabled: fence is recorded.
+    let fenced = environment.service.fence(PrivacyGeneration::new(1));
+    assert_eq!(fenced.queues, 1);
+    let cancelled = environment
+        .service
+        .cancel_undispatched(PrivacyGeneration::new(1));
+    assert_eq!(cancelled.in_flight, 1);
+
+    // Now the in-flight uploads complete while fenced.
+    let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+    environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            objects[0].object_id(),
+            TimestampMs::new(6_000),
+        )
+        .expect("upload noted");
+    let complete = environment
+        .service()
+        .note_object_uploaded(
+            archive_id(),
+            BackupGeneration::new(1),
+            manifest_id,
+            TimestampMs::new(6_001),
+        )
+        .expect("manifest upload noted");
+    assert!(complete);
+
+    // It was the last object, but because the host was fenced, NO publish entry was enqueued into outbox!
+    let outbox = environment.service().outbox().expect("outbox");
+    assert!(
+        outbox.is_empty(),
+        "no publish step may be enqueued while fenced: {outbox:?}"
+    );
+
+    // The generation was settled as Cancelled rather than Uploading/Published.
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("read")
+        .expect("record");
+    assert_eq!(record.state, GenerationState::Cancelled);
+
+    // When the fence is released later, nothing becomes dispatchable.
+    environment.service().release_fence().expect("release");
+    let outbox_after = environment
+        .service()
+        .outbox()
+        .expect("outbox after release");
+    assert!(outbox_after.is_empty());
 }

@@ -19,7 +19,7 @@ use kr_protocol::archive::{
     ArchiveCheckpoint, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
     RecoveryKit, TrustedProducer, TrustedWriter,
 };
-use kr_protocol::scalars::{KeyId, StoredEnvelopeKey, TimestampMs, U64};
+use kr_protocol::scalars::{Bytes, KeyId, StoredEnvelopeKey, TimestampMs, U64};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
@@ -488,16 +488,32 @@ pub struct Migrated {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfflineExport {
     /// The encrypted recovery bundle, as the service holds it.
-    pub encrypted_bundle: Vec<u8>,
+    pub encrypted_bundle: Bytes,
     /// The archive's public descriptor bytes.
-    pub descriptor: Vec<u8>,
+    pub descriptor: Bytes,
     /// The encrypted archive manifest object.
-    pub encrypted_manifest: Vec<u8>,
+    pub encrypted_manifest: Bytes,
     /// The selected member objects' encrypted bytes.
-    pub objects: Vec<Vec<u8>>,
+    pub objects: Vec<Bytes>,
 }
 
 impl OfflineExport {
+    /// Constructs one offline export.
+    #[must_use]
+    pub fn new(
+        encrypted_bundle: Vec<u8>,
+        descriptor: Vec<u8>,
+        encrypted_manifest: Vec<u8>,
+        objects: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            encrypted_bundle: Bytes::new(encrypted_bundle),
+            descriptor: Bytes::new(descriptor),
+            encrypted_manifest: Bytes::new(encrypted_manifest),
+            objects: objects.into_iter().map(Bytes::new).collect(),
+        }
+    }
+
     /// Encodes this offline export into its canonical KR-CBOR-1 bytes.
     ///
     /// # Errors
@@ -513,10 +529,14 @@ impl OfflineExport {
     ///
     /// Returns [`RecoveryError::Cbor`] when the bytes cannot be decoded.
     pub fn from_canonical_slice(bytes: &[u8]) -> Result<Self> {
-        Ok(kr_cbor::from_canonical_slice(
-            bytes,
-            &kr_cbor::Limits::DEFAULT,
-        )?)
+        let limits = kr_cbor::Limits {
+            max_message_len: bytes.len().max(kr_cbor::Limits::DEFAULT.max_message_len),
+            max_bytes_len: bytes.len().max(kr_cbor::Limits::DEFAULT.max_bytes_len),
+            max_collection_len: 65_536,
+            max_items: 1_000_000,
+            ..kr_cbor::Limits::DEFAULT
+        };
+        Ok(kr_cbor::from_canonical_slice(bytes, &limits)?)
     }
 }
 

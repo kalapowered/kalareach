@@ -1176,12 +1176,12 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
     let (_, encrypted_bundle) = SyncBackupService::fetch(service.as_ref(), LOCATOR)
         .await
         .expect("the encrypted bundle");
-    let export = OfflineExport {
+    let export = OfflineExport::new(
         encrypted_bundle,
-        descriptor: sealed.descriptor_bytes.clone(),
-        encrypted_manifest: sealed.encrypted_manifest.clone(),
-        objects: vec![staged.bytes().to_vec()],
-    };
+        sealed.descriptor_bytes.clone(),
+        sealed.encrypted_manifest.clone(),
+        vec![staged.bytes().to_vec()],
+    );
     let bytes = export.to_canonical_bytes().expect("canonical bytes");
     assert!(
         !contains(&bytes, b"notes.cbor"),
@@ -1192,13 +1192,13 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
     let restored = OfflineExport::from_canonical_slice(&bytes).expect("the export");
     let key = seed.bundle_key_for(&context(ORIGIN)).expect("a key");
     let offline_bundle =
-        kr_crypto::archive::decrypt_recovery_bundle(&key, &restored.encrypted_bundle)
+        kr_crypto::archive::decrypt_recovery_bundle(&key, restored.encrypted_bundle.as_slice())
             .expect("the bundle opens offline");
     let writers: Vec<TrustedWriter> = offline_bundle.trusted_writers.iter().cloned().collect();
     // The producer key comes out of the exported bundle, not out of anything the restoring device
     // was handed: the export is the encrypted bundle and the archive's own ciphertext.
     let descriptor =
-        kr_crypto::backup::read_descriptor(&restored.descriptor).expect("a descriptor");
+        kr_crypto::backup::read_descriptor(restored.descriptor.as_slice()).expect("a descriptor");
     let sender = offline_bundle
         .trusted_producers
         .iter()
@@ -1214,12 +1214,17 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
             archive_id: archive_id(),
             generation: GenerationExpectation::Unverified,
         },
-        &restored.descriptor,
-        &restored.encrypted_manifest,
+        restored.descriptor.as_slice(),
+        restored.encrypted_manifest.as_slice(),
     )
     .expect("the exported archive opens");
     let object = opened
-        .restore_object(&reader, &sender, staged.object_id(), &restored.objects[0])
+        .restore_object(
+            &reader,
+            &sender,
+            staged.object_id(),
+            restored.objects[0].as_slice(),
+        )
         .expect("the exported object restores");
     assert_eq!(object.plaintext.expose(), b"kept offline");
 }

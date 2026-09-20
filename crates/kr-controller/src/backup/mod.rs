@@ -512,9 +512,14 @@ impl BackupService {
 
         let mut rows: Vec<ObjectRecord> = Vec::with_capacity(objects.len() + 1);
         let mut staged_bytes = 0u64;
+        let mut written_paths = Vec::new();
         for staged in objects {
             let path = store.staged_path(archive_id, backup_generation, staged.object_id());
-            write_staged(&path, staged.bytes())?;
+            if let Err(error) = write_staged(&path, staged.bytes()) {
+                cleanup_staged(&written_paths);
+                return Err(error);
+            }
+            written_paths.push(path.clone());
             staged_bytes = staged_bytes.saturating_add(staged.bytes().len() as u64);
             rows.push(ObjectRecord {
                 archive_id,
@@ -531,7 +536,11 @@ impl BackupService {
         // and a generation is complete only when it has arrived too.
         let manifest = &sealed.descriptor.encrypted_manifest;
         let manifest_path = store.staged_path(archive_id, backup_generation, manifest.object_id);
-        write_staged(&manifest_path, &sealed.encrypted_manifest)?;
+        if let Err(error) = write_staged(&manifest_path, &sealed.encrypted_manifest) {
+            cleanup_staged(&written_paths);
+            return Err(error);
+        }
+        written_paths.push(manifest_path.clone());
         staged_bytes = staged_bytes.saturating_add(sealed.encrypted_manifest.len() as u64);
         rows.push(ObjectRecord {
             archive_id,
@@ -555,7 +564,13 @@ impl BackupService {
             settled_at_ms: None,
             detail: None,
         };
-        let sequence = store.admit(&record, &rows, now_ms)?;
+        let sequence = match store.admit(&record, &rows, now_ms) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                cleanup_staged(&written_paths);
+                return Err(error);
+            }
+        };
         Ok(Admitted {
             archive_id,
             backup_generation,
@@ -841,6 +856,13 @@ impl BackupService {
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
     pub fn fenced_at(&self) -> Result<Option<u64>> {
         self.store().fenced_at()
+    }
+}
+
+/// Removes staged ciphertext files that were written before staging failed.
+fn cleanup_staged(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
     }
 }
 

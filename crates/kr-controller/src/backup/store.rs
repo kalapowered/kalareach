@@ -554,6 +554,47 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         let complete = outstanding == 0 && !GenerationState::parse(&state)?.is_settled();
         if complete {
+            let fenced_at: Option<i64> = transaction
+                .query_row(
+                    "SELECT privacy_generation FROM fence WHERE id = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(ControllerError::registry)?;
+            if let Some(fenced_at) = fenced_at {
+                // When fenced, no new publication work may be enqueued into outbox. Settle the
+                // generation as cancelled rather than leaving publication work to be dispatched
+                // after fence release.
+                transaction
+                    .execute(
+                        "DELETE FROM outbox
+                         WHERE archive_id = ?1 AND backup_generation = ?2",
+                        params![
+                            archive_id.get().as_bytes().as_slice(),
+                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                transaction
+                    .execute(
+                        "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
+                         WHERE archive_id = ?1 AND backup_generation = ?2",
+                        params![
+                            archive_id.get().as_bytes().as_slice(),
+                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                            GenerationState::Cancelled.as_str(),
+                            millis(now_ms),
+                            format!(
+                                "privacy mode fenced backup production at privacy generation {fenced_at} before publication was enqueued"
+                            ),
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                transaction.commit().map_err(ControllerError::registry)?;
+                return Ok(true);
+            }
+
             // Exactly one publish entry, and the upload entry goes with it. A second
             // acknowledgement of an object that had already arrived would otherwise enqueue a
             // second publication, and reconciliation would resume an upload that had finished.
