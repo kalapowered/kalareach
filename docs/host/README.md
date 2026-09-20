@@ -3062,6 +3062,15 @@ by the full process identity this host recorded. Closing a KalaReach attachment 
 application keeps running in the worker's pseudo-terminal. A backend this host did not launch is
 never claimed or stopped as owned, however the instance ended.
 
+The terminal is watched as a process, for as long as it runs. A socket reaching end of file and the
+process behind it exiting are two events in either order, and neither bounds the other: a terminal
+can close its connection and go on running for an hour, and a terminal whose connection stays open
+can exit at once. So what decides is the process, and the watch outlives the connection: a terminal
+that exits long after its attachment closed still ends its instance and still stops the backend
+this host dedicated to it. The backend is asked to stop, given the grace period, forced if it has
+not gone, and then waited for, so what is reported is what actually happened rather than what was
+signalled.
+
 ## The gateway
 
 A native terminal reaches its upstream through a path core code alone interprets. The connector
@@ -3130,6 +3139,60 @@ Every action records how it actually reached the upstream: a typed remote proced
 authenticated hook response, or terminal input. Terminal input is never an authoritative typed
 result, and the vocabulary says so rather than leaving it to a caller's judgement.
 
+## The connection owner
+
+One live connection has one supervised owner. It holds both ends, both byte-bounded queues, the
+correlation of both directions and the fate of every frame. Nothing else writes to either end, and
+nothing else decides what a write meant.
+
+Three separations are the whole of the contract.
+
+**Direction.** Both parties mint request identifiers and neither knows what the other has used, so
+the upstream's request `7` and this host's request `7` are different requests. Every identifier
+this host mints carries a reserved prefix, so the two sets are disjoint before anything is looked
+up. An upstream that mints one in that namespace is refused before its request is counted,
+recorded, retained or allowed to suspend anything, and so is a client that tries.
+
+**Stages of a write.** Queueing a frame, writing its bytes and the upstream acting on it are three
+facts, and a later one is never reported for an earlier one. Queueing says the owner has the frame
+and has reserved the bytes for it. What reached the socket is what the owner reports once the write
+has finished or its deadline has passed. And for a request, the upstream's own reply is what says
+it was acted on: a reply that never comes is `UPSTREAM_UNAVAILABLE`, and a receipt says `applied`
+for the acknowledgement and for nothing earlier. A frame that goes out in part is uncertainty and
+never a success, and it is never written again.
+
+**Queue bounds in bytes.** A queue bounded by frame count accepts an unbounded number of bytes, so
+each end bounds what is waiting for it in bytes. A connection whose peer has stopped draining
+becomes `UPSTREAM_UNAVAILABLE` rather than a growing buffer.
+
+No reader waits for the other end. A frame bound for a terminal that has stopped reading holds up
+that terminal's writer and nothing else: the upstream reader goes on correlating the
+acknowledgements behind it, and what the write turns out to be is work the writer does, in the
+order the frames were written. That is where a resource is settled from an answer's write, where a
+client request's intent is marked with what became of it, and where a write that did not finish
+ends the connection rather than quietly losing every frame after it.
+
+The native terminal's own traffic has a route. A frame it writes that names a method is its own
+request or notification, not an answer, and it goes through the same native admission an upstream
+request does: the method is classified with the table this host pinned, the bytes are retained as a
+source event of the instance, and the intent is recorded before anything is written. A method the
+table does not classify suspends that instance's rich mutations first, so an unclassified request
+cannot act while rich mutations are still enabled. A request is then rewritten under an identifier
+of this host's, the terminal's own identifier is kept, and the upstream's reply goes back under the
+identifier the terminal used. What this host holds for those is bounded and each entry has a
+deadline: an upstream that reads requests and never answers them cannot grow that map, and a
+terminal whose request is given up is told rather than left waiting. A connection that ends gives
+up everything still waiting on it.
+
+Every state a resource reaches is committed with the record that announces it, in one transaction,
+because a crash between the two would lose an event about a change that did happen. The event
+carries its own identifier, its position in this broker's stream, the subject and the binding
+revision it changed under, and how the request behind it was classified; the position continues
+across a restart above everything the ledger already holds. Publication happens where the
+transition is committed, so every authorised observer is told in the order the transitions
+committed in, and a connection observes the instance it was opened against and nothing else. An
+observer that has stopped reading is withdrawn rather than grown.
+
 ## Volatile-native mode
 
 When the journal faults during live traffic the gateway enters `native_only_volatile`, atomically:
@@ -3173,9 +3236,17 @@ first frame under a deadline, refuses anything a browser would have added, authe
 the process and the private exchange, opens the gateway connection against the tables this host
 pinned, registers that connection's transport as the instance's own, subscribes the connection to
 the resolutions of the instance it speaks for, and serves both ends until one closes. Teardown
-takes the transport back, closes the connection and withdraws the subscription; a terminal this
-host started and that has exited stops its dedicated backend through the normal grace period, and a
-connection that closes while that terminal is running stops nothing.
+closes admission on both ends, lets the writers finish what was already queued, joins them, takes
+the transport back, closes the connection and withdraws the subscription. It stops nothing of the
+terminal's: what the terminal does is the terminal's own supervision's, and that is still running
+when the connection has gone.
+
+Launching is the other half of the same composition. It checks the launch intent against the
+foreground it was prepared against, starts the executable the profile names with the registration
+and credential paths in its environment and nothing secret in its arguments, reads back from the
+kernel what it actually started, generates the private exchange, writes the owner-only credential
+file, registers the instance against that record, and writes the registration file last, so a
+forwarder that reads it reads a complete one and the credential it names already exists.
 
 A connection carrying any header a browser adds — `origin`, `referer`, `sec-fetch-site`,
 `sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method` — is refused. A page that

@@ -1043,6 +1043,22 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
     let mut client = cli(&host).await;
+    // A real terminal attachment on this connection, taken before anything is outstanding. Its
+    // identifier is what the lease, the keystrokes and the interrupt all name.
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            action_target(&host),
+            &terminal_attachment(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the terminal attaches")
+        .to_typed()
+        .expect("decodes");
+    let attachment_id = attached.attachment.attachment_id;
+
     // The connection's own keepalive runs on its own timer, started when the connection was
     // established. The prompt is sent part way through that interval, so the beat this test waits
     // for falls inside the window in which the prompt is outstanding rather than racing the
@@ -1070,27 +1086,21 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         "the prompt reached the transport"
     );
 
-    // The same connection asks for the lease, interrupts and reads its own receipt, and every one
-    // of those is answered while the prompt is still outstanding.
+    // The same connection takes the input lease, types, interrupts and reads its own receipt, and
+    // every one of those succeeds while the prompt is still outstanding.
     let lease = MutationRequest {
         request_id: RequestId::new(22),
         method: Method::InputAcquire.into(),
         method_version: MethodVersion::V1,
         action_id: ActionId::new(kr_ipc::new_uuid()),
         grant_id: Nullable::null(),
-        target: ActionTarget {
-            environment_id: host.environment_id,
-            session_id: Nullable::some(host.session_id),
-            session_epoch: Nullable::some(SessionEpoch::V1),
-            application_instance_id: Nullable::null(),
-            agent_binding_revision: Nullable::null(),
-        },
+        target: action_target(&host),
         expected: ParamsValue::empty(),
         action_window_id: client.action_window().action_window_id.clone(),
         requested_ttl_ms: DurationMs::new(60_000),
         params: ParamsValue::from_typed(&kr_protocol::input::InputAcquireParams {
             session_id: host.session_id,
-            attachment_id: kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
+            attachment_id,
             expected_epoch: Nullable::null(),
         })
         .expect("encodes"),
@@ -1101,6 +1111,45 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         .await
         .expect("writes the lease request");
 
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let leased: kr_protocol::input::InputAcquireResult =
+        answer_to(&mut client, RequestId::new(22), deadline)
+            .await
+            .expect("the lease is granted while the prompt is outstanding")
+            .to_typed()
+            .expect("decodes");
+    let epoch = leased.lease.epoch;
+
+    // Keystrokes, under the lease this connection holds.
+    client
+        .writer()
+        .write_message(&ControlFrame::Request(Request {
+            request_id: RequestId::new(24),
+            method: Method::InputWrite.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::input::InputWriteParams {
+                session_id: host.session_id,
+                attachment_id,
+                epoch,
+                sequence: kr_protocol::ids::InputSequence::new(0),
+                bytes: kr_protocol::scalars::Bytes::new(b"hello".to_vec()),
+            })
+            .expect("encodes"),
+        }))
+        .await
+        .expect("writes the input");
+    let written: kr_protocol::input::InputWriteResult =
+        answer_to(&mut client, RequestId::new(24), deadline)
+            .await
+            .expect("the keystrokes are accepted while the prompt is outstanding")
+            .to_typed()
+            .expect("decodes");
+    assert_eq!(
+        written.forwarded_bytes.get(),
+        5,
+        "every byte the person typed reached the terminal"
+    );
+
     // An interrupt on the same connection, which is the other thing section 12 has this socket
     // carry while a mutation is outstanding.
     let interrupt = MutationRequest {
@@ -1109,20 +1158,14 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         method_version: MethodVersion::V1,
         action_id: ActionId::new(kr_ipc::new_uuid()),
         grant_id: Nullable::null(),
-        target: ActionTarget {
-            environment_id: host.environment_id,
-            session_id: Nullable::some(host.session_id),
-            session_epoch: Nullable::some(SessionEpoch::V1),
-            application_instance_id: Nullable::null(),
-            agent_binding_revision: Nullable::null(),
-        },
+        target: action_target(&host),
         expected: ParamsValue::empty(),
         action_window_id: client.action_window().action_window_id.clone(),
         requested_ttl_ms: DurationMs::new(60_000),
         params: ParamsValue::from_typed(&kr_protocol::input::InputInterruptParams {
             session_id: host.session_id,
-            attachment_id: kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            attachment_id,
+            epoch,
             action: kr_protocol::input::InterruptAction::NativeInterrupt,
         })
         .expect("encodes"),
@@ -1132,40 +1175,21 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         .write_message(&ControlFrame::Mutation(Box::new(interrupt)))
         .await
         .expect("writes the interrupt");
-
-    // The answers come back in the order this connection can produce them, and the one for the
-    // prompt is not among them until the upstream has spoken.
-    let mut lease_answered = false;
-    let mut interrupt_answered = false;
-    let mut prompt_answered = false;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !lease_answered || !interrupt_answered {
-        let frame = tokio::time::timeout_at(deadline, client.recv())
+    let interrupted: kr_protocol::input::InputLeaseResult =
+        answer_to(&mut client, RequestId::new(23), deadline)
             .await
-            .expect("this connection keeps answering")
-            .expect("the worker answers");
-        match frame {
-            ControlFrame::Response(response) => {
-                if response.request_id == RequestId::new(22) {
-                    lease_answered = true;
-                } else if response.request_id == RequestId::new(23) {
-                    interrupt_answered = true;
-                } else if response.request_id == RequestId::new(21) {
-                    prompt_answered = true;
-                }
-            }
-            ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
-            other => panic!("the worker answered {other:?}"),
-        }
-    }
-    assert!(
-        !prompt_answered,
-        "the prompt is not answered before its upstream has said anything"
+            .expect("the interrupt is carried out while the prompt is outstanding")
+            .to_typed()
+            .expect("decodes");
+    assert_eq!(
+        interrupted.lease.epoch, epoch,
+        "the interrupt ran under the lease this connection holds"
     );
+
     assert_eq!(
         receipt(&mut client, action_id).await.state,
         kr_protocol::receipt::ReceiptState::Dispatching,
-        "and its receipt says the operation is with the upstream"
+        "and the prompt's receipt still says the operation is with the upstream"
     );
 
     // The connection's own keepalive is read straight off the socket, because the ordinary client
@@ -1195,6 +1219,70 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         "the connection's keepalive went out while the prompt was outstanding"
     );
     assert!(matches!(answered, Outcome::Ok(_)), "{answered:?}");
+
+    // And the operation the upstream acknowledged is applied, which is what the receipt the caller
+    // reads has to say once its own answer has arrived.
+    let mut client = cli(&host).await;
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        kr_protocol::receipt::ReceiptState::Applied,
+        "the upstream acknowledged it, so the receipt says so"
+    );
+}
+
+/// The target every mutation of this connection acts on.
+fn action_target(host: &Host) -> ActionTarget {
+    ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(host.session_id),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    }
+}
+
+/// A terminal attachment that asks to observe and to type.
+fn terminal_attachment(session_id: SessionId) -> kr_protocol::attachment::SessionAttachParams {
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    requested.insert(kr_protocol::attachment::AttachmentCapability::Input);
+    kr_protocol::attachment::SessionAttachParams {
+        session_id,
+        mode: kr_protocol::attachment::AttachMode::Terminal,
+        claim_geometry: false,
+        dimensions: Nullable::some(Dimensions::new(80, 24)),
+        // Declared, because the worker has to know what this terminal's keys mean before it will
+        // carry a person's keystrokes to the application.
+        terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+        requested,
+    }
+}
+
+/// Reads this connection's answer to one request, ignoring everything else it carries.
+async fn answer_to(
+    client: &mut LocalClient,
+    request_id: RequestId,
+    deadline: tokio::time::Instant,
+) -> Result<ParamsValue, kr_protocol::error::ProtocolError> {
+    loop {
+        let frame = tokio::time::timeout_at(deadline, client.recv())
+            .await
+            .expect("this connection keeps answering")
+            .expect("the worker answers");
+        match frame {
+            ControlFrame::Response(response) if response.request_id == request_id => {
+                return match response.outcome {
+                    Outcome::Ok(value) => Ok(value),
+                    Outcome::Error(failure) => Err(failure),
+                };
+            }
+            ControlFrame::Response(_)
+            | ControlFrame::Notification(_)
+            | ControlFrame::Event(_)
+            | ControlFrame::Receipt(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    }
 }
 
 /// Lets the transport go once, from a loop that may come round again.
@@ -1202,4 +1290,141 @@ fn release_once(release: &mut Option<tokio::sync::oneshot::Sender<()>>) {
     if let Some(release) = release.take() {
         let _ = release.send(());
     }
+}
+
+/// The connector table this host pins for the real transport below.
+fn upstream_table() -> kr_protocol::gateway::DeclarativeTable {
+    let mut table = kr_protocol::gateway::DeclarativeTable {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        table_version: kr_protocol::ids::MethodTableVersion::new(1),
+        upstream_protocol_version: "1".to_owned(),
+        digest: Digest256::from_bytes([1; 32]),
+        framing: kr_protocol::gateway::NativeFraming::JsonLines,
+        request_id_field: "id".to_owned(),
+        response_id_field: "id".to_owned(),
+        method_field: "method".to_owned(),
+        params_field: "params".to_owned(),
+        result_field: "result".to_owned(),
+        error_field: "error".to_owned(),
+        entries: vec![kr_protocol::gateway::DeclarativeEntry {
+            method: kr_protocol::ids::UpstreamMethod::new("session/prompt").expect("valid"),
+            class: kr_protocol::gateway::NativeMethodClass::Mutation,
+            expects_response: true,
+            approval_option_field: Nullable::null(),
+            reverse: Nullable::null(),
+        }],
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    table
+}
+
+/// The closed rich table that names the method a prompt goes out as.
+fn upstream_rich() -> kr_protocol::gateway::RichMethodTable {
+    kr_protocol::gateway::RichMethodTable {
+        table_version: kr_protocol::ids::MethodTableVersion::new(1),
+        upstream_protocol_version: "1".to_owned(),
+        entries: vec![kr_protocol::gateway::RichMethodEntry {
+            method: kr_protocol::ids::UpstreamMethod::new("session/prompt").expect("valid"),
+            class: kr_protocol::gateway::NativeMethodClass::Mutation,
+            required_right: kr_protocol::rights::ActionRight::AgentPrompt,
+            operation: Nullable::some(kr_protocol::gateway::RichOperation::PromptSubmit),
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        }],
+    }
+}
+
+/// KR-REQ-09 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
+/// nobody can read as applied.
+///
+/// The transport here is the real one, over a real socket pair. The upstream reads the whole frame
+/// and says nothing, which is the case a queue-shaped transport cannot tell from success: the
+/// bytes went, so nothing failed, and the upstream never acted, so nothing succeeded. What the
+/// caller is told and what the receipt says is that nobody can establish it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_receipt() {
+    let host = host().await;
+    register(&host, None);
+    let broker = host.service.broker();
+    broker
+        .pin_table(instance(), upstream_table(), upstream_rich())
+        .expect("the installed tables are pinned");
+    broker
+        .open_native_connection(
+            instance(),
+            &[9; 32],
+            &ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900),
+            &PluginId::new("kalareach.codex").expect("valid"),
+            "1",
+        )
+        .expect("the native connection is authenticated");
+    let (upstream_here, upstream_there) =
+        tokio::net::UnixStream::pair().expect("a socket pair is made");
+    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (owner, writes) = kr_worker::broker::Duplex::new(
+        Arc::clone(broker),
+        kr_protocol::ids::GatewayConnectionId::new(1),
+        kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+        upstream_here,
+        tokio::io::split(client_here).1,
+        kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        "agent-user",
+    );
+    let driving = tokio::spawn(writes);
+    broker
+        .bind_dispatch(instance(), owner.dispatch().expect("it carries operations"))
+        .expect("the transport is bound");
+
+    // An upstream that reads everything and answers nothing.
+    let read = Arc::new(std::sync::Mutex::new(String::new()));
+    let reading = {
+        let read = Arc::clone(&read);
+        tokio::spawn(async move {
+            let (reader, _writer) = tokio::io::split(upstream_there);
+            let mut reader = tokio::io::BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => read
+                        .lock()
+                        .expect("the record is not poisoned")
+                        .push_str(&line),
+                }
+            }
+        })
+    };
+
+    let mut client = cli(&host).await;
+    let mutation = prompt_mutation(&client, &host, 31);
+    let action_id = mutation.action_id;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        send(&mut client, mutation),
+    )
+    .await
+    .expect("the worker answers within its own deadline");
+    let Outcome::Error(failure) = outcome else {
+        panic!("an operation nobody acknowledged is not a success: {outcome:?}");
+    };
+    assert_eq!(
+        failure.code,
+        ErrorCode::UpstreamUnavailable,
+        "the transport says the upstream did not answer"
+    );
+    assert!(
+        read.lock()
+            .expect("the record is not poisoned")
+            .contains("session/prompt"),
+        "and the whole frame did reach the upstream: {}",
+        read.lock().expect("the record is not poisoned")
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown,
+        "a frame that went and was never acknowledged is never applied and never refused"
+    );
+
+    reading.abort();
+    driving.abort();
 }

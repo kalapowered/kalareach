@@ -1352,26 +1352,44 @@ async fn kr_req_12_13_traffic_in_both_directions_keeps_identifiers_that_look_ali
             br#"{"method":"session/update","params":{}}"#,
             TimestampMs::new(3),
         )
-        .await;
-    assert!(
-        matches!(
-            notification,
-            Ok(Carried::UpstreamRequest {
-                resource_id: None,
-                ..
-            }) | Err(_)
-        ),
+        .await
+        .expect("a notification is carried");
+    assert_eq!(
+        notification,
+        Carried::UpstreamRequest {
+            method: method("session/update"),
+            resource_id: None,
+        },
         "a notification names no request and resolves nothing"
     );
-    let reverse = owner
+    // The upstream reusing its own live identifier is one party naming two requests the same, and
+    // that is refused exactly, with nothing performed.
+    let duplicate = owner
         .from_upstream(
             br#"{"id":7,"method":"fs/read_text_file","params":{"path":"/nowhere"}}"#,
             TimestampMs::new(4),
         )
-        .await;
-    assert!(
-        matches!(reverse, Ok(Carried::Reverse { .. }) | Err(_)),
-        "and a reverse request under the same raw identifier is still a reverse request"
+        .await
+        .expect_err("one identifier names one live request");
+    assert_eq!(
+        duplicate.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument
+    );
+    // Under an identifier of its own it is a reverse request, refused in place because no host
+    // resource has been granted for it.
+    let reverse = owner
+        .from_upstream(
+            br#"{"id":70,"method":"fs/read_text_file","params":{"path":"/nowhere"}}"#,
+            TimestampMs::new(4),
+        )
+        .await
+        .expect("a reverse request is carried");
+    assert_eq!(
+        reverse,
+        Carried::Reverse {
+            operation: ReverseOperation::FilesystemRead,
+            performed: false,
+        }
     );
 
     // The native client asks the upstream for something of its own, also under raw seven. It goes
@@ -1525,6 +1543,25 @@ async fn settlement_of(
         if transition.resource_id == resource_id && transition.state.is_terminal() {
             return transition;
         }
+    }
+}
+
+/// Waits for one resource to reach a state nothing follows, and returns it.
+async fn settled_within(
+    broker: &Arc<Broker>,
+    resource_id: kr_protocol::ids::PendingResourceId,
+    within: std::time::Duration,
+) -> Option<PendingState> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let state = broker.pending(resource_id).map(|resource| resource.state);
+        if state.is_some_and(PendingState::is_terminal) {
+            return state;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
@@ -1772,6 +1809,269 @@ async fn kr_req_12_11_an_observer_that_falls_behind_is_withdrawn_rather_than_gro
     served.drained.abort();
 }
 
+/// Builds one owner over two in-memory pipes, for the tests that need no real socket.
+fn duplex_over_pipes(
+    broker: &Arc<Broker>,
+    capacity: usize,
+) -> (
+    Arc<Duplex>,
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    impl std::future::Future<Output = ()> + Send + use<>,
+) {
+    let (upstream_here, upstream_there) = tokio::io::duplex(capacity);
+    let (client_here, client_there) = tokio::io::duplex(capacity);
+    let (owner, writes) = Duplex::new(
+        Arc::clone(broker),
+        GatewayConnectionId::new(1),
+        Framing::new(NativeFraming::JsonLines),
+        upstream_here,
+        client_here,
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        "agent-user",
+    );
+    (owner, upstream_there, client_there, writes)
+}
+
+/// KR-REQ-12.13 and KR-REQ-09: the client's own requests are bounded, given up on a deadline, and
+/// cleared when the connection ends.
+///
+/// The upstream reads everything the terminal asks and answers none of it. What this host holds
+/// for it is bounded, the entries do not outlive their deadline, and what is still waiting when
+/// the connection ends is given back to the client rather than left in a map nobody reads.
+#[tokio::test(start_paused = true)]
+async fn kr_req_12_13_a_client_request_the_upstream_never_answers_is_bounded_and_given_up() {
+    let broker = broker();
+    let (owner, upstream, mut client, writes) = duplex_over_pipes(&broker, 1 << 20);
+    let drained = tokio::spawn(writes);
+
+    // One more request than this connection may have outstanding.
+    let bound = kr_worker::broker::MAX_FORWARDED_CLIENT_REQUESTS;
+    for id in 0..bound {
+        owner
+            .from_client(
+                format!(r#"{{"id":{id},"method":"session/update","params":{{}}}}"#).as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the terminal's own request is carried");
+    }
+    assert_eq!(owner.forwarded_client_requests(), bound);
+    let refused = owner
+        .from_client(
+            br#"{"id":9999,"method":"session/update","params":{}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect_err("a connection holds only what it can carry");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    assert_eq!(
+        owner.forwarded_client_requests(),
+        bound,
+        "and the refusal added nothing"
+    );
+
+    // The upstream reads them and answers none. The deadline is what removes them.
+    tokio::time::advance(
+        kr_worker::broker::CLIENT_REPLY_DEADLINE + std::time::Duration::from_secs(30),
+    )
+    .await;
+    for _ in 0..200 {
+        if owner.forwarded_client_requests() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        owner.forwarded_client_requests(),
+        0,
+        "nothing waits for a reply that is not coming"
+    );
+    // And the terminal is told, under its own identifiers.
+    let told = read_available(&mut client).await;
+    assert!(
+        told.contains("\"id\":0") && told.contains("error"),
+        "the client reads an error for the request it made: {}",
+        &told[..told.len().min(200)]
+    );
+
+    // What is still waiting when the connection ends is given up too.
+    owner
+        .from_client(
+            br#"{"id":4242,"method":"session/update","params":{}}"#,
+            TimestampMs::new(4),
+        )
+        .await
+        .expect("one more is carried");
+    assert_eq!(owner.forwarded_client_requests(), 1);
+    owner.shutdown();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drained).await;
+    assert_eq!(
+        owner.forwarded_client_requests(),
+        0,
+        "a connection that ended holds nothing for an upstream that will never speak again"
+    );
+    drop(upstream);
+}
+
+/// KR-REQ-11.32: teardown closes admission and both writers finish, with other handles still live.
+///
+/// A dispatch and the owner itself are held for the whole of this, which is what production does
+/// while a connection is torn down. The writers still end, nothing new is taken, and a frame
+/// queued before the shutdown still goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_teardown_closes_admission_and_joins_both_writers() {
+    let broker = broker();
+    let (owner, upstream, client, writes) = duplex_over_pipes(&broker, 1 << 20);
+    let driving = tokio::spawn(writes);
+    // Held for the whole teardown, exactly as the composition holds them.
+    let dispatch = owner.dispatch().expect("it carries operations");
+    broker
+        .bind_dispatch(
+            instance(),
+            Arc::clone(&dispatch) as Arc<dyn kr_worker::broker::UpstreamDispatch>,
+        )
+        .expect("the transport is bound");
+
+    owner
+        .from_client(
+            br#"{"id":6,"method":"session/update","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("a frame queued before the shutdown");
+    owner.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(20), driving)
+        .await
+        .expect("both writers finish even though the owner and its dispatch are still held")
+        .expect("their task is joined");
+
+    // Nothing new is taken once admission has closed.
+    let refused = owner
+        .from_client(
+            br#"{"id":7,"method":"session/update","params":{}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect_err("a connection that has stopped taking frames takes none");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    // And what was queued before it went.
+    let mut upstream = upstream;
+    let written = read_available(&mut upstream).await;
+    assert!(
+        written.contains("\"id\":\"kr-1\""),
+        "the frame admitted before the shutdown reached the upstream: {written}"
+    );
+    drop(client);
+    drop(dispatch);
+}
+
+/// Reads whatever is waiting on one pipe, without waiting for more.
+async fn read_available(stream: &mut tokio::io::DuplexStream) -> String {
+    let mut held = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read(stream, &mut chunk),
+        )
+        .await;
+        match read {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(bytes)) => held.extend_from_slice(&chunk[..bytes]),
+        }
+    }
+    String::from_utf8_lossy(&held).into_owned()
+}
+
+/// KR-REQ-11.32 and KR-REQ-09: a reader goes on correlating while the other end is not draining.
+///
+/// The terminal has stopped reading, so a frame bound for it fills the pipe and sits there for the
+/// whole write deadline. Meanwhile this host's own operation is acknowledged by the upstream. The
+/// acknowledgement is correlated and the caller is answered well inside that deadline, because
+/// what a write turns out to be is the owner's work and not the reader's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_an_acknowledgement_is_correlated_behind_a_blocked_client_bound_frame() {
+    let broker = broker();
+    let (upstream_here, upstream_there) =
+        tokio::net::UnixStream::pair().expect("a socket pair is made");
+    // A terminal that reads nothing: a frame bound for it goes in part and stops.
+    let (client_here, client_there) = tokio::io::duplex(8);
+    let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
+    let (owner, writes) = Duplex::new(
+        Arc::clone(&broker),
+        GatewayConnectionId::new(1),
+        Framing::new(NativeFraming::JsonLines),
+        upstream_writes,
+        client_here,
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        "agent-user",
+    );
+    let drained = tokio::spawn(writes);
+    broker
+        .bind_dispatch(instance(), owner.dispatch().expect("it carries operations"))
+        .expect("the transport is bound");
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let answering = acknowledge(upstream_there, Arc::clone(&sent));
+    let reading = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move { owner.serve(upstream_reads, true).await })
+    };
+
+    // The agent asks the person something. It is forwarded to a terminal that is not reading, so
+    // its bytes stop in the pipe and the writer holds it for the whole deadline.
+    let filling = "y".repeat(4096);
+    owner
+        .from_upstream(
+            format!(
+                r#"{{"id":51,"method":"session/request_permission","params":{{"why":"{filling}"}}}}"#
+            )
+            .as_bytes(),
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+
+    // And this host's own operation is acknowledged while that frame is still going nowhere.
+    let started = tokio::time::Instant::now();
+    broker
+        .agent_prompt(
+            &kr_worker::broker::Caller {
+                actor_id: ActorId::new("device-1").expect("valid"),
+                grant_id: None,
+            },
+            &kr_protocol::agent::AgentPromptParams {
+                target: target(),
+                draft_id: Nullable::null(),
+                text: Nullable::some(kr_protocol::agent::PromptText::new("hello").expect("valid")),
+            },
+            false,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the upstream acknowledged it");
+    let waited = started.elapsed();
+    assert!(
+        waited < kr_worker::broker::WRITE_DEADLINE,
+        "the acknowledgement was correlated in {waited:?}, which is not behind the blocked write"
+    );
+    assert!(
+        !sent.lock().expect("the record is not poisoned").is_empty(),
+        "the operation reached the upstream"
+    );
+
+    drop(client_there);
+    answering.abort();
+    reading.abort();
+    drained.abort();
+}
+
 /// KR-REQ-11.30 and KR-REQ-12.13: the native client's own request goes through native admission,
 /// and an unclassified one suspends rich mutations before a byte of it is written.
 ///
@@ -1804,43 +2104,48 @@ async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_bef
         .bind_dispatch(instance(), owner.dispatch().expect("it carries operations"))
         .expect("the transport is bound");
 
-    // The terminal asks its agent for something this connector's table does not list.
-    let carrying = {
-        let owner = Arc::clone(&owner);
-        tokio::spawn(async move {
-            owner
-                .from_client(
-                    br#"{"id":4,"method":"session/set_mode","params":{"mode":"yolo"}}"#,
-                    TimestampMs::new(2),
-                )
-                .await
-        })
+    // The terminal asks its agent for something this connector's table does not list. The owner
+    // takes the frame and its bytes stop in the pipe, so nothing about it has reached the agent.
+    let carried = owner
+        .from_client(
+            br#"{"id":4,"method":"session/set_mode","params":{"mode":"yolo"}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the terminal's own request is carried");
+    let Carried::ClientRequest {
+        classification,
+        suspended_rich_mutations,
+        ..
+    } = carried
+    else {
+        panic!("a request of the client's is what this was");
     };
+    assert!(
+        !classification.declared,
+        "the table did not classify it, so it is presumed a mutation"
+    );
+    assert_eq!(classification.class, NativeMethodClass::Mutation);
+    assert!(suspended_rich_mutations);
 
-    // Before any of it goes: the intent is recorded, the source is retained and rich mutations
-    // are suspended.
-    let recorded = loop {
-        let held = broker.client_requests().expect("the records read");
-        if let Some(intent) = held.first() {
-            break intent.clone();
-        }
-        assert!(!carrying.is_finished(), "the frame is still unwritten");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    };
+    // What was recorded before any of it went, and what it changed before any of it went.
+    let recorded = broker
+        .client_requests()
+        .expect("the records read")
+        .into_iter()
+        .next()
+        .expect("the request was recorded");
     assert_eq!(
         recorded.method,
         method("session/set_mode"),
         "the method the terminal named"
     );
     assert_eq!(recorded.classification.class, NativeMethodClass::Mutation);
-    assert!(
-        !recorded.classification.declared,
-        "the table did not classify it, so it is presumed a mutation"
-    );
+    assert!(!recorded.classification.declared);
     assert_eq!(
         recorded.outcome,
         kr_worker::broker::ClientRequestOutcome::Recorded,
-        "recorded before its bytes went, not after"
+        "recorded before its bytes went, not after: the pipe has not taken them"
     );
     assert!(
         recorded
@@ -1861,7 +2166,6 @@ async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_bef
         suspended.rich_mutations_suspended,
         "an unclassified request suspends rich mutations"
     );
-    assert!(!carrying.is_finished(), "and none of it has been written");
 
     // And a rich mutation is refused while that is true, which is the whole point of the order.
     let refused = broker
@@ -1886,7 +2190,6 @@ async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_bef
         "a precondition the instance has stopped meeting"
     );
 
-    carrying.abort();
     drop(upstream_there);
     drained.abort();
 }
@@ -1979,24 +2282,24 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
         .find(|resource| resource.state == PendingState::Pending)
         .expect("the request is pending");
 
-    // The person's answer is admitted, and its bytes fill the pipe and stop. What the caller is
-    // told is that nothing can be established, and the resource says so.
+    // The person's answer is admitted, and its bytes fill the pipe and stop. The owner reports
+    // what actually reached the socket, and the resource says what that was.
     let long = "x".repeat(4096);
     let answer =
         serde_json::json!({ "id": 31, "result": { "outcome": "allow", "why": long } }).to_string();
-    let refusal = owner
+    owner
         .from_client(answer.as_bytes(), TimestampMs::new(3))
         .await
-        .expect_err("a frame that went in part is not an answer that arrived");
+        .expect("the answer is admitted and queued");
+    let settled = settled_within(
+        &broker,
+        resource.resource_id,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .expect("the owner settles what it could not write");
     assert_eq!(
-        refusal.code(),
-        kr_protocol::error::ErrorCode::UpstreamUnavailable
-    );
-    assert_eq!(
-        broker
-            .pending(resource.resource_id)
-            .expect("recorded")
-            .state,
+        settled,
         PendingState::Uncertain,
         "an answer whose fate nobody can establish leaves the resource uncertain"
     );

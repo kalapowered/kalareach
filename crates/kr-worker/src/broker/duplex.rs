@@ -72,6 +72,28 @@ pub const ACKNOWLEDGEMENT_DEADLINE: std::time::Duration = std::time::Duration::f
 /// How many resolutions one observer may fall behind before its subscription is withdrawn.
 pub const MAX_QUEUED_OBSERVATIONS: usize = 64;
 
+/// How many of the native client's own requests may be awaiting an upstream reply at once.
+///
+/// Each one holds the client's identifier until the upstream answers it. An upstream that reads
+/// requests and never replies would otherwise grow that map for as long as the terminal kept
+/// asking, so the bound is what a terminal can have outstanding and the rest are refused in place.
+pub const MAX_FORWARDED_CLIENT_REQUESTS: usize = 256;
+
+/// How long one of the client's own requests waits for the upstream before it is given up.
+///
+/// It is generous, because an agent answering a person's request may be thinking for a long time,
+/// and it is finite, because an entry nothing will ever answer is an entry nothing will ever
+/// remove. When it passes, the client is told rather than left waiting on a reply that is not
+/// coming.
+pub const CLIENT_REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often the owner looks for client requests whose deadline has passed.
+///
+/// It is short because it is also how long a teardown waits for this work to notice that the
+/// connection is going, and a teardown that timed out would abandon the requests it should have
+/// given back. Scanning a bounded map once a second costs nothing.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// What every request identifier this host mints begins with.
 ///
 /// The upstream mints identifiers for the requests it sends and this host mints identifiers for
@@ -129,11 +151,39 @@ impl Queued {
     }
 }
 
-/// One frame on its way to one end of a connection.
-#[derive(Debug)]
-struct Outbound {
-    body: Vec<u8>,
-    report: tokio::sync::oneshot::Sender<Delivery>,
+/// What the owner does once it knows what reached the socket.
+///
+/// It runs in the writer's own task, in the order the frames were written, so the work that
+/// depends on a write finishing does not happen in whichever reader queued it. That is what keeps
+/// a reader reading: a frame the peer is not draining holds up the writer and nothing else.
+type AfterDelivery = Box<dyn FnOnce(Delivery) + Send>;
+
+/// One thing on its way to one end of a connection.
+enum Outbound {
+    /// A frame to write.
+    Frame {
+        body: Vec<u8>,
+        report: tokio::sync::oneshot::Sender<Delivery>,
+        after: Option<AfterDelivery>,
+    },
+    /// The end of this end's admission.
+    ///
+    /// It travels in the queue rather than beside it, so the boundary is exact: everything queued
+    /// before it is written, and nothing queued after it exists, because admission was closed
+    /// before it was sent.
+    Close,
+}
+
+impl std::fmt::Debug for Outbound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frame { body, .. } => formatter
+                .debug_struct("Frame")
+                .field("bytes", &body.len())
+                .finish(),
+            Self::Close => formatter.write_str("Close"),
+        }
+    }
 }
 
 /// One end of a connection, as something frames are queued on.
@@ -145,6 +195,7 @@ pub struct Sink {
     frames: tokio::sync::mpsc::UnboundedSender<Outbound>,
     framing: Framing,
     queued: Arc<AtomicUsize>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
     limit: usize,
 }
 
@@ -153,19 +204,36 @@ impl Sink {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UpstreamUnavailable`] when the owner has gone, or when this end
-    /// already holds [`MAX_QUEUED_BYTES`] waiting to be written. Section 11: if the framing
-    /// connection cannot safely continue, say so; do not open a hidden second backend.
+    /// Returns [`BrokerError::UpstreamUnavailable`] when this end has stopped taking frames, when
+    /// the owner has gone, or when this end already holds [`MAX_QUEUED_BYTES`] waiting to be
+    /// written. Section 11: if the framing connection cannot safely continue, say so; do not open
+    /// a hidden second backend.
     pub fn queue(&self, body: &[u8]) -> Result<Queued> {
+        self.queue_then(body, None)
+    }
+
+    /// The same, with work the owner does once it knows what reached the socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Sink::queue`] does. The work is not run when the frame is refused here,
+    /// because nothing was taken.
+    pub fn queue_then(&self, body: &[u8], after: Option<AfterDelivery>) -> Result<Queued> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BrokerError::UpstreamUnavailable {
+                detail: "this connection has stopped taking frames".to_owned(),
+            });
+        }
         let framed = self.framing.encode(body);
         self.reserve(framed.len())?;
         let (report, receiver) = tokio::sync::oneshot::channel();
         let length = framed.len();
         if self
             .frames
-            .send(Outbound {
+            .send(Outbound::Frame {
                 body: framed,
                 report,
+                after,
             })
             .is_err()
         {
@@ -175,6 +243,23 @@ impl Sink {
             });
         }
         Ok(Queued { report: receiver })
+    }
+
+    /// Stops this end taking frames, and lets the writer finish what it already holds.
+    ///
+    /// A teardown that left admission open would take an answer this host had admitted, reserve
+    /// its bytes and never write them, while its resource said it had gone.
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.frames.send(Outbound::Close);
+    }
+
+    /// Returns true when this end has stopped taking frames.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Returns how many bytes are waiting to be written to this end.
@@ -210,22 +295,47 @@ impl Sink {
 }
 
 /// Builds one end's sink and the task that empties it.
-fn sink<W>(framing: Framing, writer: W) -> (Sink, impl std::future::Future<Output = ()> + Send)
+///
+/// `failing` is the owner's own stop: a write that does not finish is a connection this host
+/// cannot go on using, and the owner is told rather than left to discover it one lost frame at a
+/// time.
+fn sink<W>(
+    framing: Framing,
+    writer: W,
+    failing: Stopping,
+) -> (Sink, impl std::future::Future<Output = ()> + Send)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (frames, queue) = tokio::sync::mpsc::unbounded_channel();
     let queued = Arc::new(AtomicUsize::new(0));
-    let draining = Arc::clone(&queued);
-    (
-        Sink {
-            frames,
-            framing,
-            queued,
-            limit: MAX_QUEUED_BYTES,
-        },
-        drain(writer, queue, draining),
-    )
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sink = Sink {
+        frames,
+        framing,
+        queued: Arc::clone(&queued),
+        closed: Arc::clone(&closed),
+        limit: MAX_QUEUED_BYTES,
+    };
+    // The writer holds the flag and not a sink. Holding a sink would hold a sender, and a
+    // connection whose every sink had been dropped would leave a writer waiting for a frame that
+    // nothing could ever queue.
+    (sink, drain(writer, queue, queued, closed, failing))
+}
+
+/// How an end tells the owner it can no longer be used.
+#[derive(Clone, Debug)]
+struct Stopping {
+    stopping: Arc<tokio::sync::Notify>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Stopping {
+    /// Ends the owner's reading.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.stopping.notify_waiters();
+    }
 }
 
 /// Writes one end's frames, one at a time, and says what happened to each.
@@ -233,21 +343,58 @@ async fn drain<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
     queued: Arc<AtomicUsize>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    failing: Stopping,
 ) {
     let mut usable = true;
     while let Some(outbound) = queue.recv().await {
-        let length = outbound.body.len();
+        let Outbound::Frame {
+            body,
+            report,
+            after,
+        } = outbound
+        else {
+            // Admission closed, and everything that was queued before it has been written.
+            break;
+        };
+        let length = body.len();
         // Once one frame has failed the stream is no longer one this host can write to, and the
         // frames behind it never went. Telling their senders so is what keeps a caller from
         // waiting on a write that will not happen.
         let delivery = if usable {
-            write_frame(&mut writer, &outbound.body).await
+            write_frame(&mut writer, &body).await
         } else {
             Delivery::Unsent
         };
         queued.fetch_sub(length, Ordering::Release);
-        usable = usable && delivery == Delivery::Transmitted;
-        let _ = outbound.report.send(delivery);
+        if usable && delivery != Delivery::Transmitted {
+            usable = false;
+            // A connection with a half-written frame on it is one nothing can go on using: the
+            // peer has seen a fragment and nothing can say what it made of it. So admission ends
+            // here and the owner stops reading, rather than every later frame being lost quietly.
+            // What is already queued is still reported, each frame as the unsent frame it is.
+            closed.store(true, Ordering::Release);
+            failing.stop();
+        }
+        finish(report, after, delivery);
+    }
+    // A frame that raced the close is one nobody wrote.
+    while let Ok(outbound) = queue.try_recv() {
+        if let Outbound::Frame { report, after, .. } = outbound {
+            finish(report, after, Delivery::Unsent);
+        }
+    }
+}
+
+/// Tells one frame's sender what happened and runs the work that waited on it.
+fn finish(
+    report: tokio::sync::oneshot::Sender<Delivery>,
+    after: Option<AfterDelivery>,
+    delivery: Delivery,
+) {
+    let _ = report.send(delivery);
+    if let Some(after) = after {
+        after(delivery);
     }
 }
 
@@ -325,6 +472,15 @@ pub struct UpstreamReply {
     pub refusal: Option<UpstreamFailure>,
 }
 
+/// One request of the client's, waiting for the upstream to answer it.
+#[derive(Clone, Debug)]
+struct Forwarded {
+    /// The identifier the client used, which its reply goes back under.
+    client: serde_json::Value,
+    /// When this host stops waiting for the upstream to answer it.
+    expires_at: tokio::time::Instant,
+}
+
 /// The requests this host has sent one upstream and not yet had answered.
 ///
 /// It is the owner's, not a dispatch's: two dispatches of one connection that each kept their own
@@ -341,7 +497,10 @@ struct Outstanding {
     /// forwarded under an identifier of this host's and the client's own is kept here. The
     /// upstream's answer comes back under this host's identifier and is written to the client
     /// under the client's, which is what "preserve upstream IDs" means from the other side.
-    forwarded: std::sync::Mutex<BTreeMap<UpstreamRequestId, serde_json::Value>>,
+    ///
+    /// It is bounded and each entry has a deadline, because the upstream decides whether a reply
+    /// ever comes and this host cannot hold a map that only the upstream can empty.
+    forwarded: std::sync::Mutex<BTreeMap<UpstreamRequestId, Forwarded>>,
 }
 
 impl Outstanding {
@@ -385,16 +544,64 @@ impl Outstanding {
     }
 
     /// Records that one identifier this host minted carries a request of the client's.
-    fn forwarding(&self, id: &UpstreamRequestId, client: serde_json::Value) {
-        self.mapped().insert(id.clone(), client);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UpstreamUnavailable`] when this connection already holds
+    /// [`MAX_FORWARDED_CLIENT_REQUESTS`] requests the upstream has not answered.
+    fn forwarding(&self, id: &UpstreamRequestId, client: serde_json::Value) -> Result<()> {
+        let mut mapped = self.mapped();
+        if mapped.len() >= MAX_FORWARDED_CLIENT_REQUESTS {
+            return Err(BrokerError::UpstreamUnavailable {
+                detail: format!(
+                    "this connection already has {MAX_FORWARDED_CLIENT_REQUESTS} requests the \
+                     upstream has not answered, so it cannot carry another"
+                ),
+            });
+        }
+        mapped.insert(
+            id.clone(),
+            Forwarded {
+                client,
+                expires_at: tokio::time::Instant::now() + CLIENT_REPLY_DEADLINE,
+            },
+        );
+        Ok(())
     }
 
     /// Returns the client's own identifier for one request this host forwarded.
     fn client_identifier(&self, id: &UpstreamRequestId) -> Option<serde_json::Value> {
-        self.mapped().remove(id)
+        self.mapped().remove(id).map(|forwarded| forwarded.client)
     }
 
-    fn mapped(&self) -> std::sync::MutexGuard<'_, BTreeMap<UpstreamRequestId, serde_json::Value>> {
+    /// Takes every client request whose deadline has passed.
+    fn expired(&self) -> Vec<(UpstreamRequestId, serde_json::Value)> {
+        let now = tokio::time::Instant::now();
+        let mut mapped = self.mapped();
+        let over: Vec<UpstreamRequestId> = mapped
+            .iter()
+            .filter(|(_, forwarded)| forwarded.expires_at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        over.into_iter()
+            .filter_map(|id| mapped.remove(&id).map(|forwarded| (id, forwarded.client)))
+            .collect()
+    }
+
+    /// Takes every client request that is still waiting, because this connection is ending.
+    fn abandon(&self) -> Vec<(UpstreamRequestId, serde_json::Value)> {
+        std::mem::take(&mut *self.mapped())
+            .into_iter()
+            .map(|(id, forwarded)| (id, forwarded.client))
+            .collect()
+    }
+
+    /// Returns how many of the client's requests are waiting for the upstream.
+    fn forwarded_count(&self) -> usize {
+        self.mapped().len()
+    }
+
+    fn mapped(&self) -> std::sync::MutexGuard<'_, BTreeMap<UpstreamRequestId, Forwarded>> {
         self.forwarded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -830,12 +1037,13 @@ pub enum Carried {
         /// True when the reply was queued for the client.
         returned: bool,
     },
-    /// The client's own answer, admitted and forwarded to the upstream.
+    /// The client's own answer, admitted and queued for the upstream.
+    ///
+    /// What the resource becomes is what the write turns out to be, which the owner settles: a
+    /// frame that went resolves it and a frame that went in part leaves it uncertain.
     ClientAnswer {
-        /// The resource it resolved.
+        /// The resource it answers.
         resource_id: PendingResourceId,
-        /// What the resource became.
-        state: PendingState,
     },
     /// A reply to one of this host's own requests, given to whatever was waiting for it.
     HostReply {
@@ -898,8 +1106,12 @@ impl Duplex {
         U: AsyncWrite + Unpin + Send + 'static,
         C: AsyncWrite + Unpin + Send + 'static,
     {
-        let (to_upstream, upstream_writes) = sink(framing, upstream);
-        let (to_client, client_writes) = sink(framing, client);
+        let failing = Stopping {
+            stopping: Arc::new(tokio::sync::Notify::new()),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (to_upstream, upstream_writes) = sink(framing, upstream, failing.clone());
+        let (to_client, client_writes) = sink(framing, client, failing.clone());
         let owner = Arc::new(Self {
             broker,
             connection,
@@ -909,13 +1121,69 @@ impl Duplex {
             outstanding: Arc::new(Outstanding::default()),
             site,
             os_user: os_user.into(),
-            stopping: Arc::new(tokio::sync::Notify::new()),
-            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopping: Arc::clone(&failing.stopping),
+            stopped: Arc::clone(&failing.stopped),
         });
+        let sweeping = {
+            let owner = Arc::clone(&owner);
+            async move { owner.sweep().await }
+        };
         let writes = async move {
-            tokio::join!(upstream_writes, client_writes);
+            tokio::join!(upstream_writes, client_writes, sweeping);
         };
         (owner, writes)
+    }
+
+    /// Gives up the client requests the upstream has stopped answering, and tells the client.
+    ///
+    /// It runs beside the two writers and ends with them. A request nothing will ever answer is an
+    /// entry nothing would ever remove, so the deadline is what removes it, and the client is told
+    /// rather than left holding an identifier this host has forgotten.
+    async fn sweep(self: &Arc<Self>) {
+        while !self.stopped.load(Ordering::Acquire) {
+            for (id, client) in self.outstanding.expired() {
+                self.give_up(&id, &client, "the upstream did not answer this request");
+            }
+            tokio::select! {
+                () = tokio::time::sleep(SWEEP_INTERVAL) => {}
+                () = self.stopping.notified() => break,
+            }
+        }
+        // The connection is ending. Everything still waiting is given up here rather than left in
+        // a map nobody will read again.
+        for (id, client) in self.outstanding.abandon() {
+            self.give_up(
+                &id,
+                &client,
+                "this connection ended before the upstream answered",
+            );
+        }
+    }
+
+    /// Tells the client that one of its own requests will not be answered.
+    fn give_up(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) {
+        let Some(held) = self.broker.connection(self.connection) else {
+            return;
+        };
+        let mut body = serde_json::Map::new();
+        body.insert(held.table.response_id_field.clone(), client.clone());
+        body.insert(
+            held.table.error_field.clone(),
+            serde_json::json!({
+                "code": -32_603,
+                "message": format!("{why} ({id})"),
+            }),
+        );
+        let Ok(encoded) = serde_json::to_vec(&serde_json::Value::Object(body)) else {
+            return;
+        };
+        let _ = self.client.queue(&encoded);
+    }
+
+    /// Returns how many of the client's own requests are waiting for the upstream.
+    #[must_use]
+    pub fn forwarded_client_requests(&self) -> usize {
+        self.outstanding.forwarded_count()
     }
 
     /// Returns the connection this owner speaks for.
@@ -950,13 +1218,17 @@ impl Duplex {
         self.upstream.queued_bytes()
     }
 
-    /// Asks this owner to stop reading both ends.
+    /// Asks this owner to stop reading both ends, and stops either end taking new frames.
     ///
     /// Frames already queued are still written: a shutdown that dropped them would leave an answer
-    /// this host had admitted unsent while its resource said it had gone.
+    /// this host had admitted unsent while its resource said it had gone. Nothing new is taken,
+    /// because a frame admitted into a connection that is going away is a frame whose bytes would
+    /// never be written while its caller waited.
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
         self.stopping.notify_waiters();
+        self.upstream.close();
+        self.client.close();
     }
 
     /// Returns true when this owner has been asked to stop.
@@ -996,10 +1268,11 @@ impl Duplex {
         // Recorded first, forwarded second. Section 11 puts the record before the forwarding so
         // that a crash in between leaves a request this host knows about rather than one it does
         // not.
-        let queued = self.client.queue(frame)?;
-        if let Some(refusal) = queued.delivered().await.refusal() {
-            return Err(refusal);
-        }
+        //
+        // Queued, not awaited. Waiting here for the client's own socket would hold this reader,
+        // and everything the upstream said behind this frame, behind one end that is not
+        // draining. What the write turns out to be is the owner's to act on.
+        self.client.queue(frame)?;
         Ok(Carried::UpstreamRequest {
             method: forwarded.method,
             resource_id: resource.map(|resource| resource.resource_id),
@@ -1055,31 +1328,29 @@ impl Duplex {
         if let Some(named) = self.client_request(frame)? {
             return self.forward_to_upstream(named, now).await;
         }
-        // The admission is held by a guard for the whole of the wait. This runs inside a reader
-        // that a connection ending cancels, and an admitted answer whose caller went away is one
-        // nobody can establish rather than one that never happened.
-        let mut admitted = AdmittedAnswer {
-            broker: self.broker.as_ref(),
+        // The admission is held by a guard that outlives this reader. Settling is what the write
+        // finishing means, and the write finishing is the owner's to report: an answer whose fate
+        // nobody establishes is one the guard settles uncertain, whether the reader is cancelled,
+        // the connection ends, or the frame goes out in part.
+        let admitted = AdmittedAnswer {
+            broker: Arc::clone(&self.broker),
             answer: Some(
                 self.broker
                     .admit_native_answer(self.connection, frame, now)?,
             ),
         };
-        let queued = self.upstream.queue(admitted.frame())?;
-        let delivered = queued.delivered().await;
-        let answer = admitted.take();
-        let now = kr_ipc::now_ms();
-        let settled = match delivered.refusal() {
-            None => self.broker.native_answer_sent(&answer, now)?,
-            Some(error) => {
-                let _ = self.broker.native_answer_uncertain(&answer, now);
-                return Err(error);
-            }
-        };
-        Ok(Carried::ClientAnswer {
-            resource_id: settled.resource_id,
-            state: settled.state,
-        })
+        let resource_id = admitted.resource_id();
+        let body = admitted.frame().to_vec();
+        // The guard travels with the work that reports the write. If the frame is refused here it
+        // is dropped instead, which settles the resource uncertain: the admission was spent and
+        // no answer went.
+        self.upstream.queue_then(
+            &body,
+            Some(Box::new(move |delivery: Delivery| {
+                admitted.settle(delivery)
+            })),
+        )?;
+        Ok(Carried::ClientAnswer { resource_id })
     }
 
     /// Reads one frame the client sent, when it is a request or a notification of its own.
@@ -1144,26 +1415,12 @@ impl Duplex {
             let encoded = serde_json::to_vec(&body).map_err(|error| {
                 BrokerError::invalid(format!("this notification will not encode: {error}"))
             })?;
-            let queued = match self.upstream.queue(&encoded) {
-                Ok(queued) => queued,
-                Err(error) => {
-                    let _ = self
-                        .broker
-                        .client_request_settled(&admitted, ClientRequestOutcome::Unsent);
-                    return Err(error);
-                }
-            };
-            let delivered = queued.delivered().await;
-            let _ = self
-                .broker
-                .client_request_settled(&admitted, outcome_of(delivered));
-            if let Some(refusal) = delivered.refusal() {
-                return Err(refusal);
-            }
-            return Ok(Carried::ClientNotification {
+            let carried = Carried::ClientNotification {
                 classification: admitted.classification,
                 suspended_rich_mutations: admitted.suspends_rich_mutations,
-            });
+            };
+            self.queue_client_frame(&encoded, admitted, None)?;
+            return Ok(carried);
         };
         let upstream_request_id = self.outstanding.allocate()?;
         let admitted = self.broker.admit_client_request(
@@ -1172,6 +1429,11 @@ impl Duplex {
             Some(&upstream_request_id),
             now,
         )?;
+        let carried = Carried::ClientRequest {
+            upstream_request_id: upstream_request_id.clone(),
+            classification: admitted.classification,
+            suspended_rich_mutations: admitted.suspends_rich_mutations,
+        };
         let minted: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
             .map_err(|error| {
                 BrokerError::invalid(format!("this identifier will not encode: {error}"))
@@ -1183,32 +1445,48 @@ impl Duplex {
         let encoded = serde_json::to_vec(&body).map_err(|error| {
             BrokerError::invalid(format!("this request will not encode: {error}"))
         })?;
-        // The mapping goes in before the bytes, so an answer that arrives at once finds it.
-        self.outstanding
-            .forwarding(&upstream_request_id, client_identifier);
-        let queued = match self.upstream.queue(&encoded) {
-            Ok(queued) => queued,
-            Err(error) => {
-                self.outstanding.client_identifier(&upstream_request_id);
-                let _ = self
-                    .broker
-                    .client_request_settled(&admitted, ClientRequestOutcome::Unsent);
-                return Err(error);
-            }
-        };
-        let delivered = queued.delivered().await;
-        let _ = self
-            .broker
-            .client_request_settled(&admitted, outcome_of(delivered));
-        if let Some(refusal) = delivered.refusal() {
-            self.outstanding.client_identifier(&upstream_request_id);
-            return Err(refusal);
+        // The mapping goes in before the bytes, so an answer that arrives at once finds it. It is
+        // bounded: a client that asks more than this connection can have outstanding is refused
+        // here, with its intent recorded as unsent, rather than growing a map only the upstream
+        // could empty.
+        if let Err(error) = self
+            .outstanding
+            .forwarding(&upstream_request_id, client_identifier)
+        {
+            let _ = self
+                .broker
+                .client_request_settled(&admitted, ClientRequestOutcome::Unsent);
+            return Err(error);
         }
-        Ok(Carried::ClientRequest {
-            upstream_request_id,
-            classification: admitted.classification,
-            suspended_rich_mutations: admitted.suspends_rich_mutations,
-        })
+        self.queue_client_frame(&encoded, admitted, Some(upstream_request_id))?;
+        Ok(carried)
+    }
+
+    /// Queues one frame of the client's and leaves the rest to the owner.
+    ///
+    /// Nothing here waits for the socket. What the write turns out to be is recorded against the
+    /// intent by the writer itself, in the order the frames went, and a request whose bytes never
+    /// went gives its identifier mapping back.
+    fn queue_client_frame(
+        &self,
+        encoded: &[u8],
+        admitted: crate::broker::ClientRequest,
+        forwarded: Option<UpstreamRequestId>,
+    ) -> Result<()> {
+        let broker = Arc::clone(&self.broker);
+        let outstanding = Arc::clone(&self.outstanding);
+        let queued = self.upstream.queue_then(
+            encoded,
+            Some(Box::new(move |delivery: Delivery| {
+                let _ = broker.client_request_settled(&admitted, outcome_of(delivery));
+                if delivery != Delivery::Transmitted
+                    && let Some(id) = forwarded.as_ref()
+                {
+                    outstanding.client_identifier(id);
+                }
+            })),
+        );
+        queued.map(|_| ())
     }
 
     /// Refuses one reverse request, before anything of it could have an effect.
@@ -1259,10 +1537,9 @@ impl Duplex {
         let body = serde_json::to_vec(&serde_json::Value::Object(answer)).map_err(|error| {
             BrokerError::invalid(format!("this answer will not encode: {error}"))
         })?;
-        let queued = self.upstream.queue(&body)?;
-        if let Some(refusal) = queued.delivered().await.refusal() {
-            return Err(refusal);
-        }
+        // Queued, not awaited: a refusal is not an effect, and this reader has other frames to
+        // read whether or not the upstream is draining.
+        self.upstream.queue(&body)?;
         Ok(false)
     }
 
@@ -1289,8 +1566,24 @@ impl Duplex {
             BrokerError::invalid(format!("this reply will not encode: {error}"))
         })?;
         // Queued, not awaited: this runs inside the upstream reader, and waiting here for the
-        // client to drain would hold every frame behind it.
-        self.client.queue(&encoded).map(|_| true)
+        // client to drain would hold every frame behind it. The delivery is still watched, so a
+        // reply that does not reach the client ends the connection rather than disappearing.
+        let failing = Stopping {
+            stopping: Arc::clone(&self.stopping),
+            stopped: Arc::clone(&self.stopped),
+        };
+        let client = self.client.clone();
+        self.client
+            .queue_then(
+                &encoded,
+                Some(Box::new(move |delivery: Delivery| {
+                    if delivery != Delivery::Transmitted {
+                        client.close();
+                        failing.stop();
+                    }
+                })),
+            )
+            .map(|_| true)
     }
 
     /// Reads one end for as long as it has frames, carrying each one.
@@ -1369,26 +1662,42 @@ const fn outcome_of(delivery: Delivery) -> ClientRequestOutcome {
 /// One admitted native answer, held until something says what happened to it.
 ///
 /// Dropping it without saying leaves the resource uncertain, which is what an answer whose fate
-/// nobody established is. That covers the reader being cancelled mid-write as well as a caller
-/// that returns early.
-struct AdmittedAnswer<'a> {
-    broker: &'a Broker,
+/// nobody established is. That covers the writer's task ending, the reader being cancelled, and a
+/// caller that returns early.
+struct AdmittedAnswer {
+    broker: Arc<Broker>,
     answer: Option<crate::broker::NativeAnswer>,
 }
 
-impl AdmittedAnswer<'_> {
+impl AdmittedAnswer {
     fn frame(&self) -> &[u8] {
         self.answer
             .as_ref()
             .map_or(&[][..], |answer| answer.frame.as_slice())
     }
 
-    fn take(&mut self) -> crate::broker::NativeAnswer {
-        self.answer.take().expect("the admission is taken once")
+    fn resource_id(&self) -> PendingResourceId {
+        self.answer.as_ref().map_or_else(
+            || PendingResourceId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16])),
+            |answer| answer.resource_id,
+        )
+    }
+
+    /// Settles the resource from what actually reached the upstream.
+    fn settle(mut self, delivery: Delivery) {
+        let Some(answer) = self.answer.take() else {
+            return;
+        };
+        let now = kr_ipc::now_ms();
+        if delivery == Delivery::Transmitted {
+            let _ = self.broker.native_answer_sent(&answer, now);
+        } else {
+            let _ = self.broker.native_answer_uncertain(&answer, now);
+        }
     }
 }
 
-impl Drop for AdmittedAnswer<'_> {
+impl Drop for AdmittedAnswer {
     fn drop(&mut self) {
         let Some(answer) = self.answer.take() else {
             return;
@@ -1438,6 +1747,14 @@ fn read_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stop nothing is listening for, for a sink built on its own.
+    fn stopping() -> Stopping {
+        Stopping {
+            stopping: Arc::new(tokio::sync::Notify::new()),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
 
     /// One prepared plugin action, as an admission hands it to a transport.
     fn plugin_action(
@@ -1527,6 +1844,7 @@ mod tests {
         let (sink, _writes) = sink(
             Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             upstream,
+            stopping(),
         );
         let body = vec![b'x'; 4096];
         let mut accepted = 0;
@@ -1552,6 +1870,7 @@ mod tests {
         let (sink, writes) = sink(
             Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             writer,
+            stopping(),
         );
         let driving = tokio::spawn(writes);
         let queued = sink.queue(&vec![b'y'; 4096]).expect("it is queued");

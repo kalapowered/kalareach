@@ -87,8 +87,9 @@ pub use crate::broker::attach::{
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{
-    Carried, Closure, Delivery, Dispatch, Duplex, MAX_QUEUED_OBSERVATIONS, Observations,
-    Observatory, Queued, ResourceTransition, Sink, UpstreamFailure, UpstreamReply,
+    CLIENT_REPLY_DEADLINE, Carried, Closure, Delivery, Dispatch, Duplex,
+    MAX_FORWARDED_CLIENT_REQUESTS, MAX_QUEUED_OBSERVATIONS, Observations, Observatory, Queued,
+    ResourceTransition, Sink, UpstreamFailure, UpstreamReply, WRITE_DEADLINE,
 };
 pub use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 pub use crate::broker::error::{BrokerError, Result};
