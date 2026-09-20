@@ -14,11 +14,13 @@
 //! A controller additionally answers the worker's own challenge with a generation token, which is
 //! what fences the connection that spoke for the previous generation.
 
+use std::collections::VecDeque;
+
 use kr_protocol::envelope::{
     ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::ProtocolError;
-use kr_protocol::frame::StreamKind;
+use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, StreamKind};
 use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::ids::{ActionId, BuildId, RequestId};
 use kr_protocol::local::{LocalClientKind, LocalHello, LocalHelloAck};
@@ -42,6 +44,23 @@ pub struct LocalClient {
     acknowledgement: LocalHelloAck,
     generation_challenge: Option<kr_protocol::worker::GenerationChallenge>,
     next_request: u64,
+    /// What the host pushed while one of this client's own calls was outstanding.
+    ///
+    /// A call reads frames until its answer arrives, and what it reads on the way is this
+    /// connection's subscription, not an answer to anything: it is kept here, oldest first, and
+    /// handed back by [`LocalClient::take_held`] or by the next [`LocalClient::recv`]. Both drain
+    /// this before the socket, so a frame the host sent first is never delivered after one it sent
+    /// afterwards.
+    held: VecDeque<Held>,
+    /// What those frames occupy on the wire, length prefixes included.
+    held_bytes: usize,
+}
+
+/// One frame this client kept, with what it is charged against the connection's bound.
+#[derive(Debug)]
+struct Held {
+    frame: ControlFrame,
+    charged: usize,
 }
 
 impl LocalClient {
@@ -98,6 +117,8 @@ impl LocalClient {
             acknowledgement,
             generation_challenge: None,
             next_request: 0,
+            held: VecDeque::new(),
+            held_bytes: 0,
         };
         if kind == LocalClientKind::Controller {
             // A worker offers its generation challenge as soon as a controller announces itself, so
@@ -376,9 +397,13 @@ impl LocalClient {
             .write_message(&ControlFrame::AuthorityRevision(notice))
             .await?;
         loop {
-            match self.read_frame().await? {
+            match self.read_socket_frame().await? {
                 ControlFrame::AuthorityRevisionAck(ack) => return Ok(ack),
-                ControlFrame::Notification(_) => {}
+                // This connection's subscription, not an answer to the revision. It is kept in
+                // arrival order and handed back afterwards.
+                ControlFrame::Notification(notification) => {
+                    self.hold(ControlFrame::Notification(notification))?;
+                }
                 ControlFrame::Response(Response {
                     outcome: Outcome::Error(error),
                     ..
@@ -430,8 +455,10 @@ impl LocalClient {
 
     /// Reads the next frame, which may be a notification.
     ///
-    /// A window the host pushed is applied here rather than returned: it is the connection's own
-    /// resource, not an answer to anything a caller asked for.
+    /// Anything the host pushed while one of this client's own calls was outstanding comes out
+    /// here first, oldest first, before another byte is read from the socket. A window the host
+    /// pushed is applied rather than returned: it is the connection's own resource, not an answer
+    /// to anything a caller asked for.
     ///
     /// # Errors
     ///
@@ -440,25 +467,68 @@ impl LocalClient {
         self.read_frame().await
     }
 
+    /// Returns how many frames the host pushed while a call of this client's own was outstanding.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Takes the oldest frame the host pushed while a call of this client's own was outstanding.
+    ///
+    /// This is what a caller asks after a call to learn what it was told during it, without
+    /// reading the socket and without waiting for anything further to arrive. [`Self::recv`]
+    /// returns the same frames in the same order for a caller that is reading the stream anyway.
+    pub fn take_held(&mut self) -> Option<ControlFrame> {
+        let held = self.held.pop_front()?;
+        self.held_bytes = self.held_bytes.saturating_sub(held.charged);
+        Some(held.frame)
+    }
+
     /// Returns the writing half, for a caller that streams input.
     pub const fn writer(&mut self) -> &mut FrameWriter {
         &mut self.writer
     }
 
     /// Splits the client into its two halves.
+    ///
+    /// A caller that takes the halves takes the stream itself, so anything this client is still
+    /// holding for it has to be collected first: drain [`Self::take_held`] until it is empty, or
+    /// split before the first call. Both callers in this workspace split a connection they have
+    /// only just opened, where nothing has been pushed yet.
     #[must_use]
     pub fn into_halves(self) -> (FrameReader, FrameWriter, LocalHelloAck) {
+        debug_assert!(
+            self.held.is_empty(),
+            "the halves are taken with {} frame(s) still held for this caller",
+            self.held.len()
+        );
         (self.reader, self.writer, self.acknowledgement)
     }
 
-    /// Reads one frame, applying anything that belongs to the connection rather than to a caller.
+    /// Returns the next frame of this connection's stream, held or freshly read.
+    ///
+    /// What a call kept comes first, because it arrived first. Only when nothing is held does this
+    /// reach the socket.
+    async fn read_frame(&mut self) -> Result<ControlFrame> {
+        if let Some(frame) = self.take_held() {
+            return Ok(frame);
+        }
+        self.read_socket_frame().await
+    }
+
+    /// Reads one frame off the socket, applying anything that belongs to the connection rather
+    /// than to a caller.
     ///
     /// The host renews this connection's action window without being asked, at half the window's
     /// validity. Absorbing that here is what lets every call site read frames without each of them
     /// having to know about a resource none of them asked for. The reader keeps its position
     /// inside a frame, so a cancelled read resumes rather than restarting, and a renewal that has
     /// already been applied is not lost by the cancellation.
-    async fn read_frame(&mut self) -> Result<ControlFrame> {
+    ///
+    /// A caller waiting for its own answer reads through this rather than through
+    /// [`Self::read_frame`], so that what it keeps on the way is appended behind whatever is
+    /// already held instead of being read back out in front of it.
+    async fn read_socket_frame(&mut self) -> Result<ControlFrame> {
         loop {
             let frame: ControlFrame = self.reader.read_message().await?;
             match frame {
@@ -471,6 +541,44 @@ impl LocalClient {
                 other => return Ok(other),
             }
         }
+    }
+
+    /// Keeps a frame that arrived while a call of this client's own was outstanding.
+    ///
+    /// Section 9 has a peer that cannot keep up told rather than waited for, so what this holds is
+    /// bounded by the send queue the connection negotiated - the most the host would have queued
+    /// for this peer before resynchronising it - and a client that reaches the bound is told
+    /// instead of quietly losing the oldest of what it was sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure naming the bound when this connection is already holding it.
+    fn hold(&mut self, frame: ControlFrame) -> Result<()> {
+        let charged = charge(&frame);
+        let ceiling = self.held_ceiling();
+        let held = self.held_bytes.saturating_add(charged);
+        if held > ceiling {
+            return Err(IpcError::socket(
+                "hold what the host pushed while this call was outstanding",
+                std::io::Error::other(format!(
+                    "{held} bytes over this connection's {ceiling}-byte bound"
+                )),
+            ));
+        }
+        self.held_bytes = held;
+        self.held.push_back(Held { frame, charged });
+        Ok(())
+    }
+
+    /// What this client may hold for its caller, in bytes.
+    ///
+    /// What the connection negotiated, never more than the protocol's own bound: a host that
+    /// stated a smaller send queue is taken at its word, and one that states a larger figure does
+    /// not thereby enlarge what a client keeps in memory.
+    fn held_ceiling(&self) -> usize {
+        usize::try_from(self.acknowledgement.max_receive.max_send_queue_bytes.get())
+            .unwrap_or(kr_protocol::limits::MAX_SEND_QUEUE_BYTES)
+            .min(kr_protocol::limits::MAX_SEND_QUEUE_BYTES)
     }
 
     /// Applies anything the host has already pushed, without waiting for more.
@@ -495,8 +603,14 @@ impl LocalClient {
                     self.acknowledgement.action_window = window;
                 }
                 Some(ControlFrame::Event(ControlEvent::Keepalive)) => {}
-                // Anything else is an answer or an event a caller wants. It is not consumed here.
-                Some(_) | None => return Ok(()),
+                // Anything else is an answer or an event a caller wants. It has left the socket,
+                // so it is kept for whoever asks next rather than lost here, and this stops at it:
+                // a renewal behind it waits for the next read, which is where it was before.
+                Some(other) => {
+                    self.hold(other)?;
+                    return Ok(());
+                }
+                None => return Ok(()),
             }
         }
     }
@@ -506,7 +620,7 @@ impl LocalClient {
         request_id: RequestId,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         loop {
-            match self.read_frame().await? {
+            match self.read_socket_frame().await? {
                 ControlFrame::Response(response) if response.request_id == request_id => {
                     return Ok(match response.outcome {
                         Outcome::Ok(value) => Ok(value),
@@ -514,7 +628,11 @@ impl LocalClient {
                     });
                 }
                 // A notification that arrives while a call is outstanding is not an answer to it.
-                ControlFrame::Notification(_) => {}
+                // It is this connection's subscription, so it is kept in the order it arrived and
+                // handed back afterwards rather than dropped for having been badly timed.
+                ControlFrame::Notification(notification) => {
+                    self.hold(ControlFrame::Notification(notification))?;
+                }
                 _ => {
                     return Err(IpcError::UnexpectedMessage(
                         "the host answered something other than this request",
@@ -528,4 +646,15 @@ impl LocalClient {
         self.next_request += 1;
         RequestId::new(self.next_request)
     }
+}
+
+/// What a frame occupies on the wire, its four-byte length prefix included.
+///
+/// A count of frames is not a bound on memory: one notification can carry a whole batch of output,
+/// so the bound is in the same bytes section 9 states a send queue in. A frame that cannot be
+/// encoded is charged everything, which refuses it rather than admitting something unmeasured.
+fn charge(frame: &ControlFrame) -> usize {
+    kr_cbor::to_canonical_value(frame)
+        .map(|value| kr_cbor::encoded_len(&value).saturating_add(FRAME_LENGTH_PREFIX_LEN))
+        .unwrap_or(usize::MAX)
 }
