@@ -23,6 +23,8 @@
 //!
 //! This reduces precision. It does not hide traffic patterns, and section 20 says so.
 
+mod paired;
+
 use std::collections::BTreeMap;
 
 use kr_protocol::ids::EnvelopeId;
@@ -38,6 +40,8 @@ use crate::error::{CryptoError, Result};
 use crate::keys::{StoredEnvelopeKeyPair, key_id};
 use crate::sealed;
 use crate::sodium;
+
+pub use paired::{PairedSenders, open_delivered_envelope};
 
 /// Seals one envelope for one recipient.
 ///
@@ -107,14 +111,25 @@ pub(crate) fn pad_plaintext(plaintext: &EnvelopePlaintext) -> Result<(Vec<u8>, u
             actual: content_len as usize,
         });
     }
+    pad_to_bucket(&mut encoded)
+}
+
+/// Pads a canonical encoding to its declared size bucket and clears the input.
+///
+/// One padding rule covers a mailbox envelope and a synchronised object, because section 20 gives
+/// them the same declared buckets. The input is cleared whatever the outcome: it holds the
+/// plaintext in the clear, and a caller that kept it would be keeping the thing the padding is
+/// there to hide the length of.
+pub(crate) fn pad_to_bucket(encoded: &mut [u8]) -> Result<(Vec<u8>, u64)> {
+    let content_len = encoded.len() as u64;
     let granularity = mailbox_granularity(content_len);
     let bucket = mailbox_size_bucket(content_len);
 
     // The padded buffer is allocated at its final size, so it never reallocates and never leaves a
     // copy of the plaintext behind in an abandoned allocation.
     let mut padded = Vec::with_capacity(bucket as usize);
-    padded.extend_from_slice(&encoded);
-    sodium::memzero(&mut encoded);
+    padded.extend_from_slice(encoded);
+    sodium::memzero(encoded);
     padded.resize(bucket as usize, 0);
     let padded_len = sodium::pad(&mut padded, content_len as usize, granularity as usize)?;
     if padded_len as u64 != bucket {
@@ -124,6 +139,26 @@ pub(crate) fn pad_plaintext(plaintext: &EnvelopePlaintext) -> Result<(Vec<u8>, u
         });
     }
     Ok((padded, bucket))
+}
+
+/// Returns how many bytes of a padded plaintext are content.
+///
+/// The three bands do not overlap, so the granularity is recovered from the padded length before
+/// the padding is removed, and the bucket is then recomputed from the content length and compared
+/// with the length that arrived. A padded length that is not one of section 20's buckets, or one
+/// that is not its own content's bucket, is refused here rather than decoded.
+pub(crate) fn unpadded_len(opened: &[u8]) -> Result<usize> {
+    let padded_len = opened.len() as u64;
+    let granularity = granularity_for_bucket(padded_len).ok_or(CryptoError::BindingMismatch {
+        what: "the padded length of an envelope, which is not a declared size bucket",
+    })?;
+    let content_len = sodium::unpad(opened, granularity as usize)?;
+    if mailbox_size_bucket(content_len as u64) != padded_len {
+        return Err(CryptoError::BindingMismatch {
+            what: "the padded length of an envelope, which is not its content's bucket",
+        });
+    }
+    Ok(content_len)
 }
 
 /// Opens one envelope against a previously paired sender key.
@@ -156,15 +191,7 @@ where
     )?;
 
     let padded_len = opened.len() as u64;
-    let granularity = granularity_for_bucket(padded_len).ok_or(CryptoError::BindingMismatch {
-        what: "the padded length of an envelope, which is not a declared size bucket",
-    })?;
-    let content_len = sodium::unpad(opened.expose(), granularity as usize)?;
-    if mailbox_size_bucket(content_len as u64) != padded_len {
-        return Err(CryptoError::BindingMismatch {
-            what: "the padded length of an envelope, which is not its content's bucket",
-        });
-    }
+    let content_len = unpadded_len(opened.expose())?;
     if sealed_envelope.routing.size_bucket_bytes.get() != padded_len {
         return Err(CryptoError::BindingMismatch {
             what: "the declared size bucket outside the envelope",
