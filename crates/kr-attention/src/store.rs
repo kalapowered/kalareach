@@ -70,10 +70,13 @@
 //! Two things that rests on. Nothing here takes a second handle on the file: on the Unix family,
 //! closing any descriptor for a file drops every lock the process holds on it, so a handle opened
 //! beside SQLite's own would release the locks the receipt journal and the question ledger are
-//! holding on the same file. And a file that more than one name reaches is refused outright with
+//! holding on the same file. And a file that more than one name reaches is refused with
 //! [`Error::StoreAliased`], because the write-ahead log SQLite keeps beside a database is named
 //! after the name the database was opened by: two processes opening one file by two names would
-//! journal it twice over, and neither would see the other's claim or the other's writes.
+//! journal it twice over, and neither would see the other's claim or the other's writes. That
+//! refusal is as good as what the platform will say about a file: the Unix family counts a file's
+//! names, and Windows hands the count out only through an open handle, which this host will not
+//! take on a database.
 //!
 //! # What a stored value may not do
 //!
@@ -116,52 +119,56 @@ pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything the feature store holds.
 #[derive(Clone, Debug, Default)]
-pub struct StoredState {
+pub(crate) struct StoredState {
     /// The inbox.
-    pub items: Vec<Item>,
+    pub(crate) items: Vec<Item>,
     /// Each actor's acknowledgements of items.
-    pub item_acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
+    pub(crate) item_acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
     /// Each actor's acknowledgement revision.
-    pub revisions: BTreeMap<ActorId, u64>,
+    pub(crate) revisions: BTreeMap<ActorId, u64>,
     /// The highest sequence consumed from each source.
-    pub consumed: BTreeMap<AttentionSource, u64>,
+    pub(crate) consumed: BTreeMap<AttentionSource, u64>,
     /// The ranges of retained events the host can no longer read.
-    pub gaps: Vec<AttentionGap>,
+    pub(crate) gaps: Vec<AttentionGap>,
     /// How many items the host has let go of to stay inside its bound.
-    pub dropped: u64,
+    pub(crate) dropped: u64,
     /// The secret this store derives its item keys under.
     ///
     /// It is generated once, when a store first has state to write, and read back with the rest.
     /// A store that has never been written gives a fresh one, which is right: it has no keys.
-    pub keys: crate::key::KeySecret,
+    pub(crate) keys: crate::key::KeySecret,
     /// The highest identity this store has given an announcement.
     ///
     /// It only goes forward, and it outlives the item whose decision it named, so an identity a
     /// delivery consumer recorded never comes back attached to a later decision.
-    pub next_announcement: u64,
+    pub(crate) next_announcement: u64,
     /// The questions waiting for an answer.
-    pub pending_inputs: BTreeMap<QuestionId, PendingInput>,
+    pub(crate) pending_inputs: BTreeMap<QuestionId, PendingInput>,
     /// The configured quiet-hours window.
-    pub quiet: Option<QuietHours>,
+    pub(crate) quiet: Option<QuietHours>,
     /// Each review subject at the version the host holds.
-    pub subjects: BTreeMap<String, Subject>,
+    pub(crate) subjects: BTreeMap<String, Subject>,
     /// Each actor's review acknowledgements.
-    pub review_acks: BTreeMap<ActorId, BTreeMap<String, ReviewAck>>,
+    pub(crate) review_acks: BTreeMap<ActorId, BTreeMap<String, ReviewAck>>,
     /// The retained semantic changes, oldest first.
-    pub changes: VecDeque<SemanticChange>,
+    pub(crate) changes: VecDeque<SemanticChange>,
     /// The cursor the next change is recorded at.
-    pub next_cursor: u64,
+    pub(crate) next_cursor: u64,
     /// The ranges that are missing from what a visit can be shown.
-    pub omitted: Vec<Omitted>,
+    pub(crate) omitted: Vec<Omitted>,
     /// The model summaries the host holds.
-    pub summaries: Vec<ChangeSummary>,
+    pub(crate) summaries: Vec<ChangeSummary>,
     /// Each actor's visit and the views it had open.
-    pub visits: BTreeMap<ActorId, Visit>,
+    pub(crate) visits: BTreeMap<ActorId, Visit>,
 }
 
 /// The environment feature store.
+///
+/// It is the crate's own: [`crate::Attention`] is the one writer, because a write is only correct
+/// under a claim this crate takes and refreshes, and a caller that could write around it could
+/// replace an owner's committed work with a state from before it.
 #[derive(Debug)]
-pub struct Store {
+pub(crate) struct Store {
     connection: Connection,
 }
 
@@ -177,23 +184,23 @@ pub struct Store {
 /// that has gone is stale at once, one that is running holds its store, and one the host cannot
 /// ask about stands until its lease runs out.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Owner {
+pub(crate) struct Owner {
     /// What tells this claim apart from every other, including another in the same process.
     ///
     /// A process identifier cannot do it: two owners inside one process share one, and a process
     /// that died and whose number was given to another is not the owner that number names. This is
     /// random, and one value holds one of them for its life.
-    pub claim: u64,
+    pub(crate) claim: u64,
     /// The process that holds the store, as the kernel described it when the claim was made.
     ///
     /// The number alone would name whoever holds it now, which after a crash is an unrelated
     /// program. The start value is what says this is the same process, and the pair is what the
     /// host asks about.
-    pub process: ProcessStartIdentity,
+    pub(crate) process: ProcessStartIdentity,
     /// The boot that process is running in.
-    pub boot: BootMark,
+    pub(crate) boot: BootMark,
     /// The continuous reading the claim was last refreshed at, within that boot.
-    pub refreshed_ms: u64,
+    pub(crate) refreshed_ms: u64,
 }
 
 /// What the host can see of the process that made a claim.
@@ -265,7 +272,11 @@ pub const OWNER_LEASE_MS: u64 = 10 * 60_000;
 impl Owner {
     /// Returns `process`'s claim at this reading.
     #[must_use]
-    pub const fn here(claim: u64, process: ProcessStartIdentity, reading: HostReading) -> Self {
+    pub(crate) const fn here(
+        claim: u64,
+        process: ProcessStartIdentity,
+        reading: HostReading,
+    ) -> Self {
         Self {
             claim,
             process,
@@ -279,12 +290,15 @@ impl Owner {
     /// Sixty-three bits of it: the store writes an integer it can read back exactly, so the top
     /// bit is dropped rather than stored as a value that would come back negative. Every one of
     /// the sixty-three is random - the fixed version and variant bits of the identifier they are
-    /// drawn from are left out - which makes two live owners drawing the same value about as
-    /// likely as the same second of a host's life happening twice. It is not a guarantee, and
-    /// nothing here treats it as one: a claim decides which owner a row belongs to, and the boot,
-    /// the process and the lease decide whether it still stands.
+    /// drawn from are left out.
+    ///
+    /// **This is an assumption, not a proof.** Two owners that drew the same value would each read
+    /// the other's row as its own: the second would open a store the first is holding, and both
+    /// would pass the check every write makes. Nothing here can rule that out; what it rests on is
+    /// sixty-three bits of a random draw, against the handful of owners one host's stores ever
+    /// have.
     #[must_use]
-    pub fn fresh_claim() -> u64 {
+    pub(crate) fn fresh_claim() -> u64 {
         // Bytes six and eight of a version-four identifier carry its version and variant, which
         // are the same in every one of them. These eight do not.
         let bytes = *uuid::Uuid::new_v4().as_bytes();
@@ -302,7 +316,7 @@ impl Owner {
     /// however long it has been idle, and one the host cannot ask about stands until
     /// [`OWNER_LEASE_MS`] has run since its last refresh.
     #[must_use]
-    pub fn stands_against(
+    pub(crate) fn stands_against(
         &self,
         claim: u64,
         reading: HostReading,
@@ -353,7 +367,18 @@ fn resolve(path: &Path) -> Result<std::path::PathBuf> {
         .join(name))
 }
 
-/// Refuses a database file that more than one name reaches.
+/// What one look at a name says: which file it reaches, and how many names reach that file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileMark {
+    /// The device the file is on.
+    device: u64,
+    /// The file, within that device.
+    inode: u64,
+    /// How many names reach it.
+    names: u64,
+}
+
+/// Refuses a database file that more than one name reaches, and says which file this name reached.
 ///
 /// SQLite names the write-ahead log it keeps beside a database, and the shared memory both are
 /// coordinated through, after the name the database was opened by. Two hard links to one file are
@@ -362,40 +387,59 @@ fn resolve(path: &Path) -> Result<std::path::PathBuf> {
 /// be the loser. A symbolic link is a different thing and is admitted: it is resolved before
 /// SQLite is given the path, so every symbolic link to a store reaches the one name it has.
 ///
-/// The count is the file's own, read from its metadata rather than worked out by comparing names,
-/// and it is read without opening the file: on the Unix family, closing any descriptor for a file
-/// drops every lock the process holds on it, and the receipt journal and the question ledger hold
-/// locks on this one.
-fn one_name(file: &Path) -> Result<()> {
-    if let Some(names) = link_count(file)?
-        && names > 1
+/// The count is the file's own rather than a comparison of names, and it is read without opening
+/// the file: on the Unix family, closing any descriptor for a file drops every lock the process
+/// holds on it, and the receipt journal and the question ledger hold locks on this one.
+///
+/// **What this cannot do.** It describes the file a name reaches rather than the file SQLite has
+/// open, because nothing this crate can safely call will describe that one. So it is done twice,
+/// once before the database is opened and once after, and a name that reached two different files
+/// across the two is refused: what is left is an actor that can move files under this host inside
+/// its own runtime directory, which is the owner. Where the platform does not report the count at
+/// all, there is nothing to compare.
+fn one_name(file: &Path) -> Result<Option<FileMark>> {
+    let mark = describe(file)?;
+    if let Some(mark) = mark
+        && mark.names > 1
     {
-        return Err(Error::StoreAliased { names });
+        return Err(Error::StoreAliased { names: mark.names });
     }
-    Ok(())
+    Ok(mark)
 }
 
-/// Returns how many names reach `file`, where the platform says.
+/// Returns what this name reaches, where the platform says, and nothing where it does not.
+///
+/// A name that reaches nothing at all is not a failure: a store is created by opening it.
 #[cfg(unix)]
-fn link_count(file: &Path) -> Result<Option<u64>> {
+fn describe(file: &Path) -> Result<Option<FileMark>> {
     use std::os::unix::fs::MetadataExt;
 
-    let described = std::fs::metadata(file).map_err(|error| Error::StoreUnavailable {
-        kind: StoreFault::Other,
-        detail: format!("{} cannot be described: {error}", file.display()),
-    })?;
-    Ok(Some(described.nlink()))
+    let described = match std::fs::metadata(file) {
+        Ok(described) => described,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::StoreUnavailable {
+                kind: StoreFault::Other,
+                detail: format!("{} cannot be described: {error}", file.display()),
+            });
+        }
+    };
+    Ok(Some(FileMark {
+        device: described.dev(),
+        inode: described.ino(),
+        names: described.nlink(),
+    }))
 }
 
-/// Returns how many names reach `file`, where the platform says.
+/// Returns what this name reaches, where the platform says, and nothing where it does not.
 ///
-/// Windows keeps the count, but hands it out only through an open handle on the file, and this
-/// host opens no second handle on a database. So a Windows store is admitted on the name it was
-/// given, and what stands in for the count there is where the file is: the host keeps each
+/// Windows keeps a file's name count, but hands it out only through an open handle on the file,
+/// and this host opens no second handle on a database. So a Windows store is admitted on the name
+/// it was given, and what stands in for the count there is where the file is: the host keeps each
 /// session's store under a directory of its own making, so a second name for one is something
 /// somebody went and made.
 #[cfg(not(unix))]
-fn link_count(_file: &Path) -> Result<Option<u64>> {
+fn describe(_file: &Path) -> Result<Option<FileMark>> {
     Ok(None)
 }
 
@@ -637,16 +681,19 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreAliased`] when more than one name reaches the file,
+    /// Returns [`Error::StoreAliased`] when the platform says more than one name reaches the file,
     /// [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be created,
     /// and [`Error::StoreUnreadable`] when the file records a schema this build does not know.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         // The resolved path, never the name that reached here: SQLite reads a name beginning
         // `file:` as a URI and `:memory:` as a database of its own, and neither is the file this
         // store is meant to be. Who owns the store is a row inside it, not anything about a name.
         let resolved = resolve(path.as_ref())?;
+        // Once before the open and once after: the second look is the one that has to hold, and
+        // the first is what says the file did not change under the open.
+        let before = one_name(&resolved)?;
         let connection = Connection::open_with_flags(&resolved, FILE_ONLY)?;
-        Self::prepare(connection, Some(&resolved))
+        Self::prepare(connection, Some((resolved.as_path(), before)))
     }
 
     /// Opens the store inside the worker's private journal, or in memory when there is none.
@@ -656,10 +703,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreAliased`] when more than one name reaches the file,
+    /// Returns [`Error::StoreAliased`] when the platform says more than one name reaches the file,
     /// [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be created,
     /// and [`Error::StoreUnreadable`] when the file records a schema this build does not know.
-    pub fn beside(path: Option<&Path>) -> Result<Self> {
+    pub(crate) fn beside(path: Option<&Path>) -> Result<Self> {
         match path {
             Some(path) => Self::open(path),
             None => Self::in_memory(),
@@ -671,20 +718,29 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`Error::StoreUnavailable`] when the schema cannot be created.
-    pub fn in_memory() -> Result<Self> {
+    pub(crate) fn in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory()?;
         Self::prepare(connection, None)
     }
 
-    fn prepare(connection: Connection, file: Option<&Path>) -> Result<Self> {
+    fn prepare(connection: Connection, file: Option<(&Path, Option<FileMark>)>) -> Result<Self> {
         // The store shares its file with the receipt journal and the question ledger, so a write
         // can find another of them holding it. The wait is bounded: past it the caller is told the
         // store is unavailable rather than left blocked.
         connection.busy_timeout(BUSY_TIMEOUT)?;
         // Before the write-ahead log exists, because it is the write-ahead log that a second name
         // for this file would split in two.
-        if let Some(file) = file {
-            one_name(file)?;
+        if let Some((file, before)) = file {
+            let after = one_name(file)?;
+            if before.is_some_and(|before| Some(before) != after) {
+                return Err(Error::StoreUnavailable {
+                    kind: StoreFault::Other,
+                    detail: format!(
+                        "{} reached a different file while it was being opened",
+                        file.display()
+                    ),
+                });
+            }
         }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -713,16 +769,6 @@ impl Store {
         }
         connection.execute_batch(SCHEMA)?;
         Ok(Self { connection })
-    }
-
-    /// Reads the whole stored state back.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::StoreUnavailable`] when a read fails and [`Error::StoreUnreadable`] when a
-    /// stored value is not one this build can read back exactly.
-    pub fn load(&self) -> Result<StoredState> {
-        Self::load_from(&self.connection)
     }
 
     /// Reads the whole state through a connection the caller owns, which may be a transaction.
@@ -867,7 +913,7 @@ impl Store {
     /// [`Error::StoreUnavailable`] when the transaction cannot be committed and
     /// [`Error::StoreUnreadable`] when a value cannot be stored without changing it. Nothing is
     /// left half written: the store is either at the previous state or at this one.
-    pub fn write(&mut self, owner: &Owner, state: &StoredState) -> Result<()> {
+    pub(crate) fn write(&mut self, owner: &Owner, state: &StoredState) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -880,7 +926,7 @@ impl Store {
         Ok(())
     }
 
-    /// Gives up `claim`, so the next opener waits for nothing.
+    /// Gives up `claim`, so the next opener does not have to work out that nobody is holding it.
     ///
     /// Only that claim: a row this owner no longer holds belongs to whoever took the store, and
     /// removing it would let a third opener in while the second is still writing. The state is not
@@ -888,9 +934,11 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreUnavailable`] when the row cannot be removed, which leaves the claim
-    /// for its lease to release.
-    pub fn release(&mut self, claim: u64) -> Result<()> {
+    /// Returns [`Error::StoreUnavailable`] when the row cannot be removed - the file is gone, or
+    /// another holder of it kept the write waiting past [`BUSY_TIMEOUT`]. The claim then stays
+    /// where it is, and the next opener has to establish that this process has gone: while this
+    /// process is still running, no lease will release that claim for it.
+    pub(crate) fn release(&mut self, claim: u64) -> Result<()> {
         self.connection.execute(
             "DELETE FROM attention_owner WHERE id = 0 AND claim = ?1",
             params![as_i64(claim, "owner claim")?],

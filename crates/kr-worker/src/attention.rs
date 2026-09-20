@@ -249,7 +249,11 @@ impl Attention {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
     pub fn next_deadline(&self, time: &TimeContract) -> Result<Option<u64>> {
-        Ok(self.locked()?.engine().next_deadline(reading(time)))
+        Ok(self
+            .locked()?
+            .engine()
+            .map_err(translate)?
+            .next_deadline(reading(time)))
     }
 
     /// Serves `attention.read`.
@@ -282,7 +286,7 @@ impl Attention {
         rule: kr_protocol::attention::AttentionRule,
         subject: &str,
     ) -> Result<kr_protocol::attention::AttentionKey> {
-        Ok(self.locked()?.key_for(rule, subject))
+        self.locked()?.key_for(rule, subject).map_err(translate)
     }
 
     /// Returns how far the engine has read one retained source.
@@ -291,7 +295,7 @@ impl Attention {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
     pub fn consumed(&self, source: AttentionSource) -> Result<Option<u64>> {
-        Ok(self.locked()?.engine().consumed(source))
+        Ok(self.locked()?.engine().map_err(translate)?.consumed(source))
     }
 
     /// Returns the announcements the host has decided and no consumer has settled.
@@ -303,7 +307,7 @@ impl Attention {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
     pub fn take_announcements(&self) -> Result<Vec<kr_attention::engine::Announcement>> {
-        Ok(self.locked()?.take_announcements())
+        self.locked()?.take_announcements().map_err(translate)
     }
 
     /// Forgets the announcements a consumer has taken durable responsibility for.
@@ -350,6 +354,7 @@ impl Attention {
         let engine = self.locked()?;
         let state = engine
             .reviews()
+            .map_err(translate)?
             .state(
                 &ActorId::new("local:precheck").expect("a constant principal"),
                 &params.subject,
@@ -462,9 +467,10 @@ impl Attention {
         engine
             .set_quiet_hours(params.quiet_hours.0.clone())
             .map_err(translate)?;
+        let state = engine.engine().map_err(translate)?;
         Ok(AttentionQuietHoursResult {
-            quiet_hours: kr_protocol::scalars::Nullable(engine.engine().quiet_hours().cloned()),
-            quiet_now: engine.engine().quiet_now(now),
+            quiet_hours: kr_protocol::scalars::Nullable(state.quiet_hours().cloned()),
+            quiet_now: state.quiet_now(now),
             quiet_hours_provable: now.wall_proven,
         })
     }
@@ -484,7 +490,12 @@ impl Attention {
         let engine = self.locked()?;
         let (reviews, more) = match params.subject.as_ref() {
             Some(subject) => (
-                engine.reviews().state(actor, subject).into_iter().collect(),
+                engine
+                    .reviews()
+                    .map_err(translate)?
+                    .state(actor, subject)
+                    .into_iter()
+                    .collect(),
                 false,
             ),
             None => engine
@@ -558,12 +569,14 @@ impl Attention {
         oldest_output_cursor: u64,
         content: Content,
     ) -> Result<VisitChangedResult> {
-        Ok(self.locked()?.changed_result(
-            actor,
-            params.max_changes.get(),
-            oldest_output_cursor,
-            content,
-        ))
+        self.locked()?
+            .changed_result(
+                actor,
+                params.max_changes.get(),
+                oldest_output_cursor,
+                content,
+            )
+            .map_err(translate)
     }
 
     /// Gives the engine a page of retained records it has not seen, announcing none of them.

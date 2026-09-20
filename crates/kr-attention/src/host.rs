@@ -78,6 +78,13 @@ pub struct Attention {
     /// which is never later than now: a claim that looks older than it is may be taken by somebody
     /// else, and one that looked newer would keep a store nobody owns.
     latest: HostReading,
+    /// Whether the store has been taken from this value.
+    ///
+    /// What it holds is the state as it was before that happened, which is not the state any more:
+    /// an item somebody else has acknowledged still looks outstanding here, and a decision they
+    /// resolved is still waiting to be announced. So it answers nothing once this is set. The
+    /// store is read again by whoever opens it next.
+    taken: bool,
 }
 
 impl Attention {
@@ -86,7 +93,7 @@ impl Attention {
     /// # Errors
     ///
     /// Returns [`crate::Error::StoreHeld`] when another live owner already holds the store,
-    /// [`crate::Error::StoreAliased`] when more than one name reaches its file,
+    /// [`crate::Error::StoreAliased`] when the platform says more than one name reaches its file,
     /// [`crate::Error::StoreUnavailable`] when it cannot be opened, read or written back, and
     /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read. Opening
     /// writes, because what it read back may have had to be re-anchored.
@@ -103,7 +110,7 @@ impl Attention {
     /// # Errors
     ///
     /// Returns [`crate::Error::StoreHeld`] when another live owner already holds the store,
-    /// [`crate::Error::StoreAliased`] when more than one name reaches its file,
+    /// [`crate::Error::StoreAliased`] when the platform says more than one name reaches its file,
     /// [`crate::Error::StoreUnavailable`] when it cannot be opened, read or written back, and
     /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read. Opening
     /// writes, because what it read back may have had to be re-anchored.
@@ -165,6 +172,7 @@ impl Attention {
             store,
             owner,
             latest: reading,
+            taken: false,
         })
     }
 
@@ -202,27 +210,47 @@ impl Attention {
     }
 
     /// Returns the engine.
-    #[must_use]
-    pub const fn engine(&self) -> &Engine {
-        &self.state.engine
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn engine(&self) -> Result<&Engine> {
+        self.live()?;
+        Ok(&self.state.engine)
     }
 
     /// Returns the review state.
-    #[must_use]
-    pub const fn reviews(&self) -> &Reviews {
-        &self.state.reviews
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn reviews(&self) -> Result<&Reviews> {
+        self.live()?;
+        Ok(&self.state.reviews)
     }
 
     /// Returns the visits and the semantic change log.
-    #[must_use]
-    pub const fn visits(&self) -> &Visits {
-        &self.state.visits
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn visits(&self) -> Result<&Visits> {
+        self.live()?;
+        Ok(&self.state.visits)
     }
 
     /// Returns one actor's acknowledgement revision.
-    #[must_use]
-    pub fn revision(&self, actor: &ActorId) -> u64 {
-        self.state.revisions.get(actor).copied().unwrap_or_default()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn revision(&self, actor: &ActorId) -> Result<u64> {
+        self.live()?;
+        Ok(self.state.revisions.get(actor).copied().unwrap_or_default())
     }
 
     /// Applies one typed event and records what it produced.
@@ -251,8 +279,12 @@ impl Attention {
     /// leaves its claim behind, and the next opener is the one that clears it: it can see the
     /// process is gone, or, where it cannot be asked, the lease runs out.
     fn release(&mut self) {
-        // Best effort: a store that cannot be written now is one whose claim the next opener
-        // clears instead, and there is nobody left to tell.
+        if self.taken {
+            // The claim on the store is somebody else's, and theirs is not this one's to remove.
+            return;
+        }
+        // Best effort: a store whose claim cannot be removed now is one the next opener clears
+        // instead, and there is nobody left to tell.
         let _ = self.store.release(self.owner.claim);
     }
 
@@ -261,22 +293,32 @@ impl Attention {
     /// A producer that wants to name an item it raised asks here rather than deriving one of its
     /// own: the derivation is under a secret of this store's, which is what stops a reader served
     /// the record without the session's text working the key out from a guess at the text.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
     pub fn key_for(
         &self,
         rule: kr_protocol::attention::AttentionRule,
         subject: &str,
-    ) -> AttentionKey {
-        self.state.engine.key_for(rule, subject)
+    ) -> Result<AttentionKey> {
+        self.live()?;
+        Ok(self.state.engine.key_for(rule, subject))
     }
 
     /// Returns the continuous reading the next timer is due at.
     ///
     /// A host wakes at it rather than polling, and `None` means nothing is waiting on time. While
     /// anything is deferred and the window that deferred it has ended, it is now.
-    #[must_use]
-    pub fn next_deadline(&self, reading: HostReading) -> Option<u64> {
-        self.state.engine.next_deadline(reading)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn next_deadline(&self, reading: HostReading) -> Result<Option<u64>> {
+        self.live()?;
+        Ok(self.state.engine.next_deadline(reading))
     }
 
     /// Advances every timer to this reading.
@@ -327,16 +369,22 @@ impl Attention {
     }
 
     /// Returns the inbox one actor sees.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
     pub fn inbox(
         &self,
         actor: &ActorId,
         include_acknowledged: bool,
         content: Content,
-    ) -> Vec<AttentionItem> {
-        self.state
+    ) -> Result<Vec<AttentionItem>> {
+        self.live()?;
+        Ok(self
+            .state
             .engine
-            .inbox(actor, include_acknowledged, content)
+            .inbox(actor, include_acknowledged, content))
     }
 
     /// Returns one page of the inbox one actor sees, with the quiet-hours state beside it.
@@ -386,9 +434,14 @@ impl Attention {
     ///
     /// Nothing is forgotten by asking. A consumer records what it is given and then calls
     /// [`Attention::settle_announcements`]; anything it does not settle is offered again.
-    #[must_use]
-    pub fn take_announcements(&self) -> Vec<Announcement> {
-        self.state.engine.take_announcements()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn take_announcements(&self) -> Result<Vec<Announcement>> {
+        self.live()?;
+        Ok(self.state.engine.take_announcements())
     }
 
     /// Forgets the announcements a consumer has taken durable responsibility for.
@@ -403,9 +456,14 @@ impl Attention {
     }
 
     /// Returns how many decided announcements are waiting to be taken.
-    #[must_use]
-    pub fn awaiting_delivery(&self) -> usize {
-        self.state.engine.awaiting_delivery()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn awaiting_delivery(&self) -> Result<usize> {
+        self.live()?;
+        Ok(self.state.engine.awaiting_delivery())
     }
 
     /// Answers whether this store would admit one actor, without changing anything.
@@ -535,9 +593,14 @@ impl Attention {
     }
 
     /// Returns one actor's visit.
-    #[must_use]
-    pub fn visit(&self, actor: &ActorId) -> Option<&Visit> {
-        self.state.visits.visit(actor)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn visit(&self, actor: &ActorId) -> Result<Option<&Visit>> {
+        self.live()?;
+        Ok(self.state.visits.visit(actor))
     }
 
     /// Records a model summary of one interval.
@@ -551,30 +614,40 @@ impl Attention {
     }
 
     /// Answers what changed since one actor's last visit.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
     pub fn changed_since(
         &self,
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
         content: Content,
-    ) -> Changed {
-        self.state
+    ) -> Result<Changed> {
+        self.live()?;
+        Ok(self
+            .state
             .visits
-            .changed_since(actor, max_changes, oldest_output_cursor, content)
+            .changed_since(actor, max_changes, oldest_output_cursor, content))
     }
 
     /// Answers what changed since one actor's last visit, as the wire type.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
     pub fn changed_result(
         &self,
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
         content: Content,
-    ) -> VisitChangedResult {
-        let changed = self.changed_since(actor, max_changes, oldest_output_cursor, content);
-        VisitChangedResult {
+    ) -> Result<VisitChangedResult> {
+        let changed = self.changed_since(actor, max_changes, oldest_output_cursor, content)?;
+        Ok(VisitChangedResult {
             actor_id: actor.clone(),
             from_cursor: U64::new(changed.from_cursor),
             to_cursor: U64::new(changed.to_cursor),
@@ -583,7 +656,7 @@ impl Attention {
             more: changed.more,
             summary: Nullable(changed.summary),
             views: changed.views,
-        }
+        })
     }
 
     /// Returns one page of one actor's review state for one session, oldest first.
@@ -631,9 +704,14 @@ impl Attention {
     }
 
     /// Returns the ranges of retained events the host can no longer read.
-    #[must_use]
-    pub fn gaps(&self) -> Vec<AttentionGap> {
-        self.state.engine.gaps().to_vec()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`] when the store is no longer this owner's, because what
+    /// this value holds is then the state as it was before somebody else took it.
+    pub fn gaps(&self) -> Result<Vec<AttentionGap>> {
+        self.live()?;
+        Ok(self.state.engine.gaps().to_vec())
     }
 
     /// Runs one change against a copy of the state and installs it once it is written down.
@@ -641,14 +719,32 @@ impl Attention {
         self.try_commit(|state| Ok(change(state)))
     }
 
+    /// Refuses every further answer once the store has been taken from this value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreTaken`], which is what the caller was told when the store went.
+    fn live(&self) -> Result<()> {
+        if self.taken {
+            return Err(crate::Error::StoreTaken);
+        }
+        Ok(())
+    }
+
     /// The same, for a change that can refuse before anything is written.
     fn try_commit<T>(&mut self, change: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        self.live()?;
         let mut candidate = self.state.clone();
         let answer = change(&mut candidate)?;
         // Every write refreshes the claim, which is what tells a later opener this owner is still
         // here, and every write is refused unless the claim on the store is still this one's.
         let refreshed = Owner::here(self.owner.claim, self.owner.process.clone(), self.latest);
-        self.store.write(&refreshed, &snapshot(&candidate))?;
+        if let Err(error) = self.store.write(&refreshed, &snapshot(&candidate)) {
+            // A store this owner no longer holds is one whose state this value no longer knows.
+            // It keeps neither the change nor the answer, and it answers nothing else either.
+            self.taken = matches!(error, crate::Error::StoreTaken);
+            return Err(error);
+        }
         self.owner = refreshed;
         self.state = candidate;
         Ok(answer)

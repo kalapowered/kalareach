@@ -199,7 +199,9 @@ fn adapter_failed(sequence: u64, at_ms: u64) -> SourceEvent {
 
 /// The key one rule and one subject land on, derived the way the engine derives it.
 fn key(attention: &Attention, id: AttentionRule, subject: &str) -> AttentionKey {
-    attention.key_for(id, subject)
+    attention
+        .key_for(id, subject)
+        .expect("the store is this owner's")
 }
 
 /// Takes every outstanding announcement and settles it, which is what a delivery consumer does
@@ -208,6 +210,7 @@ fn key(attention: &Attention, id: AttentionRule, subject: &str) -> AttentionKey 
 fn deliver(attention: &mut Attention) {
     let taken: Vec<_> = attention
         .take_announcements()
+        .expect("the store is this owner's")
         .into_iter()
         .map(|one| (one.key, one.number))
         .collect();
@@ -259,7 +262,9 @@ fn engine() -> Attention {
 }
 
 fn whole_inbox(attention: &Attention) -> Vec<AttentionItem> {
-    attention.inbox(&actor("local:501"), true, Content::Whole)
+    attention
+        .inbox(&actor("local:501"), true, Content::Whole)
+        .expect("the store is this owner's")
 }
 
 /// Every review subject of one session, as one page the bound admits.
@@ -388,7 +393,10 @@ fn a_record_no_rule_covers_moves_the_cursor_and_nothing_else() {
         .expect("the store records the decision");
     assert!(outcomes.is_empty());
     assert_eq!(
-        attention.engine().consumed(AttentionSource::Receipts),
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .consumed(AttentionSource::Receipts),
         Some(1)
     );
     let next = attention
@@ -473,7 +481,12 @@ fn an_announcement_inside_quiet_hours_is_deferred_and_released_when_they_end() {
 
     // One hour later the window has ended and the held announcement is released.
     let after = HostReading::new(boot(), 3_600_000, NOON + 3_600_000, true);
-    assert!(!attention.engine().quiet_now(after));
+    assert!(
+        !attention
+            .engine()
+            .expect("the store is this owner's")
+            .quiet_now(after)
+    );
     let released = attention
         .tick(after)
         .expect("the store records the release");
@@ -510,6 +523,7 @@ fn a_repeat_that_falls_inside_quiet_hours_is_deferred_once_rather_than_on_every_
     // host waits for the release instead of waking on every tick.
     let deadline = attention
         .engine()
+        .expect("the store is this owner's")
         .next_deadline(reading(REMINDER_INTERVAL_MS))
         .expect("a deferred item waits for the window to end");
     assert!(
@@ -578,7 +592,10 @@ fn clearing_quiet_hours_releases_what_they_were_holding() {
     // Clearing the window announces nothing by itself: the release is a timer decision, and the
     // deadline the engine reports while anything is deferred is now.
     assert_eq!(
-        attention.engine().next_deadline(reading(1_000)),
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .next_deadline(reading(1_000)),
         Some(1_000),
         "the host is told to come back at once"
     );
@@ -595,7 +612,12 @@ fn quiet_hours_are_not_enforced_on_a_clock_this_host_cannot_prove() {
         .set_quiet_hours(Some(quiet_over_noon()))
         .expect("the store records the window");
     let unproven = HostReading::new(boot(), 0, NOON, false);
-    assert!(!attention.engine().quiet_now(unproven));
+    assert!(
+        !attention
+            .engine()
+            .expect("the store is this owner's")
+            .quiet_now(unproven)
+    );
     let outcomes = attention
         .apply(&approval(1, 1_000, "req-1"), unproven)
         .expect("the store records the decision");
@@ -781,6 +803,7 @@ fn one_actor_s_acknowledgement_does_not_silence_the_host_s_reminder() {
     assert_eq!(
         attention
             .inbox(&actor("local:501"), false, Content::Whole)
+            .expect("the store is this owner's")
             .len(),
         1,
         "and another actor still has it to look at"
@@ -813,7 +836,10 @@ fn the_next_deadline_is_the_earliest_timer_the_host_has_to_wake_for() {
         )
         .expect("the store records the decision");
     assert_eq!(
-        attention.engine().next_deadline(reading(0)),
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .next_deadline(reading(0)),
         Some(IDLE_REMINDER_MS),
         "the idle reminder is the only timer"
     );
@@ -909,11 +935,13 @@ fn an_acknowledgement_affects_only_the_actor_that_made_it() {
     assert!(
         attention
             .inbox(&actor("device:phone"), false, Content::Whole)
+            .expect("the store is this owner's")
             .is_empty()
     );
     assert_eq!(
         attention
             .inbox(&actor("local:501"), false, Content::Whole)
+            .expect("the store is this owner's")
             .len(),
         1,
         "another actor has not seen it"
@@ -936,6 +964,7 @@ fn a_later_occurrence_is_work_an_earlier_acknowledgement_does_not_cover() {
     assert!(
         attention
             .inbox(&actor("device:phone"), false, Content::Whole)
+            .expect("the store is this owner's")
             .is_empty()
     );
     attention
@@ -944,6 +973,7 @@ fn a_later_occurrence_is_work_an_earlier_acknowledgement_does_not_cover() {
     assert_eq!(
         attention
             .inbox(&actor("device:phone"), false, Content::Whole)
+            .expect("the store is this owner's")
             .len(),
         1,
         "the condition happened again"
@@ -1121,16 +1151,22 @@ fn a_caller_the_host_cannot_narrow_is_served_the_record_without_the_session_s_te
         ))
         .expect("the store records the summary");
 
-    let whole = attention.inbox(&actor("device:phone"), true, Content::Whole);
+    let whole = attention
+        .inbox(&actor("device:phone"), true, Content::Whole)
+        .expect("the store is this owner's");
     assert!(whole.iter().all(|item| item.summary.is_present()));
-    let narrowed = attention.inbox(&actor("device:phone"), true, Content::Narrowed);
+    let narrowed = attention
+        .inbox(&actor("device:phone"), true, Content::Narrowed)
+        .expect("the store is this owner's");
     assert_eq!(narrowed.len(), whole.len(), "the same items");
     for item in &narrowed {
         assert_eq!(item.summary, Nullable::null(), "without the session's text");
         assert!(item.occurrences.get() >= 1, "with the host's own record");
     }
 
-    let changed = attention.changed_since(&actor("device:phone"), 100, 0, Content::Narrowed);
+    let changed = attention
+        .changed_since(&actor("device:phone"), 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
     assert!(!changed.changes.is_empty());
     assert!(
         changed
@@ -1209,6 +1245,7 @@ fn completing_a_review_takes_its_waiting_item_out_of_that_actor_s_inbox() {
     assert_eq!(
         attention
             .inbox(&actor("local:501"), false, Content::Whole)
+            .expect("the store is this owner's")
             .len(),
         1
     );
@@ -1218,12 +1255,14 @@ fn completing_a_review_takes_its_waiting_item_out_of_that_actor_s_inbox() {
     assert!(
         attention
             .inbox(&actor("local:501"), false, Content::Whole)
+            .expect("the store is this owner's")
             .is_empty(),
         "review state and the inbox say one thing"
     );
     assert_eq!(
         attention
             .inbox(&actor("device:phone"), false, Content::Whole)
+            .expect("the store is this owner's")
             .len(),
         1,
         "and only for the actor that reviewed it"
@@ -1235,6 +1274,7 @@ fn completing_a_review_takes_its_waiting_item_out_of_that_actor_s_inbox() {
     assert_eq!(
         attention
             .inbox(&actor("local:501"), false, Content::Whole)
+            .expect("the store is this owner's")
             .len(),
         1,
         "a later version is work again"
@@ -1260,7 +1300,9 @@ fn a_review_acknowledgement_names_a_version_the_host_holds() {
         "version two was never presented"
     );
     assert_eq!(
-        attention.revision(&actor("local:501")),
+        attention
+            .revision(&actor("local:501"))
+            .expect("the store is this owner's"),
         0,
         "a refused acknowledgement records nothing"
     );
@@ -1277,6 +1319,7 @@ fn a_review_acknowledgement_is_per_actor() {
         .expect("the version is one the host holds");
     let other = attention
         .reviews()
+        .expect("the store is this owner's")
         .state(&actor("device:phone"), &turn_subject())
         .expect("the subject exists for every actor");
     assert!(other.outstanding, "another actor has not reviewed it");
@@ -1308,6 +1351,7 @@ fn a_change_set_captured_outside_a_turn_is_review_work_of_its_own() {
     };
     let state = attention
         .reviews()
+        .expect("the store is this owner's")
         .state(&actor("local:501"), &subject)
         .expect("the change set is a subject");
     assert_eq!(state.current_version, U64::new(4));
@@ -1359,7 +1403,9 @@ fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_event
             )
             .expect("the store records the decision");
     }
-    let all = attention.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let all = attention
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     assert_eq!(all.from_cursor, 0);
     assert_eq!(
         all.changes.len(),
@@ -1371,14 +1417,18 @@ fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_event
     attention
         .acknowledge_visit(&actor("local:501"), all.to_cursor, Vec::new())
         .expect("the store records the visit");
-    let nothing = attention.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let nothing = attention
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     assert!(nothing.changes.is_empty());
     assert!(nothing.omitted.is_empty());
 
     attention
         .apply(&turn_completed(4, 4_000, 4), reading(0))
         .expect("the store records the decision");
-    let latest = attention.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let latest = attention
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     assert_eq!(latest.changes.len(), 2);
     assert_eq!(latest.from_cursor, all.to_cursor);
 }
@@ -1415,7 +1465,9 @@ fn a_summary_travels_beside_the_events_and_names_the_interval_it_came_from() {
             TimestampMs::new(2_000),
         ))
         .expect("the store records the summary");
-    let changed = attention.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let changed = attention
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     let summary = changed.summary.expect("a summary covers the interval");
     assert_eq!(summary.from_cursor, U64::new(0));
     assert_eq!(summary.to_cursor, U64::new(2));
@@ -1437,7 +1489,9 @@ fn a_range_a_retained_source_lost_is_shown_in_what_changed_since_a_visit() {
     attention
         .apply(&turn_completed(9, 9_000, 2), reading(120_000))
         .expect("the store records the decision");
-    let changed = attention.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let changed = attention
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     let omitted = changed
         .omitted
         .iter()
@@ -1456,6 +1510,7 @@ fn a_range_a_retained_source_lost_is_shown_in_what_changed_since_a_visit() {
     assert!(
         attention
             .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+            .expect("the store is this owner's")
             .omitted
             .is_empty()
     );
@@ -1487,7 +1542,7 @@ fn a_gap_in_the_retained_events_is_never_an_answered_approval() {
         first.uncertain,
         "the host cannot say whether the missing range answered it"
     );
-    let gaps = attention.gaps();
+    let gaps = attention.gaps().expect("the store is this owner's");
     assert_eq!(gaps.len(), 1);
     assert_eq!(gaps[0].from_sequence, U64::new(2));
     assert_eq!(gaps[0].to_sequence, U64::new(9));
@@ -1570,6 +1625,7 @@ fn replaying_the_retained_events_twice_gives_one_inbox() {
     let once = whole_inbox(&attention);
     let changes_once = attention
         .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's")
         .changes;
 
     let again = attention
@@ -1580,6 +1636,7 @@ fn replaying_the_retained_events_twice_gives_one_inbox() {
     assert_eq!(
         attention
             .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+            .expect("the store is this owner's")
             .changes,
         changes_once
     );
@@ -1645,8 +1702,10 @@ fn a_rebuild_from_nothing_holds_the_same_items_as_the_live_engine() {
     assert_eq!(
         rebuilt
             .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+            .expect("the store is this owner's")
             .changes,
         live.changed_since(&actor("local:501"), 100, 0, Content::Whole)
+            .expect("the store is this owner's")
             .changes
     );
 }
@@ -1698,7 +1757,12 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
             .expect("the store records the window");
         items = whole_inbox(&attention);
         states = review_states(&attention, "local:501", session(1));
-        assert_eq!(attention.revision(&actor("local:501")), 2);
+        assert_eq!(
+            attention
+                .revision(&actor("local:501"))
+                .expect("the store is this owner's"),
+            2
+        );
     }
 
     let reopened =
@@ -1706,17 +1770,25 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
     assert_eq!(whole_inbox(&reopened), items);
     assert_eq!(review_states(&reopened, "local:501", session(1)), states);
     assert_eq!(
-        reopened.engine().quiet_hours(),
+        reopened
+            .engine()
+            .expect("the store is this owner's")
+            .quiet_hours(),
         Some(&quiet_over_noon()),
         "the configured window survives"
     );
     assert_eq!(
-        reopened.engine().consumed(AttentionSource::Receipts),
+        reopened
+            .engine()
+            .expect("the store is this owner's")
+            .consumed(AttentionSource::Receipts),
         Some(3),
         "the consumed cursors survive, so a replay is still idempotent"
     );
     assert_eq!(
-        reopened.revision(&actor("local:501")),
+        reopened
+            .revision(&actor("local:501"))
+            .expect("the store is this owner's"),
         2,
         "and so does the per-actor revision"
     );
@@ -1789,7 +1861,13 @@ fn an_interval_is_never_measured_across_a_clock_somebody_can_set() {
                 HostReading::new(boot(), 10_000, NOON, true),
             )
             .expect("the store records the decision");
-        assert_eq!(attention.awaiting_delivery(), 1, "it went out at once");
+        assert_eq!(
+            attention
+                .awaiting_delivery()
+                .expect("the store is this owner's"),
+            1,
+            "it went out at once"
+        );
     }
 
     // The machine rebooted two seconds later and its wall clock was stepped an hour forward. Both
@@ -1840,7 +1918,10 @@ fn a_write_that_fails_leaves_the_engine_where_it_was() {
         "a decision this host could not write down did not happen"
     );
     assert_eq!(
-        attention.engine().consumed(AttentionSource::Receipts),
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .consumed(AttentionSource::Receipts),
         Some(1),
         "so the same record can be offered again"
     );
@@ -1909,7 +1990,9 @@ fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
     }
     let reopened =
         Attention::open(&path, reading(10_000), &opener()).expect("the feature store reopens");
-    let changed = reopened.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let changed = reopened
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     assert_eq!(changed.views.len(), 1);
     assert_eq!(changed.views[0].view.source_offset, U64::new(4_096));
     assert_eq!(changed.views[0].view.filter, "level=error");
@@ -1929,7 +2012,9 @@ fn switching_to_another_view_loses_neither_one_s_position() {
     attention
         .acknowledge_visit(&actor("local:501"), 0, vec![view("deploy", 99, "unit=web")])
         .expect("the store records the visit");
-    let changed = attention.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let changed = attention
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     let mut held: Vec<_> = changed
         .views
         .iter()
@@ -1976,7 +2061,9 @@ fn the_view_a_client_used_last_is_the_one_the_bound_keeps() {
         .acknowledge_visit(&actor("local:501"), 0, vec![view("view-new", 1, "")])
         .expect("the store records the visit");
 
-    let changed = attention.changed_since(&actor("local:501"), 100, 0, Content::Whole);
+    let changed = attention
+        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
     let ids: Vec<_> = changed
         .views
         .iter()
@@ -2004,7 +2091,9 @@ fn a_view_whose_range_retention_took_is_served_from_the_oldest_byte_and_told_abo
         )
         .expect("the store records the visit");
     // Retention has moved the oldest readable output past where the view was reading.
-    let changed = attention.changed_since(&actor("local:501"), 100, 500, Content::Whole);
+    let changed = attention
+        .changed_since(&actor("local:501"), 100, 500, Content::Whole)
+        .expect("the store is this owner's");
     let retained = &changed.views[0];
     assert_eq!(retained.view.source_offset, U64::new(500));
     assert_eq!(retained.view.filter, "level=error", "the filter is kept");
@@ -2026,18 +2115,32 @@ fn a_decided_announcement_waits_to_be_taken_and_survives_a_restart() {
         attention
             .apply(&approval(1, 1_000, "req-1"), reading(0))
             .expect("the store records the decision");
-        assert_eq!(attention.awaiting_delivery(), 1);
+        assert_eq!(
+            attention
+                .awaiting_delivery()
+                .expect("the store is this owner's"),
+            1
+        );
         assert!(whole_inbox(&attention)[0].awaiting_delivery);
     }
     // The host died before it sent anything. The decision is still there to be taken.
     let mut reopened =
         Attention::open(&path, reading(10_000), &opener()).expect("the feature store reopens");
-    assert_eq!(reopened.awaiting_delivery(), 1);
-    let taken = reopened.take_announcements();
+    assert_eq!(
+        reopened
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
+        1
+    );
+    let taken = reopened
+        .take_announcements()
+        .expect("the store is this owner's");
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].rule, AttentionRule::PendingApproval);
     assert_eq!(
-        reopened.awaiting_delivery(),
+        reopened
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
         1,
         "asking forgets nothing: a consumer that died between the asking and its own record gets \
          the same answer again"
@@ -2045,7 +2148,12 @@ fn a_decided_announcement_waits_to_be_taken_and_survives_a_restart() {
     reopened
         .settle_announcements(&[(taken[0].key.clone(), taken[0].number)])
         .expect("the store records that it was settled");
-    assert_eq!(reopened.awaiting_delivery(), 0);
+    assert_eq!(
+        reopened
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
+        0
+    );
     assert!(!whole_inbox(&reopened)[0].awaiting_delivery);
 }
 
@@ -2058,7 +2166,13 @@ fn a_release_quiet_hours_let_through_is_an_announcement_waiting_to_be_taken() {
     attention
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    assert_eq!(attention.awaiting_delivery(), 0, "nothing has gone out yet");
+    assert_eq!(
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
+        0,
+        "nothing has gone out yet"
+    );
     attention
         .set_quiet_hours(None)
         .expect("the store records the window");
@@ -2066,7 +2180,9 @@ fn a_release_quiet_hours_let_through_is_an_announcement_waiting_to_be_taken() {
         .tick(reading(1_000))
         .expect("the store records the decision");
     assert_eq!(
-        attention.awaiting_delivery(),
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
         1,
         "the released announcement is waiting to be taken rather than lost"
     );
@@ -2082,7 +2198,10 @@ fn an_item_nobody_has_decided_about_is_due_now() {
         .rebuild(&[approval(1, 1_000, "req-1")], now)
         .expect("the store records the rebuild");
     assert_eq!(
-        attention.engine().next_deadline(now),
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .next_deadline(now),
         Some(now.continuous_ms),
         "a rebuilt item still owes a decision, so the host wakes for it at once"
     );
@@ -2117,6 +2236,7 @@ fn an_escalation_waits_out_the_de_duplication_window() {
     );
     let deadline = attention
         .engine()
+        .expect("the store is this owner's")
         .next_deadline(reading(ADAPTER_ESCALATION_MS))
         .expect("the held announcement is a deadline");
     assert_eq!(deadline, ADAPTER_ESCALATION_MS - 1_000 + 60_000);
@@ -2137,7 +2257,9 @@ fn a_replayed_occurrence_outside_the_window_is_decided_after_the_rebuild() {
         attention
             .apply(&command(1, 1_000, "cargo test", 101), reading(0))
             .expect("the store records the decision");
-        let taken = attention.take_announcements();
+        let taken = attention
+            .take_announcements()
+            .expect("the store is this owner's");
         attention
             .settle_announcements(
                 &taken
@@ -2155,7 +2277,10 @@ fn a_replayed_occurrence_outside_the_window_is_decided_after_the_rebuild() {
         .rebuild(&[command(1, 1_000, "cargo test", 101), later], now)
         .expect("the store records the rebuild");
     assert_eq!(
-        reopened.engine().next_deadline(now),
+        reopened
+            .engine()
+            .expect("the store is this owner's")
+            .next_deadline(now),
         Some(now.continuous_ms),
         "the new occurrence owes a decision"
     );
@@ -2260,6 +2385,7 @@ fn a_review_subject_an_inbox_item_still_points_at_is_never_let_go_of() {
     }
     let state = attention
         .reviews()
+        .expect("the store is this owner's")
         .state(&actor("local:501"), &turn_subject())
         .expect("the turn the inbox still points at is still a subject");
     assert!(state.outstanding);
@@ -2340,6 +2466,7 @@ fn a_turn_whose_name_a_key_cannot_carry_is_protected_like_any_other() {
         assert!(
             attention
                 .reviews()
+                .expect("the store is this owner's")
                 .state(&actor("local:501"), &subject)
                 .is_some(),
             "{name:?} is still a subject the inbox points at"
@@ -2382,6 +2509,7 @@ fn a_subject_an_actor_has_acknowledged_is_never_let_go_of() {
     }
     let state = attention
         .reviews()
+        .expect("the store is this owner's")
         .state(&actor("local:501"), &subject)
         .expect("what an actor read is still there to be read back");
     assert_eq!(state.acknowledged_version, Nullable::some(U64::new(1)));
@@ -2410,7 +2538,9 @@ fn one_more_actor_than_the_store_admits_is_refused_rather_than_displacing_one() 
     );
     assert!(refused.is_err(), "a new actor past the bound is refused");
     assert_eq!(
-        attention.revision(&actor("device:0")),
+        attention
+            .revision(&actor("device:0"))
+            .expect("the store is this owner's"),
         1,
         "and nothing an actor already here recorded was deleted to make room"
     );
@@ -2512,7 +2642,9 @@ fn a_key_carries_none_of_the_text_the_condition_came_from() {
         assert!(derived.starts_with(DERIVED_MARKER));
     }
     // And a caller the host cannot narrow gets neither the text nor a key carrying it.
-    let narrowed = attention.inbox(&actor("device:phone"), true, Content::Narrowed);
+    let narrowed = attention
+        .inbox(&actor("device:phone"), true, Content::Narrowed)
+        .expect("the store is this owner's");
     assert!(narrowed.iter().all(|item| item.summary.0.is_none()));
     assert!(
         narrowed
@@ -2556,7 +2688,9 @@ fn an_announcement_identity_is_never_given_out_twice() {
     attention
         .apply(&lost(1, 1_000), reading(0))
         .expect("the store records the decision");
-    let first = attention.take_announcements();
+    let first = attention
+        .take_announcements()
+        .expect("the store is this owner's");
     assert_eq!(first.len(), 1);
     attention
         .apply(
@@ -2569,11 +2703,19 @@ fn an_announcement_identity_is_never_given_out_twice() {
             reading(1_000),
         )
         .expect("the store records the decision");
-    assert_eq!(attention.awaiting_delivery(), 0, "the condition ended");
+    assert_eq!(
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
+        0,
+        "the condition ended"
+    );
     attention
         .apply(&lost(3, 3_000), reading(2_000))
         .expect("the store records the decision");
-    let second = attention.take_announcements();
+    let second = attention
+        .take_announcements()
+        .expect("the store is this owner's");
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].key, first[0].key, "the same condition");
     assert_ne!(
@@ -2586,14 +2728,21 @@ fn an_announcement_identity_is_never_given_out_twice() {
         .settle_announcements(&[(first[0].key.clone(), first[0].number)])
         .expect("the store records the settlement");
     assert_eq!(
-        attention.awaiting_delivery(),
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
         1,
         "an identity from before the condition returned settles nothing after it"
     );
     attention
         .settle_announcements(&[(second[0].key.clone(), second[0].number)])
         .expect("the store records the settlement");
-    assert_eq!(attention.awaiting_delivery(), 0);
+    assert_eq!(
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
+        0
+    );
 }
 
 #[test]
@@ -2607,7 +2756,9 @@ fn an_announcement_identity_keeps_going_forward_across_a_restart() {
         attention
             .apply(&command(1, 1_000, "cargo test", 101), reading(0))
             .expect("the store records the decision");
-        taken = attention.take_announcements();
+        taken = attention
+            .take_announcements()
+            .expect("the store is this owner's");
         assert_eq!(taken.len(), 1);
     }
     let mut reopened =
@@ -2615,7 +2766,9 @@ fn an_announcement_identity_keeps_going_forward_across_a_restart() {
     reopened
         .apply(&notice(1, 2_000, "build finished", false), reading(10_000))
         .expect("the store records the decision");
-    let after = reopened.take_announcements();
+    let after = reopened
+        .take_announcements()
+        .expect("the store is this owner's");
     let fresh = after
         .iter()
         .find(|one| one.rule == AttentionRule::ApplicationNotice)
@@ -2637,7 +2790,12 @@ fn a_decision_no_consumer_has_settled_is_never_let_go_of() {
         .apply(&notice(1, 1_000, "the first notice", false), reading(0))
         .expect("the store records the decision");
     let held = notice_key(&attention, "the first notice");
-    assert_eq!(attention.awaiting_delivery(), 1);
+    assert_eq!(
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
+        1
+    );
     let bound = MAX_RETAINED_ATTENTION_ITEMS;
     for sequence in 2..=bound + 10 {
         attention
@@ -2652,7 +2810,9 @@ fn a_decision_no_consumer_has_settled_is_never_let_go_of() {
             )
             .expect("the store records the decision");
         // Everything after the first is taken and settled at once, so only the first is held.
-        let taken = attention.take_announcements();
+        let taken = attention
+            .take_announcements()
+            .expect("the store is this owner's");
         let settled: Vec<_> = taken
             .iter()
             .filter(|one| one.key != held)
@@ -2666,7 +2826,12 @@ fn a_decision_no_consumer_has_settled_is_never_let_go_of() {
         whole_inbox(&attention).iter().any(|item| item.key == held),
         "the item whose decision nobody has taken is still there"
     );
-    assert_eq!(attention.awaiting_delivery(), 1);
+    assert_eq!(
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
+        1
+    );
 }
 
 #[test]
@@ -2768,6 +2933,7 @@ fn review_work_the_host_has_just_recorded_is_never_the_one_the_bound_lets_go_of(
     };
     let state = attention
         .reviews()
+        .expect("the store is this owner's")
         .state(&who, &fresh)
         .expect("the capture the host was just told about is review work it holds");
     assert_eq!(state.current_version, U64::new(3));
@@ -2860,15 +3026,25 @@ fn a_question_answered_after_its_reminder_record_left_is_still_a_change() {
         )
         .expect("the store records the decision");
     assert!(
-        !attention.engine().pending_inputs().contains_key(&first),
+        !attention
+            .engine()
+            .expect("the store is this owner's")
+            .pending_inputs()
+            .contains_key(&first),
         "the oldest reminded record is the one the bound took"
     );
     assert!(
-        attention.engine().pending_inputs().len() <= bound,
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .pending_inputs()
+            .len()
+            <= bound,
         "the bound held"
     );
     let before = attention
         .changed_since(&actor("local:501"), 500, 0, Content::Whole)
+        .expect("the store is this owner's")
         .changes
         .len();
     attention
@@ -2886,7 +3062,9 @@ fn a_question_answered_after_its_reminder_record_left_is_still_a_change() {
             reading(IDLE_REMINDER_MS * 3),
         )
         .expect("the store records the decision");
-    let after = attention.changed_since(&actor("local:501"), 500, 0, Content::Whole);
+    let after = attention
+        .changed_since(&actor("local:501"), 500, 0, Content::Whole)
+        .expect("the store is this owner's");
     assert_eq!(
         after.changes.len(),
         before + 1,
@@ -2925,7 +3103,9 @@ fn a_condition_nobody_has_decided_about_yet_is_never_let_go_of() {
     }
     // Nothing has been settled, so every item there is protected already.
     assert_eq!(
-        attention.awaiting_delivery(),
+        attention
+            .awaiting_delivery()
+            .expect("the store is this owner's"),
         usize::try_from(bound).expect("a small bound")
     );
     let newest = notice_key(&attention, "the newest notice");
@@ -3041,6 +3221,7 @@ fn review_work_survives_every_event_that_follows_it() {
     };
     let state = attention
         .reviews()
+        .expect("the store is this owner's")
         .state(&who, &subject)
         .expect("review work the host was told about is review work it still holds");
     assert_eq!(state.current_version, U64::new(3));
@@ -3162,11 +3343,15 @@ fn a_turn_version_the_host_already_holds_reopens_no_review_and_announces_nothing
         .acknowledge_review(&who, &subject, 2, reading(1_000))
         .expect("the actor reads it");
     assert!(
-        attention.inbox(&who, false, Content::Whole).is_empty(),
+        attention
+            .inbox(&who, false, Content::Whole)
+            .expect("the store is this owner's")
+            .is_empty(),
         "the review is complete, so nothing is waiting for this actor"
     );
     let before = attention
         .changed_since(&who, 500, 0, Content::Whole)
+        .expect("the store is this owner's")
         .changes
         .len();
 
@@ -3179,12 +3364,16 @@ fn a_turn_version_the_host_already_holds_reopens_no_review_and_announces_nothing
         "a record the host already holds is consumed and nothing else: {outcomes:?}"
     );
     assert!(
-        attention.inbox(&who, false, Content::Whole).is_empty(),
+        attention
+            .inbox(&who, false, Content::Whole)
+            .expect("the store is this owner's")
+            .is_empty(),
         "and the completed review stays complete"
     );
     assert_eq!(
         attention
             .changed_since(&who, 500, 0, Content::Whole)
+            .expect("the store is this owner's")
             .changes
             .len(),
         before,
@@ -3192,13 +3381,17 @@ fn a_turn_version_the_host_already_holds_reopens_no_review_and_announces_nothing
     );
     let state = attention
         .reviews()
+        .expect("the store is this owner's")
         .state(&who, &subject)
         .expect("the subject is still there");
     assert_eq!(state.current_version, U64::new(2));
     assert!(!state.outstanding);
     // And it was consumed: the next event is not read as a range retention took.
     assert_eq!(
-        attention.engine().consumed(AttentionSource::Semantic),
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .consumed(AttentionSource::Semantic),
         Some(2)
     );
 }
@@ -3306,6 +3499,7 @@ fn a_late_turn_beside_a_newer_change_set_still_records_the_change_set() {
             .expect("the actor reads it");
         let before = attention
             .changed_since(&who, 500, 0, Content::Whole)
+            .expect("the store is this owner's")
             .changes
             .len();
 
@@ -3320,6 +3514,7 @@ fn a_late_turn_beside_a_newer_change_set_still_records_the_change_set() {
         }
         let state = attention
             .reviews()
+            .expect("the store is this owner's")
             .state(&who, &change_set)
             .expect("the change set is a subject the host holds");
         assert_eq!(
@@ -3331,6 +3526,7 @@ fn a_late_turn_beside_a_newer_change_set_still_records_the_change_set() {
         assert_eq!(
             attention
                 .changed_since(&who, 500, 0, Content::Whole)
+                .expect("the store is this owner's")
                 .changes
                 .len(),
             before + 1,
@@ -3338,6 +3534,7 @@ fn a_late_turn_beside_a_newer_change_set_still_records_the_change_set() {
         );
         let turn = attention
             .reviews()
+            .expect("the store is this owner's")
             .state(
                 &who,
                 &ReviewSubject::CompletedTurn {
@@ -3373,7 +3570,13 @@ fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_prov
                 HostReading::new(boot(), 10_000, 1_000, false),
             )
             .expect("the store records the decision");
-        assert_eq!(attention.awaiting_delivery(), 1, "it went out at once");
+        assert_eq!(
+            attention
+                .awaiting_delivery()
+                .expect("the store is this owner's"),
+            1,
+            "it went out at once"
+        );
     }
     // Two seconds later on the machine's own clock, with the wall clock corrected and proved.
     let mut reopened = Attention::open(
@@ -3808,24 +4011,29 @@ fn the_write_an_open_makes_does_not_replace_what_the_owner_before_it_committed()
     let mut held = Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
     held.apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    let key = held.key_for(AttentionRule::PendingApproval, "req-1");
+    let key = held
+        .key_for(AttentionRule::PendingApproval, "req-1")
+        .expect("the store is this owner's");
 
     // One owner acknowledges, and its work is committed.
     held.acknowledge(&who, std::slice::from_ref(&key), reading(1_000))
         .expect("the store records the acknowledgement");
-    assert_eq!(held.revision(&who), 1);
+    assert_eq!(held.revision(&who).expect("the store is this owner's"), 1);
     drop(held);
 
     // The next owner opens the same file. Its own opening write must not put back the state that
     // stood before the acknowledgement.
     let second = Attention::open(&path, reading(2_000), &opener()).expect("the store reopens");
     assert_eq!(
-        second.revision(&who),
+        second.revision(&who).expect("the store is this owner's"),
         1,
         "the acknowledgement another owner committed is still there"
     );
     assert!(
-        second.inbox(&who, false, Content::Whole).is_empty(),
+        second
+            .inbox(&who, false, Content::Whole)
+            .expect("the store is this owner's")
+            .is_empty(),
         "and it still means what it meant"
     );
 }
@@ -3842,7 +4050,9 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     let mut held = Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
     held.apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    let key = held.key_for(AttentionRule::PendingApproval, "req-1");
+    let key = held
+        .key_for(AttentionRule::PendingApproval, "req-1")
+        .expect("the store is this owner's");
 
     // A second owner tries to read the state before the first one's next write lands. It never
     // gets that far.
@@ -3864,8 +4074,12 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     // Once the first owner lets go, the next one opens and finds everything it committed.
     drop(held);
     let next = Attention::open(&path, reading(4_000), &opener()).expect("the store reopens");
-    assert_eq!(next.revision(&who), 1);
-    assert!(next.inbox(&who, false, Content::Whole).is_empty());
+    assert_eq!(next.revision(&who).expect("the store is this owner's"), 1);
+    assert!(
+        next.inbox(&who, false, Content::Whole)
+            .expect("the store is this owner's")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3930,6 +4144,7 @@ fn a_file_more_than_one_name_reaches_is_not_opened_at_all() {
     assert_eq!(
         reopened
             .inbox(&actor("device:phone"), true, Content::Whole)
+            .expect("the store is this owner's")
             .len(),
         1,
         "the state a refusal protected is the state that comes back"
@@ -3974,7 +4189,9 @@ fn a_store_whose_owner_has_gone_is_taken_at_once() {
     let next = Attention::open(&path, reading(1_000), &Claimant::new(process(2), ENDED))
         .expect("the store is taken from a process that has gone");
     assert_eq!(
-        next.inbox(&who, true, Content::Whole).len(),
+        next.inbox(&who, true, Content::Whole)
+            .expect("the store is this owner's")
+            .len(),
         1,
         "and everything the owner before it wrote down is there"
     );
@@ -4004,7 +4221,7 @@ fn a_claim_nobody_can_ask_about_stands_until_its_lease_runs_out() {
 }
 
 #[test]
-fn an_owner_whose_store_was_taken_writes_nothing_more() {
+fn an_owner_whose_store_was_taken_answers_nothing_more() {
     // The state an owner holds is the state as it was before it lost the store. Writing that back
     // would replace everything the owner that took it has done since, so the write is refused and
     // the store is read again by whoever opens it next.
@@ -4016,7 +4233,9 @@ fn an_owner_whose_store_was_taken_writes_nothing_more() {
     first
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    let key = first.key_for(AttentionRule::PendingApproval, "req-1");
+    let key = first
+        .key_for(AttentionRule::PendingApproval, "req-1")
+        .expect("the store is this owner's");
 
     // The second owner is told the first one's process has gone, and takes the store.
     let mut second = Attention::open(&path, reading(1_000), &Claimant::new(process(2), ENDED))
@@ -4032,6 +4251,28 @@ fn an_owner_whose_store_was_taken_writes_nothing_more() {
         "the store is not this owner's to write: {refused:?}"
     );
 
+    // And it answers nothing else either. What it holds is the state as it was before the store
+    // went, so the item the second owner acknowledged still looks outstanding in it, and serving
+    // that would be answering about a session this value no longer has.
+    assert!(
+        matches!(
+            first.inbox(&who, true, Content::Whole),
+            Err(kr_attention::Error::StoreTaken)
+        ),
+        "a value that lost the store reads nothing from it"
+    );
+    assert!(matches!(
+        first.revision(&who),
+        Err(kr_attention::Error::StoreTaken)
+    ));
+    assert!(
+        matches!(
+            first.take_announcements(),
+            Err(kr_attention::Error::StoreTaken)
+        ),
+        "and offers no announcement about a condition somebody else may have resolved"
+    );
+
     // Letting go gives up its own claim and nothing else, so the second owner still holds the
     // store and a third opener is still shut out.
     drop(first);
@@ -4045,6 +4286,11 @@ fn an_owner_whose_store_was_taken_writes_nothing_more() {
     drop(second);
     let after = Attention::open(&path, reading(5_000), &Claimant::new(process(4), UNKNOWN))
         .expect("the store reopens");
-    assert_eq!(after.revision(&who), 1);
-    assert!(after.inbox(&who, false, Content::Whole).is_empty());
+    assert_eq!(after.revision(&who).expect("the store is this owner's"), 1);
+    assert!(
+        after
+            .inbox(&who, false, Content::Whole)
+            .expect("the store is this owner's")
+            .is_empty()
+    );
 }

@@ -1369,9 +1369,11 @@ away replaces nothing: it is told the store is no longer its to write, and whoev
 next reads it fresh.
 
 Letting the store go removes that one claim and nothing else - not the state, and not a claim
-somebody else now holds - and the next opener waits for nothing. An owner that ends without letting
-go, one that was killed or a machine that stopped, leaves its claim behind, and the next opener is
-what clears it. A claim from a boot that has ended is not standing, because that boot's processes
+somebody else now holds - so the next opener does not have to work out that nobody is holding it.
+That removal is the best this worker can do rather than a promise: a file that has gone, or another
+holder of it that keeps the write waiting, leaves the claim where it is. An owner that ends without
+letting go, one that was killed or a machine that stopped, leaves its claim behind too, and the
+next opener is what clears it. A claim from a boot that has ended is not standing, because that boot's processes
 are gone with it. A claim from this boot is weighed on the process it names: the worker records the
 pair the kernel describes, its number and the start value that tells it apart from whoever holds
 that number next, so a claim whose process has gone is taken the moment the next worker asks. Where
@@ -1382,7 +1384,11 @@ idle.
 
 A database is journalled under the name it was opened by, so one file that two names reach can be
 journalled twice over by two processes that never see each other's work. The store refuses such a
-file outright, where the platform counts a file's names, and says how many reach it.
+file outright and says how many names reach it, on the platforms that count them, which is the Unix
+family. Windows counts a file's names as well but hands the count out only through an open handle
+on the file, and this host opens no second handle on a database, so what stands in for it there is
+where the store is: under a directory this host makes for the session, where a second name is
+something somebody went and made.
 
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same
