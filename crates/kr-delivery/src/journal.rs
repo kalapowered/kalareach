@@ -412,6 +412,15 @@ pub struct DeliveryRecord {
     pub suppression: Option<PushSuppression>,
     /// One line saying what the last outcome was, for a person reading the journal.
     pub detail: Option<String>,
+    /// Whether the content of this record may already have left this host.
+    ///
+    /// It is a fact about what happened, kept apart from the state, because the two answer
+    /// different questions. A state says whether anything will move this record again; this says
+    /// whether it is too late to take it back. Privacy mode cancels what has not left and
+    /// reconciles what has, and an authorisation that ended says nothing about either.
+    ///
+    /// Once true it stays true: the attempt that set it cannot be unmade by a later one.
+    pub dispatched: bool,
 }
 
 /// One attempt at one delivery.
@@ -460,6 +469,13 @@ pub struct Transition {
     ///
     /// A settled delivery keeps nothing: the record of what happened stays, the bytes do not.
     pub keep_content: bool,
+    /// Whether this attempt reached a point where the content could have left this host.
+    ///
+    /// The seam that made the attempt is the only thing that knows. A connection that was never
+    /// established did not; a gateway that answered, and a timeout after the body was written,
+    /// both did. It is recorded once and never cleared, because privacy mode's question is not
+    /// *is this still moving* but *is it too late to take it back*.
+    pub left_this_host: bool,
 }
 
 /// One delivery the outbox says is due.
@@ -1457,7 +1473,8 @@ impl DeliveryJournal {
                     suppression_reason = COALESCE(?6, suppression_reason),
                     suppression_into = COALESCE(?7, suppression_into),
                     suppression_count = COALESCE(?8, suppression_count),
-                    suppression_next_ms = COALESCE(?9, suppression_next_ms)
+                    suppression_next_ms = COALESCE(?9, suppression_next_ms),
+                    dispatched = MAX(dispatched, ?10)
               WHERE notification_id = ?1",
             params![
                 identifier,
@@ -1469,6 +1486,7 @@ impl DeliveryJournal {
                 into,
                 count,
                 next,
+                i64::from(transition.left_this_host),
             ],
         )?;
         match transition.next_attempt_at_ms {
@@ -1694,6 +1712,13 @@ impl DeliveryJournal {
 
     /// Takes back everything admitted and not dispatched.
     ///
+    /// The dispatch fact decides, not the state. A record waiting for its next attempt may be one
+    /// nothing has sent, which is taken back and its bytes go with it; or it may be a
+    /// notification the gateway is holding, or an external message with an unknown outcome, both
+    /// of which have already left. Cancelling one of those would claim this host took back
+    /// something it cannot reach. They are moved to an unknown outcome instead, which is a record
+    /// a reconciliation can still resolve, and counted as outstanding until it does.
+    ///
     /// Returns how many were taken back and how much had already left this host and cannot be.
     ///
     /// # Errors
@@ -1704,17 +1729,33 @@ impl DeliveryJournal {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let in_flight: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM delivery_notifications WHERE state IN ('in_flight',
-             'outcome_unknown')",
+            "SELECT COUNT(*) FROM delivery_notifications
+              WHERE state IN ('in_flight', 'outcome_unknown')
+                 OR (dispatched = 1 AND state IN ('admitted', 'retrying'))",
             [],
             |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE delivery_notifications
+                SET state = 'outcome_unknown',
+                    content = NULL,
+                    detail = 'privacy mode stopped this after it had already left, so what
+                              became of it is unknown until it is reconciled'
+              WHERE dispatched = 1 AND state IN ('admitted', 'retrying')",
+            [],
         )?;
         let cancelled = transaction.execute(
             "UPDATE delivery_notifications
                 SET state = 'cancelled',
                     content = NULL,
                     detail = 'privacy mode took this back before it was dispatched'
-              WHERE state IN ('admitted', 'retrying')",
+              WHERE dispatched = 0 AND state IN ('admitted', 'retrying')",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM delivery_outbox WHERE notification_id IN
+                 (SELECT notification_id FROM delivery_notifications
+                   WHERE state = 'outcome_unknown')",
             [],
         )?;
         transaction.execute(
@@ -2006,6 +2047,74 @@ impl DeliveryJournal {
         Ok(secret)
     }
 
+    /// Returns the deliveries this journal admitted and nothing has dispatched, oldest first.
+    ///
+    /// Section 24 resumes *only what is still authorised*, and this is the list a caller checks
+    /// authorisation against. Nothing here has left the host, so a caller that finds an
+    /// authorisation gone may take it back; a record that has left is not in this list and is
+    /// reconciled instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn undispatched(&self) -> Result<Vec<DeliveryRecord>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{NOTIFICATION_COLUMNS} WHERE dispatched = 0
+               AND state IN ('admitted', 'retrying') ORDER BY admitted_at_ms"
+        ))?;
+        let rows = statement.query_map([], decode_delivery)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row??);
+        }
+        Ok(records)
+    }
+
+    /// Settles one record that nothing has dispatched, without it ever having been sent.
+    ///
+    /// It is refused for a record something has dispatched, whatever its state: a record that has
+    /// left this host is reconciled rather than settled from here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn settle_undispatched(
+        &mut self,
+        notification_id: NotificationId,
+        state: DeliveryState,
+        detail: &str,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let identifier = notification_id.to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held: Option<(String, i64, i64)> = transaction
+            .query_row(
+                "SELECT state, attempts, dispatched FROM delivery_notifications
+                  WHERE notification_id = ?1",
+                params![identifier],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((held_state, attempts, dispatched)) = held else {
+            return Ok(false);
+        };
+        if dispatched != 0 || !matches!(held_state.as_str(), "admitted" | "retrying") {
+            return Ok(false);
+        }
+        settle_in(
+            &transaction,
+            &identifier,
+            as_u64(attempts),
+            now_ms,
+            state,
+            detail,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Returns the deliveries a restart has to reconcile, oldest first.
     ///
     /// An attempt that was on the wire when this host stopped has an outcome nobody knows. Section
@@ -2053,7 +2162,7 @@ const DESTINATION_COLUMNS: &str = "SELECT destination_id, kind, enabled, configu
 const NOTIFICATION_COLUMNS: &str = "SELECT notification_id, event_key, destination_id, state, \
      privacy_generation, content, payload_bytes, expires_at_ms, admitted_at_ms, attempts, \
      suppression_reason, suppression_into, suppression_count, suppression_next_ms, detail, \
-     destination_digest, authority_digest FROM delivery_notifications";
+     destination_digest, authority_digest, dispatched FROM delivery_notifications";
 
 type DestinationRow = (
     String,
@@ -2216,6 +2325,7 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
     let detail: Option<String> = row.get(14)?;
     let destination_digest: String = row.get(15)?;
     let authority_digest: String = row.get(16)?;
+    let dispatched: i64 = row.get(17)?;
     Ok((|| {
         let source = event
             .split_once(':')
@@ -2265,6 +2375,7 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
             attempts: as_u64(attempts),
             suppression,
             detail,
+            dispatched: dispatched != 0,
         })
     })())
 }
@@ -2583,6 +2694,7 @@ const SCHEMA: &str = "
         detail TEXT,
         destination_digest TEXT NOT NULL DEFAULT '',
         authority_digest TEXT NOT NULL DEFAULT '',
+        dispatched INTEGER NOT NULL DEFAULT 0,
         UNIQUE (event_key, destination_id)
     );
     CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -2695,6 +2807,7 @@ mod tests {
             attempts: 0,
             suppression: None,
             detail: None,
+            dispatched: false,
         }
     }
 
@@ -2892,6 +3005,7 @@ mod tests {
                 detail: Some("queued".to_owned()),
                 suppression: None,
                 keep_content: false,
+                left_this_host: false,
             })
             .expect("a transition");
         assert!(!settled, "the attempt number is not the claimed one");
@@ -3034,6 +3148,7 @@ mod tests {
                     detail: Some("the provider was busy".to_owned()),
                     suppression: None,
                     keep_content: true,
+                    left_this_host: false,
                 })
                 .expect("a transition")
         );
@@ -3075,6 +3190,7 @@ mod tests {
                 detail: Some("queued".to_owned()),
                 suppression: None,
                 keep_content: false,
+                left_this_host: false,
             })
             .expect("a transition");
         assert!(journal.due(50_000, 10).expect("a read").is_empty());

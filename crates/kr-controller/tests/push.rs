@@ -886,9 +886,48 @@ fn a_restart_records_what_was_in_flight_as_unknown_and_resumes_only_what_is_auth
         .expect("a read");
 }
 
-/// KR-REQ-24.12: an authorisation that ended is revoked rather than resumed.
+/// KR-REQ-24.12: an authorisation that ended is revoked rather than resumed - and that is a
+/// statement about queued work, not about an attempt that was already on the wire.
 #[test]
 fn a_restart_revokes_what_is_no_longer_authorised() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    environment
+        .module
+        .reconcile(
+            std::slice::from_ref(&destination),
+            &Granted(BTreeSet::new()),
+            &|_| false,
+            NOW + 1_000,
+        )
+        .expect("a reconciliation");
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Revoked);
+            assert!(!record.dispatched, "nothing had left this host");
+            assert_eq!(record.content, None, "the bytes go with the revocation");
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-24.12: an attempt that was on the wire has an unknown outcome, and an authorisation
+/// that has since ended does not turn it into a revocation. A revocation is not evidence about
+/// delivery.
+#[test]
+fn an_interrupted_send_is_unknown_even_when_its_authority_ended() {
     let environment = environment();
     let destination = push_destination(&environment, true);
     environment
@@ -914,15 +953,12 @@ fn a_restart_revokes_what_is_no_longer_authorised() {
     environment
         .module
         .with(|producer| {
-            assert_eq!(
-                producer
-                    .journal()
-                    .deliveries()
-                    .expect("a read")
-                    .remove(0)
-                    .state,
-                DeliveryState::Revoked
-            );
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+            assert!(record.dispatched, "it was on the wire");
+            assert!(record.detail.as_deref().is_some_and(|detail| {
+                detail.contains("what became of the attempt is still unknown")
+            }));
             Ok(())
         })
         .expect("a read");
@@ -1313,6 +1349,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                     detail: Some("the provider accepted it for delivery".to_owned()),
                     suppression: None,
                     keep_content: false,
+                    left_this_host: false,
                 })
                 .expect("a transition");
             let selected = producer.journal().due(NOW, 1).expect("a read");

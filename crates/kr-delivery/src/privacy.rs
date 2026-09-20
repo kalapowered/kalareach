@@ -239,6 +239,7 @@ mod tests {
                     attempts: 0,
                     suppression: None,
                     detail: None,
+                    dispatched: false,
                 })
                 .expect("admitted");
         }
@@ -278,6 +279,61 @@ mod tests {
         }
     }
 
+    /// A record something has already dispatched is not "undispatched", whatever its state says
+    /// about retrying. Cancelling it would claim this host took back something it cannot reach.
+    #[test]
+    fn a_record_that_has_left_is_reconciled_rather_than_cancelled() {
+        let mut journal = journal_with_work();
+        // One of the three has been out to the destination and is waiting to be asked about
+        // again: the destination answered, so the message has left this host.
+        claim(&mut journal, 11, 1_500);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(11)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(1_500),
+                settled_at_ms: Some(TimestampMs::new(1_600)),
+                next_attempt_at_ms: Some(TimestampMs::new(5_000)),
+                detail: Some("the destination is holding it".to_owned()),
+                suppression: None,
+                keep_content: true,
+                left_this_host: true,
+            })
+            .expect("a transition");
+
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(2_000));
+        let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
+        let enabling = mode.apply(&mut [&mut outbox], TimestampMs::new(2_000));
+        let cancelled = enabling
+            .cancelled
+            .iter()
+            .find(|(name, _)| *name == "delivery")
+            .expect("it reported its cancellation");
+        assert_eq!(
+            cancelled.1.undispatched, 2,
+            "only what never left is taken back"
+        );
+        assert_eq!(
+            cancelled.1.in_flight, 1,
+            "what has left is counted rather than claimed back"
+        );
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(11)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::OutcomeUnknown,
+            "it is left in a state a reconciliation can still resolve"
+        );
+        assert!(matches!(
+            PrivacyMode::reconcile(&[&DeliveryOutbox::over(&mut journal, 2_000)]),
+            Completion::Reconciling { .. }
+        ));
+    }
+
     #[test]
     fn cleanup_is_not_complete_while_a_send_is_in_flight() {
         let mut journal = journal_with_work();
@@ -304,6 +360,7 @@ mod tests {
                 detail: Some("queued".to_owned()),
                 suppression: None,
                 keep_content: false,
+                left_this_host: false,
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
@@ -325,6 +382,7 @@ mod tests {
                 detail: Some("nobody knows".to_owned()),
                 suppression: None,
                 keep_content: false,
+                left_this_host: false,
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
@@ -349,6 +407,7 @@ mod tests {
                 detail: Some("the destination took it".to_owned()),
                 suppression: None,
                 keep_content: false,
+                left_this_host: false,
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);

@@ -166,6 +166,13 @@ pub struct Decision {
     pub suppression: Option<PushSuppression>,
     /// Whether the destination's token should be taken out of service.
     pub disable_destination: bool,
+    /// Whether this attempt reached a point where the notification could have left this host.
+    ///
+    /// A gateway that answered has it, whatever it answered, because the identifier is claimed
+    /// before anything reaches a provider. An outcome nobody knows has it too: not knowing is not
+    /// the same as knowing it did not go. A credential the gateway refused and a connection that
+    /// was never established do not.
+    pub left_this_host: bool,
 }
 
 /// Decides what one gateway answer means.
@@ -186,6 +193,7 @@ pub fn decide(
         detail,
         suppression: None,
         disable_destination: false,
+        left_this_host: false,
     };
     match outcome {
         SendOutcome::Decided(ack) => {
@@ -203,6 +211,7 @@ pub fn decide(
                     detail: format!("the credential was refused, so it is renewed: {detail}"),
                     suppression: None,
                     disable_destination: false,
+                    left_this_host: false,
                 },
                 None => settle(
                     DeliveryState::Expired,
@@ -219,6 +228,7 @@ pub fn decide(
                     detail: format!("nothing was dispatched, so it is presented again: {detail}"),
                     suppression: None,
                     disable_destination: false,
+                    left_this_host: false,
                 },
                 None if attempt >= MAX_ATTEMPTS => settle(
                     DeliveryState::Abandoned,
@@ -239,6 +249,7 @@ pub fn decide(
             detail: format!("the outcome is unknown and is not retried automatically: {detail}"),
             suppression: None,
             disable_destination: false,
+            left_this_host: true,
         },
     }
 }
@@ -258,6 +269,9 @@ fn decide_from_ack(
         detail: detail.to_owned(),
         suppression: suppression.clone(),
         disable_destination: false,
+        // The gateway answered, and it claims the identifier before anything reaches a provider,
+        // so the notification is the gateway's from here whatever the answer was.
+        left_this_host: true,
     };
     match ack.state {
         // Queued is acceptance for delivery. It is recorded as acceptance and never as displayed,
@@ -277,6 +291,7 @@ fn decide_from_ack(
                     detail: "the gateway is holding it and retrying the provider".to_owned(),
                     suppression,
                     disable_destination: false,
+                    left_this_host: true,
                 },
                 None => settled(
                     DeliveryState::Expired,
@@ -301,6 +316,7 @@ fn decide_from_ack(
                 .to_owned(),
             suppression,
             disable_destination: true,
+            left_this_host: true,
         },
         PushDeliveryState::Refused => settled(
             DeliveryState::Refused,

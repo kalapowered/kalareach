@@ -399,6 +399,8 @@ impl DeliveryModule {
                     detail: Some(detail.to_owned()),
                     suppression: None,
                     keep_content: false,
+                    // Nothing was presented, so nothing left this host.
+                    left_this_host: false,
                 })
                 .map_err(unavailable)?;
             Ok(())
@@ -475,6 +477,7 @@ impl DeliveryModule {
                     detail: Some(decision.detail.clone()),
                     suppression: decision.suppression.clone(),
                     keep_content: !decision.state.is_settled(),
+                    left_this_host: decision.left_this_host,
                 })
                 .map_err(unavailable)?;
             Ok(())
@@ -515,6 +518,7 @@ impl DeliveryModule {
                     detail: Some(decision.detail.clone()),
                     suppression: None,
                     keep_content: !decision.state.is_settled(),
+                    left_this_host: decision.left_this_host,
                 })
                 .map_err(unavailable)?;
             Ok(())

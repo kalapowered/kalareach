@@ -328,6 +328,12 @@ pub struct ExternalDecision {
     pub next_attempt_at_ms: Option<TimestampMs>,
     /// One line for the journal.
     pub detail: String,
+    /// Whether this attempt reached a point where the message could have left this host.
+    ///
+    /// A destination that answered has it, including one that refused the message: the service
+    /// read it either way. An outcome nobody knows has it too, which is the whole of section 25's
+    /// duplicate-delivery uncertainty. A connection that was never established does not.
+    pub left_this_host: bool,
 }
 
 /// Decides what one external answer means, under section 25's retry rule.
@@ -340,24 +346,30 @@ pub fn decide_external(
     now_ms: u64,
     expires_at_ms: TimestampMs,
 ) -> ExternalDecision {
-    let settle = |state: DeliveryState, detail: String| ExternalDecision {
+    let settle = |state: DeliveryState, detail: String, left_this_host: bool| ExternalDecision {
         state,
         next: NextAction::None,
         next_attempt_at_ms: None,
         detail,
+        left_this_host,
     };
     match outcome {
         ExternalOutcome::Delivered => settle(
             DeliveryState::Accepted,
             "the destination accepted the message".to_owned(),
+            true,
         ),
         ExternalOutcome::Duplicate => settle(
             DeliveryState::Duplicate,
             "the destination had already seen this delivery identifier".to_owned(),
+            true,
         ),
+        // The destination read the message and refused it, so the content reached the service
+        // whatever it decided to do with it.
         ExternalOutcome::Refused { detail } => settle(
             DeliveryState::Refused,
             format!("the destination refused the message: {detail}"),
+            true,
         ),
         // Nothing left this host, so presenting it again cannot be a second message whatever the
         // destination does about identifiers.
@@ -368,10 +380,12 @@ pub fn decide_external(
                     next: NextAction::Send,
                     next_attempt_at_ms: Some(at),
                     detail: format!("nothing was dispatched, so it is sent again: {detail}"),
+                    left_this_host: false,
                 },
                 None => settle(
                     DeliveryState::Expired,
                     format!("the message expired before it was dispatched: {detail}"),
+                    false,
                 ),
             }
         }
@@ -385,6 +399,7 @@ pub fn decide_external(
                         "the outcome is unknown and this destination deduplicates by the \
                          delivery identifier, so it is sent again: {detail}"
                     ),
+                    left_this_host: true,
                 },
                 None => settle(
                     DeliveryState::DuplicateUncertain,
@@ -392,6 +407,7 @@ pub fn decide_external(
                         "the outcome is unknown and the message expired before it could be \
                          presented again: {detail}"
                     ),
+                    true,
                 ),
             }
         }
@@ -402,6 +418,7 @@ pub fn decide_external(
                  identifier, so it is not sent again: the message may have arrived, and sending \
                  it again could deliver it twice ({detail})"
             ),
+            true,
         ),
     }
 }

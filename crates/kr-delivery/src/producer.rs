@@ -593,6 +593,7 @@ impl Producer {
                              collapsed into an attention update"
                                 .to_owned(),
                         ),
+                        dispatched: false,
                     },
                     Some(budget.stored()),
                 ));
@@ -629,6 +630,7 @@ impl Producer {
                 attempts: 0,
                 suppression,
                 detail: None,
+                dispatched: false,
             },
             Some(budget.stored()),
         ))
@@ -811,6 +813,7 @@ impl Producer {
             attempts: 0,
             suppression: None,
             detail: None,
+            dispatched: false,
         })
     }
 
@@ -835,12 +838,18 @@ impl Producer {
         }
     }
 
-    /// Records what a restart found in flight: an outcome nobody knows is recorded as unknown.
+    /// Records what a restart found, keeping the dispatch fact apart from the authority.
     ///
-    /// Section 24 resumes *only what is still authorised*, so `still_authorised` is asked about
-    /// each destination before anything is resumed. What it says no to is revoked rather than
-    /// carried on with. What it says yes to is left in the outbox for the ordinary loop, except
-    /// for an attempt that was on the wire, which has no known outcome and is recorded as such.
+    /// Two questions, and they have two answers. **Did it leave?** An attempt that was on the
+    /// wire when this host stopped has an outcome nobody knows, and that stays true whatever has
+    /// since happened to the authorisation: a revocation is not evidence about delivery. So every
+    /// interrupted attempt is recorded as an unknown outcome, and section 23 leaves it there
+    /// until a reconciliation reads the receipt.
+    ///
+    /// **May it still be sent?** That is what `still_authorised` answers, and it applies to the
+    /// records nothing has dispatched. Section 24 resumes *only what is still authorised*, so a
+    /// queued notification for a destination whose authorisation has ended is taken back; one
+    /// that is still authorised stays in the outbox for the ordinary loop.
     ///
     /// # Errors
     ///
@@ -852,29 +861,44 @@ impl Producer {
     ) -> Result<Vec<(NotificationId, DeliveryState)>> {
         let mut reconciled = Vec::new();
         for record in self.journal.unreconciled()? {
-            let state = if still_authorised(&record.destination_id) {
-                DeliveryState::OutcomeUnknown
-            } else {
-                DeliveryState::Revoked
-            };
-            let detail = if state == DeliveryState::OutcomeUnknown {
+            let detail = if still_authorised(&record.destination_id) {
                 "this host stopped while the attempt was on the wire, so its outcome is unknown \
                  and it is not retried automatically"
+                    .to_owned()
             } else {
-                "the authorisation ended while the attempt was on the wire"
+                "this host stopped while the attempt was on the wire and the authorisation has \
+                 since ended; what became of the attempt is still unknown"
+                    .to_owned()
             };
-            self.journal.record_attempt(&crate::journal::Transition {
+            let recorded = self.journal.record_attempt(&crate::journal::Transition {
                 notification_id: record.notification_id,
                 attempt: record.attempts.max(1),
-                state,
+                state: DeliveryState::OutcomeUnknown,
                 started_at_ms: record.admitted_at_ms,
                 settled_at_ms: Some(TimestampMs::new(now_ms)),
                 next_attempt_at_ms: None,
-                detail: Some(detail.to_owned()),
+                detail: Some(detail),
                 suppression: None,
-                keep_content: false,
+                keep_content: true,
+                // It was on the wire. Whether it arrived is the unknown; that it left is not.
+                left_this_host: true,
             })?;
-            reconciled.push((record.notification_id, state));
+            if recorded {
+                reconciled.push((record.notification_id, DeliveryState::OutcomeUnknown));
+            }
+        }
+        for record in self.journal.undispatched()? {
+            if still_authorised(&record.destination_id) {
+                continue;
+            }
+            if self.journal.settle_undispatched(
+                record.notification_id,
+                DeliveryState::Revoked,
+                "the authorisation ended before anything was dispatched",
+                now_ms,
+            )? {
+                reconciled.push((record.notification_id, DeliveryState::Revoked));
+            }
         }
         Ok(reconciled)
     }
