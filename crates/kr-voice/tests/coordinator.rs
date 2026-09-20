@@ -1609,21 +1609,49 @@ async fn one_action_identifier_carries_one_delegation() {
         VoiceRefusal::UnannouncedDelegation
     );
 
-    // The same identifier and the same delegation: the delegation is spent, so the answer says so
-    // and the effect happened exactly once.
+    // The same identifier and the same delegation: answered from what that action came to, with
+    // no second dispatch and no content of the first answer.
     let again = fixture
         .coordinator
         .delegate(device(PHONE), action(1), &params, 11_200)
         .await
         .expect("an answer");
-    assert_eq!(
-        refusal(&again.outcome).0,
-        VoiceRefusal::UnannouncedDelegation
+    let VoiceDelegationOutcome::Admitted { action_id, note } = &again.outcome else {
+        panic!("a retry is told where its receipt is: {:?}", again.outcome);
+    };
+    assert_eq!(*action_id, action(1));
+    assert!(
+        note.contains("not evidence that a host action ran"),
+        "{note}"
     );
     assert_eq!(
         fixture.submitter.proposals().len(),
         1,
         "the effect happened once"
+    );
+
+    // And the same delegation through a second call of the same device reaches nothing, because
+    // one delegation is one action whichever call carries it.
+    fixture
+        .coordinator
+        .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 11_250)
+        .await
+        .expect("the call stops");
+    let second = started(&fixture, Some(&[VoiceAction::Status])).await;
+    let elsewhere = delegate_params(second, delegation("one"), VoiceAction::Status);
+    let refused_again = fixture
+        .coordinator
+        .delegate(device(PHONE), action(2), &elsewhere, 11_400)
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&refused_again.outcome).0,
+        VoiceRefusal::UnannouncedDelegation
+    );
+    assert_eq!(
+        fixture.submitter.proposals().len(),
+        1,
+        "the effect still happened once"
     );
 }
 

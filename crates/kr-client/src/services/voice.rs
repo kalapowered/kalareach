@@ -800,14 +800,73 @@ pub trait ManagedVoiceService: Send + Sync + fmt::Debug {
 /// already a scheme, a host and an optional port by the time it is accepted.
 fn normalised_origin(origin: &str) -> String {
     let lowered = origin.to_lowercase();
-    for (scheme, port) in [("https://", ":443"), ("http://", ":80")] {
-        if let Some(rest) = lowered.strip_prefix(scheme)
-            && let Some(host) = rest.strip_suffix(port)
+    let Some((scheme, rest)) = lowered
+        .split_once("://")
+        .map(|(scheme, rest)| (format!("{scheme}://"), rest.to_owned()))
+    else {
+        return lowered;
+    };
+    // The port, as a number rather than as the digits somebody wrote: `:0443` and `:443` are one
+    // port, and the port a scheme implies is the same origin as no port at all.
+    let (host, port) = match rest.rfind(':') {
+        Some(at)
+            if !rest[at + 1..].is_empty() && rest[at + 1..].chars().all(|c| c.is_ascii_digit()) =>
         {
-            return format!("{scheme}{host}");
+            (rest[..at].to_owned(), rest[at + 1..].parse::<u32>().ok())
         }
+        _ => (rest.clone(), None),
+    };
+    // A host written as an address literal is the address, not its spelling.
+    let host = match host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(literal) => literal
+            .parse::<std::net::Ipv6Addr>()
+            .map_or(host.clone(), |address| format!("[{address}]")),
+        None => host,
+    };
+    let implied = match scheme.as_str() {
+        "https://" => Some(443),
+        "http://" => Some(80),
+        _ => None,
+    };
+    match port {
+        Some(port) if Some(port) != implied => format!("{scheme}{host}:{port}"),
+        _ => format!("{scheme}{host}"),
     }
-    lowered
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::normalised_origin;
+
+    /// KR-REQ-15.01: two clients of one service are one provider, whatever spelling each was
+    /// configured with, and a client of another service is not.
+    #[test]
+    fn one_service_has_one_identity() {
+        let canonical = normalised_origin("https://reach.example");
+        for spelling in [
+            "https://reach.example",
+            "https://reach.example:443",
+            "https://reach.example:0443",
+            "HTTPS://Reach.Example",
+        ] {
+            assert_eq!(normalised_origin(spelling), canonical, "{spelling}");
+        }
+        assert_eq!(
+            normalised_origin("http://[0:0:0:0:0:0:0:1]"),
+            normalised_origin("http://[::1]")
+        );
+        assert_ne!(
+            normalised_origin("https://reach.example"),
+            normalised_origin("https://other.example")
+        );
+        assert_ne!(
+            normalised_origin("https://reach.example"),
+            normalised_origin("https://reach.example:8443")
+        );
+    }
 }
 
 /// The managed voice broker client.
