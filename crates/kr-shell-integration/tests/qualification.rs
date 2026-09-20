@@ -695,6 +695,7 @@ fn the_startup_and_the_customisation(
         // says a prompt hook cannot tell from an empty prompt. The reader's own answer is what
         // the fence carries, so it is asked with the line held and again once it is cleared,
         // under the same customisation.
+        session.ensure_reading();
         session.type_bytes(b"k");
         settle(&mut session, Duration::from_millis(200), REPLY);
         let held = session.fence_exchange(&enter, shellpkg::fence_id(1));
@@ -962,6 +963,9 @@ fn the_gesture_detaches_at_an_eligible_prompt(
 ) -> kr_protocol::root::RootEditorEnterParams {
     let (enter, fence) = session.fenced_after_a_command(11);
     settle(session, Duration::from_millis(200), REPLY);
+    // The command this fence follows ended a prompt, and the gesture belongs to the reader at the
+    // one after it: it is offered once that reader has said it is inside its read.
+    session.ensure_reading();
     session.type_bytes(shellpkg::CTRL_D);
 
     let (id, event) = session.expect_event("eof_detach", |event| {
@@ -993,7 +997,8 @@ fn the_gesture_detaches_at_an_eligible_prompt(
     );
 
     // After a detach the bridge drops its fence, so a repeated gesture cannot take on the next
-    // attachment's identity.
+    // attachment's identity. The reader that reported the detach reported it from inside its own
+    // read, and nothing since has taken it out of one, so this key needs no probe of its own.
     session.type_bytes(shellpkg::CTRL_D);
     let (_, repeated) = session.expect_event("pre_eof_consumed", |event| {
         matches!(event, BridgeEvent::PreEofConsumed(_))
@@ -1049,6 +1054,10 @@ fn outside_the_condition_the_editor_keeps_the_key(
             std::thread::sleep(Duration::from_millis(200));
             session.forget_events();
         }
+        // The state this drive puts the reader into is reached by the keys below, so they are
+        // offered to a reader that has said it is inside its read: keys the terminal holds instead
+        // reach the editor as a line, and the state they are for is never entered.
+        session.ensure_reading();
         for bytes in drive.setup {
             session.type_bytes(bytes);
             std::thread::sleep(Duration::from_millis(80));
@@ -1295,6 +1304,7 @@ fn an_unattributable_gesture_is_consumed_with_one_hint(
     settle(session, Duration::from_millis(200), REPLY);
     session.forget_events();
 
+    session.ensure_reading();
     session.type_bytes(shellpkg::CTRL_D);
     let (_, first) = session.expect_event("pre_eof_consumed", |event| {
         matches!(event, BridgeEvent::PreEofConsumed(_))
@@ -1332,6 +1342,8 @@ fn an_unattributable_gesture_is_consumed_with_one_hint(
     let BridgeEvent::PreEofConsumed(second) = second else {
         unreachable!()
     };
+    // The reader answered the first gesture from inside its own read, and the second is offered
+    // at that same read, so nothing needs to be established again between them.
     assert!(
         !second.hint_printed,
         "{}: the hint is printed at most once per prompt",
@@ -1360,6 +1372,7 @@ fn an_unattributable_gesture_is_consumed_with_one_hint(
     );
     let _ = session.next_prompt();
     settle(session, Duration::from_millis(200), REPLY);
+    session.ensure_reading();
     session.type_bytes(shellpkg::CTRL_D);
     let (_, third) = session.expect_event("a stale-fence consume", |event| {
         matches!(event, BridgeEvent::PreEofConsumed(_))
@@ -2708,6 +2721,80 @@ fn idled(prompt: u64, revision: u64, candidate: u8) -> Stimulus {
         },
         candidate_fence: shellpkg::fence_id(candidate),
     })
+}
+
+/// One report of the reader's, as a package sends it at a key boundary or as it enters its read.
+fn reported(prompt: u64, revision: u64, empty: bool, queued: u64, pending: u64) -> ReaderIdle {
+    ReaderIdle {
+        session_id: race_session(),
+        prompt_generation: PromptGeneration::new(prompt),
+        reader_revision: ReaderRevision::new(prompt),
+        reader_context: ReaderContext::Primary,
+        snapshot: KeyQueueSnapshot {
+            keys: kr_protocol::scalars::Bytes::new(Vec::new()),
+            pending_bytes: kr_protocol::scalars::U64::new(pending),
+            queued_keys: kr_protocol::scalars::U64::new(queued),
+        },
+        editor: EditorState {
+            buffer_revision: EditorBufferRevision::new(revision),
+            buffer_empty: empty,
+            keymap: EditorKeymap::Emacs,
+            pending: PendingReaderInput::NONE,
+        },
+        cwd_revision: CwdRevision::new(2),
+    }
+}
+
+/// KR-REQ-07.87: a key is offered only after the reader says it is inside the read it is meant for.
+///
+/// Every report here is one a package really sends, put to the rule directly rather than waited
+/// for from a shell. The one this exists for is the report a reader sends as it enters: it goes
+/// out before the editor takes the terminal, it carries an empty line and empty queues, and it
+/// belongs to a prompt this session has not probed. Read as readiness it offers the chord to an
+/// editor that is not reading, which is the failure this qualification kept meeting under load.
+/// The rule's answer to it is another probe at that prompt, never a longer wait at the old one.
+#[test]
+fn a_report_the_probe_did_not_produce_never_says_the_reader_is_reading() {
+    let probe = shellpkg::ReaderMark {
+        prompt_generation: 7,
+        buffer_revision: 40,
+    };
+
+    // The report a reader sends as it enters the prompt after the probe's. It looks exactly like
+    // readiness and proves none of it.
+    assert_eq!(
+        shellpkg::readiness_of(probe, &reported(8, 41, true, 0, 0)),
+        shellpkg::ReadinessStep::Moved,
+        "a later prompt's first report was taken for the probe's reader being ready"
+    );
+    // A prompt before the probe's, whatever it says about itself.
+    assert_eq!(
+        shellpkg::readiness_of(probe, &reported(6, 99, true, 0, 0)),
+        shellpkg::ReadinessStep::Behind
+    );
+    // The probe's own report, and one from before it at the same prompt.
+    assert_eq!(
+        shellpkg::readiness_of(probe, &reported(7, 40, true, 0, 0)),
+        shellpkg::ReadinessStep::Behind
+    );
+    assert_eq!(
+        shellpkg::readiness_of(probe, &reported(7, 39, true, 0, 0)),
+        shellpkg::ReadinessStep::Behind
+    );
+    // At the probe's own prompt and after it, with the line or a queue still holding something.
+    for (empty, queued, pending) in [(false, 0, 0), (true, 1, 0), (true, 0, 3)] {
+        assert_eq!(
+            shellpkg::readiness_of(probe, &reported(7, 41, empty, queued, pending)),
+            shellpkg::ReadinessStep::Busy,
+            "a reader still holding something was called ready"
+        );
+    }
+    // The one report that says it: the clear ran, at the prompt the probe was drawn at, after the
+    // report that proved that reader was inside its read.
+    assert_eq!(
+        shellpkg::readiness_of(probe, &reported(7, 41, true, 0, 0)),
+        shellpkg::ReadinessStep::Ready
+    );
 }
 
 /// A machine at a published fence, with the moment that fence was published.

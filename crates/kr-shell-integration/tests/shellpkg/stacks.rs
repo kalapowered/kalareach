@@ -32,6 +32,7 @@ use kr_protocol::root::{
     FENCE_EXCHANGE_TIMEOUT, FenceCause, RootEditorFenceParams, RootEditorFenceResult,
 };
 use kr_protocol::scalars::Uuid;
+use kr_shell_integration::contract::events::ReaderIdle;
 use kr_shell_integration::contract::qualification::{DetachExclusion, ShellKind};
 use kr_shell_integration::contract::transport::{
     BOOTSTRAP_SECRET_LEN, BridgeEndpoint, BridgeFrame, HandshakeOutcome, ObservedPeer,
@@ -67,6 +68,82 @@ pub const STEP_KEY: &[u8] = &[0x06];
 pub const LIVENESS_COMMAND: &str = "echo kr-answering";
 /// What [`LIVENESS_COMMAND`] prints.
 pub const LIVENESS_MARKER: &str = "kr-answering";
+
+/// How long a session waits, over all its probes, for an editor to say it is reading.
+const READINESS: Duration = Duration::from_secs(30);
+
+/// How long one report of that wait is waited for before the probe is drawn again.
+const READINESS_STEP: Duration = Duration::from_secs(6);
+
+/// Where a probe left the reader: the prompt its report carried, and the buffer revision with it.
+///
+/// Both numbers only ever go up, so the pair is a mark in the reader's own account of itself that
+/// a later report is compared against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderMark {
+    /// The prompt the probe's own report was at.
+    pub prompt_generation: u64,
+    /// The buffer revision that report carried.
+    pub buffer_revision: u64,
+}
+
+impl ReaderMark {
+    /// The mark one report leaves behind it.
+    #[must_use]
+    pub fn of(idle: &ReaderIdle) -> Self {
+        Self {
+            prompt_generation: idle.prompt_generation.get(),
+            buffer_revision: idle.editor.buffer_revision.get(),
+        }
+    }
+}
+
+/// What one report of the reader's says about the probe a session is waiting out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessStep {
+    /// The probe's own report, or one from before it. It is about a line that is gone.
+    Behind,
+    /// After the probe at the probe's own prompt, with the line or a queue still holding
+    /// something: this reader is inside the read the probe drew and has not finished with it.
+    Busy,
+    /// After the probe at the probe's own prompt, at an empty line with nothing queued behind it.
+    Ready,
+    /// A prompt after the probe's.
+    Moved,
+}
+
+/// What a report of the reader's says about the probe that left `since`.
+///
+/// This is the rule every session here offers a key by. A key goes to an editor only after the
+/// reader has said, in a report of its own, that it is inside its read for the prompt the key is
+/// meant for. It says so by reporting an empty line with nothing queued, at the prompt the probe
+/// was drawn at, later than the probe's own report.
+///
+/// The report a reader sends as it enters cannot say it. That one goes out before the editor takes
+/// the terminal, and it is the first report of its prompt, so it is always behind a probe's report
+/// of the same prompt and is dropped here by comparison rather than waited out. A report from a
+/// prompt after the probe's says nothing about this wait either, for the same reason: at that
+/// prompt the session has not probed yet. The answer there is another probe, not a longer wait.
+#[must_use]
+pub fn readiness_of(since: ReaderMark, idle: &ReaderIdle) -> ReadinessStep {
+    let generation = idle.prompt_generation.get();
+    if generation > since.prompt_generation {
+        return ReadinessStep::Moved;
+    }
+    if generation < since.prompt_generation
+        || idle.editor.buffer_revision.get() <= since.buffer_revision
+    {
+        return ReadinessStep::Behind;
+    }
+    if idle.editor.buffer_empty
+        && idle.snapshot.queued_keys == U64::ZERO
+        && idle.snapshot.pending_bytes == U64::ZERO
+    {
+        ReadinessStep::Ready
+    } else {
+        ReadinessStep::Busy
+    }
+}
 
 /// One stack, as `scripts/fetch-shell-stacks.sh` left it.
 #[derive(Clone, Debug, Deserialize)]
@@ -825,39 +902,50 @@ impl Session {
     /// An editor that takes the terminal out of its own line mode reads a key as the key it binds.
     /// One typed before it takes the terminal goes through the terminal's own line discipline
     /// instead, which holds it until a line ends, so a chord sent a moment early is lost. A person
-    /// waits for the prompt; against such an editor this session waits for its drawing, which is
-    /// the editor rather than the prompt.
+    /// waits for the prompt; against such an editor this session waits for the reader's own word
+    /// that it is inside its read, which is a different thing from the prompt being on the screen.
     ///
-    /// The line the probe leaves is then taken away, and the reader's own word for that is what
-    /// this waits on: the reader reports itself idle at each of its key boundaries, and the report
-    /// carries the buffer and the queues it read at that instant. Everything the reader said
-    /// before the probe was drawn is put behind a barrier first, because a check that has already
-    /// typed and cleared a line left reports that look exactly like the two this is about to wait
-    /// for. After that barrier, two reports decide it: the first holds the probe, and the second
-    /// holds an empty line with nothing queued behind it, later at this prompt or at one after it,
-    /// which is the reader back at a key wait with nothing in the line. A length of silence would
-    /// be a guess at the same thing.
+    /// That word is [`readiness_of`]'s rule, and nothing here infers it from a length of silence
+    /// or from a report that could belong to another prompt. The three other readers need no such
+    /// wait: their editors read what the terminal's line discipline held for them while the shell
+    /// was busy, so a key offered a moment early reaches them at the read it was meant for rather
+    /// than being lost. [`Dialect::types_at_the_prompt`] is where that difference is recorded.
     ///
     /// # Panics
     ///
-    /// Panics when no prompt or no drawing arrives, which is an editor that never started reading,
-    /// and when the reader never reports the line the clear took away.
+    /// Panics when the shell draws no prompt at all, and when the reader never says it is inside
+    /// its read at the prompt it was probed at.
     pub fn ensure_reading(&mut self) {
         if !dialect(self.package_kind).types_at_the_prompt {
             return;
         }
+        let deadline = Instant::now() + READINESS;
+        let mut probes = 0;
+        while Instant::now() < deadline {
+            probes += 1;
+            if self.probe_for_a_reading_editor() {
+                return;
+            }
+        }
+        panic!(
+            "{probes} probes and the reader never said it was inside its read at the prompt it \
+             was probed at:\n{}",
+            self.terminal_output()
+        );
+    }
+
+    /// Draws one probe and waits the reader out, returning whether it said it was reading.
+    ///
+    /// False is the prompt having moved under the probe, or the reader having said nothing inside
+    /// [`READINESS_STEP`]: either way the answer is another probe at whatever prompt is there now,
+    /// not a longer wait at the one that has gone.
+    fn probe_for_a_reading_editor(&mut self) -> bool {
         assert!(
             self.wait_for_prompt(),
             "the shell drew no prompt:\n{}",
             self.terminal_output()
         );
-        let start = self.terminal_output().len();
         self.type_bytes(b"x");
-        assert!(
-            self.wait_for_editor(start),
-            "the editor drew nothing for a key typed at its prompt:\n{}",
-            self.terminal_output()
-        );
         // Everything the reader said before this moment is about a line that is gone, and some of
         // it looks exactly like what this is about to ask for: a check that typed a character and
         // cleared it leaves a report of a held line and a report of an empty one behind it. A
@@ -881,37 +969,80 @@ impl Session {
         }));
         let _ = self.answer(barrier);
         self.forget_events();
+        // From here the session types every key itself. Acknowledging an event types one too --
+        // this editor reaches its own queue when the reader steps, so an answer carries a step
+        // with it -- and a key of that kind in flight is a key in the queue the reports below are
+        // read for. They are held off until the two reports have been seen.
+        let stepping = self.stepping;
+        self.stepping = false;
+        let reading = self.watch_the_reader_clear_the_probe();
+        self.stepping = stepping;
+        reading
+    }
+
+    /// Watches the reader hold the probe and then report the line the clear took away.
+    ///
+    /// The first report proves the reader is inside its read: the buffer it carries holds the
+    /// probe, and this reader reads its buffer only while it is reading. The second report is the
+    /// one [`readiness_of`] calls [`ReadinessStep::Ready`], at that same prompt.
+    fn watch_the_reader_clear_the_probe(&mut self) -> bool {
         // The probe character is the editor's own insertion, which this package does not sit in
         // front of, so the reader is given one key it does have a binding for: the cursor moves,
         // nothing else of the line changes, and the boundary that key ends at is where the reader
         // reads its own state and reports it.
         self.type_bytes(STEP_KEY);
-        let (_, held) = self.expect_event(
-            "the reader holding the probe",
-            |event| matches!(event, BridgeEvent::ReaderIdle(idle) if !idle.editor.buffer_empty),
-        );
-        let BridgeEvent::ReaderIdle(held) = held else {
-            unreachable!("the predicate accepted an idle report")
+        let Some(held) = self.next_reader_report(READINESS_STEP, |idle| !idle.editor.buffer_empty)
+        else {
+            return false;
         };
-        let since = (
-            held.prompt_generation.get(),
-            held.editor.buffer_revision.get(),
-        );
+        let since = ReaderMark::of(&held);
         self.clear_line();
-        // An empty line with nothing queued, reported later than the one this probe held: later
-        // at this prompt is the clear having run, and later at a prompt after it is a reader that
-        // has started a new line, which is the same answer to the same question. A report the
-        // probe itself produced, or one from before it, is behind that mark and is not this.
-        self.expect_event("the reader at the line the clear took away", |event| {
-            matches!(
-                event,
-                BridgeEvent::ReaderIdle(idle)
-                    if (idle.prompt_generation.get(), idle.editor.buffer_revision.get()) > since
-                        && idle.editor.buffer_empty
-                        && idle.snapshot.queued_keys == U64::ZERO
-                        && idle.snapshot.pending_bytes == U64::ZERO
-            )
-        });
+        let deadline = Instant::now() + READINESS_STEP;
+        loop {
+            while let Some(idle) = self.take_reader_report() {
+                match readiness_of(since, &idle) {
+                    ReadinessStep::Ready => return true,
+                    ReadinessStep::Moved => return false,
+                    ReadinessStep::Behind | ReadinessStep::Busy => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(Duration::from_millis(25));
+        }
+    }
+
+    /// Takes the next report of the reader's off this session's queue, where one has arrived.
+    ///
+    /// What is in front of it is dropped, as [`Session::expect_event`] drops it: each call asks
+    /// for the next thing the reader said about itself.
+    fn take_reader_report(&mut self) -> Option<ReaderIdle> {
+        while let Some((_, event)) = self.events.pop_front() {
+            if let BridgeEvent::ReaderIdle(idle) = event {
+                return Some(idle);
+            }
+        }
+        None
+    }
+
+    /// Waits inside `within` for the next report of the reader's that `accept` takes.
+    fn next_reader_report<F>(&mut self, within: Duration, accept: F) -> Option<ReaderIdle>
+    where
+        F: Fn(&ReaderIdle) -> bool,
+    {
+        let deadline = Instant::now() + within;
+        loop {
+            while let Some(idle) = self.take_reader_report() {
+                if accept(&idle) {
+                    return Some(idle);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            self.pump(Duration::from_millis(25));
+        }
     }
 
     /// Presses the key the case's own binding is on and waits for what that binding writes.
@@ -964,12 +1095,12 @@ impl Session {
             }
         }
         Err(format!(
-            "the key was offered four times and wrote no {USER_BINDING_TEXT}; the terminal {} \
-             between the offers",
+            "the key was offered four times and wrote no {USER_BINDING_TEXT}; {} between the \
+             offers",
             if settled {
-                "went quiet"
+                "the terminal went quiet before every deadline"
             } else {
-                "never went quiet"
+                "at least one wait for the terminal ran out before it went quiet"
             }
         ))
     }
