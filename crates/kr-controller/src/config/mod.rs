@@ -37,6 +37,19 @@ pub fn open(paths: &EnvironmentPaths) -> Resolver {
     Resolver::open(paths)
 }
 
+/// One applied edit, with the lock still held.
+///
+/// The lock outlives the write on purpose: a change that also has to be put somewhere else, such
+/// as the session number the registry admits against, has to do that before another writer can
+/// prepare an edit of its own. Dropping this value releases the lock.
+#[derive(Debug)]
+pub struct AppliedEdit {
+    /// What the edit did.
+    pub applied: Applied,
+    /// The lock, held until this value is dropped.
+    pub lock: configuration::EditLock,
+}
+
 /// What one applied edit did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
@@ -51,6 +64,16 @@ pub struct Applied {
     pub invalidated: Vec<CapabilityInvalidation>,
     /// True when this change affects authority, so dispatch is fenced before it is acknowledged.
     pub fences_dispatch: bool,
+    /// The revision the fence was raised at, when one was.
+    pub authority_revision: Option<kr_protocol::ids::AuthorityRevision>,
+    /// True when every affected worker's barrier held before this returned.
+    ///
+    /// A revision that advanced is not a completed revocation. A worker that has not acknowledged
+    /// its fence still holds work admitted under the old authority, and a caller told the change
+    /// is in force would be told something that is not yet true of that worker.
+    pub barrier_holds: bool,
+    /// How many workers had not acknowledged the fence when this returned.
+    pub pending_workers: u64,
 }
 
 /// Applies one validated edit to this environment's configuration document.
@@ -77,20 +100,60 @@ pub struct Applied {
 ///
 /// Returns [`ControllerError::Configuration`] when the document may not be edited, when the result
 /// does not validate, or when another writer moved the revision first.
-pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<Applied> {
-    // Held across the read, the edit and the replacement, so two writers cannot each read one
-    // revision and each publish the next.
-    let held = kr_worker::config::lock(paths).map_err(ControllerError::Configuration)?;
+pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> Result<AppliedEdit> {
+    // Held across the read, the edit and the replacement, and handed back to the caller so the
+    // effects of the edit land before another writer can prepare one.
+    let lock = kr_worker::config::lock(paths).map_err(ControllerError::Configuration)?;
     let loaded = kr_worker::config::load(paths);
     let edited = configuration::edit(&loaded, change).map_err(refused)?;
+    // A ceiling the intersection would refuse is refused here, before it is written. Section 26
+    // rejects a more permissive value; a document that recorded one and was then quietly read back
+    // narrower would be a rejection nobody was told about, and an owner who lowered a number and
+    // then raised it past the limit would find the low number gone.
+    if let Some(problem) = refused_ceiling(&edited.document.ceilings, limits) {
+        return Err(ControllerError::Configuration(problem));
+    }
     write(paths, &edited)?;
-    drop(held);
-    Ok(Applied {
-        revision: edited.revision,
-        effect: edited.effect,
-        invalidated: change.invalidates(),
-        fences_dispatch: change.affects_authority(),
+    Ok(AppliedEdit {
+        applied: Applied {
+            revision: edited.revision,
+            effect: edited.effect,
+            invalidated: change.invalidates(),
+            fences_dispatch: change.affects_authority(),
+            authority_revision: None,
+            // Nothing was fenced here, so nothing is outstanding. A change that does fence sets
+            // both of these from the barrier the fence returned.
+            barrier_holds: true,
+            pending_workers: 0,
+        },
+        lock,
     })
+}
+
+/// Returns why a document's ceilings would not be applied as written, when one would not.
+fn refused_ceiling(
+    ceilings: &kr_protocol::hostinfo::configuration::ConfigurationCeilings,
+    limits: HardLimits,
+) -> Option<String> {
+    let sessions = ceilings::session_limit(ceilings, limits);
+    if sessions.refused {
+        return Some(format!(
+            "a session number of {} is more permissive than what is in force: {}",
+            sessions
+                .configured
+                .map_or_else(|| "none".to_owned(), |asked| asked.to_string()),
+            sessions
+                .narrowed_by
+                .unwrap_or_else(|| "this host's own limit".to_owned())
+        ));
+    }
+    let enrolment = ceilings::enrolment(ceilings);
+    if enrolment.refused {
+        return Some(enrolment.narrowed_by.unwrap_or_else(|| {
+            "this enrolment budget is more permissive than section 11 allows".to_owned()
+        }));
+    }
+    None
 }
 
 /// Writes an edit whose base revision is still the one on disk.
@@ -395,6 +458,23 @@ pub fn secret_line(effective: &EffectiveConfiguration) -> String {
 #[must_use]
 pub fn sleep_inhibition(paths: &EnvironmentPaths) -> SleepInhibitionSetting {
     Resolver::open(paths).sleep_inhibition(None).value
+}
+
+/// Returns the session number this host admits against, when the configuration names one.
+///
+/// `None` means the document says nothing about it, and nothing here changes what the environment
+/// already admits against. A document this host cannot use says nothing either: a restriction an
+/// owner accepted must not be lifted because a later build could not read the file it was in.
+#[must_use]
+pub fn configured_session_limit(resolver: &Resolver, limits: HardLimits) -> Option<u64> {
+    if resolver.status().state.is_a_problem() {
+        return None;
+    }
+    let ceilings = resolver.ceilings();
+    ceilings
+        .session_limit
+        .is_present()
+        .then(|| ceilings::session_limit(&ceilings, limits).value)
 }
 
 #[cfg(test)]

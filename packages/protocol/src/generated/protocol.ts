@@ -4988,7 +4988,10 @@ export interface ConfigurationCeilings {
    */
   grant_rights?: string[] | null
   /**
-   * The most sessions this host admits, when the owner sets one below the built-in limit.
+   * The most sessions this host admits, when the owner chooses a number.
+   *
+   * Section 2 makes 128 the default and says the owner configures it; the intersection is
+   * with what this machine's own resources allow, not with the default.
    */
   session_limit?: number | null
 }

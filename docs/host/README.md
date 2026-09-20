@@ -163,14 +163,17 @@ force is refused and reported as refused.
 
 | Ceiling | Intersected with |
 | --- | --- |
-| `session_limit` | the hard limit of 128 sessions per environment |
+| `session_limit` | what this machine's own resources allow. 128 is the product default rather than a maximum: the owner may set a higher number, and this host establishes no resource limit yet, so nothing narrows the choice and `kr doctor` says so |
 | `grant_rights` | the rights the grant and this host's policy already allow, which the grant intersection decides; this ceiling only removes |
 | `enrolment` | section 11's own budgets; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
 
-A ceiling is applied where the thing it restricts reads it. `session_limit` becomes the limit this
-host admits a create against, at startup and again after every edit. `grant_rights` narrows a grant
-before the method's required rights are checked, so a method whose right the ceiling has removed is
-refused rather than permitted with nothing in it.
+A ceiling is applied where the thing it restricts reads it, and an edit whose value the
+intersection would refuse is refused before it is written rather than recorded and then quietly
+read back narrower. `session_limit` becomes the number this host admits a create against, at
+startup and again after every edit, and a document that says nothing about it leaves that number
+alone: a restriction an owner accepted is never lifted because a later build could not read the
+file it was in. `grant_rights` narrows a grant before the method's required rights are checked, so
+a method whose right the ceiling has removed is refused rather than permitted with nothing in it.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
 it, which secure store it lives in and its name inside that store. There is no field a value would

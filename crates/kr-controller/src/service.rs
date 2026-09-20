@@ -478,16 +478,18 @@ impl Controller {
         let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
         let generation = lock.advance(&mut registry)?;
-        // The configured session ceiling, intersected with the hard resource limit, becomes the
-        // limit admission actually enforces. A ceiling that was only reported would be a promise
-        // rather than a restriction, and section 26 makes it an intersection.
-        registry.set_session_limit(
-            crate::config::ceilings::session_limit(
-                &crate::config::open(&setup.paths).ceilings(),
-                crate::config::HardLimits::default(),
-            )
-            .value,
-        )?;
+        // The configured session number, intersected with what this machine's resources allow,
+        // becomes the number admission enforces. Only when the document actually names one: a
+        // document that says nothing, and one this build cannot read, must not lift a restriction
+        // the owner accepted through some other path.
+        if let Some(limit) = crate::config::configured_session_limit(
+            &crate::config::open(&setup.paths),
+            crate::config::HardLimits {
+                sessions_per_environment: None,
+            },
+        ) {
+            registry.set_session_limit(limit)?;
+        }
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let boot = setup.boot_identity.clone();
@@ -4312,7 +4314,10 @@ impl Controller {
         let desktop = self.capability_report().await?;
         encode(&EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
-            default_worker_profile: crate::desktop::default_profile(&desktop.desktop),
+            // The same answer `host.info` gives: what this host creates a session in when the
+            // request chooses nothing, which is what the configuration resolves rather than what
+            // the platform alone would say. Two reads of one question must not disagree.
+            default_worker_profile: self.default_profile().await,
             desktop,
             persistence: crate::desktop::persistence(&self.supervisor.describe()),
             power: self.power_state().await,
@@ -4443,19 +4448,49 @@ impl Controller {
         self: &Arc<Self>,
         change: &kr_protocol::hostinfo::configuration::Change,
     ) -> Result<crate::config::Applied> {
-        let applied = crate::config::apply(&self.paths, change)?;
-        // What the new document says, put where the thing it restricts actually reads it. A
-        // ceiling this host reported and did not enforce would be worse than none.
-        let limit = crate::config::ceilings::session_limit(
-            &self.configuration().ceilings(),
-            crate::config::HardLimits::default(),
-        )
-        .value;
-        self.registry.lock().await.set_session_limit(limit)?;
-        if applied.fences_dispatch {
-            self.revoke_authority().await?;
+        let edit = crate::config::apply(&self.paths, change, self.hard_limits())?;
+        // Inside the lock. What the new document says goes where the thing it restricts actually
+        // reads it before another writer can prepare an edit of its own, so a slower older edit
+        // cannot put its number back after a newer one has landed.
+        if let Some(limit) =
+            crate::config::configured_session_limit(&self.configuration(), self.hard_limits())
+        {
+            self.registry.lock().await.set_session_limit(limit)?;
+        } else if matches!(
+            change,
+            kr_protocol::hostinfo::configuration::Change::SessionLimit(None)
+        ) {
+            // Clearing the number is an explicit removal rather than a document that says nothing,
+            // so the product default goes back.
+            self.registry.lock().await.set_session_limit(
+                kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64,
+            )?;
         }
+        let mut applied = edit.applied.clone();
+        if applied.fences_dispatch {
+            // Before the caller is told the change is in force. The barrier travels with the
+            // answer: a revision that advanced while a worker has not yet acknowledged its fence
+            // is not a completed revocation, and section 9 asks for the per-worker state rather
+            // than for the revision alone.
+            let barrier = self.revoke_authority().await?;
+            applied.pending_workers = barrier.pending().len() as u64;
+            applied.barrier_holds = barrier.holds();
+            applied.authority_revision = Some(barrier.authority_revision);
+        }
+        drop(edit);
         Ok(applied)
+    }
+
+    /// The resource limits a configured ceiling is intersected with on this machine.
+    ///
+    /// This host does not measure its own headroom, so nothing is established and an owner's
+    /// configured number applies. The value is here rather than at each call site so the day it is
+    /// measured there is one place to answer from.
+    #[must_use]
+    pub const fn hard_limits(&self) -> crate::config::HardLimits {
+        crate::config::HardLimits {
+            sessions_per_environment: None,
+        }
     }
 
     async fn host_doctor(self: &Arc<Self>) -> Result<ParamsValue> {

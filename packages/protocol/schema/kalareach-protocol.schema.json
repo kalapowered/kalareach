@@ -4338,7 +4338,7 @@
             }
           ],
           "default": null,
-          "description": "The most sessions this host admits, when the owner sets one below the built-in limit."
+          "description": "The most sessions this host admits, when the owner chooses a number.\n\nSection 2 makes 128 the default and says the owner configures it; the intersection is\nwith what this machine's own resources allow, not with the default."
         }
       },
       "type": "object"

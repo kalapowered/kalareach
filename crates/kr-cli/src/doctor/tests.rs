@@ -198,9 +198,39 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
 }
 
 /// KR-REQ-26.44: a bundle written to a bare file name lands in the directory the command ran in.
+///
+/// Run as the command runs it: a separate process, in a directory of its own, given the name and
+/// nothing else. A bare name has no parent for the atomic replacement to write its temporary file
+/// into, which is what used to make a bundle report failure after it had already been written.
 #[test]
 fn a_relative_destination_is_resolved_against_the_current_directory() {
     let directory = tempfile::tempdir().expect("a directory");
+    let program = std::env::current_exe().expect("this test binary");
+    let written = std::process::Command::new(&program)
+        .arg("--exact")
+        .arg("doctor::tests::writes_a_bundle_to_a_bare_name")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .current_dir(directory.path())
+        .env("KR_BUNDLE_NAME", "support.tar")
+        .output()
+        .expect("the child runs");
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    assert!(
+        directory.path().join("support.tar").exists(),
+        "the bundle is in the directory the command ran in"
+    );
+}
+
+/// The half of the test above that runs in the child, in its own directory.
+#[test]
+#[ignore = "run by a_relative_destination_is_resolved_against_the_current_directory"]
+fn writes_a_bundle_to_a_bare_name() {
+    let name = std::env::var("KR_BUNDLE_NAME").expect("the name the parent chose");
     let bundle = SupportBundle::new(
         TimestampMs::new(1),
         Vec::new(),
@@ -209,27 +239,8 @@ fn a_relative_destination_is_resolved_against_the_current_directory() {
         configured(),
         Vec::new(),
     );
-    // Written through the same path a bare `--bundle support.tar` takes, without changing this
-    // process's own directory: a relative destination has no parent for the atomic replacement to
-    // write its temporary file into, which is what used to make a bundle report failure after it
-    // had already been written.
-    let relative = std::path::Path::new("support.tar");
-    assert!(
-        relative
-            .parent()
-            .is_some_and(|parent| parent.as_os_str().is_empty())
-    );
-    bundle::write(&directory.path().join(relative), &bundle, &[], "report")
-        .expect("an absolute destination");
-    let here = std::env::current_dir().expect("a current directory");
-    bundle::write(
-        &here.join("kr-doctor-bundle-test.tar"),
-        &bundle,
-        &[],
-        "report",
-    )
-    .expect("a destination inside the current directory");
-    std::fs::remove_file(here.join("kr-doctor-bundle-test.tar")).expect("removes what it wrote");
+    bundle::write(std::path::Path::new(&name), &bundle, &[], "report")
+        .expect("a bare file name resolves against the current directory");
 }
 
 /// KR-REQ-26.44: an entry the archive format cannot carry is refused rather than truncated.

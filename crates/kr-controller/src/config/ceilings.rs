@@ -36,50 +36,43 @@ pub struct Ceiling<T> {
 
 /// The hard resource limits a configured ceiling is intersected with.
 ///
-/// They are facts about this build and this environment rather than preferences, which is why they
-/// are passed in rather than read from the document: a document that could raise them would be a
-/// document that could raise a limit by asking.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HardLimits {
-    /// The most sessions one environment admits, whatever a configuration asks for.
-    pub sessions_per_environment: u64,
-}
-
-impl Default for HardLimits {
-    fn default() -> Self {
-        Self {
-            sessions_per_environment: DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64,
-        }
-    }
-}
-
-/// Intersects the configured session ceiling with the hard resource limit.
+/// Facts about this machine rather than preferences, which is why they are passed in rather than
+/// read from the document: a document that could raise them would be a document that raised a
+/// limit by asking.
 ///
-/// A configured ceiling below the limit is this owner's own restriction and applies. A configured
-/// ceiling above it is more permissive than the product allows, so it is refused and the limit
-/// stands; nothing about asking for more raises anything.
+/// Section 2 makes 128 live or creating sessions the *default* admission, "configurable by the
+/// local owner and constrained by available PTY/process/storage resources". So 128 is the product
+/// default at the bottom of the ladder, and the hard limit is what those resources actually allow.
+/// This host does not measure that headroom, so it says so rather than inventing a number: with
+/// nothing established, an owner's configured number is what applies, and `kr doctor` reports that
+/// no resource limit narrowed it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HardLimits {
+    /// The most sessions this machine's own resources allow, where this host has established it.
+    pub sessions_per_environment: Option<u64>,
+}
+
+/// Intersects the configured session number with the hard resource limit.
+///
+/// The configured number applies when this host has established no resource limit, and is narrowed
+/// and reported as refused when it exceeds one that has been established. Asking for more never
+/// raises anything.
 #[must_use]
 pub fn session_limit(ceilings: &ConfigurationCeilings, limits: HardLimits) -> Ceiling<u64> {
-    let hard = limits.sessions_per_environment;
     let configured = ceilings.session_limit.0;
-    match configured {
-        Some(asked) if asked > hard => Ceiling {
+    let asked = configured.unwrap_or(DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64);
+    match limits.sessions_per_environment {
+        Some(hard) if asked > hard => Ceiling {
             configured,
             value: hard,
             narrowed_by: Some(format!(
-                "the hard resource limit of {hard} sessions per environment"
+                "this machine's resources allow {hard} live or creating sessions"
             )),
             refused: true,
         },
-        Some(asked) => Ceiling {
+        _ => Ceiling {
             configured,
             value: asked,
-            narrowed_by: None,
-            refused: false,
-        },
-        None => Ceiling {
-            configured: None,
-            value: hard,
             narrowed_by: None,
             refused: false,
         },

@@ -12,7 +12,7 @@ use kr_protocol::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesResult,
     SleepInhibitionState,
 };
-use kr_protocol::hostinfo::HostInfoResult;
+use kr_protocol::hostinfo::{HostInfoResult, redaction};
 use kr_protocol::session::{SessionState, SessionSummary};
 use serde_json::{Value, json};
 
@@ -164,15 +164,19 @@ pub fn capability(record: &CapabilityRecord) -> Value {
         "revision": record.revision.get(),
         "state": record.state.as_str(),
         "evidence_source": record.evidence_source.as_str(),
-        "binary": record.identity.binary.as_ref().cloned(),
-        "facility_identity": record.identity.version.as_ref().cloned(),
+        // A capability's own identity and its sentence come from whatever probed it: a binary
+        // found on `PATH`, a facility's version string, a platform's own message. Any of those can
+        // carry a credential nobody meant to print, so everything a person or a file sees goes
+        // through the same redaction the diagnostics do.
+        "binary": record.identity.binary.0.as_deref().map(redaction::redact),
+        "facility_identity": record.identity.version.0.as_deref().map(redaction::redact),
         "profile": record.identity.profile.as_ref().map(|profile| profile.as_str()),
         "invalidation": record
             .invalidation
             .iter()
             .map(|trigger| trigger.as_str())
             .collect::<Vec<_>>(),
-        "disabled_reason": record.disabled_reason.as_ref().cloned(),
+        "disabled_reason": record.disabled_reason.0.as_deref().map(redaction::redact),
         "observed_at_ms": record.observed_at_ms.get(),
     })
 }
@@ -267,14 +271,18 @@ pub fn capability_lines(report: &DesktopCapabilityReport) -> Vec<String> {
         .records
         .iter()
         .map(|record| {
-            let detail = record.disabled_reason.as_ref().cloned().unwrap_or_else(|| {
-                record
-                    .identity
-                    .binary
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| "no facility named".to_owned())
-            });
+            // Redacted for the same reason the JSON form is: the sentence and the facility name
+            // both come from whatever probed the capability.
+            let detail = redaction::redact(
+                &record.disabled_reason.as_ref().cloned().unwrap_or_else(|| {
+                    record
+                        .identity
+                        .binary
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| "no facility named".to_owned())
+                }),
+            );
             format!(
                 "  {:<26} {:<24} {detail}",
                 record.capability.to_string(),

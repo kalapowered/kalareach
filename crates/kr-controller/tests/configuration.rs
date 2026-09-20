@@ -14,6 +14,7 @@
 mod net_support;
 
 use kr_controller::config;
+use kr_controller::config::ceilings;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::desktop::{CapabilityInvalidation, SleepInhibitionSetting};
 use kr_protocol::envelope::ParamsValue;
@@ -23,7 +24,6 @@ use kr_protocol::hostinfo::configuration::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::Nullable;
 use net_support::Host;
 
 /// A grant that sees a session and nothing more, which is all the host's own reads need.
@@ -216,20 +216,30 @@ async fn only_the_documented_overrides_participate_and_they_say_where() {
     host.stop().await;
 }
 
-/// KR-REQ-26.15: a configured ceiling above the hard limit is refused and reported as refused.
+/// KR-REQ-26.15: a configured budget more permissive than section 11 allows never applies.
+///
+/// Two gates, and this shows both. The document is refused when it is read, so nothing is taken
+/// out of it and every value is the product default; and the intersection refuses the budget on
+/// its own account, so a document that reached the ceiling function by some other path would still
+/// not get what it asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_more_permissive_configured_ceiling_is_refused_rather_than_applied() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let environment = host.tree().environment();
-    let limits = config::HardLimits::default();
 
-    // Written directly rather than through the edit, because the edit's own validation is not what
-    // this is about: what this shows is that a document asking for more than the product allows
-    // does not get it.
     let mut document = ConfigurationDocument::empty();
-    document.ceilings.session_limit =
-        Nullable::some(limits.sessions_per_environment.saturating_mul(4));
+    document.ceilings.enrolment.cached_payload_bytes = 8 * 1024 * 1024 * 1024;
+    let asked = ceilings::enrolment(&document.ceilings);
+    assert!(
+        asked.refused,
+        "the intersection refuses it on its own account"
+    );
+    assert_eq!(
+        asked.value.cached_payload_bytes,
+        kr_protocol::hostinfo::configuration::DEFAULT_CACHED_PAYLOAD_BYTES
+    );
+
     kr_ipc::paths::write_owner_only_file(
         &kr_worker::config::document_path(&environment),
         kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
@@ -243,19 +253,36 @@ async fn a_more_permissive_configured_ceiling_is_refused_rather_than_applied() {
             .await
             .expect("host.doctor is served to the device"),
     );
+    assert_eq!(
+        result.configuration.status.state,
+        DocumentState::Invalid,
+        "the document is refused rather than partly believed"
+    );
+    assert!(
+        result
+            .configuration
+            .status
+            .detail
+            .contains("full_offline_mirror"),
+        "and it says which rule refused it: {}",
+        result.configuration.status.detail
+    );
     let ceiling = result
         .configuration
         .ceilings
         .iter()
-        .find(|ceiling| ceiling.key == "session_limit")
-        .expect("the session ceiling");
-    assert!(ceiling.refused, "asking for more raises nothing");
-    assert_eq!(ceiling.value, limits.sessions_per_environment.to_string());
+        .find(|ceiling| ceiling.key == "enrolment")
+        .expect("the enrolment ceiling");
+    assert!(
+        ceiling.value.contains("1073741824 cached payload bytes"),
+        "the budget in force is section 11's own: {}",
+        ceiling.value
+    );
     let check = result
         .checks
         .iter()
-        .find(|check| check.id == "configuration-ceilings")
-        .expect("the ceilings check");
+        .find(|check| check.id == "configuration-document")
+        .expect("the document check");
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
     assert!(check.remedy.is_present(), "and it says what to do about it");
 
@@ -375,9 +402,11 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
     let applied = config::apply(
         &environment,
         &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
+        config::HardLimits::default(),
     )
     .expect("the owner's choice");
-    assert_eq!(applied.revision, 1);
+    assert_eq!(applied.applied.revision, 1);
+    drop(applied);
 
     let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
     let info: kr_protocol::hostinfo::HostInfoResult = typed(
@@ -461,8 +490,8 @@ async fn a_configured_session_ceiling_is_the_limit_this_host_admits_against() {
     );
     assert_eq!(
         info.session_limit.get(),
-        kr_controller::config::HardLimits::default().sessions_per_environment,
-        "and clearing it puts the hard resource limit back"
+        kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64,
+        "and clearing it puts the product default back"
     );
 
     session.close();

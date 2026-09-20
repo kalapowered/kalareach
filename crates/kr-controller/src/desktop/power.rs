@@ -141,7 +141,12 @@ pub fn write(
     paths: &kr_ipc::paths::EnvironmentPaths,
     chosen: SleepInhibitionSetting,
 ) -> Result<()> {
-    crate::config::apply(paths, &Change::SleepInhibition(chosen)).map(|_| ())
+    crate::config::apply(
+        paths,
+        &Change::SleepInhibition(chosen),
+        crate::config::HardLimits::default(),
+    )
+    .map(|_| ())
 }
 
 /// Returns which facility this host holds a sleep assertion with.

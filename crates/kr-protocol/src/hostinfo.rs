@@ -461,6 +461,17 @@ impl SupportBundle {
                     disabled_reason: Nullable(
                         record.disabled_reason.0.as_deref().map(redaction::redact),
                     ),
+                    // The identity is the binary a probe found and the version it reported, both
+                    // of which come from outside this host.
+                    identity: crate::desktop::CapabilityIdentity {
+                        binary: Nullable(
+                            record.identity.binary.0.as_deref().map(redaction::redact),
+                        ),
+                        version: Nullable(
+                            record.identity.version.0.as_deref().map(redaction::redact),
+                        ),
+                        ..record.identity
+                    },
                     ..record
                 })
                 .collect(),
@@ -701,7 +712,10 @@ pub mod configuration {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields, default)]
     pub struct ConfigurationCeilings {
-        /// The most sessions this host admits, when the owner sets one below the built-in limit.
+        /// The most sessions this host admits, when the owner chooses a number.
+        ///
+        /// Section 2 makes 128 the default and says the owner configures it; the intersection is
+        /// with what this machine's own resources allow, not with the default.
         pub session_limit: Nullable<u64>,
         /// The rights a grant may carry on this host, as the stable action-right strings.
         ///
@@ -1161,6 +1175,13 @@ pub mod configuration {
         /// an unreadable one both report revision zero, so an edit prepared against nothing would
         /// otherwise be allowed to replace a document this build must not touch.
         pub based_on_state: DocumentState,
+        /// The document this edit was prepared against, when there was one.
+        ///
+        /// Compared as well, because two different documents can carry the same revision: one
+        /// restored from a backup, or one a person edited by hand without touching the counter.
+        /// Comparing the whole document is what makes the check about the thing rather than about
+        /// its label.
+        pub based_on_document: Option<ConfigurationDocument>,
         /// The revision it applies.
         pub revision: u64,
         /// When it takes effect.
@@ -1251,6 +1272,7 @@ pub mod configuration {
             contents: text,
             based_on,
             based_on_state: loaded.status.state,
+            based_on_document: loaded.document.clone(),
             revision: document.revision,
             effect: change.effect(),
             document,
@@ -1268,7 +1290,10 @@ pub mod configuration {
     ///
     /// Returns [`EditRefused::NotOurs`] naming both revisions when the document moved.
     pub fn still_current(edited: &Edited, current: &Loaded) -> Result<(), EditRefused> {
-        if current.status.state == edited.based_on_state && current.revision() == edited.based_on {
+        if current.status.state == edited.based_on_state
+            && current.revision() == edited.based_on
+            && current.document == edited.based_on_document
+        {
             return Ok(());
         }
         Err(EditRefused::NotOurs(format!(
@@ -1301,21 +1326,35 @@ pub mod configuration {
     #[derive(Debug)]
     pub struct EditLock {
         path: std::path::PathBuf,
+        /// What the file this lock created was, so releasing it cannot remove a different one.
+        ///
+        /// A holder that was paused past [`LOCK_PATIENCE`] and woke up after its lock had been
+        /// taken over would otherwise remove the *new* holder's file on the way out, and the two
+        /// would then both believe they held the lock.
+        identity: Option<u64>,
     }
 
     impl Drop for EditLock {
         fn drop(&mut self) {
-            // Released whichever way the edit ended, including a refusal. A lock left behind by an
-            // edit that was refused would stop the next one for no reason.
-            let _ = std::fs::remove_file(&self.path);
+            // Released whichever way the edit ended, including a refusal, and only when the file
+            // there is still the one this lock created.
+            if lock_identity(&self.path) == self.identity {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 
     /// Takes the configuration lock in `state_directory`.
     ///
-    /// Exclusive creation is the whole of it: the filesystem decides which of two writers created
-    /// the file, and the other is told to try again. A lock left by a process that ended without
-    /// releasing it is taken over after [`LOCK_PATIENCE`].
+    /// Exclusive creation is the whole of the ordinary case: the filesystem decides which of two
+    /// writers created the file, and the other is told to try again.
+    ///
+    /// A lock left by a process that ended without releasing it would otherwise stop every later
+    /// edit, so one older than [`LOCK_PATIENCE`] is taken over. The takeover is itself exclusive:
+    /// a contender first creates `<lock>.takeover`, which only one of them can do, so two
+    /// contenders cannot each remove the other's replacement. The holder's own release checks that
+    /// the file is still the one it created, so a holder that was paused through its own takeover
+    /// removes nothing.
     ///
     /// # Errors
     ///
@@ -1326,21 +1365,28 @@ pub mod configuration {
         match take_lock(&path) {
             Ok(held) => Ok(held),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .is_ok_and(|since| since.elapsed().is_ok_and(|age| age >= LOCK_PATIENCE));
-                if !stale {
-                    return Err(format!(
-                        "another writer is applying an edit to {}",
-                        state_directory.join(FILE_NAME).display()
-                    ));
+                if !is_stale(&path) {
+                    return Err(busy(state_directory, &path));
                 }
-                // The holder is gone. Removing what it left and creating one of our own is still
-                // the filesystem's decision: whichever writer creates it next holds the lock.
+                // One contender at a time performs a takeover. Whoever creates this file does it;
+                // everyone else is told the lock is busy and tries again.
+                let takeover = path.with_extension("takeover");
+                let claim = match take_lock(&takeover) {
+                    Ok(claim) => claim,
+                    Err(_) => return Err(busy(state_directory, &path)),
+                };
+                // Checked once more inside the takeover: the holder may have released it between
+                // the check above and this line, in which case there is nothing to take over.
+                if !is_stale(&path) {
+                    drop(claim);
+                    return Err(busy(state_directory, &path));
+                }
                 let _ = std::fs::remove_file(&path);
-                take_lock(&path).map_err(|error| {
+                let held = take_lock(&path).map_err(|error| {
                     format!("this host could not take {}: {error}", path.display())
-                })
+                });
+                drop(claim);
+                held
             }
             Err(error) => Err(format!(
                 "this host could not take {}: {error}",
@@ -1349,7 +1395,41 @@ pub mod configuration {
         }
     }
 
-    /// Creates the lock file, failing when it is already there.
+    /// The sentence a caller reports when the lock is held.
+    fn busy(state_directory: &std::path::Path, lock: &std::path::Path) -> String {
+        format!(
+            "another writer is applying an edit to {}; {} is held",
+            state_directory.join(FILE_NAME).display(),
+            lock.display()
+        )
+    }
+
+    /// Whether the lock at `path` was left by a holder that is no longer editing.
+    fn is_stale(path: &std::path::Path) -> bool {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|since| since.elapsed().is_ok_and(|age| age >= LOCK_PATIENCE))
+    }
+
+    /// What the file at `path` is, as a number two holders cannot share.
+    ///
+    /// The inode on Unix. Windows has no equally cheap answer through the standard library, so a
+    /// release there removes the lock unconditionally; the takeover above is still exclusive, and
+    /// what remains is the narrow case of a holder paused through its own takeover.
+    #[cfg(unix)]
+    fn lock_identity(path: &std::path::Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        std::fs::metadata(path).ok().map(|metadata| metadata.ino())
+    }
+
+    /// What the file at `path` is, where the platform does not answer cheaply.
+    #[cfg(not(unix))]
+    fn lock_identity(_path: &std::path::Path) -> Option<u64> {
+        None
+    }
+
+    /// Creates a lock file, failing when it is already there.
     fn take_lock(path: &std::path::Path) -> std::io::Result<EditLock> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -1361,6 +1441,7 @@ pub mod configuration {
         }
         options.open(path)?;
         Ok(EditLock {
+            identity: lock_identity(path),
             path: path.to_path_buf(),
         })
     }
@@ -1843,11 +1924,19 @@ pub mod redaction {
         "privatekey",
     ];
 
-    /// Components that make a name public rather than secret, whatever else it contains.
+    /// Components that make a *key* public rather than secret.
     ///
-    /// A public key is something a diagnostic exists to print. Redacting it would lose the one
-    /// identifier a person needs to compare two hosts, and it protects nothing.
+    /// A public key is something a diagnostic exists to print: redacting it would lose the one
+    /// identifier a person needs to compare two hosts, and it protects nothing. The exception
+    /// applies only when `key` was the word that made the name secret, so `public_api_token` is
+    /// still a token and `public_key` is still a public key.
     const PUBLIC_COMPONENTS: &[&str] = &["public", "pub", "fingerprint"];
+
+    /// The secret-naming components a [`PUBLIC_COMPONENTS`] word may excuse.
+    const PUBLIC_EXCUSES: &[&str] = &["key", "keys"];
+
+    /// Authorization schemes whose value follows the scheme word rather than a separator.
+    const SCHEMES: &[&str] = &["Bearer", "Basic", "Token", "Digest"];
 
     /// Components whose value runs to the end of the line rather than to the next space.
     ///
@@ -1878,45 +1967,99 @@ pub mod redaction {
     #[must_use]
     pub fn redact(text: &str) -> String {
         let assignments = redact_assignments(text);
-        let userinfo = redact_userinfo(&assignments);
+        let schemes = redact_schemes(&assignments);
+        let userinfo = redact_userinfo(&schemes);
         redact_opaque_runs(&userinfo)
+    }
+
+    /// Replaces the value after a standalone authorization scheme word.
+    ///
+    /// `Bearer <token>` carries a credential with nothing naming it: the scheme word is the name.
+    /// It appears that way in a copied header, in a curl command line and in a library's own error
+    /// message.
+    fn redact_schemes(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for (index, line) in text.split_inclusive(['\n', '\r']).enumerate() {
+            let _ = index;
+            let mut rest = line;
+            let mut wrote = String::new();
+            while let Some((scheme, at)) = SCHEMES
+                .iter()
+                .filter_map(|scheme| rest.find(&format!("{scheme} ")).map(|at| (*scheme, at)))
+                .min_by_key(|(_, at)| *at)
+            {
+                let value_start = at + scheme.len() + 1;
+                let value_end = rest[value_start..]
+                    .find(|character: char| character.is_whitespace())
+                    .map_or(rest.len(), |offset| value_start + offset);
+                if value_end > value_start {
+                    wrote.push_str(&rest[..value_start]);
+                    wrote.push_str(MARKER);
+                    rest = &rest[value_end..];
+                } else {
+                    wrote.push_str(&rest[..value_start]);
+                    rest = &rest[value_start..];
+                }
+            }
+            wrote.push_str(rest);
+            out.push_str(&wrote);
+        }
+        out
     }
 
     /// Returns true when `name` is a name whose value is a credential.
     #[must_use]
     pub fn names_a_secret(name: &str) -> bool {
         let components = components(name);
-        if components
+        let mut naming: Vec<&str> = components
             .iter()
-            .any(|component| PUBLIC_COMPONENTS.contains(&component.as_str()))
+            .map(String::as_str)
+            .filter(|component| SECRET_COMPONENTS.contains(component))
+            .collect();
+        if components
+            .windows(2)
+            .any(|pair| SECRET_COMPONENTS.contains(&format!("{}{}", pair[0], pair[1]).as_str()))
         {
+            naming.push("apikey");
+        }
+        if naming.is_empty() {
             return false;
         }
-        components
+        let public = components
             .iter()
-            .any(|component| SECRET_COMPONENTS.contains(&component.as_str()))
-            || components
-                .windows(2)
-                .any(|pair| SECRET_COMPONENTS.contains(&format!("{}{}", pair[0], pair[1]).as_str()))
+            .any(|component| PUBLIC_COMPONENTS.contains(&component.as_str()));
+        // A public word excuses a key and nothing else: a name that also says token, secret or
+        // password is one whatever else is in front of it.
+        !(public && naming.iter().all(|word| PUBLIC_EXCUSES.contains(word)))
     }
 
     /// Splits a name into its lowercase components, on its own separators and on case changes.
     fn components(name: &str) -> Vec<String> {
+        let characters: Vec<char> = name.chars().collect();
         let mut parts = Vec::new();
         let mut current = String::new();
-        let mut previous_lower = false;
-        for character in name.chars() {
+        for (index, character) in characters.iter().copied().enumerate() {
             if !character.is_ascii_alphanumeric() {
                 if !current.is_empty() {
                     parts.push(std::mem::take(&mut current));
                 }
-                previous_lower = false;
                 continue;
             }
-            if character.is_ascii_uppercase() && previous_lower && !current.is_empty() {
-                parts.push(std::mem::take(&mut current));
+            if character.is_ascii_uppercase() && !current.is_empty() {
+                let previous = characters[index - 1];
+                // `apiKey` breaks between the lower case and the capital. `HTTPAuthorization`
+                // breaks before the capital that begins the next word, which is the one followed
+                // by lower case; without that the whole run reads as one unknown word and a name
+                // that plainly says "authorization" would not be recognised.
+                let after_lower = previous.is_ascii_lowercase() || previous.is_ascii_digit();
+                let starts_a_word = previous.is_ascii_uppercase()
+                    && characters
+                        .get(index + 1)
+                        .is_some_and(|next| next.is_ascii_lowercase());
+                if after_lower || starts_a_word {
+                    parts.push(std::mem::take(&mut current));
+                }
             }
-            previous_lower = character.is_ascii_lowercase() || character.is_ascii_digit();
             current.push(character.to_ascii_lowercase());
         }
         if !current.is_empty() {
@@ -1938,7 +2081,7 @@ pub mod redaction {
                     .iter()
                     .collect::<String>()
                     .trim()
-                    .trim_matches('"')
+                    .trim_matches(['"', '\''])
                     .to_owned();
                 if names_a_secret(&name) {
                     let whole_line = components(&name)
@@ -1975,6 +2118,7 @@ pub mod redaction {
                 || character == '-'
                 || character == '.'
                 || character == '"'
+                || character == '\''
             {
                 start -= 1;
             } else {
@@ -1992,19 +2136,23 @@ pub mod redaction {
         while start < text.len() && (text[start] == ' ' || text[start] == '\t') {
             start += 1;
         }
-        let quoted = start < text.len() && text[start] == '"';
-        if quoted {
+        let quote = match text.get(start) {
+            Some('"') => Some('"'),
+            Some('\'') => Some('\''),
+            _ => None,
+        };
+        if quote.is_some() {
             start += 1;
         }
         let mut end = start;
         while end < text.len() {
             let character = text[end];
-            if quoted {
+            if let Some(quote) = quote {
                 if character == '\\' {
                     end = (end + 2).min(text.len());
                     continue;
                 }
-                if character == '"' {
+                if character == quote {
                     break;
                 }
             } else {
@@ -2162,6 +2310,19 @@ mod tests {
                 "eyJhbGciOiJIUzI1NiJ9",
                 "Authorization",
             ),
+            (
+                "HTTPAuthorization: Bearer hunter2",
+                "hunter2",
+                "HTTPAuthorization",
+            ),
+            (
+                "the header was Bearer hunter2 and it failed",
+                "hunter2",
+                "it failed",
+            ),
+            ("'password': 'hunter2'", "hunter2", "password"),
+            ("password='two words'", "two words", "password"),
+            ("public_api_token=hunter2", "hunter2", "public_api_token"),
             ("password = hunter2", "hunter2", "password"),
             (
                 r#"{"api_key": "sk-live-\"escaped\"-tail"}"#,

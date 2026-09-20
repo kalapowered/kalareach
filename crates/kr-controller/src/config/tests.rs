@@ -9,13 +9,18 @@ use kr_protocol::scalars::Nullable;
 
 use super::*;
 
+/// One edit, applied the way the host applies it, with the lock released before the assertion.
+fn edit_once(environment: &kr_ipc::paths::EnvironmentPaths, change: &Change) -> Result<Applied> {
+    apply(environment, change, HardLimits::default()).map(|edit| edit.applied.clone())
+}
+
 /// KR-REQ-26.16: an edit is validated, then a revision is applied, then it is written.
 #[test]
 fn an_edit_applies_one_revision_and_a_refused_edit_applies_none() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
 
-    let applied = apply(
+    let applied = edit_once(
         &environment,
         &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
     )
@@ -29,7 +34,7 @@ fn an_edit_applies_one_revision_and_a_refused_edit_applies_none() {
         SleepInhibitionSetting::MainsOnly
     );
 
-    let refused = apply(&environment, &Change::SessionLimit(Some(0)))
+    let refused = edit_once(&environment, &Change::SessionLimit(Some(0)))
         .expect_err("a ceiling that admits nothing");
     assert!(
         format!("{refused}").contains("admit no session"),
@@ -47,7 +52,7 @@ fn an_edit_applies_one_revision_and_a_refused_edit_applies_none() {
 fn a_profile_change_invalidates_the_evidence_taken_under_the_old_one() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    let applied = apply(
+    let applied = edit_once(
         &environment,
         &Change::WorkerProfile(WorkerProfile::HeadlessUser),
     )
@@ -68,7 +73,7 @@ fn a_profile_change_invalidates_the_evidence_taken_under_the_old_one() {
 fn a_grant_ceiling_change_fences_dispatch_before_it_is_acknowledged() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    let applied = apply(
+    let applied = edit_once(
         &environment,
         &Change::GrantRights(Some(vec!["session.view".to_owned()])),
     )
@@ -76,7 +81,7 @@ fn a_grant_ceiling_change_fences_dispatch_before_it_is_acknowledged() {
     assert!(applied.fences_dispatch);
     assert_eq!(applied.effect, ValueEffect::Immediately);
 
-    let refused = apply(
+    let refused = edit_once(
         &environment,
         &Change::GrantRights(Some(vec!["not.a.right".to_owned()])),
     )
@@ -97,7 +102,7 @@ fn an_edit_built_on_a_revision_another_writer_moved_is_refused() {
     .expect("a valid edit");
 
     // Another writer gets there first.
-    apply(&environment, &Change::SessionLimit(Some(4))).expect("the other writer's edit");
+    edit_once(&environment, &Change::SessionLimit(Some(4))).expect("the other writer's edit");
 
     let refused = write(&environment, &prepared).expect_err("the revision moved underneath it");
     assert!(
@@ -112,26 +117,83 @@ fn an_edit_built_on_a_revision_another_writer_moved_is_refused() {
     );
 }
 
-/// KR-REQ-26.15: a configured ceiling above the hard limit is refused, not applied.
+/// KR-REQ-26.15: the configured number applies, and a resource limit narrows it when one exists.
+///
+/// Section 2 makes 128 the default admission and says the owner configures it, so a number above
+/// 128 is the owner's choice rather than something to refuse. What narrows it is what this machine
+/// can actually run, and this host establishes no such limit yet: with none established the
+/// owner's number stands, and with one established a larger number is refused.
 #[test]
-fn a_session_ceiling_above_the_hard_limit_is_refused() {
-    let limits = HardLimits::default();
-    let below = ConfigurationCeilings {
+fn the_configured_session_number_is_narrowed_only_by_a_resource_limit() {
+    let unmeasured = HardLimits::default();
+    assert_eq!(unmeasured.sessions_per_environment, None);
+
+    let none_chosen = ConfigurationCeilings::default();
+    let ceiling = ceilings::session_limit(&none_chosen, unmeasured);
+    assert_eq!(ceiling.configured, None);
+    assert_eq!(
+        ceiling.value,
+        kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64,
+        "the product default is the bottom rung"
+    );
+
+    let raised = ConfigurationCeilings {
+        session_limit: Nullable::some(512),
+        ..ConfigurationCeilings::default()
+    };
+    let ceiling = ceilings::session_limit(&raised, unmeasured);
+    assert_eq!(
+        ceiling.value, 512,
+        "the owner's own number, with nothing to narrow it"
+    );
+    assert!(!ceiling.refused);
+
+    let measured = HardLimits {
+        sessions_per_environment: Some(64),
+    };
+    let ceiling = ceilings::session_limit(&raised, measured);
+    assert_eq!(ceiling.value, 64);
+    assert!(
+        ceiling.refused,
+        "asking for more than the machine allows raises nothing"
+    );
+    assert!(ceiling.narrowed_by.is_some());
+
+    let lowered = ConfigurationCeilings {
         session_limit: Nullable::some(8),
         ..ConfigurationCeilings::default()
     };
-    let ceiling = ceilings::session_limit(&below, limits);
-    assert_eq!(ceiling.value, 8);
-    assert!(!ceiling.refused);
+    assert_eq!(ceilings::session_limit(&lowered, measured).value, 8);
+}
 
-    let above = ConfigurationCeilings {
-        session_limit: Nullable::some(limits.sessions_per_environment + 1),
-        ..ConfigurationCeilings::default()
+/// KR-REQ-26.15: an edit the intersection would refuse is refused before it is written.
+#[test]
+fn an_edit_the_intersection_would_refuse_leaves_the_document_alone() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    apply(
+        &environment,
+        &Change::SessionLimit(Some(3)),
+        HardLimits::default(),
+    )
+    .expect("the owner's number");
+
+    let measured = HardLimits {
+        sessions_per_environment: Some(4),
     };
-    let ceiling = ceilings::session_limit(&above, limits);
-    assert_eq!(ceiling.value, limits.sessions_per_environment);
-    assert!(ceiling.refused, "asking for more raises nothing");
-    assert!(ceiling.narrowed_by.is_some());
+    let refused = apply(&environment, &Change::SessionLimit(Some(512)), measured)
+        .expect_err("more than this machine allows");
+    assert!(
+        format!("{refused}").contains("more permissive"),
+        "{refused}"
+    );
+    let resolver = open(&environment);
+    assert_eq!(resolver.revision(), 1, "a refused edit applies no revision");
+    assert_eq!(
+        configured_session_limit(&resolver, measured),
+        Some(3),
+        "and the number the owner accepted is still the one in force"
+    );
 }
 
 /// KR-REQ-26.15: a payload budget above the default without the explicit setting is refused.
@@ -200,7 +262,7 @@ fn a_configured_right_the_grant_does_not_carry_adds_nothing() {
 fn the_effective_report_names_every_value_its_source_and_its_effect() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    apply(
+    edit_once(
         &environment,
         &Change::SleepInhibition(SleepInhibitionSetting::BatteryToo),
     )
@@ -364,7 +426,7 @@ fn an_edit_refuses_a_document_at_a_version_this_build_does_not_know() {
     let written = br#"{"version": 7, "preferences": {}}"#;
     kr_ipc::paths::write_owner_only_file(&path, written).expect("writes the document");
 
-    let refused = apply(
+    let refused = edit_once(
         &environment,
         &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
     )
@@ -385,7 +447,7 @@ fn a_second_writer_is_refused_while_the_first_holds_the_lock() {
     let environment = temp.environment();
 
     let held = kr_worker::config::lock(&environment).expect("the first writer takes it");
-    let refused = apply(
+    let refused = edit_once(
         &environment,
         &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
     )
@@ -394,7 +456,7 @@ fn a_second_writer_is_refused_while_the_first_holds_the_lock() {
     drop(held);
 
     // Released with the first writer, whichever way it ended.
-    apply(
+    edit_once(
         &environment,
         &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
     )
@@ -434,38 +496,170 @@ fn a_right_the_ceiling_removed_is_refused_rather_than_emptied() {
     assert_eq!(narrowed, vec![ActionRight::SessionView]);
 }
 
-/// KR-REQ-26.15: the configured session ceiling is what admission enforces, not only what is
-/// reported.
+/// KR-REQ-26.15: the configured session number is what admission enforces, and a document this
+/// host cannot use never lifts a restriction the owner accepted.
 #[test]
-fn the_configured_session_ceiling_reaches_the_limit_admission_reads() {
+fn the_configured_session_number_reaches_the_limit_admission_reads() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let mut registry =
         crate::registry::Registry::open(environment.registry_database(), temp.environment_id())
             .expect("opens the registry");
-    let hard = HardLimits::default().sessions_per_environment;
-    assert_eq!(registry.session_limit().expect("the limit"), hard);
-
-    apply(&environment, &Change::SessionLimit(Some(3))).expect("the owner's ceiling");
-    let ceiling = ceilings::session_limit(&open(&environment).ceilings(), HardLimits::default());
-    registry
-        .set_session_limit(ceiling.value)
-        .expect("the ceiling reaches the registry");
+    let limits = HardLimits::default();
     assert_eq!(
         registry.session_limit().expect("the limit"),
-        3,
-        "admission reads what the configuration asked for"
+        kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64
     );
 
-    apply(&environment, &Change::SessionLimit(Some(hard * 4))).expect("a ceiling above the limit");
-    let ceiling = ceilings::session_limit(&open(&environment).ceilings(), HardLimits::default());
-    assert!(ceiling.refused);
-    registry
-        .set_session_limit(ceiling.value)
-        .expect("the hard limit reaches the registry");
     assert_eq!(
-        registry.session_limit().expect("the limit"),
-        hard,
-        "and asking for more raises nothing"
+        configured_session_limit(&open(&environment), limits),
+        None,
+        "a document that says nothing about it changes nothing"
     );
+
+    edit_once(&environment, &Change::SessionLimit(Some(3))).expect("the owner's number");
+    let limit = configured_session_limit(&open(&environment), limits).expect("a configured number");
+    registry
+        .set_session_limit(limit)
+        .expect("the number reaches the registry");
+    assert_eq!(registry.session_limit().expect("the limit"), 3);
+
+    // A document this build cannot use says nothing, so the number the owner accepted stands.
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&environment),
+        br#"{"version": 4096}"#,
+    )
+    .expect("a document from a later build");
+    assert_eq!(
+        configured_session_limit(&open(&environment), limits),
+        None,
+        "and a restriction is never lifted because a file could not be read"
+    );
+}
+
+/// KR-REQ-26.15: the configured ceiling narrows the grant before the method's rights are checked.
+///
+/// This calls the intersection itself rather than reproducing it: a ceiling that removes a right
+/// the method needs has to come back as a refusal, not as a permission with nothing in it.
+#[test]
+fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{AuthorityRevision, DeviceId, EnvironmentId, GrantId, SessionId};
+    use kr_protocol::method::Method;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Uuid};
+
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0xe0; 16]));
+    let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
+    let grant = Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([1; 16])),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([0xf1; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::These {
+            environment_ids: [environment_id].into_iter().collect(),
+        },
+        session_selector: SessionSelector::These {
+            session_ids: [session_id].into_iter().collect(),
+        },
+        actions: [ActionRight::SessionView, ActionRight::TerminalInput]
+            .into_iter()
+            .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::from_iter([]),
+            named_approvals: CanonicalSet::from_iter([]),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    };
+    let record = crate::grants::GrantRecord {
+        session_id: Some(session_id),
+        grant: grant.clone(),
+        issued_at_ms: 1_000,
+        activated_at_ms: Some(1_000),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    };
+    let mut policy = crate::grants::HostPolicy::personal(AuthorityRevision::new(1));
+    let request = |method| crate::grants::AccessRequest {
+        method,
+        ingress: ActorIngress::PairedDevice,
+        environment_id,
+        session_id: Some(session_id),
+        claims_geometry: false,
+        recipient_account: None,
+        own_subject: None,
+        now_ms: 1_000,
+    };
+
+    // No ceiling: the grant decides on its own, and the input right is in the decision.
+    let open_host = ConfigurationCeilings::default();
+    let decided = ceilings::decide_with_ceiling(
+        &open_host,
+        &grant,
+        &record,
+        &mut policy,
+        request(Method::SessionRead),
+    )
+    .expect("the grant decides");
+    assert!(
+        decided
+            .permitted
+            .rights
+            .contains(&ActionRight::TerminalInput)
+    );
+    assert!(decided.removed.is_empty());
+
+    // A ceiling that keeps only the view right takes the input right out of the decision, and
+    // takes it out before the decision rather than after it.
+    let narrowed = ConfigurationCeilings {
+        grant_rights: Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]),
+        ..ConfigurationCeilings::default()
+    };
+    let decided = ceilings::decide_with_ceiling(
+        &narrowed,
+        &grant,
+        &record,
+        &mut policy,
+        request(Method::SessionRead),
+    )
+    .expect("a method the remaining right answers for");
+    assert!(decided.permitted.rights.contains(&ActionRight::SessionView));
+    assert!(
+        !decided
+            .permitted
+            .rights
+            .contains(&ActionRight::TerminalInput),
+        "what the ceiling removed is gone from the decision"
+    );
+    assert!(decided.removed.contains(&ActionRight::TerminalInput));
+    assert!(
+        decided.refused_rights.is_empty(),
+        "the ceiling named nothing the grant does not carry"
+    );
+
+    // A ceiling naming a right the grant never carried adds nothing and is reported.
+    let wider = ConfigurationCeilings {
+        grant_rights: Nullable::some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+            ActionRight::HostManage.as_str().to_owned(),
+        ]),
+        ..ConfigurationCeilings::default()
+    };
+    let decided = ceilings::decide_with_ceiling(
+        &wider,
+        &grant,
+        &record,
+        &mut policy,
+        request(Method::SessionRead),
+    )
+    .expect("the grant still decides");
+    assert!(!decided.permitted.rights.contains(&ActionRight::HostManage));
+    assert!(decided.refused_rights.contains(&ActionRight::HostManage));
 }
