@@ -1599,6 +1599,71 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     assert!(bare.describe().contains("generation 11"));
 }
 
+#[test]
+fn an_archive_pinned_to_one_exact_generation_admits_only_that_generation_and_manifest() {
+    let parties = Parties::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = seal(&parties, 5, &objects);
+    let pinned = checkpoint(
+        5,
+        sealed.descriptor.encrypted_manifest.encrypted_object_hash,
+    );
+
+    let standing =
+        RestoreGeneration::against(&sealed.descriptor, GenerationExpectation::Exactly(&pinned));
+    assert!(matches!(
+        standing.standing,
+        GenerationStanding::AtThePinnedGeneration
+    ));
+    assert!(standing.is_admissible());
+    assert!(!standing.proves_no_newer_archive());
+    let sentence = standing.describe();
+    assert!(sentence.contains("generation 5"));
+    assert!(sentence.contains("authorised"));
+
+    let opened = open_archive(
+        &ArchiveReader::Device(&parties.device),
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &ArchiveExpectation {
+            archive_id: archive_id(),
+            generation: GenerationExpectation::Exactly(&pinned),
+        },
+        &sealed.descriptor_bytes,
+        &sealed.encrypted_manifest,
+    )
+    .expect("the pinned archive opens");
+    assert!(matches!(
+        opened.generation().standing,
+        GenerationStanding::AtThePinnedGeneration
+    ));
+
+    // A descriptor with a different generation is refused.
+    let different_generation = seal(&parties, 6, &objects);
+    let refused_gen = RestoreGeneration::against(
+        &different_generation.descriptor,
+        GenerationExpectation::Exactly(&pinned),
+    );
+    assert!(matches!(
+        refused_gen.standing,
+        GenerationStanding::NotThePinnedGeneration { .. }
+    ));
+    assert!(!refused_gen.is_admissible());
+
+    // A descriptor for another archive is refused.
+    let other = ArchiveCheckpoint {
+        archive_id: ArchiveId::new(Uuid::from_bytes([0x77; 16])),
+        ..pinned
+    };
+    let refused_archive =
+        RestoreGeneration::against(&sealed.descriptor, GenerationExpectation::Exactly(&other));
+    assert!(matches!(
+        refused_archive.standing,
+        GenerationStanding::OtherArchive { .. }
+    ));
+    assert!(!refused_archive.is_admissible());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Helpers that open a sealed archive's manifest, so a test can inspect or rewrite it.
 // ---------------------------------------------------------------------------------------------

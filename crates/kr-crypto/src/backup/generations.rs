@@ -62,6 +62,11 @@ pub enum GenerationStanding {
         /// Where the checkpoint came from.
         source: CheckpointSource,
     },
+    /// It is exactly the generation this restore was authorised for.
+    ///
+    /// Separate from [`Self::AtCheckpoint`] because it says something different: not that somebody
+    /// verified this generation, but that this restore was authorised for this one and got it.
+    AtThePinnedGeneration,
     /// It is newer than the checkpoint: the owner has written generations since it was taken.
     Ahead {
         /// Where the checkpoint came from.
@@ -126,9 +131,7 @@ impl RestoreGeneration {
                     && pinned.encrypted_manifest_hash
                         == descriptor.encrypted_manifest.encrypted_object_hash
                 {
-                    GenerationStanding::AtCheckpoint {
-                        source: CheckpointSource::Pairing,
-                    }
+                    GenerationStanding::AtThePinnedGeneration
                 } else {
                     GenerationStanding::NotThePinnedGeneration {
                         pinned: pinned.backup_generation,
@@ -219,6 +222,9 @@ impl RestoreGeneration {
         let standing = match self.standing {
             GenerationStanding::AtCheckpoint { source } => {
                 format!("It is the generation {} last verified.", source.as_str())
+            }
+            GenerationStanding::AtThePinnedGeneration => {
+                "It is the generation this restore was authorised for.".to_owned()
             }
             GenerationStanding::Ahead { source, checkpoint } => format!(
                 "It is newer than generation {} that {} last verified.",

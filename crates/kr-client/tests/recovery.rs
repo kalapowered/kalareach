@@ -982,6 +982,85 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
 }
 
 #[tokio::test]
+async fn migrating_a_kit_with_several_origins_is_refused() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    let kit = kit_of(&seed, &[ORIGIN, OTHER_ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let destination = RecoveryContext {
+        service_origin: "https://third.example".to_owned(),
+        bundle_locator: "moved-bundle-locator".to_owned(),
+    };
+    let err = store
+        .migrate(
+            &seed,
+            &mut bundle,
+            &kit,
+            destination_service as Arc<_>,
+            destination,
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("a kit naming multiple origins cannot be migrated one service at a time");
+    assert!(matches!(
+        err,
+        RecoveryError::MigrationWouldLoseAnOrigin { origins: 2 }
+    ));
+}
+
+#[tokio::test]
+async fn migrating_a_bundle_whose_revision_moved_on_is_refused() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let destination = RecoveryContext {
+        service_origin: OTHER_ORIGIN.to_owned(),
+        bundle_locator: "moved-bundle-locator".to_owned(),
+    };
+    let mut stale_bundle = bundle.clone();
+    stale_bundle.revision = U64::new(99);
+    let err = store
+        .migrate(
+            &seed,
+            &mut stale_bundle,
+            &kit,
+            destination_service as Arc<_>,
+            destination,
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("a bundle whose revision differs from held is refused");
+    assert!(matches!(err, RecoveryError::BundleConflict { .. }));
+}
+
+#[tokio::test]
 async fn one_kit_serves_several_services() {
     let first = ScriptedService::shared();
     let second = ScriptedService::shared();

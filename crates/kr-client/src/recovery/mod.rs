@@ -100,6 +100,19 @@ pub enum RecoveryError {
         /// The generation that was offered.
         offered: u64,
     },
+    /// Migrating this kit would drop a service origin it names.
+    ///
+    /// A kit's origins share one bundle locator, so a kit that names several cannot be migrated one
+    /// service at a time: the updated kit would point every origin at the one bundle that moved.
+    /// Per-origin locators are what this needs, and this build does not have them.
+    #[error(
+        "this kit names {origins} service origins and they share one locator, so migrating it \
+         would lose all but one"
+    )]
+    MigrationWouldLoseAnOrigin {
+        /// How many origins the kit names.
+        origins: usize,
+    },
     /// The bundle at the locator was written by somebody else since this device last read it.
     #[error("the recovery bundle at generation {expected} has moved on; read it again")]
     BundleConflict {

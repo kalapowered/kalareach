@@ -145,10 +145,15 @@ impl BundleStore {
         {
             return Err(RecoveryError::BundleConflict { expected });
         }
-        bundle.revision = U64::new(bundle.revision.get().saturating_add(1));
-        bundle.written_at_ms = now_ms;
+        // The candidate is prepared beside the caller's bundle, so a failure anywhere below leaves
+        // the caller's revision where it was: a rollback after the fact would not cover a failure
+        // that happened before it, and the caller would then be holding a revision it could never
+        // commit.
+        let mut candidate = bundle.clone();
+        candidate.revision = U64::new(candidate.revision.get().saturating_add(1));
+        candidate.written_at_ms = now_ms;
         let key = seed.bundle_key_for(&self.context)?;
-        let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(&key, bundle)?;
+        let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(&key, &candidate)?;
         match self
             .service
             .compare_exchange(bundle_collection(&self.context), expected, &ciphertext)
@@ -156,15 +161,11 @@ impl BundleStore {
         {
             Ok(generation) => {
                 self.generation = Some(generation);
-                self.held = Some(bundle.clone());
+                self.held = Some(candidate.clone());
+                *bundle = candidate;
                 Ok(generation)
             }
-            Err(error) => {
-                // The revision was advanced for a write that did not land, so it goes back: the
-                // caller re-reads and applies its change to whatever is actually there.
-                bundle.revision = U64::new(bundle.revision.get().saturating_sub(1));
-                Err(conflict_or_service(error, expected))
-            }
+            Err(error) => Err(conflict_or_service(error, expected)),
         }
     }
 
@@ -345,6 +346,18 @@ impl BundleStore {
         destination: RecoveryContext,
         now_ms: TimestampMs,
     ) -> Result<Migrated> {
+        // The bundle being moved has to be the one this store last authenticated. Migrating a
+        // snapshot from before somebody else's write would move an older writer set and older
+        // checkpoints to the new location and point the updated kit at them.
+        if self
+            .held
+            .as_ref()
+            .is_some_and(|held| held.revision.get() != bundle.revision.get())
+        {
+            return Err(RecoveryError::BundleConflict {
+                expected: self.generation.unwrap_or(0),
+            });
+        }
         let origin = self.context.clone();
         let mut moved = Self::new(destination_service, destination.clone());
         let generation = moved.commit(seed, bundle, now_ms).await?;
@@ -357,12 +370,17 @@ impl BundleStore {
             return Err(RecoveryError::BundleNotAuthentic);
         }
 
-        // The updated kit names the destination and nothing else. A kit's origins all share one
-        // locator, so an origin left in it would point at a bundle this migration did not move and
-        // would open, if anything, a superseded copy. An owner with several services migrates each
-        // one and keeps the kit each migration produced.
+        // A kit's origins share one locator, so the updated kit can name only the destination: an
+        // origin left in it would point at a bundle this migration did not move. That makes a kit
+        // naming several origins impossible to migrate one service at a time without losing the
+        // others, so it is refused rather than silently reduced. Per-origin locators are what a
+        // multiple-service migration needs, and this build does not have them.
+        if kit.service_origins.len() > 1 {
+            return Err(RecoveryError::MigrationWouldLoseAnOrigin {
+                origins: kit.service_origins.len(),
+            });
+        }
         let origins = vec![destination.service_origin.clone()];
-        let _ = kit;
         let updated_kit =
             kr_crypto::kdf::RecoverySeed::to_kit(seed, origins, destination.bundle_locator.clone());
 
