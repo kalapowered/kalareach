@@ -726,6 +726,65 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
         .expect("a read");
 }
 
+/// Section 24: reading a receipt presents the request again, so it is the one reconciliation that
+/// could put content back on the wire. A record admitted under a generation privacy mode has ended
+/// is never presented, whatever the fence says now.
+#[test]
+fn a_receipt_is_not_read_for_a_record_from_a_generation_that_has_ended() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Unknown {
+        detail: "the connection was reset".to_owned(),
+    }]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    // Privacy mode ends the generation and lifts its fence again, which is the state a person who
+    // turned privacy mode on and off leaves behind.
+    environment
+        .module
+        .with(|producer| {
+            producer.journal_mut().fence(1).expect("a fence");
+            producer
+                .journal_mut()
+                .lift_fence(2)
+                .expect("the fence lifts");
+            Ok(())
+        })
+        .expect("a boundary");
+    let resolved = environment
+        .module
+        .read_receipts(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &at(NOW + 120_000),
+        )
+        .expect("a reconciliation");
+    assert_eq!(resolved, 0);
+    assert_eq!(
+        gateway.receipts(),
+        0,
+        "nothing from a generation that has ended is presented again"
+    );
+}
+
 /// KR-REQ-16.13: a receipt carries the same answers a send does, so it carries the same
 /// consequences. A token the provider rejected goes out of service whichever call learned of it,
 /// and what the answer says was suppressed is recorded either way.

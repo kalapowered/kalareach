@@ -316,17 +316,28 @@ impl DeliveryModule {
         if is_fenced {
             return Ok(0);
         }
-        let unknown = self.with(|producer| {
-            Ok(producer
-                .journal()
-                .unreconciled()
-                .map_err(unavailable)?
-                .into_iter()
-                .filter(|record| record.state == DeliveryState::OutcomeUnknown)
-                .collect::<Vec<_>>())
+        let (generation, unknown) = self.with(|producer| {
+            let generation = producer.journal().generation().map_err(unavailable)?;
+            Ok((
+                generation,
+                producer
+                    .journal()
+                    .unreconciled()
+                    .map_err(unavailable)?
+                    .into_iter()
+                    .filter(|record| record.state == DeliveryState::OutcomeUnknown)
+                    .collect::<Vec<_>>(),
+            ))
         })?;
         let mut resolved = 0;
         for record in unknown {
+            // A record admitted under a generation privacy mode has ended is not asked about. The
+            // request bytes are the only thing that resolves it, and presenting them is the one
+            // case where this could dispatch; nothing from a generation that has been walked past
+            // may leave this host again.
+            if record.privacy_generation != generation {
+                continue;
+            }
             let Some(content) = record.content else {
                 // Privacy mode removed what the receipt would present. The record stays as the
                 // artifact it is, and this host says so rather than asking about nothing.
@@ -341,6 +352,12 @@ impl DeliveryModule {
             else {
                 continue;
             };
+            // The same request under the same authorisation, or not at all: a destination that is
+            // disabled, or one whose configuration is no longer the one this was admitted for, is
+            // not a destination this host may present content to.
+            if !destination.enabled || destination.binding_digest() != record.destination_digest {
+                continue;
+            }
             let Some(push) = destination.as_push() else {
                 continue;
             };
