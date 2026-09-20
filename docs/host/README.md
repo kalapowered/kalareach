@@ -1423,8 +1423,8 @@ generation it belonged to cannot be admitted again until it is removed by hand.
 ### What a restart resolves
 
 Reconciliation runs before anything can add to the store. It looks at settled generations for two
-reasons. **Cancelled work this host still holds ciphertext for is a removal it owes**, and the
-obligation is written down before anything else is: a stop between the cancellation and the removal
+reasons. **Staged ciphertext a removal has not reached is a removal this host owes**, whether the
+generation was cancelled or published, and the obligation is written down before anything else is: a stop between the cancellation and the removal
 leaves the staged copies here with nothing else to say so, and an obligation recorded afterwards is
 one that stop would lose. A store that will not record it leaves the settlement undone as well, so
 the outbox entry that was counting the cleanup stays where it is and the next reconciliation tries
@@ -1545,7 +1545,8 @@ the failure becomes a **durable obligation**, named for the step that owed it: i
 work outstanding, a restart comes back owing what it owed, and the step's own next success clears
 it, so privacy mode cannot report complete over a cleanup that did not happen. A store that will
 not answer at all is itself an obligation, so an unreadable store reports something outstanding
-rather than nothing. Three kinds of generation keep their record once their
+rather than nothing. A repeated cleanup reports what it actually removed, which over a generation whose
+bytes have already gone is nothing. Three kinds of generation keep their record once their
 bytes have gone: one already published, because it has left and is shown rather than pretended
 away; one whose outcome this host could not establish, for the same reason; and one with work still
 in flight, because its outbox entry is what says the cleanup is not finished.

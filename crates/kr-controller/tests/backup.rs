@@ -2033,3 +2033,105 @@ fn a_late_acknowledgement_does_not_bring_back_a_cleanup_that_is_finished() {
     let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
+
+#[test]
+fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reached() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let staged_paths: Vec<std::path::PathBuf>;
+    {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let admitted = service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        service
+            .note_dispatched(admitted.sequence)
+            .expect("the upload is in flight");
+        let manifest_id = sealed.descriptor.encrypted_manifest.object_id;
+        for object in [objects[0].object_id(), manifest_id] {
+            service
+                .note_object_uploaded(
+                    archive_id(),
+                    BackupGeneration::new(1),
+                    object,
+                    TimestampMs::new(6_000),
+                )
+                .expect("acknowledged");
+        }
+        let publication = service.outbox().expect("a read");
+        service
+            .note_dispatched(publication[0].sequence)
+            .expect("the publication is in flight");
+        let mode = PrivacyMode::new();
+        service
+            .note_published(
+                archive_id(),
+                BackupGeneration::new(1),
+                PrivacyGeneration::INITIAL,
+                &mode,
+                TimestampMs::new(6_500),
+            )
+            .expect("the service accepted it");
+        staged_paths = service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .into_iter()
+            .map(|row| row.staged_path)
+            .collect();
+
+        // Privacy mode fences and cancels, and this host stops before it removes anything. The
+        // published generation has nothing left in its outbox, so nothing there says its staged
+        // copies are still here.
+        let _fenced = service.fence(PrivacyGeneration::new(1));
+        service.cancel_undispatched(PrivacyGeneration::new(1));
+    }
+
+    // While the fence is recorded, every staged copy is a removal privacy mode asked for. A
+    // published archive's ciphertext is as much on this host as a cancelled one's.
+    let mut service = BackupService::open(&state).expect("the service opens again");
+    service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    for path in &staged_paths {
+        assert!(path.exists(), "the ciphertext is still on this host");
+    }
+    assert!(!service.obligations().expect("a read").is_empty());
+    {
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
+    }
+
+    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    assert!(removed.bytes > 0);
+    assert!(removed.records > 0);
+    for path in &staged_paths {
+        assert!(!path.exists(), "the ciphertext left this host");
+    }
+    {
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+    }
+
+    // A second pass has nothing to remove and says so, and the record of what left this host stays.
+    let again = service.remove_retained(PrivacyGeneration::new(1));
+    assert_eq!(again.bytes, 0);
+    assert_eq!(again.records, 0);
+    let kept = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("a published archive is shown rather than pretended away");
+    assert_eq!(kept.state, GenerationState::Published);
+}

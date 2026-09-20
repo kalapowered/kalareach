@@ -371,6 +371,13 @@ impl BackupService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         unpersisted.retain(|item| !item.contains(step));
+        if unpersisted.is_empty() {
+            // The marker stands in for work this host could not write down. Nothing is left
+            // unwritten now, and this very call wrote to the store, so the condition it reported
+            // has passed. Left behind it would be a host owing something it could never name and
+            // never clear, which is privacy cleanup that can never report complete.
+            let _ = store.clear_obligation(FAILED_TO_RECORD);
+        }
     }
 
     /// Returns what privacy mode asked for that this host has not done.
@@ -773,7 +780,12 @@ impl BackupService {
                 // with nothing else to say so. Recording it first is what makes it durable: the
                 // outbox entry this loop is about to clear was the only other thing counting the
                 // cleanup, and an obligation written afterwards is one a stop in between loses.
-                let owed = record.state == GenerationState::Cancelled
+                // Two reasons this host still owes a removal. Cancelled work is work it will
+                // not do, so its staged copies are bytes nothing will ever use. And while a fence
+                // is recorded, every staged copy is a removal privacy mode asked for, whatever
+                // became of the generation: a published archive's ciphertext is as much here as a
+                // cancelled one's, and a stop before the removal leaves both.
+                let owed = (record.state == GenerationState::Cancelled || fenced.is_some())
                     && store
                         .objects(record.archive_id, record.backup_generation)?
                         .iter()
@@ -1181,7 +1193,14 @@ impl PrivacySubsystem for BackupService {
                         "a generation's objects could not be marked: {error}"
                     ));
                 } else {
-                    removed.records = removed.records.saturating_add(objects.len() as u64);
+                    // What this pass changed, not what it looked at. A generation whose rows
+                    // already said the ciphertext had gone is one this call removed nothing from.
+                    removed.records = removed.records.saturating_add(
+                        objects
+                            .iter()
+                            .filter(|object| object.state != ObjectState::Removed)
+                            .count() as u64,
+                    );
                 }
                 continue;
             }
