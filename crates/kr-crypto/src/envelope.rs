@@ -25,6 +25,7 @@
 
 mod authority;
 mod paired;
+mod sync;
 
 use std::collections::BTreeMap;
 
@@ -44,6 +45,7 @@ use crate::sodium;
 
 pub use authority::{AuthorityDirectory, verify_authority_payload};
 pub use paired::{PairedSenders, open_delivered_envelope};
+pub use sync::{SYNC_OBJECT_DOMAIN, open_sync_object, seal_sync_object};
 
 /// Seals one envelope for one recipient.
 ///
