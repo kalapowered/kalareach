@@ -450,6 +450,12 @@ impl Producer {
         if !self.journal.has_event(&notice.event)? {
             return Err(DeliveryError::NoUnderlyingEvent(notice.event.stored()));
         }
+        // T-040's rule at the one place this crate publishes. The notice was captured under a
+        // generation; notifications built from it are that work's results, and a result produced
+        // under a generation that is no longer in force belongs to work privacy mode ended.
+        // [`DeliveryJournal::produce`] checks the same thing inside its own transaction, so this
+        // is the early refusal rather than the only one.
+        self.publish_under(self.journal.event_generation(&notice.event)?)?;
         push::check_expiry(now_ms, notice.expires_at_ms)?;
         let generation = self.journal.generation()?;
         let mut produced = Produced::default();
@@ -1356,21 +1362,21 @@ mod tests {
                 1_000,
             )
             .expect("a page");
-        assert_eq!(
-            producer.journal().pending_events(10).expect("a read").len(),
-            1
-        );
-        producer
-            .finish_pending(&[], &Everything(BTreeSet::new()), 1_000)
-            .expect("a recovery pass");
         assert!(
             producer
                 .journal()
                 .pending_events(10)
                 .expect("a read")
                 .is_empty(),
-            "an event nobody notifies about is still an event this journal has taken"
+            "an event nobody notifies about is decided as it is taken, not left pending"
         );
+        assert!(
+            producer.journal().has_event(&key).expect("a read"),
+            "it is still an event this journal has taken"
+        );
+        producer
+            .finish_pending(&[], &Everything(BTreeSet::new()), 1_000)
+            .expect("a recovery pass");
         assert!(producer.journal().deliveries().expect("a read").is_empty());
     }
 

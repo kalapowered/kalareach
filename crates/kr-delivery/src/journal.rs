@@ -80,6 +80,15 @@ const REQUIRED_TABLES: [&str; 11] = [
     "delivery_privacy",
 ];
 
+/// The decision recorded on an event this journal produced notifications from.
+const DECISION_PRODUCED: &str = "produced";
+
+/// The decision recorded on an event that warranted no notification at all.
+const DECISION_NOTHING: &str = "nothing";
+
+/// The decision recorded on an event privacy mode ended before anything was produced from it.
+const DECISION_CANCELLED: &str = "cancelled";
+
 /// How long a write waits for another connection to this file before it gives up.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -757,11 +766,22 @@ impl DeliveryJournal {
     /// crash-safety a consumer owns: the upstream acknowledgement happens after this returns, so a
     /// host that dies in between is handed the same page again and the event keys absorb it.
     ///
+    /// A notice holds the summary a notification is built from, so taking one is capturing
+    /// content: a fenced outbox refuses the whole page rather than writing plaintext privacy mode
+    /// has already walked past. Each event records the generation it was captured under, and
+    /// [`DeliveryJournal::produce`] refuses to produce from a notice captured under another.
+    ///
+    /// An event with an empty notice is nobody's notification. It is taken because that is what
+    /// makes this journal a registered consumer of the whole stream, and it is recorded as
+    /// **decided** rather than pending, so a recovery pass never reads an empty notice and has to
+    /// guess whether it means silence or a notice that was never written.
+    ///
     /// Returns how many events were new.
     ///
     /// # Errors
     ///
-    /// Returns [`DeliveryError::NotAuthorised`] when the consumer has not registered, and
+    /// Returns [`DeliveryError::NotAuthorised`] when the consumer has not registered,
+    /// [`DeliveryError::Fenced`] when privacy mode has stopped this environment's outbox, and
     /// [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn take_events(
         &mut self,
@@ -777,14 +797,24 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (generation, fenced): (i64, i64) = transaction.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if fenced != 0 {
+            return Err(DeliveryError::Fenced);
+        }
         let mut taken = 0usize;
         for event in events {
+            let decided = event.notice.is_empty();
             let changed = transaction.execute(
                 "INSERT INTO delivery_events
                      (event_key, source, source_cursor, session_id, recorded_at_ms, taken_seq,
-                      notice, produced)
+                      notice, produced, privacy_generation, decision)
                  VALUES (?1, ?2, ?3, ?4, ?5,
-                         (SELECT COALESCE(MAX(taken_seq), 0) + 1 FROM delivery_events), ?6, 0)
+                         (SELECT COALESCE(MAX(taken_seq), 0) + 1 FROM delivery_events), ?6, ?7,
+                         ?8, ?9)
                  ON CONFLICT (event_key) DO NOTHING",
                 params![
                     event.key.stored(),
@@ -793,6 +823,9 @@ impl DeliveryJournal {
                     event.session_id.map(|id| id.to_string()),
                     as_i64(event.recorded_at_ms.get()),
                     event.notice.as_slice(),
+                    i64::from(decided),
+                    generation,
+                    decided.then_some(DECISION_NOTHING),
                 ],
             )?;
             taken += usize::from(changed > 0);
@@ -1070,16 +1103,33 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let taken: Option<i64> = transaction
+        let (generation, fenced): (i64, i64) = transaction.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if fenced != 0 {
+            return Err(DeliveryError::Fenced);
+        }
+        let taken: Option<(i64, i64)> = transaction
             .query_row(
-                "SELECT produced FROM delivery_events WHERE event_key = ?1",
+                "SELECT produced, privacy_generation FROM delivery_events WHERE event_key = ?1",
                 params![event.stored()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         match taken {
             None => return Err(DeliveryError::NoUnderlyingEvent(event.stored())),
-            Some(produced) if produced != 0 => return Ok(false),
+            Some((produced, _)) if produced != 0 => return Ok(false),
+            // A notice captured before a privacy boundary belongs to work that boundary ended.
+            // Producing from it now would give old content the new generation, which is exactly
+            // what the generation exists to stop.
+            Some((_, captured)) if captured != generation => {
+                return Err(DeliveryError::LateResult {
+                    produced_under: as_u64(captured),
+                    in_force: as_u64(generation),
+                });
+            }
             Some(_) => {}
         }
         for record in records {
@@ -1089,11 +1139,31 @@ impl DeliveryJournal {
             record_budget_in(&transaction, destination, budget)?;
         }
         transaction.execute(
-            "UPDATE delivery_events SET produced = 1 WHERE event_key = ?1",
-            params![event.stored()],
+            "UPDATE delivery_events SET produced = 1, decision = ?2 WHERE event_key = ?1",
+            params![event.stored(), DECISION_PRODUCED],
         )?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// Returns the privacy generation one taken event's notice was captured under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::NoUnderlyingEvent`] when the event has not been taken, and
+    /// [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn event_generation(&self, event: &EventKey) -> Result<u64> {
+        let generation: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT privacy_generation FROM delivery_events WHERE event_key = ?1",
+                params![event.stored()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        generation
+            .map(as_u64)
+            .ok_or_else(|| DeliveryError::NoUnderlyingEvent(event.stored()))
     }
 
     /// Returns the events this journal took and has produced nothing from, oldest first.
@@ -1661,6 +1731,13 @@ impl DeliveryJournal {
              ON CONFLICT (notification_id, attempt) DO NOTHING",
             params![as_i64(now_ms)],
         )?;
+        // An event taken and not yet produced from is a notification this host has not built. It
+        // is decided here rather than left pending: after the fence lifts, producing from it
+        // would give content captured before the boundary the generation that came after it.
+        transaction.execute(
+            "UPDATE delivery_events SET produced = 1, decision = ?1 WHERE produced = 0",
+            params![DECISION_CANCELLED],
+        )?;
         transaction.commit()?;
         Ok((cancelled as u64, as_u64(in_flight)))
     }
@@ -1690,15 +1767,30 @@ impl DeliveryJournal {
             [],
             |row| row.get(0),
         )?;
+        let notice_bytes: i64 = transaction.query_row(
+            "SELECT COALESCE(SUM(LENGTH(notice)), 0) FROM delivery_events WHERE notice IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
         let emptied = transaction.execute(
             "UPDATE delivery_notifications SET content = NULL WHERE content IS NOT NULL",
             [],
         )?;
         let objects = transaction.execute("DELETE FROM delivery_objects", [])?;
+        // A notice holds the plaintext summary a notification would have been built from, so it
+        // is queued content and goes with the rest of it. The event row stays: which event was
+        // taken, and that this host decided nothing more about it, is a record rather than
+        // content.
+        let notices = transaction.execute(
+            "UPDATE delivery_events SET notice = NULL WHERE notice IS NOT NULL",
+            [],
+        )?;
         transaction.commit()?;
         Ok((
-            as_u64(bytes).saturating_add(as_u64(object_bytes)),
-            (emptied + objects) as u64,
+            as_u64(bytes)
+                .saturating_add(as_u64(object_bytes))
+                .saturating_add(as_u64(notice_bytes)),
+            (emptied + objects + notices) as u64,
         ))
     }
 
@@ -2450,7 +2542,9 @@ const SCHEMA: &str = "
         recorded_at_ms INTEGER NOT NULL,
         taken_seq INTEGER NOT NULL,
         notice BLOB,
-        produced INTEGER NOT NULL DEFAULT 0
+        produced INTEGER NOT NULL DEFAULT 0,
+        privacy_generation INTEGER NOT NULL DEFAULT 0,
+        decision TEXT
     );
     CREATE TABLE IF NOT EXISTS delivery_destinations (
         destination_id TEXT PRIMARY KEY,
@@ -2624,6 +2718,85 @@ mod tests {
             .configure_destination(&destination("hook"))
             .expect("a destination");
         journal
+    }
+
+    /// A notice holds the summary a notification is built from, so capturing one while the outbox
+    /// is fenced would write plaintext privacy mode has already walked past.
+    #[test]
+    fn nothing_is_taken_while_the_outbox_is_fenced() {
+        let mut journal = journal();
+        journal.fence(1).expect("a fence");
+        let error = journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect_err("a fenced journal captures nothing");
+        assert!(matches!(error, DeliveryError::Fenced));
+        assert!(journal.events().expect("a read").is_empty());
+    }
+
+    /// After the fence lifts, an event taken before the boundary is not produced from: its notice
+    /// belongs to the generation privacy mode ended.
+    #[test]
+    fn a_notice_taken_before_the_boundary_produces_nothing_after_it() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal.fence(1).expect("a fence");
+        journal.cancel_undispatched(2_000).expect("a cancellation");
+        journal.remove_retained().expect("the content goes");
+        journal.lift_fence(1).expect("the fence lifts");
+        assert!(
+            journal.pending_events(10).expect("a read").is_empty(),
+            "the cleanup decided it rather than leaving it to be produced later"
+        );
+        assert!(
+            !journal.produce(&event(1), &[], &[]).expect("a decision"),
+            "an event the cleanup decided produces nothing afterwards"
+        );
+    }
+
+    /// A host that stopped between the fence and the cleanup comes back with a pending event from
+    /// the generation the fence ended. The generation on the event is what refuses it.
+    #[test]
+    fn a_notice_from_a_generation_that_has_passed_is_refused_at_production() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal.fence(1).expect("a fence");
+        journal.lift_fence(1).expect("the fence lifts");
+        let error = journal
+            .produce(&event(1), &[], &[])
+            .expect_err("an old notice is not produced under a new generation");
+        assert!(matches!(
+            error,
+            DeliveryError::LateResult {
+                produced_under: 0,
+                in_force: 1
+            }
+        ));
+    }
+
+    /// The summary inside a notice is content, and privacy mode removes content.
+    #[test]
+    fn the_cleanup_removes_the_notice_a_pending_event_was_taken_with() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        assert!(
+            !journal.events().expect("a read")[0].notice.is_empty(),
+            "the notice is there before the cleanup"
+        );
+        journal.fence(1).expect("a fence");
+        journal.cancel_undispatched(2_000).expect("a cancellation");
+        let (bytes, records) = journal.remove_retained().expect("the content goes");
+        assert!(bytes > 0);
+        assert!(records > 0);
+        assert!(
+            journal.events().expect("a read")[0].notice.is_empty(),
+            "the plaintext summary goes with the rest of the queued content"
+        );
     }
 
     /// A selection is a read; a claim is the write that decides. Two passes that selected the same
