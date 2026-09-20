@@ -48,6 +48,14 @@ pub fn carries(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Returns how many times `haystack` carries `needle`.
+pub fn carried_times(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
 /// Reads everything the session has retained of what the application wrote.
 pub fn retained(runtime: &SessionRuntime) -> Vec<u8> {
     let session = runtime.session();
@@ -77,18 +85,29 @@ pub fn retained(runtime: &SessionRuntime) -> Vec<u8> {
 /// because one stopping short of it would be satisfied while a line feed that has still to scroll
 /// the grid is on its way.
 pub async fn produced(runtime: &SessionRuntime, marker: &[u8]) {
+    produced_times(runtime, marker, 1).await;
+}
+
+/// Waits until the session's retained output carries `marker` `count` times.
+///
+/// The same wait as [`produced`] for an application that writes the same thing more than once, or
+/// for a host that answers the same question more than once: the second answer is not the first,
+/// and a test waiting for "an answer" would go on from the one that had already arrived.
+pub async fn produced_times(runtime: &SessionRuntime, marker: &[u8], count: usize) {
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     loop {
         let seen = retained(runtime);
-        if carries(&seen, marker) {
+        if carried_times(&seen, marker) >= count {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "waited {:?} for {} in the session's retained output, which ends {}",
+            "waited {:?} for {count} of {} in the session's retained output, which carries {} of \
+             them and ends {}",
             started.elapsed(),
             String::from_utf8_lossy(marker).escape_debug(),
+            carried_times(&seen, marker),
             String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;

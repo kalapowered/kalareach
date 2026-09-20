@@ -40,7 +40,7 @@ use kr_worker::session::{Session, SessionConfig};
 
 mod common;
 
-use common::{Keys, LIVENESS_DEADLINE, carries, produced, take_the_keys};
+use common::{Keys, LIVENESS_DEADLINE, carries, produced, produced_times, take_the_keys};
 
 /// The session's own size. An attachment of exactly this size takes the stream directly.
 const CANONICAL: (u64, u64) = (80, 24);
@@ -416,10 +416,19 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
     // ordinary text. That echo is what makes the answer visible from outside the process, and it
     // is why this is the one fixture here that leaves the echo on.
     //
-    // The question is asked once this terminal is attached and watching, because a question asked
-    // before that would be answered to nobody and would say nothing about what an attachment is
-    // sent.
-    let host = host("read -r _; printf '\\033[c'; read -r _").await;
+    // The question is asked twice, because the two halves of the claim are about different
+    // moments. The first time nobody is attached and nobody holds the input lease: section 8 gives
+    // the host's own replies a lane of their own that requires no human lease and never acquires
+    // one, so an answer that waited for somebody to be holding the keys would never come. The
+    // second time this terminal is attached and watching, which is the only way to see what an
+    // attachment is sent.
+    let host = host(
+        "printf '\\033[c'; read -r _; printf '\\033[c'; read -r _; printf 'kr-asked.\\n'; \
+         read -r _",
+    )
+    .await;
+    produced(&host.runtime, b"[?62;22c").await;
+
     let (mut client, presentation, mut keys) =
         attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
     assert_eq!(
@@ -427,11 +436,13 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
         Some(TerminalPresentationMode::Direct),
         "the terminal is the session's size"
     );
+    // The second question, and then a line that follows it. The run ends on that line rather than
+    // on the answer, so what it carries is everything the question produced: a host that forwarded
+    // the question would have put it in this same stream, in front of its own answer.
     keys.release(&host.runtime);
-
-    // The answer is where the run ends. A forwarded question would be in front of it in this same
-    // stream, because the application wrote the question before the host wrote the answer.
-    let seen = collect_until(&mut client, b"[?62;22c").await;
+    produced_times(&host.runtime, b"[?62;22c", 2).await;
+    keys.release(&host.runtime);
+    let seen = collect_until(&mut client, b"kr-asked.").await;
     let text = String::from_utf8_lossy(&seen).into_owned();
     assert!(
         !text.contains("\u{1b}[c"),
@@ -450,7 +461,8 @@ async fn joining_late_draws_the_screen_rather_than_replaying_what_made_it() {
     // gets is the text, on a screen; what it must not get is the bell or the clipboard write, which
     // were events when they happened and are not events now.
     let host = host(
-        "stty -echo; printf 'visible-line\\a\\033]52;c;aGVsbG8=\\033\\\\\\n'; read -r _; \
+        "stty -echo -echonl || exit 1; \
+         printf 'visible-line\\a\\033]52;c;aGVsbG8=\\033\\\\\\n'; read -r _; \
          printf 'kr-joined.\\n'; read -r _",
     )
     .await;
@@ -482,9 +494,11 @@ async fn joining_late_draws_the_screen_rather_than_replaying_what_made_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream() {
-    let host =
-        host("stty -echo; printf 'first\\nsecond\\n'; read -r _; printf 'third\\n'; read -r _")
-            .await;
+    let host = host(
+        "stty -echo -echonl || exit 1; printf 'first\\nsecond\\n'; read -r _; \
+         printf 'third\\n'; read -r _; printf 'fourth\\n'; read -r _",
+    )
+    .await;
     produced(&host.runtime, b"second\r\n").await;
     // Half the session's width and height. A byte stream that assumed 80 columns would wrap this
     // terminal's lines in the wrong places and leave its cursor somewhere else entirely.
@@ -496,10 +510,14 @@ async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream
         "a terminal that is not the session's size is shown a projection"
     );
     // A third line, written after this terminal joined, so the run covers both halves of the
-    // claim: the screen it was installed with and the output that followed. A raw span of either
-    // would be in front of the row that ends the run.
+    // claim: the screen it was installed with and the output that followed. A fourth line closes
+    // it, released once the third is through the engine: a host that sent this terminal the third
+    // line as bytes as well as rows would have queued those bytes in front of the fourth line's
+    // row, and a run that ended at the third line's own row would have stopped in front of them.
     keys.release(&host.runtime);
-    let (bytes, header, rows) = collect_projection_until(&mut client, "third").await;
+    produced(&host.runtime, b"third\r\n").await;
+    keys.release(&host.runtime);
+    let (bytes, header, rows) = collect_projection_until(&mut client, "fourth").await;
     assert!(
         bytes.is_empty(),
         "no byte stream that assumes the session's width is sent: {:?}",
@@ -540,16 +558,24 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     // the text is output and reaches every terminal watching, which is what makes it a marker both
     // of them can wait for. A watcher that has been sent the text has been sent everything the
     // bell could have come with.
-    let host = host("stty -echo; read -r _; printf '\\akr-rang.\\n'; read -r _").await;
+    let host = host(
+        "stty -echo -echonl || exit 1; read -r _; printf '\\akr-rang.\\n'; read -r _; \
+         printf 'kr-after.\\n'; read -r _",
+    )
+    .await;
     // One of them takes the input lease, which is what makes it the single destination, and what
     // lets it release the write.
     let (mut holder, _, mut keys) =
         attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
     let (mut watcher, _, _) = attached(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
     keys.release(&host.runtime);
+    // A second line, released once the first is through the engine, ends both runs past everything
+    // the bell could have arrived with rather than at the line it was written on.
+    produced(&host.runtime, b"kr-rang.\r\n").await;
+    keys.release(&host.runtime);
 
-    let rang = collect_until(&mut holder, b"kr-rang.").await;
-    let watched = collect_until(&mut watcher, b"kr-rang.").await;
+    let rang = collect_until(&mut holder, b"kr-after.").await;
+    let watched = collect_until(&mut watcher, b"kr-after.").await;
     assert!(
         rang.contains(&0x07),
         "the bell reaches the attachment holding the input lease: {:?}",
@@ -574,19 +600,23 @@ async fn a_screen_a_restoration_cannot_carry_is_never_continued_as_a_raw_stream(
     // is one a restoration carries perfectly - `abcd` on one row, `X` on the next, no pending wrap
     // - and this terminal is handed the stream, correctly, with the `X` inside the restoration.
     let host = host_sized(
-        "stty -echo; printf 'abcd'; read -r _; printf 'X'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'abcd'; read -r _; printf 'X'; read -r _; \
+         printf 'Y'; read -r _",
         Dimensions::new(4, 5),
     )
     .await;
     produced(&host.runtime, b"abcd").await;
     let (mut client, _, mut keys) = attached_holding_the_keys(&host, Dimensions::new(4, 5)).await;
-    keys.release(&host.runtime);
 
-    let (bytes, header, rows) = collect_projection_until(&mut client, "X").await;
+    // The screen it is installed with, before anything else is written: the state a restoration
+    // could not have carried is in it, which is why this attachment is painted rather than
+    // continued.
+    let (installed, header, installed_rows) = collect_projection_until(&mut client, "abcd").await;
+    let header = header.expect("the state of the canonical screen");
     assert!(
-        !bytes.contains(&b'X'),
-        "the character never arrives as a span of the raw stream: {:?}",
-        String::from_utf8_lossy(&bytes)
+        header.cursor.pending_wrap,
+        "the attachment holds the canonical screen, pending wrap and all: {:?}",
+        header.cursor
     );
     assert_eq!(
         presentation_of(&host, keys.attachment()),
@@ -594,14 +624,24 @@ async fn a_screen_a_restoration_cannot_carry_is_never_continued_as_a_raw_stream(
         "the screen it was given could not carry the pending wrap, so the host paints it rather \
          than continuing the stream into it"
     );
-    let header = header.expect("the state of the canonical screen");
+
+    // The character, and then one more released once the first is through the engine. The run ends
+    // on the second, so a host that painted the `X` and *also* continued the stream into this
+    // terminal would have queued those bytes in front of it.
+    keys.release(&host.runtime);
+    produced(&host.runtime, b"X").await;
+    keys.release(&host.runtime);
+    let (afterwards, _, later_rows) = collect_projection_until(&mut client, "Y").await;
     assert!(
-        header.cursor.pending_wrap
-            || rows
-                .iter()
-                .any(|row| row.runs.iter().any(|run| run.text.contains('X'))),
-        "the attachment holds the canonical screen, pending wrap and all"
+        !installed.contains(&b'X') && !afterwards.contains(&b'X'),
+        "the character never arrives as a span of the raw stream: {:?} then {:?}",
+        String::from_utf8_lossy(&installed),
+        String::from_utf8_lossy(&afterwards)
     );
+    let rows: Vec<kr_protocol::projection::ProjectedRow> = installed_rows
+        .into_iter()
+        .chain(later_rows.into_iter())
+        .collect();
     let drawn: Vec<String> = rows
         .iter()
         .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
