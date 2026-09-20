@@ -5063,6 +5063,36 @@ impl Controller {
             Method::EnvironmentRefresh => {
                 let params: EnvironmentRefreshParams = parse(&mutation.params)?;
                 let environment_id = params.environment_id;
+
+                // An access class that is not a process bridge is answered from the record alone.
+                // Asking the platform first would fail for it, because there is no launcher to ask
+                // with, and the answer a person needs is that this environment is reached another
+                // way rather than that a command was missing.
+                let reading = state_dir.clone();
+                let cached = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&reading, |store| {
+                        store.row_of(environment_id, now_ms).ok_or_else(|| {
+                            ControllerError::InvalidArgument(format!(
+                                "this host has no enrolled environment {environment_id}"
+                            ))
+                        })
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                if !cached.enrolment.access.is_process_bridge() {
+                    let connection = format!(
+                        "{} is not reached by a process bridge, so none was opened",
+                        cached.enrolment.access.as_str()
+                    );
+                    return encode(&EnvironmentRefreshResult {
+                        row: cached,
+                        started: false,
+                        verification: Nullable::null(),
+                        connection,
+                    });
+                }
+
                 let observing = state_dir.clone();
                 // The platform command is a blocking one, and it is run on a blocking thread so a
                 // distribution that takes seconds to start does not hold this runtime.
@@ -5082,15 +5112,9 @@ impl Controller {
                 // Only a running environment is worth opening a bridge to, and only a process
                 // bridge has one to open. Everything else says so rather than starting anything:
                 // section 3 leaves starting to the caller that asked for it.
-                let (verification, connection) = if !row.enrolment.access.is_process_bridge() {
-                    (
-                        Nullable::null(),
-                        format!(
-                            "{} is not reached by a process bridge, so none was opened",
-                            row.enrolment.access.as_str()
-                        ),
-                    )
-                } else if row.status != kr_protocol::identity::EnvironmentPresence::Running {
+                let (verification, connection) = if row.status
+                    != kr_protocol::identity::EnvironmentPresence::Running
+                {
                     (
                         Nullable::null(),
                         "no bridge was opened, because this environment is not running; refresh \
@@ -5113,7 +5137,7 @@ impl Controller {
                             let scoping = state_dir.clone();
                             tokio::task::spawn_blocking(move || {
                                 crate::bridge::store::Store::with_locked(&scoping, |store| {
-                                    store.scope_channel(environment_id)
+                                    store.scope_channel(environment_id, now_ms)
                                 })
                             })
                             .await

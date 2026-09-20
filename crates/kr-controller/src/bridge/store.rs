@@ -42,6 +42,24 @@ struct Observation {
     at_ms: u64,
 }
 
+/// What one opened bridge established about an environment's own local channel.
+///
+/// Section 18: an integration needs a helper and scoped credentials in the target environment, and
+/// forwarding a socket installs neither. So this is evidence rather than a flag: it names the
+/// destination, the user and the helper that answered, and a record whose destination has changed
+/// since no longer matches it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ScopedChannel {
+    /// The platform identity the helper answered from.
+    target: String,
+    /// The operating-system user it ran as there.
+    os_user: String,
+    /// The helper that answered.
+    helper_path: String,
+    /// When it answered.
+    at_ms: u64,
+}
+
 /// The file this host keeps its enrolments and observations in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Record {
@@ -49,8 +67,9 @@ struct Record {
     enrolments: Vec<EnvironmentEnrolment>,
     /// The last observation of each, by environment identity.
     observations: BTreeMap<String, Observation>,
-    /// The environments the owner has given their own scoped local channel.
-    scoped_channels: Vec<String>,
+    /// What a bridge established about each environment's own scoped local channel.
+    #[serde(default)]
+    scoped_channels: BTreeMap<String, ScopedChannel>,
 }
 
 /// Asks the platform about one environment, and starts it when told to.
@@ -167,6 +186,10 @@ impl Store {
             .enrolments
             .retain(|existing| existing.environment_id != environment_id);
         self.record.observations.remove(&environment_id.to_string());
+        // What a bridge established about an environment this host no longer records goes with it.
+        self.record
+            .scoped_channels
+            .remove(&environment_id.to_string());
         let removed = self.record.enrolments.len() != before;
         if removed {
             self.write()?;
@@ -244,18 +267,48 @@ impl Store {
         Ok((row, started))
     }
 
-    /// Records that the owner has given one environment its own scoped local channel.
+    /// Records what an opened bridge established about one environment's scoped local channel.
+    ///
+    /// The evidence is the destination that answered, so a record whose target, user or helper
+    /// changes afterwards does not keep the result: the next bridge decides again.
     ///
     /// # Errors
     ///
-    /// Returns a supervision failure when the record cannot be written.
-    pub fn scope_channel(&mut self, environment_id: EnvironmentId) -> Result<()> {
-        let key = environment_id.to_string();
-        if !self.record.scoped_channels.contains(&key) {
-            self.record.scoped_channels.push(key);
+    /// Returns a not-found failure when nothing is enrolled under that identity, and a supervision
+    /// failure when the record cannot be written.
+    pub fn scope_channel(&mut self, environment_id: EnvironmentId, now_ms: u64) -> Result<()> {
+        let enrolment = self.enrolment(environment_id).ok_or_else(|| {
+            ControllerError::InvalidArgument(format!(
+                "this host has no enrolled environment {environment_id}"
+            ))
+        })?;
+        let established = ScopedChannel {
+            target: enrolment.target.clone(),
+            os_user: enrolment.os_user.clone(),
+            helper_path: enrolment.helper_path.clone(),
+            at_ms: now_ms,
+        };
+        if self
+            .record
+            .scoped_channels
+            .insert(environment_id.to_string(), established.clone())
+            .as_ref()
+            != Some(&established)
+        {
             self.write()?;
         }
         Ok(())
+    }
+
+    /// Returns the cached row for one enrolment, without asking any platform.
+    #[must_use]
+    pub fn row_of(
+        &self,
+        environment_id: EnvironmentId,
+        now_ms: u64,
+    ) -> Option<EnvironmentInventoryRow> {
+        self.enrolment(environment_id)
+            .map(|enrolment| self.row(enrolment, now_ms))
     }
 
     /// Builds one row from the record and the cache.
@@ -287,10 +340,18 @@ impl Store {
     /// Reports what one environment still needs.
     fn readiness(&self, enrolment: &EnvironmentEnrolment) -> EnvironmentReadiness {
         let helper_enrolled = enrolment.validate().is_ok();
+        // The channel is scoped when a bridge established it *for this record*. A destination, a
+        // user or a helper that has changed since is a different installation of the integration,
+        // and the evidence does not carry over to it.
         let channel_scoped = self
             .record
             .scoped_channels
-            .contains(&enrolment.environment_id.to_string());
+            .get(&enrolment.environment_id.to_string())
+            .is_some_and(|established| {
+                established.target == enrolment.target
+                    && established.os_user == enrolment.os_user
+                    && established.helper_path == enrolment.helper_path
+            });
         let detail = match (helper_enrolled, channel_scoped) {
             (true, true) => "the helper and the scoped channel are both recorded".to_owned(),
             (false, _) => format!(
@@ -479,9 +540,46 @@ mod tests {
         assert!(!before[0].readiness.is_ready());
         assert!(before[0].readiness.detail.contains("forwarding a socket"));
 
-        store.scope_channel(record.environment_id).expect("scoped");
+        store
+            .scope_channel(record.environment_id, 100)
+            .expect("scoped");
         let after = store.list(None, 100);
         assert!(after[0].readiness.is_ready());
+    }
+
+    #[test]
+    fn a_destination_that_changed_does_not_keep_what_an_earlier_bridge_established() {
+        let (_directory, mut store) = store();
+        let record = enrolment(1, "ubuntu");
+        store.enrol(record.clone(), 100).expect("enrolled");
+        store
+            .scope_channel(record.environment_id, 100)
+            .expect("scoped");
+        assert!(store.list(None, 100)[0].readiness.is_ready());
+
+        // The same identity, a different helper. Nothing has answered from there yet.
+        let mut moved = record.clone();
+        moved.helper_path = "/opt/kalareach/kr".to_owned();
+        store.enrol(moved, 200).expect("enrolled again");
+        let rows = store.list(None, 200);
+        assert!(!rows[0].readiness.channel_scoped);
+        assert!(rows[0].readiness.detail.contains("forwarding a socket"));
+    }
+
+    #[test]
+    fn forgetting_an_environment_forgets_what_a_bridge_established_about_it() {
+        let (_directory, mut store) = store();
+        let record = enrolment(1, "ubuntu");
+        store.enrol(record.clone(), 100).expect("enrolled");
+        store
+            .scope_channel(record.environment_id, 100)
+            .expect("scoped");
+        assert!(store.forget(record.environment_id).expect("forgotten"));
+        store.enrol(record.clone(), 300).expect("enrolled again");
+        assert!(
+            !store.list(None, 300)[0].readiness.channel_scoped,
+            "a record enrolled again starts with nothing established"
+        );
     }
 
     #[test]

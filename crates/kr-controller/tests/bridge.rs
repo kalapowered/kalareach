@@ -235,18 +235,23 @@ async fn a_refresh_that_cannot_reach_a_destination_says_so_and_scopes_no_channel
         )
         .await
         .expect("the daemon answers");
-    if let Ok(value) = answered {
-        let refreshed: EnvironmentRefreshResult = value.to_typed().expect("a refresh result");
-        assert!(
-            refreshed.verification.as_ref().is_none(),
-            "nothing answered, so nothing is recorded as verified"
-        );
-        assert!(
-            !refreshed.connection.is_empty(),
-            "the result says what opening the bridge did"
-        );
-        assert!(!refreshed.row.readiness.channel_scoped);
-        assert!(!refreshed.row.readiness.is_ready());
+    match answered {
+        Ok(value) => {
+            let refreshed: EnvironmentRefreshResult = value.to_typed().expect("a refresh result");
+            assert!(
+                refreshed.verification.as_ref().is_none(),
+                "nothing answered, so nothing is recorded as verified"
+            );
+            assert!(
+                !refreshed.connection.is_empty(),
+                "the result says what opening the bridge did"
+            );
+            assert!(!refreshed.row.readiness.channel_scoped);
+            assert!(!refreshed.row.readiness.is_ready());
+        }
+        // This machine has no `wsl.exe`, so the observation itself may fail. What it may not do is
+        // report the environment reached.
+        Err(error) => assert_eq!(error.code, ErrorCode::ResourceUnavailable, "{error}"),
     }
     for row in inventory(&mut client).await.rows {
         assert!(
@@ -280,15 +285,21 @@ async fn a_refresh_of_an_environment_that_is_not_a_process_bridge_opens_none() {
         )
         .await
         .expect("the daemon answers");
-    if let Ok(value) = answered {
-        let refreshed: EnvironmentRefreshResult = value.to_typed().expect("a refresh result");
-        assert!(refreshed.verification.as_ref().is_none());
-        assert!(
-            refreshed.connection.contains("process bridge"),
-            "{}",
-            refreshed.connection
-        );
-    }
+    let refreshed: EnvironmentRefreshResult = answered
+        .expect("an SSH environment is answered from the record rather than refused")
+        .to_typed()
+        .expect("a refresh result");
+    assert!(refreshed.verification.as_ref().is_none());
+    assert!(!refreshed.started);
+    assert!(
+        refreshed.connection.contains("process bridge"),
+        "{}",
+        refreshed.connection
+    );
+    assert_eq!(
+        refreshed.row.enrolment.environment_id,
+        record.environment_id
+    );
     host.stop().await;
 }
 
