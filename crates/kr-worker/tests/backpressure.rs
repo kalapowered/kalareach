@@ -40,6 +40,10 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+mod common;
+
+use common::LIVENESS_DEADLINE;
+
 /// The bound one attachment's queue is given.
 ///
 /// Smaller than the eight megabytes a session uses by default, so a client that stops reading
@@ -73,8 +77,12 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
 
     // A shell that keeps producing for the whole test, rather than in one burst at startup. A
     // burst would be a race: a client that attached a moment late would subscribe past most of it
-    // and never reach its bound. Roughly 140 KiB a second is many times one attachment's queue over
-    // the window this test leaves a client not reading, and nothing at all for a client that reads.
+    // and never reach its bound. Roughly 140 KiB a second is many times one attachment's queue
+    // while this test leaves a client not reading, and nothing at all for a client that reads.
+    //
+    // Its `sleep 1` between runs of lines is the application's own pace and not a wait anything
+    // here depends on: every step below waits for something the session reports, and a slower
+    // application only means waiting longer for the same thing.
     let config = SessionConfig {
         session_id,
         session_epoch: SessionEpoch::V1,
@@ -166,18 +174,35 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     // what section 9 promises. The other is the client that *is* reading, which shows the fan-out
     // reaching somebody while one peer is silent.
     let before = runtime.session().output_cursor();
-    let advances = progress(&received, Duration::from_secs(10)).await;
-    let after = runtime.session().output_cursor();
-    let counted = received.load(std::sync::atomic::Ordering::Relaxed);
+    let started = Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let (after, counted) = loop {
+        let after = runtime.session().output_cursor();
+        let counted = received.load(std::sync::atomic::Ordering::Relaxed);
+        if after > before && counted > 0 {
+            break (after, counted);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "waited {:?} for the session to read past {before} - it is at {after} - and for the \
+             client that kept reading to receive anything - it has {counted} batches - while the \
+             other one was not reading, on {}",
+            started.elapsed(),
+            finished(&draining)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert!(
         after > before,
         "the pseudo-terminal was read while one client was not reading: the output cursor stood \
-         at {before} and is at {after}"
+         at {before} and is at {after} after {:?}",
+        started.elapsed()
     );
     assert!(
         counted > 0,
         "the client that kept reading received output while the other was not reading: \
-         {advances} arrivals and {counted} batches in ten seconds, on {}",
+         {counted} batches in {:?}, on {}",
+        started.elapsed(),
         finished(&draining)
     );
 
@@ -185,25 +210,19 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     // silent client's queue filled; what section 9 requires is that the read loop keeps going
     // *after* it has. So the test waits for the overflow itself, which the session knows about,
     // and then measures again from there.
-    let overflowed = {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut seen = false;
-        while Instant::now() < deadline {
-            if runtime.session().is_resynchronising(slow_id) {
-                seen = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        seen
-    };
-    assert!(
-        overflowed,
-        "the queue for the client that stopped reading filled, which is the condition this test \
-         is about: {} batches reached the other one, on {}",
-        received.load(std::sync::atomic::Ordering::Relaxed),
-        finished(&draining)
-    );
+    let started = Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    while !runtime.session().is_resynchronising(slow_id) {
+        assert!(
+            Instant::now() < deadline,
+            "waited {:?} for the queue of the client that stopped reading to fill, which is the \
+             condition this test is about: {} batches reached the other one, on {}",
+            started.elapsed(),
+            received.load(std::sync::atomic::Ordering::Relaxed),
+            finished(&draining)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let at_overflow = runtime.session().output_cursor();
     let read_at_overflow = received.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
@@ -262,23 +281,32 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     let mut resynchronised = false;
     let started = Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
-    while Instant::now() < deadline {
-        // A timeout here is not an answer. The loop keeps looking until its own deadline rather
-        // than concluding from one quiet moment that nothing is coming.
-        let Ok(Ok(message)) = tokio::time::timeout(Duration::from_secs(5), slow.recv()).await
-        else {
-            continue;
-        };
-        if let ControlFrame::Notification(notification) = message
-            && notification.event_type.as_str() == "session.resync"
-        {
-            resynchronised = true;
-            break;
+    while !resynchronised {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, slow.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.resync" =>
+            {
+                resynchronised = true;
+            }
+            // Anything else it was sent is not the marker; the loop keeps looking.
+            Ok(Ok(_)) => {}
+            // A connection that has gone can never deliver the marker, and a client left without
+            // one is exactly what this test is about, so neither is waited out in silence.
+            Ok(Err(error)) => panic!(
+                "waited {:?} for the client that stopped reading to be told to resynchronise and \
+                 its connection ended: {error}",
+                started.elapsed()
+            ),
+            Err(_) => panic!(
+                "waited {:?} for the client that stopped reading to be told to resynchronise",
+                started.elapsed()
+            ),
         }
     }
     assert!(
         resynchronised,
-        "waited {:?} for the client that stopped reading to be told to resynchronise",
+        "the client that stopped reading was told to resynchronise after {:?}",
         started.elapsed()
     );
 
@@ -326,36 +354,6 @@ fn finished(handle: &tokio::task::JoinHandle<Drained>) -> &'static str {
         "a stream that was still open"
     }
 }
-
-/// Counts how many times `counter` advances over `window`, waiting the whole of it.
-///
-/// The window is waited out rather than cut short at the first good news, because the other client
-/// has to be left unread for long enough to fall behind. Counting advances through the same window
-/// is what makes this an assertion about order: while one client was not reading, another was
-/// receiving.
-async fn progress(counter: &Arc<std::sync::atomic::AtomicUsize>, window: Duration) -> usize {
-    let deadline = Instant::now() + window;
-    let mut seen = counter.load(std::sync::atomic::Ordering::Relaxed);
-    let mut advances = 0;
-    while Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let now = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if now > seen {
-            advances += 1;
-            seen = now;
-        }
-    }
-    advances
-}
-
-/// How long a wait for something to arrive is given.
-///
-/// A liveness wait is not a measurement: it is there to fail when something never arrives. Thirty
-/// seconds was inside the range the slowest reference hosts reach when several suites share them,
-/// which turned these waits into coin tosses; two minutes is outside it. The poll intervals are
-/// unchanged, so a wait that succeeds costs what it always did, and each failure says how long it
-/// actually waited. What the assertions themselves say is untouched.
-const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
