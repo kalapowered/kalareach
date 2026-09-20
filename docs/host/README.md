@@ -885,6 +885,109 @@ that creates a job of its own running inside the session's job; a child that ask
 being refused; an IME composing at a real keyboard; and Windows Terminal, WSL interop and a nested
 ConPTY across the release matrix.
 
+## WSL and containers
+
+A WSL distribution is a Linux host. It has its own control daemon, its own runtime and state
+directories, its own environment identity, its own paired endpoint and its own grants, and the
+Linux package is what installs it. Nothing about that changes when Windows also has KalaReach
+installed, and a person who only uses the distribution runs the Linux command line there and never
+touches the Windows side.
+
+What a native Windows installation adds is discovery and pairing from Windows: a list of the
+environments this machine can reach, and one command that runs inside the chosen one. That
+convenience is the whole of it. Take the Windows installation away and the distribution keeps
+working, because nothing it needs lives on the Windows side.
+
+### The process bridge
+
+Reaching a distribution from Windows is an explicit process bridge, not a socket:
+
+```text
+wsl.exe --distribution <name> --user <user> --exec <absolute-kr-path> bridge --stdio
+```
+
+and an enrolled container is the equivalent against the container's own identifier:
+
+```text
+podman exec --interactive --user <user> -- <container-id> <absolute-helper-path> bridge --stdio
+```
+
+The child is `kr bridge --stdio` inside the destination. It authenticates to that environment's
+own control daemon or session worker over local IPC, and carries protocol frames on its standard
+input and output. Standard error stays diagnostic, so a warning there cannot corrupt the stream.
+
+Four things about that invocation are deliberate.
+
+* **It is an argument vector, never a command line.** A distribution called `My Distro`, a
+  container identifier beginning with a dash and a helper path containing a quotation mark each
+  cross as one element, unchanged. `--exec` is part of this: without it `wsl.exe` hands the rest of
+  the line to the distribution's login shell, which parses it again.
+* **No Linux socket is opened from Windows**, and no localhost forwarding mode is assumed. The
+  helper runs inside the destination, so the socket it connects to is its own environment's.
+* **Frames are bounded.** Both directions use section 9's control-frame maximum, and the declared
+  length is checked before a buffer for it exists. A frame past the bound is refused, not
+  truncated: half of somebody else's message is worse than none of it.
+* **No authority is read from the environment.** The helper's rights inside the destination are
+  the rights of the operating-system user the enrolment names, established there by peer
+  credentials. A forwarded variable confers nothing.
+
+### What may cross a bridge
+
+The bridges serve locally authenticated command-line invocations only. A request that arrived on
+this host from the network is refused before an argument vector is built, and the helper refuses
+the same handshake again on its own side. A remote client reaches the distribution through the
+distribution's own paired endpoint, which it has.
+
+The ingress the request originally arrived on travels in the opening frame, so what the
+destination records is where the request entered rather than the local IPC hop the helper made
+there. There is no arrangement of hops that turns a network device into a local owner, and a
+request that has already crossed one bridge is refused a second rather than chained: a federated
+proxy is not part of this version.
+
+### The enrolled environments, and the cached inventory
+
+An enrolment records the identity the platform issued, the operating-system user the helper runs
+as, and the absolute path of the helper installed there. The label is what a person types; it
+selects a record and is never compared as an identity, so a container destroyed and recreated under
+the same name does not inherit the old record.
+
+`environment.inventory` reads the owner-approved cache. Every row carries the environment identity,
+when it was last observed, and an explicit status: `running`, `environment_stopped` or `stale`. A
+listing contacts nothing and starts nothing, and a cached row is never evidence that a process is
+live — the row says it was read from the cache, and only a refresh that found the environment
+running says otherwise. `environment.refresh` is the one that asks the platform, and it starts the
+environment it selected only when the request asked it to.
+
+Starting a stopped distribution does not revive what was in it. A session that was closed before it
+stopped still answers `SESSION_CLOSED`.
+
+### Named SSH and container environments
+
+An SSH host and a paired remote host are named environments too, and neither is a process bridge.
+An SSH user runs the destination command line under their own login, which is genuine local access
+there; a named remote host in the application uses that environment's paired endpoint. Asking for
+either as a bridge is refused by name rather than served through a launcher that happens to accept
+it.
+
+Both still need a helper installed in the target and a scoped local channel of their own. Those two
+conditions are reported separately, because neither implies the other and forwarding a socket
+supplies neither.
+
+### Independent environment authorities
+
+Each Windows, WSL and enrolled container installation is its own environment authority. Grouping
+them so a person can see them together grants nothing: enrolling one here gives this host's owner
+no right inside it, and the keys, grants and session identifiers a standalone distribution already
+had are kept. Every row in a grouped listing names its own environment, and none of them is this
+host's.
+
+### What is not settled here
+
+WSL networking has two modes, NAT and mirrored, and which of them a bridge should behave
+differently in is decided by measuring both rather than assumed. Until that measurement exists
+there is no automatic behaviour to describe: the invocation above is the same in either mode,
+because it opens no socket.
+
 ## Who may type
 
 A session has one input lease with an epoch. `input.acquire` takes it immediately: the epoch

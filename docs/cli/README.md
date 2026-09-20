@@ -19,6 +19,8 @@ worker directly for what a session owns.
 | `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
+| `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
+| `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
@@ -625,6 +627,47 @@ support bundle written to support.tar (4 software versions, 2 capability records
 
 Giving the flag is the selection. Without it there is no content-bearing export and the manifest
 says so.
+
+## `kr bridge`
+
+`kr bridge --stdio` is the destination half of a local process bridge. It is what a Windows host
+starts inside a WSL distribution, and what a container host starts inside an enrolled container:
+
+```text
+wsl.exe --distribution Ubuntu-24.04 --user kala --exec /usr/local/bin/kr bridge --stdio
+podman exec --interactive --user kala -- 8f3c1d2e4a5b /usr/local/bin/kr bridge --stdio
+```
+
+It reads protocol frames from standard input, carries them to this environment's own control
+daemon or session worker over local IPC, and writes the answers back to standard output. Standard
+error stays diagnostic. Nothing is printed on standard output but frames, so the stream cannot be
+corrupted by a message meant for a person.
+
+The bridge serves locally authenticated invocations only. A handshake that says the request
+arrived from the network is refused with `PERMISSION_DENIED` before anything is connected, and so
+is one that says the request has already crossed a bridge. A frame larger than the protocol's
+control-frame maximum is refused rather than truncated.
+
+The other four operations act on the environments this host has enrolled:
+
+```text
+kr bridge list [--access wsl|container|ssh|paired]
+kr bridge enrol --access wsl --label ubuntu --target Ubuntu-24.04 \
+  --user kala --helper /usr/local/bin/kr [--clipboard <destination>]
+kr bridge forget <label>
+kr bridge refresh <label> [--start]
+```
+
+`--target` is the identity the platform issued: the distribution name WSL registered, the
+identifier the container runtime issued, or the SSH destination. `--label` is what a person types
+to select the record; it is never compared as an identity, so a container recreated under the same
+name does not inherit the old one. `--helper` is absolute, in the target environment's own terms.
+
+`list` reads this host's cache. It contacts nothing and starts nothing, and every row says so:
+each carries the environment identity, when it was last observed, an explicit `running`,
+`environment_stopped` or `stale` status, and whether that came from the cache or from an
+observation. `refresh` is the only one that asks the platform, and it starts the environment it
+selected only with `--start`.
 
 ## `kr host power`
 
