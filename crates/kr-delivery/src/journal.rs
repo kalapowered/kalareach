@@ -1570,6 +1570,14 @@ impl DeliveryJournal {
                 )?;
             }
         }
+        if transition.state.is_settled() && !transition.left_this_host {
+            transaction.execute(
+                "UPDATE delivery_budget
+                 SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
+                 WHERE collapse_into = ?1",
+                params![identifier],
+            )?;
+        }
         transaction.commit()?;
         Ok(true)
     }
@@ -2065,8 +2073,8 @@ impl DeliveryJournal {
                 params![destination_id.as_str()],
                 |row| {
                     Ok(StoredBudget {
-                        burst_scaled: as_u64(row.get::<_, i64>(0)?),
-                        sustained_scaled: as_u64(row.get::<_, i64>(1)?),
+                        burst_scaled: row.get::<_, i64>(0)?,
+                        sustained_scaled: row.get::<_, i64>(1)?,
                         refilled_at_ms: as_u64(row.get::<_, i64>(2)?),
                         collapse_into: row.get::<_, Option<String>>(3)?,
                         collapse_opened_at_ms: row.get::<_, Option<i64>>(4)?.map(as_u64),
@@ -2075,6 +2083,26 @@ impl DeliveryJournal {
                 },
             )
             .optional()?)
+    }
+
+    /// Releases the collapse window opened by `notification_id` for `destination_id`, when that
+    /// notification never went out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn release_collapse_window(
+        &mut self,
+        destination_id: &DestinationId,
+        notification_id: &NotificationId,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE delivery_budget
+             SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
+             WHERE destination_id = ?1 AND collapse_into = ?2",
+            params![destination_id.as_str(), notification_id.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Writes one destination's spent allowance down.
@@ -2290,9 +2318,9 @@ impl DeliveryJournal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredBudget {
     /// The burst allowance spent, scaled.
-    pub burst_scaled: u64,
+    pub burst_scaled: i64,
     /// The sustained allowance spent, scaled.
-    pub sustained_scaled: u64,
+    pub sustained_scaled: i64,
     /// When the bucket was last refilled, in UTC milliseconds.
     pub refilled_at_ms: u64,
     /// The attention update excess notifications are collapsing into.
@@ -2643,6 +2671,12 @@ fn settle_in(
         "DELETE FROM delivery_outbox WHERE notification_id = ?1",
         params![identifier],
     )?;
+    transaction.execute(
+        "UPDATE delivery_budget
+         SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
+         WHERE collapse_into = ?1",
+        params![identifier],
+    )?;
     Ok(())
 }
 
@@ -2679,8 +2713,8 @@ fn budget_params(
 ) -> [Box<dyn rusqlite::ToSql>; 7] {
     [
         Box::new(destination_id.as_str().to_owned()),
-        Box::new(as_i64(budget.burst_scaled)),
-        Box::new(as_i64(budget.sustained_scaled)),
+        Box::new(budget.burst_scaled),
+        Box::new(budget.sustained_scaled),
         Box::new(as_i64(budget.refilled_at_ms)),
         Box::new(budget.collapse_into.clone()),
         Box::new(budget.collapse_opened_at_ms.map(as_i64)),

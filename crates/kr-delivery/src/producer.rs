@@ -707,8 +707,20 @@ impl Producer {
         } else {
             notice.alert
         };
-        let (request, staged) =
-            self.build_request(notice, &push, &destination.id, identifier, alert, now_ms)?;
+        let (request, staged) = match self.build_request(
+            notice,
+            &push,
+            &destination.id,
+            identifier,
+            alert,
+            now_ms,
+        ) {
+            Ok((request, staged)) => (request, staged),
+            Err(error) => {
+                budget.release_collapse_window(&identifier);
+                return Err(error);
+            }
+        };
         let content = preview::encode_request(&request)?;
         let payload_bytes = preview::provider_payload_bytes(&request)?;
         Ok((

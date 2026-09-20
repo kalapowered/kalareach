@@ -40,7 +40,7 @@ use crate::journal::StoredBudget;
 ///
 /// It is chosen so that both refill rates are whole numbers of scaled units per millisecond, which
 /// makes every arithmetic step here exact.
-pub const SCALE: u64 = 60 * 1000;
+pub const SCALE: i64 = 60 * 1000;
 
 /// How long the burst allowance takes to refill completely, in milliseconds.
 pub const BURST_REFILL_MS: u64 = 60 * 1000;
@@ -49,27 +49,27 @@ pub const BURST_REFILL_MS: u64 = 60 * 1000;
 pub const SUSTAINED_REFILL_MS: u64 = 60 * 60 * 1000;
 
 /// The burst bucket's capacity, in scaled units.
-pub const BURST_CAPACITY: u64 = FREE_PUSH_BURST * SCALE;
+pub const BURST_CAPACITY: i64 = (FREE_PUSH_BURST as i64) * SCALE;
 
 /// The sustained bucket's capacity, in scaled units.
-pub const SUSTAINED_CAPACITY: u64 = FREE_PUSH_PER_HOUR * SCALE;
+pub const SUSTAINED_CAPACITY: i64 = (FREE_PUSH_PER_HOUR as i64) * SCALE;
 
 /// Scaled units the burst bucket gains each millisecond.
-pub const BURST_REFILL_SCALED: u64 = BURST_CAPACITY / BURST_REFILL_MS;
+pub const BURST_REFILL_SCALED: i64 = BURST_CAPACITY / (BURST_REFILL_MS as i64);
 
 /// Scaled units the sustained bucket gains each millisecond.
-pub const SUSTAINED_REFILL_SCALED: u64 = SUSTAINED_CAPACITY / SUSTAINED_REFILL_MS;
+pub const SUSTAINED_REFILL_SCALED: i64 = SUSTAINED_CAPACITY / (SUSTAINED_REFILL_MS as i64);
 
 // Both rates divide exactly at this scale. A change to either limit that stopped them dividing
 // would silently round the refill down, so it stops the build instead.
-const _: () = assert!(BURST_CAPACITY.is_multiple_of(BURST_REFILL_MS));
-const _: () = assert!(SUSTAINED_CAPACITY.is_multiple_of(SUSTAINED_REFILL_MS));
+const _: () = assert!(BURST_CAPACITY % (BURST_REFILL_MS as i64) == 0);
+const _: () = assert!(SUSTAINED_CAPACITY % (SUSTAINED_REFILL_MS as i64) == 0);
 
 /// What one destination's account says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Budget {
-    burst_scaled: u64,
-    sustained_scaled: u64,
+    burst_scaled: i64,
+    sustained_scaled: i64,
     refilled_at_ms: u64,
     collapse_into: Option<NotificationId>,
     collapse_opened_at_ms: Option<u64>,
@@ -124,8 +124,8 @@ impl Budget {
     #[must_use]
     pub fn restored(stored: &StoredBudget) -> Self {
         Self {
-            burst_scaled: stored.burst_scaled.min(BURST_CAPACITY),
-            sustained_scaled: stored.sustained_scaled.min(SUSTAINED_CAPACITY),
+            burst_scaled: stored.burst_scaled.clamp(-SCALE, BURST_CAPACITY),
+            sustained_scaled: stored.sustained_scaled.clamp(-SCALE, SUSTAINED_CAPACITY),
             refilled_at_ms: stored.refilled_at_ms,
             collapse_into: stored
                 .collapse_into
@@ -159,6 +159,7 @@ impl Budget {
             self.refilled_at_ms = self.refilled_at_ms.max(now_ms);
             return;
         }
+        let elapsed = elapsed as i64;
         self.burst_scaled = self
             .burst_scaled
             .saturating_add(elapsed.saturating_mul(BURST_REFILL_SCALED))
@@ -172,14 +173,22 @@ impl Budget {
 
     /// Returns how many whole notifications the burst allowance has left.
     #[must_use]
-    pub const fn burst_available(&self) -> u64 {
-        self.burst_scaled / SCALE
+    pub fn burst_available(&self) -> u64 {
+        if self.burst_scaled <= 0 {
+            0
+        } else {
+            (self.burst_scaled / SCALE) as u64
+        }
     }
 
     /// Returns how many whole notifications the sustained allowance has left.
     #[must_use]
-    pub const fn sustained_available(&self) -> u64 {
-        self.sustained_scaled / SCALE
+    pub fn sustained_available(&self) -> u64 {
+        if self.sustained_scaled <= 0 {
+            0
+        } else {
+            (self.sustained_scaled / SCALE) as u64
+        }
     }
 
     /// Decides what happens to one notification, and spends whatever it spends.
@@ -192,17 +201,17 @@ impl Budget {
         fresh_update: impl FnOnce() -> NotificationId,
     ) -> Admission {
         self.refill(now_ms);
-        let short = if self.burst_scaled < SCALE {
-            Some(PushSuppressionReason::Burst)
-        } else if self.sustained_scaled < SCALE {
-            Some(PushSuppressionReason::Sustained)
-        } else {
-            None
-        };
-        let Some(reason) = short else {
-            self.burst_scaled -= SCALE;
-            self.sustained_scaled -= SCALE;
+        let burst_ok = self.burst_scaled >= SCALE;
+        let sustained_ok = self.sustained_scaled >= SCALE;
+        self.burst_scaled = (self.burst_scaled - SCALE).max(-SCALE);
+        self.sustained_scaled = (self.sustained_scaled - SCALE).max(-SCALE);
+        if burst_ok && sustained_ok {
             return Admission::Send;
+        }
+        let reason = if !burst_ok {
+            PushSuppressionReason::Burst
+        } else {
+            PushSuppressionReason::Sustained
         };
         let window_open = self
             .collapse_opened_at_ms
@@ -220,6 +229,19 @@ impl Budget {
         Admission::OpenUpdate {
             update,
             suppression: self.suppression(update, reason),
+        }
+    }
+
+    /// Releases the collapse window opened by `update_id` if this budget is holding it.
+    ///
+    /// When a notification that opened a collapse window is refused or never leaves the host,
+    /// holding the window would cause subsequent suppressed notifications to reference an
+    /// attention update that was never sent.
+    pub fn release_collapse_window(&mut self, update_id: &NotificationId) {
+        if self.collapse_into.as_ref() == Some(update_id) {
+            self.collapse_into = None;
+            self.collapse_opened_at_ms = None;
+            self.collapse_count = 0;
         }
     }
 
@@ -311,6 +333,48 @@ mod tests {
             ),
             "the twenty-first in one moment is over the burst"
         );
+    }
+
+    #[test]
+    fn twenty_one_requests_at_time_zero_puts_burst_into_debt_so_three_seconds_later_is_still_collapsed() {
+        let mut budget = Budget::fresh(0);
+        spend_the_burst(&mut budget, 0);
+        let stopped = budget.admit(0, || update(21));
+        assert!(matches!(stopped, Admission::OpenUpdate { .. }));
+        assert_eq!(budget.burst_scaled, -SCALE);
+
+        // At 3,000 ms, refill is 1 token (+SCALE), which pays off debt to 0 tokens.
+        budget.refill(3_000);
+        assert_eq!(budget.burst_scaled, 0);
+        assert_eq!(budget.burst_available(), 0);
+
+        // A request at 3,000 ms must still be collapsed because it has 0 tokens available.
+        let at_3s = budget.admit(3_000, || update(22));
+        assert!(matches!(at_3s, Admission::Collapse { .. }));
+        assert_eq!(budget.burst_scaled, -SCALE);
+
+        // At 9,000 ms (two refill intervals after request 22):
+        budget.refill(9_000);
+        assert_eq!(budget.burst_available(), 1);
+        assert_eq!(budget.admit(9_000, || update(23)), Admission::Send);
+    }
+
+    #[test]
+    fn releasing_a_collapse_window_clears_the_update_so_a_new_one_can_open() {
+        let mut budget = Budget::fresh(0);
+        spend_the_burst(&mut budget, 0);
+        let Admission::OpenUpdate { update: first, .. } = budget.admit(0, || update(1)) else {
+            panic!("expected open update");
+        };
+        assert_eq!(budget.collapse_into, Some(first));
+        budget.release_collapse_window(&first);
+        assert_eq!(budget.collapse_into, None);
+        assert_eq!(budget.collapse_opened_at_ms, None);
+        assert_eq!(budget.collapse_count, 0);
+        let Admission::OpenUpdate { update: second, .. } = budget.admit(0, || update(2)) else {
+            panic!("expected open update after release");
+        };
+        assert_eq!(second, update(2));
     }
 
     #[test]
