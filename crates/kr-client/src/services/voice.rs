@@ -816,14 +816,31 @@ fn normalised_origin(origin: &str) -> String {
         }
         _ => (rest.clone(), None),
     };
-    // A host written as an address literal is the address, not its spelling.
+    // A host is a host: nothing that could carry a path, a credential, a query, a fragment or an
+    // escape is one, and an empty answer is what the caller refuses.
+    if host.is_empty() || host.contains(['/', '?', '#', '@', '%', '\\', ' ']) || !host.is_ascii() {
+        return String::new();
+    }
+    // A host written as an address is the address, not its spelling: `[0:0:0:0:0:0:0:1]` and
+    // `[::1]` are one host, and `127.1` is `127.0.0.1` written short. A second spelling of one
+    // address would be a second service to a host that tells calls apart by their provider.
     let host = match host
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
-        Some(literal) => literal
-            .parse::<std::net::Ipv6Addr>()
-            .map_or(host.clone(), |address| format!("[{address}]")),
+        Some(literal) => match literal.parse::<std::net::Ipv6Addr>() {
+            Ok(address) => format!("[{address}]"),
+            Err(_) => return String::new(),
+        },
+        None if host
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.') =>
+        {
+            match host.parse::<std::net::Ipv4Addr>() {
+                Ok(address) => address.to_string(),
+                Err(_) => return String::new(),
+            }
+        }
         None => host,
     };
     let implied = match scheme.as_str() {
@@ -858,6 +875,14 @@ mod origin_tests {
             normalised_origin("http://[0:0:0:0:0:0:0:1]"),
             normalised_origin("http://[::1]")
         );
+        assert_eq!(
+            normalised_origin("http://127.1"),
+            String::new(),
+            "an address written short is not the one spelling this host compares"
+        );
+        assert!(normalised_origin("https://%72each.example").is_empty());
+        assert!(normalised_origin("https://user@reach.example").is_empty());
+        assert!(normalised_origin("https://reach.example/path").is_empty());
         assert_ne!(
             normalised_origin("https://reach.example"),
             normalised_origin("https://other.example")
@@ -1660,6 +1685,9 @@ mod tests {
             "HTTPS://Reach.Example",
             "https://[0:0:0:0:0:0:0:1]",
             "https://bücher.example",
+            "http://127.1",
+            "https://%72each.example",
+            "https://user@reach.example",
         ] {
             assert!(
                 ManagedVoiceBroker::new(refused, Arc::new(NoHttp), Arc::new(NoToken)).is_err(),

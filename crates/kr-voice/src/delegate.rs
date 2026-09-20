@@ -1095,11 +1095,6 @@ impl Coordinator {
         params: &VoiceDelegateParams,
         now_ms: u64,
     ) -> Result<VoiceDelegateResult> {
-        // One action identifier is one delegation, for one device. The payload cannot be the key,
-        // because a confirmation is bound to the request that asked for it and the signed
-        // resubmission is the same identifier carrying a different payload; so the identifier is
-        // bound to the delegation it was first used for, and what that delegation came to is kept
-        // with it. The binding is taken here, in one critical section, before anything is awaited.
         self.answer_delegation(device_id, action_id, params, now_ms)
             .await
     }

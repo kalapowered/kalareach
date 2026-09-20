@@ -89,22 +89,6 @@ impl VoiceSessionRecord {
             .any(|held| &held.delegation_id == delegation_id)
     }
 
-    /// The delegation one action identifier was used for in this call, when it was used.
-    ///
-    /// One identifier is one action: an identifier that already carried a delegation cannot carry
-    /// a different one, and the same pair returning is the signed resubmission of an action that
-    /// was waiting for its confirmation.
-    #[must_use]
-    pub fn action_used_for(
-        &self,
-        action_id: kr_protocol::ids::ActionId,
-    ) -> Option<&VoiceDelegationId> {
-        self.announced
-            .iter()
-            .find(|held| held.action_id == action_id)
-            .map(|held| &held.delegation_id)
-    }
-
     /// Takes one delegation back out of this call's announced set.
     ///
     /// One delegation is one action, so submitting a delegation spends it. An answer that admitted
