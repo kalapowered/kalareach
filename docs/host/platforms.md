@@ -122,18 +122,22 @@ kr host power --set battery_too      # the same on battery, which is a separate 
 kr host power --set off              # the default
 ```
 
-The setting is per-user host configuration, kept in `power.json` in the environment's own state
-directory, which `kr doctor` prints the path of. The document carries its own version, and a
-document whose version this build does not know is left alone and read as off rather than guessed
-at. Writing it installs no service, obtains no privilege and changes nothing else about the
-machine.
+The setting is one section of the versioned per-user host configuration document, `config.json` in
+the environment's own state directory, which `kr doctor` prints the path of. A document whose
+version this build does not know is left alone and every value reads as the product default rather
+than being guessed at, so an unknown document means the setting is off. Writing it installs no
+service, obtains no privilege and changes nothing else about the machine.
 
 ```json
 {
   "version": 1,
-  "sleep_inhibition": "mains_only"
+  "revision": 1,
+  "preferences": { "sleep_inhibition": "mains_only" }
 }
 ```
+
+`docs/host/README.md` has the whole schema, the precedence between a request, a profile and the
+document, and the ceilings that intersect rather than default.
 
 With the setting on, an assertion is held while the host has verified foreground work or a request
 it has accepted and not answered. Four things count, and the host reads each of them rather than

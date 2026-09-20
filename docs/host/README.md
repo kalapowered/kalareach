@@ -59,6 +59,90 @@ account can read is a key its own account can read, and no file permission makes
 A host that must do better needs a hardware-backed store, which is a separate decision from this
 one.
 
+## Configuration
+
+One versioned document per user, per environment, in that environment's own state directory:
+`config.json`, beside the registry. It is the only configuration file this host reads.
+
+```json
+{
+  "version": 1,
+  "revision": 3,
+  "preferences": { "sleep_inhibition": "mains_only" },
+  "profiles": { "review": { "shell_mode": "native_compat" } },
+  "default_profile": null,
+  "ceilings": {
+    "session_limit": 16,
+    "grant_rights": null,
+    "enrolment": {
+      "metadata_bytes": 67108864,
+      "metadata_entries": 100000,
+      "cached_payload_bytes": 1073741824,
+      "full_offline_mirror": false
+    }
+  },
+  "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }]
+}
+```
+
+| Rule | What it means |
+| --- | --- |
+| `version` | The schema version. A document declaring one this build does not know is left exactly as it is, nothing is read out of it, every value falls to the product default, and `kr doctor` reports the version it found |
+| `revision` | Rises by one with each validated edit. An edit names the revision it was built on and is refused if another writer moved it first, so no edit silently erases another |
+| 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |
+| owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
+| unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
+
+Editing is validated before a revision is applied. A change that would affect authority fences
+dispatch before the change is acknowledged, so work admitted under the old authority cannot be
+dispatched by the time the caller is told the change is in force. A change to the execution context
+invalidates the capability evidence taken under the old one and migrates no worker: a running
+session keeps the context it was created in.
+
+The document the sleep setting used to live in, `power.json`, is not read. A copy found beside the
+configuration is reported by `kr doctor` in one line and ignored.
+
+### Precedence
+
+For an ordinary preference, highest first:
+
+1. an explicit request or command-line option;
+2. the selected session or environment profile;
+3. the per-user host configuration;
+4. the product default.
+
+Every ordinary preference resolves through one function, so the order cannot drift between call
+sites. A profile a request names and this host does not have contributes nothing and the value
+falls through to the document.
+
+The creator's shell environment is recorded as an execution snapshot: it is what the session's own
+processes run with, and nothing this host decides is taken from it. Only the variables below
+participate in configuration, and they are read from the host's own environment.
+
+| Variable | Supplies | Acts at | Why there |
+| --- | --- | --- | --- |
+| `KR_RUNTIME_DIR` | the runtime tree | an explicit request | it selects the runtime tree, which no document inside that tree can name |
+| `KR_STATE_DIR` | the state tree | an explicit request | it selects the state tree the configuration document itself is read from |
+
+Any other inherited variable changes nothing. No entry in that table names authority, an
+organisation restriction, a grant ceiling, a hard resource limit or a provider origin, and none can:
+each entry has to name an ordinary preference, and those are not.
+
+### Ceilings
+
+Authority, organisation restrictions, grant ceilings and hard resource limits are intersections
+rather than defaults a flag can raise. A configured value more permissive than what is already in
+force is refused and reported as refused.
+
+| Ceiling | Intersected with |
+| --- | --- |
+| `session_limit` | the hard limit of 128 sessions per environment |
+| `grant_rights` | the rights the grant and this host's policy already allow, which the grant intersection decides; this ceiling only removes |
+| `enrolment` | section 11's own budgets; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
+
+A secret is never in the document. `secrets` holds named references: what this configuration calls
+it, which secure store it lives in and its name inside that store. There is no field a value would
+fit in, so `kr doctor` and a support bundle print the reference and can print nothing else.
 
 ## The bundled package
 

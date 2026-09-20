@@ -1561,12 +1561,16 @@ pub mod redaction {
     ///   credential the host was talking about; the value goes.
     /// * **Userinfo in a URL.** `https://user:password@host/path` keeps the host and the path and
     ///   loses the pair in front of them, which is where a credential in a provider origin lives.
-    /// * **A long opaque run.** A token pasted on its own, with nothing naming it. Anything of
-    ///   [`OPAQUE_RUN`] characters or more drawn only from the base64 and hexadecimal alphabets
-    ///   goes, and a path, a sentence or an identifier with punctuation in it does not.
+    /// * **A long opaque run.** A token pasted on its own, with nothing naming it: at least
+    ///   [`OPAQUE_RUN`] characters drawn only from the alphanumeric and base64 alphabet, mixing
+    ///   upper case, lower case and digits. That is the shape a generated credential has and the
+    ///   shape ordinary text does not.
     ///
-    /// It is deliberately eager. A redacted diagnostic that lost a long identifier is a diagnostic
-    /// someone can still read; a bundle that carried a live key is an incident.
+    /// The last rule is deliberately narrow, because the first two carry the real load and an
+    /// eager third rule damages diagnostics for nothing. A run never crosses a path separator, so
+    /// a directory this host is trying to tell someone about survives; a lowercase hexadecimal
+    /// digest survives, because it has no upper case; and a word survives, because it has no
+    /// digits.
     #[must_use]
     pub fn redact(text: &str) -> String {
         let assignments = redact_assignments(text);
@@ -1690,7 +1694,7 @@ pub mod redaction {
         let mut out = String::with_capacity(text.len());
         let mut run = String::new();
         for character in text.chars() {
-            if character.is_ascii_alphanumeric() || character == '+' || character == '/' {
+            if character.is_ascii_alphanumeric() || character == '+' {
                 run.push(character);
                 continue;
             }
@@ -1718,18 +1722,16 @@ pub mod redaction {
         run.clear();
     }
 
-    /// Whether a run is encoded material rather than a word.
+    /// Whether a run is a generated credential rather than something a person wrote.
     ///
-    /// Encoded material mixes cases or mixes letters with digits across its whole length. A run of
-    /// one case and no digits is a word, however long, and a bundle that lost the longest word in
-    /// a sentence would be harder to read for nothing.
+    /// All three of upper case, lower case and digits, across one unbroken run. A generated key
+    /// has all three; a word has none of the last two; a hexadecimal digest has no upper case; a
+    /// directory name is broken into short runs by its separators. Requiring all three is what
+    /// keeps this rule from eating the paths and identifiers a diagnostic exists to report.
     fn is_opaque(run: &str) -> bool {
-        let digits = run.chars().filter(char::is_ascii_digit).count();
-        let upper = run.chars().filter(|c| c.is_ascii_uppercase()).count();
-        let lower = run.chars().filter(|c| c.is_ascii_lowercase()).count();
-        let mixed_case = upper > 0 && lower > 0;
-        let has_digits = digits > 0;
-        (mixed_case && has_digits) || (has_digits && digits * 4 >= run.len())
+        run.chars().any(|character| character.is_ascii_digit())
+            && run.chars().any(|character| character.is_ascii_uppercase())
+            && run.chars().any(|character| character.is_ascii_lowercase())
     }
 }
 
@@ -1766,9 +1768,9 @@ mod tests {
         assert!(remedy.contains("example.com/keys"), "{remedy}");
     }
 
-    /// A long opaque run with nothing naming it is still a credential.
+    /// A long opaque run with nothing naming it is still a credential; a path is not.
     #[test]
-    fn an_unnamed_token_is_redacted_and_a_sentence_is_not() {
+    fn an_unnamed_token_is_redacted_and_a_path_is_not() {
         let redacted = redaction::redact(
             concat!("the worker reported ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5 while starting"),
         );
@@ -1782,6 +1784,18 @@ mod tests {
             plain, "the supervisor describes itself as a launchd user agent",
             "an ordinary sentence is left alone"
         );
+        // A diagnostic exists to name these. A redaction that ate them would be worse than none.
+        for kept in [
+            "/var/folders/55/ab_cd/T/kr-41736cb3/s/environments/2513782e/config.json: version 1",
+            "/Users/example/Library/Application Support/KalaReach",
+            "the package digest is 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ] {
+            assert_eq!(
+                redaction::redact(kept),
+                kept,
+                "a diagnostic still says this"
+            );
+        }
     }
 
     /// KR-REQ-26.13: a document declaring a version this build does not know is left alone.

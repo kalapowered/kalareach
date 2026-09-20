@@ -16,7 +16,7 @@ worker directly for what a session owns.
 | `kr question [list/show/answer/cancel]` | — | Read and answer the questions agents are waiting on |
 | `kr skill [install/status/remove]` | — | Install the contact skill and its tool configuration for an agent |
 | `kr agent-tools --stdio` | — | Run the contact tools for the agent that launched this process |
-| `kr doctor` | — | Read-only diagnostics |
+| `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 
@@ -516,6 +516,69 @@ A `--json` failure carries the same information:
 { "ok": false, "code": "AMBIGUOUS_SESSION", "message": "...", "exit_code": 5 }
 ```
 
+## `kr doctor`
+
+Read-only. It asks the host what it is, what it is configured from and what is wrong with it, and
+it repairs nothing.
+
+```sh
+kr doctor                          # each check's verdict, with evidence only where one did not pass
+kr doctor --verbose                # every check's evidence, including the checks that passed
+kr doctor --bundle support.tar     # write a redacted support bundle
+kr doctor --bundle support.tar --include-content   # add the content-bearing diagnostic export
+```
+
+The output opens with the environment, the execution context, the desktop and its capabilities and
+the sleep policy, then this host's effective configuration, then the checks and a summary:
+
+```text
+configuration /home/example/.local/state/kalareach/environments/70a528be/config.json (schema
+version 1, revision 3): version 1
+  sleep_inhibition = mains_only from host_configuration (…/config.json), applies immediately
+  worker_profile = headless_user from default, applies new_sessions_only
+  shell_mode = native_compat from default, applies new_sessions_only
+  runtime_directory = /run/user/1000/kalareach/70a528be from default, applies new_sessions_only
+  state_directory = …/environments/70a528be from default, applies new_sessions_only
+  session_limit ceiling 128
+  enrolment ceiling 67108864 metadata bytes, 100000 entries, 1073741824 cached payload bytes
+  grant_rights ceiling every right the grant and the host policy allow
+ok             The runtime directory is owner-only
+warning        Every published descriptor answered its challenge
+               1 verified, 1 quarantined
+               A quarantined descriptor is never used. Remove it once its session is known to be gone.
+not_applicable Catalogue metadata and its capability evidence
+               no catalogue is synchronised on this host
+13 checks: 11 passed, 1 with something worth knowing, 0 failed, 1 not applicable
+```
+
+Each engineering default the product makes configurable is printed with the value in force and the
+rung it came from, so what this host is doing and why are one reading rather than two.
+
+The exit status is 0 when no check failed and 1 when one did. `--json` returns one document with
+`ok`, `host`, `doctor`, `configuration` and `environment`.
+
+### Support bundles
+
+`--bundle <path>` writes an uncompressed `tar` archive holding `manifest.json`, which carries the
+software versions, the capability evidence, the diagnostics, the effective configuration and this
+host's errors, and `report.txt`, which is what the command printed. Everything in it is redacted:
+an assignment whose name says it is a credential loses its value, a URL loses its userinfo, and a
+generated key loses itself, whichever check or library produced the sentence.
+
+Nothing content-bearing is in it. `--include-content` adds a `content/` entry, and the command
+prints what that entry will hold before it writes anything:
+
+```text
+--include-content adds the content-bearing diagnostic export:
+  content/sessions.json: every live and closed session (4 of them) with its shell command line,
+  working directory and title
+support bundle written to support.tar (4 software versions, 2 capability records, 13 checks,
+1 content-bearing entries)
+```
+
+Giving the flag is the selection. Without it there is no content-bearing export and the manifest
+says so.
+
 ## `kr host power`
 
 Automatic sleep is the machine's own policy, and `kr` changes it only when you ask:
@@ -527,8 +590,10 @@ kr host power --set battery_too   # the same on battery, which is a separate cho
 kr host power --set off           # the default
 ```
 
-The setting is per-user host configuration. Writing it installs no service, obtains no privilege
-and changes nothing else about the machine. With it on, the host holds the platform's own assertion
+The setting is one section of the versioned per-user host configuration document, and `--set`
+applies one validated revision of it. Writing it installs no service, obtains no privilege and
+changes nothing else about the machine. `docs/host/README.md` has the document's schema, where it
+lives and what decides a value when a request, a profile and the document disagree. With it on, the host holds the platform's own assertion
 against automatic sleep while it has verified foreground work or a request it has accepted and not
 answered, and releases it when that ends:
 
