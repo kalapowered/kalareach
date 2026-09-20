@@ -36,6 +36,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `skills/kalareach-contact` | The installable contact skill: what an agent reads, its tool reference and its installation manifest |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
+| `bundled-plugins/` | The plugin package that ships with the host, and the lock that names every byte of it |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
 | `docs/protocol/` | The protocol reference |
 | `docs/host/` | The host: process topology, directories, descriptors, supervision, the terminal, action windows, journals and recovery |

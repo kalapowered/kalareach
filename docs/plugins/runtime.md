@@ -433,3 +433,57 @@ Dropping the *last* handle signals the thread rather than waiting for it, which 
 handle safe to drop anywhere. Dropping one a caller holds stops nothing on its own: the runtime
 holds a handle of its own until the binding is unbound or its owner goes, and only the last one to
 go signals the thread.
+
+## The package that ships with the host
+
+A fresh installation has no repository. It still has to recognise an application, present it and
+activate a package, so one package travels with the host: `bundled-plugins/fixture`, which is
+`kalareach/example-declarative` 0.1.0, and `bundled-plugins.lock`, which names it.
+
+The lock is the evidence beside the bytes. It carries the package identifier, the version, the SDK
+and WIT ranges the manifest declares, the digest and exact length of the manifest and of every
+payload, the total the package adds up to, the trust root the chain was verified against, and the
+repository, commit, generation and tree address the copy was made from.
+
+The two checks happen at different times, on purpose.
+
+| When | What is checked | By what |
+| --- | --- | --- |
+| Making the copy | The whole TUF chain: root, timestamp, snapshot, targets, every target's digest and length, expiry enforced | `scripts/sync-bundled-plugins.sh`, through the catalogue tool the plugin repository publishes |
+| Using the copy | Every byte against the digest and length the lock names | `kr_plugin_sdk::bundle`, on every activation |
+
+A host reading a bundled package has no repository and no clock it can trust to be current, so it
+cannot re-run a chain. What it can do is recompute the digest of every byte it is about to use, and
+refuse anything that is not what the lock names. That is what `BundleLock::activate` does: it opens
+the package directory relative to a `cap_std::fs::Dir` handle the caller supplies, reads and
+verifies every file, and only then parses anything. A package whose files do not all verify does
+not activate at all, so nothing half-read reaches a caller, and a payload the lock does not name
+answers `PACKAGE_UNAVAILABLE_OFFLINE` rather than a capability nobody could perform.
+
+Absence and tampering are answered apart. A file that is simply not there is
+`PACKAGE_UNAVAILABLE_OFFLINE`, because there is nowhere to fetch it from. A file that is there and
+is not what the lock names, including a link in place of one, is `REPOSITORY_UNTRUSTED`: a host that
+reported that as "try again when you are online" would retry for ever.
+
+### What the bundle does not promise
+
+It is one package of one generation, frozen at the commit it was copied from. It is not a
+catalogue: nothing about it searches, fetches, updates or decides that a newer generation exists,
+and the generation it names does not become the host's enrolled repository. Its trust root is the
+development root the plugin repository publishes for exactly this purpose, so the signature over
+those bytes proves that the pipeline produced them and nothing about who may run them. The host
+still applies the package's capability requests, its grants and its ceiling before anything binds.
+
+### Changing what is bundled
+
+`scripts/sync-bundled-plugins.sh` makes the copy. It takes the plugin repository checkout and the
+commit to pin (the lock's own commit by default), exports that commit into a private directory of
+its own, verifies the chain there, resolves each payload by the digest the verified metadata pins,
+stages the package beside the published entry and publishes it with one rename. It refuses a
+checkout that is not at the pin, an unsafe path, a link, two names that are one file, a payload that
+is not the exact length the metadata pinned, and an entry already published that the lock on disk
+does not describe. It executes nothing out of the package.
+
+`scripts/sync-bundled-plugins.sh --verify` is the offline half: it recomputes every digest under
+`bundled-plugins/` against the lock and reports any drift. It reaches no network, builds nothing and
+needs no plugin repository, which is why it runs in continuous integration.

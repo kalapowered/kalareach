@@ -60,6 +60,30 @@ A host that must do better needs a hardware-backed store, which is a separate de
 one.
 
 
+## The bundled package
+
+The host ships with one plugin package, so a fresh installation can recognise an application and
+present it before any repository is reachable. The bytes are in `bundled-plugins/`, one directory
+per package, and `bundled-plugins.lock` beside them says what those bytes are: the package, its
+version, the digest and exact length of every file, the trust root the copy was verified against,
+and the repository, commit and generation it came from.
+
+The lock is checked on every activation, not once at installation. The host opens the bundle
+directory, reads every file relative to that handle, and compares each one's length and SHA-256
+digest with the lock before anything is parsed. A package whose files do not all match does not
+activate at all: there is no half-activated package, and no unverified byte reaches a parser.
+
+Absence and tampering are answered apart, because a caller does different things about them. A file
+that is not there is `PACKAGE_UNAVAILABLE_OFFLINE`: nothing is reachable to fetch it from, and the
+honest answer is that the package is unavailable rather than a capability that would fail the moment
+somebody used it. A file that is there and is not what the lock names, a link in place of one
+included, is `REPOSITORY_UNTRUSTED`.
+
+What the bundle is not: a catalogue, an enrolled repository, or a grant. It carries one generation,
+frozen at the commit it was copied from, and the package's capability requests, grants and
+repository ceiling are applied to it exactly as they are to anything installed. The plugin runtime
+reference describes how the copy is made and what the synchronisation script refuses.
+
 ## Descriptors
 
 The control daemon publishes one descriptor per live session, atomically — written to a temporary

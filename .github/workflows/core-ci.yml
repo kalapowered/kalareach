@@ -70,6 +70,13 @@ jobs:
       - name: Build the test components
         run: bash scripts/build-plugin-fixtures.sh
 
+      # The package that ships with the host, checked against the lock that names it. This
+      # recomputes every digest under bundled-plugins/ and fails on any drift. It reaches no
+      # network and needs no plugin repository: the bundle and the lock beside it are the whole
+      # input, which is what a host with nothing reachable has too.
+      - name: The bundled package matches its lock
+        run: bash scripts/sync-bundled-plugins.sh --verify
+
       - name: Format
         run: cargo fmt --all -- --check
 
