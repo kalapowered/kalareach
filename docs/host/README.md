@@ -26,7 +26,7 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 | Root | macOS | Linux | Override | Holds |
 | --- | --- | --- | --- | --- |
 | runtime | `$TMPDIR/kalareach` | `$XDG_RUNTIME_DIR/kalareach` | `KR_RUNTIME_DIR` | the control socket, the rendezvous socket, worker endpoints, published descriptors |
-| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area |
+| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext |
 
 Everything above a root is created with the platform's ordinary permissions; `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
@@ -1385,6 +1385,58 @@ what holds a closed session's record: a session it has a record of keeps what wa
 one whose journal it cannot read keeps it too, because declining to delete is the answer that
 cannot lose a file, and one neither the registry nor the archive knows about keeps nothing.
 
+## The backup service
+
+The producer is `kr-crypto`: it encrypts each object under its own key, wraps the keys, signs the
+manifest and builds the public descriptor. Object storage is the storage service's. What the daemon
+owns is the part in between, which is the part a crash can lose.
+
+`backup.sqlite` sits beside the registry in the environment's state directory, with the staged
+ciphertext in a `backup/` directory next to it. It holds generation records, object rows, upload
+state and an outbox. It holds **no object key, no plaintext and no filename**: the keys stay with
+the producer until the generation is sealed, and the filenames are inside the encrypted manifest.
+
+Every write changes the state *and* whatever follows from it, in one transaction. Admitting a
+generation writes its object rows and its first outbox entry with it. The object that finishes an
+upload writes the publish step with it, so a host that recorded the object and then died does not
+come back with a complete upload nothing publishes. A publication settles the generation and clears
+its outbox entries together. There is no point at which half a step is recorded, so nothing has to
+guess what the other half was.
+
+### What a restart resolves
+
+Reconciliation runs before anything can add to the store, and it gives one of three answers.
+
+* A generation whose writer this host no longer holds an enrolment for is **cancelled**. It is work
+  this host may not do, whatever state it was left in.
+* A generation whose *publication* was dispatched and never answered is recorded as **unknown**.
+  The service may hold it and may not, and a host that wrote either answer would be writing
+  something it does not know; section 23 never retries that automatically.
+* Everything else **resumes**, dispatched uploads included. The same object under the same identity
+  and hash is the same object, so sending it again is not a second publication.
+
+### What a restore checks, and in what order
+
+The owner's enrolment first, because it is the owner's own signature and it is what says this
+writer may publish for this collection at all. Then the writer key the recovery bundle supplied,
+which must be the key that enrolment names and must be its own identifier. Then the publication's
+structure and its signature under that writer. Then the generation against the checkpoint the owner
+trusts, which refuses an archive older than what the owner verified and one that claims the
+checkpoint's generation with a different manifest. A `VerifiedRestore` is built by that call and by
+nothing else, so the reading half is not reachable without the checking half.
+
+A restore returns data. Session content, device configuration and generation checkpoints come back;
+reusable endpoint and control-signing private keys, the notification extension's preview key, the
+recovery seed, this host's own grant and revocation authority and any revoked grant do not, each
+with the reason rather than as a silent omission. The table is `kr_crypto::backup`'s, so this host
+and the device that made the backup give the same answer.
+
+### What it does not do
+
+It serves no method. `backup.manifest` is a *service* method, which this host calls rather than
+answers, and nothing in this build carries an object to a service: the daemon accounts for what was
+admitted, staged and dispatched, and the upload path itself belongs with the storage service.
+
 ## Privacy mode
 
 Enabling privacy mode records a **privacy generation** and asks the same four things of every
@@ -1433,6 +1485,18 @@ unless explicitly cleared and excluded from later sync while privacy mode is on.
 claimed a functioning durable control system wrote no state at all would be claiming something
 untrue.
 
+Backup production is fenced where it is accounted for. The backup service records the privacy
+generation it is fenced at **durably**, so a host that fenced and restarted does not come back and
+dispatch the entries it had just stopped; it takes back every undispatched outbox entry and settles
+the generations that had nothing else in flight; and it removes the staged ciphertext it holds. It
+reports only what it actually removed: a file it could not unlink stays in the accounting, and the
+failure is recorded and counted as work outstanding, so privacy mode cannot report complete over a
+cleanup that did not happen. Two kinds of generation keep their record once their bytes have gone -
+one that has already been published, because it is shown as a retained artifact rather than
+forgotten, and one with work still in flight, because its outbox entry is what says the cleanup is
+not finished. A publication whose result was produced under an earlier generation is refused rather
+than recorded, under the same comparison every other subsystem uses.
+
 What has already left the host is shown rather than erased. An uploaded archive or notification is
 listed with a separately authorised deletion action for the copies this host holds a reference to;
 it does not silently delete unrelated backup collections and does not claim a copy somebody else
@@ -1454,11 +1518,11 @@ reason to keep output.
 Stated here rather than left to be discovered, because the gap between what a mode is called and
 what it removes is exactly the thing a person cannot check for themselves.
 
-* **Nothing in this build turns it on.** The generation, the contract and the two adapters over
-  the spool and the journal are here and tested; no method or command reaches them, and the
-  transfer preview, description inference, sync and backup subsystems are recorded stubs rather
-  than services. Until a caller exists, privacy mode is a contract this host can keep, not a
-  setting a person has.
+* **Nothing in this build turns it on.** The generation, the contract, the two adapters over the
+  spool and the journal and the backup service's own hook are here and tested; no method or command
+  reaches them, and the transfer preview, description inference and sync subsystems are recorded
+  stubs rather than services. Until a caller exists, privacy mode is a contract this host can keep,
+  not a setting a person has.
 * **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident
   window; the projection's own history is not reached, because removing rows from it while keeping
   the live screen needs an interface the task that owns the projection has to provide.

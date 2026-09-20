@@ -233,6 +233,75 @@ managed resources and keep the product.
 `services::NullService` implements every trait by saying so. It exists so a caller can hold a
 service client unconditionally and get an honest answer rather than a silent default.
 
+## Recovery
+
+`recovery` holds the owner's half of section 20's recovery material: the kit that carries the seed,
+the bundle at its stable locator, and what a fresh restore may put back.
+
+### The kit
+
+One document, printed for a person to type and carried in a QR code's byte mode for a camera to
+read. They are the same bytes, so what a scanner reads is what a person could have typed. It names
+the format and cryptographic profile version, the seed and its checksum, every configured service
+origin and the stable opaque bundle locator, because a seed with no way to find the encrypted
+bundle is not a complete kit.
+
+The seed is grouped Crockford base32: no `I`, `L`, `O` or `U`, so the letters a hand-written kit is
+misread as are not in the alphabet, and reading maps `I` and `L` to `1` and `O` to `0` because that
+is what somebody who wrote them down meant. The checksum catches what the alphabet does not, and it
+is checked before anything is derived, so a mistyped kit fails as a mistyped kit rather than as an
+authentication failure that looks like a hostile service. The rendered document is built into a
+buffer reserved at its exact final size inside `Zeroizing`, so no reallocation leaves a copy of the
+seed behind.
+
+### The bundle
+
+`BundleStore` reads and writes the bundle through `services::SyncBackupService`, which is a
+compare-and-swap over opaque bytes at the locator. Three things follow.
+
+**A writer is declared recovery-enabled only after its bundle has landed.** `enable_writer` commits
+the updated bundle and then returns `WriterEnabled`, which is built nowhere else: a caller cannot
+declare a writer whose bundle did not commit, because it has nothing to declare it with. A rotation
+replaces the old key with the new one in a single commit, since a bundle that briefly held neither
+would refuse the archives the writer had already published.
+
+**A lost comparison is a conflict, not a failure.** Another device that wrote first leaves this one
+with `BundleConflict`, its bundle's revision put back where it was, and the obvious next step:
+read again and apply the change to what is actually there.
+
+**Where the bundle is stored is part of its key.** The encryption key mixes the seed with the
+origin and the locator, so a bundle served from somewhere else does not authenticate. A migration
+is therefore a deliberate re-encryption rather than a copy: `migrate` writes at the new location,
+reads it back, authenticates it there, and only then produces the updated kit and the record. The
+copy at the old location stays there, because this seam publishes and fetches and does not delete,
+and because removing a bundle before its owner has the new kit in hand would be a migration that
+lost what it was moving. `MigrationRecord::describe` says exactly that: keep the updated kit and
+destroy the old one, which still opens the superseded copy.
+
+### A fresh restore
+
+A restore obtains service access through the configured retrieval policy - a managed account or a
+service the owner runs - and then authenticates the bundle with the kit. They are two different
+things: `FreshRestore::open_bundle` refuses before the policy has been satisfied, and the
+ciphertext that access does reach opens only under the owner's own seed. Signing in gets a restore
+to the bytes and no further.
+
+Substituting the origin or the locator fails authentication. A kit will not even build a context
+for an origin it does not name, and a bundle written at one origin does not open under the key
+another derives. It does not fall back to anything, and in particular it does not fall back to a
+writer key an archive supplied: `TrustedMaterial` carries the writers the bundle named, and nothing
+in a restore reads a writer key out of an archive at all.
+
+What a restore puts back is `kr_crypto::backup`'s table, so a device and a host give the same
+answer: session data, device configuration and generation checkpoints. It refuses reusable endpoint
+and control-signing private keys, the notification extension's preview key, the recovery seed,
+this host's grant and revocation authority, and any grant that had been revoked, each with its
+reason rather than as a silent omission. A restored device still has no host access: it requires
+fresh owner-authorised pairing, and it never creates remote-control authority.
+
+The seed comes from the kit or from a device's secure store. Those are the two, and a service is
+not one of them, so an account password reset returns an account and nothing else.
+
 ## Requirement rows
 
 | Row | What closes it |
@@ -246,3 +315,9 @@ service client unconditionally and get an honest answer rather than a silent def
 | KR-REQ-20.13 | `crates/kr-client/tests/sync.rs` drives this row's client rules: per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The service half is closed by the storage service's own suite |
 | §24 privacy | `crates/kr-client/tests/sync.rs` drives the fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, and work whose caller walked away staying outstanding. Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | `the_service_holds_ciphertext_in_a_declared_bucket_and_never_a_setting` and `the_feature_names_its_three_parts_and_which_of_them_is_optional` in `crates/kr-client/tests/sync.rs`, for the encrypted settings sync part only. The history backup and recovery material parts are the recovery module's, and nothing here performs either |
+| KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived` and `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
+| KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared` and `rotating_a_writers_key_replaces_it_in_one_commit` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.17 | `a_backup_never_carries_a_reusable_key_and_a_restore_never_gives_back_a_revoked_grant` and `a_restore_puts_back_data_and_configuration_and_still_needs_fresh_owner_pairing` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.18 | `a_migration_produces_an_updated_kit_and_a_verified_record`, `one_kit_serves_several_services` and `the_encrypted_bundle_and_selected_archives_export_offline` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.19 | `service_access_alone_does_not_decrypt_the_bundle` and `substituting_the_origin_or_the_locator_fails_authentication` in `crates/kr-client/tests/recovery.rs` |

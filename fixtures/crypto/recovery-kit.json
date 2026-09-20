@@ -1,0 +1,24 @@
+{
+  "name": "recovery-kit",
+  "description": "The printable and QR recovery kit of section 20 paragraph 12: the format and crypto profile version, the seed and its checksum, each configured service origin and the stable opaque bundle locator.",
+  "note": "The seed below is the same test material as `kdf.json`, so the two documents agree about its checksum and its derived subkeys. A real seed is 256 random bits and is never a literal.",
+  "kit": {
+    "format": "kalareach-recovery-kit/1",
+    "profile_version": 1,
+    "seed_hex": "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7",
+    "seed_checksum_hex": "e2be22e4",
+    "bundle_locator": "kr-recovery-vector-locator",
+    "service_origins": [
+      "https://reach.kala.to",
+      "https://self-hosted.example"
+    ]
+  },
+  "printed": {
+    "description": "What a person types, and what a QR code carries in byte mode. The two are the same bytes.",
+    "seed_alphabet": "Crockford base32, without I, L, O and U; reading accepts either case and maps I and L to 1 and O to 0.",
+    "seed_groups": "TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBY-5FH2-WG",
+    "document": "kalareach-recovery-kit/1\nseed: TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBX-FNYQ-TZBY-5FH2-WG\nlocator: kr-recovery-vector-locator\norigin: https://reach.kala.to\norigin: https://self-hosted.example\n",
+    "qr_payload_len": 206,
+    "qr_payload_hex": "6b616c6172656163682d7265636f766572792d6b69742f310a736565643a20545a42582d464e59512d545a42582d464e59512d545a42582d464e59512d545a42582d464e59512d545a42582d464e59512d545a42582d464e59512d545a42592d354648322d57470a6c6f6361746f723a206b722d7265636f766572792d766563746f722d6c6f6361746f720a6f726967696e3a2068747470733a2f2f72656163682e6b616c612e746f0a6f726967696e3a2068747470733a2f2f73656c662d686f737465642e6578616d706c650a"
+  }
+}

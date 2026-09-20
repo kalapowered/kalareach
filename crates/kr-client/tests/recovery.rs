@@ -190,6 +190,67 @@ fn a_kit_round_trips_through_its_printable_and_scanned_forms() {
 }
 
 #[test]
+fn the_printed_kit_is_the_document_the_fixture_publishes() {
+    // `fixtures/crypto/recovery-kit.json` pins the exact bytes a person types and a camera reads,
+    // for the same test seed `fixtures/crypto/kdf.json` derives its subkeys from. A change to the
+    // rendering is a change to something already printed on paper, so it fails here rather than
+    // leaving two builds that disagree about what a kit is.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/crypto/recovery-kit.json");
+    let text = std::fs::read_to_string(&path).expect("the recovery kit fixture");
+    let fixture: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+
+    let seed_hex = fixture["kit"]["seed_hex"].as_str().expect("a seed");
+    let seed_bytes: Vec<u8> = (0..seed_hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&seed_hex[index..index + 2], 16).expect("hexadecimal"))
+        .collect();
+    let seed = RecoverySeed::from_stored_bytes(&seed_bytes).expect("the seed");
+    let kit = seed.to_kit(
+        fixture["kit"]["service_origins"]
+            .as_array()
+            .expect("origins")
+            .iter()
+            .map(|origin| origin.as_str().expect("an origin").to_owned())
+            .collect(),
+        fixture["kit"]["bundle_locator"]
+            .as_str()
+            .expect("a locator")
+            .to_owned(),
+    );
+
+    let document = render_kit(&kit).expect("a printable kit");
+    assert_eq!(
+        document.as_str(),
+        fixture["printed"]["document"].as_str().expect("a document")
+    );
+    let scanned = qr_payload(&kit).expect("a QR payload");
+    assert_eq!(
+        scanned.len() as u64,
+        fixture["printed"]["qr_payload_len"]
+            .as_u64()
+            .expect("a length")
+    );
+    assert_eq!(
+        kit.seed_checksum
+            .as_slice()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        fixture["kit"]["seed_checksum_hex"]
+            .as_str()
+            .expect("a checksum")
+    );
+
+    // And the published document reads back to the kit it was printed from.
+    let read = parse_kit(fixture["printed"]["document"].as_str().expect("a document"))
+        .expect("the published document is a kit");
+    assert_eq!(read.seed.expose(), kit.seed.expose());
+    assert_eq!(read.bundle_locator, kit.bundle_locator);
+    assert_eq!(read.service_origins, kit.service_origins);
+}
+
+#[test]
 fn a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived() {
     let seed = RecoverySeed::generate().expect("a seed");
     let kit = kit_of(&seed, &[ORIGIN]);

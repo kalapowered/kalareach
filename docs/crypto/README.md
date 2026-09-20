@@ -129,6 +129,78 @@ takes the trusted writers as an argument and has no way to read one out of the a
 descriptor cannot introduce a writer. A writer whose identifier is not the identifier of its own
 signing key is rejected even if it reaches the trusted list.
 
+## Producing one backup generation
+
+`backup` is the layer above those primitives. It puts them in the order section 20 fixes, so a
+producer does not have to remember it, and it is the only thing in the tree that writes an archive.
+
+1. **Stage each object.** One random 256-bit key, `secretstream` in 1 MiB records, the final
+   authenticated record required. A staged object also holds the SHA-256 of the plaintext it was
+   made from; that digest and the object key are encryption state, they stay on the device, and a
+   producer uploads the ciphertext and nothing else from it.
+2. **Resume by reusing ciphertext.** An upload that stopped is continued with the bytes already
+   created when the source digest still matches, and encryption restarts under a *new* key when it
+   does not: continuing the old ciphertext would produce an object whose records came from two
+   different sources under one key. A resume never reuses a wrap nonce, because sealing a
+   generation is a new call and every call draws a fresh nonce.
+3. **Seal the generation.** The manifest is signed, every member key is wrapped once per recipient,
+   the signed manifest *and those wraps* become the plaintext of one more encrypted object, and the
+   manifest key is wrapped once per recipient into the public descriptor. The member wraps travel
+   inside the manifest object because each one names an object identifier and an encrypted hash,
+   and section 20 keeps both inside the encrypted manifest: only the opaque archive identifier and
+   the encrypted-object references stay outside.
+4. **Open it again.** The descriptor is bounded and validated before anything is allocated, the
+   manifest is decrypted and its signature verified against the owner's trusted writers, the
+   manifest is checked against the descriptor it came with, and only then can a member object be
+   restored. `OpenArchive` cannot be built any other way, so a caller cannot reach the reading half
+   without the checking half.
+
+### Two limits, and which one binds
+
+The public descriptor has two defaults, 64 KiB and 128 recipients, and the first applicable one
+binds. In this encoding that is the byte limit, at **100 recipients**, because a sealed key wrap
+carries its whole authenticated context beside the box and comes to 648 bytes: a hundred of them
+and the descriptor's own fields are 64 902 bytes, and a hundred and one are 65 646. `seal_archive`
+refuses over either limit and names the one it hit, and
+`a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit` pins both numbers, so a
+change to the encoding that moves them is a change a test reports rather than one that quietly
+shrinks how many devices an archive serves.
+
+### Revocation, rotation and the checkpoint
+
+Revoking a recipient removes it from every future wrap, and for a mutable shared collection it
+rotates the keys as well: ciphertext staged before the revocation is discarded and staged again
+under a new key, because a device that kept reading what the others wrote after it left would have
+lost nothing by being removed. Nothing here claims retroactive secrecy.
+`still_readable_after_revocation` computes what the removed device keeps - every generation
+published before the revocation - so a host shows a person that rather than implying otherwise, and
+`Revocation::describe` says it in a sentence.
+
+Old object keys are held against the retained backup that needs them. `RetainedObjectKeys::
+retain_only` is the whole policy: a host passes the backups it still retains and every key kept for
+one it no longer retains goes, keys zeroising as they are dropped.
+
+A signed manifest stops forgery; it does not stop a service handing back an older archive the owner
+really did write. `RestoreGeneration::against` compares one descriptor with the checkpoint the
+owner trusts and says where it stands: at it, ahead of it, replayed from before it, or claiming its
+generation with another manifest. The last two are refused. Where the checkpoint came from travels
+with the answer, because a paired device's and a recovery bundle's mean different things to a
+person. `proves_no_newer_archive` is always false and is a method rather than a comment: a service
+holding a newer archive back looks exactly like an owner who has not written one, and
+`RestoreGeneration::describe` says so in the sentence a restore displays, alongside the generation
+it is restoring.
+
+### What a backup carries
+
+`may_back_up` and `may_restore` are one table, here rather than in each caller, so a device and a
+host cannot answer the question differently. A backup carries session data, device configuration,
+generation checkpoints and grant records. It never carries a reusable endpoint or control-signing
+private key, the notification extension's preview key, the recovery seed or this host's grant and
+revocation authority, and each refusal carries the reason. A restore refuses all of those and one
+more: a grant that had been revoked. `RestoreLimits` states what a restore cannot do whatever it
+put back - it always requires fresh owner-authorised pairing, and it never creates remote-control
+authority.
+
 ## Envelopes and padding
 
 Section 20 puts envelope sizes in declared buckets. A bucket that only described the plaintext would
@@ -248,6 +320,14 @@ device.
 The seed's checksum is the first four bytes of its SHA-256, so a mistyped recovery kit fails before
 anything is decrypted.
 
+The kit's printable and QR forms are one document rather than two encodings: a scanner reads the
+bytes a person could have typed, and there is one format to get right. `kr_client::recovery`
+renders and parses it. The seed is grouped Crockford base32, which leaves out `I`, `L`, `O` and
+`U`, so the pairs a hand-written kit is misread as are not both in the alphabet; reading accepts
+either case and maps `I` and `L` to `1` and `O` to `0`, and the checksum catches what the alphabet
+does not. `fixtures/crypto/recovery-kit.json` publishes the exact document for the same test seed
+`kdf.json` derives its subkeys from.
+
 ## Secret storage
 
 `SecretStore` has three implementations:
@@ -340,15 +420,18 @@ answered by ending idle connections rather than by forgetting a challenge.
 
 ## Vectors
 
-`fixtures/crypto/` holds three documents, regenerated with
+`fixtures/crypto/` holds the documents below. The first four are regenerated with
 `cargo run -p kr-crypto --bin kr-crypto-vectors` and checked in continuous integration with
-`--check`:
+`--check`. `recovery-kit.json` is checked by `crates/kr-client/tests/recovery.rs::
+the_printed_kit_is_the_document_the_fixture_publishes` instead, because the rendering it pins
+belongs to `kr-client` rather than to the vector generator:
 
 | File | Contents |
 | --- | --- |
 | `signatures.json` | Ed25519 signatures over the domain-separated transcripts `fixtures/cbor/digests.json` and `fixtures/protocol/transcripts.json` publish, both `kr-connect/1` proofs over the published connection transcript, the RFC 8032 section 7.1 test vector, and three negative cases a verifier must reject |
 | `envelopes.json` | A sealed mailbox envelope with its authenticated plaintext and canonical bytes; a signed revocation request forwarded in an envelope, with the exact bytes its signature covers; a sealed manifest key wrap with its plaintext; the section 20 size buckets |
 | `kdf.json` | The RFC 5869 HKDF-SHA256 vector, an HMAC-SHA256 vector, the `KRRECOV1` subkeys with the recovery recipient's public key, and the context-bound bundle key |
+| `recovery-kit.json` | The printable and QR recovery kit for the same test seed: its profile version, checksum, grouped base32 seed, locator, origins and the exact document bytes |
 
 Only domain-separated transcripts are signed. `fixtures/cbor/digests.json` also publishes a complete
 mutation object, which is hashed rather than signed: section 23 authenticates a live mutation
