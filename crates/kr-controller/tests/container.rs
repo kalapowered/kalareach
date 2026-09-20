@@ -179,18 +179,18 @@ fn a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container() {
         return;
     }
     let container = Container::start(&unique("kr-t025-space"));
-    // A copy of the shell at a path a command line would split in two. If any layer between here
+    // A small script at a path a command line would split in two. If any layer between here
     // and the container parsed the vector again, this would be "no such file" twice over.
-    let (copied, text) = podman(&[
+    let (created, text) = podman(&[
         "exec",
         "--",
         &container.id,
-        "/bin/cp",
-        "/bin/echo",
-        "/tmp/an echo",
+        "/bin/sh",
+        "-c",
+        "printf '#!/bin/sh\\necho \"$@\"\\n' > '/tmp/an echo' && chmod +x '/tmp/an echo'",
     ]);
     assert!(
-        copied,
+        created,
         "the helper is placed at a path with a space: {text}"
     );
 
