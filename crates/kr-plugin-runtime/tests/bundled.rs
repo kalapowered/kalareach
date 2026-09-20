@@ -486,6 +486,52 @@ fn a_lock_that_claims_more_than_it_may_does_not_activate() {
         "the refusal is about the collision: {error}"
     );
 
+    // Two spellings of one directory. On a case-folding volume they are one directory and on a
+    // case-sensitive one they are two, so a package that used both would mean different things on
+    // two machines and a digest could not speak for it.
+    let (_directory, bundle_root, lock_path) = copy_of_the_bundle();
+    let text = std::fs::read_to_string(&lock_path).expect("the lock reads");
+    let two_spellings = text.replacen(
+        "\"payloads\": [",
+        "\"payloads\": [{\"digest\": \
+         \"8696fa4d9de1f26d0b021aff9a30545d086a30fff8f6298ba7d84f13dbbfec8e\", \
+         \"path\": \"Fixtures/other.json\", \"role\": \"asset\", \"size_bytes\": \"1288\"},",
+        1,
+    );
+    std::fs::write(&lock_path, &two_spellings).expect("a writable lock");
+    let lock = BundleLock::read(&lock_path).expect("the altered lock reads");
+    let error = lock
+        .activate(&open_bundle(&bundle_root), &bundled_plugin())
+        .expect_err("two spellings of one directory do not activate");
+    assert!(
+        error.to_string().contains("are one file"),
+        "the refusal is about the collision: {error}"
+    );
+
+    // Several payloads that each fit and together do not. The sum is taken from the declarations
+    // rather than from the total beside them, so this is refused before a byte is read instead of
+    // after the reader is holding all of it.
+    let (_directory, bundle_root, lock_path) = copy_of_the_bundle();
+    let text = std::fs::read_to_string(&lock_path).expect("the lock reads");
+    let huge = text.replacen(
+        "\"payloads\": [",
+        "\"payloads\": [{\"digest\": \
+         \"8696fa4d9de1f26d0b021aff9a30545d086a30fff8f6298ba7d84f13dbbfec8e\", \
+         \"path\": \"one.bin\", \"role\": \"asset\", \"size_bytes\": \"67108864\"},{\"digest\": \
+         \"8696fa4d9de1f26d0b021aff9a30545d086a30fff8f6298ba7d84f13dbbfec8e\", \
+         \"path\": \"two.bin\", \"role\": \"asset\", \"size_bytes\": \"67108864\"},",
+        1,
+    );
+    std::fs::write(&lock_path, &huge).expect("a writable lock");
+    let lock = BundleLock::read(&lock_path).expect("the altered lock reads");
+    let error = lock
+        .activate(&open_bundle(&bundle_root), &bundled_plugin())
+        .expect_err("a package does not hold twice what a package may hold");
+    assert!(
+        error.to_string().contains("package limit"),
+        "the refusal is about the limit: {error}"
+    );
+
     // A declared length no package may hold. The reader reserves against what a package may hold
     // rather than against what the lock says, so this is refused rather than allocated.
     let (_directory, bundle_root, lock_path) = copy_of_the_bundle();

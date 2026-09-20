@@ -203,7 +203,10 @@ try:
 except OSError as error:
     sys.exit(f"sync-bundled-plugins: {bundle_root} is not a readable directory: {error}")
 
-expected_packages = {package["directory"].split("/")[0] for package in lock["packages"]}
+# One directory per package, directly under the bundle directory. Keeping it to a single segment is
+# what makes the scan below complete: an entry is either a package the lock names or it is drift,
+# with no directory in between for something undeclared to sit in.
+expected_packages = {package["directory"] for package in lock["packages"]}
 
 try:
     # A package the lock does not name is drift too: a host reads what is in this directory, not
@@ -219,6 +222,12 @@ try:
         label = rejection(name)
         if label is not None:
             problems.append(f"the lock's directory {name!r} {label}")
+            continue
+        if "/" in name:
+            problems.append(
+                f"the lock's directory {name!r} is more than one segment;"
+                " a bundled package is one directory"
+            )
             continue
 
         declared = {}

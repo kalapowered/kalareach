@@ -452,9 +452,9 @@ The two checks happen at different times, on purpose.
 | Making the copy | The whole TUF chain: root, timestamp, snapshot, targets, every target's digest and length, expiry enforced | `scripts/sync-bundled-plugins.sh`, through the catalogue tool the plugin repository publishes |
 | Using the copy | Every byte against the digest and length the lock names | `kr_plugin_sdk::bundle`, on every activation |
 
-A host reading a bundled package has no repository and no clock it can trust to be current, so it
-cannot re-run a chain. What it can do is recompute the digest of every byte it is about to use, and
-refuse anything that is not what the lock names. That is what `BundleLock::activate` does: it opens
+A host reading a bundled package has no repository to re-run a chain against: the metadata, the
+mirror and the delegations are all behind the network it has not got. What it can do is recompute
+the digest of every byte it is about to use, and refuse anything that is not what the lock names. That is what `BundleLock::activate` does: it opens
 the package directory relative to a `cap_std::fs::Dir` handle the caller supplies, reads and
 verifies every file, and only then parses anything. A package whose files do not all verify does
 not activate at all, so nothing half-read reaches a caller, and a payload the lock does not name
@@ -492,12 +492,17 @@ disk does not describe. It executes nothing out of the package, and it holds a d
 runs cannot publish at once.
 
 Publishing is three renames: the published entry moves aside, the staged package takes its name, and
-the new lock replaces the old one. Each one is a rename, so the published name is a whole package
+the new lock replaces the old one. Each is a rename, so the published name holds a whole package
 before and after every step and never a mixture of two. It is not a single atomic replacement: POSIX
-has no directory swap, so between the first two renames the name is briefly absent. A run that stops
-there restores what was there; a run that stops between the second and the third leaves the new
-package, the previous one and the new lock all on disk and says where each is, because guessing
-which a person wanted would be worse than telling them.
+has no directory swap, so between the first two renames the name is absent.
+
+What an interruption leaves depends on what kind it was. A failure, a `SIGINT` or a `SIGTERM` runs
+the script's own cleanup, which puts the previous package back when nothing was published, and
+otherwise leaves the new package, the previous one and the new lock all on disk and prints where
+each is, because guessing which a person wanted would be worse than telling them. A `SIGKILL`, a
+power cut or a full disk runs nothing: what is on disk then is whichever renames had happened, and
+`--verify` is how to find out which. The dotted directories beside the published entry are what a
+run left behind, and the lock is what says which package is the right one.
 
 `scripts/sync-bundled-plugins.sh --verify` is the offline half: it recomputes every digest under
 `bundled-plugins/` against the lock and reports any drift, including a file, a directory or a whole

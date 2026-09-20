@@ -15,10 +15,10 @@
 //! signatures are checked, once, by the tool that owns the catalogue; using the copy is where the
 //! digests are checked, every time, by this module.
 //!
-//! That split is deliberate. A host reading a bundled package has no repository and no clock it
-//! can trust to be current, so it cannot re-run a TUF chain. What it can do, and what
-//! [`BundledPackage::activate`] does, is recompute the digest of every byte it is about to use and
-//! refuse anything that is not what the lock names.
+//! That split is deliberate. A host reading a bundled package has no repository to re-run a TUF
+//! chain against: the metadata, the mirror and the delegations are all behind the network it has
+//! not got. What it can do, and what [`BundledPackage::activate`] does, is recompute the digest of
+//! every byte it is about to use and refuse anything that is not what the lock names.
 //!
 //! # What activating a bundled package is
 //!
@@ -406,11 +406,25 @@ impl BundledPackage {
         generation: RepositoryGeneration,
     ) -> Result<ActivatedPackage, BundleError> {
         // What the lock says, checked before anything is opened. A lock is the one input here that
-        // is not covered by a digest, so its own claims are bounded first: no file over what a
-        // package may hold, no name twice, and no two names that are one file on a case-folding
-        // volume. Without that last check two entries could be verified against one file's bytes
-        // and counted twice towards a total that then appeared to add up.
+        // no digest covers, so its own claims are bounded first: no name twice, no two names that
+        // are one file on a case-folding volume, no file over what a package may hold, and a total
+        // that is the sum of the files it lists.
         let declared = self.files();
+
+        // The names first, because what they are is what everything after this counts. Two entries
+        // that are one file would otherwise be verified against one file's bytes and counted twice
+        // towards a total, and the complaint that came out would be about arithmetic rather than
+        // about the two names that caused it.
+        let paths: Vec<PackagePath> = declared.iter().map(|file| file.path.clone()).collect();
+        if let Some(collision) = first_collision(&paths) {
+            return Err(collision);
+        }
+
+        // What the files add up to, from the files themselves rather than from the total beside
+        // them. A lock that declared several payloads of a package's whole size and a total of one
+        // of them would otherwise be read in full before the totals were compared, which is a way
+        // to make this hold as much memory as the lock liked.
+        let mut declared_total: u64 = 0;
         for file in &declared {
             if file.size_bytes.get() > MAX_PACKAGE_BYTES {
                 return Err(BundleError::Oversized {
@@ -419,19 +433,25 @@ impl BundledPackage {
                     limit: MAX_PACKAGE_BYTES,
                 });
             }
+            declared_total = declared_total
+                .checked_add(file.size_bytes.get())
+                .ok_or_else(|| BundleError::Oversized {
+                    path: file.path.clone(),
+                    declared: u64::MAX,
+                    limit: MAX_PACKAGE_BYTES,
+                })?;
         }
-        if self.total_size_bytes.get() > MAX_PACKAGE_BYTES {
+        if declared_total > MAX_PACKAGE_BYTES {
             return Err(BundleError::Oversized {
                 path: self.directory.clone(),
-                declared: self.total_size_bytes.get(),
+                declared: declared_total,
                 limit: MAX_PACKAGE_BYTES,
             });
         }
-        let paths: Vec<PackagePath> = declared.iter().map(|file| file.path.clone()).collect();
-        if let Some(collision) = find_collisions(&paths).into_iter().next() {
-            return Err(BundleError::Collision {
-                first: collision.first,
-                second: collision.second,
+        if declared_total != self.total_size_bytes.get() {
+            return Err(BundleError::Expansion {
+                declared: self.total_size_bytes.get(),
+                actual: declared_total,
             });
         }
 
@@ -723,13 +743,77 @@ fn descend<'a>(
 /// permission this installation has not got.
 fn absence(path: &PackagePath, error: &std::io::Error) -> BundleError {
     if error.kind() == std::io::ErrorKind::NotFound {
-        BundleError::Absent { path: path.clone() }
-    } else {
-        BundleError::Unreadable {
+        return BundleError::Absent { path: path.clone() };
+    }
+    if is_resource_shortage(error) {
+        return BundleError::Resource {
             path: path.clone(),
             detail: error.to_string(),
+        };
+    }
+    BundleError::Unreadable {
+        path: path.clone(),
+        detail: error.to_string(),
+    }
+}
+
+/// Returns true when the system refused for want of something it may have again.
+///
+/// A descriptor table that is full and a page it could not spare are this installation's problem
+/// for the moment, not the bundle's. They are the reason the answer is not simply "absent or
+/// untrusted": a person sent to look for tampering that never happened has been told the wrong
+/// thing.
+fn is_resource_shortage(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(raw) = error.raw_os_error() {
+        return matches!(raw, libc::EMFILE | libc::ENFILE | libc::ENOMEM);
+    }
+    false
+}
+
+/// Returns the first pair of paths that cannot both exist, including two directory spellings.
+///
+/// [`find_collisions`] compares whole file paths, which catches `a/b` against `A/B` and a file that
+/// is another path's directory. It does not catch `Assets/a` beside `assets/b`: two paths that
+/// differ everywhere except in a directory's spelling, which a case-folding volume makes one
+/// directory and a case-sensitive one makes two. A package that means one thing on macOS and
+/// another on Linux is not a package a digest can speak for, so both are refused here.
+fn first_collision(paths: &[PackagePath]) -> Option<BundleError> {
+    if let Some(collision) = find_collisions(paths).into_iter().next() {
+        return Some(BundleError::Collision {
+            first: collision.first,
+            second: collision.second,
+        });
+    }
+
+    let mut folded: BTreeMap<String, PackagePath> = BTreeMap::new();
+    for path in paths {
+        let segments: Vec<&str> = path.segments().collect();
+        for depth in 1..segments.len() {
+            let prefix = segments[..depth].join("/");
+            let key = segments[..depth]
+                .iter()
+                .map(|segment| segment.to_lowercase())
+                .collect::<Vec<_>>()
+                .join("/");
+            match folded.get(&key) {
+                Some(seen) if seen.as_str() != prefix => {
+                    return Some(BundleError::Collision {
+                        first: seen.clone(),
+                        second: PackagePath::new(prefix).ok()?,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    folded.insert(key, PackagePath::new(prefix).ok()?);
+                }
+            }
         }
     }
+    None
 }
 
 #[cfg(test)]
@@ -802,6 +886,46 @@ mod tests {
             BundleLock::from_slice(text.as_bytes(), "lock"),
             Err(LockError::Unparsable { .. })
         ));
+    }
+
+    #[test]
+    fn a_local_shortage_is_not_an_untrusted_repository() {
+        let path = PackagePath::new("README.md").expect("a package path");
+        let shortage = std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+        assert_eq!(
+            absence(&path, &shortage).code(),
+            ErrorCode::ResourceUnavailable
+        );
+
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            absence(&path, &missing).code(),
+            ErrorCode::PackageUnavailableOffline
+        );
+
+        let refused = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            absence(&path, &refused).code(),
+            ErrorCode::RepositoryUntrusted
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_directory_are_one_name() {
+        let paths = ["Assets/a.json", "assets/b.json"]
+            .into_iter()
+            .map(|value| PackagePath::new(value).expect("a package path"))
+            .collect::<Vec<_>>();
+        assert!(
+            first_collision(&paths).is_some(),
+            "two spellings of one directory cannot both exist"
+        );
+
+        let apart = ["assets/a.json", "fixtures/b.json"]
+            .into_iter()
+            .map(|value| PackagePath::new(value).expect("a package path"))
+            .collect::<Vec<_>>();
+        assert!(first_collision(&apart).is_none());
     }
 
     #[test]

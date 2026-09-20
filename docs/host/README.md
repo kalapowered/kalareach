@@ -82,6 +82,10 @@ included, is `REPOSITORY_UNTRUSTED`. A read the machine could not make for want 
 memory is neither, and is `RESOURCE_UNAVAILABLE`: sending a person to look for tampering that never
 happened is its own kind of wrong answer.
 
+The bundle holds one directory per package, directly under `bundled-plugins/`. A file, a directory
+or a whole package that is there and is not in the lock is drift, and the check that reads the lock
+reports it.
+
 What the bundle is not: a catalogue, an enrolled repository, or a grant. It carries one generation,
 frozen at the commit it was copied from, and the package's capability requests, grants and
 repository ceiling are applied to it exactly as they are to anything installed. The plugin runtime
