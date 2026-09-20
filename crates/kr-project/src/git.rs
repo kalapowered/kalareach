@@ -261,8 +261,8 @@ const FORBIDDEN_LONG: &[&str] = &[
     "--work-tree",
 ];
 
-/// The object name Git reads as "no object", which is how a reference is deleted.
-const NULL_OBJECT: &str = "0000000000000000000000000000000000000000";
+/// The lengths of a full object name, for the two object formats Git repositories use.
+const OBJECT_NAME_LENGTHS: [usize; 2] = [40, 64];
 
 /// Refuses anything but a full reference name for a reference this service moves.
 ///
@@ -274,7 +274,10 @@ fn check_reference_name(name: &str) -> Result<()> {
         || name.ends_with('/')
         || name.contains("//")
         || name.contains("..")
-        || name.contains('@')
+        // `@{` is Git's own reflog and upstream syntax, which names something other than the
+        // reference. A bare `@` is an ordinary character in a reference name.
+        || name.contains("@{")
+        || name.ends_with('@')
         || name.contains('\\')
         || name.contains('~')
         || name.contains('^')
@@ -304,7 +307,7 @@ fn check_reference_name(name: &str) -> Result<()> {
 /// This service moves a reference that exists to another object that exists, so neither position
 /// takes it.
 fn check_object_name(name: &str, position: &str) -> Result<()> {
-    if name.len() != NULL_OBJECT.len()
+    if !OBJECT_NAME_LENGTHS.contains(&name.len())
         || !name
             .chars()
             .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
@@ -313,7 +316,8 @@ fn check_object_name(name: &str, position: &str) -> Result<()> {
             format!("{} is not {} as a full object name", redact(name), position).into(),
         ));
     }
-    if name == NULL_OBJECT {
+    // The null object of whichever format this name is written in.
+    if name.chars().all(|character| character == '0') {
         return Err(ProjectError::InvalidArgument(
             format!(
                 "the null object as {} deletes or creates a reference; this service moves one \

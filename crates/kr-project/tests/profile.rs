@@ -348,6 +348,15 @@ fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
         OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
     ])
     .expect("update-ref with --no-deref is permitted");
+    // A repository whose object format is the longer one names its objects in it, and `@` is an
+    // ordinary character in a reference name: only Git's own `@{` syntax names something else.
+    check_arguments(&[
+        OsStr::new("update-ref"),
+        OsStr::new("refs/heads/release@2026"),
+        OsStr::new(&"a".repeat(64)),
+        OsStr::new(&"b".repeat(64)),
+    ])
+    .expect("a reference and objects a repository can really hold are permitted");
 
     for (refused, reason) in [
         (
@@ -449,6 +458,24 @@ fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
                 OsStr::new("0123456789abcdef0123456789abcdef01234567"),
             ],
             "is not a full reference name",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/main@{1}"),
+                OsStr::new("abcdef0123456789abcdef0123456789abcdef01"),
+                OsStr::new("0123456789abcdef0123456789abcdef01234567"),
+            ],
+            "is not a full reference name",
+        ),
+        (
+            vec![
+                OsStr::new("update-ref"),
+                OsStr::new("refs/heads/main"),
+                OsStr::new(&"0".repeat(64)),
+                OsStr::new(&"b".repeat(64)),
+            ],
+            "deletes or creates a reference",
         ),
         (
             vec![
