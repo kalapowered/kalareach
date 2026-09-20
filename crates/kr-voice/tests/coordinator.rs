@@ -88,6 +88,19 @@ struct Authority {
     store: Mutex<Store>,
     device_grant: Mutex<Option<Grant>>,
     identity: AuthorisationKey,
+    lookups: Lookups,
+}
+
+/// A standing-grant lookup a test can hold open, and the number that have begun.
+///
+/// A real lookup reads a store, so it takes time, and that time is the window two changes to one
+/// device's voice grant can meet in. Holding the first one open puts them both in that window on
+/// purpose rather than hoping the scheduler interleaves two fast calls.
+#[derive(Debug, Default)]
+struct Lookups {
+    started: std::sync::atomic::AtomicU64,
+    holding: Mutex<bool>,
+    resumed: std::sync::Condvar,
 }
 
 impl Authority {
@@ -99,7 +112,26 @@ impl Authority {
             }),
             device_grant: Mutex::new(Some(device_grant)),
             identity,
+            lookups: Lookups::default(),
         }
+    }
+
+    /// Holds the next standing-grant lookup open until [`Authority::release_lookup`].
+    fn hold_next_lookup(&self) {
+        *self.lookups.holding.lock().expect("the held lookup") = true;
+    }
+
+    /// Lets the held lookup finish.
+    fn release_lookup(&self) {
+        *self.lookups.holding.lock().expect("the held lookup") = false;
+        self.lookups.resumed.notify_all();
+    }
+
+    /// How many standing-grant lookups have begun.
+    fn lookups_started(&self) -> u64 {
+        self.lookups
+            .started
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Narrows the device's ordinary grant, the way revoking and reissuing one does.
@@ -116,6 +148,25 @@ impl Authority {
             .expect("the store")
             .revoked
             .contains(&grant_id)
+    }
+
+    /// The standing voice grants this device holds that nothing has revoked.
+    ///
+    /// More than one is the failure the atomic replacement exists to prevent: two scopes standing
+    /// at once, only one of which the person was shown.
+    fn standing_grants(&self, device_id: DeviceId) -> Vec<GrantId> {
+        let store = self.store.lock().expect("the store");
+        store
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.recipient_device_id == device_id
+                    && grant.parent_grant_id.0.is_none()
+                    && grant.permits(ActionRight::VoiceUse)
+                    && !store.revoked.contains(&grant.grant_id)
+            })
+            .map(|grant| grant.grant_id)
+            .collect()
     }
 
     fn revoked_at(&self, grant_id: GrantId) -> Option<u64> {
@@ -159,6 +210,18 @@ impl VoiceAuthority for Authority {
         device_id: DeviceId,
         _now_ms: u64,
     ) -> kr_voice::Result<Option<Grant>> {
+        self.lookups
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut holding = self.lookups.holding.lock().expect("the held lookup");
+        while *holding {
+            holding = self
+                .lookups
+                .resumed
+                .wait(holding)
+                .expect("the held lookup is released");
+        }
+        drop(holding);
         let store = self.store.lock().expect("the store");
         Ok(store
             .grants
@@ -938,6 +1001,72 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
     assert!(
         fixture.broker.closed().is_empty(),
         "nothing closed the call the first start was creating"
+    );
+}
+
+/// KR-REQ-15.21: two changes to one device's standing voice grant leave one grant standing,
+/// whichever order they run in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
+    let fixture = fixture();
+    let coordinator = Arc::new(fixture.coordinator);
+    coordinator
+        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
+        .expect("a standing voice grant");
+    let before = fixture.authority.lookups_started();
+    // The first change is held inside the store lookup, which is the window the second one would
+    // otherwise read the same standing grant in.
+    fixture.authority.hold_next_lookup();
+
+    let narrow = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .grant(
+                    &grant_params(Some(&[VoiceAction::Navigate])),
+                    AuthorityRevision::new(1),
+                    10_100,
+                )
+                .await
+                .expect("a narrower standing voice grant")
+                .grant_id
+        }
+    });
+    while fixture.authority.lookups_started() == before {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let wider = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .grant(
+                    &grant_params(Some(&[VoiceAction::Navigate, VoiceAction::Status])),
+                    AuthorityRevision::new(1),
+                    10_100,
+                )
+                .await
+                .expect("a wider standing voice grant")
+                .grant_id
+        }
+    });
+    // Long enough for the second change to get as far as it can while the first is held.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    fixture.authority.release_lookup();
+
+    let narrow = narrow.await.expect("the narrower change finishes");
+    let wider = wider.await.expect("the wider change finishes");
+    assert_ne!(narrow, wider);
+
+    let standing = fixture.authority.standing_grants(device(PHONE));
+    assert_eq!(
+        standing.len(),
+        1,
+        "one standing voice grant stands, not two scopes at once: {standing:?}"
+    );
+    assert!(
+        standing == vec![narrow] || standing == vec![wider],
+        "the one standing is one of the two that were written: {standing:?}"
     );
 }
 

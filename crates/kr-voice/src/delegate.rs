@@ -234,23 +234,31 @@ impl Coordinator {
                 authority_revision,
             },
         )?;
-        // The one this replaces goes first. A second standing grant beside the first would leave
-        // the old scope authorising calls nobody can see in the new statement, and the store's
-        // cascade is what ends the calls running under it.
-        let replaced = self
-            .authority
-            .standing_voice_grant(params.device_id, now_ms)?;
-        let mut ending: Vec<String> = Vec::new();
-        if let Some(replaced) = replaced.as_ref() {
-            self.authority.revoke(replaced.grant_id, now_ms)?;
+        // Reading the grant this replaces, withdrawing it and writing the new one happen together
+        // or not at all. Every one of the three is a synchronous call on the host's store, so
+        // holding this coordinator's own lock across them is what makes the replacement atomic:
+        // two changes arriving at once cannot each read the same standing grant, withdraw it and
+        // leave two replacements standing. The broker is told afterwards, outside the lock.
+        let (written, ending) = {
             let mut state = self.state.lock().expect("the coordinator's state");
-            for ended in state.sessions.stop_under(replaced.grant_id) {
-                state.ledger.forget_session(ended.voice_session_id);
-                if let Some(call_id) = ended.call_id {
-                    ending.push(call_id);
+            let replaced = self
+                .authority
+                .standing_voice_grant(params.device_id, now_ms)?;
+            let mut ending: Vec<String> = Vec::new();
+            if let Some(replaced) = replaced.as_ref() {
+                // The one this replaces goes first. A second standing grant beside the first would
+                // leave the old scope authorising calls nobody can see in the new statement, and
+                // the store's cascade is what ends the calls running under it.
+                self.authority.revoke(replaced.grant_id, now_ms)?;
+                for ended in state.sessions.stop_under(replaced.grant_id) {
+                    state.ledger.forget_session(ended.voice_session_id);
+                    if let Some(call_id) = ended.call_id {
+                        ending.push(call_id);
+                    }
                 }
             }
-        }
+            (self.authority.issue(&planned.plan)?, ending)
+        };
         // Outside the lock, and after the authority is already gone: a call whose grant this
         // change withdrew is finalised rather than left metering until its own deadline.
         if let Some(provider) = self.provider.clone() {
@@ -258,7 +266,6 @@ impl Coordinator {
                 self.close_unbound(&provider, call_id).await;
             }
         }
-        let written = self.authority.issue(&planned.plan)?;
 
         Ok(VoiceGrantResult {
             grant_id: written.grant_id,
