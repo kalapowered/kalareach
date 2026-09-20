@@ -436,6 +436,43 @@ pub enum ObjectPolicy {
     ReadableFile,
 }
 
+/// An access-control list read from or applied to a file descriptor.
+///
+/// Each platform stores an access-control list differently. On Apple platforms it lives beside
+/// the mode bits in the platform's extended ACL system, manipulated through descriptors via libc.
+/// On Linux it is a POSIX ACL stored in the `system.posix_acl_access` extended attribute.
+/// A file whose protection is its mode bits alone carries [`AccessControl::None`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccessControl {
+    /// The file carries no access-control list beyond its mode bits.
+    None,
+    /// An Apple extended access-control list text representation.
+    #[cfg(target_os = "macos")]
+    Apple(String),
+    /// A POSIX access-control list raw attribute bytes on Linux.
+    #[cfg(target_os = "linux")]
+    Posix(Vec<u8>),
+    /// A platform whose access-control lists this host does not know how to read.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Unsupported,
+}
+
+impl AccessControl {
+    /// Returns true when this represents a file carrying an access-control list beyond mode bits.
+    #[must_use]
+    pub const fn has_entries(&self) -> bool {
+        match self {
+            Self::None => false,
+            #[cfg(target_os = "macos")]
+            Self::Apple(_) => true,
+            #[cfg(target_os = "linux")]
+            Self::Posix(_) => true,
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            Self::Unsupported => false,
+        }
+    }
+}
+
 impl ObjectPolicy {
     fn check(self, metadata: &cap_std::fs::Metadata, what: &str) -> Result<(), Escape> {
         if !metadata.is_file() {
@@ -1179,6 +1216,85 @@ impl AuthorisedFile {
         }
     }
 
+    /// Returns the access-control list of this file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform call fails for a reason other than absence.
+    pub fn access_control(&self) -> std::io::Result<AccessControl> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsFd as _;
+
+            match crate::apple::read_access_control(self.file.as_fd())? {
+                Some(text) => Ok(AccessControl::Apple(text)),
+                None => Ok(AccessControl::None),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd as _;
+
+            match read_linux_access_control(self.file.as_fd())? {
+                Some(bytes) => Ok(AccessControl::Posix(bytes)),
+                None => Ok(AccessControl::None),
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Ok(AccessControl::Unsupported)
+        }
+    }
+
+    /// Sets or clears the access-control list of this file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform call fails.
+    pub fn set_access_control(&self, acl: &AccessControl) -> std::io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsFd as _;
+
+            match acl {
+                AccessControl::None => crate::apple::set_access_control(self.file.as_fd(), None),
+                AccessControl::Apple(text) => {
+                    crate::apple::set_access_control(self.file.as_fd(), Some(text))
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd as _;
+
+            match acl {
+                AccessControl::None => set_linux_access_control(self.file.as_fd(), None),
+                AccessControl::Posix(bytes) => {
+                    set_linux_access_control(self.file.as_fd(), Some(bytes))
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            match acl {
+                AccessControl::None => Ok(()),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "access-control lists cannot be written on this platform",
+                )),
+            }
+        }
+    }
+
+    /// Clears any access-control list on this file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform call fails.
+    pub fn clear_access_control(&self) -> std::io::Result<()> {
+        self.set_access_control(&AccessControl::None)
+    }
+
     /// Rereads the object's identity, length and kind through the handle.
     ///
     /// # Errors
@@ -1681,6 +1797,60 @@ fn create_owner_only_directory(directory: &Dir, path: &str) -> std::io::Result<(
     // The staging root carries the owner-only access-control list and blocks inheritance from
     // above it; a directory created beneath it inherits that list.
     directory.create_dir(path)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_access_control(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::fd::AsFd as _;
+
+    let mut initial = [0_u8; 256];
+    match rustix::fs::fgetxattr(fd.as_fd(), "system.posix_acl_access", &mut initial[..]) {
+        Ok(size) => Ok(Some(initial[..size].to_vec())),
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(None),
+        Err(rustix::io::Errno::RANGE) => {
+            let size = match rustix::fs::fgetxattr(
+                fd.as_fd(),
+                "system.posix_acl_access",
+                &mut [0_u8; 0][..],
+            ) {
+                Ok(size) => size,
+                Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            let mut buf = vec![0_u8; size];
+            match rustix::fs::fgetxattr(fd.as_fd(), "system.posix_acl_access", &mut buf) {
+                Ok(read_size) => {
+                    buf.truncate(read_size);
+                    Ok(Some(buf))
+                }
+                Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_access_control(
+    fd: std::os::fd::BorrowedFd<'_>,
+    acl: Option<&[u8]>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+
+    match acl {
+        None => match rustix::fs::fremovexattr(fd.as_fd(), "system.posix_acl_access") {
+            Ok(()) | Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(()),
+            Err(err) => Err(err.into()),
+        },
+        Some(bytes) => rustix::fs::fsetxattr(
+            fd.as_fd(),
+            "system.posix_acl_access",
+            bytes,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .map_err(std::io::Error::from),
+    }
 }
 
 #[cfg(test)]

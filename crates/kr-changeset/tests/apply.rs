@@ -444,6 +444,85 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
     );
 }
 
+/// KR-REQ-14.29: a direct apply preserves an access-control list on the destination.
+///
+/// An access-control list is protection this host must neither lose silently nor refuse across
+/// an apply: the list is read through the destination handle, restored onto the staged copy, and
+/// verified on read-back of the published file.
+#[test]
+fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "source-tree");
+    write_bytes(&source, "README.md", b"updated content with ACL\n");
+    let source_workspace = fixture.workspace("source-tree");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "destination-tree");
+    let readme_path = destination.join("README.md");
+    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+    let given = if cfg!(target_os = "macos") {
+        std::process::Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(format!("{who} allow read"))
+            .arg(&readme_path)
+            .status()
+    } else {
+        std::process::Command::new("setfacl")
+            .arg("-m")
+            .arg(format!("u:{who}:r"))
+            .arg(&readme_path)
+            .status()
+    };
+    match given {
+        Ok(status) if status.success() => {
+            let workspace = fixture.workspace("destination-tree");
+            let affected = expectations(&destination, &["README.md"]);
+            let limitations = apply::limitations(DestinationClass::SharedExisting);
+            let order = support::apply_order(
+                reference(&record),
+                DestinationClass::SharedExisting,
+                workspace,
+                &affected,
+                &limitations,
+            );
+            let result = apply::apply(fixture.service(), &order).expect("the apply runs");
+            assert_eq!(
+                result.outcome,
+                Nullable(Some(ApplyOutcomeClass::Applied)),
+                "{}: {:?}",
+                result.detail,
+                result.progress
+            );
+            assert_eq!(
+                support::read_bytes(&destination, "README.md"),
+                b"updated content with ACL\n"
+            );
+            let authority = kr_transfer::AuthorisedDirectory::open_root(
+                fixture.service().environment_id(),
+                &destination,
+            )
+            .expect("opens authority");
+            let name = kr_transfer::RelativeName::parse("README.md").expect("valid name");
+            let file = authority
+                .open_read(&name, kr_transfer::ObjectPolicy::ReadableFile)
+                .expect("opens file");
+            assert!(
+                file.carries_access_control(),
+                "the destination still carries its access-control list after apply"
+            );
+            let acl = file.access_control().expect("reads access control");
+            assert!(
+                acl.has_entries(),
+                "the destination's access-control list has entries"
+            );
+        }
+        _ => println!(
+            "not exercised: this platform's access-control tool did not run, so the \
+             ACL preservation apply test was skipped"
+        ),
+    }
+}
+
 /// KR-REQ-14.28: a direct apply is not chosen until its limitation has been shown.
 #[test]
 fn a_direct_apply_is_refused_until_its_limitation_has_been_shown() {

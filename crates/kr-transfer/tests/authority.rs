@@ -590,6 +590,11 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
         !file.carries_access_control(),
         "a file whose protection is its mode bits alone carries no list"
     );
+    assert_eq!(
+        file.access_control().expect("reads access control"),
+        kr_transfer::AccessControl::None,
+        "ordinary file has no access-control list"
+    );
     drop(file);
 
     // The other half needs the platform's own tool. Where it is not installed, this says so rather
@@ -619,6 +624,57 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
             assert!(
                 file.carries_access_control(),
                 "a file with a list says so through its own handle"
+            );
+            let acl = file.access_control().expect("reads access control");
+            assert!(
+                acl.has_entries(),
+                "read access-control list carries entries"
+            );
+            drop(file);
+
+            // Restoring the read access-control list onto a second file descriptor sets the same list.
+            let target_name = RelativeName::parse("target.txt").expect("a name");
+            std::fs::write(root.path().join("target.txt"), b"target\n").expect("a target file");
+            let target = authority
+                .open_write(&target_name)
+                .expect("opens target write");
+            assert!(!target.carries_access_control());
+            target
+                .set_access_control(&acl)
+                .expect("restores access-control list");
+            drop(target);
+
+            // Re-read target and verify it matches the source list.
+            let target_read = authority
+                .open_read(&target_name, ObjectPolicy::ReadableFile)
+                .expect("opens target read");
+            assert!(target_read.carries_access_control());
+            assert_eq!(
+                target_read.access_control().expect("reads target acl"),
+                acl,
+                "restored access-control list matches the source exactly"
+            );
+            drop(target_read);
+
+            // Clearing the access-control list leaves the file with no list.
+            let target_clear = authority
+                .open_write(&target_name)
+                .expect("opens target write");
+            target_clear
+                .clear_access_control()
+                .expect("clears access-control list");
+            drop(target_clear);
+
+            let target_cleared = authority
+                .open_read(&target_name, ObjectPolicy::ReadableFile)
+                .expect("opens target read");
+            assert!(
+                !target_cleared.carries_access_control(),
+                "cleared file carries no access-control list"
+            );
+            assert_eq!(
+                target_cleared.access_control().expect("reads cleared acl"),
+                kr_transfer::AccessControl::None
             );
         }
         _ => println!(

@@ -1602,7 +1602,7 @@ fn install(
             .sync_all()
             .map_err(ChangeSetError::storage)?;
         let carried = match carry_permissions(&here, &leaf_name, &staged, executable)? {
-            Some(mode) => mode,
+            Some(permissions) => permissions,
             None => {
                 return Ok(Installed::Unresolved(
                     "this host could not read what permissions the destination has, and it does \
@@ -1643,7 +1643,7 @@ fn install(
         // from that would be a claim about another tree.
         let expected = digest_of(bytes);
         match read_destination(&here, &leaf_name)? {
-            Some(landed) if landed == expected && !published_with(&here, &leaf_name, carried) => {
+            Some(landed) if landed == expected && !published_with(&here, &leaf_name, &carried) => {
                 Ok(Installed::Unresolved(
                     "the destination holds the content this host installed under permissions this \
                      host did not set on it"
@@ -1847,48 +1847,59 @@ const PERMISSION_BITS: u32 = 0o7777;
 /// Puts the destination's own permissions on the staged copy before it is renamed over it.
 ///
 /// Returns the mode it set, so the read-back after the rename can confirm the published file
-/// carries it, and nothing when the destination is there and this host could not read what
-/// permissions it has: replacing a file whose protection cannot be carried across is exactly what
-/// "preserve permissions" forbids, so the path is left alone instead.
+/// The permissions and access-control list carried across a replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CarriedPermissions {
+    mode: u32,
+    #[cfg(unix)]
+    access_control: kr_transfer::AccessControl,
+}
+
+/// Carries permissions from the destination to the staged copy: preserves the destination's mode
+/// bits and access-control list.
 ///
-/// What this carries is the platform's mode bits. An access-control list beside them is not
-/// carried, and that is stated as a limit rather than quietly lost.
+/// Returns the carried permissions when the destination's mode and list were read and applied,
+/// the default permissions when the path is absent (the version's executable bit decides), and
+/// nothing when the destination is there and this host could not read what permissions it has:
+/// replacing a file whose protection cannot be carried across is exactly what "preserve
+/// permissions" forbids, so the path is left alone instead.
 #[cfg(unix)]
 fn carry_permissions(
     destination: &AuthorisedDirectory,
     leaf: &RelativeName,
     staged: &kr_transfer::AuthorisedFile,
     executable: bool,
-) -> Result<Option<u32>> {
+) -> Result<Option<CarriedPermissions>> {
     use cap_std::fs::PermissionsExt as _;
     let existing = match destination.open_read(leaf, ObjectPolicy::ReadableFile) {
         Ok(file) => {
-            // An access-control list is protection this host cannot carry across a replacement,
-            // and losing it silently is exactly what preserving permissions forbids. A destination
-            // that has one is left alone and reported. Asked of the handle this host has open on
-            // it, never of its name.
-            if file.carries_access_control() {
-                return Ok(None);
-            }
-            match file.handle().metadata() {
+            let mode = match file.handle().metadata() {
                 // The permission bits alone: what a platform reports beside them says what kind of
                 // object it is rather than who may use it, and setting those back is not carrying
                 // permissions across.
-                Ok(metadata) => Some(metadata.permissions().mode() & PERMISSION_BITS),
+                Ok(metadata) => metadata.permissions().mode() & PERMISSION_BITS,
                 Err(_) => return Ok(None),
-            }
+            };
+            let acl = match file.access_control() {
+                Ok(acl) => acl,
+                Err(_) => return Ok(None),
+            };
+            Some((mode, acl))
         }
         // Absent is not a failure to read: there is nothing there whose permissions to carry, so
         // the version's own bit decides.
         Err(kr_transfer::Escape::NotFound { .. }) => None,
         Err(_) => return Ok(None),
     };
-    let mode = existing.unwrap_or(if executable { 0o755 } else { 0o644 });
-    // A directory can carry a **default** access-control list, which the platform puts on every
-    // file created inside it. The copy this host just made would then reach the destination
-    // carrying protection the file it replaces never had, and the mode bits alone would not say
-    // so. It is taken off the copy before the mode is set, or the path is left alone.
-    if !clear_inherited_access_control(staged) {
+    let (mode, target_acl) = existing.unwrap_or((
+        if executable { 0o755 } else { 0o644 },
+        kr_transfer::AccessControl::None,
+    ));
+    // Restore the destination's access-control list onto the staged copy, or clear any inherited
+    // list if the destination has none. A directory can carry a default access-control list that
+    // attaches to every file made inside it, so the staged copy must match the destination's
+    // protection before the mode bits are set.
+    if staged.set_access_control(&target_acl).is_err() {
         return Ok(None);
     }
     // Through the handle this host created a moment ago, not through the name: a name reopened is
@@ -1897,7 +1908,10 @@ fn carry_permissions(
         .handle()
         .set_permissions(cap_std::fs::Permissions::from_mode(mode))
         .map_err(ChangeSetError::storage)?;
-    Ok(Some(mode))
+    Ok(Some(CarriedPermissions {
+        mode,
+        access_control: target_acl,
+    }))
 }
 
 /// Does nothing: this platform has no mode bits to carry across.
@@ -1907,8 +1921,8 @@ fn carry_permissions(
     _leaf: &RelativeName,
     _staged: &kr_transfer::AuthorisedFile,
     _executable: bool,
-) -> Result<Option<u32>> {
-    Ok(Some(0))
+) -> Result<Option<CarriedPermissions>> {
+    Ok(Some(CarriedPermissions { mode: 0 }))
 }
 
 /// Returns true when the published file carries the permissions this host set on the copy it
@@ -1918,46 +1932,35 @@ fn carry_permissions(
 /// file substituted between the rename and the read-back can hold the same bytes under different
 /// protection, and an apply that reported success for it would have changed who can read it.
 #[cfg(unix)]
-fn published_with(directory: &AuthorisedDirectory, name: &RelativeName, mode: u32) -> bool {
+fn published_with(
+    directory: &AuthorisedDirectory,
+    name: &RelativeName,
+    carried: &CarriedPermissions,
+) -> bool {
     use cap_std::fs::PermissionsExt as _;
-    directory
-        .open_read(name, ObjectPolicy::ReadableFile)
-        .ok()
-        .and_then(|file| file.handle().metadata().ok())
-        .is_some_and(|metadata| metadata.permissions().mode() & PERMISSION_BITS == mode)
+    let Ok(file) = directory.open_read(name, ObjectPolicy::ReadableFile) else {
+        return false;
+    };
+    let Ok(metadata) = file.handle().metadata() else {
+        return false;
+    };
+    if metadata.permissions().mode() & PERMISSION_BITS != carried.mode {
+        return false;
+    }
+    let Ok(acl) = file.access_control() else {
+        return false;
+    };
+    acl == carried.access_control
 }
 
 /// Returns true: this platform has no mode bits for this host to have set.
 #[cfg(not(unix))]
-fn published_with(_directory: &AuthorisedDirectory, _name: &RelativeName, _mode: u32) -> bool {
+fn published_with(
+    _directory: &AuthorisedDirectory,
+    _name: &RelativeName,
+    _carried: &CarriedPermissions,
+) -> bool {
     true
-}
-
-/// Takes any inherited access-control list off the copy this host staged.
-///
-/// Returns false when the copy carries one this host could not take off, because publishing it
-/// would give the destination protection the file it replaces never had. A directory can carry an
-/// inheritable entry, and every file made inside it then starts with a list of its own.
-#[cfg(target_os = "linux")]
-fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool {
-    match rustix::fs::fremovexattr(staged.handle(), "system.posix_acl_access") {
-        // There was one and it is off.
-        Ok(()) => true,
-        // There was none to take off, which is the ordinary case.
-        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => true,
-        Err(_) => false,
-    }
-}
-
-/// Returns false when the copy this host staged inherited an access-control list.
-///
-/// This platform keeps a file's list where nothing may write it, so the list cannot be taken off
-/// the copy here. What is established instead is whether there is one, asked of the copy's **own
-/// descriptor**, and a copy that has one ends the operation: the destination is left exactly as it
-/// was rather than replaced by a file carrying protection it never had.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool {
-    !staged.carries_access_control()
 }
 
 /// Returns a second authority over one working tree, confined to the tree's own mount.
