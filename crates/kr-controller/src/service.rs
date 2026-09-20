@@ -1555,6 +1555,13 @@ impl Controller {
         ) {
             return self.retained_authority_change(actor_id, mutation);
         }
+        // A voice change is one of those records: section 9 keeps a receipt readable after the
+        // window that admitted it has expired, and a retry that cannot reach its result would
+        // otherwise be told its window is gone rather than what happened. A delegation is not
+        // here, because its signed resubmission is the same action carrying a different payload.
+        if crate::voice::VoiceModule::serves(method) && method != Method::VoiceDelegate {
+            return self.retained_authority_change(actor_id, mutation);
+        }
 
         if method != Method::SessionCreate {
             return None;
@@ -2326,28 +2333,42 @@ impl Controller {
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
             let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
             let narrowed = self.voice_authority_now(proposal, session_id)?;
-            // The same bound the context path applies. What an effect answers with is content
-            // about the session, so a grant whose history begins after this session was created
-            // hears that it is running and not where it runs: a result that skipped the filter
-            // would be the way round the bound rather than an exception to it.
+            // The same bound the context path applies, and the answer is built from what it
+            // admitted and from nothing else. A session's description carries its number and the
+            // shell it runs, and both are facts from the moment it was created: naming them after
+            // the filter had withheld them would be the way round the bound rather than an answer
+            // under it. Whether a session that is still running is running is a fact about now,
+            // so it travels with a description the bound admitted.
+            let live = read.session.state != kr_protocol::session::SessionState::Closed;
             let state = read.session.state.as_str().to_owned();
-            let display_number = read.session.display_number;
             let filtered = crate::voice::filtered(
                 crate::voice::snapshot_of(&read.session, session_id),
                 &narrowed,
             );
+            let summary = match (filtered.session_description, filtered.working_directory) {
+                (None, _) => "this grant's history does not reach that session".to_owned(),
+                (Some(description), directory) => {
+                    let mut summary = description.text;
+                    if live {
+                        summary.push_str(" is ");
+                        summary.push_str(&state);
+                    }
+                    match directory {
+                        Some(directory) => {
+                            summary.push_str(" in ");
+                            summary.push_str(&directory.text);
+                        }
+                        None => {
+                            summary.push_str("; where it runs is outside what this grant may see");
+                        }
+                    }
+                    summary
+                }
+            };
             return Ok(kr_voice::seams::HostReceipt {
                 action_id,
                 performed: true,
-                summary: match filtered.working_directory {
-                    Some(directory) => {
-                        format!("session {display_number} is {state} in {}", directory.text)
-                    }
-                    None => format!(
-                        "session {display_number} is {state}; where it runs is outside what this \
-                         grant may see"
-                    ),
-                },
+                summary,
             });
         }
         Ok(kr_voice::seams::HostReceipt {
@@ -2379,6 +2400,17 @@ impl Controller {
         method: Method,
         authority_revision: AuthorityRevision,
     ) -> Result<ParamsValue> {
+        // A delegation is not deduplicated by its payload, and must not be: section 15 ¶8 binds a
+        // confirmation to the request that asked for it, so the signed resubmission is the same
+        // action identifier carrying a different payload, which is exactly what a payload digest
+        // refuses. What makes one delegation one action is the delegation identifier, which the
+        // coordinator spends when it admits one.
+        if method == Method::VoiceDelegate {
+            return self
+                .voice()
+                .answer(actor, mutation, method, authority_revision, wall_clock_ms())
+                .await;
+        }
         // What this action already produced, if it produced anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict.
         if let Some(answered) = self.voice_answered(actor_id, mutation)? {

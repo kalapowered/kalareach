@@ -171,6 +171,10 @@ impl VoiceAuthority for GrantAuthority {
         Ok(now_ms)
     }
 
+    fn now_ms(&self) -> u64 {
+        now_ms()
+    }
+
     fn device_identity_key(
         &self,
         device_id: DeviceId,

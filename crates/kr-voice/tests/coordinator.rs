@@ -89,6 +89,8 @@ struct Authority {
     device_grant: Mutex<Option<Grant>>,
     identity: AuthorisationKey,
     lookups: Lookups,
+    /// This host's clock, as a test moves it.
+    now: std::sync::atomic::AtomicU64,
 }
 
 /// A standing-grant lookup a test can hold open, and the number that have begun.
@@ -114,12 +116,18 @@ impl Authority {
             device_grant: Mutex::new(Some(device_grant)),
             identity,
             lookups: Lookups::default(),
+            now: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Holds the next standing-grant lookup open until [`Authority::release_lookup`].
+    /// Moves this host's clock to `now_ms`.
+    fn clock_reaches(&self, now_ms: u64) {
+        self.now.store(now_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Holds the next revocation open until [`Authority::release_lookup`].
     ///
-    /// Only the next one: every later lookup runs straight through, which is what puts a second
+    /// Only the next one: everything after it runs straight through, which is what puts a second
     /// caller inside the window the first one is being held in.
     fn hold_next_lookup(&self) {
         *self.lookups.holding.lock().expect("the held lookup") = true;
@@ -220,20 +228,6 @@ impl VoiceAuthority for Authority {
         self.lookups
             .started
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self
-            .lookups
-            .armed
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let mut holding = self.lookups.holding.lock().expect("the held lookup");
-            while *holding {
-                holding = self
-                    .lookups
-                    .resumed
-                    .wait(holding)
-                    .expect("the held lookup is released");
-            }
-        }
         let store = self.store.lock().expect("the store");
         Ok(store
             .grants
@@ -258,6 +252,22 @@ impl VoiceAuthority for Authority {
     }
 
     fn revoke(&self, grant_id: GrantId, now_ms: u64) -> kr_voice::Result<u64> {
+        // Held here, after the grant to replace has been read and before it is withdrawn: that is
+        // the window a second change would read the same grant in.
+        if self
+            .lookups
+            .armed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut holding = self.lookups.holding.lock().expect("the held lookup");
+            while *holding {
+                holding = self
+                    .lookups
+                    .resumed
+                    .wait(holding)
+                    .expect("the held lookup is released");
+            }
+        }
         let mut store = self.store.lock().expect("the store");
         // The cascade: a revoked parent takes its descendants with it.
         let mut going = vec![grant_id];
@@ -280,6 +290,10 @@ impl VoiceAuthority for Authority {
             }
         }
         Ok(now_ms)
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.now.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn device_identity_key(
@@ -1052,8 +1066,8 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
         .await
         .expect("a standing voice grant");
     let before = fixture.authority.lookups_started();
-    // The first change is held inside the store lookup, which is the window the second one would
-    // otherwise read the same standing grant in.
+    // The first change is held after it has read the grant it replaces and before it withdraws
+    // it, which is the window the second one would otherwise read the same grant in.
     fixture.authority.hold_next_lookup();
 
     let narrow = tokio::spawn({
@@ -1955,6 +1969,33 @@ async fn a_result_that_was_admitted_and_not_performed_is_reported_as_admitted() 
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-15.20: context selection
 // ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-15.20 and 15.14: a call whose own deadline passes while the host is reading does not
+/// have that read served to it.
+#[tokio::test]
+async fn a_selection_is_not_served_after_the_call_it_was_read_for_ran_out() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    // The host's clock reaches past the call's own deadline while the read is in flight. The
+    // request still carries the moment it arrived, which is what the first check reads.
+    fixture.authority.clock_reaches(10_000 + 600_000 + 1);
+
+    let error = fixture
+        .coordinator
+        .context(
+            device(PHONE),
+            &VoiceContextParams {
+                voice_session_id,
+                session_id: session(SESSION_A),
+                selected: CanonicalSet::from_iter([]),
+                delegation_id: Nullable::null(),
+            },
+            10_100,
+        )
+        .await
+        .expect_err("a call that ran out is served nothing");
+    assert_eq!(error.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
+}
 
 /// KR-REQ-15.20: the selection is built under the requesting device's own grant, carries section
 /// 15 ¶12's five things, excludes the rest until the person selects it, names its interval and

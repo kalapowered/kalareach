@@ -204,8 +204,29 @@ impl ConfirmationLedger {
         Self::default()
     }
 
+    /// How many challenges one voice session may have outstanding at once.
+    ///
+    /// A person confirms one action at a time. A caller that asks for challenge after challenge
+    /// and signs none is not a person confirming anything, so the oldest goes when the bound is
+    /// reached: nothing is admitted either way, and what the ledger holds stays bounded.
+    pub const PER_SESSION: usize = 8;
+
     /// Records a challenge this host has just issued.
+    ///
+    /// The oldest challenge of the same voice session goes when that session is already at
+    /// [`ConfirmationLedger::PER_SESSION`].
     pub fn issue(&mut self, request: &VoiceConfirmationRequest) {
+        let mut theirs: Vec<(u64, [u8; 16])> = self
+            .outstanding
+            .iter()
+            .filter(|(_, held)| held.voice_session_id == request.voice_session_id)
+            .map(|(id, held)| (held.expires_at_ms.get(), *id))
+            .collect();
+        theirs.sort_unstable();
+        while theirs.len() >= Self::PER_SESSION {
+            let (_, oldest) = theirs.remove(0);
+            self.outstanding.remove(&oldest);
+        }
         self.outstanding
             .insert(*request.confirmation_id.get().as_bytes(), request.clone());
     }

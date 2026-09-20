@@ -739,7 +739,20 @@ impl Coordinator {
             state.ledger.forget_session(params.voice_session_id);
             record
         };
-        let revoked_at_ms = self.authority.revoke(record.grant_id, now_ms)?;
+        let revoked_at_ms = match self.authority.revoke(record.grant_id, now_ms) {
+            Ok(revoked_at_ms) => revoked_at_ms,
+            // The voice session is already out of the registry, so nothing can use it, and this
+            // record is the only thing that still knows which call it held. The call is finalised
+            // before the failure is reported, or nothing would be able to finalise it afterwards.
+            Err(error) => {
+                if let (Some(provider), Some(call_id)) =
+                    (record.provider.as_ref(), record.call_id.as_ref())
+                {
+                    self.close_unbound(provider, call_id).await;
+                }
+                return Err(error);
+            }
+        };
 
         let mut broker_notified = false;
         // Through the provider that created it, not through whatever this coordinator brokers
@@ -823,9 +836,11 @@ impl Coordinator {
             selected: params.selected.clone(),
         };
         let gathered = self.context.gather(&request).await?;
-        // Checked again, now the read has finished. A read waits for the host, and a stop or a
-        // grant change during that wait withdraws the authority it was admitted under: what must
-        // not happen is *serving* that content, not reading it.
+        // Checked again, now the read has finished, and at the moment of the check rather than at
+        // the moment the request arrived. A read waits for the host; a stop, a grant change or
+        // the call's own deadline during that wait withdraws the authority it was admitted under,
+        // and what must not happen is *serving* that content, not reading it.
+        let now_ms = self.authority.now_ms().max(now_ms);
         {
             let state = self.state.lock().expect("the coordinator's state");
             let record = state

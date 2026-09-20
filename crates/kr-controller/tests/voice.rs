@@ -898,12 +898,24 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
             },
         )
         .await;
-    if let Err(kr_client::error::ClientError::Host(refusal)) = &context {
-        assert_ne!(
-            refusal.code,
-            kr_protocol::error::ErrorCode::PermissionDenied,
-            "the read reached the coordinator: {refusal:?}"
-        );
+    match &context {
+        // The coordinator answered. This host runs no worker for that session, so what it could
+        // gather is nothing; what the row asks is that the read reached it.
+        Ok(result) => assert_eq!(result.session_id, session_id),
+        Err(kr_client::error::ClientError::Host(refusal)) => {
+            assert!(
+                matches!(
+                    refusal.code,
+                    kr_protocol::error::ErrorCode::UnknownSession
+                        | kr_protocol::error::ErrorCode::SessionClosed
+                        | kr_protocol::error::ErrorCode::EnvironmentUnavailable
+                        | kr_protocol::error::ErrorCode::ResourceUnavailable
+                ),
+                "the read reached the coordinator and failed on the session, not on the ingress: \
+                 {refusal:?}"
+            );
+        }
+        Err(other) => panic!("the read reached the host: {other:?}"),
     }
     let delegated = remote_voice(
         &session,
@@ -938,10 +950,16 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
                 answered.outcome
             );
         }
-        Err(kr_client::error::ClientError::Host(refusal)) => assert_ne!(
-            refusal.code,
-            kr_protocol::error::ErrorCode::PermissionDenied,
-            "the delegation reached the coordinator: {refusal:?}"
+        Err(kr_client::error::ClientError::Host(refusal)) => assert!(
+            matches!(
+                refusal.code,
+                kr_protocol::error::ErrorCode::UnknownSession
+                    | kr_protocol::error::ErrorCode::SessionClosed
+                    | kr_protocol::error::ErrorCode::EnvironmentUnavailable
+                    | kr_protocol::error::ErrorCode::ResourceUnavailable
+            ),
+            "the delegation reached the coordinator and failed on the session, not on the \
+             ingress: {refusal:?}"
         ),
         Err(other) => panic!("the delegation reached the host: {other:?}"),
     }

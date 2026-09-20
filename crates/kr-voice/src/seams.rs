@@ -194,6 +194,14 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     /// Returns an error when the revocation cannot be written.
     fn revoke(&self, grant_id: GrantId, now_ms: u64) -> Result<u64>;
 
+    /// This host's clock, in UTC milliseconds.
+    ///
+    /// A decision taken after a wait is taken at the moment it is taken, not at the moment the
+    /// request arrived: a grant that ran out while the host was reading must not authorise what
+    /// the read produced. The host owns the clock, so the coordinator asks it rather than keeping
+    /// one of its own.
+    fn now_ms(&self) -> u64;
+
     /// The device identity key that signs this device's authority-bearing requests.
     ///
     /// Section 15 ¶8's confirmation is checked against this key and never against a session key.
