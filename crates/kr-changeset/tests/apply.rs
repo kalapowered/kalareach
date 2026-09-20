@@ -2380,3 +2380,179 @@ fn an_authority_withdrawn_after_the_claim_opens_no_apply() {
         "there is no undecided apply to settle"
     );
 }
+
+/// KR-REQ-14.28: a staged name this host could not look at keeps its record, the live answer
+/// names it, and the recovery that follows takes it up although the apply is settled.
+///
+/// The temporary is replaced by a **directory** in the window before the rename, so every later
+/// look at that name refuses rather than saying it holds nothing: this host can prove neither
+/// that its own file is there nor that it is gone. A record cleared on that answer would be an
+/// obligation dropped, so it stays, and it is still there for the next daemon to take up.
+#[test]
+fn a_staged_name_this_host_cannot_look_at_stays_recorded_until_it_is_resolved() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "unreadable-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("unreadable-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "unreadable-destination");
+    let workspace = fixture.workspace("unreadable-destination");
+    let entry = staged_entry("README.md");
+    let at = destination.join(&entry);
+    fixture.service().inject(Some(Fault {
+        after_paths: usize::MAX,
+        act: None,
+        before_rename: Some(std::sync::Arc::new(move |path: &str| {
+            if path == "README.md" {
+                // Somebody takes this host's temporary away and puts a directory at the name. The
+                // apply goes on: what it must not do is publish, and what it must not do
+                // afterwards is forget the name.
+                std::fs::remove_file(&at).expect("their editor removes the staged file");
+                std::fs::create_dir(&at).expect("and puts a directory at the name");
+            }
+            true
+        })),
+        stop: false,
+        detail: String::new(),
+    }));
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let action = order.action_id;
+    let result = apply::apply(fixture.service(), &order).expect("the apply settles");
+    fixture.service().inject(None);
+
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::UncertainOutcome)),
+        "nothing was published: {}",
+        result.detail
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"a repository\n",
+        "the destination is exactly as it was"
+    );
+    // The live answer names the path, rather than telling the caller there is nothing to look at.
+    assert_eq!(
+        result.recovery.staged_leftovers,
+        vec!["README.md".to_owned()],
+        "the apply that settled says which name it could not clear"
+    );
+    assert!(
+        destination.join(&entry).is_dir(),
+        "and it removed nothing it could not prove it made"
+    );
+
+    // The apply is settled, so nothing about it is undecided. The record is still an obligation,
+    // and the next daemon takes it up for itself.
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(
+        recovery.applies_settled, 0,
+        "there is no undecided apply to settle"
+    );
+    assert_eq!(
+        recovery.staged_removed, 0,
+        "a directory is not the file this host made"
+    );
+    assert_eq!(
+        recovery.staged_left, 1,
+        "and the name is reported rather than dropped"
+    );
+    assert!(destination.join(&entry).is_dir(), "left exactly as it is");
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.recovery.staged_leftovers,
+        vec!["README.md".to_owned()]
+    );
+
+    // Once the name is free again, the same recovery clears the record: the obligation ends when
+    // the name is proved to hold nothing, not when the apply was settled.
+    std::fs::remove_dir(destination.join(&entry)).expect("the person takes their directory away");
+    let recovery = replacement
+        .recover_before_serving()
+        .expect("recovery runs again");
+    assert_eq!(recovery.staged_left, 0);
+    assert_eq!(recovery.staged_removed, 0, "there was nothing left to take");
+    let cleared = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert!(
+        cleared.recovery.staged_leftovers.is_empty(),
+        "the record is cleared once the name holds nothing"
+    );
+}
+
+/// KR-REQ-14.28: a temporary this host made and could not take away in the moment is taken away
+/// by the recovery that follows, although the apply it belongs to was settled long before.
+///
+/// The first recovery cannot reach the destination at all, so it settles the interrupted apply
+/// and leaves every name it could not look at. The record is what carries the obligation past
+/// that settlement.
+#[test]
+fn a_temporary_left_by_a_settled_apply_is_taken_away_by_a_later_recovery() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "later-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("later-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "later-destination");
+    let workspace = fixture.workspace("later-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+    let entry = staged_entry("README.md");
+    assert!(destination.join(&entry).is_file(), "the temporary is there");
+
+    // The whole checkout is somewhere else when the daemon starts, which is a workspace this host
+    // cannot open. The apply is settled all the same: a recovery runs before anything is served
+    // and it never fails to run because a destination moved.
+    let moved = fixture.work().join("later-destination-moved");
+    std::fs::rename(&destination, &moved).expect("the person moves their checkout");
+    let replacement = fixture.reopen();
+    let first = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(first.applies_settled, 1);
+    assert_eq!(first.staged_removed, 0);
+    assert_eq!(
+        first.staged_left, 1,
+        "the name is reported, because this host could not look at it"
+    );
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.outcome,
+        Nullable(Some(ApplyOutcomeClass::InterruptedApply)),
+        "the apply is decided, and the obligation is not"
+    );
+    assert_eq!(
+        settled.recovery.staged_leftovers,
+        vec!["README.md".to_owned()]
+    );
+
+    // The checkout comes back and the next daemon starts. Nothing about this apply is undecided,
+    // so only the staging record itself brings this host back to the temporary it left.
+    std::fs::rename(&moved, &destination).expect("the person puts their checkout back");
+    let later = fixture.reopen();
+    let second = later
+        .recover_before_serving()
+        .expect("the later recovery runs");
+    assert_eq!(
+        second.applies_settled, 0,
+        "there is no undecided apply left to settle"
+    );
+    assert_eq!(
+        second.staged_removed, 1,
+        "and the temporary this host made is gone"
+    );
+    assert_eq!(second.staged_left, 0);
+    assert!(
+        !destination.join(&entry).exists(),
+        "the name is free again for the next apply of that path"
+    );
+    let cleared = apply::read_apply(&later, action).expect("the apply is recorded");
+    assert!(cleared.recovery.staged_leftovers.is_empty());
+}

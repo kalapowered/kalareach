@@ -1162,6 +1162,16 @@ fn direct(
             .into(),
         });
     }
+    // Every temporary this apply still has a record of: one this host staged and could not take
+    // away again, beside a destination it did not publish to. The caller is told the names now,
+    // and the next recovery takes up the same records, so an obligation this host could not
+    // discharge is neither hidden nor forgotten.
+    let staged_leftovers: Vec<String> = service
+        .locked()?
+        .staged_paths(order.action_id)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
     let conflicted: Vec<PathConflict> = progress
         .iter()
         .filter(|row| row.state == PathProgressState::Conflicted)
@@ -1200,7 +1210,7 @@ fn direct(
             })),
             applied_version: Nullable(Some(order.version)),
             staged_path: Nullable(Some(staged_name)),
-            staged_leftovers: Vec::new(),
+            staged_leftovers,
             detail: "the destination as it stood before this apply and as it stands after it, \
                      both immutable and both materialisable; what is not claimed is that every \
                      intermediate version was captured"
@@ -1675,9 +1685,15 @@ fn install(
     let mut staged = match here.create_new(&temporary) {
         Ok(file) => file,
         Err(error) => {
-            // The name was taken by something this host did not make, so there is nothing of its
-            // own here to account for.
-            staging.gone(path)?;
+            // A refused creation is not proof that nothing is there. The name can be taken by a
+            // file this host did not make, and the creation can also *succeed* and then be
+            // refused by the check that follows it, which leaves this host's own file at the
+            // name with no handle to it and no identity to record. So the record is cleared only
+            // when the name holds nothing: anything else keeps it, and this host reports the name
+            // rather than removing what it cannot prove it made.
+            if let Err(kr_transfer::Escape::NotFound { .. }) = here.probe(&temporary) {
+                staging.gone(path)?;
+            }
             return Ok(Installed::Unresolved(format!(
                 "this host did not write anything, because the name it would have staged through \
                  is taken and it removes nothing to make room: {error}"
@@ -1685,7 +1701,14 @@ fn install(
         }
     };
     let staged_identity = staged.identity();
-    staging.created(path, &entry, staged_identity)?;
+    if let Err(error) = staging.created(path, &entry, staged_identity) {
+        // The journal would not take the identity of the temporary this host had just made, so
+        // nothing could later prove the file at that name was this host's own. It goes now, while
+        // the handle that created it is still open and its identity is still known, through the
+        // same rule the cleanup below follows.
+        let _ = clear_temporary(&here, &temporary, staged_identity, staging, path);
+        return Err(error);
+    }
     let outcome = (|| -> Result<Installed> {
         staged
             .handle_mut()
@@ -1779,27 +1802,46 @@ fn install(
     // A host that stopped inside the window leaves everything exactly as it was: that is the
     // whole of what this fixture reproduces, and cleaning up here would hide it.
     if !matches!(outcome, Ok(Installed::Written(_))) && !stopped_here {
-        // The temporary this host made goes away — **that object**, not that name. A file somebody
-        // put at the name after this host created its own is a file this host leaves alone. The
-        // handle stays open across the removal, so the object cannot be taken away and its number
-        // handed to something else while this host is deciding about it.
-        match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
-            Ok(found) if found.identity() == staged_identity => {
-                if here.remove(&temporary).is_ok() {
-                    staging.gone(path)?;
-                }
-                drop(found);
-            }
-            // The name holds nothing, or it holds something this host did not make. Neither is a
-            // name this apply has anything of its own left at, and a record of one would send a
-            // recovery after somebody else's file.
-            Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => staging.gone(path)?,
-            // Anything else is a name this host could not look at, which is not the same as one
-            // that holds nothing. The record stays, so recovery accounts for it.
-            Err(_) => {}
-        }
+        clear_temporary(&here, &temporary, staged_identity, staging, path)?;
     }
     outcome
+}
+
+/// Takes away the temporary this host staged through, and clears its record when it is gone.
+///
+/// **That object, not that name.** A file somebody put at the name after this host created its
+/// own is a file this host leaves alone. The handle stays open across the removal, so the object
+/// cannot be taken away and its number handed to something else while this host is deciding about
+/// it. The record is cleared only where the name is proved to hold nothing of this apply's: after
+/// a removal this host made durable, or where the name holds nothing or something this host did
+/// not make. Anything else — a name this host could not look at, a removal or a sync it could not
+/// finish — keeps the record, so the obligation reaches the next recovery instead of being
+/// dropped here.
+fn clear_temporary(
+    here: &AuthorisedDirectory,
+    temporary: &RelativeName,
+    staged_identity: kr_transfer::ObjectIdentity,
+    staging: &Staging<'_>,
+    path: &str,
+) -> Result<()> {
+    match here.open_read(temporary, ObjectPolicy::ReadableFile) {
+        Ok(found) if found.identity() == staged_identity => {
+            // The name is gone durably before the record of it is cleared. A power failure
+            // between the two would otherwise leave a temporary nothing accounts for.
+            if here.remove(temporary).is_ok() && here.sync().is_ok() {
+                staging.gone(path)?;
+            }
+            drop(found);
+        }
+        // The name holds nothing, or it holds something this host did not make. Neither is a
+        // name this apply has anything of its own left at, and a record of one would send a
+        // recovery after somebody else's file.
+        Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => staging.gone(path)?,
+        // Anything else is a name this host could not look at, which is not the same as one
+        // that holds nothing. The record stays, so recovery accounts for it.
+        Err(_) => {}
+    }
+    Ok(())
 }
 
 /// Reads what one path resolves to from the working tree's own handle.
@@ -2623,6 +2665,8 @@ fn clean_preflight(order: &ApplyOrder<'_>, limitations: &[String]) -> DiffApplyR
 pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::service::Recovery> {
     let mut recovery = crate::service::Recovery::default();
     let undecided = service.locked()?.undecided_applies()?;
+    let settled_here: std::collections::BTreeSet<ActionId> =
+        undecided.iter().map(|row| row.action_id).collect();
     for row in undecided {
         let staged = clear_staged(service, &row, &mut recovery)?;
         let progress = service.locked()?.progress(row.action_id)?;
@@ -2683,6 +2727,26 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
             kr_ipc::now_ms(),
         )?;
         recovery.applies_settled += 1;
+    }
+    // A staged temporary this host did not get rid of is an obligation of its own, and it does
+    // not end when the apply that made it is decided: a live removal that failed leaves the
+    // record behind and the apply settles all the same. So every outstanding record is taken up
+    // here, whatever its apply came to, rather than only the ones an interrupted apply left. The
+    // applies settled just above are left out because they have just been through this.
+    // Read into a list first, for the same reason the unanswered claims below are: the store's
+    // lock is taken again inside the loop, and an iterator that held it would hold it there too.
+    let outstanding = service.locked()?.applies_with_staged_paths()?;
+    for action_id in outstanding {
+        if settled_here.contains(&action_id) {
+            continue;
+        }
+        let Some(row) = service.locked()?.apply(action_id)? else {
+            continue;
+        };
+        // The counts go into this recovery; the apply's own record is not rewritten. It said what
+        // it came to when it was settled, and what it holds about its temporaries is the staging
+        // rows themselves, which a reader gets through the apply's own answer.
+        clear_staged(service, &row, &mut recovery)?;
     }
     // An apply that said what it came to and an action nobody answered: a daemon that stopped
     // between the two leaves exactly that, and a repeat of the action would otherwise be told

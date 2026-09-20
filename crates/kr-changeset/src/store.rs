@@ -1614,6 +1614,34 @@ impl Store {
         Ok(rows)
     }
 
+    /// Returns every apply that still has a staged temporary recorded against it.
+    ///
+    /// Whatever the apply came to. A staged temporary is an obligation of this host's own: it does
+    /// not end when the apply that made it is settled, because a live removal this host could not
+    /// finish leaves the record behind and the apply is decided all the same.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn applies_with_staged_paths(&self) -> Result<Vec<ActionId>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT action_id FROM apply_progress
+                  WHERE staged_entry IS NOT NULL ORDER BY action_id",
+            )
+            .map_err(ChangeSetError::store)?;
+        let rows = statement
+            .query_map([], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                Ok(ActionId::new(uuid_of(&id, 0)?))
+            })
+            .map_err(ChangeSetError::store)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChangeSetError::store)?;
+        Ok(rows)
+    }
+
     /// Records one action's outcome, leaving an existing row alone.
     ///
     /// Returns the record that was already there, when another copy of the action recorded first.
