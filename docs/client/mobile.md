@@ -19,6 +19,42 @@ The generated Tauri projects are committed at `apps/companion/src-tauri/gen/appl
 reference the hand-written native sources by relative path, which is why those sources live outside
 the generated directories: `tauri ios init` and `tauri android init` rewrite what is inside them.
 
+### How the Android native sources reach the application
+
+There are two paths into the Android build and they are not the same.
+
+`apps/companion/native/android` is a Gradle module, `:krnative`. `settings.gradle` includes it by
+relative path and the application module depends on it. Nothing in it touches an Android class, so
+`./gradlew :krnative:test` runs on a developer's machine with no device.
+
+`apps/companion/native/android/android/src/main/java` is not a module. It holds the classes that do
+need the framework — the push receiver, the background worker, the keystore reader, the audio
+session and the share sheet — and it reaches the application as a source directory of the
+application module's own `main` source set, named in `app/build.gradle.kts`.
+
+That second path is one line, and the build checks it rather than trusting it. Gradle treats a
+source directory that does not exist as an empty one, so a path that resolves nowhere compiles
+nothing, packages nothing and still reports a successful build. Two things stop that being
+invisible. The build file fails at configuration time, naming the path, when the directory is not
+there. And `pnpm -C apps/companion android` reads the packaged application back afterwards and
+refuses one whose dex does not define the two classes the system resolves by name: the messaging
+service, from the manifest, and the background worker, from the request the receiver enqueues.
+Those two are the names a shrinking build is obliged to keep — it renames everything it reaches
+only from other code — and neither exists at all unless the module compiled the tree.
+
+The application's merged manifest declares what the compiled code needs: the messaging service
+against `com.google.firebase.MESSAGING_EVENT`, unexported, and `POST_NOTIFICATIONS` from the
+project's own manifest; Firebase's receiver, component discovery and init provider from
+`firebase-messaging`; and WorkManager's own services, its boot receiver and its
+`androidx.startup.InitializationProvider` entry from `work-runtime`, which is what initialises the
+scheduler without an application class. Read it with the command below rather than assuming it.
+
+`tauri android init` regenerates the project in place. It leaves `settings.gradle`,
+`app/build.gradle.kts` and `app/src/main/AndroidManifest.xml` alone when they already exist, so the
+wiring above survives it; it does rewrite `buildSrc/src/main/java/.../BuildTask.kt`, which carries
+the archive-tool resolution described below. `gen/android` is committed, so `git diff` after an init
+shows exactly what an init changed and what to put back.
+
 Both packaged applications build. `tauri ios build --debug --target aarch64-sim` produces
 `KalaReach.app`, which installs and runs on the iOS Simulator; `tauri android build --debug`
 produces an APK and an AAB.
@@ -191,6 +227,22 @@ cd apps/companion/src-tauri/gen/apple && xcodebuild test \
   -project companion-tauri.xcodeproj -scheme KalaReachNativeTests \
   -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 cd apps/companion/src-tauri/gen/android && ./gradlew :krnative:test
+
+# The hand-written Android tree, compiled by the application module. A syntax error anywhere
+# under native/android/android/ fails this.
+cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugKotlin
+
+# What the packaged application actually carries. It reads the class definitions out of every dex
+# in each APK and AAB under app/build/outputs and names anything missing; `--list` prints the whole
+# hand-written half of whatever it is given. `pnpm -C apps/companion android` runs the check for
+# you; run it on its own against a build you already have, or against a particular file.
+pnpm -C apps/companion android:classes
+pnpm -C apps/companion android:classes --list
+pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
+
+# The manifest the packaged application was built from.
+cat apps/companion/src-tauri/gen/android/app/build/intermediates/packaged_manifests/\
+universalDebug/processUniversalDebugManifestForPackage/AndroidManifest.xml
 ```
 
 `scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running, stops only

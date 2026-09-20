@@ -10,10 +10,14 @@
 // It also refuses to build against an archive a previous run left empty, because that build
 // script does not notice that the tools have changed and would hand the same empty archive over
 // again.
+//
+// After the build it reads the packaged application back and refuses one that is missing the
+// hand-written native classes.
 import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
+import { verify } from './android-classes.mjs'
 import { toolPath } from './tools.mjs'
 
 /** Every Android target this build could be asked for. */
@@ -129,4 +133,10 @@ if (result.error) {
   console.error(result.error.message)
   process.exit(1)
 }
-process.exit(result.status ?? 0)
+if (result.status !== 0) process.exit(result.status ?? 1)
+
+// A successful Android build is not the same as a complete application. The hand-written native
+// sources reach the module through a source-set entry, and a source directory that resolves
+// nowhere is an empty one to Gradle: the build reports success and packages none of it. So what
+// was packaged is read back before this command claims to have built anything.
+process.exit(verify([]) ? 0 : 1)

@@ -13,6 +13,22 @@ val tauriProperties = Properties().apply {
     }
 }
 
+/**
+ * The application's hand-written Android sources -- the push receiver, the background worker, the
+ * keystore reader and everything else that needs the framework -- kept outside this generated
+ * directory so regenerating the project never touches them.
+ *
+ * The directory is checked here, at configuration time, because Gradle treats a source directory
+ * that does not exist as an empty one. A path that resolves nowhere compiles nothing, packages
+ * nothing and still reports a successful build, so a mistake in it is otherwise silent: the
+ * application loses its push receiver and no build output says so. A wrong path fails here, by
+ * name, instead.
+ */
+val handWrittenNativeSources = file("../../../../native/android/android/src/main/java")
+check(handWrittenNativeSources.isDirectory) {
+    "The application's hand-written Android sources are not at $handWrittenNativeSources"
+}
+
 android {
     compileSdk = 36
     // Android 15 and later run with 16 KB memory pages, and a library linked for 4 KB pages is
@@ -56,9 +72,7 @@ android {
         buildConfig = true
     }
     sourceSets {
-        // The hand-written native half of this application, kept outside this generated directory
-        // so regenerating the project never touches it.
-        getByName("main").java.srcDir("../../../native/android/android/src/main/java")
+        getByName("main").java.srcDir(handWrittenNativeSources)
     }
 }
 

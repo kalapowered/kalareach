@@ -17,7 +17,8 @@
     "test:setup": "vitest run test/setup-states.test.ts test/setup-assistant.test.tsx",
     "e2e": "node scripts/e2e.mjs",
     "tauri": "tauri",
-    "android": "node scripts/android.mjs"
+    "android": "node scripts/android.mjs",
+    "android:classes": "node scripts/android-classes.mjs"
   },
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",
