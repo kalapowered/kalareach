@@ -1222,12 +1222,17 @@ fn nested_repositories(
         return Err(unplaceable("this working tree"));
     }
     refused.insert((reported.device, reported.file_id));
-    let environment_id = tree.environment_id();
-    for path in [repository.git_dir_path(), repository.own_dir_path()] {
+    for handle in [repository.git_dir(), repository.own_dir()] {
+        // **The handle this repository's identity was read through**, not the path it was read
+        // from. A path resolved a second time can reach a different object: something mounted over
+        // the administrative directory while this ran would be the thing this scan accounted for,
+        // and the data it covered would go unexamined. The handle cannot be covered.
+        //
         // Outside this working tree or inside it, the object is the object, and it goes in
         // unconditionally: what decides anything later is whether a directory this capture opens
         // **is** it, and holding one that nothing reaches costs nothing.
-        let held = AuthorisedDirectory::open_root(environment_id, path)
+        let held = handle
+            .try_clone()
             .and_then(AuthorisedDirectory::confined_to_one_mount)
             .map_err(|_| unplaceable("this repository's own data"))?;
         let identity = identity_of(&held);
@@ -1375,11 +1380,36 @@ fn administrative_descendants(
             )));
         }
         if kind.is_file() {
-            // A plain file. Git gives one several names as a matter of course — a local clone and
-            // a shared object store are built out of that — so the number of names it has says
-            // nothing here, and what a second name inside the tree would cost is recorded as a
-            // limit rather than guessed at.
-            continue;
+            // A plain file, opened rather than taken on trust. A file mounted here is a second
+            // name for a file of the tree, and then what Git writes through this name is that
+            // file's content: the bytes under an ordinary path of the tree are this repository's
+            // own data, and the path crosses nothing to get there. The open compares the mount
+            // the way every other open this capture makes does.
+            //
+            // What it does not see is a second *hard link*. Git gives one file several names as a
+            // matter of course — a local clone and a shared object store are built out of that —
+            // so the number of names a file has says nothing here, and a link from this data to a
+            // file of the tree is recorded as a limit rather than guessed at.
+            let name = RelativeName::parse(&name)?;
+            match directory.open_read(&name, ObjectPolicy::ReadableFile) {
+                Ok(_) => continue,
+                Err(kr_transfer::Escape::CrossedMount { .. }) => {
+                    return Err(unreadable_data(format!(
+                        "it holds a mount at {}, which makes a file of this tree part of this \
+                         repository's own data",
+                        kr_project::git::redact(name.as_str())
+                    )));
+                }
+                // Gone between the listing and the open, which is nothing of this repository's
+                // data to account for.
+                Err(kr_transfer::Escape::NotFound { .. }) => continue,
+                Err(_) => {
+                    return Err(unreadable_data(format!(
+                        "this host could not look at {}, so it cannot say what it is",
+                        kr_project::git::redact(name.as_str())
+                    )));
+                }
+            }
         }
         if !kind.is_dir() {
             return Err(unreadable_data(format!(

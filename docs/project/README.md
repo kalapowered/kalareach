@@ -668,16 +668,18 @@ removes is never opened at all:
    mounted directory in it is ordinary to them.
 
    The second is a link **out** of a repository's own data. Every directory of that data is looked
-   inside once, entry by entry, and data that holds a link, a mount, or anything that is not a
-   plain file or a plain directory is data this host does not capture around: such a link makes a
-   directory of the tree part of that repository's own data under a path that crosses nothing
-   either. Data deeper, or with more entries, than this host reads refuses on the same terms,
-   naming the limit it reached. None of this is skipped, and the link and the mount are named where
-   they were found.
+   inside once, entry by entry, and every file it holds is opened: data that holds a link, a mount
+   of a directory or of a file, or anything that is not a plain file or a plain directory is data
+   this host does not capture around, because each of those makes something of the tree part of
+   that repository's own data under a path that crosses nothing either. The scan works from the
+   handles this host opened when it read the repository's identity, so a directory mounted over the
+   administrative directory afterwards is not what gets examined. Data deeper, or with more
+   entries, than this host reads refuses on the same terms, naming the limit it reached. None of
+   this is skipped, and what was found is named where it was found.
 
-   What is left is a *file* with two names: a hard link from a repository's own data to a file of
-   the tree is an alias no comparison of directories sees. A mount over a file is refused with the
-   rest; a second hard link is not.
+   What is left is a *file* with two names in two directories: a hard link from a repository's own
+   data to a file of the tree is an alias nothing about either path says is there. A mount over a
+   file is refused on both sides; a second hard link is not.
 
    What this covers is what a capture reads: a repository in a directory no path of the capture
    goes near is one the capture does not reach either.

@@ -63,10 +63,11 @@
 //!   object wherever the name goes. That is the same rule the rest of this module is built on: the
 //!   grant follows the object, not the name. What it is not is an escape to somewhere a caller
 //!   never named, and it is the price of the leaf being the thing the descent checked.
-//! * A mount over a *file* is not seen. A confined authority compares the mount of every directory
-//!   it descends through and of the file a read returns, which covers a directory mounted into the
-//!   tree; a regular file with a second name, by a hard link or by a mount of its own, is an alias
-//!   this module does not decide.
+//! * A regular file with a **second hard link** is an alias this module does not decide. A
+//!   confined authority compares the mount of every directory it descends through and of the file
+//!   a read returns, so a directory or a file mounted into the tree is refused; a second name in
+//!   another directory of the same filesystem is a name, not a mount, and nothing about the path
+//!   says it is there.
 
 use std::path::{Path, PathBuf};
 
@@ -544,6 +545,29 @@ impl AuthorisedDirectory {
     #[must_use]
     pub const fn identity(&self) -> ObjectIdentity {
         self.identity
+    }
+
+    /// Returns a second authority over the same open directory, with the same rule on it.
+    ///
+    /// The handle is duplicated, not reopened: two authorities over one object, which is what a
+    /// caller needs when one of them is going to be consumed and the object must stay reachable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::Unopenable`] when the handle cannot be duplicated.
+    pub fn try_clone(&self) -> Result<Self, Escape> {
+        let handle = self
+            .directory
+            .try_clone()
+            .map_err(|error| Escape::Unopenable {
+                component: self.display.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        let held = Self::from_handle(self.environment_id, handle, self.display.clone())?;
+        if self.mount.is_some() {
+            return held.confined_to_one_mount();
+        }
+        Ok(held)
     }
 
     /// Returns the mount this authority is confined to, when it is confined to one.
@@ -1228,10 +1252,10 @@ fn directory_identity(directory: &Dir, what: &Path) -> Result<ObjectIdentity, Es
 
 /// Returns the mount an open directory was resolved through.
 ///
-/// The kernel's own answer where there is one: `statx` carries the mount a handle was resolved
-/// through, which is what tells a bind mount from the tree it was made from. A kernel too old to
-/// carry it leaves the field the same for everything, and then the device is the whole comparison,
-/// which still tells one filesystem from another.
+/// The kernel's own answer: `statx` carries the mount a handle was resolved through, which is what
+/// tells a bind mount from the tree it was made from. A kernel too old to carry it reports so in
+/// the mask, and then this refuses rather than comparing device numbers a bind mount would
+/// satisfy.
 #[cfg(target_os = "linux")]
 fn mount_of_handle(handle: impl std::os::fd::AsFd, what: &str) -> Result<MountId, Escape> {
     let stat = rustix::fs::statx(

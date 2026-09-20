@@ -1744,3 +1744,82 @@ fn a_version_number_is_never_reused() {
         "the number version two used is not handed out again"
     );
 }
+
+/// KR-REQ-14.33 and D-087f: a file mounted inside a repository's own data refuses the capture.
+///
+/// The reverse of a path reaching administrative bytes: here an ordinary file of the tree is given
+/// a second name **inside** the repository's own data, so what Git writes through that name is the
+/// content of a file the capture reads under an ordinary path. Nothing about the tree's path says
+/// so, and no directory of the tree is on another mount. What finds it is the administrative scan
+/// opening each file it holds.
+///
+/// It needs a mount namespace this account owns. Where the host gives none, the case says it was
+/// not exercised rather than reporting a result it did not produce.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around() {
+    const NOT_EXERCISED: i32 = 42;
+
+    if std::env::var_os("KR_CAPTURE_FILE_MOUNT").is_some() {
+        a_file_mounted_inside_administrative_data();
+        return;
+    }
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        println!("not exercised: this host does not give this account a mount namespace");
+        return;
+    }
+    let binary = std::env::current_exe().expect("the test binary");
+    let status = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--"])
+        .arg(binary)
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .arg("a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around")
+        .env("KR_CAPTURE_FILE_MOUNT", "1")
+        .status()
+        .expect("the test binary runs inside a mount namespace");
+    if status.code() == Some(NOT_EXERCISED) {
+        println!("not exercised: this namespace would not place a bind mount over a file");
+        return;
+    }
+    assert!(
+        status.success(),
+        "the capture inside the mount namespace did not refuse: {status}"
+    );
+}
+
+/// The half that runs inside the mount namespace.
+#[cfg(target_os = "linux")]
+fn a_file_mounted_inside_administrative_data() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "file-aliased");
+    write(&path, "history.txt", "the reflog this would alias\n");
+    std::fs::create_dir_all(path.join(".git/logs/refs/heads")).expect("a reflog directory");
+    std::fs::write(path.join(".git/logs/refs/heads/main"), b"").expect("a reflog file");
+    let placed = std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(path.join("history.txt"))
+        .arg(path.join(".git/logs/refs/heads/main"))
+        .status();
+    if !placed.is_ok_and(|status| status.success()) {
+        std::process::exit(42);
+    }
+
+    let workspace = fixture.workspace("file-aliased");
+    let failure = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect_err("a repository whose own data holds a mounted file is not captured around");
+    let said = failure.to_string();
+    assert!(
+        said.contains("cannot account for") && said.contains("holds a mount at"),
+        "the refusal names the mounted file it found: {failure}"
+    );
+}

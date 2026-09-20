@@ -751,11 +751,19 @@ fn a_mount_placed_while_reads_resolve_never_reaches_the_other_tree() {
         .env("KR_AUTHORITY_MOUNT_RACE", "1")
         .status()
         .expect("the test binary runs inside a mount namespace");
+    if status.code() == Some(NOT_EXERCISED) {
+        println!("not exercised: this namespace would not place a bind mount");
+        return;
+    }
     assert!(
         status.success(),
         "the reads inside the mount namespace did not hold: {status}"
     );
 }
+
+/// What the half inside the namespace exits with when it could not place a mount at all.
+#[cfg(target_os = "linux")]
+const NOT_EXERCISED: i32 = 42;
 
 /// The half that runs inside the mount namespace.
 #[cfg(target_os = "linux")]
@@ -771,13 +779,40 @@ fn mount_race() {
         .and_then(AuthorisedDirectory::confined_to_one_mount)
         .expect("opens the authority, confined to one mount");
     let name = RelativeName::parse("history/main").expect("a valid relative name");
+
+    // Both states, before anything races: the tree's own bytes when nothing covers the directory,
+    // and a refusal while something does. A run that reached neither would prove nothing, so this
+    // is asserted rather than hoped for.
+    assert_eq!(
+        read_through(&authority, &name),
+        "inside",
+        "the tree's own bytes when nothing covers its directory"
+    );
+    let onto = root.path().join("history");
+    let from = root.path().join("elsewhere");
+    if rustix::mount::mount_bind(&from, &onto).is_err() {
+        std::process::exit(NOT_EXERCISED);
+    }
+    assert!(
+        matches!(
+            authority.open_read(&name, ObjectPolicy::ReadableFile),
+            Err(Escape::CrossedMount { .. })
+        ),
+        "a read refuses while another tree is mounted over the directory it descends through"
+    );
+    rustix::mount::unmount(&onto, rustix::mount::UnmountFlags::DETACH)
+        .expect("the mount comes off");
+    assert_eq!(
+        read_through(&authority, &name),
+        "inside",
+        "and the tree's own bytes again once it is off"
+    );
+
     let stop = AtomicBool::new(false);
     let placed = AtomicUsize::new(0);
 
     std::thread::scope(|threads| {
         let mounter = threads.spawn(|| {
-            let onto = root.path().join("history");
-            let from = root.path().join("elsewhere");
             for _ in 0..2_000 {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -829,10 +864,10 @@ fn mount_race() {
         mounter.join().expect("the mounter did not panic");
         let mounts = placed.load(Ordering::Relaxed);
         assert_eq!(read + refused, 400);
-        if mounts == 0 {
-            println!("not exercised: this namespace would not place a bind mount");
-        } else {
-            println!("{read} reads resolved, {refused} were refused, over {mounts} mounts");
-        }
+        assert!(
+            mounts > 0,
+            "the mount loop placed nothing, so the reads raced against nothing"
+        );
+        println!("{read} reads resolved, {refused} were refused, over {mounts} mounts");
     });
 }

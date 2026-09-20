@@ -61,6 +61,14 @@ pub struct RepositoryIdentity {
 #[derive(Debug)]
 pub struct OpenedRepository {
     work_tree: AuthorisedDirectory,
+    /// The administrative directory every worktree of this repository shares, held open from the
+    /// moment its identity was read. A caller that has to account for this repository's own data
+    /// works from this handle rather than resolving the path again: a path resolved a second time
+    /// can reach a different object, and what was checked is then not what was read.
+    git_dir: AuthorisedDirectory,
+    /// This working tree's own administrative directory, held open for the same reason. The same
+    /// object as [`Self::git_dir`] in an ordinary repository.
+    own_dir: AuthorisedDirectory,
     identity: RepositoryIdentity,
     git_dir_path: PathBuf,
     own_dir_path: PathBuf,
@@ -128,8 +136,16 @@ impl OpenedRepository {
             });
         }
         // The Git directory is opened as an object of its own, because for a linked worktree it
-        // lies outside the working tree this call named.
+        // lies outside the working tree this call named. Both directories are opened here, where
+        // Git has just said where they are, and kept: every later question about this
+        // repository's own data is asked of these handles, so nothing has to resolve those paths
+        // again and find whatever has since taken the name.
         let git_dir = AuthorisedDirectory::open_root(environment_id, &git_dir_path)?;
+        let own_dir = if own_dir_path == git_dir_path {
+            git_dir.try_clone()?
+        } else {
+            AuthorisedDirectory::open_root(environment_id, &own_dir_path)?
+        };
         let tree = AuthorisedDirectory::open_root(environment_id, &top_level)?;
         let identity = RepositoryIdentity {
             git_dir: git_dir.identity(),
@@ -143,6 +159,8 @@ impl OpenedRepository {
         audit.require_expressible()?;
         Ok(Self {
             work_tree,
+            git_dir,
+            own_dir,
             identity,
             git_dir_path,
             own_dir_path,
@@ -228,6 +246,19 @@ impl OpenedRepository {
     #[must_use]
     pub fn git_dir_path(&self) -> &Path {
         &self.git_dir_path
+    }
+
+    /// Returns the handle on the administrative directory every worktree of this repository
+    /// shares, opened when its identity was read.
+    #[must_use]
+    pub const fn git_dir(&self) -> &AuthorisedDirectory {
+        &self.git_dir
+    }
+
+    /// Returns the handle on **this working tree's own** administrative directory.
+    #[must_use]
+    pub const fn own_dir(&self) -> &AuthorisedDirectory {
+        &self.own_dir
     }
 
     /// Returns **this working tree's own** Git directory, which a split repository keeps apart
@@ -392,6 +423,70 @@ impl OpenedRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-14.05: the administrative handles name the objects whose identities were read, and
+    /// go on naming them when the paths they were read from name something else.
+    ///
+    /// This is what a caller accounting for a repository's own data stands on. Resolving those
+    /// paths again would let whatever has since taken the name be the thing that was accounted
+    /// for, while the data it covered went unexamined.
+    #[test]
+    fn the_administrative_handles_keep_their_objects_when_the_paths_name_something_else() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        let checkout = root.path().join("project");
+        std::fs::create_dir_all(&checkout).expect("a directory for the checkout");
+        let profile_root = root.path().join("profile");
+        let profile = match RestrictedProfile::prepare(&profile_root, environment_id) {
+            Ok(profile) => profile,
+            Err(error) => {
+                println!("not exercised: this host has no Git to prepare a profile with: {error}");
+                return;
+            }
+        };
+        let made = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["init", "--initial-branch=main"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", root.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(made.status.success(), "the repository is made");
+        let opened = OpenedRepository::open(&profile, environment_id, &checkout)
+            .expect("the repository opens");
+        let recorded = opened.identity().git_dir;
+        assert_eq!(
+            opened.git_dir().identity(),
+            recorded,
+            "the handle is on the object the identity was read from"
+        );
+
+        // The name now belongs to something else entirely.
+        std::fs::rename(checkout.join(".git"), root.path().join("moved"))
+            .expect("the administrative directory is moved away");
+        std::fs::create_dir(checkout.join(".git")).expect("something else takes the name");
+
+        assert_eq!(
+            opened.git_dir().identity(),
+            recorded,
+            "and it is still on that object, not on what took the name"
+        );
+        assert_eq!(
+            opened.own_dir().identity(),
+            recorded,
+            "an ordinary repository keeps its own data in the one place, and that is this object"
+        );
+        assert_ne!(
+            opened.git_dir().identity(),
+            AuthorisedDirectory::open_root(environment_id, &checkout.join(".git"))
+                .expect("the name opens")
+                .identity(),
+            "which is a different object from the one the path reaches now"
+        );
+    }
 
     #[test]
     fn the_wire_form_of_an_identity_carries_both_numbers_unchanged() {
