@@ -296,6 +296,15 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
              make the native answer observable, or the other way round",
             case.id
         );
+        for skipped in &case.skip_exclusions {
+            assert!(
+                DetachExclusion::ALL
+                    .iter()
+                    .any(|exclusion| exclusion.as_str() == skipped),
+                "{} skips {skipped}, which is not one of the excluded states",
+                case.id
+            );
+        }
         assert!(
             !case.checks.contains(&"takeover_under_the_stack".to_owned())
                 || shellpkg::pending_wait(case.shell).is_some(),
@@ -992,7 +1001,18 @@ fn outside_the_condition_the_editor_keeps_the_key(
     settle(session, Duration::from_millis(200), REPLY);
 
     let mut driven = Vec::new();
+    let mut skipped = Vec::new();
     for drive in shellpkg::exclusion_drives(case.shell) {
+        if case
+            .skip_exclusions
+            .iter()
+            .any(|named| named == drive.exclusion.as_str())
+        {
+            // The customisation this case installs takes the key this state is reached through,
+            // so what the key reaches is its own reader rather than the managed one.
+            skipped.push(drive.exclusion);
+            continue;
+        }
         if let Some((command, marker)) = drive.prepare {
             assert!(
                 session.run(command, marker),
@@ -1055,6 +1075,7 @@ fn outside_the_condition_the_editor_keeps_the_key(
         {
             assert!(
                 driven.contains(&exclusion)
+                    || skipped.contains(&exclusion)
                     || shellpkg::not_constructible_here(case.shell, exclusion).is_some()
                     || shellpkg::not_driven_by_the_qualification(case.shell, exclusion).is_some(),
                 "{}: {} is neither driven here nor recorded as one this reader cannot be put \
@@ -1067,7 +1088,12 @@ fn outside_the_condition_the_editor_keeps_the_key(
     shellpkg::record(
         &format!("exclusions-{}.txt", case.id),
         &format!(
-            "driven: {}\naccounted for: {}\n",
+            "skipped, the customisation takes the key: {}\ndriven: {}\naccounted for: {}\n",
+            skipped
+                .iter()
+                .map(|exclusion| exclusion.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
             driven
                 .iter()
                 .map(|exclusion| exclusion.as_str())
@@ -2195,14 +2221,50 @@ fn a_live_session_keeps_the_package_it_started_with() {
          the terminal showed:\n{}",
         next.terminal_output()
     );
+    assert_eq!(
+        running_image(&mut next),
+        Some(after.executable.clone()),
+        "the session started after the update is running the image it replaced"
+    );
     assert!(next.alive());
 
-    // An installation whose record cannot be read is refused rather than substituted.
-    std::fs::write(shell.join("bbbbbbbbbbbbbbbb/kr-shell-identity.json"), "{").expect("the record");
+    // A replacement that reads perfectly well and is not this package is refused rather than
+    // launched: the record names a binary outside the package it is in.
+    let record_path = shell.join("bbbbbbbbbbbbbbbb/kr-shell-identity.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).expect("the record"))
+            .expect("the record decodes");
+    record["shell"]["executable"] = serde_json::Value::String("/bin/zsh".to_owned());
+    std::fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&record).expect("the record encodes"),
+    )
+    .expect("the record");
+    assert!(
+        kr_shell_integration::host::package::PackageSet::discover(root.path()).is_err(),
+        "an installation that names a binary outside itself was resolved anyway"
+    );
+
+    // And one whose record cannot be read at all.
+    std::fs::write(&record_path, "{").expect("the record");
     assert!(
         kr_shell_integration::host::package::PackageSet::discover(root.path()).is_err(),
         "an installation whose record cannot be read was resolved anyway"
     );
+}
+
+/// The image a session's shell is actually executing, as the operating system reports it.
+fn running_image(session: &mut Session) -> Option<std::path::PathBuf> {
+    let pid = session.child_pid()?;
+    if cfg!(target_os = "linux") {
+        return std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    }
+    let reported = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&reported.stdout).trim().to_owned();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
 }
 
 /// Another identity of the same package this host has built before, where it has one.

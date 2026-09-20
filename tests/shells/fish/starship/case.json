@@ -27,8 +27,8 @@
   "plugin": {
     "probe": "echo kr-plugin=(set -q STARSHIP_SESSION_KEY; and echo on; or echo off)",
     "marker": "kr-plugin=on",
-    "operation": "echo kr-plugin-(functions fish_prompt | string match -q '*starship*'; and echo yes; or echo no)",
-    "operation_marker": "kr-plugin-yes"
+    "operation": "set -l p (fish_prompt); echo kr-plugin-(string match -q '*KR>*' -- \"$p\"; and echo drew; or echo blank)",
+    "operation_marker": "kr-plugin-drew"
   },
   "covers": [
     "KR-REQ-07.87",
