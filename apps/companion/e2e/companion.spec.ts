@@ -239,12 +239,34 @@ test.describe('the raw terminal', () => {
     // Back over the surface first: clicking the tab left the pointer on the header, and a wheel
     // delivered there would never reach the terminal at all.
     await surface.hover()
+    // The count standing still says nothing on its own, because it was already standing at one.
+    // This watches the wheel itself instead. The view owns the wheel here and cancels it, and the
+    // path that would have given it to the application returns before anything is cancelled, so a
+    // wheel that was cancelled is a wheel that was not forwarded. This listener sits on the same
+    // element and in the same phase as the terminal's own, and was added after it, so it is called
+    // second and reads a decision that has already been made.
+    await surface.evaluate((element) => {
+      const held = window as unknown as { krWheelCancelled?: boolean }
+      held.krWheelCancelled = undefined
+      element.addEventListener(
+        'wheel',
+        (event) => {
+          held.krWheelCancelled = event.defaultPrevented
+        },
+        { capture: true, once: true }
+      )
+    })
     await page.mouse.wheel(0, 120)
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => (window as unknown as { krWheelCancelled?: boolean }).krWheelCancelled),
+        { timeout: PRESENTATION_DEADLINE }
+      )
+      .toBe(true)
     await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
 
-    // That the count did not move is only worth something once something has moved it since. In
-    // control mode the next wheel is given to the application, and the count goes to two rather
-    // than to three, which is the view-mode wheel having been delivered and withheld.
+    // And control mode still gives it away, so the count moves when it is meant to.
     await page.getByRole('tab', { name: 'Control' }).click()
     await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'control')
     await surface.hover()

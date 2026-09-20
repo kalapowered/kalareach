@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
@@ -25,6 +25,20 @@ function start(initialPlace: Place = { view: 'attention' }): { controls: FakeHos
 }
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+/**
+ * One event of a drag, with the moment it happened.
+ *
+ * The release velocity is read from the last hundred milliseconds of pointer positions, and an
+ * environment that stamps three events within a microsecond of each other turns a sixty-pixel drag
+ * into sixty thousand pixels a second, which dismisses the surface. Saying when each one happened
+ * is what makes a gesture mean the same thing on every machine.
+ */
+function gesture(type: string, clientY: number, timeStamp: number): PointerEvent {
+  const event = new PointerEvent(type, { bubbles: true, clientY })
+  Object.defineProperty(event, 'timeStamp', { value: timeStamp })
+  return event
+}
 
 describe('the attention inbox', () => {
   it('keeps its four states apart', async () => {
@@ -323,19 +337,61 @@ describe('the sheet', () => {
     // go short of a dismissal springs it back, and it says so again when it gets there. Without
     // that last part the surface would sit there claiming to be arriving for good.
     const grip = screen.getByTestId('sheet-grip')
-    grip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientY: 200 }))
+    grip.dispatchEvent(gesture('pointerdown', 200, 1_000))
     await waitFor(() => {
       expect(sheet).toHaveAttribute('data-presentation', 'arriving')
     })
-    grip.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 300 }))
-    grip.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 150 }))
-    grip.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 150 }))
+    grip.dispatchEvent(gesture('pointermove', 260, 1_016))
+    grip.dispatchEvent(gesture('pointerup', 260, 1_200))
 
     await waitFor(() => {
       expect(sheet).toHaveAttribute('data-presentation', 'here')
     })
-    // The gesture reversed, so it stayed.
+    // A gesture that neither travelled far enough nor carried any speed, so it stayed.
     expect(screen.getByTestId('sheet')).toBeInTheDocument()
+  })
+
+  it('says so too when the hold interrupted its arrival', async () => {
+    // The frames are handed out one at a time here, so the surface is taken hold of at a place
+    // this test chose rather than wherever the machine's own frames had carried it. This is the
+    // case that used to leave it saying it was arriving for ever: the grab stops the spring whose
+    // end would otherwise have said it had arrived.
+    const frames: FrameRequestCallback[] = []
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => frames.push(callback))
+    vi.stubGlobal('cancelAnimationFrame', () => undefined)
+    try {
+      start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+      await userEvent.click(await screen.findByTestId('open-settings'))
+      const sheet = await screen.findByTestId('sheet')
+      // The first frame of a spring carries no time; the second advances it by one step, which
+      // leaves the surface part way in and stops there because nothing else is handed out.
+      await act(async () => {
+        frames.shift()?.(0)
+      })
+      await act(async () => {
+        frames.shift()?.(64)
+      })
+      expect(sheet).toHaveAttribute('data-presentation', 'arriving')
+
+      const grip = screen.getByTestId('sheet-grip')
+      grip.dispatchEvent(gesture('pointerdown', 300, 1_000))
+      // Two hundred pixels upward and released still, which from part way in is neither far
+      // enough nor fast enough to dismiss, so the surface springs back to where it sits.
+      grip.dispatchEvent(gesture('pointermove', 100, 1_016))
+      grip.dispatchEvent(gesture('pointerup', 100, 1_200))
+
+      for (let step = 0; step < 200 && sheet.getAttribute('data-presentation') !== 'here'; step += 1) {
+        const next = frames.shift()
+        if (!next) break
+        await act(async () => {
+          next(16 * (step + 2))
+        })
+      }
+      expect(sheet).toHaveAttribute('data-presentation', 'here')
+      expect(screen.getByTestId('sheet')).toBeInTheDocument()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('dismisses on a downward flick', async () => {

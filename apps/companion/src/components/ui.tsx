@@ -475,8 +475,11 @@ export function Sheet({
       place(0)
       sheet.style.opacity = open ? '1' : '0'
       const handle = setTimeout(() => {
-        if (open) setAtRest(true)
-        else setMounted(false)
+        // A finger that landed during the fade owns the surface now, and the release will say
+        // when it is at rest again. This timer is not what stops a drag.
+        if (open) {
+          if (dragStart.current === null) setAtRest(true)
+        } else setMounted(false)
       }, REDUCED_MOTION_FADE_MS)
       return () => {
         clearTimeout(handle)
