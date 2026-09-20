@@ -177,6 +177,10 @@ impl DescriptionFence {
             return Ok(PublishGate::DeadlineExceeded);
         }
         store.publish(session_id, description, wall_ms)?;
+        if cancellation.is_cancelled() {
+            let _ = store.remove_generated_for(session_id);
+            return Ok(PublishGate::Cancelled);
+        }
         Ok(PublishGate::Allowed)
     }
 }
@@ -722,5 +726,114 @@ mod tests {
 
         assert_eq!(gate, PublishGate::Fenced);
         assert!(store.generated(&session).expect("record").is_none());
+    }
+
+    #[test]
+    fn publish_under_lock_guarantees_atomicity_under_concurrent_fence_contention() {
+        let store = Arc::new(Mutex::new(DescriptionStore::in_memory().expect("store")));
+        let fence = DescriptionFence::new();
+        let session = sample_session(42);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+
+        for iteration in 0..50 {
+            let store_clone = store.clone();
+            let fence_clone = fence.clone();
+            let session_clone = session;
+            let desc_clone = desc.clone();
+            let cancellation = Cancellation::new();
+            let clock = JobClock::by_hand();
+
+            let t_publish = std::thread::spawn(move || {
+                let store_guard = store_clone.lock().unwrap();
+                fence_clone.publish_under_lock(
+                    &store_guard,
+                    &session_clone,
+                    &desc_clone,
+                    1000 + iteration,
+                    PrivacyGeneration::INITIAL,
+                    PrivacyGeneration::INITIAL,
+                    &cancellation,
+                    &clock,
+                    0,
+                    5000,
+                )
+            });
+
+            let fence_clone2 = fence.clone();
+            let t_fence = std::thread::spawn(move || {
+                fence_clone2.raise(session, PrivacyGeneration::new(2));
+            });
+
+            let gate = t_publish.join().expect("publish thread").expect("gate");
+            t_fence.join().expect("fence thread");
+
+            if matches!(
+                gate,
+                PublishGate::Fenced | PublishGate::LateGeneration { .. } | PublishGate::Cancelled
+            ) {
+                // When the publication was rejected by the gate, it must not have been published after the fence.
+                let store_guard = store.lock().unwrap();
+                let record = store_guard.generated(&session).expect("read");
+                assert!(
+                    record.is_none(),
+                    "a fenced publication must leave nothing in the store"
+                );
+            }
+
+            let store_guard = store.lock().unwrap();
+            let _ = store_guard.remove_generated_for(&session);
+            fence.lower(&session);
+        }
+    }
+
+    #[test]
+    fn publish_under_lock_guarantees_atomicity_under_concurrent_cancellation_contention() {
+        let store = Arc::new(Mutex::new(DescriptionStore::in_memory().expect("store")));
+        let fence = DescriptionFence::new();
+        let session = sample_session(99);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+
+        for iteration in 0..50 {
+            let store_clone = store.clone();
+            let fence_clone = fence.clone();
+            let desc_clone = desc.clone();
+            let cancellation = Cancellation::new();
+            let cancellation_clone = cancellation.clone();
+            let clock = JobClock::by_hand();
+
+            let t_publish = std::thread::spawn(move || {
+                let store_guard = store_clone.lock().unwrap();
+                fence_clone.publish_under_lock(
+                    &store_guard,
+                    &session,
+                    &desc_clone,
+                    2000 + iteration,
+                    PrivacyGeneration::INITIAL,
+                    PrivacyGeneration::INITIAL,
+                    &cancellation,
+                    &clock,
+                    0,
+                    5000,
+                )
+            });
+
+            let t_cancel = std::thread::spawn(move || {
+                cancellation_clone.cancel();
+            });
+
+            let gate = t_publish.join().expect("publish thread").expect("gate");
+            t_cancel.join().expect("cancel thread");
+
+            if gate == PublishGate::Cancelled {
+                let store_guard = store.lock().unwrap();
+                assert!(
+                    store_guard.generated(&session).expect("read").is_none(),
+                    "a cancelled publication must leave nothing in the store"
+                );
+            }
+
+            let store_guard = store.lock().unwrap();
+            let _ = store_guard.remove_generated_for(&session);
+        }
     }
 }

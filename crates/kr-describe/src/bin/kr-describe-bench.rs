@@ -353,6 +353,8 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
 
     let bench_sampling = Arc::new(AtomicBool::new(true));
     let bench_sampling_clone = bench_sampling.clone();
+    let peak_bench_rss = Arc::new(AtomicU64::new(peak_rss_during_load));
+    let peak_bench_rss_clone = peak_bench_rss.clone();
     let peak_bench_cpu = Arc::new(AtomicU64::new(model_cpu));
     let peak_bench_cpu_clone = peak_bench_cpu.clone();
     let bench_sampler_thread = std::thread::spawn(move || {
@@ -361,6 +363,8 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         while bench_sampling_clone.load(Ordering::Relaxed) {
             system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
             if let Some(p) = system.process(pid) {
+                let current_rss = p.memory();
+                peak_bench_rss_clone.fetch_max(current_rss, Ordering::Relaxed);
                 let current_cpu = p.cpu_usage().round() as u64;
                 peak_bench_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
             }
@@ -458,6 +462,32 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     let _ = bench_sampler_thread.join();
     stop_workload.store(true, Ordering::Release);
     let _ = workload_thread.join();
+
+    let active_rss = peak_bench_rss.load(Ordering::Acquire);
+    let active_cpu = peak_bench_cpu.load(Ordering::Acquire);
+    let active_figures = ProcessFigures {
+        whole_product_rss_bytes: active_rss,
+        model_rss_bytes: active_rss.saturating_sub(baseline_rss),
+        whole_product_cpu_centis: active_cpu,
+        model_cpu_centis: active_cpu,
+    };
+    println!(
+        "measured_active_inference_rss_bytes: whole process {}, model and runtime {}, process without the model {} [{machine}]",
+        active_figures.whole_product_rss_bytes,
+        active_figures.model_rss_bytes,
+        active_figures.product_without_model_rss_bytes()
+    );
+    println!(
+        "measured_active_inference_cpu_centis: whole process {}, model and runtime {}, process without the model {} [{machine}]",
+        active_figures.whole_product_cpu_centis,
+        active_figures.model_cpu_centis,
+        active_figures.product_without_model_cpu_centis()
+    );
+    println!(
+        "active_inference_process_ceiling_bytes: {} held: {} [{machine}]",
+        budgets.process_memory_ceiling_bytes,
+        active_figures.whole_product_rss_bytes <= budgets.process_memory_ceiling_bytes
+    );
 
     for reading in ledger.published() {
         report(
