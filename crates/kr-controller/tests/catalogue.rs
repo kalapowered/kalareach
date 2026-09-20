@@ -8,6 +8,10 @@
 use std::path::Path;
 
 use kr_controller::catalogue::CatalogueModule;
+use kr_controller::sharing::{
+    CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan,
+};
+use kr_plugin_runtime::catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
 use kr_protocol::catalogue as wire;
 use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
@@ -17,7 +21,8 @@ use kr_protocol::ids::{
     ActionId, ActionWindowId, EnvironmentId, PluginId, RepositoryGeneration, RequestId,
 };
 use kr_protocol::method::{Method, MethodName, MethodVersion};
-use kr_protocol::scalars::{DurationMs, Nullable, U64};
+use kr_protocol::pairing::{ConfirmationChannel, OwnerConfirmationProof, SensitiveAction};
+use kr_protocol::scalars::{Digest256, DurationMs, Nullable, U64};
 
 /// Where the copied development generation lives inside this checkout.
 fn fixture() -> std::path::PathBuf {
@@ -30,6 +35,119 @@ struct Host {
     environment_id: EnvironmentId,
     working: std::path::PathBuf,
     _working_temp: tempfile::TempDir,
+    ceremony: Ceremony,
+}
+
+impl Host {
+    fn confirmations(&self) -> &dyn OwnerConfirmations {
+        &self.ceremony
+    }
+}
+
+/// This host's clock, derived the way the daemon derives its own.
+///
+/// A fixed boot value would make every confirmation built here look like one from another boot.
+#[derive(Debug)]
+struct Clock;
+
+impl kr_pairing::platform::PairingClock for Clock {
+    fn monotonic_ms(&self) -> u64 {
+        kr_ipc::clock::SharedClock::boot_elapsed_ms(&kr_ipc::clock::SystemSharedClock)
+    }
+
+    fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
+        let value = kr_ipc::identity::boot_identity()
+            .map(|identity| identity.value.as_slice().to_vec())
+            .unwrap_or_default();
+        kr_pairing::platform::BootIdentity(kr_cbor::sha256(&value))
+    }
+
+    fn wall_clock_ms(&self) -> u64 {
+        kr_ipc::now_ms().get()
+    }
+}
+
+/// The owner's ceremony, as a host that has an enrolled owner signer runs it.
+///
+/// This is the real acceptance: the challenge is issued and recorded here, the proof is signed by
+/// the enrolled key, and the ledger consumes it exactly once. Nothing in these tests asserts a
+/// confirmation by writing one down.
+struct Ceremony {
+    owner: kr_crypto::keys::AuthorisationKeyPair,
+    ledger: std::sync::Mutex<kr_pairing::confirm::ConfirmationLedger>,
+    clock: Clock,
+    device_id: kr_protocol::ids::DeviceId,
+    endpoint_id: kr_protocol::scalars::EndpointKey,
+}
+
+impl Ceremony {
+    fn new() -> Self {
+        Self {
+            owner: kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key"),
+            ledger: std::sync::Mutex::new(kr_pairing::confirm::ConfirmationLedger::new()),
+            clock: Clock,
+            device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7u8; 32]),
+        }
+    }
+
+    /// Issues a challenge for one action and signs it, as the owner's device does.
+    fn approve(&self, action: SensitiveAction, digest: Digest256) -> OwnerConfirmationProof {
+        let request = kr_pairing::confirm::request_confirmation(
+            &self.clock,
+            action,
+            digest,
+            None,
+            std::collections::BTreeSet::new(),
+            self.device_id,
+            self.endpoint_id,
+        )
+        .expect("a challenge");
+        self.ledger
+            .lock()
+            .expect("the ledger")
+            .issue(&request, &self.clock);
+        kr_pairing::confirm::sign_confirmation(
+            &self.owner,
+            &request,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof")
+    }
+}
+
+impl OwnerConfirmations for Ceremony {
+    fn accept(
+        &self,
+        action: SensitiveAction,
+        action_digest: Digest256,
+        proof: &OwnerConfirmationProof,
+    ) -> kr_controller::Result<ConfirmedAction> {
+        ConfirmedAction::verify(
+            &kr_pairing::confirm::ConfirmationExpectation {
+                action,
+                action_digest,
+                host_device_id: self.device_id,
+                host_endpoint_id: self.endpoint_id,
+                destination_keys: None,
+                destination_rights: &kr_protocol::scalars::CanonicalSet::new(),
+            },
+            &mut self.ledger.lock().expect("the ledger"),
+            &self.clock,
+            &proof.request,
+            proof,
+            self.owner.public(),
+            kr_pairing::confirm::HostEnrolment::Enrolled,
+        )
+    }
+
+    fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
+        self.device_id
+    }
+
+    fn clock(&self) -> &dyn kr_pairing::platform::PairingClock {
+        &self.clock
+    }
 }
 
 /// Opens a daemon-hosted catalogue over a copy of the published development generation.
@@ -50,6 +168,7 @@ fn host() -> Host {
         environment_id,
         working,
         _working_temp: working_temp,
+        ceremony: Ceremony::new(),
     }
 }
 
@@ -144,16 +263,76 @@ fn budgets() -> wire::CatalogueBudgets {
 
 fn add_params(host: &Host) -> wire::CatalogueAddParams {
     use base64::Engine as _;
+    let root = std::fs::read(host.working.join("root.json")).expect("a trust root");
+    let metadata_url = directory_url(&host.working.join("metadata"));
+    let targets_url = directory_url(&host.working.join("targets"));
+    // The owner is asked about this exact enrolment: this repository, this root and this ceiling.
+    // The client builds the plan the host will build, which is what makes the digests agree.
+    let digest = CatalogueTrustPlan {
+        environment_id: host.environment_id,
+        catalogue_id: "development".to_owned(),
+        root_digest: kr_plugin_sdk::digest::PayloadDigest::of(&root).to_string(),
+        root_key_ids: root_key_ids(&root, &metadata_url, &targets_url),
+        ceiling: kr_protocol::scalars::CanonicalSet::new(),
+    }
+    .action_digest()
+    .expect("a digest");
     wire::CatalogueAddParams {
         environment_id: host.environment_id,
         catalogue_id: "development".to_owned(),
         kind: wire::CatalogueKind::Local,
-        metadata_url: directory_url(&host.working.join("metadata")),
-        targets_url: directory_url(&host.working.join("targets")),
-        root: base64::engine::general_purpose::STANDARD
-            .encode(std::fs::read(host.working.join("root.json")).expect("a trust root")),
+        metadata_url,
+        targets_url,
+        root: base64::engine::general_purpose::STANDARD.encode(&root),
         budgets: budgets(),
         ceiling: Vec::new(),
+        owner_confirmation: host
+            .ceremony
+            .approve(SensitiveAction::TrustRepositoryRoot, digest),
+    }
+}
+
+/// The key identifiers the root declares for its own role, read out of the root document.
+fn root_key_ids(
+    root: &[u8],
+    metadata_url: &str,
+    targets_url: &str,
+) -> kr_protocol::scalars::CanonicalSet<String> {
+    Enrolment::new(
+        RepositoryId::new("development").expect("a valid identifier"),
+        RepositoryKind::Local,
+        url::Url::parse(metadata_url).expect("a location"),
+        url::Url::parse(targets_url).expect("a location"),
+        root.to_vec(),
+        kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .expect("an enrolment")
+    .root_key_ids()
+    .expect("a readable root")
+    .into_iter()
+    .collect()
+}
+
+/// The parameters of a `plugin.grant`, with the owner's confirmation of that exact grant.
+fn grant_params(host: &Host, package_digest: &str, grant: Vec<String>) -> wire::PluginGrantParams {
+    let digest = PluginGrantPlan {
+        environment_id: host.environment_id,
+        plugin_id: plugin(),
+        version: "0.1.0".to_owned(),
+        package_digest: package_digest.to_owned(),
+        grant: grant.iter().cloned().collect(),
+    }
+    .action_digest()
+    .expect("a digest");
+    wire::PluginGrantParams {
+        environment_id: host.environment_id,
+        plugin_id: plugin(),
+        package_digest: package_digest.to_owned(),
+        grant,
+        owner_confirmation: host
+            .ceremony
+            .approve(SensitiveAction::GrantExecutableCapability, digest),
     }
 }
 
@@ -178,6 +357,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
                 &add_params(&host),
             ),
             Method::CatalogueAdd,
+            Some(host.confirmations()),
         )
         .await);
     assert_eq!(added.catalogue.catalogue_id, "development");
@@ -204,6 +384,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
                 },
             ),
             Method::CatalogueSync,
+            Some(host.confirmations()),
         )
         .await);
     assert_eq!(synced.generation.get(), 1);
@@ -252,6 +433,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
                 },
             ),
             Method::CataloguePin,
+            Some(host.confirmations()),
         )
         .await);
     assert_eq!(
@@ -273,6 +455,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
                     },
                 ),
                 Method::CataloguePin,
+                Some(host.confirmations()),
             )
             .await,
     );
@@ -290,6 +473,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
                 },
             ),
             Method::CatalogueRemove,
+            Some(host.confirmations()),
         )
         .await);
     assert_eq!(removed.catalogue_id, "development");
@@ -305,13 +489,16 @@ async fn kr_req_23_28_a_second_enrolment_of_one_root_is_refused() {
         .write_frame(
             &mutation(Method::CatalogueAdd, host.environment_id, &params),
             Method::CatalogueAdd,
+            Some(host.confirmations()),
         )
         .await);
+    let params2 = add_params(&host);
     let refused = refusal(
         host.module
             .write_frame(
-                &mutation(Method::CatalogueAdd, host.environment_id, &params),
+                &mutation(Method::CatalogueAdd, host.environment_id, &params2),
                 Method::CatalogueAdd,
+                Some(host.confirmations()),
             )
             .await,
     );
@@ -347,6 +534,7 @@ async fn a_location_that_is_a_version_control_branch_is_refused() {
             .write_frame(
                 &mutation(Method::CatalogueAdd, host.environment_id, &params),
                 Method::CatalogueAdd,
+                Some(host.confirmations()),
             )
             .await,
     );
@@ -373,6 +561,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 &add_params(&host),
             ),
             Method::CatalogueAdd,
+            Some(host.confirmations()),
         )
         .await);
     let _: wire::CatalogueSyncResult = ok(host
@@ -387,6 +576,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 },
             ),
             Method::CatalogueSync,
+            Some(host.confirmations()),
         )
         .await);
 
@@ -422,6 +612,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                     },
                 ),
                 Method::PluginInstall,
+                Some(host.confirmations()),
             )
             .await,
     );
@@ -443,6 +634,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 },
             ),
             Method::PluginInstall,
+            Some(host.confirmations()),
         )
         .await);
     assert_eq!(installed.plugin.package_digest, digest);
@@ -465,6 +657,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 },
             ),
             Method::PluginEnable,
+            Some(host.confirmations()),
         )
         .await);
     assert!(enabled.plugin.enabled);
@@ -482,6 +675,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 },
             ),
             Method::PluginPin,
+            Some(host.confirmations()),
         )
         .await);
     assert!(pinned.plugin.pinned);
@@ -540,13 +734,14 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 &mutation(
                     Method::PluginGrant,
                     host.environment_id,
-                    &wire::PluginGrantParams {
-                        environment_id: host.environment_id,
-                        plugin_id: plugin(),
-                        grant: vec!["filesystem.write".to_owned()],
-                    },
+                    &grant_params(
+                        &host,
+                        &installed.plugin.package_digest,
+                        vec!["filesystem.write".to_owned()],
+                    ),
                 ),
                 Method::PluginGrant,
+                Some(host.confirmations()),
             )
             .await,
     );
@@ -565,6 +760,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 },
             ),
             Method::PluginDisable,
+            Some(host.confirmations()),
         )
         .await);
     assert!(!disabled.plugin.enabled);
@@ -581,6 +777,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                 },
             ),
             Method::PluginRemove,
+            Some(host.confirmations()),
         )
         .await);
     assert_eq!(removed.plugin_id, plugin());
@@ -599,6 +796,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
                 &add_params(&host),
             ),
             Method::CatalogueAdd,
+            Some(host.confirmations()),
         )
         .await);
     let _: wire::CatalogueSyncResult = ok(host
@@ -613,6 +811,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
                 },
             ),
             Method::CatalogueSync,
+            Some(host.confirmations()),
         )
         .await);
     let digest = {
@@ -646,6 +845,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
                 },
             ),
             Method::PluginInstall,
+            Some(host.confirmations()),
         )
         .await);
 
@@ -661,6 +861,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
                 },
             ),
             Method::CatalogueRemove,
+            Some(host.confirmations()),
         )
         .await);
     assert_eq!(removed.installed_packages, vec![plugin()]);
@@ -763,24 +964,8 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
     assert!(listed.catalogues.is_empty());
 
     // And so does a mutation: what this proves is that the envelope check admits it, which is the
-    // one thing driving the module directly cannot show.
-    let working_temp = tempfile::tempdir().expect("a temporary directory");
-    let working = working_temp.path().join("development");
-    copy_tree(&fixture(), &working);
-    let params = {
-        use base64::Engine as _;
-        wire::CatalogueAddParams {
-            environment_id,
-            catalogue_id: "development".to_owned(),
-            kind: wire::CatalogueKind::Local,
-            metadata_url: directory_url(&working.join("metadata")),
-            targets_url: directory_url(&working.join("targets")),
-            root: base64::engine::general_purpose::STANDARD
-                .encode(std::fs::read(working.join("root.json")).expect("a trust root")),
-            budgets: budgets(),
-            ceiling: Vec::new(),
-        }
-    };
+    // one thing driving the module directly cannot show. The catalogue itself answers, naming the
+    // repository nobody enrolled rather than the method nobody serves.
     let target = ActionTarget {
         environment_id,
         session_id: Nullable::null(),
@@ -788,19 +973,61 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         application_instance_id: Nullable::null(),
         agent_binding_revision: Nullable::null(),
     };
-    let added: wire::CatalogueAddResult = client
+    let refused = client
+        .mutate(
+            Method::CatalogueSync,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &wire::CatalogueSyncParams {
+                environment_id,
+                catalogue_id: "development".to_owned(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("nothing is enrolled yet");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+
+    // `catalogue.add` reaches the module too, and stops at the owner's ceremony. This daemon has
+    // no enrolled owner signer, and section 10 does not let the caller's operating-system identity
+    // stand in for one.
+    let working_temp = tempfile::tempdir().expect("a temporary directory");
+    let working = working_temp.path().join("development");
+    copy_tree(&fixture(), &working);
+    let ceremony = Ceremony::new();
+    let params = {
+        use base64::Engine as _;
+        let root = std::fs::read(working.join("root.json")).expect("a trust root");
+        wire::CatalogueAddParams {
+            environment_id,
+            catalogue_id: "development".to_owned(),
+            kind: wire::CatalogueKind::Local,
+            metadata_url: directory_url(&working.join("metadata")),
+            targets_url: directory_url(&working.join("targets")),
+            root: base64::engine::general_purpose::STANDARD.encode(&root),
+            budgets: budgets(),
+            ceiling: Vec::new(),
+            owner_confirmation: ceremony.approve(
+                SensitiveAction::TrustRepositoryRoot,
+                Digest256::from_bytes([0u8; 32]),
+            ),
+        }
+    };
+    let refused = client
         .mutate(
             Method::CatalogueAdd,
             ActionId::new(kr_ipc::new_uuid()),
-            target,
+            target.clone(),
             &params,
         )
         .await
         .expect("the call reaches the daemon")
-        .expect("and is answered")
-        .to_typed()
-        .expect("a readable result");
-    assert_eq!(added.catalogue.catalogue_id, "development");
+        .expect_err("this host has no owner to confirm with");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("owner"),
+        "the refusal names the ceremony: {refused:?}"
+    );
 
     let listed: wire::PluginListResult = client
         .request(

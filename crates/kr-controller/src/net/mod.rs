@@ -211,6 +211,16 @@ pub struct NetworkGuard {
 }
 
 impl NetworkGuard {
+    /// Returns the host's pairing state machine, which is where an owner confirmation is checked.
+    ///
+    /// A daemon reaches its own ceremony through this. `None` means no owner is enrolled, and a
+    /// method that needs the owner's confirmation is refused rather than performed under the
+    /// operating-system identity of whoever called it.
+    #[must_use]
+    pub fn pairing(&self) -> Option<&Arc<PairingHost>> {
+        self.host.pairing.as_ref()
+    }
+
     /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
     fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.listener

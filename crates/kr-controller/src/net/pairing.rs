@@ -623,6 +623,49 @@ impl PairingHost {
     }
 }
 
+/// The host accepts the owner's confirmation of a sensitive action against its own ledger.
+///
+/// The challenge has to be one this host issued and still holds, so a caller cannot present a
+/// challenge of its own making with a matching signature. Consuming it here is what makes one
+/// ceremony authorise exactly one action.
+impl crate::sharing::OwnerConfirmations for PairingHost {
+    fn accept(
+        &self,
+        action: SensitiveAction,
+        action_digest: Digest256,
+        proof: &kr_protocol::pairing::OwnerConfirmationProof,
+    ) -> Result<crate::sharing::ConfirmedAction> {
+        crate::sharing::ConfirmedAction::verify(
+            &kr_pairing::confirm::ConfirmationExpectation {
+                action,
+                action_digest,
+                host_device_id: self.identity.device_id,
+                host_endpoint_id: self.identity.endpoint_id,
+                // A catalogue action sends authority to no device and grants no session right.
+                // What it changes is what this host will trust or run.
+                destination_keys: None,
+                destination_rights: &kr_protocol::scalars::CanonicalSet::new(),
+            },
+            &mut self.ledger(),
+            &self.clock,
+            // The host's own retained challenge is what the ledger compares this against, so a
+            // challenge the caller made up is refused before the signature is ever believed.
+            &proof.request,
+            proof,
+            &self.owner_signer,
+            self.enrolment,
+        )
+    }
+
+    fn host_device_id(&self) -> DeviceId {
+        self.identity.device_id
+    }
+
+    fn clock(&self) -> &dyn kr_pairing::platform::PairingClock {
+        &self.clock
+    }
+}
+
 impl PairingSurface for PairingHost {
     fn call(
         &self,

@@ -10,10 +10,11 @@
 //! * The checks section 23 names for these two rows happen here, against the service's answers:
 //!   the repository's root, generation and budgets for the catalogue group, and the package hash,
 //!   the repository ceiling, the environment and the bindings for the plugin group.
-//! * Adopting a trust root and granting a capability are the owner's decisions. This endpoint
-//!   serves a local caller under its authenticated operating-system identity, which is the owner,
-//!   so a caller that asserts a confirmation of its own is refused rather than believed: a
-//!   confirmation a caller can write is not a confirmation.
+//! * Adopting a trust root and granting a capability are the owner's decisions, and section 10
+//!   says outright that an operating-system identity is not that decision. Both methods carry the
+//!   owner's confirmation of one exact action: the challenge this host issued and is still
+//!   holding, answered under the enrolled signer, bound to the root or the release in front of the
+//!   owner, and consumed here so one ceremony authorises one action.
 //! * Enlarging trust is never a side effect of another method. A sync verifies inside the ceiling
 //!   the enrolment already has and refuses a generation that would need more; an install refuses a
 //!   grant wider than the installation already held and names `plugin.grant`, which is the method
@@ -41,6 +42,8 @@ use kr_protocol::ids::{EnvironmentId, PluginId, RepositoryGeneration, RequestId}
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::{Nullable, U64};
 use tokio::sync::Mutex;
+
+use crate::sharing::{ConfirmedAction, OwnerConfirmations};
 
 /// What a catalogue call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -204,16 +207,33 @@ impl CatalogueModule {
 
     /// Serves one catalogue or plugin mutation and returns the frame it answers with.
     #[must_use]
-    pub async fn write_frame(&self, mutation: &MutationRequest, method: Method) -> ControlFrame {
-        frame(mutation.request_id, self.write(mutation, method).await)
+    pub async fn write_frame(
+        &self,
+        mutation: &MutationRequest,
+        method: Method,
+        confirmations: Option<&dyn OwnerConfirmations>,
+    ) -> ControlFrame {
+        frame(
+            mutation.request_id,
+            self.write(mutation, method, confirmations).await,
+        )
     }
 
     /// Serves one catalogue or plugin mutation.
     ///
+    /// `confirmations` is where the two confirmed methods check the owner's decision. `None` is a
+    /// host with no enrolled owner signer, which refuses them rather than performing them under
+    /// the identity of whoever called.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the catalogue decided, under the catalogue's own code.
-    pub async fn write(&self, mutation: &MutationRequest, method: Method) -> Answer<ParamsValue> {
+    pub async fn write(
+        &self,
+        mutation: &MutationRequest,
+        method: Method,
+        confirmations: Option<&dyn OwnerConfirmations>,
+    ) -> Answer<ParamsValue> {
         let mut catalogue = self.catalogue.lock().await;
         match method {
             Method::CatalogueAdd => {
@@ -221,10 +241,32 @@ impl CatalogueModule {
                 self.check_environment(params.environment_id)?;
                 let enrolment = enrolment_from(&params)?;
                 let id = enrolment.id.clone();
-                // Adopting a root is the owner's act, and `catalogue.add` is that act performed by
-                // a caller this endpoint authenticated as the owner. Re-anchoring an existing
-                // repository is two deliberate acts, `catalogue.remove` and `catalogue.add`, so
-                // that a root never changes underneath a repository somebody is already using.
+                // Adopting a root is the owner's act. The confirmation names this repository, this
+                // root and this ceiling, so one obtained for a narrower enrolment does not adopt a
+                // wider one. Re-anchoring an existing repository is two deliberate acts,
+                // `catalogue.remove` and `catalogue.add`, so that a root never changes underneath
+                // a repository somebody is already using.
+                let plan = crate::sharing::CatalogueTrustPlan {
+                    environment_id: params.environment_id,
+                    catalogue_id: id.to_string(),
+                    root_digest: enrolment.root_digest().to_string(),
+                    root_key_ids: enrolment
+                        .root_key_ids()
+                        .map_err(ProtocolError::from)?
+                        .into_iter()
+                        .collect(),
+                    ceiling: params.ceiling.iter().cloned().collect(),
+                };
+                let confirmed = confirm(
+                    confirmations,
+                    crate::sharing::CatalogueTrustPlan::sensitive_action(),
+                    plan.action_digest(),
+                    &params.owner_confirmation,
+                    "enrolment",
+                )?;
+                // Again, immediately before the effect. A confirmation has a short lifetime, and
+                // the checks and the store's lock between the acceptance and here take time.
+                recheck(confirmations, &confirmed, plan.action_digest(), "enrolment")?;
                 catalogue
                     .enrol(enrolment, true)
                     .map_err(ProtocolError::from)?;
@@ -378,6 +420,36 @@ impl CatalogueModule {
                 let params: wire::PluginGrantParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let grant = grant_from(&params.grant)?;
+                // The grant is about the release the owner was shown. An installation that moved
+                // on is a different decision, so the digest is checked before the confirmation is
+                // even read rather than the change being applied to whatever is installed now.
+                let installed =
+                    installation_of(&catalogue, params.environment_id, &params.plugin_id)?;
+                let named = digest(&params.package_digest)?;
+                if installed.package_digest != named {
+                    return Err(ProtocolError::new(
+                        ErrorCode::IdConflict,
+                        format!(
+                            "{} is installed at {} and this grant is for {}",
+                            params.plugin_id, installed.package_digest, named
+                        ),
+                    ));
+                }
+                let plan = crate::sharing::PluginGrantPlan {
+                    environment_id: params.environment_id,
+                    plugin_id: params.plugin_id.clone(),
+                    version: installed.version.to_string(),
+                    package_digest: named.to_string(),
+                    grant: params.grant.iter().cloned().collect(),
+                };
+                let confirmed = confirm(
+                    confirmations,
+                    crate::sharing::PluginGrantPlan::sensitive_action(),
+                    plan.action_digest(),
+                    &params.owner_confirmation,
+                    "grant",
+                )?;
+                recheck(confirmations, &confirmed, plan.action_digest(), "grant")?;
                 let installation = catalogue
                     .set_grant(params.environment_id, &params.plugin_id, grant)
                     .map_err(ProtocolError::from)?;
@@ -703,6 +775,60 @@ const fn kind_of(kind: RepositoryKind) -> wire::CatalogueKind {
         RepositoryKind::Local => wire::CatalogueKind::Local,
         RepositoryKind::Mirror => wire::CatalogueKind::Mirror,
     }
+}
+
+/// Accepts the owner's confirmation of one exact action, or refuses the method.
+///
+/// A host with no enrolled owner signer has no way to obtain a confirmation, and section 10 does
+/// not let it fall back to the identity of whoever called. It refuses, and says why.
+fn confirm(
+    confirmations: Option<&dyn OwnerConfirmations>,
+    action: kr_protocol::pairing::SensitiveAction,
+    action_digest: crate::Result<kr_protocol::scalars::Digest256>,
+    proof: &kr_protocol::pairing::OwnerConfirmationProof,
+    subject: &str,
+) -> Answer<ConfirmedAction> {
+    let confirmations = confirmations.ok_or_else(|| {
+        ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            format!(
+                "this {subject} needs the owner's confirmation and this host has no enrolled \
+                 owner signer to check one against"
+            ),
+        )
+    })?;
+    let digest = action_digest.map_err(|error| error.to_protocol_error())?;
+    confirmations
+        .accept(action, digest, proof)
+        .map_err(|error| error.to_protocol_error())
+}
+
+/// Checks the confirmation again immediately before the effect.
+///
+/// A confirmation is for a decision the owner is making now. Between the acceptance above and the
+/// store's own lock there is parsing, a catalogue lock and whatever else is queued, and one
+/// carried past its short deadline is no longer that decision.
+fn recheck(
+    confirmations: Option<&dyn OwnerConfirmations>,
+    confirmed: &ConfirmedAction,
+    action_digest: crate::Result<kr_protocol::scalars::Digest256>,
+    subject: &str,
+) -> Answer<()> {
+    let confirmations = confirmations.ok_or_else(|| {
+        ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            format!("this {subject} needs the owner's confirmation"),
+        )
+    })?;
+    let digest = action_digest.map_err(|error| error.to_protocol_error())?;
+    confirmed
+        .covers(
+            digest,
+            confirmations.host_device_id(),
+            confirmations.clock(),
+            subject,
+        )
+        .map_err(|error| error.to_protocol_error())
 }
 
 fn enrolment_from(params: &wire::CatalogueAddParams) -> Answer<Enrolment> {

@@ -102,18 +102,7 @@ impl TransferPlan {
 /// write; this is not. [`Self::covers`] then checks that the evidence is about *this* plan, which
 /// is what stops a confirmation for one transfer being carried to another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConfirmedTransfer {
-    action_digest: Digest256,
-    /// The host the challenge was verified against. Evidence accepted for one host says nothing
-    /// about another, so this travels with it and is checked where the transfer happens.
-    host_device_id: DeviceId,
-    /// The boot the confirmation was accepted in, and the monotonic moment its lifetime ends.
-    ///
-    /// The wall clock is what the signer reads; the deadline this host enforces is monotonic and
-    /// tied to a boot, because a clock wound back would otherwise lengthen a confirmation.
-    boot: kr_pairing::platform::BootIdentity,
-    expires_at_monotonic_ms: u64,
-}
+pub struct ConfirmedTransfer(crate::sharing::ConfirmedAction);
 
 impl ConfirmedTransfer {
     /// Verifies and consumes the owner's confirmation for this exact transfer.
@@ -144,52 +133,31 @@ impl ConfirmedTransfer {
         signer: &kr_protocol::scalars::AuthorisationKey,
         enrolment: kr_pairing::confirm::HostEnrolment,
     ) -> Result<Self> {
-        let action_digest = plan.action_digest()?;
         // The host and the destination come from what this host knows, not from the challenge. A
         // challenge that named its own host would be proving only that somebody issued it.
         let expectation = kr_pairing::confirm::ConfirmationExpectation {
             action: TransferPlan::sensitive_action(),
-            action_digest,
+            action_digest: plan.action_digest()?,
             host_device_id: host.device_id,
             host_endpoint_id: host.endpoint_id,
             destination_keys: Some(host.recipient_keys),
             destination_rights: &plan.actions,
         };
-        // The deadline this host is enforcing for this challenge, read from the ledger before the
-        // acceptance consumes it. It is monotonic and belongs to a boot, which is what makes it a
-        // deadline the wall clock cannot lengthen; recomputing one from `expires_at_ms` would take
-        // whatever the wall clock said at acceptance, and a clock that had gone back in the
-        // meantime would hand the confirmation more life than it was issued with.
-        let (boot, expires_at_monotonic_ms) =
-            ledger.deadline(request.confirmation_id).ok_or_else(|| {
-                ControllerError::PermissionDenied {
-                    detail: "this host has no such outstanding confirmation".to_owned(),
-                }
-            })?;
-        kr_pairing::confirm::accept_confirmation(
+        Ok(Self(crate::sharing::ConfirmedAction::verify(
+            &expectation,
             ledger,
             clock,
             request,
             proof,
             signer,
             enrolment,
-            &expectation,
-        )
-        .map_err(|error| ControllerError::PermissionDenied {
-            detail: format!("the owner's confirmation does not authorise this transfer: {error}"),
-        })?;
-        Ok(Self {
-            action_digest,
-            host_device_id: host.device_id,
-            boot,
-            expires_at_monotonic_ms,
-        })
+        )?))
     }
 
     /// The digest this confirmation is about.
     #[must_use]
     pub const fn action_digest(&self) -> Digest256 {
-        self.action_digest
+        self.0.action_digest()
     }
 
     /// Checks that this confirmation is about this plan, and is still inside its own deadline.
@@ -205,27 +173,8 @@ impl ConfirmedTransfer {
         host_device_id: DeviceId,
         clock: &dyn kr_pairing::platform::PairingClock,
     ) -> Result<()> {
-        if plan.action_digest()? != self.action_digest {
-            return Err(ControllerError::PermissionDenied {
-                detail: "the owner's confirmation is for a different transfer".to_owned(),
-            });
-        }
-        if self.host_device_id != host_device_id {
-            return Err(ControllerError::PermissionDenied {
-                detail: "the owner's confirmation was accepted for another host".to_owned(),
-            });
-        }
-        if clock.boot_identity() != self.boot {
-            return Err(ControllerError::PermissionDenied {
-                detail: "the owner's confirmation was accepted in an earlier boot".to_owned(),
-            });
-        }
-        if clock.monotonic_ms() >= self.expires_at_monotonic_ms {
-            return Err(ControllerError::PermissionDenied {
-                detail: "the owner's confirmation for this transfer has expired".to_owned(),
-            });
-        }
-        Ok(())
+        self.0
+            .covers(plan.action_digest()?, host_device_id, clock, "transfer")
     }
 }
 

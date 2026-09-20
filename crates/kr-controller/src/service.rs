@@ -3975,7 +3975,21 @@ impl Controller {
                     error.to_string(),
                 );
             }
-            return self.catalogue.write_frame(mutation, method).await;
+            // The owner's ceremony, where this host has an enrolled owner. A host without one
+            // refuses the two confirmed methods rather than performing them under the caller's
+            // operating-system identity.
+            let pairing = self
+                .network
+                .get()
+                .and_then(|guard| guard.pairing())
+                .map(std::sync::Arc::clone);
+            let confirmations = pairing
+                .as_deref()
+                .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
+            return self
+                .catalogue
+                .write_frame(mutation, method, confirmations)
+                .await;
         }
         if crate::project::ProjectModule::serves(method) {
             let Some(admitted_revision) = admitted else {

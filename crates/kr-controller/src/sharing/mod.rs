@@ -21,6 +21,7 @@
 //! is, and re-issuing what a device already holds enlarges nothing. Transfer of control is
 //! separate and always confirmed, because it changes who the owner is.
 
+pub mod confirmation;
 pub mod invitation;
 pub mod roles;
 pub mod transfer;
@@ -39,6 +40,7 @@ use kr_protocol::sharing::{
 use crate::error::{ControllerError, Result};
 use crate::grants::{GrantDirectory, GrantRecord, GrantRevocation};
 
+pub use confirmation::{CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan};
 pub use invitation::InvitationRecord;
 pub use roles::{Intermediary, effective_rights};
 pub use transfer::{ConfirmedTransfer, ControlTransfer, TransferHost, TransferPlan};

@@ -344,6 +344,36 @@ impl Enrolment {
         PayloadDigest::of(&self.root)
     }
 
+    /// The key identifiers the adopted root declares for its own role.
+    ///
+    /// What an owner confirms when it adopts a root is the keys that will sign the next one, so
+    /// they are read out of the root document rather than described from outside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::Untrusted`] when the root is not a signed TUF root document.
+    pub fn root_key_ids(&self) -> CatalogueResult<Vec<String>> {
+        let root: tough::schema::Signed<tough::schema::Root> =
+            serde_json::from_slice(&self.root).map_err(|source| CatalogueError::Untrusted {
+                detail: format!(
+                    "{} was given a root this host cannot read: {source}",
+                    self.id
+                ),
+            })?;
+        let keys = root
+            .signed
+            .roles
+            .get(&tough::schema::RoleType::Root)
+            .ok_or_else(|| CatalogueError::Untrusted {
+                detail: format!("{}'s root declares no keys for the root role", self.id),
+            })?;
+        Ok(keys
+            .keyids
+            .iter()
+            .map(|key_id| hex_of(key_id.as_ref()))
+            .collect())
+    }
+
     /// Decides whether a proposed change needs the owner to confirm it.
     ///
     /// A different root is a different trust anchor, whatever it is called. A wider ceiling is
@@ -384,6 +414,16 @@ impl Enrolment {
         }
         Ok(())
     }
+}
+
+/// Renders bytes as lowercase hexadecimal, which is how TUF writes a key identifier.
+fn hex_of(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 #[cfg(test)]

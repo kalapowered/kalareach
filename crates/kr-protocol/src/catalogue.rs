@@ -25,6 +25,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{CapabilityId, EnvironmentId, PluginId, RepositoryGeneration};
+use crate::pairing::OwnerConfirmationProof;
 use crate::scalars::{Nullable, TimestampMs, U64};
 
 /// The kind of repository an enrolment is.
@@ -137,6 +138,13 @@ pub struct CatalogueAddParams {
     pub budgets: CatalogueBudgets,
     /// Capabilities its packages may hold without a further grant, beyond the default ceiling.
     pub ceiling: Vec<String>,
+    /// The owner's confirmation of this exact enrolment.
+    ///
+    /// Adopting a root is one of the actions section 10 requires a fresh confirmation for, bound
+    /// to the exact action digest and consumed once. It is not optional here: a caller's
+    /// operating-system identity is explicitly not that confirmation, so there is no shape of this
+    /// request that carries none.
+    pub owner_confirmation: OwnerConfirmationProof,
 }
 
 /// Result of `catalogue.add`.
@@ -548,11 +556,21 @@ pub struct PluginGrantParams {
     pub environment_id: EnvironmentId,
     /// The package.
     pub plugin_id: PluginId,
+    /// The exact package hash the grant is for.
+    ///
+    /// A grant is decided about a release the owner was shown. Naming the hash is what stops a
+    /// decision made about one release reaching whatever is installed by the time it arrives.
+    pub package_digest: String,
     /// The capabilities the installation is to hold after this change.
     ///
     /// The whole set, not an addition: an increase over what the installation already had is a new
     /// decision, and a host that received only additions could not tell one from a removal.
     pub grant: Vec<String>,
+    /// The owner's confirmation of this exact grant.
+    ///
+    /// Bound to the package hash and the capability set above, so a confirmation cannot be carried
+    /// to another release or a wider set.
+    pub owner_confirmation: OwnerConfirmationProof,
 }
 
 /// Result of `plugin.grant`.

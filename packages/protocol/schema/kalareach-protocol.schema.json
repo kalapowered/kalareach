@@ -4219,6 +4219,10 @@
           "description": "Where its metadata lives.",
           "type": "string"
         },
+        "owner_confirmation": {
+          "$ref": "#/$defs/OwnerConfirmationProof",
+          "description": "The owner's confirmation of this exact enrolment.\n\nAdopting a root is one of the actions section 10 requires a fresh confirmation for, bound\nto the exact action digest and consumed once. It is not optional here: a caller's\noperating-system identity is explicitly not that confirmation, so there is no shape of this\nrequest that carries none."
+        },
         "root": {
           "description": "The trust root, as its bytes, base64 encoded.",
           "type": "string"
@@ -4236,7 +4240,8 @@
         "targets_url",
         "root",
         "budgets",
-        "ceiling"
+        "ceiling",
+        "owner_confirmation"
       ],
       "type": "object"
     },
@@ -18405,6 +18410,14 @@
           },
           "type": "array"
         },
+        "owner_confirmation": {
+          "$ref": "#/$defs/OwnerConfirmationProof",
+          "description": "The owner's confirmation of this exact grant.\n\nBound to the package hash and the capability set above, so a confirmation cannot be carried\nto another release or a wider set."
+        },
+        "package_digest": {
+          "description": "The exact package hash the grant is for.\n\nA grant is decided about a release the owner was shown. Naming the hash is what stops a\ndecision made about one release reaching whatever is installed by the time it arrives.",
+          "type": "string"
+        },
         "plugin_id": {
           "$ref": "#/$defs/PluginId",
           "description": "The package."
@@ -18413,7 +18426,9 @@
       "required": [
         "environment_id",
         "plugin_id",
-        "grant"
+        "package_digest",
+        "grant",
+        "owner_confirmation"
       ],
       "type": "object"
     },

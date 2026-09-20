@@ -1710,7 +1710,7 @@ export interface KalaReachProtocol {
   operation_record?: OperationRecord
   organisation_policy?: OrganisationPolicy
   output_event?: OutputEvent
-  owner_confirmation_proof?: OwnerConfirmationProof
+  owner_confirmation_proof?: OwnerConfirmationProof1
   owner_confirmation_request?: OwnerConfirmationRequest1
   pair_finish_request?: PairFinishRequest
   pair_redeem_params?: PairRedeemParams
@@ -6105,6 +6105,7 @@ export interface CatalogueAddParams {
    * Where its metadata lives.
    */
   metadata_url: string
+  owner_confirmation: OwnerConfirmationProof
   /**
    * The trust root, as its bytes, base64 encoded.
    */
@@ -6137,6 +6138,107 @@ export interface CatalogueBudgets {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   payload_cache_bytes: string
+}
+/**
+ * The owner's confirmation of this exact enrolment.
+ *
+ * Adopting a root is one of the actions section 10 requires a fresh confirmation for, bound
+ * to the exact action digest and consumed once. It is not optional here: a caller's
+ * operating-system identity is explicitly not that confirmation, so there is no shape of this
+ * request that carries none.
+ */
+export interface OwnerConfirmationProof {
+  /**
+   * How the confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  request: OwnerConfirmationRequest
+  /**
+   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
+   */
+  signature: string
+  /**
+   * The key identifier of the signer that produced the proof.
+   */
+  signer_key_id: string
+}
+/**
+ * The challenge this proof answers.
+ */
+export interface OwnerConfirmationRequest {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+}
+/**
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
+ */
+export interface DevicePublicKeys {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
 }
 /**
  * Result of `catalogue.add`.
@@ -8521,7 +8623,7 @@ export interface DesktopContext1 {
  * The device is the one the connection authenticated as; the parameters name nothing else.
  */
 export interface DeviceKeysCompleteParams {
-  keys: DevicePublicKeys
+  keys: DevicePublicKeys1
   /**
    * The Ed25519 signature over [`DeviceKeysDeclaration::signing_input`], by the authorisation
    * key the host recorded for this device.
@@ -8529,10 +8631,12 @@ export interface DeviceKeysCompleteParams {
   signature: string
 }
 /**
- * All four of the device's public keys. The two the host recorded at pairing must be among
- * them unchanged.
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
  */
-export interface DevicePublicKeys {
+export interface DevicePublicKeys1 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -8558,12 +8662,15 @@ export interface DeviceKeysCompleteResult {
    * One paired device.
    */
   device_id: string
-  keys: DevicePublicKeys1
+  keys: DevicePublicKeys2
 }
 /**
- * The four keys now on record.
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
  */
-export interface DevicePublicKeys1 {
+export interface DevicePublicKeys2 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -8594,12 +8701,15 @@ export interface DeviceKeysDeclaration {
    * One paired device.
    */
   device_id: string
-  keys: DevicePublicKeys2
+  keys: DevicePublicKeys3
 }
 /**
- * All four of the device's public keys.
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
  */
-export interface DevicePublicKeys2 {
+export interface DevicePublicKeys3 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -8681,7 +8791,7 @@ export interface DeviceSummary {
    * `device.keys.complete`. Another device seals to a device's stored-envelope key only when this
    * host reports it, because the pairing the owner approved is what binds it to the device.
    */
-  keys: DevicePublicKeys3 | null
+  keys: DevicePublicKeys | null
   /**
    * Whether the device's grant lets it manage this host, which is what an owner's device holds.
    */
@@ -8694,30 +8804,6 @@ export interface DeviceSummary {
    * Whether the device has been revoked.
    */
   revoked: boolean
-}
-/**
- * One device's four purpose-separated public keys.
- *
- * An authenticated pairing exchange binds these public keys and their explicit purposes to one
- * device record.
- */
-export interface DevicePublicKeys3 {
-  /**
-   * The Ed25519 authorisation key.
-   */
-  authorisation: string
-  /**
-   * The X25519 notification-preview key.
-   */
-  notification_preview: string
-  /**
-   * The X25519 stored-envelope key.
-   */
-  stored_envelope: string
-  /**
-   * The iroh transport identity.
-   */
-  transport: string
 }
 /**
  * Parameters of `device.preview_key.update`.
@@ -11185,7 +11271,7 @@ export interface GrantCreateParams {
   /**
    * The owner's confirmation, when the request enlarges persistent authority.
    */
-  owner_confirmation: OwnerConfirmationProof | null
+  owner_confirmation: OwnerConfirmationProof1 | null
   /**
    * The grant this one is delegated from. Null issues from the issuer's own authority.
    */
@@ -11207,7 +11293,7 @@ export interface GrantCreateParams {
  * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
  * challenge-consumption transition together.
  */
-export interface OwnerConfirmationProof {
+export interface OwnerConfirmationProof1 {
   /**
    * How the confirmation reached the host.
    */
@@ -11228,53 +11314,6 @@ export interface OwnerConfirmationProof {
    * The key identifier of the signer that produced the proof.
    */
   signer_key_id: string
-}
-/**
- * The challenge this proof answers.
- */
-export interface OwnerConfirmationRequest {
-  /**
-   * What is being confirmed.
-   */
-  action:
-    | 'issue_invitation'
-    | 'confirm_device'
-    | 'enlarge_grant'
-    | 'trust_repository_root'
-    | 'grant_executable_capability'
-    | 'change_host_authority'
-  /**
-   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
-   */
-  action_digest: string
-  /**
-   * The challenge identity. Single use.
-   */
-  confirmation_id: string
-  /**
-   * The keys the action sends authority to. Null when the action has no destination device.
-   */
-  destination_keys: DevicePublicKeys3 | null
-  /**
-   * The rights the action would grant.
-   */
-  destination_rights: ActionRight[]
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  expires_at_ms: string
-  /**
-   * One paired device.
-   */
-  host_device_id: string
-  /**
-   * The host's iroh endpoint identity.
-   */
-  host_endpoint_id: string
-  /**
-   * The host's fresh challenge nonce.
-   */
-  nonce: string
 }
 /**
  * The role and the explicit choices on top of it.
@@ -13146,7 +13185,7 @@ export interface OwnerConfirmationRequest1 {
   /**
    * The keys the action sends authority to. Null when the action has no destination device.
    */
-  destination_keys: DevicePublicKeys3 | null
+  destination_keys: DevicePublicKeys | null
   /**
    * The rights the action would grant.
    */
@@ -13560,10 +13599,47 @@ export interface PluginGrantParams {
    * decision, and a host that received only additions could not tell one from a removal.
    */
   grant: string[]
+  owner_confirmation: OwnerConfirmationProof2
+  /**
+   * The exact package hash the grant is for.
+   *
+   * A grant is decided about a release the owner was shown. Naming the hash is what stops a
+   * decision made about one release reaching whatever is installed by the time it arrives.
+   */
+  package_digest: string
   /**
    * A plugin identifier from its manifest.
    */
   plugin_id: string
+}
+/**
+ * An owner's answer to a confirmation challenge.
+ *
+ * The verification ceremony itself is platform code; this object records its result and binds it
+ * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
+ * challenge-consumption transition together.
+ */
+export interface OwnerConfirmationProof2 {
+  /**
+   * How the confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  request: OwnerConfirmationRequest
+  /**
+   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
+   */
+  signature: string
+  /**
+   * The key identifier of the signer that produced the proof.
+   */
+  signer_key_id: string
 }
 /**
  * Result of `plugin.grant`.
@@ -14575,7 +14651,7 @@ export interface ProjectLocationAttachParams {
   /**
    * The owner's confirmation, on the submission that carries one.
    */
-  owner_confirmation: OwnerConfirmationProof | null
+  owner_confirmation: OwnerConfirmationProof1 | null
   /**
    * The repository to bind.
    */
@@ -14629,7 +14705,7 @@ export interface OwnerConfirmationRequest2 {
   /**
    * The keys the action sends authority to. Null when the action has no destination device.
    */
-  destination_keys: DevicePublicKeys3 | null
+  destination_keys: DevicePublicKeys | null
   /**
    * The rights the action would grant.
    */
@@ -14741,7 +14817,7 @@ export interface ProjectLocationAuthoriseParams {
    * the owner's own fresh confirmation for that. A first submission carries none and is answered
    * with the challenge; the same action submitted again carries the proof.
    */
-  owner_confirmation: OwnerConfirmationProof | null
+  owner_confirmation: OwnerConfirmationProof1 | null
   /**
    * The absolute path to open.
    */
@@ -14795,7 +14871,7 @@ export interface OwnerConfirmationRequest3 {
   /**
    * The keys the action sends authority to. Null when the action has no destination device.
    */
-  destination_keys: DevicePublicKeys3 | null
+  destination_keys: DevicePublicKeys | null
   /**
    * The rights the action would grant.
    */
@@ -20586,7 +20662,10 @@ export interface ClientBundle {
   platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
 }
 /**
- * The candidate's purpose-separated public keys.
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
  */
 export interface DevicePublicKeys6 {
   /**
