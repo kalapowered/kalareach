@@ -5,7 +5,7 @@
 //! ```text
 //! <root>/<repository>/
 //!   datastore/            the client's own trusted metadata
-//!   index/<n>.json        each verified generation's index, whole
+//!   index/<digest>.json   each verified generation's index, whole and named by its own digest
 //!   index/active.json     which generation is current
 //!   payloads/<digest>     cached payloads, by content hash
 //!   packages/<digest>/    an activated package's files, under its manifest digest

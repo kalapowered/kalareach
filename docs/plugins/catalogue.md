@@ -155,9 +155,10 @@ it bound to and not against the bytes that arrived afterwards.
 A revoked release stops receiving new bindings immediately, and stops matching, so nothing new is
 ever offered it.
 
-An active binding is not torn down under a request that is already running. It warns, and it follows
-the administrator's explicit disable policy at the point that policy names: keep serving, admit
-nothing new, or disable at the next admission.
+An active binding is not torn down under a request that is already running. Each live binding on a
+revoked release is reported against that exact release, with the administrator's explicit disable
+policy beside it: keep serving, admit nothing new, or disable at the next admission. The policy is
+applied where the next admission happens, never in the middle of a request.
 
 ## Capabilities and qualification
 
@@ -185,14 +186,14 @@ and four lines hold:
 - it cannot say the capability works *here*: only a host probe or a live binding establishes that,
   and a catalogue record gets its own state saying which release it describes.
 
-## What is not here yet
+## The transport, and the broker
 
-The client reads a repository through a transport the host supplies, and the one this build ships
-reads a local directory: an official, vendor or community repository is reachable as a local
-directory or a mirror of one. An https enrolment is refused by name until a host supplies a network
-transport, rather than failing somewhere later with a message about trust. Nothing above changes
-when that transport lands, because verification never trusted the transport.
+A repository is read over https or from a local directory, and nothing else: a Git URL, a branch or
+a revision is refused by name at enrolment, because a branch is not update authority. The default
+transport fetches over https with the platform's own trust store and reads a local directory mirror,
+and a host may supply another. Which transport carried the bytes changes nothing above: verification
+never trusted the transport, only the signatures over what it delivered.
 
 Capability evidence from a live binding, and admission of a package's declarative proxy, come from
-the trusted broker through a trait this crate defines. Until a broker is bound, there is no live
+the trusted broker through a trait this crate defines. Where no broker is bound, there is no live
 evidence and no proxy is admitted, and both say so rather than guessing.

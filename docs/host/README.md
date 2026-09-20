@@ -504,17 +504,20 @@ catalogue/
 ```
 
 Both method groups arrive through the ordinary path. A read is checked against current authority; a
-mutation carries an action window and is checked against the method registry and its envelope, and
-the admission is checked again before the catalogue is entered. A sync and an install then reach
-the network and the filesystem behind the catalogue's own lock, so the gap between that check and
-the effect is the wait for that lock and for the fetch; closing it needs the admission carried into
-the catalogue's own transaction, which is written up in the handoff as work this daemon still
-owes.
+mutation carries an action window and is checked against the method registry and its envelope. That
+admission travels into the catalogue's own transaction, where it is checked again once the store
+lock is held and before the state changes, so a request whose deadline or authority ran out while
+it waited behind another sync changes nothing. A mutation also leaves a durable action claim under
+the caller and the action identifier, so a retry of an action already applied returns what the
+first one returned instead of repeating its effect.
 
-Two decisions are the owner's and are not side effects of anything else. Adopting a trust root is
-`catalogue.add`, performed by a caller this endpoint authenticated as the owner; a sync verifies
-inside the ceiling the enrolment already has and refuses a generation that would need more. Granting
-a capability is `plugin.grant`; an install refuses a grant wider than the installation already held
+Two decisions are the owner's and are not side effects of anything else. Adopting a trust root, or
+widening the trust of one already adopted, is `catalogue.add`, and it needs the owner's confirmation
+of that exact action: a single-use confirmation, bound to a digest of the root's keys and the trust
+change, with a short lifetime. Being authenticated as the owner is not that confirmation. A sync
+verifies inside the ceiling the enrolment already has and refuses a generation that would need more.
+Granting a capability is `plugin.grant`, confirmed the same way and bound to the package digest and
+the capabilities it is about; an install refuses a grant wider than the installation already held
 and says which method that decision belongs to.
 
 Removing a repository stops trusting its root and uninstalls nothing. A package installed from it is

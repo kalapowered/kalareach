@@ -173,11 +173,17 @@ fn write_action_record(
     drop(file);
     std::fs::rename(&temporary, &path)
         .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+    // The rename is only durable once the directory holding it is. A claim that survives the
+    // effect it guards is the whole point of writing one, so a directory this host cannot flush
+    // is reported here rather than left to be discovered as a repeated effect after a crash.
     #[cfg(unix)]
     {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        let directory = std::fs::File::open(parent).map_err(|error| {
+            ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
+        })?;
+        directory.sync_all().map_err(|error| {
+            ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
+        })?;
     }
     Ok(())
 }

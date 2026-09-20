@@ -52,9 +52,9 @@ pub enum Resolution {
     Selected(Candidate),
     /// Several packages recognised it exactly, and the person decides.
     ///
-    /// A host does not pick one on the package's behalf. An inferred match never reaches this:
-    /// an exact rule beats every inferred one, because an inferred match is a reasonable guess
-    /// from a name on disk and is presented as one.
+    /// A host does not pick one on the package's behalf. An exact rule beats every inferred one,
+    /// so an inferred match reaches this only where nothing matched exactly and more than one
+    /// package guessed from a name on disk.
     Conflict(Vec<Candidate>),
 }
 
