@@ -241,6 +241,22 @@ struct Held {
     charged: bool,
 }
 
+/// The capability one accepted line holds while that line is still running.
+///
+/// The generation is the line's own, and it is what says whether the line is still the one this
+/// capability was minted for. A capability whose line has ended names nothing, because the
+/// question `kr detach` asks — which terminal typed the line I am running from — has no answer
+/// once that line is over: the shell is back at its prompt and the next line has not been typed.
+#[derive(Debug)]
+struct LineCapability {
+    /// The minted secret, compared against what a caller presents.
+    token: String,
+    /// The attachment the line was typed in.
+    attachment_id: AttachmentId,
+    /// The prompt generation the line was accepted at.
+    prompt_generation: PromptGeneration,
+}
+
 /// The worker's side of the root-editor contract, driven against a real clock.
 pub struct FenceDriver {
     session_id: SessionId,
@@ -272,15 +288,20 @@ pub struct FenceDriver {
     reader: Option<(PromptGeneration, ReaderRevision)>,
     /// Whether the last stimulus was one the machine ignored as belonging to something that ended.
     ignored: bool,
-    /// The capability the accepted line holds, and the attachment it names.
+    /// The prompt generation of the acceptance being applied, while one is.
+    ///
+    /// The machine's record-acceptance action carries the origin alone, and a capability is about
+    /// one line, so the generation the event named is kept here for the length of that apply and
+    /// taken by the action that mints the capability.
+    accepting: Option<PromptGeneration>,
+    /// The capability the live accepted line holds, and the attachment it names.
     ///
     /// One line, one token. It is minted where the acceptance is recorded, it goes to the bridge
-    /// in the answer to the event that recorded it, and it lasts exactly as long as that record
-    /// does: the next accepted line replaces it, and a line this host could not attribute leaves
-    /// none. It outlives the fence, because the line does: a client taking the keys while the
-    /// command runs invalidates the fence and changes nothing about which terminal that line was
-    /// typed in. Nothing about a caller's own process says which line it belongs to; this does.
-    line_token: Option<(String, AttachmentId)>,
+    /// in the answer to the event that recorded it, and it lasts exactly as long as that line runs.
+    /// It outlives the fence, because the line does: a client taking the keys while the command
+    /// runs invalidates the fence and changes nothing about which terminal that line was typed in.
+    /// Nothing about a caller's own process says which line it belongs to; this does.
+    line_token: Option<LineCapability>,
     /// What the connection's own task waits on when the deadline or the queue may have moved.
     waker: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -322,6 +343,7 @@ impl FenceDriver {
             answering: None,
             reader: None,
             ignored: false,
+            accepting: None,
             line_token: None,
             waker: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
@@ -361,23 +383,64 @@ impl FenceDriver {
         self.machine.held()
     }
 
-    /// Returns the attachment one line's own capability names.
+    /// Returns the attachment one line's own capability names, while that line is still running.
     ///
     /// The comparison takes the same time for every token of the same length, because a caller
     /// that can ask repeatedly could otherwise learn one a byte at a time.
     #[must_use]
     pub fn detach_for_token(&self, presented: &str) -> Option<AttachmentId> {
-        let (minted, attachment_id) = self.line_token.as_ref()?;
-        if minted.len() != presented.len() {
+        let held = self.line_token.as_ref()?;
+        if held.token.len() != presented.len() {
             return None;
         }
-        let same = minted
+        let same = held
+            .token
             .bytes()
             .zip(presented.bytes())
             .fold(0_u8, |difference, (minted, presented)| {
                 difference | (minted ^ presented)
             });
-        (same == 0).then_some(*attachment_id)
+        (same == 0).then_some(held.attachment_id)
+    }
+
+    /// Ends the capability the accepted line holds, because that line is over.
+    ///
+    /// Called wherever the line this host recorded stops running: its own command block reports a
+    /// status, the reader comes back at a later prompt, or the integration is lost and nothing it
+    /// says can be attributed any more. A lease change is deliberately not one of them: the line
+    /// goes on running and goes on belonging to the terminal it was typed in.
+    fn end_line(&mut self) {
+        self.line_token = None;
+    }
+
+    /// Ends the capability when the reader is at a prompt the accepted line is no longer at.
+    ///
+    /// A reader that enters or idles at a later generation is the shell back at its next prompt,
+    /// which it reaches only once the line before it has finished. The same generation is the same
+    /// prompt — a continuation, a reader that idled before the line was submitted — and leaves the
+    /// capability alone.
+    fn end_line_before(&mut self, prompt_generation: PromptGeneration) {
+        if self
+            .line_token
+            .as_ref()
+            .is_some_and(|held| held.prompt_generation < prompt_generation)
+        {
+            self.end_line();
+        }
+    }
+
+    /// Ends the capability when it belongs to the line at this generation.
+    ///
+    /// A command block that reports a status names the generation its line was accepted at, so it
+    /// ends exactly that capability and never a later one.
+    fn end_line_at(&mut self, prompt_generation: PromptGeneration) {
+        if self
+            .line_token
+            .as_ref()
+            .is_some_and(|held| held.prompt_generation == prompt_generation)
+        {
+            self.end_line();
+        }
     }
 
     /// Returns what a `kr detach` with no attachment identifier targets.
@@ -535,6 +598,11 @@ impl FenceDriver {
     ///
     /// A bridge whose connection ends reports nothing; this is how the session hears about it.
     pub fn integration_lost(&mut self, loss: IntegrationLoss) -> Effects {
+        // Nothing this session says about its lines can be relied on after a loss: the hooks, the
+        // reader or the root shell itself has gone, so the host would never learn that the line
+        // the capability names had ended. It ends here instead, and a detach that names nothing
+        // is answered with the hint.
+        self.end_line();
         let mut effects = self.apply(&Stimulus::IntegrationLost(loss), Context::Other);
         let decision = self.phase.lost(loss);
         if decision.closes_session {
@@ -624,6 +692,12 @@ impl FenceDriver {
                 self.command_hook(CommandHook::Resolve(params.clone()))
             }
             BridgeEvent::CommandBlock(params) => {
+                // A block that reports a status is its line's own ending, said by the integration
+                // that ran it. A block for a line still running says nothing about the capability,
+                // and one for another generation is not about this line at all.
+                if params.finished() {
+                    self.end_line_at(params.prompt_generation);
+                }
                 self.command_hook(CommandHook::Block(params.clone()))
             }
             BridgeEvent::HooksActivated(_) => {
@@ -684,6 +758,9 @@ impl FenceDriver {
     }
 
     fn editor_entered(&mut self, params: &RootEditorEnterParams) -> Effects {
+        // The reader back at a later prompt is the line before it finished, whatever else this
+        // entry decides. A capability for a line that is over names nothing.
+        self.end_line_before(params.prompt_generation);
         if !self.phase.retains_fence() {
             // Below a qualified session there is no fence to hold. The reader is answered so it
             // does not wait, and nothing starts an exchange: a startup profile that asks a question
@@ -743,6 +820,8 @@ impl FenceDriver {
     }
 
     fn reader_idled(&mut self, idle: &ReaderIdle) -> Effects {
+        // Idle at a later prompt is the same statement an entry makes: the line before it is over.
+        self.end_line_before(idle.prompt_generation);
         if !self.phase.retains_fence() {
             return self.received();
         }
@@ -765,6 +844,9 @@ impl FenceDriver {
     }
 
     fn command_accepted(&mut self, params: &RootCommandAcceptedParams) -> Effects {
+        // The line this acceptance is about, for the capability the record-acceptance action
+        // mints. It is taken there and dropped here if the machine records nothing.
+        self.accepting = Some(params.prompt_generation);
         let params = if self.phase.permits_attribution() {
             params.clone()
         } else {
@@ -776,7 +858,10 @@ impl FenceDriver {
                 ..params.clone()
             }
         };
-        self.apply(&Stimulus::CommandAccepted(params), Context::Other)
+        let effects = self.apply(&Stimulus::CommandAccepted(params), Context::Other);
+        // An acceptance the machine ignored as stale records nothing, so nothing took this.
+        self.accepting = None;
+        effects
     }
 
     /// Answers the event being processed.
@@ -958,19 +1043,25 @@ impl FenceDriver {
             Action::RecordAcceptance(origin) => {
                 effects.acceptance = Some(origin.clone());
                 // A capability for this line and for no other. A line this host could not
-                // attribute gets none, because there is nothing for a token to name.
-                self.line_token = match &origin {
-                    AcceptedOrigin::Fenced { attachment_id, .. } => {
-                        Some((kr_ipc::new_uuid().to_string(), *attachment_id))
+                // attribute gets none, because there is nothing for a token to name, and the one
+                // the line before it held ends here either way.
+                let prompt_generation = self.accepting.take();
+                self.line_token = match (&origin, prompt_generation) {
+                    (AcceptedOrigin::Fenced { attachment_id, .. }, Some(prompt_generation)) => {
+                        Some(LineCapability {
+                            token: kr_ipc::new_uuid().to_string(),
+                            attachment_id: *attachment_id,
+                            prompt_generation,
+                        })
                     }
-                    AcceptedOrigin::Mixed | AcceptedOrigin::Unverifiable => None,
+                    _ => None,
                 };
                 self.answer(
                     &mut effects,
                     EventOutcome::CommandRecorded(RootCommandAcceptedResult {
                         origin: origin.clone(),
                         detach_token: Nullable(
-                            self.line_token.as_ref().map(|(token, _)| token.clone()),
+                            self.line_token.as_ref().map(|held| held.token.clone()),
                         ),
                         state,
                     }),

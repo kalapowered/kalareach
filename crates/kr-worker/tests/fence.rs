@@ -2130,6 +2130,138 @@ async fn a_capability_from_an_earlier_line_names_nothing_after_another_is_accept
     wired.close().await;
 }
 
+/// KR-REQ-07.84: a capability names nothing once its own line has finished.
+///
+/// Nothing else has to happen for a line to end: no second line is typed, no client takes the
+/// keys, no attachment leaves. The command reports the status it exited with and the reader comes
+/// back at the next prompt, and from that moment the question a bare `kr detach` asks — which
+/// terminal typed the line I am running from — has no answer, because nothing is running from a
+/// line any more. A caller still holding the capability that line was given is told to name the
+/// attachment it means.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_names_nothing_once_its_own_line_has_finished() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let typist = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    accept(&mut wired, &fence, typist).await;
+    let token = recorded_token(&mut wired)
+        .await
+        .expect("a capability for the line");
+
+    // The command that line started ends, with the status it exited with.
+    let finished = kr_protocol::root::RootCommandBlockParams {
+        session_id: wired.session_id,
+        prompt_generation: fence.prompt_generation,
+        command: "sleep 10".to_owned(),
+        started_at_ms: kr_protocol::scalars::TimestampMs::new(1_700_000_000_000),
+        duration_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(10_000)),
+        exit_status: Nullable::some(U64::ZERO),
+        cwd: "/tmp/project".to_owned(),
+        cwd_revision: CwdRevision::new(1),
+    };
+    let recorded = block_over(&mut wired, finished).await;
+    assert_eq!(recorded.retained.get(), 1);
+
+    // No further line is accepted, and the attachment that typed the first one is still here.
+    assert_eq!(wired.runtime.session().attachments().len(), 1);
+    let refused = detach(
+        &mut client,
+        &wired,
+        Nullable::null(),
+        Nullable::some(token.clone()),
+    )
+    .await
+    .expect_err("a capability whose line has finished names nothing");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert!(
+        refused.message.contains(DETACH_HINT),
+        "the refusal carries section 7's own instruction: {}",
+        refused.message
+    );
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        1,
+        "and nothing was detached"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.84: a capability names nothing once the reader is back at the next prompt.
+///
+/// The packaged shells report no command block today, so the reader's own return is what says a
+/// line is over for them: a primary prompt after the one a line was accepted at is reached only
+/// once that line has finished. Nothing else changes here — one attachment, no second line, no
+/// lease change — and the capability from the prompt before names nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_names_nothing_once_the_reader_is_back_at_the_next_prompt() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let typist = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    accept(&mut wired, &fence, typist).await;
+    let token = recorded_token(&mut wired)
+        .await
+        .expect("a capability for the line");
+    let _next = fenced(&mut wired, 2, 2).await;
+
+    let refused = detach(&mut client, &wired, Nullable::null(), Nullable::some(token))
+        .await
+        .expect_err("a capability from the prompt before this one names nothing");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert!(refused.message.contains(DETACH_HINT));
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        1,
+        "and nothing was detached"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.84: a session that lost its integration holds no capability.
+///
+/// After a loss the host is no longer told anything it can rely on: the hooks, the reader or the
+/// root shell itself has gone, so it would never learn that the line the capability names had
+/// ended. The capability ends with the loss, and a detach that names nothing is answered with the
+/// instruction to name one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_ends_with_the_integration_that_recorded_its_line() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let typist = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    accept(&mut wired, &fence, typist).await;
+    let token = recorded_token(&mut wired)
+        .await
+        .expect("a capability for the line");
+
+    let outcome = wired
+        .runtime
+        .drive_fence(|driver| driver.integration_lost(IntegrationLoss::SemanticHookLoss));
+    assert_eq!(
+        outcome.close_session, None,
+        "a live session is not closed by it"
+    );
+
+    let refused = detach(&mut client, &wired, Nullable::null(), Nullable::some(token))
+        .await
+        .expect_err("a capability outlives neither the reader nor the hooks that recorded it");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert!(refused.message.contains(DETACH_HINT));
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        1,
+        "and nothing was detached"
+    );
+    wired.close().await;
+}
+
 /// Records one accepted line for this attachment and waits for the machine to take it.
 async fn accept(
     wired: &mut Wired,
