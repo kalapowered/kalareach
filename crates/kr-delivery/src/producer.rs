@@ -519,9 +519,7 @@ impl Producer {
                 continue;
             }
             let outcome = match &destination.destination {
-                Destination::Push(_) => self
-                    .build_push(notice, destination, generation, now_ms)
-                    .map(|(record, budget, staged)| (record, budget, staged)),
+                Destination::Push(_) => self.build_push(notice, destination, generation, now_ms),
                 Destination::External(_) => self
                     .build_external(notice, destination, authority, lines, generation, now_ms)
                     .map(|record| (record, None, None)),
