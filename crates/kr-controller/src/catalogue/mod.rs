@@ -408,10 +408,15 @@ impl CatalogueModule {
                 let decisions = catalogue
                     .capabilities(params.environment_id, &params.plugin_id)
                     .map_err(ProtocolError::from)?;
-                let active = catalogue
+                // The repository may have been removed since this package was installed. An
+                // installed package stays usable, so an answer about it never depends on an
+                // enrolment: no active generation and no index means the answer is built from what
+                // the installation itself recorded.
+                let generation = catalogue
                     .active(&installation.repository)
-                    .map_err(ProtocolError::from)?;
-                let generation = active.map(|a| a.generation).unwrap_or(1);
+                    .ok()
+                    .flatten()
+                    .map_or(1, |active| active.generation);
                 let evidence_records = if let Ok(index) = catalogue.index(&installation.repository)
                     && let Some(entry) =
                         index.find(&plugin_id_of(&installation)?, &installation.version)

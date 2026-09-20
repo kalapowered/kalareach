@@ -445,10 +445,18 @@ impl Catalogue {
             let lock = state.store.lock()?;
             state.enrolment.check_change(&proposed, confirmed)?;
             if state.enrolment.root != proposed.root {
-                // The owner adopted a different root. Datastore and active index are cleared, and
-                // the new root is written where the client reads one from, so a restart verifies
-                // against what was adopted rather than what was replaced.
-                state.store.reset_trust(&proposed.root)?;
+                // A root lives in the repository's own directory, and replacing it clears the
+                // datastore and the active index: a durable change with no way to commit it in the
+                // same breath as the enrolment it belongs to. Re-anchoring is therefore two
+                // deliberate acts, removing the repository and enrolling it again under the new
+                // root, which is what the host documents and what the owner confirms.
+                return Err(CatalogueError::InvalidArgument {
+                    detail: format!(
+                        "{} is enrolled against another root; remove it and enrol it again to \
+                         adopt a different one",
+                        proposed.id
+                    ),
+                });
             }
             // The ledger the new budgets give, carrying what this repository already holds.
             let mut ledger = BudgetLedger::new(proposed.budgets);
@@ -1327,7 +1335,10 @@ impl Catalogue {
             // release that newly requests something the repository's ceiling already permits
             // would otherwise widen an installation with both grants empty.
             let held =
-                ceiling::effective(&previous.requested, &repository_ceiling, &previous.grant);
+                // Under the ceiling the previous release was installed under, not under the one
+                // the destination has now. A wider enrolment, or a move between repositories, must
+                // not make an increase look like something the installation already held.
+                ceiling::effective(&previous.requested, &previous.ceiling, &previous.grant);
             let proposed = ceiling::effective(&entry.capabilities, &repository_ceiling, &grant);
             if let Some(added) = proposed.difference(&held).next().copied() {
                 return Err(CatalogueError::GrantRequired {
@@ -1431,7 +1442,7 @@ impl Catalogue {
                 // 11's own answer rather than a refusal about the repository.
                 let store = Store::open(&self.root, &repository)?;
                 let _lock = store.lock()?;
-                if !store.has_package(installation.package_digest) {
+                if !store.holds_package(installation.package_digest) {
                     return Err(CatalogueError::UnavailableOffline {
                         detail: format!(
                             "{plugin_id} {version} is installed from {repository}, which is no                              longer enrolled, and its payloads are not cached here"

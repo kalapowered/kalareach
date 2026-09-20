@@ -449,8 +449,32 @@ async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plug
         );
     }
 
-    // plugin.grant reaches the module's own decision: a capability outside the repository's
-    // ceiling is refused by name, which nothing in the dispatcher knows how to say.
+    // plugin.grant completes over the network, under the owner's confirmation of that exact
+    // grant: the capability is one the package asks for and the repository's ceiling reaches.
+    let granted: wire::PluginGrantResult = typed(
+        &remote_mutation(
+            &session,
+            environment_id,
+            Method::PluginGrant,
+            &grant_params(
+                &host,
+                &owner,
+                &package_digest,
+                vec!["broker.semantic_events".to_owned()],
+            ),
+        )
+        .await
+        .expect("plugin.grant answers a device"),
+    );
+    assert!(
+        granted.capabilities.iter().any(|grant| {
+            grant.capability.as_str().contains("broker.semantic_events") && grant.permitted
+        }),
+        "{granted:?}"
+    );
+
+    // And it reaches the module's own decision: a capability this package does not ask for is
+    // refused by name, which nothing in the dispatcher knows how to say.
     let refused = remote_mutation(
         &session,
         environment_id,
@@ -459,13 +483,34 @@ async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plug
             &host,
             &owner,
             &package_digest,
-            vec!["filesystem.write".to_owned()],
+            vec!["filesystem.read".to_owned()],
         ),
     )
     .await
-    .expect_err("filesystem.write is outside the default ceiling");
-    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
-    assert!(refused.message.contains("filesystem.write"), "{refused:?}");
+    .expect_err("this package does not ask for filesystem.read");
+    assert_eq!(refused.code, ErrorCode::PluginGrantRequired, "{refused:?}");
+    assert!(
+        refused.message.contains("does not request filesystem.read"),
+        "{refused:?}"
+    );
+
+    // An owner confirmation this host never issued authorises nothing, whichever door it arrives
+    // at: the challenge in the proof has to be one this host's own ledger is still holding.
+    let mut forged = grant_params(
+        &host,
+        &owner,
+        &package_digest,
+        vec!["broker.semantic_events".to_owned()],
+    );
+    forged.owner_confirmation = host.confirm(
+        &owner,
+        SensitiveAction::GrantExecutableCapability,
+        kr_protocol::scalars::Digest256::from_bytes([9u8; 32]),
+    );
+    let refused = remote_mutation(&session, environment_id, Method::PluginGrant, &forged)
+        .await
+        .expect_err("a confirmation of another action grants nothing");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
 
     // plugin.disable, plugin.remove and catalogue.remove.
     let disabled: wire::PluginEnableResult = typed(
@@ -560,12 +605,13 @@ async fn a_catalogue_mutation_from_a_device_names_an_environment_and_never_a_ses
     host.stop().await;
 }
 
-/// The grant decides what a device reaches, the same way it decides everything else.
+/// The registry decides what a device without `host.manage` reaches, and the daemon holds it there.
 ///
-/// Both groups are admitted at this ingress by the registry, so what keeps a device out of them is
-/// the rights its grant carries and nothing about the dispatcher.
+/// Both groups are admitted at this ingress, so what keeps a device out of them is the rights its
+/// grant carries. Every mutation and `catalogue.list` require `host.manage`; `plugin.list` and
+/// `plugin.capabilities` require no right at all, and a device that holds none still reads them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_without_host_manage_reaches_neither_group() {
+async fn what_a_device_without_host_manage_reaches_is_what_the_registry_lists() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (_device, session) =
@@ -581,18 +627,58 @@ async fn a_device_without_host_manage_reaches_neither_group() {
     .expect_err("catalogue.list needs host.manage");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
 
-    let refused = remote_mutation(
-        &session,
-        environment_id,
+    for method in [
         Method::CatalogueSync,
-        &wire::CatalogueSyncParams {
-            environment_id,
-            catalogue_id: "development".to_owned(),
+        Method::CatalogueRemove,
+        Method::PluginEnable,
+    ] {
+        let refused = session
+            .mutate(
+                method,
+                ActionTarget::environment(environment_id),
+                None,
+                &ParamsValue::empty(),
+                &wire::CatalogueSyncParams {
+                    environment_id,
+                    catalogue_id: "development".to_owned(),
+                },
+                LIFETIME,
+            )
+            .await
+            .map(|_| ())
+            .expect_err("every mutation in both groups needs host.manage");
+        let refused = client_refusal(refused);
+        assert_eq!(
+            refused.code,
+            ErrorCode::PermissionDenied,
+            "{}: {refused:?}",
+            method.as_str()
+        );
+    }
+
+    // The two reads the registry lists with no required right answer this device.
+    let plugins: wire::PluginListResult = typed(
+        &remote_read::<_, ParamsValue>(
+            &session,
+            Method::PluginList,
+            &wire::PluginListParams { environment_id },
+        )
+        .await
+        .expect("plugin.list requires no right"),
+    );
+    assert!(plugins.plugins.is_empty());
+
+    // And an environment this daemon does not own is refused before anything is read.
+    let refused = remote_read::<_, ParamsValue>(
+        &session,
+        Method::PluginList,
+        &wire::PluginListParams {
+            environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
         },
     )
     .await
-    .expect_err("catalogue.sync needs host.manage");
-    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    .expect_err("this daemon owns one environment");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
 
     session.close();
     host.stop().await;

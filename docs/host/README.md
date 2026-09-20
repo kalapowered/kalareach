@@ -536,10 +536,12 @@ root to verify a fetch against.
 The registry admits a paired device to all thirteen of these methods, and the daemon serves them
 through the same module a local caller reaches, so a device's `catalogue.list` and the owner's are
 one answer. A catalogue and an installed package belong to the environment, so there is no worker to
-forward a mutation to and no session content to narrow: the grant's environment selector and
-`host.manage` are what admit them, the envelope check refuses a target naming a session or an
-application, and the effect runs on a task a dropped connection cannot cancel part way. The owner's
-confirmation is the same ceremony on both doors, and a device cannot stand in for it.
+forward a mutation to and no session content to narrow: the grant's environment selector is what
+scopes them, the envelope check refuses a target naming a session or an application, and the effect
+runs on a task a dropped connection cannot cancel part way. Every mutation in both groups, and
+`catalogue.list`, require `host.manage`; `plugin.list` and `plugin.capabilities` require no right,
+because what they describe is what this environment already runs. The owner's confirmation is the
+same ceremony on both doors, and a device cannot stand in for it.
 
 `docs/plugins/catalogue.md` has the sync, the budgets, the extraction rules and what a signed
 qualification may not do.

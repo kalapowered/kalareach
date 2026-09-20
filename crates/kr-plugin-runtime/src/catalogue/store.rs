@@ -237,6 +237,19 @@ impl Store {
         self.package_dir(manifest_digest).is_dir()
     }
 
+    /// Returns true when an activated package still holds the manifest its digest names.
+    ///
+    /// The directory alone says a package was activated here once. The package hash *is* the
+    /// manifest's hash, and the manifest names every other file, so reading it back and hashing it
+    /// is what distinguishes a package that is still here from a directory something emptied.
+    #[must_use]
+    pub fn holds_package(&self, manifest_digest: PayloadDigest) -> bool {
+        let manifest = self
+            .package_dir(manifest_digest)
+            .join(kr_plugin_sdk::package::MANIFEST_FILE);
+        std::fs::read(manifest).is_ok_and(|bytes| PayloadDigest::of(&bytes) == manifest_digest)
+    }
+
     /// Reads which generation is current.
     ///
     /// # Errors

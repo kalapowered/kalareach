@@ -1090,10 +1090,29 @@ async fn an_admission_refusal_keeps_the_class_the_daemon_decided() {
     let host = host();
     let actor = ActorId::new("kr:actor:test").expect("a valid actor");
 
+    // The catalogue has to be enrolled, so the refusal comes from the admission inside the
+    // effect rather than from the repository being absent.
+    let _: wire::CatalogueAddResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::CatalogueAdd,
+                host.environment_id,
+                &add_params(&host),
+            ),
+            Method::CatalogueAdd,
+            Some(host.confirmations()),
+        )
+        .await);
+
     for (code, expected) in [
         (ErrorCode::StorageUnavailable, ErrorCode::StorageUnavailable),
         (ErrorCode::PermissionDenied, ErrorCode::PermissionDenied),
     ] {
+        // The module's own entry check passes; the refusal is the one the effect asks for after
+        // it has taken the catalogue's lock, which is where the adapter between the daemon's
+        // vocabulary and the catalogue's own sits.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
         let refused = refusal(
             host.module
                 .write_frame(
@@ -1109,6 +1128,9 @@ async fn an_admission_refusal_keeps_the_class_the_daemon_decided() {
                     Method::CatalogueSync,
                     Some(host.confirmations()),
                     || {
+                        if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                            return Ok(());
+                        }
                         Err(kr_protocol::error::ProtocolError::new(
                             code,
                             "the daemon's own answer",
@@ -1116,6 +1138,10 @@ async fn an_admission_refusal_keeps_the_class_the_daemon_decided() {
                     },
                 )
                 .await,
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "the effect asked about the admission again"
         );
         assert_eq!(refused.code, expected, "{refused:?}");
         assert!(

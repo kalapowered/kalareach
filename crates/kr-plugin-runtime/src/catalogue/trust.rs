@@ -200,12 +200,19 @@ impl VerifiedGeneration {
                 detail: format!("the repository does not carry {name}"),
             })?;
         // The stream is bounded by the length the signed metadata pins and its digest is checked
-        // as it arrives, so what comes back is at most that many bytes or an error.
+        // as it arrives, so what comes back is at most that many bytes or an error. A storage
+        // failure and an expiry keep their own class. Everything else here is the metadata
+        // refusing what arrived — the client reports a length the signed metadata does not allow
+        // as a transport failure, and it is an integrity failure about this repository's bytes.
         let bytes = stream
             .into_vec()
             .await
-            .map_err(|source| CatalogueError::Integrity {
-                detail: format!("{name} did not verify against the metadata: {source}"),
+            .map_err(|source| match classify(&source) {
+                CatalogueError::UnavailableOffline { detail }
+                | CatalogueError::Untrusted { detail } => CatalogueError::Integrity {
+                    detail: format!("{name} did not verify against the metadata: {detail}"),
+                },
+                other => other,
             })?;
         let actual = bytes.len() as u64;
         if actual != declared.length || PayloadDigest::of(&bytes) != declared.digest {

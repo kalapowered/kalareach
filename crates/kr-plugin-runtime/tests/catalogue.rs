@@ -2418,11 +2418,13 @@ async fn old_installed_package_must_enable_after_index_drops_it() {
 async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    // A ceiling wider than the default, so what a restart reads back can be told apart from the
+    // narrowest one a repository can have.
     let mut catalogue = enrolled(
         home.path(),
         &generation,
         RepositoryBudgets::defaults(),
-        CapabilityCeiling::default_ceiling(),
+        CapabilityCeiling::with([PluginCapability::TranscriptTail]),
     )
     .await;
     catalogue
@@ -2488,7 +2490,8 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
         "the recorded ceiling still decides: {refused:?}"
     );
 
-    // And what a restart reads back says the same thing.
+    // And what a restart reads back says the same thing, from the ceiling it recorded rather than
+    // from the default one: the repository is gone and the wider ceiling it had is still here.
     let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
     assert!(
         !reopened
@@ -2496,6 +2499,15 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
             .expect("effective capabilities after a restart")
             .contains(&PluginCapability::FilesystemRead)
     );
+    let installed = reopened
+        .installations()
+        .get(environment(), &plugin())
+        .expect("still installed after a restart");
+    assert!(
+        installed.ceiling.permits(PluginCapability::TranscriptTail),
+        "the wider ceiling this package was installed under survives the restart"
+    );
+    assert!(!installed.ceiling.permits(PluginCapability::FilesystemRead));
 
     let closed = catalogue
         .uninstall(environment(), &plugin())
