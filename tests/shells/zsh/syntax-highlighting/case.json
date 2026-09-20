@@ -2,7 +2,7 @@
   "id": "zsh-syntax-highlighting",
   "shell": "zsh",
   "stack": "zsh-syntax-highlighting",
-  "title": "zsh-syntax-highlighting, which wraps every reader widget and loads after the integration",
+  "title": "zsh-syntax-highlighting, which hooks the reader's own redrawing and loads after the integration",
   "supported": true,
   "requires": [
     "zsh-syntax-highlighting"
@@ -26,7 +26,9 @@
   ],
   "plugin": {
     "probe": "echo kr-plugin=$ZSH_HIGHLIGHT_VERSION",
-    "marker": "kr-plugin=0.8.0"
+    "marker": "kr-plugin=0.8.0",
+    "operation": "echo kr-plugin=${#ZSH_HIGHLIGHT_HIGHLIGHTERS[@]}-$ZSH_HIGHLIGHT_HIGHLIGHTERS[1]",
+    "operation_marker": "kr-plugin=2-main"
   },
   "covers": [
     "KR-REQ-07.87",

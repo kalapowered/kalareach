@@ -71,6 +71,7 @@ date), `flagged` (past its target date, with the choices above) or `not-affected
 | 2026-09-20 | The official GNU Bash 5.2 patch series, 001 to 037 | bash | The pinned release is 5.2.37, which carries every patch published for 5.2 at the time of this pin. | 2026-10-04 | not-affected |
 | 2026-09-20 | The fish-shell advisories published against 4.x | fish | The pinned release is 4.9.3, which is the newest 4.x release at the time of this pin and carries every advisory fix published for the series. | 2026-10-04 | not-affected |
 | 2026-09-20 | The editor identity this package was qualified against | psreadline | This package was qualified against PSReadLine 2.4.5 on PowerShell 7.6.6, which is the identity its record names. The range it declares says which editor the integration works with and not which releases inside it carry which fixes, so an advisory against either project is triaged against the versions that advisory names and gets its own row. | 2026-10-04 | not-affected |
+| 2026-09-20 | CVE-2026-62801, PowerShell, published at github.com/PowerShell/Announcements/issues/98; fixed in 7.4.20, 7.5.11 and 7.6.6 | psreadline | The host this package was qualified against is 7.6.6, which is the fixed release of its own series, so the qualified identity carries the fix. A person on an earlier 7.4 or 7.5 release is on an affected host and updates it; this package qualifies the editor against the host the person runs and does not ship one. | 2026-10-04 | not-affected |
 <!-- /kr:triage -->
 
 ## Requalifying a package
@@ -79,7 +80,10 @@ date), `flagged` (past its target date, with the choices above) or `not-affected
 2. `bash scripts/build-shells.sh --<shell> --check-patches` — the patches have to apply to the new
    release with no fuzz. A patch that does not is a patch to rewrite, not one to force.
 3. `bash scripts/build-shells.sh --<shell> --require-upstream-tests` — the build fetches the new
-   archive, verifies the digest, applies the patches and runs the shell's own suite.
+   archive, verifies the digest, applies the patches and runs the shell's own suite. The PSReadLine
+   package builds no shell and the script takes no option for it: it is requalified by importing
+   `shells/psreadline/module` on the host in question and running `Publish-KalaReachQualification`,
+   which `scripts/e2e-fence.sh` does as one of its own steps.
 4. `bash scripts/fetch-shell-stacks.sh` — the startup customisations, if they are not already here.
 5. `bash scripts/e2e-fence.sh` — the whole qualification against the rebuilt package, on a real
    daemon and a real shell.

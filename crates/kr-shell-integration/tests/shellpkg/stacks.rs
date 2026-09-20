@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use kr_protocol::ids::SessionId;
-use kr_protocol::root::{FENCE_EXCHANGE_TIMEOUT, FenceCause, RootEditorFenceParams};
+use kr_protocol::root::{
+    FENCE_EXCHANGE_TIMEOUT, FenceCause, RootEditorFenceParams, RootEditorFenceResult,
+};
 use kr_protocol::scalars::Uuid;
 use kr_shell_integration::contract::qualification::{DetachExclusion, ShellKind};
 use kr_shell_integration::contract::transport::{
@@ -226,6 +228,13 @@ pub struct PluginProbe {
     pub probe: String,
     /// What it prints when the customisation is there.
     pub marker: String,
+    /// A second command that makes the customisation do the thing it is for, where one command
+    /// cannot both set a state and read it back.
+    #[serde(default)]
+    pub operation: Option<String>,
+    /// What that prints when the customisation did it.
+    #[serde(default)]
+    pub operation_marker: Option<String>,
 }
 
 /// A combination that does not exist, with the reason it does not.
@@ -927,18 +936,45 @@ impl Session {
     ///
     /// Panics when that reader reports a queue still holding input at an empty prompt.
     pub fn fenced_latest(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
-        let enter = self.latest_prompt();
-        let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
-        let acknowledgement = self.fence_exchange(&enter, fence.fence_id);
-        assert!(
-            acknowledgement.queues.tty_typeahead_drained
-                && acknowledgement.queues.macro_input_drained
-                && acknowledgement.queues.partial_key_drained,
-            "an idle reader reported a queue still holding input: {:?}",
-            acknowledgement.queues
-        );
-        self.publish(&fence);
-        (enter, fence)
+        // A reader can leave between reporting itself and being asked — a prompt redrawn, a
+        // nested read returning — and the reader's answer to that is honest: this is not the
+        // reader you asked about. What a worker does then is ask the one that is there now, at
+        // its next boundary, which is what this does rather than calling the refusal a failure.
+        for attempt in 0..4 {
+            let enter = self.latest_prompt();
+            let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
+            let asked = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
+                session_id: self.session_id,
+                fence_id: fence.fence_id,
+                prompt_generation: enter.prompt_generation,
+                reader_revision: enter.reader_revision,
+                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                cause: FenceCause::EditorEntry,
+            }));
+            match self.answer(asked) {
+                BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
+                    assert!(
+                        acknowledgement.queues.tty_typeahead_drained
+                            && acknowledgement.queues.macro_input_drained
+                            && acknowledgement.queues.partial_key_drained,
+                        "an idle reader reported a queue still holding input: {:?}",
+                        acknowledgement.queues
+                    );
+                    self.publish(&fence);
+                    return (enter, fence);
+                }
+                BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal))
+                    if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved
+                        && attempt < 3 =>
+                {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                other => panic!(
+                    "the reader answered a fence for the reader it is running with {other:?}"
+                ),
+            }
+        }
+        unreachable!("the retry loop returns or panics")
     }
 
     /// Puts the reader back where a drive left it, before anything is asked of it.
@@ -963,9 +999,29 @@ impl Session {
     }
 
     /// Asks the shell whether the case's customisation is loaded and working.
-    #[must_use]
-    pub fn plugin_is_active(&mut self, probe: &PluginProbe) -> bool {
-        self.run(&probe.probe, &probe.marker)
+    ///
+    /// Where the case gives a second command, the first is what the customisation is meant to act
+    /// on and the second reads back what it did, which is the customisation doing its job rather
+    /// than a variable saying it is there.
+    ///
+    /// # Errors
+    ///
+    /// Returns the command that did not answer as the case said it would.
+    pub fn plugin_is_active(&mut self, probe: &PluginProbe) -> Result<(), String> {
+        if !self.run(&probe.probe, &probe.marker) {
+            return Err(format!(
+                "{} printed nothing like {}",
+                probe.probe, probe.marker
+            ));
+        }
+        if let (Some(command), Some(marker)) = (&probe.operation, &probe.operation_marker) {
+            let _ = self.next_prompt();
+            std::thread::sleep(Duration::from_millis(300));
+            if !self.run(command, marker) {
+                return Err(format!("{command} printed nothing like {marker}"));
+            }
+        }
+        Ok(())
     }
 }
 

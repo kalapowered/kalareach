@@ -26,7 +26,9 @@
   ],
   "plugin": {
     "probe": "\"kr-plugin=$(if ($env:STARSHIP_SESSION_KEY) {'on'} else {'off'})\"",
-    "marker": "kr-plugin=on"
+    "marker": "kr-plugin=on",
+    "operation": "\"kr-plugin=$((& $env:KR_STACK_STARSHIP/starship prompt --status=0) -join '')\"",
+    "operation_marker": "kr-plugin=KR>"
   },
   "covers": [
     "KR-REQ-07.87",

@@ -25,7 +25,9 @@
   ],
   "plugin": {
     "probe": "echo kr-plugin=$(( $+functions[omz] ))",
-    "marker": "kr-plugin=1"
+    "marker": "kr-plugin=1",
+    "operation": "echo kr-plugin=$(alias h)",
+    "operation_marker": "kr-plugin=h=history"
   },
   "covers": [
     "KR-REQ-07.87",

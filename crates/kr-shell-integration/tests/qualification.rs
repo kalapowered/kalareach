@@ -246,6 +246,15 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
              round",
             case.id
         );
+        if let Some(plugin) = case.plugin.as_ref() {
+            assert_eq!(
+                plugin.operation.is_some(),
+                plugin.operation_marker.is_some(),
+                "{} gives the customisation something to do and does not say what it should \
+                 print, or the other way round",
+                case.id
+            );
+        }
         assert_eq!(
             case.checks.contains(&"plugin_active".to_owned()),
             case.plugin.is_some(),
@@ -606,15 +615,14 @@ fn the_startup_and_the_customisation(
             .plugin
             .as_ref()
             .expect("the corpus check refused a case without one");
-        assert!(
-            session.plugin_is_active(probe),
-            "{}: the customisation this case is about is not loaded; {} printed nothing like \
-             {}; the terminal showed:\n{}",
-            case.id,
-            probe.probe,
-            probe.marker,
-            session.terminal_output()
-        );
+        if let Err(reason) = session.plugin_is_active(probe) {
+            panic!(
+                "{}: the customisation this case is about did not answer: {reason}; the terminal \
+                 showed:\n{}",
+                case.id,
+                session.terminal_output()
+            );
+        }
         enter = session.next_prompt();
         settle(&mut session, Duration::from_millis(300), REPLY);
         session.ensure_reading();
@@ -1393,7 +1401,7 @@ fn a_takeover_ends_a_wait_the_customisation_left_the_reader_in(
 ) {
     let wait = shellpkg::pending_wait(case.shell)
         .expect("the corpus check refused this claim for a reader with no such wait");
-    let (enter, _fence) = session.fenced_after_a_command(17);
+    let (mut enter, _fence) = session.fenced_after_a_command(17);
     settle(session, Duration::from_millis(200), REPLY);
     if let Some((command, marker)) = wait.prepare {
         assert!(
@@ -1401,7 +1409,10 @@ fn a_takeover_ends_a_wait_the_customisation_left_the_reader_in(
             "{}: the wait could not be prepared",
             case.id
         );
-        let _ = session.next_prompt();
+        // The preparation ran a command, so the reader the fence was about has gone. The one this
+        // takeover is about is the one running now.
+        let (entered, _) = session.fenced_after_a_command(18);
+        enter = entered;
         settle(session, Duration::from_millis(200), REPLY);
     }
 
@@ -2020,12 +2031,12 @@ fn a_live_session_keeps_the_package_it_started_with() {
     // The live session is untouched: it is still running the installation it started, and its
     // reader still answers.
     assert!(
-        session.run("echo kr-live=$KR_TEST_LIVE", "kr-live=before"),
+        session.run("echo kr-live-after=$KR_TEST_LIVE", "kr-live-after=before"),
         "the live session took up the installation that replaced it; the terminal showed:\n{}",
         session.terminal_output()
     );
     assert!(
-        !session.terminal_output().contains("kr-live=after"),
+        !session.terminal_output().contains("=after"),
         "the live session reported the installation that replaced it"
     );
     let (enter, fence) = session.fenced_after_a_command(30);
@@ -2312,6 +2323,33 @@ fn the_hold_releases_what_it_held_in_order_with_one_editor_busy_and_no_refusal()
         release < busy,
         "the event that explains the release came before it: {shapes:?}"
     );
+    assert_eq!(
+        shapes
+            .iter()
+            .filter(|shape| matches!(shape, ActionShape::EmitEditorBusy { .. }))
+            .count(),
+        1,
+        "the release explained itself more than once: {shapes:?}"
+    );
+    match expired
+        .actions
+        .iter()
+        .find(|action| matches!(action.shape(), ActionShape::EmitEditorBusy { .. }))
+    {
+        Some(kr_shell_integration::contract::fence::Action::EmitEditorBusy(event)) => {
+            assert_eq!(
+                event.attachment_id,
+                shellpkg::attachment_id(1),
+                "the event went to an attachment that held nothing"
+            );
+            assert_eq!(
+                event.input_epoch,
+                shellpkg::epoch(1),
+                "the event names another epoch than the one the input arrived under"
+            );
+        }
+        other => panic!("the event is {other:?}"),
+    }
     assert!(
         shapes
             .iter()
@@ -2363,13 +2401,19 @@ fn a_retried_fence_waits_for_the_mixed_queues_rather_than_discarding_them() {
     // The retry happens at the reader's own next idle report, which is one of the points section 7
     // names.
     let retried = machine.apply(at(300), &idled(1, 1, 2));
+    let shapes = retried.shapes();
     assert!(
-        retried
-            .shapes()
+        shapes
             .iter()
             .any(|shape| matches!(shape, ActionShape::AskFence { .. })),
-        "an idle reader did not retry the exchange: {:?}",
-        retried.shapes()
+        "an idle reader did not retry the exchange: {shapes:?}"
+    );
+    assert!(
+        !shapes.iter().any(|shape| matches!(
+            shape,
+            ActionShape::Discard { .. } | ActionShape::CancelNativeOperations { .. }
+        )),
+        "the retry threw away what the queues were holding: {shapes:?}"
     );
 
     // The queues the release left mixed are still holding something, so nothing is published and
@@ -2453,6 +2497,11 @@ fn a_launch_that_reaches_its_reservation_timeout_installs_no_command() {
         requested.shapes()
     );
     let deadline = machine.deadline().expect("a reservation has a deadline");
+    assert_eq!(
+        deadline.get() - (published.get() + 5),
+        250,
+        "the reservation holds input for something other than the 250 ms section 7 gives it"
+    );
 
     // Input that arrives while the reservation stands is held, and the reservation's own timeout
     // is what releases it.

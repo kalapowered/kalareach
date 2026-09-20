@@ -25,7 +25,9 @@
   ],
   "plugin": {
     "probe": "echo kr-plugin=${STARSHIP_SESSION_KEY:+on}",
-    "marker": "kr-plugin=on"
+    "marker": "kr-plugin=on",
+    "operation": "echo kr-plugin=$(\"$KR_STACK_STARSHIP/starship\" prompt --status=0 | tr -d '\\n')",
+    "operation_marker": "kr-plugin=KR>"
   },
   "covers": [
     "KR-REQ-07.87",

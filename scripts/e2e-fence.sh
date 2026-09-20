@@ -60,6 +60,10 @@ echo "  evidence: $artifacts"
 echo
 
 failed=0
+# A stage that could not run at all, as opposed to one that ran and did not hold. Either ends this
+# run without success: a qualification that skipped a stage has not qualified what that stage is
+# about, and saying so is the whole point of running it.
+incomplete=0
 fail() {
   echo "FAILED: $*"
   failed=1
@@ -223,14 +227,16 @@ else
   # run built are qualified below either way. Any other refusal is this run's.
   refusal="$(read_json "$artifacts/fence-create.json" code)"
   detail="$(read_json "$artifacts/fence-create.json" message)"
+  echo "  the daemon refused a managed session:"
+  echo "    ${detail:-$(cat "$run_root/create.err")}"
   if [ "$refusal" = "SHELL_INTEGRATION_UNSUPPORTED" ] && \
-     [ "${detail#*"$packages/powershell/"}" != "$detail" ]; then
-    echo "  the daemon refused a managed session over another shell's record:"
-    echo "    $detail"
-    echo "    the package this run asked for is $managed_shell"
+     [ "${detail#*"$packages/powershell/"}" != "$detail" ] && \
+     [ "${detail#*names paths outside the package it is in}" != "$detail" ]; then
+    echo "    the package this run asked for is $managed_shell, and the record the daemon could"
+    echo "    not read is another shell's: an installation is read as a whole here, so one"
+    echo "    unreadable record refuses every shell in it."
+    incomplete=1
   else
-    echo "  the daemon refused a managed session:"
-    echo "    ${detail:-$(cat "$run_root/create.err")}"
     fail "a managed session could not be created"
   fi
 fi
@@ -256,5 +262,10 @@ echo
 if [ "$failed" -ne 0 ]; then
   echo "the qualification did not pass"
   exit 1
+fi
+if [ "$incomplete" -ne 0 ]; then
+  echo "the qualification is incomplete: a stage above could not run, and what it is about is"
+  echo "not qualified by this run"
+  exit 2
 fi
 echo "every package was qualified against every customisation this host has"
