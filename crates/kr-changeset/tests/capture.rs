@@ -1134,7 +1134,8 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
         assert!(
             failure
                 .to_string()
-                .contains("could not reach by descending to it"),
+                .contains("could not reach by descending to it")
+                || failure.to_string().contains("cannot account for"),
             "the refusal says why for {shape}: {failure}"
         );
     }
@@ -1371,6 +1372,40 @@ fn another_name_for_this_repository_s_own_data_is_excluded_too() {
             entry.path
         );
     }
+}
+
+/// KR-REQ-14.33 and D-087d: a repository whose own data holds a link is not captured around.
+///
+/// The alias can sit on the administrative side, and then the captured path crosses nothing: an
+/// ordinary directory of the tree, and a link inside the repository's own data naming it. What
+/// answers that is refusing to read around a repository whose own data this host cannot account
+/// for.
+#[test]
+fn a_repository_whose_own_data_holds_a_link_is_not_captured_around() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "aliased-inside");
+    std::fs::create_dir_all(path.join("history")).expect("an ordinary directory of the tree");
+    write(&path, "history/kept.txt", "the reflog this would alias\n");
+    // The repository's own data reaching out at it, which is the direction a captured path never
+    // crosses.
+    std::fs::create_dir_all(path.join(".git/logs")).ok();
+    let _ = std::fs::remove_dir_all(path.join(".git/logs"));
+    std::os::unix::fs::symlink("../history", path.join(".git/logs")).expect("a link out at it");
+
+    let workspace = fixture.workspace("aliased-inside");
+    let failure = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect_err("a repository whose own data holds a link is not captured around");
+    assert!(
+        failure.to_string().contains("cannot account for"),
+        "the refusal says why: {failure}"
+    );
 }
 
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,

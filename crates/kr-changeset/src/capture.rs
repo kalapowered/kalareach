@@ -1241,7 +1241,7 @@ fn nested_repositories(
         // are reachable as ordinary content under a path that crosses neither. What answers that
         // is the same thing that answers the rest: the object. So every directory beneath this one
         // is asked what it is, and the capture compares what it opens with all of them.
-        administrative_descendants(&held, &mut refused, &mut budget)?;
+        administrative_descendants(&held, root_mount, &mut refused, &mut budget, 0)?;
     }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
@@ -1282,6 +1282,7 @@ fn nested_repositories(
             return Err(unplaceable(directory));
         }
         refused.insert(identity_of(data));
+        administrative_descendants(data, root_mount, &mut refused, &mut budget, 0)?;
         let common = RelativeName::parse("commondir")?;
         match data.probe(&common) {
             // It keeps everything in one place.
@@ -1294,6 +1295,7 @@ fn nested_repositories(
                         return Err(unplaceable(directory));
                     }
                     refused.insert(identity_of(last));
+                    administrative_descendants(last, root_mount, &mut refused, &mut budget, 0)?;
                 }
             }
             Err(_) => return Err(unplaceable(directory)),
@@ -1311,59 +1313,102 @@ fn nested_repositories(
     Ok(found)
 }
 
-/// Adds the identity of every directory beneath one administrative directory.
+/// Adds the identity of every directory beneath one administrative directory, and refuses a
+/// repository whose own data holds a link, a mount or anything that is not a plain file or a
+/// plain directory (D-087d).
 ///
-/// Bounded by the same budget the rest of the capture's directory reading is, and refusing rather
-/// than skipping whatever it could not read: a directory of a repository's own data that this host
-/// could not ask about is one it cannot say is not somewhere else in the tree as well.
+/// The one way a repository's own data can be reached as ordinary content, once the content side
+/// refuses links and other mounts and the identity set holds the same objects, is a link or a
+/// mount **inside** the administrative tree, pointing out at a directory of the tree. Then the
+/// captured path crosses nothing. So an administrative tree that holds one is a repository this
+/// host does not read around at all, and it says so.
+///
+/// Every entry is charged against the budget, not only the directories, and the descent is bounded
+/// in depth as the rest of this capture's reading is. Exceeding either refuses rather than skips.
 fn administrative_descendants(
     directory: &AuthorisedDirectory,
+    root: Mount,
     into: &mut BTreeSet<(u64, u64)>,
     budget: &mut usize,
+    depth: usize,
 ) -> Result<()> {
+    if depth >= MAX_WALK_DEPTH {
+        return Err(unreadable_data(format!(
+            "this repository's own data is more than {MAX_WALK_DEPTH} levels deep, which is \
+             deeper than this host reads to know what is in it"
+        )));
+    }
     let entries = directory
         .handle()
         .entries()
-        .map_err(|_| unplaceable("this repository's own data"))?;
+        .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?;
     for entry in entries {
-        let entry = entry.map_err(|_| unplaceable("this repository's own data"))?;
+        let entry = entry
+            .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?;
+        *budget = budget.checked_sub(1).ok_or_else(|| {
+            unreadable_data(format!(
+                "this repository's own data holds more than {MAX_WALK_ENTRIES} entries, which is \
+                 more than this host reads to know what they are"
+            ))
+        })?;
         let kind = entry
             .file_type()
-            .map_err(|_| unplaceable("this repository's own data"))?;
-        if !kind.is_dir() {
+            .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?;
+        let Ok(name) = entry.file_name().into_string() else {
+            return Err(unreadable_data(
+                "it holds a name this host cannot read as text".to_owned(),
+            ));
+        };
+        if kind.is_symlink() {
+            return Err(unreadable_data(format!(
+                "it holds a link at {}, which could name a directory of this tree and make that \
+                 directory's content this repository's own data under another path",
+                kr_project::git::redact(&name)
+            )));
+        }
+        if kind.is_file() {
+            // A plain file. Git gives one several names as a matter of course — a local clone and
+            // a shared object store are built out of that — so the number of names it has says
+            // nothing here, and what a second name inside the tree would cost is recorded as a
+            // limit rather than guessed at.
             continue;
         }
-        *budget = budget
-            .checked_sub(1)
-            .ok_or_else(|| ChangeSetError::QuotaExceeded {
-                detail: format!(
-                    "this repository's own data holds more than {MAX_WALK_ENTRIES} directories, \
-                     which is more than this host reads to know what they are"
-                )
-                .into(),
-            })?;
-        let Ok(name) = entry.file_name().into_string() else {
-            return Err(unplaceable("this repository's own data"));
-        };
-        let name =
-            RelativeName::parse(&name).map_err(|_| unplaceable("this repository's own data"))?;
+        if !kind.is_dir() {
+            return Err(unreadable_data(format!(
+                "it holds {}, which is neither a plain file nor a plain directory",
+                kr_project::git::redact(&name)
+            )));
+        }
+        let name = RelativeName::parse(&name)?;
         let held = directory
             .subdirectory(&name)
-            .map_err(|_| unplaceable("this repository's own data"))?;
+            .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?;
+        if mount_of(&held)? != root {
+            return Err(unreadable_data(
+                "it holds a mount, which puts a directory of this tree inside this repository's \
+                 own data"
+                    .to_owned(),
+            ));
+        }
         if into.insert(identity_of(&held)) {
-            administrative_descendants(&held, into, budget)?;
+            administrative_descendants(&held, root, into, budget, depth + 1)?;
         }
     }
     Ok(())
 }
 
+/// The refusal for a repository whose own data this host will not read around.
+fn unreadable_data(why: String) -> ChangeSetError {
+    ChangeSetError::Unsupported {
+        detail: format!(
+            "this host does not capture a tree whose repository's own data it cannot account for: \
+             {why}"
+        )
+        .into(),
+    }
+}
+
 /// Opens one directory beneath another and refuses one that is **on a different mount** (D-087c).
-///
-/// A second name for a directory inside a tree is one of three things: a symbolic link, which the
-/// authority refuses to follow; the same object under another spelling, which the identity rules
-/// catch; or a mount, which puts one directory at two places with two identities and no link. This
-/// is the third. A tree that holds a mount of its own is not one this host reads, because what is
-/// under that mount is not what the tree's own path says it is.
 fn open_beneath(
     parent: &AuthorisedDirectory,
     name: &RelativeName,
@@ -1394,8 +1439,7 @@ type Mount = u64;
 ///
 /// The kernel's own answer where it has one: a bind mount shares its device with what it came
 /// from, so a device number alone would not see it, and this asks for the mount instead. Where a
-/// platform has no such answer, the device number is the whole of what it can say and is what it
-/// says.
+/// platform has no such answer, the device number is the whole of what it can say.
 #[cfg(target_os = "linux")]
 fn mount_of(directory: &AuthorisedDirectory) -> Result<Mount> {
     let stat = rustix::fs::statx(
