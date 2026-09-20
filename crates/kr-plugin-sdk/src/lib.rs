@@ -86,6 +86,7 @@
 //! assert!(!PluginCapability::TerminalInput.within_default_ceiling());
 //! ```
 
+pub mod bundle;
 pub mod capability;
 pub mod catalogue;
 pub mod connector;
