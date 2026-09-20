@@ -849,13 +849,15 @@ impl Session {
         // An editor that takes the terminal out of its own line mode can still be between one
         // read and the next, where the two bytes go to the line discipline instead. The key is
         // offered again once; what the binding writes is the same text either way.
-        for attempt in 0..3 {
+        for attempt in 0..4 {
             self.ensure_reading();
             // The clear that `ensure_reading` ends with is an operation of the editor's own, and
-            // a chord sent while it is still redrawing is read at whatever it redraws into.
-            std::thread::sleep(Duration::from_millis(250));
+            // a chord sent while it is still redrawing is read at whatever it redraws into. A
+            // fixed pause here is a guess at how long that redraw takes, and on a loaded machine
+            // it is the wrong guess, so this waits for the editor to stop drawing instead.
+            self.quiet_for(Duration::from_millis(250), Duration::from_secs(5));
             self.type_bytes(USER_BINDING_KEY);
-            let within = if attempt < 2 {
+            let within = if attempt < 3 {
                 Duration::from_secs(6)
             } else {
                 REPLY
@@ -865,6 +867,29 @@ impl Session {
             }
         }
         false
+    }
+
+    /// Waits until the terminal has shown nothing for `quiet`, and no longer than `cap`.
+    ///
+    /// What this is for is knowing that an operation of the editor's own has finished, which a
+    /// fixed pause can only guess at: the editor is drawing for as long as it is drawing, and on
+    /// a machine with other work on it that is longer than on an idle one.
+    pub fn quiet_for(&mut self, quiet: Duration, cap: Duration) {
+        let deadline = Instant::now() + cap;
+        let mut shown = self.written();
+        let mut since = Instant::now();
+        while Instant::now() < deadline {
+            self.pump(Duration::from_millis(25));
+            let now = self.written();
+            if now == shown {
+                if since.elapsed() >= quiet {
+                    return;
+                }
+            } else {
+                shown = now;
+                since = Instant::now();
+            }
+        }
     }
 
     /// How much the terminal has shown so far, as an offset a later wait counts from.
