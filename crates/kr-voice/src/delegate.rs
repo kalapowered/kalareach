@@ -90,11 +90,17 @@ pub struct Proposal {
     pub destination: Option<kr_protocol::voice::SpokenDestination>,
 }
 
+/// One call a change withdrew, with the provider that created it.
+struct Ending {
+    call_id: String,
+    provider: Option<Arc<dyn ManagedVoiceService>>,
+}
+
 /// What running every check produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Proposed {
     /// The checks passed, and this is what the host is asked to do.
-    Ready(Proposal),
+    Ready(Box<Proposal>),
     /// The action needs a confirmation on the device's unlocked screen, and this is the challenge
     /// that ceremony signs. Nothing has been admitted, and the delegation has not been spent.
     NeedsConfirmation(Box<VoiceConfirmationRequest>),
@@ -123,6 +129,12 @@ pub struct Coordinator {
 struct State {
     sessions: VoiceSessions,
     ledger: ConfirmationLedger,
+    /// Replayed calls this host could not close while another start was in flight.
+    ///
+    /// A call nobody holds is a call somebody is paying for, so it is closed rather than left to
+    /// its own deadline; a call another start might be about to bind is left alone until that
+    /// start has finished with it.
+    deferred: Vec<String>,
     /// The devices with a start in flight.
     ///
     /// A start asks the broker between reading a device's authority and recording what came back,
@@ -289,7 +301,7 @@ impl Coordinator {
             let replaced = self
                 .authority
                 .standing_voice_grant(params.device_id, now_ms)?;
-            let mut ending: Vec<String> = Vec::new();
+            let mut ending: Vec<Ending> = Vec::new();
             if let Some(replaced) = replaced.as_ref() {
                 // The one this replaces goes first. A second standing grant beside the first would
                 // leave the old scope authorising calls nobody can see in the new statement, and
@@ -298,19 +310,28 @@ impl Coordinator {
                 for ended in state.sessions.stop_under(replaced.grant_id) {
                     state.ledger.forget_session(ended.voice_session_id);
                     if let Some(call_id) = ended.call_id {
-                        ending.push(call_id);
+                        ending.push(Ending {
+                            call_id,
+                            provider: ended.provider,
+                        });
                     }
                 }
             }
-            (self.authority.issue(&planned.plan)?, ending)
+            // The write is kept rather than returned: its failure must not skip what follows. The
+            // revocation has already happened by here, so a call it withdrew is a call nobody can
+            // stop any more, and leaving it metering because the replacement could not be written
+            // would be the worst of both.
+            (self.authority.issue(&planned.plan), ending)
         };
         // Outside the lock, and after the authority is already gone: a call whose grant this
-        // change withdrew is finalised rather than left metering until its own deadline.
-        if let Some(provider) = self.provider() {
-            for call_id in &ending {
-                self.close_unbound(&provider, call_id).await;
+        // change withdrew is finalised rather than left metering until its own deadline. Each is
+        // closed through the provider that created it.
+        for ending in &ending {
+            if let Some(provider) = ending.provider.as_ref() {
+                self.close_unbound(provider, &ending.call_id).await;
             }
         }
+        let written = written?;
 
         Ok(VoiceGrantResult {
             grant_id: written.grant_id,
@@ -491,6 +512,14 @@ impl Coordinator {
             // still waiting on is one that start will bind or close itself.
             if self.may_close_replayed(&session.call_id, device_id) {
                 self.close_unbound(&provider, &session.call_id).await;
+            } else {
+                // Another start is still waiting on the broker and may be about to bind this
+                // call. It is remembered rather than dropped, and closed once no start is left
+                // that could hold it.
+                let mut state = self.state.lock().expect("the coordinator's state");
+                if !state.deferred.iter().any(|held| held == &session.call_id) {
+                    state.deferred.push(session.call_id.clone());
+                }
             }
             return Ok(VoiceStartResult {
                 outcome: VoiceStartOutcome::Unavailable {
@@ -507,32 +536,69 @@ impl Coordinator {
 
         // Everything after this can fail, and a failure leaves a metered call running that no
         // grant covers. The call is closed on the way out rather than left for the deadline.
-        let written = match self.authority.issue(&planned.plan) {
-            Ok(written) => written,
-            Err(error) => {
-                self.close_unbound(&provider, &session.call_id).await;
-                return Err(error);
-            }
-        };
         let voice_session_id = match new_identity() {
             Ok(identity) => VoiceSessionId::new(identity),
             Err(error) => {
-                let _ = self.authority.revoke(written.grant_id, now_ms);
                 self.close_unbound(&provider, &session.call_id).await;
                 return Err(error);
             }
         };
-        let mut state = self.state.lock().expect("the coordinator's state");
-        state.sessions.start(NewVoiceSession {
-            voice_session_id,
-            device_id,
-            grant_id: written.grant_id,
-            parent_grant_id: standing.grant_id,
-            session_ids: session_ids.clone(),
-            call_id: Some(session.call_id.clone()),
-            started_at_ms: now_ms,
-            closes_at_ms,
-        });
+        // The child grant and the record of the call it belongs to are written together, under the
+        // same lock a grant change takes, and against the standing grant this call was planned
+        // for. Without that, a change that replaced the standing grant while the broker was
+        // answering would revoke a child that had not been recorded yet and find no session to
+        // stop, and this call would come back holding authority that was already withdrawn.
+        let written = {
+            let mut state = self.state.lock().expect("the coordinator's state");
+            let current = self.authority.standing_voice_grant(device_id, now_ms);
+            match current {
+                Ok(Some(current)) if current.grant_id == standing.grant_id => {
+                    match self.authority.issue(&planned.plan) {
+                        Ok(written) => {
+                            state.sessions.start(NewVoiceSession {
+                                voice_session_id,
+                                device_id,
+                                grant_id: written.grant_id,
+                                parent_grant_id: standing.grant_id,
+                                session_ids: session_ids.clone(),
+                                call_id: Some(session.call_id.clone()),
+                                provider: Some(Arc::clone(&provider)),
+                                started_at_ms: now_ms,
+                                closes_at_ms,
+                            });
+                            Ok(Some(written))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Ok(_) => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        let written = match written {
+            Ok(Some(written)) => written,
+            // The voice grant this call was planned under is not the one this device holds any
+            // more. Nothing was written, so nothing has to be unwound but the call itself.
+            Ok(None) => {
+                self.close_unbound(&provider, &session.call_id).await;
+                return Ok(VoiceStartResult {
+                    outcome: VoiceStartOutcome::Unavailable {
+                        reason: "voice_grant_changed".to_owned(),
+                        message: "this device's voice grant changed while the call was being \
+                                  created, so the call was not kept. Start it again."
+                            .to_owned(),
+                        alternatives: vec!["Start the voice session again.".to_owned()],
+                    },
+                });
+            }
+            Err(error) => {
+                self.close_unbound(&provider, &session.call_id).await;
+                return Err(error);
+            }
+        };
+        // A replayed call this host left open because another start was still running is closed
+        // now that this one has finished with it.
+        self.close_deferred().await;
 
         Ok(VoiceStartResult {
             outcome: VoiceStartOutcome::Started {
@@ -577,6 +643,41 @@ impl Coordinator {
             state: &self.state,
             device_id,
         })
+    }
+
+    /// Closes the replayed calls this host deferred, now that nothing may be about to bind them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    async fn close_deferred(&self) {
+        let (closing, provider) = {
+            let mut state = self.state.lock().expect("the coordinator's state");
+            if state.starting.len() > 1 || state.deferred.is_empty() {
+                (Vec::new(), None)
+            } else {
+                let held: Vec<String> = state
+                    .sessions
+                    .iter()
+                    .filter_map(|record| record.call_id.clone())
+                    .collect();
+                let mut closing = Vec::new();
+                state.deferred.retain(|call_id| {
+                    if held.contains(call_id) {
+                        // Somebody bound it after all, so it is theirs to stop.
+                        return false;
+                    }
+                    closing.push(call_id.clone());
+                    false
+                });
+                (closing, self.provider())
+            }
+        };
+        if let Some(provider) = provider {
+            for call_id in &closing {
+                self.close_unbound(&provider, call_id).await;
+            }
+        }
     }
 
     /// Whether a replayed call is one this host may close.
@@ -641,8 +742,10 @@ impl Coordinator {
         let revoked_at_ms = self.authority.revoke(record.grant_id, now_ms)?;
 
         let mut broker_notified = false;
-        let provider = self.provider();
-        if let (Some(provider), Some(call_id)) = (provider.as_ref(), record.call_id.as_ref()) {
+        // Through the provider that created it, not through whatever this coordinator brokers
+        // now: a service told to close a call it never created leaves the real one metering.
+        if let (Some(provider), Some(call_id)) = (record.provider.as_ref(), record.call_id.as_ref())
+        {
             // Told, not waited on. The grant is already gone; what the service does about the
             // money is settled on its own schedule and `session.closed` is what finalises it.
             broker_notified = provider.close(call_id).await.is_ok();
@@ -720,7 +823,41 @@ impl Coordinator {
             selected: params.selected.clone(),
         };
         let gathered = self.context.gather(&request).await?;
-        let selection = select_context(&gathered, &request.grant, &params.selected, &self.patterns);
+        // Checked again, now the read has finished. A read waits for the host, and a stop or a
+        // grant change during that wait withdraws the authority it was admitted under: what must
+        // not happen is *serving* that content, not reading it.
+        {
+            let state = self.state.lock().expect("the coordinator's state");
+            let record = state
+                .sessions
+                .of_device(params.voice_session_id, device_id)?;
+            if !record.reaches(params.session_id) {
+                return Err(VoiceError::refused(
+                    VoiceRefusal::SessionOutsideVoiceSession,
+                    "this voice session does not reach that session",
+                ));
+            }
+        }
+        let voice_grant = self.live_voice_grant(voice_grant_id, now_ms)?;
+        let device_grant = self
+            .authority
+            .device_grant(device_id, Some(params.session_id), now_ms)?
+            .ok_or_else(|| {
+                VoiceError::refused(
+                    VoiceRefusal::OutsideDeviceGrant,
+                    "this device's grant does not cover that session",
+                )
+            })?;
+        if !permits(&voice_grant, &device_grant, VoiceAction::Brief) {
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideVoiceGrant,
+                "this voice grant does not permit a briefing",
+            ));
+        }
+        // And the selection is built under the narrower of the two as they stand now, so a scope
+        // that narrowed while the host was reading narrows what comes back.
+        let narrowed = narrower_history(&device_grant, &voice_grant);
+        let selection = select_context(&gathered, &narrowed, &params.selected, &self.patterns);
 
         Ok(kr_protocol::voice::VoiceContextResult {
             voice_session_id: params.voice_session_id,
@@ -799,9 +936,21 @@ impl Coordinator {
         action_id: ActionId,
         now_ms: u64,
     ) -> Result<VoiceConfirmationRequest> {
-        let request = issue_confirmation(plan, action_id, self.host_device_id, device_id, now_ms)?;
+        let digest = plan.digest()?;
         let mut state = self.state.lock().expect("the coordinator's state");
         state.ledger.sweep(now_ms);
+        // One action, one challenge. Asking again for the same action of the same request returns
+        // the challenge already outstanding for it, so a caller that never signs cannot make this
+        // host issue an unbounded number of them.
+        if let Some(existing) = state
+            .ledger
+            .outstanding_for(digest, action_id, device_id, now_ms)
+        {
+            return Ok(existing.clone());
+        }
+        drop(state);
+        let request = issue_confirmation(plan, action_id, self.host_device_id, device_id, now_ms)?;
+        let mut state = self.state.lock().expect("the coordinator's state");
         state.ledger.issue(&request);
         Ok(request)
     }
@@ -838,6 +987,7 @@ impl Coordinator {
                 },
             }),
             Ok(Proposed::Ready(proposal)) => {
+                let proposal = *proposal;
                 let receipt = self.submitter.submit(&proposal).await?;
                 Ok(VoiceDelegateResult {
                     delegation_id: params.delegation_id.clone(),
@@ -1057,7 +1207,7 @@ impl Coordinator {
             ));
         }
 
-        Ok(Proposed::Ready(Proposal {
+        Ok(Proposed::Ready(Box::new(Proposal {
             voice_session_id: params.voice_session_id,
             device_id,
             voice_grant_id: voice_grant.grant_id,
@@ -1070,7 +1220,7 @@ impl Coordinator {
             approval: params.approval.0.clone(),
             turn_id: params.turn_id.0.clone(),
             destination: params.spoken_destination.0.clone(),
-        }))
+        })))
     }
 
     /// The live grant behind one voice session, at the moment of the decision.
@@ -1110,7 +1260,11 @@ impl Coordinator {
 /// Rights are intersected where each action is decided; history is intersected here, because the
 /// selection is built from one scope and that scope has to be the narrower one. The lower bound
 /// takes the later of the two, and a scope with no retained history at all wins outright.
-fn narrower_history(
+///
+/// Public because the host reads a session under this scope too: an effect that reads content
+/// answers under the same bound the context path applies, or it becomes the way round it.
+#[must_use]
+pub fn narrower_history(
     device_grant: &kr_protocol::grant::Grant,
     voice_grant: &kr_protocol::grant::Grant,
 ) -> kr_protocol::grant::Grant {

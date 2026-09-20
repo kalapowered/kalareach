@@ -2321,20 +2321,33 @@ impl Controller {
             let session_id = proposal.session_id.ok_or_else(|| {
                 ControllerError::InvalidArgument("that action names a session".to_owned())
             })?;
-            self.voice_authority_now(proposal, session_id)?;
+            let _ = self.voice_authority_now(proposal, session_id)?;
             let params = ParamsValue::from_typed(&SessionReadParams { session_id })
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
             let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
-            self.voice_authority_now(proposal, session_id)?;
+            let narrowed = self.voice_authority_now(proposal, session_id)?;
+            // The same bound the context path applies. What an effect answers with is content
+            // about the session, so a grant whose history begins after this session was created
+            // hears that it is running and not where it runs: a result that skipped the filter
+            // would be the way round the bound rather than an exception to it.
+            let state = read.session.state.as_str().to_owned();
+            let display_number = read.session.display_number;
+            let filtered = crate::voice::filtered(
+                crate::voice::snapshot_of(&read.session, session_id),
+                &narrowed,
+            );
             return Ok(kr_voice::seams::HostReceipt {
                 action_id,
                 performed: true,
-                summary: format!(
-                    "session {} is {} in {}",
-                    read.session.display_number,
-                    read.session.state.as_str(),
-                    read.session.cwd
-                ),
+                summary: match filtered.working_directory {
+                    Some(directory) => {
+                        format!("session {display_number} is {state} in {}", directory.text)
+                    }
+                    None => format!(
+                        "session {display_number} is {state}; where it runs is outside what this \
+                         grant may see"
+                    ),
+                },
             });
         }
         Ok(kr_voice::seams::HostReceipt {
@@ -2345,6 +2358,62 @@ impl Controller {
                 method.as_str()
             ),
         })
+    }
+
+    /// Performs one voice mutation exactly once for its action identifier.
+    ///
+    /// Section 23 marks the four voice mutations action-deduplicated, and three of them are not
+    /// safe to repeat: a second `voice.grant` would replace the grant the first one wrote and end
+    /// the calls started under it, and a second `voice.stop` would find nothing. The claim and the
+    /// retained answer are the same ones this host already keeps for an authority change, because
+    /// a voice grant is a grant in that same store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the caller is given.
+    pub(crate) async fn voice_mutation(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        actor: crate::voice::VoiceActor,
+        mutation: &MutationRequest,
+        method: Method,
+        authority_revision: AuthorityRevision,
+    ) -> Result<ParamsValue> {
+        // What this action already produced, if it produced anything. Answered before the claim,
+        // so a retry of a completed change is its own result rather than a conflict.
+        if let Some(answered) = self.voice_answered(actor_id, mutation)? {
+            return Ok(answered);
+        }
+        match self.claim_authority_change(actor_id, mutation)? {
+            Ok(_) => {}
+            Err(answered) => return Ok(answered),
+        }
+        let result = self
+            .voice()
+            .answer(actor, mutation, method, authority_revision, wall_clock_ms())
+            .await?;
+        self.retain_authority_change(actor_id, mutation, &result)?;
+        Ok(result)
+    }
+
+    /// What one voice action already produced, when this host has its answer.
+    fn voice_answered(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Result<Option<ParamsValue>> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let Some(result) =
+            self.sharing
+                .grants()
+                .answered_action(actor_id, mutation.action_id, &digest)?
+        else {
+            return Ok(None);
+        };
+        let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        Ok(Some(ParamsValue::new(value)))
     }
 
     /// Checks that the authority a voice proposal was admitted under still stands, now.
@@ -2358,7 +2427,7 @@ impl Controller {
         &self,
         proposal: &kr_voice::Proposal,
         session_id: SessionId,
-    ) -> Result<()> {
+    ) -> Result<kr_protocol::grant::Grant> {
         use kr_voice::seams::VoiceAuthority as _;
 
         let denied = |detail: &str| ControllerError::PermissionDenied {
@@ -2401,7 +2470,9 @@ impl Controller {
                 "the authority this action was admitted under no longer carries it",
             ));
         }
-        Ok(())
+        // The narrower of the two history scopes, which is what any content this effect answers
+        // with is filtered under.
+        Ok(kr_voice::narrower_history(&device_grant, &voice_grant))
     }
 
     /// Issues an action window for one authenticated connection.
@@ -3120,6 +3191,28 @@ impl Controller {
                     );
                 }
             };
+            // Everything between the envelope check and here can wait: for this task to be
+            // scheduled, for a blocking thread, for the coordinator's own lock. An action whose
+            // accepted deadline passed while it queued does not go on to write. A retry of a
+            // completed voice change is answered from its record before this, so anything still
+            // travelling is a first admission, and a first admission needs a deadline.
+            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
+                return respond(
+                    mutation.request_id,
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                );
+            }
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
             // The revision this daemon is at, read now: a voice grant is written under the
             // authority in force at the moment of the write rather than the one a connection was
             // admitted under.
@@ -3127,10 +3220,11 @@ impl Controller {
                 |_| AuthorityRevision::new(0),
                 |policy| policy.authority_revision(),
             );
-            return self
-                .voice()
-                .write_frame(actor, mutation, method, authority_revision, wall_clock_ms())
-                .await;
+            return respond(
+                mutation.request_id,
+                self.voice_mutation(actor_id, actor, mutation, method, authority_revision)
+                    .await,
+            );
         }
         if crate::project::ProjectModule::serves(method) {
             let Some(admitted_revision) = admitted else {

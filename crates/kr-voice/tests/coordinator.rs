@@ -99,6 +99,7 @@ struct Authority {
 #[derive(Debug, Default)]
 struct Lookups {
     started: std::sync::atomic::AtomicU64,
+    armed: std::sync::atomic::AtomicBool,
     holding: Mutex<bool>,
     resumed: std::sync::Condvar,
 }
@@ -117,8 +118,14 @@ impl Authority {
     }
 
     /// Holds the next standing-grant lookup open until [`Authority::release_lookup`].
+    ///
+    /// Only the next one: every later lookup runs straight through, which is what puts a second
+    /// caller inside the window the first one is being held in.
     fn hold_next_lookup(&self) {
         *self.lookups.holding.lock().expect("the held lookup") = true;
+        self.lookups
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Lets the held lookup finish.
@@ -213,15 +220,20 @@ impl VoiceAuthority for Authority {
         self.lookups
             .started
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut holding = self.lookups.holding.lock().expect("the held lookup");
-        while *holding {
-            holding = self
-                .lookups
-                .resumed
-                .wait(holding)
-                .expect("the held lookup is released");
+        if self
+            .lookups
+            .armed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut holding = self.lookups.holding.lock().expect("the held lookup");
+            while *holding {
+                holding = self
+                    .lookups
+                    .resumed
+                    .wait(holding)
+                    .expect("the held lookup is released");
+            }
         }
-        drop(holding);
         let store = self.store.lock().expect("the store");
         Ok(store
             .grants
@@ -1092,6 +1104,66 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
     assert!(
         standing == vec![narrow] || standing == vec![wider],
         "the one standing is one of the two that were written: {standing:?}"
+    );
+}
+
+/// KR-REQ-15.14 and 15.21: a voice grant replaced while a call is being created does not leave
+/// that call holding authority the replacement withdrew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
+    let fixture = fixture();
+    let coordinator = Arc::new(fixture.coordinator);
+    coordinator
+        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .await
+        .expect("a standing voice grant");
+    fixture.broker.hold_creations();
+
+    let start = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .start(
+                    device(PHONE),
+                    &start_params(),
+                    AuthorityRevision::new(1),
+                    10_010,
+                )
+                .await
+                .expect("an answer")
+        }
+    });
+    while fixture.broker.offers().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The person narrows their voice grant while the broker is still answering.
+    coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Navigate])),
+            AuthorityRevision::new(1),
+            10_020,
+        )
+        .await
+        .expect("a narrower standing voice grant");
+    fixture.broker.release();
+
+    let started = start.await.expect("the start finishes");
+    let VoiceStartOutcome::Unavailable { reason, .. } = &started.outcome else {
+        panic!(
+            "a call planned under a withdrawn grant is not kept: {:?}",
+            started.outcome
+        );
+    };
+    assert_eq!(reason, "voice_grant_changed");
+    assert_eq!(
+        coordinator.live_sessions(),
+        0,
+        "no voice session is holding authority the replacement withdrew"
+    );
+    assert_eq!(
+        fixture.broker.closed(),
+        vec!["call-managed".to_owned()],
+        "and the call it created was closed rather than left metering"
     );
 }
 

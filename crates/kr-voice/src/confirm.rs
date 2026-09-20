@@ -210,6 +210,27 @@ impl ConfirmationLedger {
             .insert(*request.confirmation_id.get().as_bytes(), request.clone());
     }
 
+    /// The challenge already outstanding for one exact action and request, when there is one.
+    ///
+    /// A device that asks twice for the same confirmation is asking for the same thing, and
+    /// answering with the challenge it already has keeps one action to one challenge. Without it
+    /// a caller could fill this ledger by resubmitting a delegation it never intends to sign.
+    #[must_use]
+    pub fn outstanding_for(
+        &self,
+        action_digest: Digest256,
+        action_id: ActionId,
+        device_id: DeviceId,
+        now_ms: u64,
+    ) -> Option<&VoiceConfirmationRequest> {
+        self.outstanding.values().find(|request| {
+            request.action_digest == action_digest
+                && request.action_id == action_id
+                && request.device_id == device_id
+                && now_ms < request.expires_at_ms.get()
+        })
+    }
+
     /// The challenge with this identity, when this host is still waiting for it.
     #[must_use]
     pub fn outstanding(&self, id: ConfirmationId) -> Option<&VoiceConfirmationRequest> {

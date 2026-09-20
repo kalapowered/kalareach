@@ -75,7 +75,7 @@ pub use crate::confirm::{
     ConfirmationLedger, issue_confirmation, sign_confirmation, verify_confirmation,
 };
 pub use crate::context::{SecretPatterns, Selection, select_context, token_bound};
-pub use crate::delegate::{Coordinator, Proposal};
+pub use crate::delegate::{Coordinator, Proposal, narrower_history};
 pub use crate::error::{Result, VoiceError};
 pub use crate::grant::{
     GrantBinding, VoiceGrantPlan, permits, permitted_actions, plan_voice_grant,

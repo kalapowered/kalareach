@@ -33,7 +33,7 @@ use kr_voice::Coordinator;
 use kr_voice::broker::{ManagedVoiceBroker, ManagedVoiceService, ServiceHttp};
 
 pub use authority::GrantAuthority;
-pub use context::{FilteredContext, SessionFacts, SessionSnapshot, snapshot_of};
+pub use context::{FilteredContext, SessionFacts, SessionSnapshot, filtered, snapshot_of};
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use submit::{HostDispatch, ProposalSubmitter};
 
@@ -222,18 +222,22 @@ impl VoiceModule {
     }
 
     /// Answers one of the four voice mutations.
-    pub async fn write_frame(
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the caller is given. A voice mutation is deduplicated by its action
+    /// identifier, so the caller of this is the one that claims the action and retains what it
+    /// produced; this performs the effect exactly once for that claim.
+    pub async fn answer(
         &self,
         actor: VoiceActor,
         mutation: &MutationRequest,
         method: Method,
         authority_revision: AuthorityRevision,
         now_ms: u64,
-    ) -> ControlFrame {
-        let outcome = self
-            .dispatch(actor, mutation, method, authority_revision, now_ms)
-            .await;
-        frame(mutation.request_id, outcome)
+    ) -> Result<ParamsValue> {
+        self.dispatch(actor, mutation, method, authority_revision, now_ms)
+            .await
     }
 
     async fn dispatch(

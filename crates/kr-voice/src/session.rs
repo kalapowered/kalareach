@@ -19,7 +19,7 @@ use kr_protocol::voice::{VoiceDelegationId, VoiceRefusal};
 use crate::error::{Result, VoiceError};
 
 /// One voice session, as the coordinator holds it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct VoiceSessionRecord {
     /// Its own identity.
     pub voice_session_id: VoiceSessionId,
@@ -36,6 +36,12 @@ pub struct VoiceSessionRecord {
     /// Absent for a voice session running on a provider of the person's own, which is the same
     /// voice session with a different provider behind it.
     pub call_id: Option<String>,
+    /// The provider that created the call, so the same one is told when it ends.
+    ///
+    /// Held rather than looked up: the coordinator's provider can be replaced while a call runs,
+    /// and telling a different service to close a call it never created would leave the real one
+    /// metering.
+    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::ManagedVoiceService>>,
     /// When it started, in UTC milliseconds.
     pub started_at_ms: u64,
     /// When the call's own deadline falls, in UTC milliseconds.
@@ -85,7 +91,7 @@ impl VoiceSessionRecord {
 }
 
 /// What stopping one voice session did.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Stopped {
     /// The voice session that ended.
     pub voice_session_id: VoiceSessionId,
@@ -95,12 +101,14 @@ pub struct Stopped {
     pub revoked_at_ms: u64,
     /// The broker's call identifier, for the caller to finalise afterwards.
     pub call_id: Option<String>,
+    /// The provider that created it.
+    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::ManagedVoiceService>>,
     /// The terminal sessions it reached, which keep running.
     pub sessions_left_running: CanonicalSet<SessionId>,
 }
 
 /// A voice session that is about to start.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct NewVoiceSession {
     /// Its own identity.
     pub voice_session_id: VoiceSessionId,
@@ -114,6 +122,8 @@ pub struct NewVoiceSession {
     pub session_ids: CanonicalSet<SessionId>,
     /// The broker's identifier for the call, when a managed call is behind it.
     pub call_id: Option<String>,
+    /// The provider that created it, so the same one is told when it ends.
+    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::ManagedVoiceService>>,
     /// When it started, in UTC milliseconds.
     pub started_at_ms: u64,
     /// When the call's own deadline falls, in UTC milliseconds.
@@ -142,6 +152,7 @@ impl VoiceSessions {
             parent_grant_id,
             session_ids,
             call_id,
+            provider,
             started_at_ms,
             closes_at_ms,
         } = started;
@@ -152,6 +163,7 @@ impl VoiceSessions {
             parent_grant_id,
             session_ids,
             call_id,
+            provider,
             started_at_ms,
             closes_at_ms,
             announced: Vec::new(),
@@ -288,6 +300,7 @@ mod tests {
             parent_grant_id: grant(4),
             session_ids: [session(5), session(6)].into_iter().collect(),
             call_id: Some("call-1".to_owned()),
+            provider: None,
             started_at_ms: 1_000,
             closes_at_ms: 2_000,
         })
@@ -347,6 +360,7 @@ mod tests {
             parent_grant_id: grant(4),
             session_ids: [session(5)].into_iter().collect(),
             call_id: None,
+            provider: None,
             started_at_ms: 1_000,
             closes_at_ms: 2_000,
         });

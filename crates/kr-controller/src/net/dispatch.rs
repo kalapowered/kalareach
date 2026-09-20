@@ -915,16 +915,38 @@ impl RemoteConnection {
             // coordinator decides each one against the voice grant and this device's ordinary
             // grant, intersected at the moment of the decision.
             _ if crate::voice::VoiceModule::serves(entry.method) => {
-                self.controller
-                    .voice()
-                    .write_frame(
+                // The deadline this mutation was admitted under, checked last: everything between
+                // the envelope check and here can wait, and an action whose deadline passed while
+                // it queued does not go on to write. A retry of a completed voice change is
+                // answered from its own record before the effect.
+                if self.controller.clock.now() >= accepted.deadline {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "the deadline this action was admitted under passed before it could \
+                             run",
+                        ),
+                    );
+                }
+                let actor_id = self.device.principal();
+                match self
+                    .controller
+                    .voice_mutation(
+                        &actor_id,
                         crate::voice::VoiceActor::Device(self.device.device_id),
                         mutation,
                         entry.method,
                         validated,
-                        super::super::wall_clock_ms(),
                     )
                     .await
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
+                }
             }
             // Everything else belongs to the worker that owns the session.
             _ => self.proxied_mutation(mutation, accepted, validated).await,

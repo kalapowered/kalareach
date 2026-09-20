@@ -148,53 +148,62 @@ fn admit_one(
         .next()
 }
 
+/// Runs one snapshot through the shared host-side filter under one grant's scope.
+///
+/// Every read of a session's content that voice serves goes through here, whether it was asked for
+/// as context or produced as the result of an effect: a bound applied on one path and not the
+/// other is a bound with a way round it.
+#[must_use]
+pub fn filtered(snapshot: SessionSnapshot, grant: &Grant) -> GatheredContext {
+    // One scope, built from the grant the host already checked. Nothing here builds a scope from
+    // a role, a label, a capability or the host owner's own authority.
+    let filter = HistoryFilter::new(scope_of(grant));
+    let mut withheld = snapshot.unavailable.clone();
+
+    // Selecting a class is a person saying they want it, not authority to read it. File contents
+    // and attachment bytes need the grant's own file right on top of the history bound, which is
+    // the filter's `admit_attachment_bytes` question rather than its timestamp one.
+    let mut selected: Vec<SelectedItem> = Vec::new();
+    for entry in snapshot.selected {
+        let needs_file_right = matches!(
+            entry.class,
+            kr_protocol::voice::VoiceContextClass::FileContents
+                | kr_protocol::voice::VoiceContextClass::AttachmentBytes
+        );
+        if needs_file_right
+            && let Err(reason) = filter.admit_attachment_bytes(entry.item.produced_at_ms)
+        {
+            withheld.push(WithheldRun {
+                reason: format!("{}: {reason}", entry.class),
+                count: 1,
+            });
+            continue;
+        }
+        if let Some(item) = admit_one(&filter, Some(entry.item), &mut withheld) {
+            selected.push(SelectedItem {
+                class: entry.class,
+                item,
+            });
+        }
+    }
+
+    GatheredContext {
+        session_description: admit_one(&filter, snapshot.description, &mut withheld),
+        working_directory: admit_one(&filter, snapshot.working_directory, &mut withheld),
+        active_application: admit_one(&filter, snapshot.active_application, &mut withheld),
+        pending_decisions: admit(&filter, snapshot.pending_decisions, &mut withheld),
+        recent_messages: admit(&filter, snapshot.recent_messages, &mut withheld),
+        selected,
+        resources: snapshot.resources,
+        withheld,
+    }
+}
+
 impl ContextSource for FilteredContext {
     fn gather<'a>(&'a self, request: &'a ContextRequest) -> VoiceFuture<'a, GatheredContext> {
         Box::pin(async move {
             let snapshot = self.facts.snapshot(request.session_id).await?;
-            // One scope, built from the grant the host already checked. Nothing here builds a
-            // scope from a role, a label, a capability or the host owner's own authority.
-            let filter = HistoryFilter::new(scope_of(&request.grant));
-            let mut withheld = snapshot.unavailable.clone();
-
-            // Selecting a class is a person saying they want it, not authority to read it. File
-            // contents and attachment bytes need the grant's own file right on top of the history
-            // bound, which is the filter's `admit_attachment_bytes` question rather than its
-            // timestamp one.
-            let mut selected: Vec<SelectedItem> = Vec::new();
-            for entry in snapshot.selected {
-                let needs_file_right = matches!(
-                    entry.class,
-                    kr_protocol::voice::VoiceContextClass::FileContents
-                        | kr_protocol::voice::VoiceContextClass::AttachmentBytes
-                );
-                if needs_file_right
-                    && let Err(reason) = filter.admit_attachment_bytes(entry.item.produced_at_ms)
-                {
-                    withheld.push(WithheldRun {
-                        reason: format!("{}: {reason}", entry.class),
-                        count: 1,
-                    });
-                    continue;
-                }
-                if let Some(item) = admit_one(&filter, Some(entry.item), &mut withheld) {
-                    selected.push(SelectedItem {
-                        class: entry.class,
-                        item,
-                    });
-                }
-            }
-
-            Ok(GatheredContext {
-                session_description: admit_one(&filter, snapshot.description, &mut withheld),
-                working_directory: admit_one(&filter, snapshot.working_directory, &mut withheld),
-                active_application: admit_one(&filter, snapshot.active_application, &mut withheld),
-                pending_decisions: admit(&filter, snapshot.pending_decisions, &mut withheld),
-                recent_messages: admit(&filter, snapshot.recent_messages, &mut withheld),
-                selected,
-                resources: snapshot.resources,
-                withheld,
-            })
+            Ok(filtered(snapshot, &request.grant))
         })
     }
 

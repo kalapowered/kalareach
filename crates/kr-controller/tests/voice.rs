@@ -332,6 +332,62 @@ async fn the_default_voice_grant_is_written_into_the_hosts_own_store() {
     host.clients.abort();
 }
 
+/// KR-REQ-23.51: a voice mutation is deduplicated by its action identifier, so a retry answers
+/// with what the first attempt produced rather than replacing the grant a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_voice_mutation_answers_with_what_the_first_one_did() {
+    let host = host().await;
+    let mut control = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the control endpoint");
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let params = VoiceGrantParams {
+        device_id: host.device_id,
+        session_ids: [host.session_id].into_iter().collect(),
+        actions: Nullable::some([VoiceAction::Status].into_iter().collect()),
+    };
+    let first: kr_protocol::voice::VoiceGrantResult = control
+        .mutate(
+            Method::VoiceGrant,
+            action_id,
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the voice grant is written")
+        .to_typed()
+        .expect("a voice grant result");
+    let again: kr_protocol::voice::VoiceGrantResult = control
+        .mutate(
+            Method::VoiceGrant,
+            action_id,
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the retry is answered")
+        .to_typed()
+        .expect("a voice grant result");
+    assert_eq!(
+        again.grant_id, first.grant_id,
+        "the retry is the first change's own answer, not a second grant"
+    );
+    let stored = host
+        .controller
+        .sharing()
+        .grants()
+        .record(first.grant_id)
+        .expect("the store answers")
+        .expect("the grant is there");
+    assert!(
+        stored.revoked_at_ms.is_none(),
+        "the retry did not replace the grant the first attempt wrote"
+    );
+    host.clients.abort();
+}
+
 /// KR-REQ-15.21 and 23.51: the person at this machine changes a device's voice grant on the host's
 /// own socket, which is the ingress the registry lists for `voice.grant` beside a paired device's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -826,6 +882,69 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
         panic!("the call runs: {:?}", started.outcome);
     };
     assert_eq!(call.session_ids, [session_id].into_iter().collect());
+
+    // The read and the delegation reach the coordinator over the same connection. This host runs
+    // no worker for that session, so both answer with a host failure rather than a refusal: what
+    // they prove is the ingress, and that the coordinator decided them rather than the registry
+    // turning them away.
+    let context: std::result::Result<kr_protocol::voice::VoiceContextResult, _> = session
+        .read(
+            Method::VoiceContext,
+            &VoiceContextParams {
+                voice_session_id: call.voice_session_id,
+                session_id,
+                selected: CanonicalSet::from_iter([]),
+                delegation_id: Nullable::null(),
+            },
+        )
+        .await;
+    if let Err(kr_client::error::ClientError::Host(refusal)) = &context {
+        assert_ne!(
+            refusal.code,
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "the read reached the coordinator: {refusal:?}"
+        );
+    }
+    let delegated = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceDelegate,
+        &VoiceDelegateParams {
+            voice_session_id: call.voice_session_id,
+            delegation_id: delegation("net"),
+            offset_ms: U64::new(0),
+            action: VoiceAction::Status,
+            session_id: Nullable::some(session_id),
+            spoken_destination: Nullable::null(),
+            approval: Nullable::null(),
+            turn_id: Nullable::null(),
+            confirmation: Nullable::null(),
+        },
+    )
+    .await;
+    match delegated {
+        Ok(value) => {
+            let answered: kr_protocol::voice::VoiceDelegateResult =
+                value.to_typed().expect("a delegation result");
+            assert!(
+                !matches!(
+                    answered.outcome,
+                    VoiceDelegationOutcome::Refused {
+                        reason: VoiceRefusal::OutsideVoiceGrant | VoiceRefusal::OutsideDeviceGrant,
+                        ..
+                    }
+                ),
+                "the grants admitted it: {:?}",
+                answered.outcome
+            );
+        }
+        Err(kr_client::error::ClientError::Host(refusal)) => assert_ne!(
+            refusal.code,
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "the delegation reached the coordinator: {refusal:?}"
+        ),
+        Err(other) => panic!("the delegation reached the host: {other:?}"),
+    }
 
     // Stopping it over the same connection revokes the grant it ran under.
     let stopped: kr_protocol::voice::VoiceStopResult = remote_voice(
