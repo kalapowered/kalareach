@@ -273,21 +273,18 @@ pub async fn verify(
         // read back here, where it can be named as the resource it is.
         Err(source) => {
             let datastore_root = datastore.join("root.json");
-            if let Ok(bytes) = std::fs::read(&datastore_root) {
-                if !bytes.is_empty() && bytes != enrolment.root {
-                    if let Ok(new_signed) =
-                        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&bytes)
-                    {
-                        if let Ok(old_signed) = serde_json::from_slice::<
-                            tough::schema::Signed<tough::schema::Root>,
-                        >(&enrolment.root)
-                        {
-                            if new_signed.signed.version > old_signed.signed.version {
-                                on_root_rotated(bytes)?;
-                            }
-                        }
-                    }
-                }
+            if let Ok(bytes) = std::fs::read(&datastore_root)
+                && !bytes.is_empty()
+                && bytes != enrolment.root
+                && let Ok(new_signed) =
+                    serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&bytes)
+                && let Ok(old_signed) =
+                    serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(
+                        &enrolment.root,
+                    )
+                && new_signed.signed.version > old_signed.signed.version
+            {
+                on_root_rotated(bytes)?;
             }
             return Err(budgeted.overflow().unwrap_or_else(|| classify(&source)));
         }

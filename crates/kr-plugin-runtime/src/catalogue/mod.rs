@@ -724,6 +724,9 @@ impl Catalogue {
     /// # Errors
     ///
     /// Returns the refusal verification, the budgets, admission or the package rules decided.
+    // Every argument names one part of the identity an activation is authorised against, and
+    // folding them into a struct would hide which of them a caller left unset.
+    #[allow(clippy::too_many_arguments)]
     pub async fn activate_package_scoped_with_admission(
         &mut self,
         id: &RepositoryId,
@@ -747,6 +750,7 @@ impl Catalogue {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn activate_package_scoped_locked(
         &mut self,
         id: &RepositoryId,
@@ -762,10 +766,10 @@ impl Catalogue {
         // not fetched because something matched; it is fetched because somebody installed it,
         // enabled it, or already did both and an application it recognises started.
         self.check_reason(id, environment_id, plugin_id, version, package_hash, reason)?;
-        if let Some(hash) = package_hash {
-            if self.state(id)?.store.has_package(hash) {
-                return Ok(hash);
-            }
+        if let Some(hash) = package_hash
+            && self.state(id)?.store.has_package(hash)
+        {
+            return Ok(hash);
         }
         let index = self.index(id)?;
         let entry =
@@ -775,16 +779,16 @@ impl Catalogue {
                 .ok_or_else(|| CatalogueError::NotFound {
                     detail: format!("{plugin_id} {version} is not in this repository's index"),
                 })?;
-        if let Some(expected_hash) = package_hash {
-            if entry.manifest_digest != expected_hash {
-                return Err(CatalogueError::UnavailableOffline {
-                    detail: format!(
-                        "the requested package hash {expected_hash} does not match {plugin_id} \
-                         {version} ({}) in the active catalogue generation",
-                        entry.manifest_digest
-                    ),
-                });
-            }
+        if let Some(expected_hash) = package_hash
+            && entry.manifest_digest != expected_hash
+        {
+            return Err(CatalogueError::UnavailableOffline {
+                detail: format!(
+                    "the requested package hash {expected_hash} does not match {plugin_id} \
+                     {version} ({}) in the active catalogue generation",
+                    entry.manifest_digest
+                ),
+            });
         }
         if self.state(id)?.store.has_package(entry.manifest_digest) {
             return Ok(entry.manifest_digest);
@@ -1176,6 +1180,9 @@ impl Catalogue {
     /// # Errors
     ///
     /// Returns the refusal verification, the budgets, admission, the package rules or the ceiling decided.
+    // The package identity, the environment, the grant and the admission each have to be named
+    // separately here, because an installation is authorised against all four.
+    #[allow(clippy::too_many_arguments)]
     pub async fn install_with_admission(
         &mut self,
         id: &RepositoryId,
