@@ -2312,6 +2312,146 @@ fn a_live_session_keeps_the_package_it_started_with() {
     }
 }
 
+/// KR-REQ-07.87, KR-REQ-07.88: a package binds into the editor it was qualified against, and says
+/// so about any other.
+///
+/// The PowerShell package builds no editor. It binds into the PSReadLine the person installed, so
+/// what makes its qualification true of a running session is that editor being the one the
+/// qualification ran against. A supported version range does not say that: two installations can
+/// both be inside one range, and only one of them was qualified. The package records which one,
+/// and this drives that record against the module itself.
+#[test]
+fn the_package_binds_into_the_editor_it_was_qualified_against() {
+    let Some(package) = Package::found(ShellKind::PowerShell) else {
+        return;
+    };
+    let directory = package
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the package directory")
+        .to_owned();
+
+    // A copy of the package, because what is driven here is its own record and the installed one
+    // is what every other case in this run qualifies against.
+    let root = tempfile::Builder::new()
+        .prefix("kr-qualified-editor-")
+        .tempdir()
+        .expect("a root on the internal disk");
+    let copy = root.path().join("package");
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(&directory)
+        .arg(&copy)
+        .status()
+        .expect("a copy of the package");
+    assert!(copied.success(), "the package did not copy");
+    let record_path = copy.join("kr-shell-identity.json");
+    let published: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).expect("the record"))
+            .expect("the record reads");
+    let qualified = published["qualified"].clone();
+    assert!(
+        qualified["psreadline_module_base"].is_string(),
+        "the package published no editor to be qualified against: {published}"
+    );
+
+    assert_eq!(
+        refusal(&package, &copy),
+        "",
+        "the package refused the editor it was qualified against"
+    );
+
+    // The same version somewhere else: an editor a person moved, or a second installation of it,
+    // is not the one this package was qualified against.
+    let mut elsewhere = published.clone();
+    elsewhere["qualified"]["psreadline_module_base"] = serde_json::Value::String(format!(
+        "{}-elsewhere",
+        qualified["psreadline_module_base"]
+            .as_str()
+            .expect("the published module base")
+    ));
+    write_record(&record_path, &elsewhere);
+    assert_eq!(
+        refusal(&package, &copy),
+        "psreadline_not_the_qualified_editor",
+        "a package bound into an editor it was never qualified against"
+    );
+
+    // And the same place at another version, which is what an update to the editor leaves behind.
+    let mut updated = published.clone();
+    updated["qualified"]["psreadline_found"] = serde_json::Value::String("0.0.1".to_owned());
+    write_record(&record_path, &updated);
+    assert_eq!(
+        refusal(&package, &copy),
+        "psreadline_not_the_qualified_editor",
+        "a package bound into an editor whose version it never qualified"
+    );
+
+    // A record that names no editor decides nothing, and neither does one that cannot be read.
+    let mut silent = published.clone();
+    silent
+        .as_object_mut()
+        .expect("the record is an object")
+        .remove("qualified");
+    write_record(&record_path, &silent);
+    assert_eq!(
+        refusal(&package, &copy),
+        "package_qualification_unreadable",
+        "a package that says nothing about its editor bound into one anyway"
+    );
+    std::fs::write(&record_path, "{").expect("the record");
+    assert_eq!(
+        refusal(&package, &copy),
+        "package_qualification_unreadable",
+        "a package whose record cannot be read bound into an editor anyway"
+    );
+}
+
+/// Writes one package record back the way a package holds it.
+fn write_record(path: &std::path::Path, record: &serde_json::Value) {
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(record).expect("the record encodes"),
+    )
+    .expect("the record");
+}
+
+/// What the module at `package_root` says about the editor in a host this package starts, as the
+/// name of its refusal, or nothing when it accepts that editor.
+fn refusal(package: &Package, package_root: &std::path::Path) -> String {
+    let module = package_root
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         $answer = & (Get-Module KalaReach.ShellBridge) {{ Test-KrQualifiedEditor }}; \
+         Write-Output \"kr-editor=[$($answer.Reason)]\""
+    );
+    // The package's own launcher, which is how a session starts this host: the runtime location
+    // the host needs is the launcher's to pass, not this test's to guess. Nothing of a session's
+    // is in this environment, so the module answers the question and attempts no handshake.
+    let asked = std::process::Command::new(&package.executable)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr);
+    let start = said
+        .find("kr-editor=[")
+        .unwrap_or_else(|| panic!("the module answered nothing:\n{said}\n{told}"))
+        + "kr-editor=[".len();
+    let end = said[start..]
+        .find(']')
+        .unwrap_or_else(|| panic!("the module's answer did not end:\n{said}"))
+        + start;
+    said[start..end].to_owned()
+}
+
 /// The package of one shell this installation offers a new session, where it offers one.
 fn offered(root: &std::path::Path, kind: ShellKind) -> Option<std::path::PathBuf> {
     kr_shell_integration::host::package::PackageSet::discover(root)

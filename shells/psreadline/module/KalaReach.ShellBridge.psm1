@@ -150,6 +150,24 @@ function Get-KrQualifiedHost {
     @{ executable = $executable; psreadline_module_base = "$psrlPath" }
 }
 
+function Get-KrPublishedQualification {
+    <#
+    .SYNOPSIS
+    What the installed package this module was imported from says it was qualified against.
+
+    .DESCRIPTION
+    A published package records the editor the qualification ran against, which is the person's
+    own PSReadLine rather than anything the package installs. This reads that record back so the
+    editor in this process can be compared with it. A module imported from the source tree belongs
+    to no package and answers with nothing.
+    #>
+    $root = Get-KrPackageRoot
+    if ($null -eq $root) { return $null }
+    $record = Join-Path $root 'kr-shell-identity.json'
+    try { @{ Path = $record; Qualified = (Get-Content -Raw -Path $record | ConvertFrom-Json).qualified } }
+    catch { @{ Path = $record; Qualified = $null } }
+}
+
 function Test-KrQualifiedEditor {
     $version = Get-KrPSReadLineVersion
     if ($null -eq $version) {
@@ -169,6 +187,31 @@ function Test-KrQualifiedEditor {
             Ok     = $false
             Reason = 'psreadline_queue_unreadable'
             Detail = "PSReadLine $version keeps no reader queue this package can read"
+        }
+    }
+    # This package builds no editor: it binds into the one the person has, and the qualification
+    # it publishes names exactly which one that was. A supported range is not that answer, because
+    # two installations can be in one range and only one of them was qualified. So a package says
+    # yes only to the editor it was qualified against, and an installation that has been moved,
+    # replaced or updated since is diagnosed rather than bound into.
+    $published = Get-KrPublishedQualification
+    if ($null -ne $published) {
+        $base = try { "$((Get-Module PSReadLine).ModuleBase)" } catch { '' }
+        if ($null -eq $published.Qualified -or
+            [string]::IsNullOrEmpty("$($published.Qualified.psreadline_module_base)")) {
+            return @{
+                Ok     = $false
+                Reason = 'package_qualification_unreadable'
+                Detail = "$($published.Path) does not say which editor this package was qualified against"
+            }
+        }
+        if ("$version" -ne "$($published.Qualified.psreadline_found)" -or
+            $base -ne "$($published.Qualified.psreadline_module_base)") {
+            return @{
+                Ok     = $false
+                Reason = 'psreadline_not_the_qualified_editor'
+                Detail = "PSReadLine $version at '$base' is not the $($published.Qualified.psreadline_found) at '$($published.Qualified.psreadline_module_base)' this package was qualified against"
+            }
         }
     }
     @{ Ok = $true; Reason = ''; Detail = '' }
