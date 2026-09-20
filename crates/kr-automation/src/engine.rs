@@ -231,18 +231,18 @@ impl WorkflowEngine {
                 }
 
                 if can_run {
-                    // The journal decides whether this node still has anything owed to it. A
-                    // cancellation that arrived while an earlier node was running is in there
-                    // and not in the snapshot this loop started from, so the check is made
-                    // against the store immediately before the dispatch it guards.
-                    let recorded = self.store.node_status(run_id, &node.node_id)?;
-                    if recorded != Some(NodeStatus::Pending) {
-                        node_statuses.insert(
-                            node.node_id.clone(),
-                            recorded.unwrap_or(NodeStatus::Cancelled),
+                    // A workflow paused since this run started dispatches nothing further. The
+                    // run itself stays where it is, for whoever enables the workflow again.
+                    if self
+                        .store
+                        .is_paused(definition.workflow_id, definition.revision.get())?
+                    {
+                        return self.pause_on_refusal(
+                            run_id,
+                            &node.node_id,
+                            crate::error::AutomationError::WorkflowPaused(definition.workflow_id),
+                            self.clock.now_ms(),
                         );
-                        progress = true;
-                        continue;
                     }
 
                     // Every reservation is checked against the clock as it stands now, not
@@ -270,16 +270,21 @@ impl WorkflowEngine {
                         return self.pause_on_refusal(run_id, &node.node_id, err, dispatch_time_ms);
                     }
 
-                    // Mark running
+                    // The journal, not the snapshot this loop started from, decides whether
+                    // the node still has a dispatch owed to it. Reading its status and moving
+                    // it to running is one statement, so a cancellation that arrives while an
+                    // earlier node was running either gets there first and this node is never
+                    // dispatched, or finds it already running and leaves it alone.
+                    if !self.store.claim_node_for_dispatch(run_id, &node.node_id)? {
+                        let recorded = self.store.node_status(run_id, &node.node_id)?;
+                        node_statuses.insert(
+                            node.node_id.clone(),
+                            recorded.unwrap_or(NodeStatus::Cancelled),
+                        );
+                        progress = true;
+                        continue;
+                    }
                     node_statuses.insert(node.node_id.clone(), NodeStatus::Running);
-                    self.store.update_node_receipt(
-                        run_id,
-                        &node.node_id,
-                        NodeStatus::Running,
-                        None,
-                        None,
-                        None,
-                    )?;
 
                     let action_id = node_actions[&node.node_id];
                     let outcome_res = self.runner.execute(node, action_id, dispatch_time_ms).await;
@@ -356,8 +361,11 @@ impl WorkflowEngine {
             }
         }
 
-        // Check if any node is paused or unknown
-        if node_statuses
+        // The run is only as settled as its least settled node. A cancelled node means the run
+        // was cancelled; a paused or unknown one means it is waiting on a person.
+        if node_statuses.values().any(|&s| s == NodeStatus::Cancelled) {
+            run_status = WorkflowRunStatus::Cancelled;
+        } else if node_statuses
             .values()
             .any(|&s| s == NodeStatus::Paused || s == NodeStatus::Unknown)
         {
@@ -371,7 +379,7 @@ impl WorkflowEngine {
         Ok(run_status)
     }
 
-    /// Records a refused reservation and pauses the run, keeping the refusal for the caller.
+    /// Records a refused dispatch and pauses the run, keeping the refusal for the caller.
     ///
     /// The node is paused rather than failed: nothing was dispatched, so there is no failure to
     /// report about the action itself. Returning the error preserves `CAUSAL_LIMIT` all the way

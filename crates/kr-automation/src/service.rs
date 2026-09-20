@@ -193,13 +193,13 @@ impl AutomationService {
     pub fn enable(
         &self,
         params: &WorkflowEnableParams,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> Result<WorkflowEnableResult> {
         self.installed(params.workflow_id, params.revision)?;
         self.store
             .set_enabled(params.workflow_id, params.revision.get(), true)?;
         self.store
-            .set_paused(params.workflow_id, params.revision.get(), false)?;
+            .resume_workflow(params.workflow_id, params.revision.get(), now_ms)?;
 
         Ok(WorkflowEnableResult {
             workflow_id: params.workflow_id,
@@ -272,6 +272,22 @@ impl AutomationService {
             // to escape one. Host-wide admission below is what bounds it.
             None => CausalContext::new_root(),
         };
+
+        // A trigger this journal has already recorded is the same trigger arriving twice. It is
+        // answered before admission, because a redelivery is not new load and must not be able
+        // to spend an allowance or pause the workflow. The transaction below still holds the
+        // line for two copies that arrive at once.
+        if self.store.trigger_is_recorded(
+            params.workflow_id,
+            params.revision.get(),
+            &params.event_id,
+        )? {
+            return Err(AutomationError::DuplicateTrigger {
+                workflow_id: params.workflow_id,
+                revision: params.revision.get(),
+                event_id: params.event_id.clone(),
+            });
+        }
 
         // Per-workflow concurrency, the per-grant rate and the host-wide rate, in that order.
         // A breach pauses the revision and records the attention item that pause owes, so the
@@ -401,13 +417,15 @@ impl AutomationService {
             }
         }
 
-        let remaining_causal_budget = if let Some(root_id) = params.causal_root_id.0 {
-            self.store
+        // A budget is answered only for a root the rest of this request actually covers, so a
+        // reader asking about one workflow is not handed another chain's remaining allowance.
+        let remaining_causal_budget = match params.causal_root_id.0 {
+            Some(root_id) if runs.iter().any(|run| run.causal_root_id == root_id) => self
+                .store
                 .get_budget(root_id)?
-                .map(|b| b.to_summary(now_ms))
-                .into()
-        } else {
-            Nullable::null()
+                .map(|budget| budget.to_summary(now_ms))
+                .into(),
+            _ => Nullable::null(),
         };
 
         Ok(WorkflowReadResult {
@@ -471,10 +489,16 @@ impl AutomationService {
             let event = SourceEvent::new(
                 EventCursor::new(source, sequence),
                 TimestampMs::new(record.created_at_ms),
-                EventKind::AdapterFailed {
-                    plugin_id: attention_subject(record.subject),
-                    session_id: None,
-                    detail: record.reason.clone(),
+                if record.ends_condition {
+                    EventKind::AdapterRecovered {
+                        plugin_id: attention_subject(record.subject),
+                    }
+                } else {
+                    EventKind::AdapterFailed {
+                        plugin_id: attention_subject(record.subject),
+                        session_id: None,
+                        detail: record.reason.clone(),
+                    }
                 },
             );
             raised += attention

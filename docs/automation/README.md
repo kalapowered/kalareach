@@ -87,8 +87,10 @@ is what makes it runnable, and `workflow.pause` stops it.
 ## Durability, execution, and restart
 
 The workflow journal is an environment SQLite store located under the runtime directory.
-* **Transactional commitment.** Triggers, runs, and budget reservations are committed together
-  with an outbox record in a single transaction before any node dispatches.
+* **Transactional commitment.** A trigger, its run, its deduplication key, its node receipts and
+  the chain's budget reservation commit in one transaction before any node dispatches. A
+  refusal commits its own consequences the same way: the chain's pause and the one attention
+  record it owes land together, as do a workflow's pause and its record.
 * **Deduplication.** Triggers are deduplicated by `(workflow_id, definition_revision, event_id)`.
 * **Authoritative outcomes.** A dependency runs only when the predecessor outcome is authoritative.
 * **Unknown outcomes pause.** A node whose outcome the host cannot establish, including one whose
@@ -109,7 +111,7 @@ The workflow journal is an environment SQLite store located under the runtime di
 
 ## Source workflow and evidence binding
 
-The source workflow binds what a run found to the exact bytes it ran against:
+The source workflow registers what a run reported against the exact version it was given:
 * **Immutable change-set binding.** A test result and a review result are recorded against one
   immutable change-set version (`kr_changeset`). A later edit in the workspace produces a later
   version; it never changes evidence already recorded against an earlier one.
@@ -117,3 +119,7 @@ The source workflow binds what a run found to the exact bytes it ran against:
   second reservation on the same workspace is refused until the first is released or expires.
 * **Separate identities.** The agent, the test run and the reviewer each carry their own session
   and agent identity, and a review is recorded against the reviewer who gave it.
+
+The version, the session and the outcome come from the caller. Tying them to the execution that
+produced them, so that a result cannot be registered against a version the run never read, needs
+the host execution path and is not yet in place.

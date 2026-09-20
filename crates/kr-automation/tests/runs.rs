@@ -544,11 +544,123 @@ async fn cancellation_stops_undispatched_nodes() {
         .await
         .expect("the run finishes");
 
+    let status = engine
+        .execute_run(run_id, &def, &causal_ctx)
+        .await
+        .expect("the run finishes");
+    assert_eq!(
+        status,
+        WorkflowRunStatus::Cancelled,
+        "a run with a cancelled node is a cancelled run, not a completed one"
+    );
+
     let receipts = store.list_node_receipts(run_id).unwrap();
     let step2 = receipts.iter().find(|r| r.node_id == "step2").unwrap();
     assert_eq!(
         step2.status,
         NodeStatus::Cancelled,
         "an undispatched node stays cancelled"
+    );
+}
+
+/// A workflow paused while a run is in flight dispatches nothing further.
+#[tokio::test]
+async fn a_pause_mid_run_stops_the_next_node() {
+    use kr_automation::{AutomationService, ManualClock};
+    use kr_protocol::automation::{
+        WorkflowEnableParams, WorkflowInstallParams, WorkflowPauseParams, WorkflowRunParams,
+    };
+
+    let workflow_id = test_wf_id(10);
+    let n1 = WorkflowNode {
+        node_id: "step1".to_owned(),
+        action_kind: "run_tests".to_owned(),
+        action_params: r#"{"suite": "unit"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let n2 = WorkflowNode {
+        node_id: "step2".to_owned(),
+        action_kind: "request_review".to_owned(),
+        action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let edge = WorkflowEdge {
+        from_node: "step1".to_owned(),
+        to_node: "step2".to_owned(),
+        condition: EdgeCondition::Success,
+    };
+    let definition = create_workflow_definition(
+        workflow_id,
+        1,
+        "paused-mid-run",
+        test_grant_id(10),
+        vec![n1, n2],
+        vec![edge],
+    );
+
+    let service = Arc::new(
+        AutomationService::in_memory_with_clock(
+            Arc::new(MockActionRunner::new()),
+            Arc::new(ManualClock::new(1_000)),
+        )
+        .expect("a service"),
+    );
+    service
+        .install(
+            &WorkflowInstallParams {
+                workflow_id,
+                revision: definition.revision,
+                definition: definition.clone(),
+                grant_reference: definition.grant_reference,
+            },
+            None,
+            1_000,
+        )
+        .expect("the definition installs");
+    service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("the revision enables");
+
+    // The pause lands after the run has been admitted and before its first node dispatches.
+    service
+        .pause(
+            &WorkflowPauseParams {
+                workflow_id,
+                revision: definition.revision,
+                reason: Nullable::some("stop it".to_owned()),
+            },
+            1_000,
+        )
+        .expect("the revision pauses");
+
+    let refused = service
+        .run(
+            &WorkflowRunParams {
+                workflow_id,
+                revision: definition.revision,
+                event_id: "evt-1".to_owned(),
+                event_type: "manual".to_owned(),
+                event_payload: Nullable::null(),
+                causal_parent: Nullable::null(),
+            },
+            None,
+            1_000,
+        )
+        .await
+        .expect_err("a paused workflow runs nothing");
+    assert!(refused.to_string().contains("paused"), "{refused}");
+    assert!(
+        service
+            .store()
+            .list_runs(Some(workflow_id))
+            .unwrap()
+            .is_empty(),
+        "a refused run leaves no record behind"
     );
 }

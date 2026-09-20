@@ -68,6 +68,8 @@ pub struct StoredRunRecord {
 pub const ATTENTION_CAUSAL_LIMIT: &str = "attention.causal_limit";
 /// The event type of the attention record a workflow paused by its own limits leaves.
 pub const ATTENTION_WORKFLOW_PAUSED: &str = "attention.workflow_paused";
+/// The event type that ends the condition [`ATTENTION_WORKFLOW_PAUSED`] raised.
+pub const ATTENTION_WORKFLOW_RESUMED: &str = "attention.workflow_resumed";
 
 /// What an attention record is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,8 @@ pub struct InstalledDefinition {
 /// One undelivered attention record from the workflow journal's outbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionOutboxRecord {
+    /// Whether the record raises a condition or ends one.
+    pub ends_condition: bool,
     /// The outbox row.
     ///
     /// It is also the delivery cursor: a redelivery of the same row carries the same sequence,
@@ -205,6 +209,8 @@ impl WorkflowStore {
 
         conn.execute_batch(
             "
+            BEGIN IMMEDIATE;
+
             CREATE TABLE IF NOT EXISTS workflow_definitions (
                 workflow_id TEXT NOT NULL,
                 revision INTEGER NOT NULL,
@@ -290,9 +296,12 @@ impl WorkflowStore {
                 source_name TEXT PRIMARY KEY,
                 sequence INTEGER NOT NULL
             );
+
+            PRAGMA user_version = 1;
+
+            COMMIT;
             ",
         )?;
-        conn.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -650,6 +659,37 @@ impl WorkflowStore {
         )
     }
 
+    /// Clears a pause and records the recovery the attention item it raised is waiting for.
+    ///
+    /// The item an exceedance raised stays in the inbox, climbing its ladder, until something
+    /// says the condition ended. Clearing the pause is that something, and the record commits
+    /// with it. A revision that was not paused records nothing.
+    pub fn resume_workflow(
+        &self,
+        workflow_id: WorkflowId,
+        revision: u64,
+        now_ms: u64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let resumed = tx.execute(
+            "UPDATE workflow_definitions SET paused = 0
+             WHERE workflow_id = ?1 AND revision = ?2 AND paused = 1",
+            params![workflow_id.to_string(), revision as i64],
+        )?;
+        if resumed > 0 {
+            record_attention_tx(
+                &tx,
+                ATTENTION_WORKFLOW_RESUMED,
+                &AttentionSubject::Workflow(workflow_id),
+                "the workflow was enabled again",
+                now_ms,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Pauses a workflow revision and records the attention item the pause owes, together.
     ///
     /// Section 17 ¶8 asks for both when one of a workflow's own limits is breached. A revision
@@ -704,6 +744,58 @@ impl WorkflowStore {
             .query_row(params![run_id.to_string()], Self::parse_run_record)
             .optional()?;
         Ok(record)
+    }
+
+    /// Claims a node for dispatch, if the journal still has it waiting for one.
+    ///
+    /// The read of the status and the move to running are one statement, so a cancellation that
+    /// lands between them cannot be lost: either it got there first and this returns false, or
+    /// it finds the node already running and leaves it alone.
+    pub fn claim_node_for_dispatch(&self, run_id: WorkflowRunId, node_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let claimed = conn.execute(
+            "UPDATE node_receipts SET status = ?1
+             WHERE run_id = ?2 AND node_id = ?3 AND status = ?4",
+            params![
+                NodeStatus::Running.as_str(),
+                run_id.to_string(),
+                node_id,
+                NodeStatus::Pending.as_str(),
+            ],
+        )?;
+        Ok(claimed > 0)
+    }
+
+    /// Reports whether a workflow revision is currently paused.
+    pub fn is_paused(&self, workflow_id: WorkflowId, revision: u64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let paused: Option<i64> = conn
+            .query_row(
+                "SELECT paused FROM workflow_definitions WHERE workflow_id = ?1 AND revision = ?2",
+                params![workflow_id.to_string(), revision as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(paused.unwrap_or(0) != 0)
+    }
+
+    /// Reports whether this trigger has already been recorded for this revision.
+    pub fn trigger_is_recorded(
+        &self,
+        workflow_id: WorkflowId,
+        revision: u64,
+        event_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM trigger_dedup
+                 WHERE workflow_id = ?1 AND revision = ?2 AND event_id = ?3",
+                params![workflow_id.to_string(), revision as i64, event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Reads one node's recorded status.
@@ -1019,19 +1111,20 @@ impl WorkflowStore {
     pub fn pending_attention(&self) -> Result<Vec<AttentionOutboxRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT outbox_id, payload_json, created_at_ms FROM outbox_events
+            "SELECT outbox_id, event_type, payload_json, created_at_ms FROM outbox_events
              WHERE settled_at_ms IS NULL ORDER BY outbox_id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             let outbox_id: i64 = row.get(0)?;
-            let payload: String = row.get(1)?;
-            let created_at_ms: i64 = row.get(2)?;
-            Ok((outbox_id, payload, created_at_ms))
+            let event_type: String = row.get(1)?;
+            let payload: String = row.get(2)?;
+            let created_at_ms: i64 = row.get(3)?;
+            Ok((outbox_id, event_type, payload, created_at_ms))
         })?;
 
         let mut result = Vec::new();
         for row in rows {
-            let (outbox_id, payload, created_at_ms) = row?;
+            let (outbox_id, event_type, payload, created_at_ms) = row?;
             let value: serde_json::Value = serde_json::from_str(&payload)?;
             let subject = value
                 .get("subject")
@@ -1042,6 +1135,7 @@ impl WorkflowStore {
                     ))
                 })?;
             result.push(AttentionOutboxRecord {
+                ends_condition: event_type == ATTENTION_WORKFLOW_RESUMED,
                 outbox_id,
                 subject: parse_attention_subject(subject).ok_or_else(|| {
                     AutomationError::InvalidArgument(format!(

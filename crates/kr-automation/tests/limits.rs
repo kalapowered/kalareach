@@ -214,8 +214,10 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
     let pending = service.store().pending_attention().expect("the outbox");
     assert_eq!(pending.len(), 1, "one pause owes one item");
     assert_eq!(pending[0].subject, AttentionSubject::Workflow(workflow_id));
+    assert!(!pending[0].ends_condition);
 
-    // Enabling the revision again is what clears the pause.
+    // Enabling the revision again is what clears the pause, and the record that ends the
+    // condition is committed with it, so the item does not go on asking for attention.
     service
         .enable(
             &WorkflowEnableParams {
@@ -225,9 +227,107 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
             2_000,
         )
         .expect("the revision enables again");
+    let after_enable = service.store().pending_attention().expect("the outbox");
+    assert_eq!(after_enable.len(), 2);
+    assert!(after_enable[1].ends_condition);
+
     let after = service
         .run(&params("evt-after-enable"), None, 200_000)
         .await
         .expect("the workflow runs once its pause is cleared");
     assert_eq!(after.workflow_id, workflow_id);
+}
+
+/// A redelivered trigger is answered as a duplicate, and costs the workflow nothing.
+#[tokio::test]
+async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workflow() {
+    use std::sync::Arc;
+
+    use kr_automation::{
+        AutomationService, ManualClock, MockActionRunner, create_workflow_definition,
+    };
+    use kr_protocol::automation::{
+        WorkflowEnableParams, WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
+    };
+    use kr_protocol::scalars::Nullable;
+
+    let workflow_id = test_wf_id(11);
+    let node = WorkflowNode {
+        node_id: "step".to_owned(),
+        action_kind: "run_tests".to_owned(),
+        action_params: r#"{"suite": "unit"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let definition = create_workflow_definition(
+        workflow_id,
+        1,
+        "redelivered",
+        test_grant_id(11),
+        vec![node],
+        vec![],
+    );
+
+    let service = AutomationService::in_memory_with_clock(
+        Arc::new(MockActionRunner::new()),
+        Arc::new(ManualClock::new(1_000)),
+    )
+    .expect("a service");
+    service
+        .install(
+            &WorkflowInstallParams {
+                workflow_id,
+                revision: definition.revision,
+                definition: definition.clone(),
+                grant_reference: definition.grant_reference,
+            },
+            None,
+            1_000,
+        )
+        .expect("the definition installs");
+    service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("the revision enables");
+
+    let params = WorkflowRunParams {
+        workflow_id,
+        revision: definition.revision,
+        event_id: "evt-once".to_owned(),
+        event_type: "manual".to_owned(),
+        event_payload: Nullable::null(),
+        causal_parent: Nullable::null(),
+    };
+
+    service
+        .run(&params, None, 1_000)
+        .await
+        .expect("the trigger runs");
+
+    // The same event, delivered again and again. Each is a duplicate and nothing more: no
+    // allowance is spent, and the workflow is never paused for load it did not create.
+    for _ in 0..200 {
+        let repeat = service
+            .run(&params, None, 1_000)
+            .await
+            .expect_err("a redelivery is a duplicate");
+        assert!(repeat.to_string().contains("duplicate trigger"), "{repeat}");
+    }
+
+    assert!(
+        service
+            .store()
+            .pending_attention()
+            .expect("the outbox")
+            .is_empty(),
+        "nothing was paused, so nothing owes an attention item"
+    );
+    assert_eq!(
+        service.store().list_runs(Some(workflow_id)).unwrap().len(),
+        1
+    );
 }
