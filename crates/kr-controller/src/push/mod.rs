@@ -305,6 +305,11 @@ impl DeliveryModule {
         credentials: &dyn SenderCredentials,
         clock: &dyn Clock,
     ) -> Result<usize> {
+        let is_fenced =
+            self.with(|producer| producer.journal().is_fenced().map_err(unavailable))?;
+        if is_fenced {
+            return Ok(0);
+        }
         let unknown = self.with(|producer| {
             Ok(producer
                 .journal()
@@ -360,12 +365,14 @@ impl DeliveryModule {
                     .settle_receipt(
                         record.notification_id,
                         decision.state,
+                        decision.next,
+                        decision.next_attempt_at_ms,
                         &decision.detail,
                         now_ms,
                     )
                     .map_err(unavailable)
             })?;
-            resolved += usize::from(settled);
+            resolved += usize::from(settled && decision.state.is_settled());
         }
         Ok(resolved)
     }

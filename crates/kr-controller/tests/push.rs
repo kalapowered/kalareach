@@ -690,6 +690,177 @@ fn an_unknown_outcome_is_resolved_by_reading_the_receipt() {
         .expect("a read");
 }
 
+/// A receipt returning retrying preserves the content bytes and schedules receipt polling.
+#[test]
+fn a_receipt_answering_retrying_keeps_content_and_schedules_next_receipt_poll() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![
+        SendOutcome::Unknown {
+            detail: "the connection was reset".to_owned(),
+        },
+        SendOutcome::Decided(Box::new(PushDeliveryAck {
+            decided_at_ms: TimestampMs::new(NOW),
+            notification_id: NotificationId::new(uuid(7)),
+            state: PushDeliveryState::Retrying,
+            suppression: Nullable::null(),
+        })),
+        SendOutcome::Decided(Box::new(PushDeliveryAck {
+            decided_at_ms: TimestampMs::new(NOW),
+            notification_id: NotificationId::new(uuid(7)),
+            state: PushDeliveryState::Queued,
+            suppression: Nullable::null(),
+        })),
+    ]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+
+    let held_request = environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+            assert!(record.content.is_some());
+            Ok(record.notification_id)
+        })
+        .expect("a read");
+
+    // Reading the receipt returns retrying from gateway.
+    let resolved = environment
+        .module
+        .read_receipts(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &at(NOW + 60_000),
+        )
+        .expect("a receipt pass");
+    assert_eq!(resolved, 0, "retrying is not settled yet");
+    assert_eq!(gateway.receipts(), 1);
+
+    environment
+        .module
+        .with(|producer| {
+            let record = producer
+                .journal()
+                .delivery(held_request)
+                .expect("a read")
+                .expect("the record");
+            assert_eq!(record.state, DeliveryState::Retrying);
+            assert!(
+                record.content.is_some(),
+                "recovery data is kept while still retrying"
+            );
+            Ok(())
+        })
+        .expect("a read");
+
+    // Next pass claims the due receipt poll and gateway now answers Queued.
+    let attempted = environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW + 10 * 60 * 1000),
+        )
+        .expect("a pass");
+    assert_eq!(attempted, 1);
+    assert_eq!(gateway.receipts(), 2, "the receipt was polled again");
+
+    environment
+        .module
+        .with(|producer| {
+            let record = producer
+                .journal()
+                .delivery(held_request)
+                .expect("a read")
+                .expect("the record");
+            assert_eq!(record.state, DeliveryState::Accepted);
+            assert_eq!(record.content, None, "content removed after settlement");
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// Reading receipts is refused while the journal is privacy-fenced.
+#[test]
+fn reading_receipts_is_refused_while_privacy_fenced() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Unknown {
+        detail: "the connection was reset".to_owned(),
+    }]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+
+    // Open privacy generation (fences outbox).
+    environment
+        .module
+        .with(|producer| {
+            use kr_worker::privacy::PrivacyMode;
+            let mut mode = PrivacyMode::new();
+            mode.open_generation(TimestampMs::new(NOW + 1));
+            let mut outbox =
+                kr_delivery::privacy::DeliveryOutbox::over(producer.journal_mut(), NOW + 1);
+            mode.apply(&mut [&mut outbox], TimestampMs::new(NOW + 1));
+            Ok(())
+        })
+        .expect("privacy pass");
+
+    // Reading receipts while fenced is refused without making requests.
+    let resolved = environment
+        .module
+        .read_receipts(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &at(NOW + 2),
+        )
+        .expect("read receipts");
+    assert_eq!(resolved, 0);
+    assert_eq!(
+        gateway.receipts(),
+        0,
+        "no receipt request sent while fenced"
+    );
+}
+
 /// KR-REQ-16.12: section 16 stops at expiry, and a pass reads the clock again before each
 /// dispatch rather than acting on the figure it started with.
 #[test]

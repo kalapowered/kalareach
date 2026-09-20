@@ -2253,6 +2253,8 @@ impl DeliveryJournal {
         &mut self,
         notification_id: NotificationId,
         state: DeliveryState,
+        next: crate::push::NextAction,
+        next_attempt_at_ms: Option<TimestampMs>,
         detail: &str,
         now_ms: u64,
     ) -> Result<bool> {
@@ -2273,31 +2275,71 @@ impl DeliveryJournal {
         if held_state != DeliveryState::OutcomeUnknown.as_str() {
             return Ok(false);
         }
-        transaction.execute(
-            "INSERT INTO delivery_attempts
-                 (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
-             VALUES (?1, ?2, ?3, ?3, ?4, ?5)
-             ON CONFLICT (notification_id, attempt) DO UPDATE SET
-                 settled_at_ms = excluded.settled_at_ms,
-                 outcome = excluded.outcome,
-                 detail = excluded.detail",
-            params![
-                identifier,
-                as_i64(as_u64(attempts).max(1)),
-                as_i64(now_ms),
-                state.as_str(),
-                detail
-            ],
-        )?;
-        transaction.execute(
-            "UPDATE delivery_notifications SET state = ?2, detail = ?3, content = NULL
-              WHERE notification_id = ?1",
-            params![identifier, state.as_str(), detail],
-        )?;
-        transaction.execute(
-            "DELETE FROM delivery_outbox WHERE notification_id = ?1",
-            params![identifier],
-        )?;
+        if state.is_settled() {
+            transaction.execute(
+                "INSERT INTO delivery_attempts
+                     (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?5)
+                 ON CONFLICT (notification_id, attempt) DO UPDATE SET
+                     settled_at_ms = excluded.settled_at_ms,
+                     outcome = excluded.outcome,
+                     detail = excluded.detail",
+                params![
+                    identifier,
+                    as_i64(as_u64(attempts).max(1)),
+                    as_i64(now_ms),
+                    state.as_str(),
+                    detail
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE delivery_notifications SET state = ?2, detail = ?3, content = NULL
+                  WHERE notification_id = ?1",
+                params![identifier, state.as_str(), detail],
+            )?;
+            transaction.execute(
+                "DELETE FROM delivery_outbox WHERE notification_id = ?1",
+                params![identifier],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO delivery_attempts
+                     (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5)
+                 ON CONFLICT (notification_id, attempt) DO UPDATE SET
+                     settled_at_ms = excluded.settled_at_ms,
+                     outcome = excluded.outcome,
+                     detail = excluded.detail",
+                params![
+                    identifier,
+                    as_i64(as_u64(attempts).max(1)),
+                    as_i64(now_ms),
+                    state.as_str(),
+                    detail
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE delivery_notifications SET state = ?2, detail = ?3
+                  WHERE notification_id = ?1",
+                params![identifier, state.as_str(), detail],
+            )?;
+            if let Some(due) = next_attempt_at_ms {
+                transaction.execute(
+                    "INSERT INTO delivery_outbox (notification_id, due_at_ms, attempt, next_action)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (notification_id) DO UPDATE SET
+                         due_at_ms = excluded.due_at_ms,
+                         attempt = excluded.attempt,
+                         next_action = excluded.next_action",
+                    params![
+                        identifier,
+                        as_i64(due.get()),
+                        as_i64(as_u64(attempts).max(1)),
+                        next.as_str(),
+                    ],
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(true)
     }
