@@ -326,12 +326,12 @@ mod tests {
 
     #[test]
     fn rules_are_indexed_by_executable_and_by_distribution() {
-        let mut with_distribution = rule("npm", "claude", MatchConfidence::Exact);
+        let mut with_distribution = rule("npm", "helper", MatchConfidence::Exact);
         with_distribution.distribution = Nullable(Some(DistributionMatch::Npm {
-            package: "@anthropic-ai/claude-code".to_owned(),
+            package: "@vendor/sample-helper".to_owned(),
         }));
         let catalogue = index(vec![
-            entry("one", vec![rule("a", "codex", MatchConfidence::Exact)]),
+            entry("one", vec![rule("a", "sampletool", MatchConfidence::Exact)]),
             entry("two", vec![with_distribution]),
         ]);
         let lookup = MatchIndex::build(&catalogue);
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(lookup.distribution_count(), 1);
 
         let found = lookup.candidates(&Observation {
-            executable_path: "/usr/local/bin/codex".to_owned(),
+            executable_path: "/usr/local/bin/sampletool".to_owned(),
             distribution: None,
         });
         assert_eq!(found.len(), 1);
@@ -349,7 +349,7 @@ mod tests {
         let by_distribution = lookup.candidates(&Observation {
             executable_path: "/opt/node/bin/node".to_owned(),
             distribution: Some(DistributionMatch::Npm {
-                package: "@anthropic-ai/claude-code".to_owned(),
+                package: "@vendor/sample-helper".to_owned(),
             }),
         });
         assert_eq!(by_distribution.len(), 1);
@@ -359,12 +359,12 @@ mod tests {
     #[test]
     fn an_explicit_selection_wins_a_conflict() {
         let catalogue = index(vec![
-            entry("one", vec![rule("a", "codex", MatchConfidence::Exact)]),
-            entry("two", vec![rule("b", "codex", MatchConfidence::Exact)]),
+            entry("one", vec![rule("a", "sampletool", MatchConfidence::Exact)]),
+            entry("two", vec![rule("b", "sampletool", MatchConfidence::Exact)]),
         ]);
         let lookup = MatchIndex::build(&catalogue);
         let observed = Observation {
-            executable_path: "/usr/local/bin/codex".to_owned(),
+            executable_path: "/usr/local/bin/sampletool".to_owned(),
             distribution: None,
         };
         let found = lookup.candidates(&observed);
@@ -384,12 +384,12 @@ mod tests {
     #[test]
     fn an_exact_rule_beats_an_inferred_one() {
         let catalogue = index(vec![
-            entry("guess", vec![rule("a", "codex", MatchConfidence::Inferred)]),
-            entry("exact", vec![rule("b", "codex", MatchConfidence::Exact)]),
+            entry("guess", vec![rule("a", "sampletool", MatchConfidence::Inferred)]),
+            entry("exact", vec![rule("b", "sampletool", MatchConfidence::Exact)]),
         ]);
         let lookup = MatchIndex::build(&catalogue);
         let found = lookup.candidates(&Observation {
-            executable_path: "/usr/local/bin/codex.EXE".to_owned(),
+            executable_path: "/usr/local/bin/sampletool.EXE".to_owned(),
             distribution: None,
         });
         match resolve(found, None) {
@@ -405,7 +405,7 @@ mod tests {
     fn a_revoked_release_is_never_a_candidate() {
         let mut catalogue = index(vec![entry(
             "one",
-            vec![rule("a", "codex", MatchConfidence::Exact)],
+            vec![rule("a", "sampletool", MatchConfidence::Exact)],
         )]);
         catalogue.entries[0].revocation =
             Nullable(Some(kr_plugin_sdk::catalogue::RevocationRecord {
@@ -418,7 +418,7 @@ mod tests {
         assert!(
             lookup
                 .candidates(&Observation {
-                    executable_path: "/usr/local/bin/codex".to_owned(),
+                    executable_path: "/usr/local/bin/sampletool".to_owned(),
                     distribution: None,
                 })
                 .is_empty()
@@ -427,15 +427,15 @@ mod tests {
 
     #[test]
     fn search_reads_the_whole_index_and_touches_nothing_else() {
-        let mut second = entry("qoder", vec![rule("a", "qoder", MatchConfidence::Exact)]);
-        second.display_name = kr_plugin_sdk::text::Label::new("Qoder CLI").expect("a valid label");
+        let mut second = entry("custom-cli", vec![rule("a", "custom-cli", MatchConfidence::Exact)]);
+        second.display_name = kr_plugin_sdk::text::Label::new("Custom CLI").expect("a valid label");
         second.version = PackageVersion::parse("0.2.0").expect("a valid version");
         let catalogue = index(vec![
-            entry("codex", vec![rule("a", "codex", MatchConfidence::Exact)]),
+            entry("sampletool", vec![rule("a", "sampletool", MatchConfidence::Exact)]),
             second,
         ]);
-        assert_eq!(search(&catalogue, "qoder", 10).len(), 1);
-        assert_eq!(search(&catalogue, "QODER CLI", 10).len(), 1);
+        assert_eq!(search(&catalogue, "custom-cli", 10).len(), 1);
+        assert_eq!(search(&catalogue, "CUSTOM CLI", 10).len(), 1);
         assert_eq!(search(&catalogue, "", 10).len(), 2);
         assert_eq!(search(&catalogue, "", 1).len(), 1);
         assert!(search(&catalogue, "nothing here", 10).is_empty());
@@ -444,10 +444,10 @@ mod tests {
     #[test]
     fn a_stem_is_read_the_way_every_platform_spells_it() {
         assert_eq!(
-            executable_stem("C:\\Program Files\\Codex\\CODEX.EXE"),
-            "codex"
+            executable_stem("C:\\Program Files\\SampleTool\\SAMPLETOOL.EXE"),
+            "sampletool"
         );
-        assert_eq!(executable_stem("/usr/local/bin/codex"), "codex");
+        assert_eq!(executable_stem("/usr/local/bin/sampletool"), "sampletool");
         assert_eq!(executable_stem("/usr/local/bin/"), "");
         assert_eq!(executable_stem(""), "");
     }

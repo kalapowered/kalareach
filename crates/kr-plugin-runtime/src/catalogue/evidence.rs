@@ -2,7 +2,7 @@
 //!
 //! A repository ships qualification data as signed, immutable catalogue artifacts, separately from
 //! host binaries. That is worth having: a vendor can say "this release was qualified against
-//! Codex 1.4" without waiting for a core release. It is also the obvious way to smuggle authority
+//! ExternalApp 1.4" without waiting for a core release. It is also the obvious way to smuggle authority
 //! into a host, so section 11 draws four lines and this module is where a host holds them.
 //!
 //! * **A qualification cannot create a new primitive effect.** The capability it talks about has
@@ -343,11 +343,11 @@ mod tests {
         QualificationResult {
             capability_id: capability_id(capability).expect("a capability identifier"),
             capability_version: PackageVersion::parse("1.0.0").expect("a valid version"),
-            subject: Label::new("Codex 1.4").expect("a valid label"),
+            subject: Label::new("ExternalApp 1.4").expect("a valid label"),
             state,
             source: EvidenceSource::SignedRecord,
             profile_digest: PayloadDigest::of(b"profile"),
-            statement: Summary::new("Qualified against Codex 1.4").expect("a valid statement"),
+            statement: Summary::new("Qualified against ExternalApp 1.4").expect("a valid statement"),
         }
     }
 
