@@ -3777,7 +3777,10 @@ impl Controller {
                 .await;
         }
         if crate::catalogue::CatalogueModule::serves(method) {
-            return self.catalogue.read_frame(request).await;
+            return self
+                .catalogue
+                .read_frame(kr_protocol::actor::ActorIngress::LocalIpc, request)
+                .await;
         }
         if crate::changeset::ChangeSetModule::serves(method) {
             return self.changesets.read_frame(request).await;

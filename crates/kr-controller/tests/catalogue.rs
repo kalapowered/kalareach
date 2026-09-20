@@ -12,6 +12,7 @@ use kr_controller::sharing::{
     CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan,
 };
 use kr_plugin_runtime::catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::catalogue as wire;
 use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
@@ -393,12 +394,15 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
 
     let listed: wire::CatalogueListResult = ok(host
         .module
-        .read_frame(&request(
-            Method::CatalogueList,
-            &wire::CatalogueListParams {
-                environment_id: host.environment_id,
-            },
-        ))
+        .read_frame(
+            ActorIngress::LocalIpc,
+            &request(
+                Method::CatalogueList,
+                &wire::CatalogueListParams {
+                    environment_id: host.environment_id,
+                },
+            ),
+        )
         .await);
     assert_eq!(listed.catalogues.len(), 1);
     let summary = &listed.catalogues[0];
@@ -512,12 +516,15 @@ async fn a_request_for_another_environment_is_refused_before_anything_is_read() 
     let other = EnvironmentId::new(kr_ipc::new_uuid());
     let refused = refusal(
         host.module
-            .read_frame(&request(
-                Method::CatalogueList,
-                &wire::CatalogueListParams {
-                    environment_id: other,
-                },
-            ))
+            .read_frame(
+                ActorIngress::LocalIpc,
+                &request(
+                    Method::CatalogueList,
+                    &wire::CatalogueListParams {
+                        environment_id: other,
+                    },
+                ),
+            )
             .await,
     );
     assert_eq!(refused.code, ErrorCode::InvalidArgument);
@@ -704,12 +711,15 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let listed: wire::PluginListResult = ok(host
         .module
-        .read_frame(&request(
-            Method::PluginList,
-            &wire::PluginListParams {
-                environment_id: host.environment_id,
-            },
-        ))
+        .read_frame(
+            ActorIngress::LocalIpc,
+            &request(
+                Method::PluginList,
+                &wire::PluginListParams {
+                    environment_id: host.environment_id,
+                },
+            ),
+        )
         .await);
     assert_eq!(listed.plugins.len(), 1);
     assert_eq!(listed.plugins[0].catalogue_id, "development");
@@ -717,13 +727,16 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let capabilities: wire::PluginCapabilitiesResult = ok(host
         .module
-        .read_frame(&request(
-            Method::PluginCapabilities,
-            &wire::PluginCapabilitiesParams {
-                environment_id: host.environment_id,
-                plugin_id: plugin(),
-            },
-        ))
+        .read_frame(
+            ActorIngress::LocalIpc,
+            &request(
+                Method::PluginCapabilities,
+                &wire::PluginCapabilitiesParams {
+                    environment_id: host.environment_id,
+                    plugin_id: plugin(),
+                },
+            ),
+        )
         .await);
     assert_eq!(capabilities.plugin.package_digest, digest);
     assert!(!capabilities.capabilities.is_empty());
@@ -890,12 +903,15 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
 
     let listed: wire::PluginListResult = ok(host
         .module
-        .read_frame(&request(
-            Method::PluginList,
-            &wire::PluginListParams {
-                environment_id: host.environment_id,
-            },
-        ))
+        .read_frame(
+            ActorIngress::LocalIpc,
+            &request(
+                Method::PluginList,
+                &wire::PluginListParams {
+                    environment_id: host.environment_id,
+                },
+            ),
+        )
         .await);
     assert_eq!(
         listed.plugins.len(),

@@ -182,6 +182,30 @@ impl Host {
         &self.controller
     }
 
+    /// Signs the owner's confirmation of one sensitive action against this host's own ledger.
+    ///
+    /// The challenge is the host's, issued here and consumed exactly once when the method presents
+    /// it, so nothing a suite writes down can stand in for the ceremony. The owner half is the
+    /// suite's for the same reason pairing's is: user presence is not something a daemon decides.
+    #[must_use]
+    pub fn confirm(
+        &self,
+        owner: &DeviceKeys,
+        action: SensitiveAction,
+        digest: kr_protocol::scalars::Digest256,
+    ) -> kr_protocol::pairing::OwnerConfirmationProof {
+        let pairing = self.network.pairing().expect("this host accepts pairing");
+        let request = pairing
+            .request_confirmation(action, digest, None, BTreeSet::new())
+            .expect("a challenge");
+        sign_confirmation(
+            &owner.authorisation,
+            &request,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof")
+    }
+
     /// Stops the daemon and its network the way its process ending would.
     pub async fn stop(self) {
         self.clients.abort();

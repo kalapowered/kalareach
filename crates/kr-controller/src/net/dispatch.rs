@@ -670,6 +670,17 @@ impl RemoteConnection {
                     )
                     .await
             }
+            // The catalogue and plugin reads. A catalogue belongs to the environment rather than to
+            // a session, so there is no worker to forward them to and no session content to narrow:
+            // the grant's environment selector and `host.manage` are the whole of what admits them,
+            // and the module answers a device exactly as it answers this user's own client. The
+            // ingress travels with the read so the module decides it at the connection's own.
+            _ if crate::catalogue::CatalogueModule::serves(entry.method) => {
+                self.controller
+                    .catalogue
+                    .read_frame(kr_protocol::actor::ActorIngress::PairedDevice, request)
+                    .await
+            }
             _ => failure(
                 request.request_id,
                 ProtocolError::new(
@@ -751,6 +762,16 @@ impl RemoteConnection {
             held = self
                 .controller
                 .automation()
+                .retained(&actor_id, mutation, entry.method)
+                .await;
+        }
+        // A catalogue mutation's receipt lives with the catalogue, beside the state the effect
+        // changed, so a retry of one that lost its reply is answered there rather than performed a
+        // second time.
+        if held.is_none() && crate::catalogue::CatalogueModule::serves(entry.method) {
+            held = self
+                .controller
+                .catalogue
                 .retained(&actor_id, mutation, entry.method)
                 .await;
         }
@@ -1007,6 +1028,70 @@ impl RemoteConnection {
                     ),
                 ),
             ),
+            // The ten catalogue and plugin mutations. They are the daemon's own effect: a catalogue
+            // and an installed package belong to the environment, so no worker owns them and the
+            // module performs them under its own lock.
+            _ if crate::catalogue::CatalogueModule::serves(entry.method) => {
+                // The route is claimed before the effect, the way a project mutation claims its
+                // own. It is this host's `(verified actor, action)` uniqueness check, and it is
+                // what a device that lost its connection has left to say the daemon owns the
+                // receipt. Storage that cannot record it refuses the mutation: only section 7's
+                // stop goes on without a route.
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                // The owner's own ceremony, reached through the pairing host. `None` is a host
+                // with no enrolled owner signer, and the two confirmed methods are then refused
+                // rather than performed under the identity of whoever asked.
+                let pairing = self
+                    .controller
+                    .network
+                    .get()
+                    .and_then(|guard| guard.pairing())
+                    .map(Arc::clone);
+                let controller = Arc::clone(&self.controller);
+                let admitting = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                // On a task that outlives this connection: a sync writes verified metadata and an
+                // installation extracts a package onto disk, and dropping that future part way
+                // through is a cancellation. The admission travels with it, because the module
+                // waits — for its own lock, for the repository's, for a download — and asks about
+                // the registration again inside that wait.
+                let effect = tokio::spawn(async move {
+                    let confirmations = pairing
+                        .as_deref()
+                        .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
+                    let admission = move || {
+                        admitting
+                            .check_registration(&carried)
+                            .map_err(|error| error.to_protocol_error())
+                    };
+                    controller
+                        .catalogue
+                        .write(&actor_id, &mutation, method, confirmations, admission)
+                        .await
+                });
+                match tokio::time::timeout(EFFECT_WAIT, effect).await {
+                    Ok(Ok(outcome)) => ControlFrame::Response(Response {
+                        request_id,
+                        outcome: match outcome {
+                            Ok(value) => Outcome::Ok(value),
+                            Err(error) => Outcome::Error(error),
+                        },
+                    }),
+                    // The effect is still running, so a wait that ended says the outcome is not
+                    // known rather than that the action failed. The action record the module
+                    // settles is what a resubmission is answered from.
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
+            }
             // The four voice mutations. Like a create, they are the daemon's own effect: a voice
             // session belongs to this host rather than to one terminal session, and the
             // coordinator decides each one against the voice grant and this device's ordinary
@@ -1914,6 +1999,15 @@ impl RemoteConnection {
         // its own subject check is the one the local ingress makes.
         if crate::automation::AutomationModule::serves(entry.method) {
             crate::automation::AutomationModule::check_subject(entry.method, mutation)
+                .map_err(|error| error.to_protocol_error())?;
+        }
+        // A catalogue mutation acts on a catalogue or on an installed package, both of which belong
+        // to the environment. A target naming a session or an application is refused rather than
+        // producing a receipt against something the effect never touched, and the environment in
+        // the parameters has to be the one the target names. Its own subject check is the one the
+        // local ingress makes.
+        if crate::catalogue::CatalogueModule::serves(entry.method) {
+            crate::catalogue::CatalogueModule::check_subject(entry.method, mutation)
                 .map_err(|error| error.to_protocol_error())?;
         }
         // A voice mutation's subject is this host. A voice session is not a shell session, so the

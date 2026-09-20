@@ -33,6 +33,7 @@ use kr_plugin_runtime::catalogue::{
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::version::PackageVersion;
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::catalogue as wire;
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -317,27 +318,28 @@ impl CatalogueModule {
 
     /// Serves one catalogue or plugin read and returns the frame it answers with.
     #[must_use]
-    pub async fn read_frame(&self, request: &Request) -> ControlFrame {
-        frame(request.request_id, self.read(request).await)
+    pub async fn read_frame(&self, ingress: ActorIngress, request: &Request) -> ControlFrame {
+        frame(request.request_id, self.read(ingress, request).await)
     }
 
     /// Serves one catalogue or plugin read.
     ///
+    /// `ingress` is where the request arrived. The registry lists each of these reads at more than
+    /// one ingress, so the answer is decided at the caller's own: a method kept to private IPC
+    /// stays unreachable from a paired device even though this module serves both.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the catalogue decided, under the catalogue's own code.
-    pub async fn read(&self, request: &Request) -> Answer<ParamsValue> {
+    pub async fn read(&self, ingress: ActorIngress, request: &Request) -> Answer<ParamsValue> {
         let Some(method) = request.method.method() else {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "the method is not in the registry",
             ));
         };
-        match kr_protocol::method::decide(
-            request.method.as_str(),
-            request.method_version,
-            kr_protocol::actor::ActorIngress::LocalIpc,
-        ) {
+        match kr_protocol::method::decide(request.method.as_str(), request.method_version, ingress)
+        {
             kr_protocol::authority::AuthorityDecision::Listed(_) => {}
             kr_protocol::authority::AuthorityDecision::Denied(reason) => {
                 return Err(match reason.error_code() {
