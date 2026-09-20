@@ -358,6 +358,7 @@ pub fn open_preview(
         || plaintext.expires_at_ms != envelope.routing.expires_at_ms
         || plaintext.sender_key_id != envelope.routing.sender_key_id
         || plaintext.recipient_key_id != envelope.routing.recipient_key_id
+        || plaintext.thread_id != envelope.routing.thread_id
     {
         return Err(DeliveryError::JournalUnreadable(
             "a preview's routing record does not match what was sealed",
@@ -373,6 +374,14 @@ pub fn open_preview(
 /// keeps it there. So the measurement reserves the largest token the protocol admits. The check is
 /// therefore strictly stronger than the gateway's, and a payload that passes here passes there
 /// whatever token the destination turns out to have.
+///
+/// It is the token's own length, not its escaped length. A JSON string spends two bytes on a
+/// character that has to be escaped, so a maximum-length token made entirely of quotes would
+/// occupy twice this. Reserving that instead would leave no room for any preview at all inside
+/// 3,500 bytes, so the reserve stays at the unescaped maximum and the gap is recorded rather than
+/// hidden: a registration token a provider actually issues is a couple of hundred characters of
+/// base64url, an order of magnitude inside this, and closing the gap properly means the gateway
+/// declaring an escape-free alphabet for the field.
 pub const RESERVED_TOKEN_BYTES: usize = MAX_REGISTRATION_TOKEN_LEN;
 
 /// The longest time-to-live a notification's own expiry can produce, in seconds.
@@ -522,7 +531,10 @@ pub const fn generic_text(alert: PushAlert) -> &'static str {
     alert.generic_text()
 }
 
-/// Derives a notification identifier: 128 random bits, with nothing of the work in them.
+/// Mints a notification identifier, with nothing of the work in it.
+///
+/// It is a version-four UUID: 122 random bits inside a 128-bit value, which is the workspace's
+/// random source and is far past what a provider or a gateway could enumerate.
 #[must_use]
 pub fn fresh_notification_id() -> NotificationId {
     NotificationId::new(kr_protocol::scalars::Uuid::from_bytes(

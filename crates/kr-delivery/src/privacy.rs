@@ -39,15 +39,20 @@ use crate::journal::DeliveryJournal;
 #[derive(Debug)]
 pub struct DeliveryOutbox<'a> {
     journal: &'a mut DeliveryJournal,
+    now_ms: u64,
     failure: Option<String>,
 }
 
 impl<'a> DeliveryOutbox<'a> {
     /// Builds the hook over one environment's delivery journal.
+    ///
+    /// `now_ms` is what a cancellation receipt is stamped with. A generation is not a time, and a
+    /// receipt stamped with one would say a cancellation happened in 1970.
     #[must_use]
-    pub fn over(journal: &'a mut DeliveryJournal) -> Self {
+    pub fn over(journal: &'a mut DeliveryJournal, now_ms: u64) -> Self {
         Self {
             journal,
+            now_ms,
             failure: None,
         }
     }
@@ -83,8 +88,8 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
         }
     }
 
-    fn cancel_undispatched(&mut self, generation: PrivacyGeneration) -> Cancelled {
-        match self.journal.cancel_undispatched(generation.get()) {
+    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
+        match self.journal.cancel_undispatched(self.now_ms) {
             Ok((undispatched, in_flight)) => Cancelled {
                 undispatched,
                 in_flight,
@@ -225,7 +230,7 @@ mod tests {
         let mut journal = journal_with_work();
         let mut mode = PrivacyMode::new();
         let generation = mode.open_generation(TimestampMs::new(2_000));
-        let mut outbox = DeliveryOutbox::over(&mut journal);
+        let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
         let enabling = mode.apply(&mut [&mut outbox], TimestampMs::new(2_000));
         assert_eq!(generation.get(), 1);
         let fenced = enabling
@@ -244,7 +249,7 @@ mod tests {
         assert_eq!(cancelled.1.in_flight, 0);
         assert!(outbox.failure().is_none());
         assert!(
-            journal.due(u64::MAX, 10).expect("a read").is_empty(),
+            journal.due(50_000, 10).expect("a read").is_empty(),
             "nothing is offered to a sender after the fence"
         );
         for record in journal.deliveries().expect("a read") {
@@ -271,7 +276,7 @@ mod tests {
             .expect("a transition");
         let mut mode = PrivacyMode::new();
         mode.open_generation(TimestampMs::new(2_000));
-        let mut outbox = DeliveryOutbox::over(&mut journal);
+        let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
         let enabling = mode.apply(&mut [&mut outbox], TimestampMs::new(2_000));
         assert_eq!(enabling.in_flight(), 1);
         assert!(matches!(
@@ -293,7 +298,7 @@ mod tests {
                 keep_content: false,
             })
             .expect("a transition");
-        let outbox = DeliveryOutbox::over(&mut journal);
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
         assert_eq!(PrivacyMode::reconcile(&[&outbox]), Completion::Complete);
     }
 
@@ -313,7 +318,7 @@ mod tests {
                 keep_content: false,
             })
             .expect("a transition");
-        let outbox = DeliveryOutbox::over(&mut journal);
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
         assert!(matches!(
             PrivacyMode::reconcile(&[&outbox]),
             Completion::Reconciling { .. }
@@ -336,7 +341,7 @@ mod tests {
                 keep_content: false,
             })
             .expect("a transition");
-        let outbox = DeliveryOutbox::over(&mut journal);
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
         let exported = outbox.exported();
         assert_eq!(exported.len(), 1);
         assert!(exported[0].kind.contains("webhook"));
@@ -349,7 +354,7 @@ mod tests {
     #[test]
     fn what_is_kept_is_named_rather_than_quietly_retained() {
         let mut journal = journal_with_work();
-        let outbox = DeliveryOutbox::over(&mut journal);
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
         let kept = outbox.kept();
         assert_eq!(kept.len(), 2);
         assert!(
@@ -364,7 +369,7 @@ mod tests {
         // A closed store cannot be asked, and the honest answer to "is your cleanup finished" from
         // something that cannot look is no.
         let mut journal = journal_with_work();
-        let mut outbox = DeliveryOutbox::over(&mut journal);
+        let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
         outbox.failure = Some("the store could not be written".to_owned());
         assert!(outbox.outstanding() > 0);
         assert!(matches!(

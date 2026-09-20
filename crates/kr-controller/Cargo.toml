@@ -13,6 +13,8 @@ name = "kr-controller"
 path = "src/bin/kr-controller.rs"
 
 [dependencies]
+# The delivery credential the gateway reads is 32 bytes in unpadded base64url.
+base64.workspace = true
 clap.workspace = true
 iroh.workspace = true
 kr-cbor.workspace = true

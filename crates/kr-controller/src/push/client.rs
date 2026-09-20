@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use kr_delivery::external::ExternalMessage;
 use kr_delivery::push::{PushSender, SendOutcome};
+use kr_protocol::ids::NotificationId;
 use kr_protocol::push::{PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest};
+use kr_protocol::scalars::TimestampMs;
 use kr_protocol::service::GatewayOrigin;
 
 use crate::error::{ControllerError, Result};
@@ -85,7 +87,7 @@ impl GatewayClient {
             .header("Content-Type", "application/json")
             .header(
                 "Authorization",
-                &format!("Bearer {}", hex(credential.secret.expose())),
+                &format!("Bearer {}", bearer(credential.secret.expose())),
             )
             .send(&body[..]);
         let mut response = match call {
@@ -130,21 +132,30 @@ impl GatewayClient {
 
     fn status(status: u16, detail: String) -> SendOutcome {
         match status {
-            // Section 16: a 403 means the credential is expired, revoked or aimed at another
-            // authorisation. It is renewed, not retried.
-            403 => SendOutcome::Forbidden {
+            // Section 16: a refused credential is renewed, not retried. The gateway answers 401
+            // for a credential it cannot read or match and 403 for one aimed at another
+            // authorisation; both mean the same thing to this host.
+            401 | 403 => SendOutcome::Forbidden {
                 detail: if detail.is_empty() {
                     "the gateway refused the credential".to_owned()
                 } else {
                     detail
                 },
             },
-            // The gateway claims the notification identifier before anything reaches a provider,
-            // so a refusal it answers with a status cannot have dispatched one. It is still not
-            // retried blindly: a 4xx other than 403 is a request this host has to change.
-            400..=499 => SendOutcome::NotDispatched {
-                detail: format!("the gateway refused the request with {status}: {detail}"),
+            // A 429 is the gateway asking for later, and it claims the identifier before it
+            // sends anything, so nothing was dispatched.
+            429 => SendOutcome::NotDispatched {
+                detail: format!("the gateway asked for later: {detail}"),
             },
+            // Any other 4xx is a request this host has to change: a schema failure or an
+            // authorisation the gateway does not hold. Section 23 says a configuration or software
+            // change fixes those, so they are refused rather than presented again.
+            400..=499 => SendOutcome::Decided(Box::new(PushDeliveryAck {
+                decided_at_ms: TimestampMs::new(0),
+                notification_id: NotificationId::new(kr_protocol::scalars::Uuid::NIL),
+                state: kr_protocol::push::PushDeliveryState::Refused,
+                suppression: kr_protocol::scalars::Nullable::null(),
+            })),
             _ => SendOutcome::Unknown {
                 detail: format!("the gateway answered {status}: {detail}"),
             },
@@ -230,14 +241,12 @@ struct StoredInterval {
     to_ms: String,
 }
 
-/// Renders a credential's bearer as the gateway expects it.
+/// Renders a credential's bearer as the gateway reads it: 32 bytes, unpadded base64url.
 ///
 /// It is used once, in the header of one request, and never written anywhere. The secret's own
 /// debug rendering is a redaction, which is why this is spelled out here rather than formatted.
-fn hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push_str(&format!("{byte:02x}"));
-    }
-    text
+fn bearer(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

@@ -569,11 +569,7 @@ fn an_unknown_outcome_is_recorded_and_left_alone() {
             let record = producer.journal().deliveries().expect("a read").remove(0);
             assert_eq!(record.state, DeliveryState::OutcomeUnknown);
             assert!(
-                producer
-                    .journal()
-                    .due(u64::MAX, 10)
-                    .expect("a read")
-                    .is_empty(),
+                producer.journal().due(NOW, 10).expect("a read").is_empty(),
                 "nothing picks it up again on its own"
             );
             Ok(())
@@ -743,10 +739,7 @@ fn the_journal_comes_back_with_its_work_and_its_account() {
     .expect("a delivery module");
     reopened
         .with(|producer| {
-            assert_eq!(
-                producer.journal().due(u64::MAX, 10).expect("a read").len(),
-                1
-            );
+            assert_eq!(producer.journal().due(NOW, 10).expect("a read").len(), 1);
             assert_eq!(producer.journal().deliveries().expect("a read").len(), 1);
             assert!(
                 producer
@@ -781,11 +774,7 @@ fn a_restart_records_what_was_in_flight_as_unknown_and_resumes_only_what_is_auth
     environment
         .module
         .with(|producer| {
-            let delivery = producer
-                .journal()
-                .due(u64::MAX, 1)
-                .expect("a read")
-                .remove(0);
+            let delivery = producer.journal().due(NOW, 1).expect("a read").remove(0);
             producer
                 .journal_mut()
                 .record_attempt(&kr_delivery::journal::Transition {
@@ -842,11 +831,7 @@ fn a_restart_revokes_what_is_no_longer_authorised() {
     environment
         .module
         .with(|producer| {
-            let delivery = producer
-                .journal()
-                .due(u64::MAX, 1)
-                .expect("a read")
-                .remove(0);
+            let delivery = producer.journal().due(NOW, 1).expect("a read").remove(0);
             producer
                 .journal_mut()
                 .record_attempt(&kr_delivery::journal::Transition {
@@ -1127,7 +1112,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
     environment
         .module
         .with(|producer| {
-            let due = producer.journal().due(u64::MAX, 1).expect("a read");
+            let due = producer.journal().due(NOW, 1).expect("a read");
             let sent = &due[0];
             producer
                 .journal_mut()
@@ -1143,7 +1128,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                     keep_content: false,
                 })
                 .expect("a transition");
-            let due = producer.journal().due(u64::MAX, 1).expect("a read");
+            let due = producer.journal().due(NOW, 1).expect("a read");
             producer
                 .journal_mut()
                 .record_attempt(&kr_delivery::journal::Transition {
@@ -1169,7 +1154,8 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
             use kr_worker::privacy::{Completion, PrivacyMode, PrivacySubsystem};
             let mut mode = PrivacyMode::new();
             mode.open_generation(TimestampMs::new(NOW + 1));
-            let mut outbox = kr_delivery::privacy::DeliveryOutbox::over(producer.journal_mut());
+            let mut outbox =
+                kr_delivery::privacy::DeliveryOutbox::over(producer.journal_mut(), NOW + 1);
             let enabling = mode.apply(&mut [&mut outbox], TimestampMs::new(NOW + 1));
             assert_eq!(enabling.in_flight(), 1, "the send on the wire is counted");
             assert!(matches!(

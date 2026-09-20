@@ -66,7 +66,7 @@ const SCHEMA_VERSION: i64 = 1;
 /// A store that has lost one of them is refused rather than recreated: an empty outbox and an
 /// empty privacy row say the opposite of what is true about a host that had work queued or a fence
 /// up.
-const REQUIRED_TABLES: [&str; 9] = [
+const REQUIRED_TABLES: [&str; 11] = [
     "delivery_schema",
     "delivery_consumers",
     "delivery_events",
@@ -75,6 +75,8 @@ const REQUIRED_TABLES: [&str; 9] = [
     "delivery_attempts",
     "delivery_outbox",
     "delivery_objects",
+    "delivery_budget",
+    "delivery_secret",
     "delivery_privacy",
 ];
 
@@ -506,12 +508,24 @@ impl DeliveryJournal {
              PRAGMA synchronous=FULL;
              PRAGMA foreign_keys=ON;",
         )?;
-        let recorded: Option<i64> = connection
+        // A missing `delivery_schema` table is a store nothing has created. Any other failure is
+        // a store this host could not read, which is not the same thing and must not be treated
+        // as a new one: creating over it would answer every later read from an empty store.
+        let recorded: Option<i64> = match connection
             .query_row("SELECT version FROM delivery_schema LIMIT 1", [], |row| {
                 row.get(0)
             })
             .optional()
-            .unwrap_or(None);
+        {
+            Ok(recorded) => recorded,
+            Err(error) if is_missing_table(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if recorded.is_none() && has_any_delivery_table(&connection)? {
+            return Err(DeliveryError::JournalUnreadable(
+                "the delivery journal has tables and no schema version, so this build cannot say                  what it holds",
+            ));
+        }
         match recorded {
             // A store this build wrote. It is checked rather than repaired: `CREATE TABLE IF NOT
             // EXISTS` over a store that has lost a table would answer every read from an empty one,
@@ -1134,7 +1148,9 @@ impl DeliveryJournal {
     /// A fenced outbox returns nothing: privacy mode stops the queue reaching anything outside
     /// this host at once, and that is expressed by the read rather than by every caller
     /// remembering to ask. Nor does a record admitted under an earlier generation, which is
-    /// content privacy mode has already walked past.
+    /// content privacy mode has already walked past, and nor does one whose own expiry has
+    /// passed: section 16 stops retrying at expiry, and the read is where that is kept rather
+    /// than every sender remembering it.
     ///
     /// # Errors
     ///
@@ -1150,6 +1166,7 @@ impl DeliveryJournal {
                FROM delivery_outbox o JOIN delivery_notifications n
                  ON n.notification_id = o.notification_id
               WHERE o.due_at_ms <= ?1 AND n.content IS NOT NULL
+                AND n.expires_at_ms > ?1
                 AND n.privacy_generation = ?3
               ORDER BY o.due_at_ms, n.admitted_at_ms
               LIMIT ?2",
@@ -2018,6 +2035,26 @@ fn transaction_has_event(transaction: &rusqlite::Transaction<'_>, key: &EventKey
     Ok(found.is_some())
 }
 
+/// Returns true when the failure is SQLite saying the table is not there.
+fn is_missing_table(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _) if failure.code == rusqlite::ErrorCode::Unknown
+    ) || matches!(error, rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("no such table"))
+}
+
+/// Returns true when this file already holds one of the journal's tables.
+fn has_any_delivery_table(connection: &Connection) -> Result<bool> {
+    let found: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name LIKE 'delivery_%' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 fn is_foreign_key_violation(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -2382,7 +2419,7 @@ mod tests {
                 keep_content: false,
             })
             .expect("a transition");
-        assert!(journal.due(u64::MAX, 10).expect("a read").is_empty());
+        assert!(journal.due(50_000, 10).expect("a read").is_empty());
         let record = journal
             .delivery(NotificationId::new(uuid(9)))
             .expect("a read")
@@ -2456,7 +2493,7 @@ mod tests {
                 .cursor,
             4
         );
-        assert_eq!(reopened.due(u64::MAX, 10).expect("a read").len(), 1);
+        assert_eq!(reopened.due(50_000, 10).expect("a read").len(), 1);
         assert_eq!(
             reopened
                 .budget(&DestinationId::new("hook").expect("an identifier"))
@@ -2608,7 +2645,7 @@ mod tests {
         journal.fence(1).expect("a fence");
         journal.lift_fence(1).expect("the fence lifts");
         assert!(
-            journal.due(u64::MAX, 10).expect("a read").is_empty(),
+            journal.due(50_000, 10).expect("a read").is_empty(),
             "content admitted before the boundary is not offered after it"
         );
         assert!(
@@ -2757,7 +2794,7 @@ mod tests {
         let (queues, items) = journal.fence(1).expect("a fence");
         assert_eq!((queues, items), (1, 1));
         assert!(
-            journal.due(u64::MAX, 10).expect("a read").is_empty(),
+            journal.due(50_000, 10).expect("a read").is_empty(),
             "the fence stops the queue rather than the caller remembering to ask"
         );
     }

@@ -4106,6 +4106,7 @@ dependencies = [
 name = "kr-controller"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "exacl",
  "iroh",
