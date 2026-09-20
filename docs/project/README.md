@@ -641,7 +641,10 @@ What the capture then does with the grant is what makes the class honest:
   taken afresh is a different grant over a different interval.
 * **It contradicts the grant with what it sees.** A file that changed while a reservation was
   supposed to be holding the tree still is this host's own evidence that nothing held it, and the
-  capture drops to the weaker class whatever the grant says.
+  capture drops to the weaker class whatever the grant says. That counts a change this host read
+  past as well as one it could not: a file re-read whole on a second attempt still had something
+  writing to it, so the content is kept and the class is not. A caller that required the stronger
+  class is refused there rather than served the weaker one.
 * **It gives the grant back** after the last reading, however the capture ended.
 
 The grant releases the workspace at its own deadline whatever the capture is doing, so a capture
@@ -846,11 +849,19 @@ the journal is what makes that recoverable rather than a thing a person has to f
 name is created the journal records it beside the destination path; the moment the file exists the
 journal records **the object this host created**; and the record is cleared as soon as the
 temporary is published or taken away. So the next daemon, before it serves anything, looks at every
-temporary an interrupted apply still has recorded and takes away what is at the name **only while
-it is still that object**. Anything else there is somebody's file: this host removes nothing, and
-names the path in the apply's own answer so a person can look at it. A temporary the journal names
-with no object beside it is one this host died before it could show was its own, and it is left
-alone for the same reason.
+temporary an apply still has recorded and takes away what is at the name **only while it is still
+that object**. Anything else there is somebody's file: this host removes nothing, and names the
+path in the apply's own answer so a person can look at it. A temporary the journal names with no
+object beside it is one this host died before it could show was its own, and it is left alone for
+the same reason.
+
+**The record outlives the apply.** An apply that could not take its own temporary away in the
+moment settles all the same, with the names it could not clear in its answer, and the record stays
+where it is. Every outstanding record is taken up by the next recovery, whatever the apply it
+belongs to came to, so an obligation this host could not discharge is neither hidden from the
+caller nor forgotten by the host. A record is cleared only where the name is proved to hold
+nothing of this apply's: after a removal this host made durable, or where the name holds nothing or
+holds something this host did not make. A name this host could not look at keeps its record.
 
 Permissions are the destination's own, put on the staged copy through the handle this host created
 it with, before the rename, so a file that was executable stays executable and one that was not
@@ -945,6 +956,13 @@ it: a receipt stays readable after the window that admitted it has gone.
 A blob's name **is** the digest of its content, so storing the same content twice stores it once, a
 manifest that names a digest names exactly one sequence of bytes, and a read that does not hash back
 to its own name is refused as damage rather than served.
+
+The journal carries the storage format it was written in, and the boundary is decided when it is
+opened rather than at the first query that needs a column. A journal from a later format is refused
+because this build cannot know what a column it does not have holds; one from an earlier format is
+refused because the rows it holds cannot answer what this build reads out of them, and the refusal
+says which formats they are and that the directory has to be taken away and the work captured
+again. A journal that opens is one every query can rely on.
 
 ## What a caller builds on
 
