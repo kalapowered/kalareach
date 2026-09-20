@@ -1926,3 +1926,123 @@ fn a_file_mounted_inside_administrative_data() {
         "the refusal names the mounted file it found: {failure}"
     );
 }
+
+/// KR-REQ-14.33 and D-097: two handles on one directory can lead to different children.
+///
+/// The layout is static: a repository's tree is a bind mount of another directory, and beneath the
+/// original a second mount puts a nested repository's data where an empty directory is otherwise.
+/// A nested `.git` names that place in full. The descent arrives at a directory that **is** the
+/// working tree by object and is on another mount, where the same name reaches the empty directory
+/// rather than the data. Taking the tree's own handle there would account for the wrong directory
+/// and leave the data as ordinary content, so this host refuses instead of choosing between them.
+///
+/// It needs a mount namespace this account owns. Where the host gives none, the case says it was
+/// not exercised rather than reporting a result it did not produce.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tree_reached_on_another_mount_is_not_taken_for_this_one() {
+    const NOT_EXERCISED: i32 = 42;
+
+    if std::env::var_os("KR_CAPTURE_TWO_MOUNTS").is_some() {
+        two_mounts_over_one_tree();
+        return;
+    }
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        println!("not exercised: this host does not give this account a mount namespace");
+        return;
+    }
+    let binary = std::env::current_exe().expect("the test binary");
+    let status = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--"])
+        .arg(binary)
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .arg("a_tree_reached_on_another_mount_is_not_taken_for_this_one")
+        .env("KR_CAPTURE_TWO_MOUNTS", "1")
+        .status()
+        .expect("the test binary runs inside a mount namespace");
+    if status.code() == Some(NOT_EXERCISED) {
+        println!("not exercised: this namespace would not place the two mounts");
+        return;
+    }
+    assert!(
+        status.success(),
+        "the capture inside the mount namespace did not hold: {status}"
+    );
+}
+
+/// The half that runs inside the mount namespace.
+#[cfg(target_os = "linux")]
+fn two_mounts_over_one_tree() {
+    let fixture = Fixture::create();
+    let backing = ordinary_repository(fixture.work(), "backing");
+    // The nested repository's own data, and the empty directory a second mount puts it at.
+    write(&backing, "repo-data/HEAD", "ref: refs/heads/main\n");
+    write(&backing, "repo-data/config", "[remote]\n\turl = a-secret\n");
+    std::fs::create_dir_all(backing.join("git-location")).expect("the empty directory");
+    std::fs::create_dir_all(backing.join("vendor/inner")).expect("the nested tree");
+    write(&backing, "vendor/inner/notes.txt", "its own content\n");
+    // Tracked, so the capture has every reason to reach it.
+    git_raw(&backing, ["add", "--force", "repo-data/config"]);
+    git_raw(&backing, ["commit", "--quiet", "-m", "the data this names"]);
+    let tree = fixture.work().join("tree");
+    std::fs::create_dir_all(&tree).expect("where the tree is mounted");
+    let named = std::fs::canonicalize(backing.join("git-location")).expect("the name it names");
+    std::fs::write(
+        backing.join("vendor/inner/.git"),
+        format!("gitdir: {}\n", named.display()).as_bytes(),
+    )
+    .expect("the file that names it in full");
+
+    let placed = std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(backing.join("repo-data"))
+        .arg(backing.join("git-location"))
+        .status();
+    if !placed.is_ok_and(|status| status.success()) {
+        std::process::exit(42);
+    }
+    let over = std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(&backing)
+        .arg(&tree)
+        .status();
+    if !over.is_ok_and(|status| status.success()) {
+        std::process::exit(42);
+    }
+
+    let workspace = fixture.workspace("tree");
+    match fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    ) {
+        // Refusing is the answer this host gives: the two handles are one object on two mounts,
+        // and which children the name reaches depends on which of them is used.
+        Err(refusal) => {
+            let said = refusal.to_string();
+            assert!(
+                said.contains("could not reach") || said.contains("own data"),
+                "the refusal says which shape it would not read: {refusal}"
+            );
+        }
+        // If it is read at all, the nested repository's own data is not in it.
+        Ok(record) => {
+            let manifest = fixture
+                .service()
+                .manifest(record.change_set_id, record.version)
+                .expect("its manifest");
+            for entry in &manifest.paths {
+                assert!(
+                    !entry.path.starts_with("repo-data/"),
+                    "a nested repository's own data is not content: {}",
+                    entry.path
+                );
+            }
+        }
+    }
+}

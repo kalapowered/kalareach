@@ -89,6 +89,12 @@ pub const MAX_WALK_ENTRIES: usize = 200_000;
 /// How deep one walk goes, into a reported directory or into the base commit's own tree.
 pub const MAX_WALK_DEPTH: usize = 64;
 
+/// The furthest this capture climbs to reach a directory named from above where it started.
+///
+/// Deeper than any filesystem this host is asked about, and finite, which is what matters: the
+/// directory a handle is in can be changed under the walk, so the walk has an end of its own.
+pub const MAX_CLIMB_HOPS: usize = 256;
+
 /// Largest single file one capture reads, in bytes.
 ///
 /// The total bound is charged as the capture goes rather than at the end, and this is the bound on
