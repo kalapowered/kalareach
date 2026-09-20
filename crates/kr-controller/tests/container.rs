@@ -10,13 +10,21 @@
 
 #![cfg(unix)]
 
+mod net_support;
+
 use std::process::{Command, Stdio};
 
 use kr_controller::bridge::launch;
 use kr_controller::bridge::platform::{PlatformObserver, container_runtime_present};
 use kr_controller::bridge::store::Observer;
-use kr_protocol::identity::{EnvironmentAccess, EnvironmentEnrolment, EnvironmentPresence};
-use kr_protocol::ids::EnvironmentId;
+use kr_protocol::envelope::ActionTarget;
+use kr_protocol::identity::{
+    EnvironmentAccess, EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentEnrolment,
+    EnvironmentInventoryParams, EnvironmentInventoryResult, EnvironmentPresence,
+    EnvironmentRefreshParams, EnvironmentRefreshResult,
+};
+use kr_protocol::ids::{ActionId, EnvironmentId};
+use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 
 /// A small image with a shell, which every one of these starts a sleeping process in.
@@ -200,4 +208,99 @@ fn a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container() {
     let (ran, output) = podman(&arguments);
     assert!(ran, "the helper at that path runs: {output}");
     assert_eq!(output.trim_end(), "bridge --stdio");
+}
+
+#[tokio::test]
+async fn a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel() {
+    // The one path through the daemon that reaches a bridge and is refused by it. A distribution
+    // cannot do this on a machine that has no `wsl.exe`, and a running container can: the
+    // environment is observed running, so the refresh opens a bridge, and what is at the helper
+    // path is `/bin/echo`, which answers with something that is not an opening frame.
+    //
+    // What that has to leave behind is one thing said in one place: the readiness in the answer is
+    // the record's own, so it cannot report a channel while saying none is scoped.
+    if !runtime_available("a_refresh_that_reached_a_running_environment") {
+        return;
+    }
+    let container = Container::start(&unique("kr-t025-refresh"));
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut client = host.client().await;
+    let record = container.enrolment(6, "/bin/echo");
+    let enrolled: EnvironmentEnrolResult = client
+        .mutate(
+            Method::EnvironmentEnrol,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &EnvironmentEnrolParams {
+                enrolment: record.clone(),
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("the owner may enrol an environment")
+        .to_typed()
+        .expect("an enrolment result");
+    assert!(!enrolled.row.readiness.channel_scoped);
+
+    let refreshed: EnvironmentRefreshResult = client
+        .mutate(
+            Method::EnvironmentRefresh,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &EnvironmentRefreshParams {
+                environment_id: record.environment_id,
+                start: false,
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("a running container is refreshed rather than refused")
+        .to_typed()
+        .expect("a refresh result");
+    assert_eq!(
+        refreshed.row.status,
+        EnvironmentPresence::Running,
+        "the container this test started is running"
+    );
+    assert!(
+        refreshed.verification.as_ref().is_none(),
+        "what is not a helper verifies nothing: {}",
+        refreshed.connection
+    );
+    assert!(!refreshed.row.readiness.channel_scoped);
+    assert!(
+        refreshed
+            .row
+            .readiness
+            .detail
+            .contains("forwarding a socket"),
+        "the detail says what is still needed rather than what an earlier bridge found: {}",
+        refreshed.row.readiness.detail
+    );
+
+    let inventory: EnvironmentInventoryResult = client
+        .request(
+            Method::EnvironmentInventory,
+            &EnvironmentInventoryParams {
+                access: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("the owner may read the inventory")
+        .to_typed()
+        .expect("an inventory");
+    for row in inventory.rows {
+        assert!(
+            !row.readiness.channel_scoped,
+            "a channel is scoped by a bridge that answered, not by one that was refused"
+        );
+        assert!(
+            !row.readiness.detail.contains("both recorded"),
+            "{}",
+            row.readiness.detail
+        );
+    }
+    host.stop().await;
 }

@@ -248,6 +248,15 @@ async fn a_refresh_that_cannot_reach_a_destination_says_so_and_scopes_no_channel
             );
             assert!(!refreshed.row.readiness.channel_scoped);
             assert!(!refreshed.row.readiness.is_ready());
+            assert!(
+                refreshed
+                    .row
+                    .readiness
+                    .detail
+                    .contains("forwarding a socket"),
+                "the detail is the record's own answer, not an earlier bridge's: {}",
+                refreshed.row.readiness.detail
+            );
         }
         // This machine has no `wsl.exe`, so the observation itself may fail. What it may not do is
         // report the environment reached.

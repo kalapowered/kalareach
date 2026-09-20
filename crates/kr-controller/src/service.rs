@@ -5096,7 +5096,7 @@ impl Controller {
                 let observing = state_dir.clone();
                 // The platform command is a blocking one, and it is run on a blocking thread so a
                 // distribution that takes seconds to start does not hold this runtime.
-                let (mut row, started) = tokio::task::spawn_blocking(move || {
+                let refreshed = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&observing, |store| {
                         store.refresh(
                             params.environment_id,
@@ -5108,6 +5108,11 @@ impl Controller {
                 })
                 .await
                 .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                let crate::bridge::store::Refreshed {
+                    mut row,
+                    started,
+                    instance,
+                } = refreshed;
 
                 // Only a running environment is worth opening a bridge to, and only a process
                 // bridge has one to open. Everything else says so rather than starting anything:
@@ -5134,23 +5139,21 @@ impl Controller {
                         Ok(verification) => {
                             // The destination answered on its own local channel, inside its own
                             // environment. That is section 25's scoped channel, established rather
-                            // than assumed, so the record keeps it — against the enrolment the
-                            // bridge was opened for, which another caller may have changed since.
-                            let scoping = state_dir.clone();
-                            let established = tokio::task::spawn_blocking(move || {
-                                crate::bridge::store::Store::with_locked(&scoping, |store| {
-                                    store.scope_channel(environment_id, &opened_for, now_ms)
-                                })
-                            })
-                            .await
-                            .map_err(|error| ControllerError::supervision(error.to_string()))??;
-                            row.readiness.channel_scoped = established;
-                            if established {
-                                row.readiness.detail =
-                                    "the helper and the scoped channel are both recorded"
-                                        .to_owned();
+                            // than assumed, so the record keeps it — against the approved record
+                            // the bridge was opened for, which another caller may have replaced
+                            // since.
+                            let outcome = record_outcome(
+                                &state_dir,
+                                environment_id,
+                                instance,
+                                crate::bridge::store::BridgeAnswer::Answered,
+                                now_ms,
+                            )
+                            .await?;
+                            if let Some(readiness) = outcome.readiness {
+                                row.readiness = readiness;
                             }
-                            let detail = if established {
+                            let detail = if outcome.established {
                                 format!(
                                     "environment {} answered as {} over its own local channel",
                                     verification.environment_id, verification.os_user
@@ -5163,23 +5166,20 @@ impl Controller {
                             (Nullable::some(verification), detail)
                         }
                         Err(refusal) => {
-                            // Nothing answered. What an earlier bridge established is not evidence
-                            // about this environment any more, so it is taken back rather than
+                            // Nothing answered. What an earlier bridge established for this record
+                            // is not evidence about it any more, so it is taken back rather than
                             // left standing beside a failure.
-                            let scoping = state_dir.clone();
-                            tokio::task::spawn_blocking(move || {
-                                crate::bridge::store::Store::with_locked(&scoping, |store| {
-                                    store.unscope_channel(environment_id)
-                                })
-                            })
-                            .await
-                            .map_err(|error| ControllerError::supervision(error.to_string()))??;
-                            row.readiness.channel_scoped = false;
-                            row.readiness.detail = format!(
-                                "give {} its own scoped local channel; forwarding a socket does \
-                                 not install one",
-                                row.enrolment.label
-                            );
+                            let outcome = record_outcome(
+                                &state_dir,
+                                environment_id,
+                                instance,
+                                crate::bridge::store::BridgeAnswer::Refused,
+                                now_ms,
+                            )
+                            .await?;
+                            if let Some(readiness) = outcome.readiness {
+                                row.readiness = readiness;
+                            }
                             (Nullable::null(), refusal.to_string())
                         }
                     }
@@ -7146,6 +7146,28 @@ const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> 
              request rather than replaying this one"
         }
     }
+}
+
+/// Writes what one opened bridge did to the enrolment record, and reads back what it says then.
+///
+/// The record is a file under a lock, so this runs on a blocking thread. Both of a refresh's
+/// branches come through here, which is why neither of them has a readiness of its own to assemble:
+/// what comes back is the record's own answer, taken after the result was written.
+async fn record_outcome(
+    state_dir: &Path,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    opened_for: crate::bridge::store::EnrolmentInstance,
+    answer: crate::bridge::store::BridgeAnswer,
+    now_ms: u64,
+) -> Result<crate::bridge::store::BridgeOutcome> {
+    let state_dir = state_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            store.record_bridge_outcome(environment_id, opened_for, answer, now_ms)
+        })
+    })
+    .await
+    .map_err(|error| ControllerError::supervision(error.to_string()))?
 }
 
 fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
