@@ -90,6 +90,14 @@ pub const MAX_WALK_ENTRIES: usize = 200_000;
 /// How deep one walk goes, into a reported directory or into the base commit's own tree.
 pub const MAX_WALK_DEPTH: usize = 64;
 
+/// How many references one discovery follows before it refuses.
+///
+/// A `gitdir:` line, a `commondir` and a link each name a place to go and look, and each place can
+/// name another. What stops a chain of them is not the depth of any one walk — each of those
+/// starts a walk of its own — so the number of references followed to reach a directory is
+/// counted and bounded too. Deeper than any layout this host is asked about, and finite.
+pub const MAX_REFERENCE_HOPS: usize = 64;
+
 /// The furthest this capture climbs to reach a directory named from above where it started.
 ///
 /// Deeper than any filesystem this host is asked about, and finite, which is what matters: the
@@ -1291,6 +1299,7 @@ fn nested_repositories<'a>(
             &mut inspected,
             &mut budget,
             0,
+            0,
         )?;
     }
     // What this walk has already looked through for the repositories inside it, which is its own
@@ -1313,6 +1322,7 @@ fn nested_repositories<'a>(
             &mut refused,
             &mut inspected,
             &mut budget,
+            1,
         )?;
         // And now **inside** it (D-098). The content walk stops where a nested repository begins,
         // so a repository nested inside *that* one is named by no reading of this capture, while
@@ -1330,6 +1340,7 @@ fn nested_repositories<'a>(
                 &mut refused,
                 &mut inspected,
                 &mut budget,
+                0,
                 0,
             )?;
         }
@@ -1383,7 +1394,15 @@ fn nested_data(
     refused: &mut BTreeSet<(u64, u64)>,
     inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
     budget: &mut usize,
+    hops: usize,
 ) -> Result<()> {
+    if hops > MAX_REFERENCE_HOPS {
+        return Err(unplaceable_because(
+            directory,
+            "following where these repositories say their own data is went further than this \
+             host follows",
+        ));
+    }
     let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
     let stack = match kind {
         // Its data is beside its tree, which is the ordinary nested repository.
@@ -1430,7 +1449,9 @@ fn nested_data(
     let mut here = stack;
     here.pop();
     here.push(data);
-    administrative_descendants(tree, directory, &mut here, refused, inspected, budget, 0)?;
+    administrative_descendants(
+        tree, directory, &mut here, refused, inspected, budget, 0, hops,
+    )?;
     if let Some(elsewhere) = beside {
         let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
         if same_place(last, tree) {
@@ -1443,7 +1464,16 @@ fn nested_data(
         let mut shared = elsewhere;
         shared.pop();
         shared.push(last);
-        administrative_descendants(tree, directory, &mut shared, refused, inspected, budget, 0)?;
+        administrative_descendants(
+            tree,
+            directory,
+            &mut shared,
+            refused,
+            inspected,
+            budget,
+            0,
+            hops,
+        )?;
     }
     Ok(())
 }
@@ -1483,6 +1513,7 @@ fn nested_trees(
     inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
     budget: &mut usize,
     depth: usize,
+    hops: usize,
 ) -> Result<()> {
     if depth >= MAX_WALK_DEPTH {
         return Err(unsearchable(
@@ -1533,12 +1564,17 @@ fn nested_trees(
                 "it holds a name this host cannot read as text".to_owned(),
             ));
         };
-        if grant::is_administrative(&name) {
+        if name == grant::ADMINISTRATIVE_DIRECTORY {
             // Where the repository whose tree this is keeps its own data, which was placed when
             // that repository was found and is looked through by the scan that reads such data —
             // and that scan places every `.git` it meets itself, so nothing below it is skipped.
-            // The name rule is case-insensitive, as it is everywhere else, because a filesystem
-            // that folds case reaches the same directory through `.GIT`.
+            //
+            // The name matches **exactly**, because that is the entry Git reads and the entry
+            // this walk asked about. The rule that covers every case of it decides what is left
+            // out of a version, which is a different question: a directory called `.GIT` on a
+            // filesystem that keeps the two apart is an ordinary directory nothing has accounted
+            // for, and one a repository can sit in. Where a filesystem folds case the two names
+            // are one entry, and looking through it a second time costs a walk and finds nothing.
             continue;
         }
         let below = format!("{directory}/{name}");
@@ -1571,7 +1607,16 @@ fn nested_trees(
                 Elsewhere::Nothing,
             )?;
             if let Some(reached) = reached {
-                search_reached(tree, &below, reached, searched, refused, inspected, budget)?;
+                search_reached(
+                    tree,
+                    &below,
+                    reached,
+                    searched,
+                    refused,
+                    inspected,
+                    budget,
+                    hops + 1,
+                )?;
             }
             continue;
         }
@@ -1598,7 +1643,17 @@ fn nested_trees(
                 Ok(kind) => {
                     refused.insert(identity_of(held));
                     let from = clone_stack(stack.as_slice())?;
-                    nested_data(tree, &below, held, kind, from, refused, inspected, budget)?;
+                    nested_data(
+                        tree,
+                        &below,
+                        held,
+                        kind,
+                        from,
+                        refused,
+                        inspected,
+                        budget,
+                        hops + 1,
+                    )?;
                 }
                 // An ordinary directory of the tree this walk is looking through.
                 Err(kr_transfer::Escape::NotFound { .. }) => {}
@@ -1614,6 +1669,7 @@ fn nested_trees(
             inspected,
             budget,
             depth + 1,
+            hops,
         )?;
         stack.pop();
     }
@@ -1679,7 +1735,7 @@ fn search_link(
     else {
         return Ok(());
     };
-    search_reached(tree, link, reached, searched, refused, inspected, budget)
+    search_reached(tree, link, reached, searched, refused, inspected, budget, 1)
 }
 
 /// Looks through one directory a link named, and through the repositories inside it.
@@ -1687,6 +1743,7 @@ fn search_link(
 /// It is asked the same question every directory of a nested tree is asked — does it hold a
 /// `.git` — and then looked through the same way, once per object and mount, against the same
 /// budget.
+#[allow(clippy::too_many_arguments)]
 fn search_reached(
     tree: &AuthorisedDirectory,
     directory: &str,
@@ -1695,8 +1752,32 @@ fn search_reached(
     refused: &mut BTreeSet<(u64, u64)>,
     inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
     budget: &mut usize,
+    hops: usize,
 ) -> Result<()> {
+    if hops > MAX_REFERENCE_HOPS {
+        return Err(unsearchable(
+            directory,
+            format!(
+                "following where these repositories say their own data is went more than \
+                 {MAX_REFERENCE_HOPS} references deep"
+            ),
+        ));
+    }
     let mut stack = reached;
+    // Which mount the target is on, asked of the handle the descent ended at, before it is
+    // recorded or looked into. Outside this tree there is no mount to hold the walk to, so a
+    // handle that arrives here carries no rule and would answer "no mount" for every one of
+    // them: two views of one directory — the same object on two mounts, each with different
+    // children — would then be one entry in the record of what has been looked through, and the
+    // second would be passed over. Confining it to **its own** mount makes the record name the
+    // place rather than the object, and makes every directory under it compared with that mount
+    // as the tree's own are.
+    let held = stack.last().ok_or_else(|| unplaceable(directory))?;
+    let held = clone_of(held)?
+        .confined_to_one_mount()
+        .map_err(|_| unplaceable(directory))?;
+    stack.pop();
+    stack.push(held);
     let held = stack.last().ok_or_else(|| unplaceable(directory))?;
     if !searched.insert((identity_of(held), held.mount())) {
         return Ok(());
@@ -1710,7 +1791,15 @@ fn search_reached(
             refused.insert(identity_of(held));
             let from = clone_stack(stack.as_slice())?;
             nested_data(
-                tree, directory, held, kind, from, refused, inspected, budget,
+                tree,
+                directory,
+                held,
+                kind,
+                from,
+                refused,
+                inspected,
+                budget,
+                hops + 1,
             )?;
         }
         // An ordinary directory, which can still hold a repository deeper in.
@@ -1718,7 +1807,7 @@ fn search_reached(
         Err(_) => return Err(unplaceable(directory)),
     }
     nested_trees(
-        tree, directory, &mut stack, searched, refused, inspected, budget, 0,
+        tree, directory, &mut stack, searched, refused, inspected, budget, 0, hops,
     )
 }
 
@@ -1849,12 +1938,25 @@ fn administrative_descendants(
     inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
     budget: &mut usize,
     depth: usize,
+    hops: usize,
 ) -> Result<()> {
     if depth >= MAX_WALK_DEPTH {
         return Err(unreadable_data(format!(
             "this repository's own data is more than {MAX_WALK_DEPTH} levels deep, which is \
              deeper than this host reads to know what is in it"
         )));
+    }
+    // Looked inside once, by what it **is** and the mount it was reached on, whether it was
+    // reached as a child of another administrative directory or named as one by a `.git` line
+    // somewhere. A repository whose data names itself would otherwise start this scan again at
+    // every turn, and nothing about the depth of one walk would ever end it.
+    {
+        let directory = stack
+            .last()
+            .ok_or_else(|| unreadable_data("this host could not read what is in it".to_owned()))?;
+        if !inspected.insert((identity_of(directory), directory.mount())) {
+            return Ok(());
+        }
     }
     let entries = {
         let directory = stack
@@ -1895,7 +1997,7 @@ fn administrative_descendants(
         // working tree: excluding the data this `.git` sits inside says nothing about that
         // directory, whose bytes a capture would take and an apply would write over. So it is
         // placed here, by the same descent that places one found in the working tree (D-098a).
-        if grant::is_administrative(&name) {
+        if name == grant::ADMINISTRATIVE_DIRECTORY {
             let kind = if kind.is_dir() {
                 ObjectKind::Directory
             } else {
@@ -1915,6 +2017,7 @@ fn administrative_descendants(
                 into,
                 inspected,
                 budget,
+                hops + 1,
             )?;
             continue;
         }
@@ -1988,12 +2091,18 @@ fn administrative_descendants(
         // Excluded by what it **is**; looked inside by what it is *and where it was reached*. The
         // same directory on another mount holds different children, and one of them can be a mount
         // this host has not seen.
-        let inside = inspected.insert((identity_of(&held), held.mount()));
         let below = format!("{where_it_is}/{}", name.as_str());
         stack.push(held);
-        if inside {
-            administrative_descendants(tree, &below, stack, into, inspected, budget, depth + 1)?;
-        }
+        administrative_descendants(
+            tree,
+            &below,
+            stack,
+            into,
+            inspected,
+            budget,
+            depth + 1,
+            hops,
+        )?;
         stack.pop();
     }
     Ok(())

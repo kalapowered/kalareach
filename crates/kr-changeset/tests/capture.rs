@@ -2252,3 +2252,240 @@ fn two_mounts_over_one_tree() {
         }
     }
 }
+
+/// KR-REQ-14.32 and D-098a: a repository whose own data names itself ends the walk rather than
+/// starting it again.
+///
+/// Every reference this host follows — a `gitdir:` line, a `commondir`, a link — names a place to
+/// go and look, and each place can name another. A repository whose data holds a `.git` reading
+/// `gitdir: .` names the directory the scan is already standing in, so nothing about the depth of
+/// any one walk would ever end it. What ends it is having looked through that place already, by
+/// what it is and the mount it was reached on, and a bound on how many references one discovery
+/// follows.
+#[test]
+fn a_repository_whose_own_data_names_itself_is_looked_through_once() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "self-naming-tree");
+    std::fs::write(path.join(".git/.git"), b"gitdir: .\n").expect("data that names itself");
+
+    let workspace = fixture.workspace("self-naming-tree");
+    // Whatever it answers, it answers: the walk ends, and nothing of this repository's own data
+    // is in a version it produces.
+    match fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    ) {
+        Ok(record) => {
+            let manifest = fixture
+                .service()
+                .manifest(record.change_set_id, record.version)
+                .expect("its manifest");
+            assert!(
+                manifest
+                    .paths
+                    .iter()
+                    .all(|entry| !entry.path.contains(".git")),
+                "nothing of this repository's own data is in the version: {:?}",
+                manifest
+                    .paths
+                    .iter()
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        Err(refusal) => {
+            let said = refusal.to_string();
+            assert!(
+                said.contains("could not reach")
+                    || said.contains("cannot account for")
+                    || said.contains("look through"),
+                "and a refusal says which shape it would not read: {refusal}"
+            );
+        }
+    }
+}
+
+/// KR-REQ-14.33 and D-098a: `.GIT` is not `.git` where the filesystem keeps them apart.
+///
+/// The rule that leaves a path out of a version covers every spelling of `.git`, because a
+/// filesystem that folds case reaches one directory through all of them. What a repository **is**
+/// is a different question: Git reads the entry called exactly `.git`, so on a filesystem that
+/// keeps the two apart a directory called `.GIT` is an ordinary directory nothing has accounted
+/// for — and a repository can sit inside it, keeping its own data at an ordinary path of this
+/// tree.
+#[test]
+fn a_directory_whose_name_only_looks_administrative_is_still_looked_through() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "case-kept-tree");
+    let nested = path.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("a vendored repository");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    // A second name beside the repository's own data. Where the filesystem folds case this is
+    // that directory and the creation fails, and there is nothing here to stage.
+    let upper = nested.join(".GIT");
+    if std::fs::create_dir(&upper).is_err() {
+        println!("not exercised: this filesystem does not keep `.git` and `.GIT` apart");
+        return;
+    }
+    let child = upper.join("child");
+    std::fs::create_dir_all(&child).expect("a repository inside it");
+    std::fs::write(child.join(".git"), b"gitdir: ../../../repo-data\n")
+        .expect("the file that names where its data is");
+    write(&path, "vendor/repo-data/HEAD", "ref: refs/heads/main\n");
+    write(
+        &path,
+        "vendor/repo-data/config",
+        "[remote \"origin\"]\n\turl = https://user:a-secret-token@example.invalid/x.git\n",
+    );
+
+    let workspace = fixture.workspace("case-kept-tree");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.starts_with("vendor/repo-data")),
+        "the data of the repository inside `.GIT` is not in the version: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// KR-REQ-14.33 and D-098a: two views of one directory are two places to look, not one.
+///
+/// A link can name a directory outside this tree, and outside it there is no mount to hold a walk
+/// to. What a discovery must not do is treat "no rule" as "no mount": two bind-mount views of one
+/// directory are the same object with different children, and a record of what has been looked
+/// through that named only the object would pass the second view over. One of the two views can
+/// hold a repository whose own data is an ordinary directory of this tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn two_views_of_one_directory_are_both_looked_through() {
+    const NOT_EXERCISED: i32 = 42;
+
+    if std::env::var_os("KR_CAPTURE_TWO_VIEWS").is_some() {
+        two_views_of_one_target();
+        return;
+    }
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        println!("not exercised: this host does not give this account a mount namespace");
+        return;
+    }
+    let binary = std::env::current_exe().expect("the test binary");
+    let status = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--"])
+        .arg(binary)
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .arg("two_views_of_one_directory_are_both_looked_through")
+        .env("KR_CAPTURE_TWO_VIEWS", "1")
+        .status()
+        .expect("the test binary runs inside a mount namespace");
+    if status.code() == Some(NOT_EXERCISED) {
+        println!("not exercised: this namespace would not place the two mounts");
+        return;
+    }
+    assert!(
+        status.success(),
+        "the capture inside the mount namespace did not hold: {status}"
+    );
+}
+
+/// The half that runs inside the mount namespace.
+#[cfg(target_os = "linux")]
+fn two_views_of_one_target() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "two-views-tree");
+    // The data of a repository whose tree is outside this one: an ordinary directory here.
+    write(&path, "vendor/repo-data/HEAD", "ref: refs/heads/main\n");
+    write(
+        &path,
+        "vendor/repo-data/config",
+        "[remote \"origin\"]\n\turl = https://user:a-secret-token@example.invalid/x.git\n",
+    );
+    // Outside the tree: a directory with an empty `child`, a second view of it, and the tree of
+    // the repository that will be mounted at `child` in one view only.
+    let outside = fixture.work().join("outside");
+    std::fs::create_dir_all(outside.join("base/child")).expect("the directory and its child");
+    std::fs::create_dir_all(outside.join("view")).expect("where the second view goes");
+    std::fs::create_dir_all(outside.join("repo")).expect("the repository's own tree");
+    let named = std::fs::canonicalize(path.join("vendor/repo-data")).expect("the name it names");
+    std::fs::write(
+        outside.join("repo/.git"),
+        format!("gitdir: {}\n", named.display()).as_bytes(),
+    )
+    .expect("the file that names where its data is");
+
+    // The second view first, so it holds the empty child; then the repository over the child of
+    // the first. The two views are one object and two sets of children.
+    for (from, onto) in [
+        (outside.join("base"), outside.join("view")),
+        (outside.join("repo"), outside.join("base/child")),
+    ] {
+        let placed = std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(&from)
+            .arg(&onto)
+            .status();
+        if !placed.is_ok_and(|status| status.success()) {
+            std::process::exit(42);
+        }
+    }
+    // The view without the repository is named first, so a record keyed on the object alone would
+    // pass the one with it over.
+    std::os::unix::fs::symlink(outside.join("view"), path.join("a-view"))
+        .expect("the link to the view");
+    std::os::unix::fs::symlink(outside.join("base"), path.join("b-view"))
+        .expect("the link to the other");
+
+    let workspace = fixture.workspace("two-views-tree");
+    match fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    ) {
+        Ok(record) => {
+            let manifest = fixture
+                .service()
+                .manifest(record.change_set_id, record.version)
+                .expect("its manifest");
+            assert!(
+                manifest
+                    .paths
+                    .iter()
+                    .all(|entry| !entry.path.starts_with("vendor/repo-data")),
+                "the data of the repository in the second view is not in the version: {:?}",
+                manifest
+                    .paths
+                    .iter()
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Refusing is an answer too: what it must not do is read the tree and hold that data.
+        Err(refusal) => {
+            let said = refusal.to_string();
+            assert!(
+                said.contains("could not reach")
+                    || said.contains("cannot account for")
+                    || said.contains("look through")
+                    || said.contains("different mount"),
+                "the refusal says which shape it would not read: {refusal}"
+            );
+        }
+    }
+}

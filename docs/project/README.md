@@ -708,10 +708,16 @@ removes is never opened at all:
 
    All of this spends the same entry budget the scan of a repository's own data does, and a set of
    trees deeper, or with more entries, than this host looks through refuses the capture rather
-   than being half searched. Each directory is looked through once, by what it is and the mount it
-   was reached on, and every one of them is a handle this host opened and kept: nothing is
-   searched by resolving a name a second time, because two directories renamed in between would
-   have this host ask about one place and look inside another.
+   than being half searched. Following one of those names is bounded too: each place named can
+   name another, so the number of references followed to reach a directory has an end of its own,
+   and a repository whose data names itself is looked through once rather than for ever.
+
+   Each directory is looked through once, by what it is **and the mount it was reached on** —
+   outside this tree as much as inside it, because two views of one directory hold different
+   children and passing the second over would leave whatever is in it unaccounted for. Every one
+   of them is a handle this host opened and kept: nothing is searched by resolving a name a second
+   time, because two directories renamed in between would have this host ask about one place and
+   look inside another.
 
    What this covers is what a capture reads and what those walks reach: a repository in a
    directory that no path of the capture goes near, that lies inside no tree they walk and that no
