@@ -252,7 +252,7 @@ The nested objects those fields carry:
 | `event_result.editor_entered` | `state`, `fence_exchange` |
 | `event_result.editor_left` | `state` |
 | `event_result.detached` | `detached_attachment`, `state`, `discarded_input_bytes` |
-| `event_result.command_recorded` | `origin`, `state` |
+| `event_result.command_recorded` | `origin`, `detach_token`, `state` |
 | `event_result.command_resolved` | `arguments`, `added`, `bypass` (`not_integrated`, `disabled`, `absolute_path`, `unmanaged_shell`, `not_interactive`, `backend_unavailable`, `session_closing`, or null), `backend` |
 | `event_result.command_block_recorded` | `prompt_generation`, `retained` |
 
@@ -262,6 +262,32 @@ the reader, inside the fence; a record sent after the leave could only ever say 
 the reader is holding was typed under the gesture that was in force when it was typed. And a leave
 from a reader that has already been replaced is ignored: the worker compares the prompt generation
 and reader revision before it deregisters anything.
+
+### The line capability
+
+`command_recorded` answers `command_accepted` with `detach_token`, and that field is how `kr detach`
+inside a session knows which attachment it belongs to. The worker mints one secret per accepted
+line and puts it nowhere else: this answer, to this bridge, for this line. A line the worker could
+not attribute — a mixed origin, an unverifiable one — carries a null token, because there is
+nothing for it to name.
+
+A package that implements it exports the token in the environment of the command it is about to
+run, as `KR_DETACH_TOKEN`, and for that command alone. `kr detach` with no `--attachment` presents
+whatever that variable holds; the worker resolves the attachment from the token and refuses
+everything else with `Use kr detach --attachment <id> to detach`. Nothing about the calling process
+is read, and a package must not substitute anything for the token: a process identifier, a process
+group, the terminal's foreground job and the parent chain each name the line running now just as
+well as they name a caller an earlier line left behind.
+
+The token is valid while its line runs and the worker ends it on its own: at the next accepted
+line, at a `command_block` that reports an exit status, at a reader entry or idle at a later prompt
+generation, and at `integration_lost`. A package needs no expiry logic of its own; it needs only to
+stop exporting a token once the command it exported it for has ended.
+
+The packaged shells do not export it yet, for the same reason they emit no `command_resolve` or
+`command_block`: the hooks that would carry them are the package builder's. Until a package does,
+a bare `kr detach` inside it is answered with the instruction to name the attachment, which is the
+refusal this contract asks for rather than an attachment the host cannot stand behind.
 
 ## The reader-thread rules
 

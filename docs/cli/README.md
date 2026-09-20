@@ -409,22 +409,36 @@ editor fence at the moment the line is accepted. That record is what the detach 
 so the terminal that gets removed is the one the person is sitting at, never whichever client
 happens to hold the input lease by the time the command runs.
 
-Run anywhere else it takes an identifier. The session answers a request that names nothing only
-when the calling process is the line it has a record of, which the kernel says twice: the process
-is in the session's own boundary or descends from its root shell, and it leads the job the
-terminal has in the foreground, which is the job the root shell made for the line it accepted.
-`kr detach <session>` from an ordinary terminal, from a command the shell was told to run in the
-background, from one left over from a line that has already finished, and from inside a subshell
-or a list that something else in the job leads, names the attachment it means. Where a platform does not name a foreground job, and where the shell runs without job control so
-that every line shares its own process group, there is no such job to be in and every `kr detach`
-names its attachment.
+What connects the running command to that record is a capability, not anything about the process
+the command runs in. The worker mints one secret for the line it has just recorded and gives it to
+that line's own execution, through the integration, in `KR_DETACH_TOKEN`. `kr detach` with no
+`--attachment` presents whatever that variable holds and the session answers from it alone: one
+line, one capability, one attachment. Nothing about a caller's process is read, because nothing
+about a process says which line it belongs to — it can be started by an earlier line, resumed from
+the background with `fg`, left running after the line that started it finished, or share the
+shell's own process group because job control is off. Each of those is a caller that looks exactly
+like the line running now and is not it.
 
-Everything else returns `AMBIGUOUS_ATTACHMENT` and names no attachment: a line whose input came
-from more than one attachment or epoch, a line accepted without a valid fence, an origin whose
-terminal has already left, a session whose root editor has accepted nothing yet, and a
-`native_compat` session, which records no origin at all. Pass `--attachment <id>` to say which one.
+The capability lasts as long as its line runs. It ends when that line's command reports the status
+it exited with, when the reader comes back at a later prompt, when the next line is accepted, and
+when the integration is lost. A client taking the input lease part-way through does not end it,
+because the line goes on running and goes on belonging to the terminal it was typed in.
+
+Run anywhere else it takes an identifier, because a caller outside a line holds no capability.
+
+Everything else returns `AMBIGUOUS_ATTACHMENT` and names no attachment: a caller presenting no
+capability, one presenting a capability that is not this session's current line's, a line whose
+input came from more than one attachment or epoch, a line accepted without a valid fence, an
+origin whose terminal has already left, a session whose root editor has accepted nothing yet, and
+a `native_compat` session, which records no origin at all. The refusal says `Use kr detach
+--attachment <id> to detach`, and passing `--attachment <id>` is the answer to every one of them.
 One remaining terminal is not proof that it is the one the command came from, so it is not treated
 as one.
+
+The packaged shells do not export the capability yet: it reaches them in the answer to
+`root.command.accepted`, and their bridges emit no command events today. Until they do, `kr detach`
+inside a managed shell names its attachment with `--attachment <id>`, and a bare `kr detach` there
+is answered with that instruction rather than with an attachment the host cannot stand behind.
 
 ## `kr question`
 

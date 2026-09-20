@@ -121,7 +121,7 @@ gone, or interrupt an application before the launch that interrupt revoked had b
 | `remove_attachment`, `acknowledge_detach`, `reject_detach` | The empty-prompt gesture's outcome |
 | `install_launch`, `reject_launch`, `revoke_launch`, `late_installation` | The launch transaction's outcome, and what is recorded beside it |
 | `interrupt`, `refuse_interrupt` | The configured native interrupt, which bypasses the hold |
-| `record_acceptance` | The origin a detach with no attachment identifier resolves against |
+| `record_acceptance` | The origin a detach with no attachment identifier resolves against, and the capability minted for that line |
 
 ## The takeover receipt
 
