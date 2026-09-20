@@ -104,6 +104,17 @@ pub async fn print(command: &BridgeCommand, json: bool) -> Result<()> {
                         ""
                     }
                 );
+                // What opening the bridge did, whether it answered or not. A person reading this
+                // after a failure has the program, the environment or the refusal in front of them.
+                println!("    {}", refreshed.connection);
+                if let Some(verification) = refreshed.verification.as_ref() {
+                    println!(
+                        "    speaks protocol {}.{}, carries frames to {} bytes",
+                        verification.protocol_version.major,
+                        verification.protocol_version.minor,
+                        verification.max_frame_len.get()
+                    );
+                }
             }
         }
     }

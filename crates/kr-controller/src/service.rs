@@ -3715,7 +3715,10 @@ impl Controller {
                     .await
             }
             Method::EnvironmentEnrol | Method::EnvironmentForget | Method::EnvironmentRefresh => {
-                self.environment_record(mutation, method).await
+                // The envelope this host built for the connection, not anything the caller sent.
+                // A refresh may open a bridge, and what may cross one is decided by this.
+                let actor = local_actor(actor_id.clone(), connection_id, self.generation);
+                self.environment_record(&actor, mutation, method).await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
@@ -5023,6 +5026,7 @@ impl Controller {
     /// environment it selected. Enrolling and forgetting change the record and nothing else.
     async fn environment_record(
         &self,
+        actor: &kr_protocol::actor::ActorEnvelope,
         mutation: &MutationRequest,
         method: Method,
     ) -> Result<ParamsValue> {
@@ -5058,10 +5062,12 @@ impl Controller {
             }
             Method::EnvironmentRefresh => {
                 let params: EnvironmentRefreshParams = parse(&mutation.params)?;
+                let environment_id = params.environment_id;
+                let observing = state_dir.clone();
                 // The platform command is a blocking one, and it is run on a blocking thread so a
                 // distribution that takes seconds to start does not hold this runtime.
-                let (row, started) = tokio::task::spawn_blocking(move || {
-                    crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                let (mut row, started) = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&observing, |store| {
                         store.refresh(
                             params.environment_id,
                             params.start,
@@ -5072,7 +5078,64 @@ impl Controller {
                 })
                 .await
                 .map_err(|error| ControllerError::supervision(error.to_string()))??;
-                encode(&EnvironmentRefreshResult { row, started })
+
+                // Only a running environment is worth opening a bridge to, and only a process
+                // bridge has one to open. Everything else says so rather than starting anything:
+                // section 3 leaves starting to the caller that asked for it.
+                let (verification, connection) = if !row.enrolment.access.is_process_bridge() {
+                    (
+                        Nullable::null(),
+                        format!(
+                            "{} is not reached by a process bridge, so none was opened",
+                            row.enrolment.access.as_str()
+                        ),
+                    )
+                } else if row.status != kr_protocol::identity::EnvironmentPresence::Running {
+                    (
+                        Nullable::null(),
+                        "no bridge was opened, because this environment is not running; refresh \
+                         with --start to start it"
+                            .to_owned(),
+                    )
+                } else {
+                    match crate::bridge::verify::through_bridge(
+                        actor,
+                        &row.enrolment,
+                        self.paths.environment_id(),
+                        self.build_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(verification) => {
+                            // The destination answered on its own local channel, inside its own
+                            // environment. That is section 25's scoped channel, established rather
+                            // than assumed, so the record keeps it.
+                            let scoping = state_dir.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::bridge::store::Store::with_locked(&scoping, |store| {
+                                    store.scope_channel(environment_id)
+                                })
+                            })
+                            .await
+                            .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                            row.readiness.channel_scoped = true;
+                            row.readiness.detail =
+                                "the helper and the scoped channel are both recorded".to_owned();
+                            let detail = format!(
+                                "environment {} answered as {} over its own local channel",
+                                verification.environment_id, verification.os_user
+                            );
+                            (Nullable::some(verification), detail)
+                        }
+                        Err(refusal) => (Nullable::null(), refusal.to_string()),
+                    }
+                };
+                encode(&EnvironmentRefreshResult {
+                    row,
+                    started,
+                    verification,
+                    connection,
+                })
             }
             other => Err(ControllerError::InvalidArgument(format!(
                 "{} is not an environment record this daemon changes",

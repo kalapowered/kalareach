@@ -415,6 +415,138 @@ async fn a_closed_session_still_answers_session_closed_across_the_bridge() {
     stub.abort();
 }
 
+/// The command an invoker opens a bridge with in these tests.
+///
+/// The helper is the real `kr bridge --stdio`, started the way `wsl.exe --exec` and a container
+/// runtime's exec start it: a child process with its standard streams piped. What differs from a
+/// real invocation is only where the destination environment is, and `env` is how a test says that
+/// without changing this process's own environment, which the other tests here share.
+#[cfg(unix)]
+fn opening_against(
+    tree: &kr_ipc::testing::TempHost,
+    environment_id: EnvironmentId,
+    target: BridgeTarget,
+) -> kr_controller::bridge::invoke::Opening {
+    kr_controller::bridge::invoke::Opening {
+        command: kr_controller::bridge::launch::BridgeCommand {
+            program: "/usr/bin/env".to_owned(),
+            arguments: vec![
+                format!(
+                    "{}={}",
+                    kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+                    tree.paths().runtime_root().display()
+                ),
+                format!(
+                    "{}={}",
+                    kr_ipc::paths::STATE_DIR_VARIABLE,
+                    tree.paths().state_root().display()
+                ),
+                command_binary().display().to_string(),
+                "bridge".to_owned(),
+                "--stdio".to_owned(),
+            ],
+        },
+        environment_id,
+        hello: BridgeHello {
+            protocol_version: PROTOCOL_VERSION,
+            build_id: BuildId::new("kr/test").expect("a build"),
+            origin_environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
+            origin_ingress: ActorIngress::LocalIpc,
+            already_bridged: false,
+            target,
+        },
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invoker_opens_a_bridge_and_carries_a_request_over_it() {
+    // The invoking half, end to end: the helper is started, the opening frames are exchanged, the
+    // identity that answers is compared with the one the enrolment names, and a read crosses and
+    // comes back. Nothing here stands in for the invoker.
+    let tree = kr_ipc::testing::TempHost::create();
+    let environment = tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let served = ParamsValue::from_typed(&kr_protocol::hostinfo::EnvironmentListResult {
+        environments: Vec::new(),
+    })
+    .expect("the answer encodes");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(served.clone())).await;
+
+    let opening = opening_against(&tree, tree.environment_id(), BridgeTarget::Controller);
+    let mut invocation = opening.launch().await.expect("the bridge opens");
+    assert_eq!(
+        invocation.acknowledgement().environment_id,
+        tree.environment_id()
+    );
+    assert_eq!(invocation.acknowledgement().role, LocalRole::Controller);
+
+    let response = invocation
+        .request(Request {
+            request_id: RequestId::new(11),
+            method: Method::EnvironmentList.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::empty(),
+        })
+        .await
+        .expect("the destination answers");
+    assert_eq!(response.request_id, RequestId::new(11));
+    assert_eq!(response.outcome, Outcome::Ok(served.clone()));
+
+    // A mutation quoting the window the destination acknowledged crosses the same way.
+    let window = invocation.acknowledgement().action_window.clone();
+    let mutated = invocation
+        .mutate(MutationRequest {
+            request_id: RequestId::new(12),
+            method: Method::EnvironmentEnrol.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(tree.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: window.action_window_id,
+            requested_ttl_ms: DurationMs::new(10_000),
+            params: ParamsValue::empty(),
+        })
+        .await
+        .expect("the destination answers");
+    assert_eq!(mutated.outcome, Outcome::Ok(served));
+
+    invocation.close().await.expect("the helper ends");
+    stub.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_environment_that_answers_with_another_identity_is_refused() {
+    // A distribution registered again under the name it had, or a container recreated under a
+    // reused one, answers as a different installation. The record does not carry over to it, and
+    // the refusal comes before any request crosses.
+    let tree = kr_ipc::testing::TempHost::create();
+    let environment = tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let served = ParamsValue::from_typed(&kr_protocol::hostinfo::EnvironmentListResult {
+        environments: Vec::new(),
+    })
+    .expect("the answer encodes");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(served)).await;
+
+    let enrolled = EnvironmentId::new(Uuid::from_bytes([77; 16]));
+    assert_ne!(enrolled, tree.environment_id());
+    let refusal = opening_against(&tree, enrolled, BridgeTarget::Controller)
+        .launch()
+        .await
+        .expect_err("a refusal");
+    assert_eq!(
+        refusal,
+        kr_controller::bridge::invoke::Refusal::IdentityMismatch {
+            enrolled,
+            answered: tree.environment_id(),
+        }
+    );
+    stub.abort();
+}
+
 #[test]
 fn the_command_asks_for_stdio_by_the_name_the_specification_uses() {
     // `wsl.exe --distribution <name> --user <user> --exec <absolute-kr-path> bridge --stdio` is

@@ -213,6 +213,86 @@ async fn a_refresh_of_an_environment_this_machine_does_not_have_says_so_rather_t
 }
 
 #[tokio::test]
+async fn a_refresh_that_cannot_reach_a_destination_says_so_and_scopes_no_channel() {
+    // Section 18: an integration needs a helper and scoped credentials in the target environment,
+    // and forwarding a socket does not install one. So a channel is recorded only when a bridge to
+    // that environment actually answered, and a refresh that reached nothing says what stopped it.
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut client = host.client().await;
+    let record = enrolment(1, "ubuntu", EnvironmentAccess::WslDistribution);
+    enrol(&mut client, &host, record.clone()).await;
+
+    let answered = client
+        .mutate(
+            Method::EnvironmentRefresh,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &EnvironmentRefreshParams {
+                environment_id: record.environment_id,
+                start: false,
+            },
+        )
+        .await
+        .expect("the daemon answers");
+    if let Ok(value) = answered {
+        let refreshed: EnvironmentRefreshResult = value.to_typed().expect("a refresh result");
+        assert!(
+            refreshed.verification.as_ref().is_none(),
+            "nothing answered, so nothing is recorded as verified"
+        );
+        assert!(
+            !refreshed.connection.is_empty(),
+            "the result says what opening the bridge did"
+        );
+        assert!(!refreshed.row.readiness.channel_scoped);
+        assert!(!refreshed.row.readiness.is_ready());
+    }
+    for row in inventory(&mut client).await.rows {
+        assert!(
+            !row.readiness.channel_scoped,
+            "a channel is scoped by a bridge that answered, not by a refresh that failed"
+        );
+    }
+    host.stop().await;
+}
+
+#[tokio::test]
+async fn a_refresh_of_an_environment_that_is_not_a_process_bridge_opens_none() {
+    // An SSH user runs the command line on the destination host and a named remote host is reached
+    // through its own paired endpoint. Neither is a process bridge, and a refresh of one says that
+    // rather than starting a helper.
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut client = host.client().await;
+    let record = enrolment(4, "build-host", EnvironmentAccess::SshHost);
+    enrol(&mut client, &host, record.clone()).await;
+
+    let answered = client
+        .mutate(
+            Method::EnvironmentRefresh,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &EnvironmentRefreshParams {
+                environment_id: record.environment_id,
+                start: false,
+            },
+        )
+        .await
+        .expect("the daemon answers");
+    if let Ok(value) = answered {
+        let refreshed: EnvironmentRefreshResult = value.to_typed().expect("a refresh result");
+        assert!(refreshed.verification.as_ref().is_none());
+        assert!(
+            refreshed.connection.contains("process bridge"),
+            "{}",
+            refreshed.connection
+        );
+    }
+    host.stop().await;
+}
+
+#[tokio::test]
 async fn forgetting_removes_the_row_and_says_whether_there_was_one() {
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;

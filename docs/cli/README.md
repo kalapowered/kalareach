@@ -653,7 +653,8 @@ The other four operations act on the environments this host has enrolled:
 ```text
 kr bridge list [--access wsl|container|ssh|paired]
 kr bridge enrol --access wsl --label ubuntu --target Ubuntu-24.04 \
-  --user kala --helper /usr/local/bin/kr [--clipboard <destination>]
+  --user kala --helper /usr/local/bin/kr \
+  (--environment-id <uuid> | --probe) [--clipboard <destination>]
 kr bridge forget <label>
 kr bridge refresh <label> [--start]
 ```
@@ -663,11 +664,23 @@ identifier the container runtime issued, or the SSH destination. `--label` is wh
 to select the record; it is never compared as an identity, so a container recreated under the same
 name does not inherit the old one. `--helper` is absolute, in the target environment's own terms.
 
+An enrolment names the environment's own identity. Pass it with `--environment-id`, or pass
+`--probe` to ask the destination for it — which runs the helper inside that environment, and so
+starts it when it is stopped. A container's `--target` is resolved through the container runtime
+first, and the identifier it answers with is what the record keeps; a name, or a short prefix of an
+identifier, is not one.
+
 `list` reads this host's cache. It contacts nothing and starts nothing, and every row says so:
 each carries the environment identity, when it was last observed, an explicit `running`,
 `environment_stopped` or `stale` status, and whether that came from the cache or from an
 observation. `refresh` is the only one that asks the platform, and it starts the environment it
 selected only with `--start`.
+
+A refresh of a running environment also opens a bridge to it and reports what answered: the
+environment identity, the user the helper runs as inside it, the protocol version and the frame
+bound. That line is the connection diagnostic, and it says what stopped the bridge when one could
+not be opened — the program that would not start, the environment that answered with another
+identity, or the destination's own refusal.
 
 ## `kr host power`
 

@@ -8,7 +8,8 @@
 //! | [`launch`] | The exact argument vector each access class is started with |
 //! | [`platform`] | Asking the platform whether an enrolled environment is running, and starting one |
 //! | [`store`] | The owner-approved enrolment record and the cache of what was last observed |
-//! | [`invoke`] | Opening a bridge: what may cross it, and what is refused before a process starts |
+//! | [`invoke`] | Opening a bridge: what may cross it, what is refused before a process starts, and the frames it carries |
+//! | [`verify`] | Opening a bridge to a running environment to see which one answers |
 //!
 //! **The bridge is never a hidden dependency.** A WSL installation of KalaReach works with no
 //! native Windows installation at all: the Linux daemon inside the distribution owns its own
@@ -27,3 +28,4 @@ pub mod invoke;
 pub mod launch;
 pub mod platform;
 pub mod store;
+pub mod verify;

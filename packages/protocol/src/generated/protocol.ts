@@ -8281,11 +8281,22 @@ export interface EnvironmentRefreshParams {
  * The result of `environment.refresh`.
  */
 export interface EnvironmentRefreshResult {
+  /**
+   * What opening that bridge did, in one line a person can act on.
+   */
+  connection: string
   row: EnvironmentInventoryRow2
   /**
    * Whether this refresh started the environment.
    */
   started: boolean
+  /**
+   * What the destination answered when this refresh opened a bridge to it.
+   *
+   * Absent when no bridge was opened, which is the case for an environment that is not running
+   * and for an access class that is not a process bridge. [`Self::connection`] says which.
+   */
+  verification: BridgeVerification | null
 }
 /**
  * One row of the owner-approved cached inventory.
@@ -8305,6 +8316,47 @@ export interface EnvironmentInventoryRow2 {
    * What was observed then.
    */
   status: 'running' | 'environment_stopped' | 'stale'
+}
+/**
+ * What a destination environment said about itself over a process bridge.
+ *
+ * Section 18 asks for connection diagnostics, and section 25 asks helpers to register explicit
+ * environment identities and scoped local channels rather than inferring authority from a
+ * forwarded environment variable. This is what one opened bridge established: the helper ran
+ * inside the destination, authenticated to that environment's own daemon over its own local
+ * channel, and answered with the identity, the user and the bounds below.
+ */
+export interface BridgeVerification {
+  /**
+   * The environment that answered. Compared against the enrolment before anything is recorded.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_frame_len: string
+  /**
+   * The operating-system user the helper runs as inside that environment.
+   */
+  os_user: string
+  protocol_version: ProtocolVersion5
+  /**
+   * The role that answered: the destination's control daemon, or one session's worker.
+   */
+  role: 'controller' | 'worker' | 'rendezvous'
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion5 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
 }
 /**
  * Parameters of `events.snapshot`.
@@ -9384,7 +9436,7 @@ export interface HostSelection {
    */
   host_nonce: string
   limits: ReceiveLimits3
-  selected_version: ProtocolVersion5
+  selected_version: ProtocolVersion6
 }
 /**
  * The negotiated limits.
@@ -9414,7 +9466,7 @@ export interface ReceiveLimits3 {
 /**
  * One public protocol version.
  */
-export interface ProtocolVersion5 {
+export interface ProtocolVersion6 {
   /**
    * The major version. A mismatch is not negotiable.
    */
@@ -9623,7 +9675,7 @@ export interface HostInfoResult {
    */
   live_sessions: string
   power: SleepInhibitionState1
-  protocol_version: ProtocolVersion6
+  protocol_version: ProtocolVersion7
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9698,7 +9750,7 @@ export interface SleepInhibitionState1 {
 /**
  * One public protocol version.
  */
-export interface ProtocolVersion6 {
+export interface ProtocolVersion7 {
   /**
    * The major version. A mismatch is not negotiable.
    */
@@ -19158,7 +19210,7 @@ export interface WorkerDescriptor {
    */
   environment_id: string
   process_start_identity: ProcessStartIdentity8
-  protocol_version: ProtocolVersion7
+  protocol_version: ProtocolVersion8
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -19222,7 +19274,7 @@ export interface ProcessStartIdentity8 {
 /**
  * One public protocol version.
  */
-export interface ProtocolVersion7 {
+export interface ProtocolVersion8 {
   /**
    * The major version. A mismatch is not negotiable.
    */

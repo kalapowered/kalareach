@@ -616,6 +616,28 @@ pub struct EnvironmentRefreshParams {
     pub start: bool,
 }
 
+/// What a destination environment said about itself over a process bridge.
+///
+/// Section 18 asks for connection diagnostics, and section 25 asks helpers to register explicit
+/// environment identities and scoped local channels rather than inferring authority from a
+/// forwarded environment variable. This is what one opened bridge established: the helper ran
+/// inside the destination, authenticated to that environment's own daemon over its own local
+/// channel, and answered with the identity, the user and the bounds below.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeVerification {
+    /// The environment that answered. Compared against the enrolment before anything is recorded.
+    pub environment_id: EnvironmentId,
+    /// The operating-system user the helper runs as inside that environment.
+    pub os_user: String,
+    /// The role that answered: the destination's control daemon, or one session's worker.
+    pub role: LocalRole,
+    /// The protocol version the destination selected.
+    pub protocol_version: ProtocolVersion,
+    /// The largest frame that destination will carry, in bytes.
+    pub max_frame_len: U64,
+}
+
 /// The result of `environment.refresh`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -624,6 +646,13 @@ pub struct EnvironmentRefreshResult {
     pub row: EnvironmentInventoryRow,
     /// Whether this refresh started the environment.
     pub started: bool,
+    /// What the destination answered when this refresh opened a bridge to it.
+    ///
+    /// Absent when no bridge was opened, which is the case for an environment that is not running
+    /// and for an access class that is not a process bridge. [`Self::connection`] says which.
+    pub verification: Nullable<BridgeVerification>,
+    /// What opening that bridge did, in one line a person can act on.
+    pub connection: String,
 }
 
 #[cfg(test)]

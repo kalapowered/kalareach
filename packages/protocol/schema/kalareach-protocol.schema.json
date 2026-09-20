@@ -2623,6 +2623,40 @@
         }
       ]
     },
+    "BridgeVerification": {
+      "additionalProperties": false,
+      "description": "What a destination environment said about itself over a process bridge.\n\nSection 18 asks for connection diagnostics, and section 25 asks helpers to register explicit\nenvironment identities and scoped local channels rather than inferring authority from a\nforwarded environment variable. This is what one opened bridge established: the helper ran\ninside the destination, authenticated to that environment's own daemon over its own local\nchannel, and answered with the identity, the user and the bounds below.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that answered. Compared against the enrolment before anything is recorded."
+        },
+        "max_frame_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The largest frame that destination will carry, in bytes."
+        },
+        "os_user": {
+          "description": "The operating-system user the helper runs as inside that environment.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version the destination selected."
+        },
+        "role": {
+          "$ref": "#/$defs/LocalRole",
+          "description": "The role that answered: the destination's control daemon, or one session's worker."
+        }
+      },
+      "required": [
+        "environment_id",
+        "os_user",
+        "role",
+        "protocol_version",
+        "max_frame_len"
+      ],
+      "type": "object"
+    },
     "BuildId": {
       "description": "A build identifier reported in hello.",
       "maxLength": 256,
@@ -8405,6 +8439,10 @@
       "additionalProperties": false,
       "description": "The result of `environment.refresh`.",
       "properties": {
+        "connection": {
+          "description": "What opening that bridge did, in one line a person can act on.",
+          "type": "string"
+        },
         "row": {
           "$ref": "#/$defs/EnvironmentInventoryRow",
           "description": "The row as this refresh observed it."
@@ -8412,11 +8450,24 @@
         "started": {
           "description": "Whether this refresh started the environment.",
           "type": "boolean"
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BridgeVerification"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the destination answered when this refresh opened a bridge to it.\n\nAbsent when no bridge was opened, which is the case for an environment that is not running\nand for an access class that is not a process bridge. [`Self::connection`] says which."
         }
       },
       "required": [
         "row",
-        "started"
+        "started",
+        "verification",
+        "connection"
       ],
       "type": "object"
     },

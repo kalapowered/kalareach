@@ -949,7 +949,17 @@ proxy is not part of this version.
 An enrolment records the identity the platform issued, the operating-system user the helper runs
 as, and the absolute path of the helper installed there. The label is what a person types; it
 selects a record and is never compared as an identity, so a container destroyed and recreated under
-the same name does not inherit the old record.
+the same name does not inherit the old record. The environment identifier selects a record too,
+which is how two records that share a label are told apart.
+
+A container is recorded by the whole identifier its runtime issued. A name is not an identity, and
+neither is a short prefix of an identifier: a runtime resolves either to whichever container
+carries it now. Anything typed is put to the runtime first, and the identifier it answers with is
+what the record keeps.
+
+The identity of a WSL distribution or a container is either given at enrolment or asked of the
+destination. Asking means running the helper inside it, which starts a stopped environment, so it
+happens only when the person asks for it by name.
 
 `environment.inventory` reads the owner-approved cache. Every row carries the environment identity,
 when it was last observed, and an explicit status: `running`, `environment_stopped` or `stale`. A
@@ -959,7 +969,21 @@ running says otherwise. `environment.refresh` is the one that asks the platform,
 environment it selected only when the request asked it to.
 
 Starting a stopped distribution does not revive what was in it. A session that was closed before it
-stopped still answers `SESSION_CLOSED`.
+stopped still answers `SESSION_CLOSED`, and that answer comes from the destination's own closure
+record. A file left behind in the destination is not one: a worker writes a session's journal while
+that session is running.
+
+A refresh of a running environment reached by a process bridge opens one and looks. The helper
+starts inside the destination, authenticates to that environment's own daemon over that
+environment's own local channel, and answers with the identity it has there; one read crosses and
+comes back, because a handshake alone shows only that a process started. What comes back is the
+environment that answered, the user the helper runs as, the protocol version it selected and the
+largest frame it will carry. An environment that answers with an identity the record does not name
+is refused, and the refresh says so rather than recording the answer.
+
+That exchange is also what records the environment's scoped local channel: the acknowledgement
+carries the destination daemon's own connection and boot identity, taken inside the environment the
+helper runs in, which a forwarded socket cannot produce.
 
 ### Named SSH and container environments
 
