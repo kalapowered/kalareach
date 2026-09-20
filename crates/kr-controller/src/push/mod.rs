@@ -211,9 +211,7 @@ impl DeliveryModule {
                 .into_iter()
                 .filter(|delivery| {
                     delivery.destination_id == *destination_id
-                        && (!delivery.state.is_settled()
-                            || delivery.state == DeliveryState::Accepted
-                            || delivery.state == DeliveryState::OutcomeUnknown)
+                        && delivery.state.may_still_arrive()
                         && delivery.expires_at_ms.get() > now_ms
                 })
                 .map(|delivery| delivery.expires_at_ms.get())
@@ -221,6 +219,21 @@ impl DeliveryModule {
                 .map(TimestampMs::new);
             push.preview_keys = push.preview_keys.rotated(key, revision, outstanding);
             journal.configure_destination(&record).map_err(unavailable)
+        })
+    }
+
+    /// Takes one destination out of service after the provider rejected its token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the journal cannot be written.
+    pub fn disable(&self, destination_id: &DestinationId) -> Result<()> {
+        self.with(|producer| {
+            producer
+                .journal_mut()
+                .disable_destination(destination_id)
+                .map_err(unavailable)?;
+            Ok(())
         })
     }
 
@@ -386,9 +399,7 @@ impl DeliveryModule {
             // a token the provider rejected goes out of service here as well, or the destination
             // would keep its token until something happened to ask again.
             if decision.disable_destination {
-                let mut disabled = destination.clone();
-                disabled.enabled = false;
-                self.configure(&disabled)?;
+                self.disable(&destination.id)?;
             }
             let settled = self.with(|producer| {
                 producer
@@ -465,20 +476,6 @@ impl DeliveryModule {
             // The destination is the one the claim validated inside its own transaction, not one
             // read again afterwards: what is sent has to go where the claim said it may go.
             let record = claimed.destination.clone();
-            // Deciding whether to send waits - on this host's own locks, and on whatever the
-            // recipient's authority has to be asked - and section 16 stops at expiry, so the
-            // deadline is read against the clock as it stands rather than against the reading the
-            // claim was made with.
-            let now_ms = clock.now_ms().max(now_ms);
-            if now_ms >= claimed.expires_at_ms.get() {
-                self.settle(
-                    &claimed,
-                    DeliveryState::Expired,
-                    "the notification expired while this pass was deciding whether to send it",
-                    now_ms,
-                )?;
-                continue;
-            }
             if !record.enabled {
                 self.settle(
                     &claimed,
@@ -497,6 +494,20 @@ impl DeliveryModule {
                     DeliveryState::Revoked,
                     "the recipient's authority is not the one this was admitted under",
                     clock.now_ms().max(now_ms),
+                )?;
+                continue;
+            }
+            // Deciding whether to send waits - on this host's own locks, and on whatever the
+            // recipient's authority has to be asked - and section 16 stops at expiry, so the
+            // deadline is read against the clock as it stands immediately before the dispatch
+            // rather than against the reading the claim was made with.
+            let now_ms = clock.now_ms().max(now_ms);
+            if now_ms >= claimed.expires_at_ms.get() {
+                self.settle(
+                    &claimed,
+                    DeliveryState::Expired,
+                    "the notification expired while this pass was deciding whether to send it",
+                    now_ms,
                 )?;
                 continue;
             }
@@ -693,9 +704,7 @@ impl DeliveryModule {
             let _ = credentials.renew(push.sender_record_id);
         }
         if decision.disable_destination {
-            let mut disabled = record.clone();
-            disabled.enabled = false;
-            self.configure(&disabled)?;
+            self.disable(&record.id)?;
         }
         self.with(|producer| {
             producer

@@ -965,6 +965,25 @@ impl DeliveryJournal {
 
     // ----- destinations ------------------------------------------------------------------
 
+    /// Takes one destination out of service, leaving everything else about it as it stands.
+    ///
+    /// Section 16 disables a token the provider rejected. What that decides is whether this
+    /// destination may be delivered to, and nothing else, so it is written as that one column: a
+    /// caller that wrote a whole record back would carry with it whatever the record looked like
+    /// before the call that learned the token was rejected, and would undo a rotation or a
+    /// reconfiguration made while it was waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn disable_destination(&mut self, destination_id: &DestinationId) -> Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE delivery_destinations SET enabled = 0 WHERE destination_id = ?1",
+            params![destination_id.as_str()],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Writes down one configured destination and the rule that admits content to it.
     ///
     /// # Errors

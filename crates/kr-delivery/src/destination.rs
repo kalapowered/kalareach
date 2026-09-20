@@ -381,46 +381,53 @@ impl DestinationRecord {
     /// carry at all is a policy rather than a key, so `previews_enabled` stays.
     #[must_use]
     pub fn binding_digest(&self) -> String {
-        use std::fmt::Write as _;
-
         let mut input = String::new();
-        let _ = write!(input, "id={};enabled={};", self.id, self.enabled);
+        // Every field is written with its own length in front of it, so no value can spell out
+        // the separator and the field after it. An endpoint and an idempotency header are both
+        // text somebody configured, and without the lengths one destination could be written to
+        // look exactly like another.
+        let mut field = |value: &str| {
+            use std::fmt::Write as _;
+            let _ = write!(input, "{}:{value};", value.len());
+        };
+        field(self.id.as_str());
+        field(if self.enabled { "enabled" } else { "disabled" });
         match &self.rule {
             Some(rule) => {
-                let _ = write!(input, "rule={};", rule.name);
+                field("rule");
+                field(&rule.name);
                 match rule.grant_id {
-                    Some(grant) => {
-                        let _ = write!(input, "grant={grant};");
-                    }
-                    None => input.push_str("grant=-;"),
+                    Some(grant) => field(&grant.to_string()),
+                    None => field("-"),
                 }
             }
-            None => input.push_str("rule=-;"),
+            None => field("no rule"),
         }
         match &self.destination {
             Destination::Push(push) => {
-                let _ = write!(
-                    input,
-                    "push;installation={};sender={};previews={};mailbox={};",
-                    push.installation_id,
-                    push.sender_record_id,
-                    push.previews_enabled,
-                    push.mailbox_key
+                field("push");
+                field(&push.installation_id.to_string());
+                field(&push.sender_record_id.to_string());
+                field(if push.previews_enabled {
+                    "previews"
+                } else {
+                    "no previews"
+                });
+                field(
+                    &push
+                        .mailbox_key
                         .as_ref()
                         .map_or_else(|| "-".to_owned(), |key| hex(key.as_bytes())),
                 );
             }
             Destination::External(external) => {
-                let _ = write!(
-                    input,
-                    "external;kind={};endpoint={};idempotency={};",
-                    external.kind.as_str(),
-                    external.endpoint,
-                    match &external.idempotency {
-                        Idempotency::Supported { field } => field.as_str(),
-                        Idempotency::Unsupported => "-",
-                    },
-                );
+                field("external");
+                field(external.kind.as_str());
+                field(&external.endpoint);
+                match &external.idempotency {
+                    Idempotency::Supported { field: header } => field(header),
+                    Idempotency::Unsupported => field("-"),
+                }
             }
         }
         hex(&kr_cbor::sha256(input.as_bytes()))
@@ -605,6 +612,33 @@ mod tests {
             elsewhere.binding_digest(),
             before,
             "another installation is another device"
+        );
+    }
+
+    /// Two destinations somebody could configure, whose fields spell each other out when they are
+    /// run together. The binding has to tell them apart, because one of them is another address.
+    #[test]
+    fn two_destinations_that_read_alike_do_not_share_a_binding() {
+        let hook = |endpoint: &str, header: &str| DestinationRecord {
+            id: DestinationId::new("hook").expect("an identifier"),
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Webhook,
+                endpoint: endpoint.to_owned(),
+                idempotency: Idempotency::Supported {
+                    field: header.to_owned(),
+                },
+            }),
+            rule: Some(DeliveryRule {
+                name: "on failure".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        };
+        assert_ne!(
+            hook("https://example.invalid/hook", "x;idempotency=y").binding_digest(),
+            hook("https://example.invalid/hook;idempotency=x", "y").binding_digest(),
+            "the second is another address, and a claim has to refuse it"
         );
     }
 

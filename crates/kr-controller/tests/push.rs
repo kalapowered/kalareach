@@ -36,7 +36,8 @@ use kr_protocol::push::{
     PushUrgency,
 };
 use kr_protocol::scalars::{
-    AuthorisationKey, CanonicalSet, EndpointKey, Nullable, SecretBytes32, TimestampMs, Uuid,
+    AuthorisationKey, CanonicalSet, EndpointKey, NotificationPreviewKey, Nullable, SecretBytes32,
+    TimestampMs, Uuid,
 };
 use kr_worker::history_filter::ViewerScope;
 
@@ -1829,6 +1830,159 @@ fn a_pass_sends_to_the_destination_its_claim_validated() {
         readings.load(std::sync::atomic::Ordering::Relaxed) > 2,
         "the edit landed in the window it was aimed at"
     );
+}
+
+/// Section 16 stops at expiry, and asking the recipient's authority is a question that waits. An
+/// external message whose deadline passed during that question is settled rather than sent.
+#[test]
+fn an_external_message_that_expires_during_the_authority_lookup_is_not_sent() {
+    let environment = environment();
+    let destination = webhook(Idempotency::Unsupported);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "a command failed"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    /// A grant this host has to ask about, and the asking takes longer than the notification has.
+    #[derive(Debug)]
+    struct SlowAuthority(std::sync::atomic::AtomicBool);
+
+    impl RecipientAuthority for SlowAuthority {
+        fn scope_for(&self, _rule: &DeliveryRule) -> Option<(ViewerScope, BTreeSet<SessionId>)> {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some((ViewerScope::owner(), BTreeSet::new()))
+        }
+    }
+
+    let authority = SlowAuthority(std::sync::atomic::AtomicBool::new(false));
+    let clock = || {
+        if authority.0.load(std::sync::atomic::Ordering::Relaxed) {
+            NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1
+        } else {
+            NOW
+        }
+    };
+    let external = ExternalDouble::answering(Vec::new());
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::queued(),
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &external,
+            &authority,
+            &clock,
+        )
+        .expect("a pass");
+    assert!(
+        external.sent().is_empty(),
+        "nothing leaves after the deadline it was admitted under"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Expired);
+            assert!(!record.dispatched);
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// Taking a rejected token out of service says one thing about the destination. A rotation that
+/// landed while the gateway was answering is not undone by it.
+#[test]
+fn disabling_a_rejected_token_keeps_the_configuration_written_while_it_was_asked() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    /// A gateway that rejects the token, and a device that registers a new preview key while it
+    /// is doing so.
+    #[derive(Debug)]
+    struct RotatingGateway<'a> {
+        module: &'a DeliveryModule,
+        rotated: NotificationPreviewKey,
+    }
+
+    impl PushSender for RotatingGateway<'_> {
+        fn send(
+            &self,
+            _credential: &PushDeliveryCredential,
+            request: &PushDeliveryRequest,
+        ) -> SendOutcome {
+            self.module
+                .update_preview_key(
+                    &DestinationId::new("phone").expect("an identifier"),
+                    self.rotated,
+                    2,
+                    NOW,
+                )
+                .expect("the device registers a key while this call is out");
+            SendOutcome::Decided(Box::new(PushDeliveryAck {
+                decided_at_ms: TimestampMs::new(NOW),
+                notification_id: request.notification_id,
+                state: PushDeliveryState::TokenDisabled,
+                suppression: Nullable::null(),
+            }))
+        }
+
+        fn receipt(
+            &self,
+            credential: &PushDeliveryCredential,
+            request: &PushDeliveryRequest,
+        ) -> SendOutcome {
+            self.send(credential, request)
+        }
+    }
+
+    let rotated = *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+        .expect("a keypair")
+        .public();
+    let gateway = RotatingGateway {
+        module: &environment.module,
+        rotated,
+    };
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    environment
+        .module
+        .with(|producer| {
+            let configured = producer
+                .journal()
+                .destination(&DestinationId::new("phone").expect("an identifier"))
+                .expect("a read")
+                .expect("the destination");
+            assert!(!configured.enabled, "the rejected token is out of service");
+            let push = configured.as_push().expect("a push destination");
+            assert_eq!(
+                push.preview_keys.current, rotated,
+                "and the key the device registered while the gateway was answering stands"
+            );
+            assert_eq!(push.preview_keys.revision, 2);
+            Ok(())
+        })
+        .expect("a read");
 }
 
 /// KR-REQ-18.08 and section 19: the recipient's authority is asked again at dispatch, so a grant
