@@ -69,6 +69,24 @@ impl ActorIngress {
             Self::PairedDevice | Self::UnpairedPeer | Self::ServiceClient
         )
     }
+
+    /// Returns true when a local process bridge may carry a request that arrived on this ingress.
+    ///
+    /// Section 3 restricts the Windows/WSL and container process bridges to locally authenticated
+    /// command-line invocations, and forbids a Windows controller from routing a network actor
+    /// through one and relabelling it a Linux local owner. The specification writes the two
+    /// provenance classes a request records as `local_peer` and `network_device`; in this
+    /// vocabulary `local_peer` is [`Self::LocalIpc`] and `network_device` is every ingress
+    /// [`Self::is_remote`] reports.
+    ///
+    /// The remaining two are refused as well. A workflow run and a plugin component are local to
+    /// the host, but neither is a command-line invocation a person authenticated to the operating
+    /// system, and a bridge that carried them would let an automation reach another environment's
+    /// owner authority without that environment's own grant.
+    #[must_use]
+    pub const fn may_cross_process_bridge(self) -> bool {
+        matches!(self, Self::LocalIpc)
+    }
 }
 
 /// The host-constructed identity of one request.
@@ -93,4 +111,65 @@ pub struct ActorEnvelope {
     /// The connection the request arrived on. Closing the control stream revokes every associated
     /// data stream.
     pub connection_id: ConnectionId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_locally_authenticated_caller_may_cross_a_process_bridge() {
+        assert!(ActorIngress::LocalIpc.may_cross_process_bridge());
+        for ingress in ActorIngress::ALL
+            .iter()
+            .copied()
+            .filter(|ingress| *ingress != ActorIngress::LocalIpc)
+        {
+            assert!(
+                !ingress.may_cross_process_bridge(),
+                "{} must not cross a process bridge",
+                ingress.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_ingress_is_one_of_the_two_provenance_classes_the_specification_names() {
+        // `local_peer` and `network_device` are the specification's names for what an envelope
+        // records. Each implemented ingress maps onto exactly one of them, so a request can always
+        // say which it was rather than reporting the hop it last crossed.
+        for ingress in ActorIngress::ALL.iter().copied() {
+            let local_peer = ingress.may_cross_process_bridge();
+            let network_device = ingress.is_remote();
+            assert!(
+                !(local_peer && network_device),
+                "{} cannot be both classes",
+                ingress.as_str()
+            );
+        }
+        assert!(ActorIngress::LocalIpc.may_cross_process_bridge());
+        assert!(ActorIngress::PairedDevice.is_remote());
+    }
+
+    #[test]
+    fn an_envelope_records_the_ingress_rather_than_deriving_it() {
+        // The envelope is host-constructed, and its ingress field is the only thing that says
+        // where the request entered. Nothing here can be recomputed from the other fields: a
+        // local caller and a paired device differ in ingress, and a device identity is absent
+        // from the local one rather than implied by it.
+        use crate::ids::{ActorId, ConnectionId, ControllerGeneration};
+        use crate::scalars::{Nullable, Uuid};
+
+        let envelope = ActorEnvelope {
+            actor_id: ActorId::new("local:1").expect("a principal"),
+            ingress: ActorIngress::LocalIpc,
+            device_id: Nullable::null(),
+            grant_id: Nullable::null(),
+            grant_revision: Nullable::null(),
+            controller_generation: ControllerGeneration::new(1),
+            connection_id: ConnectionId::new(Uuid::from_bytes([1; 16])),
+        };
+        assert_eq!(envelope.ingress, ActorIngress::LocalIpc);
+        assert!(!envelope.device_id.is_present());
+    }
 }

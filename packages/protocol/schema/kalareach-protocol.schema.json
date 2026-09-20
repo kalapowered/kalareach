@@ -2446,6 +2446,178 @@
         }
       ]
     },
+    "BridgeFrame": {
+      "description": "One frame on a bridge's standard input or output.\n\nStandard error stays diagnostic: nothing a person or a log reads there is part of this union,\nso a helper that writes a warning cannot corrupt the stream.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The invoker's opening frame.",
+          "properties": {
+            "hello": {
+              "$ref": "#/$defs/BridgeHello"
+            }
+          },
+          "required": [
+            "hello"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The helper's answer to it.",
+          "properties": {
+            "hello_ack": {
+              "$ref": "#/$defs/BridgeHelloAck"
+            }
+          },
+          "required": [
+            "hello_ack"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The helper's refusal. Nothing follows it.",
+          "properties": {
+            "refused": {
+              "$ref": "#/$defs/ProtocolError"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One protocol frame, carried unchanged in either direction.",
+          "properties": {
+            "control": {
+              "$ref": "#/$defs/ControlFrame"
+            }
+          },
+          "required": [
+            "control"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BridgeHello": {
+      "additionalProperties": false,
+      "description": "The first frame an invoker writes to a bridge helper's standard input.\n\nSection 3 restricts the process bridges to locally authenticated command-line invocations. The\ningress below is the one the request *originally* arrived on, not the local IPC hop the helper\nitself makes, and a helper refuses anything but a local one before it opens a connection. An\ninvoker that declared a remote ingress would be refused; an invoker that lied about it would\ngain nothing, because the declaration can never widen what the helper's own operating-system\ncredentials already establish.",
+      "properties": {
+        "already_bridged": {
+          "description": "Whether the request had already crossed a bridge before this one.\n\nSection 3 puts a federated proxy outside version 1, so a request crosses at most one\nbridge. A second hop is refused rather than chained.",
+          "type": "boolean"
+        },
+        "build_id": {
+          "$ref": "#/$defs/BuildId",
+          "description": "The invoker's build."
+        },
+        "origin_environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the invoker runs in. It is recorded, never trusted for authority."
+        },
+        "origin_ingress": {
+          "$ref": "#/$defs/ActorIngress",
+          "description": "The ingress the request originally arrived on."
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version the invoker speaks."
+        },
+        "target": {
+          "$ref": "#/$defs/BridgeTarget",
+          "description": "What to reach inside the destination environment."
+        }
+      },
+      "required": [
+        "protocol_version",
+        "build_id",
+        "origin_environment_id",
+        "origin_ingress",
+        "already_bridged",
+        "target"
+      ],
+      "type": "object"
+    },
+    "BridgeHelloAck": {
+      "additionalProperties": false,
+      "description": "The helper's answer, once it has reached what the invoker asked for.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the destination is running."
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The connection identity that host assigned the helper."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The destination environment. Its own identity, never the invoker's."
+        },
+        "max_frame_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The largest complete frame either side may write, in bytes."
+        },
+        "os_user": {
+          "description": "The operating-system user the helper runs as there.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version both sides will use."
+        },
+        "role": {
+          "$ref": "#/$defs/LocalRole",
+          "description": "Which host process the helper reached."
+        }
+      },
+      "required": [
+        "protocol_version",
+        "environment_id",
+        "os_user",
+        "role",
+        "connection_id",
+        "boot_identity",
+        "max_frame_len"
+      ],
+      "type": "object"
+    },
+    "BridgeTarget": {
+      "description": "What a bridge helper is asked to reach inside its own environment.",
+      "oneOf": [
+        {
+          "const": "controller",
+          "description": "That environment's control daemon.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker that owns one session there.",
+          "properties": {
+            "session": {
+              "properties": {
+                "session_id": {
+                  "$ref": "#/$defs/SessionId",
+                  "description": "The session."
+                }
+              },
+              "required": [
+                "session_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "session"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "BuildId": {
       "description": "A build identifier reported in hello.",
       "maxLength": 256,
@@ -7878,6 +8050,31 @@
         }
       ]
     },
+    "EnvironmentAccess": {
+      "description": "How this host reaches one enrolled environment.\n\nSection 3 keeps two of these apart on purpose. A WSL distribution and an enrolled container are\nreached by a **local process bridge**: a child process started inside the target that speaks\nthis protocol over its own standard streams. An SSH login and a paired remote host are not.\nAn SSH user runs the destination command line under their own login, which is genuinely local\noperating-system access there, and a named remote host in the application uses that\nenvironment's paired endpoint. Neither is a bridge, and neither becomes one by forwarding a\nsocket.",
+      "oneOf": [
+        {
+          "const": "wsl_distribution",
+          "description": "A WSL distribution on this Windows installation, reached by a local process bridge.",
+          "type": "string"
+        },
+        {
+          "const": "container",
+          "description": "An enrolled container on this host, reached by a local process bridge.",
+          "type": "string"
+        },
+        {
+          "const": "ssh_host",
+          "description": "A host an SSH login reaches, where the destination command line runs under that login.",
+          "type": "string"
+        },
+        {
+          "const": "paired_host",
+          "description": "A remote host the application reaches through that environment's own paired endpoint.",
+          "type": "string"
+        }
+      ]
+    },
     "EnvironmentCapabilitiesParams": {
       "additionalProperties": false,
       "description": "Parameters of `environment.capabilities`.",
@@ -7929,11 +8126,195 @@
       ],
       "type": "object"
     },
+    "EnvironmentEnrolParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `environment.enrol`.",
+      "properties": {
+        "enrolment": {
+          "$ref": "#/$defs/EnvironmentEnrolment",
+          "description": "The record the owner is approving."
+        }
+      },
+      "required": [
+        "enrolment"
+      ],
+      "type": "object"
+    },
+    "EnvironmentEnrolResult": {
+      "additionalProperties": false,
+      "description": "The result of `environment.enrol`.",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/EnvironmentInventoryRow",
+          "description": "The row this enrolment now has in the inventory."
+        }
+      },
+      "required": [
+        "row"
+      ],
+      "type": "object"
+    },
+    "EnvironmentEnrolment": {
+      "additionalProperties": false,
+      "description": "One enrolled environment, as its owner approved it.\n\nEnrolment is what section 3 requires to be recorded: the distribution or container identity,\nthe operating-system user inside it, and the absolute path of the helper installed there. The\nlabel is what a person types; it selects a record and is never compared as an identity, which\nis why a container that is destroyed and recreated under the same name does not inherit this\nrow.",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/EnvironmentAccess",
+          "description": "How this host reaches it."
+        },
+        "approved_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the owner approved this record."
+        },
+        "clipboard_destination": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where this environment's clipboard writes go, when the owner named a destination.\n\nSection 18 asks for explicit clipboard destinations. Absent means this environment has\nnone, not that it inherits this host's."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment this record names. One installation, one OS user identity."
+        },
+        "helper_path": {
+          "description": "The absolute path of the helper installed in the target.",
+          "type": "string"
+        },
+        "label": {
+          "description": "The name a person selects this record by. A label, never an identity.",
+          "type": "string"
+        },
+        "os_user": {
+          "description": "The operating-system user the helper runs as inside the target.",
+          "type": "string"
+        },
+        "target": {
+          "description": "The identity the platform issues: the distribution name WSL registered, the container\nidentifier the runtime issued, or the SSH destination. Compared exactly.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_id",
+        "access",
+        "label",
+        "target",
+        "os_user",
+        "helper_path",
+        "clipboard_destination",
+        "approved_at_ms"
+      ],
+      "type": "object"
+    },
+    "EnvironmentForgetParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `environment.forget`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment to remove."
+        }
+      },
+      "required": [
+        "environment_id"
+      ],
+      "type": "object"
+    },
+    "EnvironmentForgetResult": {
+      "additionalProperties": false,
+      "description": "The result of `environment.forget`.",
+      "properties": {
+        "forgotten": {
+          "description": "Whether a record was there to remove.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "forgotten"
+      ],
+      "type": "object"
+    },
     "EnvironmentId": {
       "description": "One installed OS, distribution or container environment and OS user.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "EnvironmentInventoryParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `environment.inventory`.",
+      "properties": {
+        "access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EnvironmentAccess"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Report only this access class, when one is named."
+        }
+      },
+      "required": [
+        "access"
+      ],
+      "type": "object"
+    },
+    "EnvironmentInventoryResult": {
+      "additionalProperties": false,
+      "description": "The result of `environment.inventory`.\n\nEvery row here was read from the cache. Nothing was contacted and nothing was started to\nproduce this answer, which is what section 3 requires of a listing.",
+      "properties": {
+        "rows": {
+          "description": "The rows, in enrolment order.",
+          "items": {
+            "$ref": "#/$defs/EnvironmentInventoryRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "rows"
+      ],
+      "type": "object"
+    },
+    "EnvironmentInventoryRow": {
+      "additionalProperties": false,
+      "description": "One row of the owner-approved cached inventory.",
+      "properties": {
+        "enrolment": {
+          "$ref": "#/$defs/EnvironmentEnrolment",
+          "description": "The enrolment this row describes."
+        },
+        "last_observed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the presence below was observed."
+        },
+        "observation": {
+          "$ref": "#/$defs/ObservationSource",
+          "description": "Whether that observation was read from the cache or made by asking the platform."
+        },
+        "readiness": {
+          "$ref": "#/$defs/EnvironmentReadiness",
+          "description": "What this environment still needs."
+        },
+        "status": {
+          "$ref": "#/$defs/EnvironmentPresence",
+          "description": "What was observed then."
+        }
+      },
+      "required": [
+        "enrolment",
+        "last_observed_at_ms",
+        "status",
+        "observation",
+        "readiness"
+      ],
+      "type": "object"
     },
     "EnvironmentListResult": {
       "additionalProperties": false,
@@ -7949,6 +8330,88 @@
       },
       "required": [
         "environments"
+      ],
+      "type": "object"
+    },
+    "EnvironmentPresence": {
+      "description": "What this host last observed about an enrolled environment.\n\nSection 3: a listing carries an explicit `stale` or `environment_stopped` status, and a cached\nrow is not evidence that a process is currently live.",
+      "oneOf": [
+        {
+          "const": "running",
+          "description": "The environment was running when it was last observed.",
+          "type": "string"
+        },
+        {
+          "const": "environment_stopped",
+          "description": "The environment was stopped when it was last observed.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "Nothing recent enough to describe the present has been observed.",
+          "type": "string"
+        }
+      ]
+    },
+    "EnvironmentReadiness": {
+      "additionalProperties": false,
+      "description": "What a named environment still needs before the bridge can serve it.\n\nSection 18: an SSH or container integration still needs a suitable helper and scoped\ncredentials in the target environment, and socket forwarding alone does not install it. So the\ntwo conditions are reported separately and neither is inferred from the other.",
+      "properties": {
+        "channel_scoped": {
+          "description": "Whether the owner has granted this environment its own scoped local channel.",
+          "type": "boolean"
+        },
+        "detail": {
+          "description": "What a person should do when either is missing.",
+          "type": "string"
+        },
+        "helper_enrolled": {
+          "description": "Whether the enrolment names a helper this host would run.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "helper_enrolled",
+        "channel_scoped",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "EnvironmentRefreshParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `environment.refresh`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment to observe."
+        },
+        "start": {
+          "description": "Whether this refresh may start the environment it selected.\n\nA listing never starts anything. A refresh may, and says so here rather than deciding for\nthe caller.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "environment_id",
+        "start"
+      ],
+      "type": "object"
+    },
+    "EnvironmentRefreshResult": {
+      "additionalProperties": false,
+      "description": "The result of `environment.refresh`.",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/EnvironmentInventoryRow",
+          "description": "The row as this refresh observed it."
+        },
+        "started": {
+          "description": "Whether this refresh started the environment.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "started"
       ],
       "type": "object"
     },
@@ -11709,6 +12172,26 @@
           "type": "string"
         },
         {
+          "const": "environment.enrol",
+          "description": "Record an enrolled WSL, container, SSH or paired environment: its platform identity, its operating-system user and the absolute path of the helper installed there.",
+          "type": "string"
+        },
+        {
+          "const": "environment.forget",
+          "description": "Remove one enrolled environment and its cached inventory row.",
+          "type": "string"
+        },
+        {
+          "const": "environment.inventory",
+          "description": "The owner-approved cached inventory of enrolled environments. It reports what was last observed and starts nothing.",
+          "type": "string"
+        },
+        {
+          "const": "environment.refresh",
+          "description": "Observe one enrolled environment now, and start it when the request asks for that.",
+          "type": "string"
+        },
+        {
           "const": "pair.invite",
           "description": "Issue a five-minute single-use pairing invitation in code or direct mode.",
           "type": "string"
@@ -12915,6 +13398,21 @@
         {
           "const": "user_report",
           "description": "A person reported what they saw.",
+          "type": "string"
+        }
+      ]
+    },
+    "ObservationSource": {
+      "description": "Where the observation in a row came from.",
+      "oneOf": [
+        {
+          "const": "cache",
+          "description": "Read from this host's cache. Nothing was contacted or started to produce it.",
+          "type": "string"
+        },
+        {
+          "const": "refresh",
+          "description": "Observed by asking the platform, as part of an explicit refresh.",
           "type": "string"
         }
       ]
@@ -25654,6 +26152,15 @@
     "backup_writer_record": {
       "$ref": "#/$defs/BackupWriterRecord"
     },
+    "bridge_frame": {
+      "$ref": "#/$defs/BridgeFrame"
+    },
+    "bridge_hello": {
+      "$ref": "#/$defs/BridgeHello"
+    },
+    "bridge_hello_ack": {
+      "$ref": "#/$defs/BridgeHelloAck"
+    },
     "capability_record": {
       "$ref": "#/$defs/CapabilityRecord"
     },
@@ -25801,8 +26308,38 @@
     "environment_capabilities_result": {
       "$ref": "#/$defs/EnvironmentCapabilitiesResult"
     },
+    "environment_enrol_params": {
+      "$ref": "#/$defs/EnvironmentEnrolParams"
+    },
+    "environment_enrol_result": {
+      "$ref": "#/$defs/EnvironmentEnrolResult"
+    },
+    "environment_enrolment": {
+      "$ref": "#/$defs/EnvironmentEnrolment"
+    },
+    "environment_forget_params": {
+      "$ref": "#/$defs/EnvironmentForgetParams"
+    },
+    "environment_forget_result": {
+      "$ref": "#/$defs/EnvironmentForgetResult"
+    },
+    "environment_inventory_params": {
+      "$ref": "#/$defs/EnvironmentInventoryParams"
+    },
+    "environment_inventory_result": {
+      "$ref": "#/$defs/EnvironmentInventoryResult"
+    },
+    "environment_inventory_row": {
+      "$ref": "#/$defs/EnvironmentInventoryRow"
+    },
     "environment_list_result": {
       "$ref": "#/$defs/EnvironmentListResult"
+    },
+    "environment_refresh_params": {
+      "$ref": "#/$defs/EnvironmentRefreshParams"
+    },
+    "environment_refresh_result": {
+      "$ref": "#/$defs/EnvironmentRefreshResult"
     },
     "events_snapshot_params": {
       "$ref": "#/$defs/EventsSnapshotParams"

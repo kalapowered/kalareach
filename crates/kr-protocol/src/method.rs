@@ -371,6 +371,30 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "Host diagnostics with credentials redacted.";
 
+    EnvironmentEnrol = "environment.enrol", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: WhenEnlargingAuthority, idempotency: ACTION,
+    doc: "Record an enrolled WSL, container, SSH or paired environment: its platform identity, its operating-system user and the absolute path of the helper installed there.";
+
+    EnvironmentForget = "environment.forget", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Remove one enrolled environment and its cached inventory row.";
+
+    EnvironmentInventory = "environment.inventory", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc], rights: [], selectors: [Host, Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "The owner-approved cached inventory of enrolled environments. It reports what was last observed and starts nothing.";
+
+    EnvironmentRefresh = "environment.refresh", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Observe one enrolled environment now, and start it when the request asks for that.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],

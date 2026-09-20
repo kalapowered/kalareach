@@ -60,6 +60,12 @@ use crate::hostinfo::{
     EffectiveConfiguration, EnvironmentListResult, HostDoctorResult, HostInfoResult, SupportBundle,
     configuration::ConfigurationDocument,
 };
+use crate::identity::{
+    BridgeFrame, BridgeHello, BridgeHelloAck, EnvironmentEnrolParams, EnvironmentEnrolResult,
+    EnvironmentEnrolment, EnvironmentForgetParams, EnvironmentForgetResult,
+    EnvironmentInventoryParams, EnvironmentInventoryResult, EnvironmentInventoryRow,
+    EnvironmentRefreshParams, EnvironmentRefreshResult,
+};
 use crate::ids;
 use crate::ids::SessionRef;
 use crate::input::{
@@ -240,6 +246,19 @@ pub fn protocol_schema() -> Value {
         "envelope_plaintext" => EnvelopePlaintext,
         "environment_capabilities_params" => EnvironmentCapabilitiesParams,
         "environment_capabilities_result" => EnvironmentCapabilitiesResult,
+        "environment_enrol_params" => EnvironmentEnrolParams,
+        "environment_enrol_result" => EnvironmentEnrolResult,
+        "environment_enrolment" => EnvironmentEnrolment,
+        "environment_forget_params" => EnvironmentForgetParams,
+        "environment_forget_result" => EnvironmentForgetResult,
+        "environment_inventory_params" => EnvironmentInventoryParams,
+        "environment_inventory_result" => EnvironmentInventoryResult,
+        "environment_inventory_row" => EnvironmentInventoryRow,
+        "environment_refresh_params" => EnvironmentRefreshParams,
+        "environment_refresh_result" => EnvironmentRefreshResult,
+        "bridge_frame" => BridgeFrame,
+        "bridge_hello" => BridgeHello,
+        "bridge_hello_ack" => BridgeHelloAck,
         "expiration_tombstone" => ExpirationTombstone,
         "fence_evidence" => FenceEvidence,
         "fenced_action" => FencedAction,

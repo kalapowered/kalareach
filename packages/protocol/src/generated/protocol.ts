@@ -139,67 +139,23 @@ export type AttentionKey = string
  */
 export type RevocationRequestId = string
 /**
- * How long a worker's execution context lasts.
+ * One frame on a bridge's standard input or output.
  *
- * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
- * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
- * survives logout where the platform's user service manager does.
+ * Standard error stays diagnostic: nothing a person or a log reads there is part of this union,
+ * so a helper that writes a warning cannot corrupt the stream.
  */
-export type WorkerProfile = 'desktop_bound' | 'headless_user'
-/**
- * What makes a capability record stale.
- */
-export type CapabilityInvalidation =
-  | 'binary_identity'
-  | 'binding_identity'
-  | 'package_schema'
-  | 'os_permission'
-  | 'desktop_generation'
-  | 'worker_profile'
-/**
- * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
- */
-export type DesktopSessionId = string
-/**
- * How consistent the source of one capture was.
- *
- * There is no default and no fourth member that means "probably fine". A live multi-file capture
- * is [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what
- * section 14 means by never advertising a point-in-time snapshot without one.
- */
-export type SourceConsistency = 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
-/**
- * One automation run.
- */
-export type WorkflowRunId = string
-/**
- * One immutable captured change set.
- */
-export type ChangeSetId = string
-/**
- * The exact version of a change set that was tested or reviewed.
- */
-export type ChangeSetVersion = string
-/**
- * A versioned capability name. Capabilities describe feasibility, never authority.
- */
-export type CapabilityId = string
-/**
- * The owner's sleep-inhibition choice.
- *
- * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
- * well is a second, separate choice.
- */
-export type SleepInhibitionSetting = 'off' | 'mains_only' | 'battery_too'
-/**
- * The host's answer to a client proof.
- */
-export type ConnectReply =
+export type BridgeFrame =
   | {
-      accepted: ConnectAccepted
+      hello: BridgeHello
+    }
+  | {
+      hello_ack: BridgeHelloAck
     }
   | {
       refused: ProtocolError
+    }
+  | {
+      control: ControlFrame
     }
 /**
  * One frame on an authorised control stream.
@@ -295,6 +251,10 @@ export type ControlFrame =
       acceptance_delivered: ActionId
     }
 /**
+ * A versioned capability name. Capabilities describe feasibility, never authority.
+ */
+export type CapabilityId = string
+/**
  * The session epoch, fixed at 1 in protocol version 1.
  */
 export type SessionEpoch = string
@@ -373,6 +333,65 @@ export type ActionRight =
  */
 export type ActionId = string
 /**
+ * How long a worker's execution context lasts.
+ *
+ * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
+ * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
+ * survives logout where the platform's user service manager does.
+ */
+export type WorkerProfile = 'desktop_bound' | 'headless_user'
+/**
+ * What makes a capability record stale.
+ */
+export type CapabilityInvalidation =
+  | 'binary_identity'
+  | 'binding_identity'
+  | 'package_schema'
+  | 'os_permission'
+  | 'desktop_generation'
+  | 'worker_profile'
+/**
+ * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
+ */
+export type DesktopSessionId = string
+/**
+ * How consistent the source of one capture was.
+ *
+ * There is no default and no fourth member that means "probably fine". A live multi-file capture
+ * is [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what
+ * section 14 means by never advertising a point-in-time snapshot without one.
+ */
+export type SourceConsistency = 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
+/**
+ * One automation run.
+ */
+export type WorkflowRunId = string
+/**
+ * One immutable captured change set.
+ */
+export type ChangeSetId = string
+/**
+ * The exact version of a change set that was tested or reviewed.
+ */
+export type ChangeSetVersion = string
+/**
+ * The owner's sleep-inhibition choice.
+ *
+ * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
+ * well is a second, separate choice.
+ */
+export type SleepInhibitionSetting = 'off' | 'mains_only' | 'battery_too'
+/**
+ * The host's answer to a client proof.
+ */
+export type ConnectReply =
+  | {
+      accepted: ConnectAccepted
+    }
+  | {
+      refused: ProtocolError
+    }
+/**
  * One selected working copy and its policy.
  */
 export type WorkspaceId = string
@@ -434,6 +453,18 @@ export type MailboxThreadId = string
  */
 export type InhibitionReason =
   'foreground_work' | 'pending_requests' | 'foreground_work_and_pending_requests'
+/**
+ * How this host reaches one enrolled environment.
+ *
+ * Section 3 keeps two of these apart on purpose. A WSL distribution and an enrolled container are
+ * reached by a **local process bridge**: a child process started inside the target that speaks
+ * this protocol over its own standard streams. An SSH login and a paired remote host are not.
+ * An SSH user runs the destination command line under their own login, which is genuinely local
+ * operating-system access there, and a named remote host in the application uses that
+ * environment's paired endpoint. Neither is a bridge, and neither becomes one by forwarding a
+ * socket.
+ */
+export type EnvironmentAccess = 'wsl_distribution' | 'container' | 'ssh_host' | 'paired_host'
 /**
  * One transport connection, allocated by the host during hello.
  */
@@ -1272,6 +1303,9 @@ export interface KalaReachProtocol {
   authority_revision_record?: AuthorityRevisionRecord
   backup_generation_publication?: BackupGenerationPublication
   backup_writer_record?: BackupWriterRecord
+  bridge_frame?: BridgeFrame
+  bridge_hello?: BridgeHello
+  bridge_hello_ack?: BridgeHelloAck
   capability_record?: CapabilityRecord
   capture_count?: CaptureCount
   change_manifest?: ChangeManifest1
@@ -1321,7 +1355,17 @@ export interface KalaReachProtocol {
   envelope_plaintext?: EnvelopePlaintext
   environment_capabilities_params?: EnvironmentCapabilitiesParams
   environment_capabilities_result?: EnvironmentCapabilitiesResult
+  environment_enrol_params?: EnvironmentEnrolParams
+  environment_enrol_result?: EnvironmentEnrolResult
+  environment_enrolment?: EnvironmentEnrolment2
+  environment_forget_params?: EnvironmentForgetParams
+  environment_forget_result?: EnvironmentForgetResult
+  environment_inventory_params?: EnvironmentInventoryParams
+  environment_inventory_result?: EnvironmentInventoryResult
+  environment_inventory_row?: EnvironmentInventoryRow1
   environment_list_result?: EnvironmentListResult
+  environment_refresh_params?: EnvironmentRefreshParams
+  environment_refresh_result?: EnvironmentRefreshResult
   events_snapshot_params?: EventsSnapshotParams
   events_snapshot_result?: EventsSnapshotResult
   events_subscribe_params?: EventsSubscribeParams
@@ -3553,6 +3597,1155 @@ export interface TrustedWriter {
   writer_key_id: string
 }
 /**
+ * The first frame an invoker writes to a bridge helper's standard input.
+ *
+ * Section 3 restricts the process bridges to locally authenticated command-line invocations. The
+ * ingress below is the one the request *originally* arrived on, not the local IPC hop the helper
+ * itself makes, and a helper refuses anything but a local one before it opens a connection. An
+ * invoker that declared a remote ingress would be refused; an invoker that lied about it would
+ * gain nothing, because the declaration can never widen what the helper's own operating-system
+ * credentials already establish.
+ */
+export interface BridgeHello {
+  /**
+   * Whether the request had already crossed a bridge before this one.
+   *
+   * Section 3 puts a federated proxy outside version 1, so a request crosses at most one
+   * bridge. A second hop is refused rather than chained.
+   */
+  already_bridged: boolean
+  /**
+   * The invoker's build.
+   */
+  build_id: string
+  /**
+   * The environment the invoker runs in. It is recorded, never trusted for authority.
+   */
+  origin_environment_id: string
+  /**
+   * The ingress the request originally arrived on.
+   */
+  origin_ingress:
+    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+  protocol_version: ProtocolVersion
+  /**
+   * What to reach inside the destination environment.
+   */
+  target:
+    | 'controller'
+    | {
+        session: {
+          /**
+           * One KalaReach terminal session.
+           */
+          session_id: string
+        }
+      }
+}
+/**
+ * The protocol version the invoker speaks.
+ */
+export interface ProtocolVersion {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
+}
+/**
+ * The helper's answer, once it has reached what the invoker asked for.
+ */
+export interface BridgeHelloAck {
+  boot_identity: BootIdentity
+  /**
+   * The connection identity that host assigned the helper.
+   */
+  connection_id: string
+  /**
+   * The destination environment. Its own identity, never the invoker's.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_frame_len: string
+  /**
+   * The operating-system user the helper runs as there.
+   */
+  os_user: string
+  protocol_version: ProtocolVersion1
+  /**
+   * Which host process the helper reached.
+   */
+  role: 'controller' | 'worker' | 'rendezvous'
+}
+/**
+ * The boot the destination is running.
+ */
+export interface BootIdentity {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The protocol version both sides will use.
+ */
+export interface ProtocolVersion1 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
+}
+/**
+ * The first frame a local client sends.
+ */
+export interface LocalHello {
+  /**
+   * The client build.
+   */
+  build_id: string
+  /**
+   * The capabilities the client offers.
+   */
+  capabilities: CapabilityId[]
+  /**
+   * What kind of client this is. It says how to frame the conversation; it confers nothing.
+   */
+  client: 'cli' | 'controller' | 'worker'
+  max_receive: ReceiveLimits
+  /**
+   * Every protocol version the client offers.
+   */
+  offered_versions: ProtocolVersion2[]
+}
+/**
+ * The client's own receive limits.
+ */
+export interface ReceiveLimits {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_attachment_frame_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_control_frame_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_input_frame_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_outstanding_mutations: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_send_queue_bytes: string
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion2 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
+}
+/**
+ * The first frame the host sends back.
+ */
+export interface LocalHelloAck {
+  action_window: ActionWindow1
+  boot_identity: BootIdentity1
+  /**
+   * The capabilities both sides will use.
+   */
+  capabilities: CapabilityId[]
+  /**
+   * The connection identity the host assigned.
+   */
+  connection_id: string
+  /**
+   * The environment this endpoint belongs to.
+   */
+  environment_id: string
+  max_receive: ReceiveLimits1
+  peer: LocalPeer
+  /**
+   * Which host process answered.
+   */
+  role: 'controller' | 'worker' | 'rendezvous'
+  selected_version: ProtocolVersion3
+}
+/**
+ * The first action window of this connection.
+ *
+ * It carries a validity *duration*, not a deadline: the authoritative deadline lives on the
+ * host's suspend-aware continuous clock, and the host renews the window on this connection
+ * without being asked. A client schedules its own expectations from the duration and never
+ * computes an expiry the host will honour.
+ */
+export interface ActionWindow1 {
+  /**
+   * The window identity a mutation names.
+   */
+  action_window_id: string
+  /**
+   * The host boot the window is bound to. A restart invalidates new admission through it.
+   */
+  boot_epoch: string
+  /**
+   * The connection the window is bound to.
+   */
+  connection_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`].
+   */
+  valid_for_ms: string
+}
+/**
+ * The boot the host is running.
+ */
+export interface BootIdentity1 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The limits both sides will use.
+ */
+export interface ReceiveLimits1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_attachment_frame_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_control_frame_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_input_frame_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_outstanding_mutations: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_send_queue_bytes: string
+}
+/**
+ * The caller the host authenticated.
+ */
+export interface LocalPeer {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  gid: string
+  /**
+   * The caller's process identifier, where the platform reports one. A hint for diagnostics,
+   * never authority on its own.
+   */
+  pid: U64 | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  uid: string
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion3 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
+}
+/**
+ * A read request.
+ */
+export interface Request {
+  /**
+   * The method name. A name that is not in the registry is denied.
+   */
+  method: string
+  /**
+   * The method version. Schemas are closed for the negotiated version.
+   */
+  method_version: number
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Unique for the lifetime of one connection.
+   */
+  request_id: string
+}
+/**
+ * A mutation request.
+ *
+ * The payload digest covers the method and version, the actor and grant, the complete target, the
+ * preconditions, the action identifier, the freshness window and time to live, and the
+ * parameters. Replacing the window changes the digest, so it is never an automatic retry.
+ */
+export interface MutationRequest {
+  /**
+   * The durable operation identity, a cryptographically generated UUIDv4.
+   */
+  action_id: string
+  /**
+   * The host-issued action window this first admission is bound to.
+   */
+  action_window_id: string
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  expected: unknown
+  /**
+   * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
+   * null and the host resolves its own owner authority.
+   */
+  grant_id: GrantId | null
+  /**
+   * The method name.
+   */
+  method: string
+  /**
+   * The method version.
+   */
+  method_version: number
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Durable operation identity is `action_id`, not this.
+   */
+  request_id: string
+  /**
+   * The requested lifetime. The host derives the accepted deadline and may shorten it. This is
+   * a duration, not permission to refresh a replay.
+   */
+  requested_ttl_ms: string
+  target: ActionTarget
+}
+/**
+ * The exact subject.
+ */
+export interface ActionTarget {
+  /**
+   * The agent binding revision, present exactly when `application_instance_id` is.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The foreground application instance, when the effect has one.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * The environment that owns the effect.
+   */
+  environment_id: string
+  /**
+   * The session epoch, present exactly when `session_id` is.
+   */
+  session_epoch: SessionEpoch | null
+  /**
+   * The session, when the effect has one.
+   */
+  session_id: SessionId | null
+}
+/**
+ * A response correlated to one request.
+ */
+export interface Response {
+  /**
+   * The result.
+   */
+  outcome:
+    | {
+        ok: ParamsValue
+      }
+    | {
+        error: ProtocolError
+      }
+  /**
+   * The request this response answers.
+   */
+  request_id: string
+}
+/**
+ * The response to a mutation request.
+ *
+ * A duplicate request from a still-authorised actor returns the retained receipt without
+ * dispatch. The host checks current authority before returning it, so a revoked device cannot use
+ * an old action identifier to retrieve protected information.
+ */
+export interface ReceiptResponse {
+  receipt: Receipt2
+  /**
+   * The request this response correlates with.
+   */
+  request_id: string
+}
+/**
+ * The current receipt.
+ */
+export interface Receipt2 {
+  /**
+   * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
+   * plus the requested time to live, and any applicable authority or subject deadline. An exact
+   * retry never receives a new deadline.
+   */
+  accepted_deadline_ms: TimestampMs | null
+  /**
+   * The durable operation identity.
+   */
+  action_id: string
+  /**
+   * The verified actor that submitted it.
+   */
+  actor_id: string
+  /**
+   * The failure recorded with a refusal, rejection or unknown outcome.
+   */
+  error: ProtocolError | null
+  /**
+   * The method and version the digest covers.
+   */
+  method: string
+  /**
+   * The method version the digest covers.
+   */
+  method_version: number
+  /**
+   * The digest of the submitted payload, used to detect a reused identifier.
+   */
+  payload_digest: string
+  /**
+   * Why the action was rejected, when the state is `rejected`.
+   */
+  reason: RejectionReason | null
+  /**
+   * A monotonically increasing revision.
+   */
+  revision: string
+  /**
+   * The current state.
+   */
+  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
+}
+/**
+ * One event on a subscribed stream.
+ *
+ * Stream sequences are application sequence numbers. Transport streams do not replace them, and a
+ * client that falls behind receives `RESYNC_REQUIRED` rather than holding the read loop.
+ */
+export interface Notification {
+  /**
+   * What happened.
+   */
+  event_type: string
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  payload: unknown
+  /**
+   * The position of this event in that stream.
+   */
+  sequence: string
+  /**
+   * Which stream the event belongs to.
+   */
+  stream_id: string
+}
+/**
+ * A worker's startup claim, signed with the key it just generated.
+ */
+export interface WorkerRendezvous {
+  boot_identity: BootIdentity2
+  process_start_identity: ProcessStartIdentity1
+  /**
+   * The reservation this worker was started for.
+   */
+  reservation_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The signature over [`rendezvous_elements`].
+   */
+  signature: string
+  /**
+   * The public half of the worker's new per-session key.
+   */
+  worker_public_key: string
+}
+/**
+ * The boot the worker started in.
+ */
+export interface BootIdentity2 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The worker's own process identity, which the controller compares with what the launcher
+ * reported and with the connecting peer.
+ */
+export interface ProcessStartIdentity1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * What the controller tells a worker to become, over the private rendezvous channel.
+ *
+ * The job definition that started the worker carries only non-secret facts: the reservation, the
+ * rendezvous address and the runtime directory. Everything else arrives here, after the worker
+ * has proved which reservation it belongs to, so a creator's environment snapshot never sits in
+ * an argument vector or an environment variable where another process could read it.
+ */
+export interface WorkerLaunchSpec {
+  /**
+   * The generation that spawned this worker.
+   */
+  controller_generation: string
+  /**
+   * The controller's public key, recorded so the worker can check generation tokens.
+   */
+  controller_public_key: string
+  create: SessionCreateParams
+  /**
+   * The local alias, which also names the worker's endpoint.
+   */
+  display_number: string
+  /**
+   * The environment the session belongs to.
+   */
+  environment_id: string
+  /**
+   * The release string the session reports as its terminal program version.
+   */
+  release: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The qualified shell package the controller resolved, as an absolute directory.
+   *
+   * Null for a create that launches no managed package. Where it is present the worker launches
+   * that package and no other: the daemon and the worker can be configured with different
+   * package roots, and a session must run the package its create was admitted against rather
+   * than whichever one the worker's own environment would have found.
+   */
+  shell_package: string | null
+}
+/**
+ * The create request the controller admitted.
+ */
+export interface SessionCreateParams {
+  /**
+   * The working directory. Null selects the caller's directory from the snapshot.
+   */
+  cwd: string | null
+  /**
+   * The starting geometry. Null uses the invisible default of 120x40.
+   */
+  dimensions: Dimensions | null
+  /**
+   * The environment to create in.
+   */
+  environment_id: string
+  /**
+   * The creator's environment snapshot. The host filters terminal identity and reserved
+   * KalaReach variables out of it, and execution-context values take precedence over it.
+   */
+  environment_snapshot: EnvironmentVariable[]
+  launch_profile: LaunchProfile
+  /**
+   * The palette this session starts with. Null takes the profile default.
+   *
+   * This is the one moment the palette can be chosen: section 8 fixes it at creation, and
+   * afterwards only an authorised explicit change moves it. The provenance is recorded either
+   * way, so a palette query can say where the session's colours came from.
+   */
+  palette: PaletteRequest | null
+  /**
+   * How the session is presented locally.
+   */
+  presentation: 'attach' | 'terminal' | 'invisible'
+  /**
+   * The shell to launch. Null selects the environment's configured default.
+   */
+  shell: string | null
+  /**
+   * The shell integration mode.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * The terminal application a `terminal` presentation opens in, by its stable identifier.
+   *
+   * The first step of section 7's order. Null leaves the choice to the host, which detects what
+   * is installed; a named application this host does not have is `TERMINAL_UNAVAILABLE` rather
+   * than a substitution, because somebody asked for that terminal.
+   */
+  terminal: string | null
+  /**
+   * How long the worker's execution context should last.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+}
+/**
+ * One environment variable in a create request's snapshot.
+ */
+export interface EnvironmentVariable {
+  /**
+   * The name.
+   */
+  name: string
+  /**
+   * The value.
+   */
+  value: string
+}
+/**
+ * How this session starts its root shell and what may be launched inside it.
+ */
+export interface LaunchProfile {
+  /**
+   * The opt-in command integrations this session applies to interactive invocations.
+   */
+  command_integrations: CommandIntegration[]
+  /**
+   * Whether a host-authorised `shell.launch` may install a command in this session's editor.
+   *
+   * A profile that says no keeps everything else a managed session has: the fence, the
+   * empty-prompt end-of-file gesture and the attributed acceptance. What it refuses is the one
+   * operation that puts text a person did not type into their editor.
+   */
+  fenced_launch: boolean
+  /**
+   * Which startup files the root shell reads.
+   */
+  startup: 'host_default' | 'interactive' | 'login'
+}
+/**
+ * One agent's opt-in command integration.
+ *
+ * Section 12: where an agent needs integration flags, an explicitly enabled integration adds them
+ * to interactive invocations inside a managed root shell. The command name and the argument
+ * vector the person typed are preserved; the flags are added and nothing is removed or reordered.
+ */
+export interface CommandIntegration {
+  /**
+   * The command name this integration applies to, as typed.
+   */
+  command: string
+  /**
+   * Whether the user has enabled it. A disabled integration changes nothing.
+   */
+  enabled: boolean
+  /**
+   * The flags the agent needs, added to an interactive invocation.
+   */
+  flags: string[]
+}
+/**
+ * The default foreground and background a client's bounded probe established.
+ */
+export interface ProbedPalette {
+  background: Rgb
+  foreground: Rgb1
+}
+/**
+ * The default background the terminal reported.
+ */
+export interface Rgb {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * The default foreground the terminal reported.
+ */
+export interface Rgb1 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * What a worker reports once its root shell is running.
+ */
+export interface WorkerReady {
+  dimensions: Dimensions3
+  /**
+   * The worker's private endpoint.
+   */
+  endpoint: string
+  root_process: ProcessStartIdentity2
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The executable actually launched.
+   */
+  shell_path: string
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions3 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  columns: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  rows: string
+}
+/**
+ * The root shell's process identity.
+ */
+export interface ProcessStartIdentity2 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * A fresh challenge sent to a worker's private endpoint.
+ */
+export interface WorkerVerifyChallenge {
+  /**
+   * Thirty-two fresh random bytes. A reused challenge proves nothing.
+   */
+  nonce: string
+}
+/**
+ * A worker's answer to a challenge.
+ *
+ * The verifier checks the signature against the descriptor's public key **and** compares every
+ * identity field with the descriptor. A worker that answers with a different session, epoch, boot
+ * or process is not the worker the descriptor named.
+ */
+export interface WorkerVerifyProof {
+  boot_identity: BootIdentity3
+  /**
+   * The endpoint the challenge arrived on.
+   */
+  endpoint: string
+  process_start_identity: ProcessStartIdentity3
+  protocol_version: ProtocolVersion4
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The signature over [`verify_elements`].
+   */
+  signature: string
+}
+/**
+ * The boot the worker is running in.
+ */
+export interface BootIdentity3 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The worker's process identity.
+ */
+export interface ProcessStartIdentity3 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion4 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
+}
+/**
+ * A worker's challenge to a controller that wants to speak for a generation.
+ */
+export interface GenerationChallenge {
+  /**
+   * Thirty-two fresh random bytes, bound to this connection and consumed once.
+   */
+  nonce: string
+}
+/**
+ * A controller's proof that it speaks for the current generation.
+ *
+ * The nonce comes from the worker, so a token cannot be replayed onto a later connection. A
+ * worker accepts its current generation again only after a fresh challenge, which fences that
+ * generation's previous connection; it rejects a lower generation outright and requires a
+ * strictly higher one from a replacement.
+ */
+export interface ControllerGenerationToken {
+  boot_identity: BootIdentity4
+  /**
+   * The environment the controller owns.
+   */
+  environment_id: string
+  /**
+   * The generation this controller holds.
+   */
+  generation: string
+  /**
+   * The challenge the worker issued.
+   */
+  nonce: string
+  /**
+   * The signature over [`generation_elements`].
+   */
+  signature: string
+}
+/**
+ * The boot the controller is running in.
+ */
+export interface BootIdentity4 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * A worker's answer to a generation token.
+ */
+export interface GenerationAccepted {
+  /**
+   * True when accepting this token fenced an earlier connection of the same generation.
+   */
+  fenced_previous: boolean
+  /**
+   * The generation the worker now accepts.
+   */
+  generation: string
+}
+/**
+ * A mutation the host admitted for a caller, passed to the component that owns its subject.
+ *
+ * The control daemon owns admission: it authenticates the caller, stamps the freshness window,
+ * checks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding
+ * carries the caller's mutation to the worker **unchanged**, because the mutation is what the
+ * payload digest covers and what the caller will retry with: rewriting any of it would give the
+ * worker a different action from the one the caller asked for.
+ *
+ * What travels beside it is what the worker cannot establish for itself: which principal the host
+ * verified, the rights the grant it was checked against carries, and the deadline the host
+ * accepted. The worker performs the action under all three.
+ */
+export interface ForwardedMutation {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  accepted_deadline_boot_ms: string
+  actor: ActorEnvelope1
+  /**
+   * The rights the grant named in the envelope carries, as the host resolved them.
+   *
+   * Section 8 makes an attachment's granted capabilities the requested ones intersected with
+   * the actor's rights, and the worker is where an attachment is admitted. It holds no grants,
+   * so the rights travel with the mutation that needs them rather than being asked for again.
+   *
+   * Empty when the envelope names no grant, which is what a locally authenticated caller's
+   * operating-system identity is. The worker narrows nothing for such a caller: there is no
+   * grant to narrow by, and its peer credentials already proved it is this user.
+   */
+  grant_rights: ActionRight[]
+  mutation: MutationRequest1
+}
+/**
+ * The actor the host verified, with the ingress it arrived on.
+ */
+export interface ActorEnvelope1 {
+  /**
+   * The stable host-issued principal for this actor.
+   */
+  actor_id: string
+  /**
+   * The connection the request arrived on. Closing the control stream revokes every associated
+   * data stream.
+   */
+  connection_id: string
+  /**
+   * The controller generation that admitted the connection. Remote dispatch is fenced when this
+   * generation is replaced.
+   */
+  controller_generation: string
+  /**
+   * The paired device, when the ingress is a device.
+   */
+  device_id: DeviceId | null
+  /**
+   * The grant the request is being checked against, when one applies.
+   */
+  grant_id: GrantId | null
+  /**
+   * The authority revision the grant was validated at.
+   */
+  grant_revision: AuthorityRevision | null
+  /**
+   * Where the request entered the host.
+   */
+  ingress:
+    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * A mutation request.
+ *
+ * The payload digest covers the method and version, the actor and grant, the complete target, the
+ * preconditions, the action identifier, the freshness window and time to live, and the
+ * parameters. Replacing the window changes the digest, so it is never an automatic retry.
+ */
+export interface MutationRequest1 {
+  /**
+   * The durable operation identity, a cryptographically generated UUIDv4.
+   */
+  action_id: string
+  /**
+   * The host-issued action window this first admission is bound to.
+   */
+  action_window_id: string
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  expected: unknown
+  /**
+   * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
+   * null and the host resolves its own owner authority.
+   */
+  grant_id: GrantId | null
+  /**
+   * The method name.
+   */
+  method: string
+  /**
+   * The method version.
+   */
+  method_version: number
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Durable operation identity is `action_id`, not this.
+   */
+  request_id: string
+  /**
+   * The requested lifetime. The host derives the accepted deadline and may shorten it. This is
+   * a duration, not permission to refresh a replay.
+   */
+  requested_ttl_ms: string
+  target: ActionTarget
+}
+/**
+ * A read the host admitted for a caller, passed to the component that owns its subject.
+ *
+ * A read needs forwarding for the same reason a mutation does, and for one reason more. The
+ * subject is the worker's, and the daemon owns admission; but a read is also *attributed*: the
+ * de-duplication key of a retained receipt is the verified actor and the action together, so a
+ * read that asks about an action has to ask as the caller rather than as the proxy. A plain
+ * request carries no actor, and serving one on the proxy's own principal would answer about the
+ * proxy's actions instead of the caller's.
+ *
+ * What travels beside the request is the actor the host verified, including the ingress it
+ * arrived on. The worker checks the method against *that* ingress, so a method the registry keeps
+ * to private IPC stays unreachable for a paired device even though the frame arrived on a socket.
+ */
+export interface ForwardedRequest {
+  actor: ActorEnvelope2
+  /**
+   * When the authority behind this request runs out, on the machine's own continuous clock.
+   *
+   * A read is not a mutation and carries no accepted deadline, but the authority behind it
+   * still ends: a grant expires while the request is in the worker's queue, and raw input is a
+   * request. The worker compares this inside the boundary that decides what reaches the
+   * application, so bytes admitted a moment before an expiry are not written after it. Null
+   * when the caller's authority is not something that expires, which is what a locally
+   * authenticated caller's operating-system identity is.
+   */
+  authority_deadline_boot_ms: U64 | null
+  request: Request1
+}
+/**
+ * The actor the host verified, with the ingress it arrived on.
+ */
+export interface ActorEnvelope2 {
+  /**
+   * The stable host-issued principal for this actor.
+   */
+  actor_id: string
+  /**
+   * The connection the request arrived on. Closing the control stream revokes every associated
+   * data stream.
+   */
+  connection_id: string
+  /**
+   * The controller generation that admitted the connection. Remote dispatch is fenced when this
+   * generation is replaced.
+   */
+  controller_generation: string
+  /**
+   * The paired device, when the ingress is a device.
+   */
+  device_id: DeviceId | null
+  /**
+   * The grant the request is being checked against, when one applies.
+   */
+  grant_id: GrantId | null
+  /**
+   * The authority revision the grant was validated at.
+   */
+  grant_revision: AuthorityRevision | null
+  /**
+   * Where the request entered the host.
+   */
+  ingress:
+    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * A read request.
+ */
+export interface Request1 {
+  /**
+   * The method name. A name that is not in the registry is denied.
+   */
+  method: string
+  /**
+   * The method version. Schemas are closed for the negotiated version.
+   */
+  method_version: number
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Unique for the lifetime of one connection.
+   */
+  request_id: string
+}
+/**
  * One capability, one subject, one answer.
  *
  * This is the shared section 11 record. Capability evidence describes feasibility and never
@@ -3561,7 +4754,7 @@ export interface TrustedWriter {
  */
 export interface CapabilityRecord {
   /**
-   * The capability, in the shared versioned namespace.
+   * A versioned capability name. Capabilities describe feasibility, never authority.
    */
   capability: string
   /**
@@ -4797,16 +5990,16 @@ export interface ClientOffer {
    * The revision of that device's purpose-separated keys.
    */
   device_key_revision: string
-  max_receive: ReceiveLimits
+  max_receive: ReceiveLimits2
   /**
    * Every public protocol version the client offers.
    */
-  offered_versions: ProtocolVersion[]
+  offered_versions: ProtocolVersion2[]
 }
 /**
  * The client's own receive limits.
  */
-export interface ReceiveLimits {
+export interface ReceiveLimits2 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -4827,19 +6020,6 @@ export interface ReceiveLimits {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
-}
-/**
- * One public protocol version.
- */
-export interface ProtocolVersion {
-  /**
-   * The major version. A mismatch is not negotiable.
-   */
-  major: number
-  /**
-   * The minor version. A peer selects the highest minor both sides support.
-   */
-  minor: number
 }
 /**
  * The final record of one closed session.
@@ -4921,7 +6101,7 @@ export interface TerminatedProcess {
    * True when the process needed forced termination after the grace period.
    */
   forced: boolean
-  identity: ProcessStartIdentity1
+  identity: ProcessStartIdentity4
   /**
    * The executable name, for diagnostics.
    */
@@ -4930,7 +6110,7 @@ export interface TerminatedProcess {
 /**
  * The process and its start identity, so a reused identifier is not mistaken for it.
  */
-export interface ProcessStartIdentity1 {
+export interface ProcessStartIdentity4 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -5102,115 +6282,8 @@ export interface SecretReference {
  * What the host returns once both proofs verify.
  */
 export interface ConnectAccepted {
-  action_window: ActionWindow1
-  host_proof: ConnectProof
-}
-/**
- * The first action window of this connection.
- */
-export interface ActionWindow1 {
-  /**
-   * The window identity a mutation names.
-   */
-  action_window_id: string
-  /**
-   * The host boot the window is bound to. A restart invalidates new admission through it.
-   */
-  boot_epoch: string
-  /**
-   * The connection the window is bound to.
-   */
-  connection_id: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  issued_at_ms: string
-  /**
-   * How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`].
-   */
-  valid_for_ms: string
-}
-/**
- * The host's own proof over the same transcript.
- */
-export interface ConnectProof {
-  /**
-   * The signature over the connection transcript, made with the paired authorisation key.
-   */
-  signature: string
-}
-/**
- * The first frame a local client sends.
- */
-export interface LocalHello {
-  /**
-   * The client build.
-   */
-  build_id: string
-  /**
-   * The capabilities the client offers.
-   */
-  capabilities: CapabilityId[]
-  /**
-   * What kind of client this is. It says how to frame the conversation; it confers nothing.
-   */
-  client: 'cli' | 'controller' | 'worker'
-  max_receive: ReceiveLimits1
-  /**
-   * Every protocol version the client offers.
-   */
-  offered_versions: ProtocolVersion[]
-}
-/**
- * The client's own receive limits.
- */
-export interface ReceiveLimits1 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_attachment_frame_len: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_control_frame_len: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_input_frame_len: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_outstanding_mutations: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_send_queue_bytes: string
-}
-/**
- * The first frame the host sends back.
- */
-export interface LocalHelloAck {
   action_window: ActionWindow2
-  boot_identity: BootIdentity
-  /**
-   * The capabilities both sides will use.
-   */
-  capabilities: CapabilityId[]
-  /**
-   * The connection identity the host assigned.
-   */
-  connection_id: string
-  /**
-   * The environment this endpoint belongs to.
-   */
-  environment_id: string
-  max_receive: ReceiveLimits2
-  peer: LocalPeer
-  /**
-   * Which host process answered.
-   */
-  role: 'controller' | 'worker' | 'rendezvous'
-  selected_version: ProtocolVersion1
+  host_proof: ConnectProof
 }
 /**
  * A host-issued action window.
@@ -5246,929 +6319,13 @@ export interface ActionWindow2 {
   valid_for_ms: string
 }
 /**
- * The boot the host is running.
+ * The host's own proof over the same transcript.
  */
-export interface BootIdentity {
+export interface ConnectProof {
   /**
-   * Where the value came from.
-   */
-  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
-  /**
-   * The opaque value. Compared for equality, never interpreted.
-   */
-  value: string
-}
-/**
- * The limits both sides will use.
- */
-export interface ReceiveLimits2 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_attachment_frame_len: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_control_frame_len: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_input_frame_len: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_outstanding_mutations: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  max_send_queue_bytes: string
-}
-/**
- * The caller the host authenticated.
- */
-export interface LocalPeer {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  gid: string
-  /**
-   * The caller's process identifier, where the platform reports one. A hint for diagnostics,
-   * never authority on its own.
-   */
-  pid: U64 | null
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  uid: string
-}
-/**
- * One public protocol version.
- */
-export interface ProtocolVersion1 {
-  /**
-   * The major version. A mismatch is not negotiable.
-   */
-  major: number
-  /**
-   * The minor version. A peer selects the highest minor both sides support.
-   */
-  minor: number
-}
-/**
- * A read request.
- */
-export interface Request {
-  /**
-   * The method name. A name that is not in the registry is denied.
-   */
-  method: string
-  /**
-   * The method version. Schemas are closed for the negotiated version.
-   */
-  method_version: number
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  params: unknown
-  /**
-   * Correlates the response. Unique for the lifetime of one connection.
-   */
-  request_id: string
-}
-/**
- * A mutation request.
- *
- * The payload digest covers the method and version, the actor and grant, the complete target, the
- * preconditions, the action identifier, the freshness window and time to live, and the
- * parameters. Replacing the window changes the digest, so it is never an automatic retry.
- */
-export interface MutationRequest {
-  /**
-   * The durable operation identity, a cryptographically generated UUIDv4.
-   */
-  action_id: string
-  /**
-   * The host-issued action window this first admission is bound to.
-   */
-  action_window_id: string
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  expected: unknown
-  /**
-   * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
-   * null and the host resolves its own owner authority.
-   */
-  grant_id: GrantId | null
-  /**
-   * The method name.
-   */
-  method: string
-  /**
-   * The method version.
-   */
-  method_version: number
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  params: unknown
-  /**
-   * Correlates the response. Durable operation identity is `action_id`, not this.
-   */
-  request_id: string
-  /**
-   * The requested lifetime. The host derives the accepted deadline and may shorten it. This is
-   * a duration, not permission to refresh a replay.
-   */
-  requested_ttl_ms: string
-  target: ActionTarget
-}
-/**
- * The exact subject.
- */
-export interface ActionTarget {
-  /**
-   * The agent binding revision, present exactly when `application_instance_id` is.
-   */
-  agent_binding_revision: AgentBindingRevision | null
-  /**
-   * The foreground application instance, when the effect has one.
-   */
-  application_instance_id: ApplicationInstanceId | null
-  /**
-   * The environment that owns the effect.
-   */
-  environment_id: string
-  /**
-   * The session epoch, present exactly when `session_id` is.
-   */
-  session_epoch: SessionEpoch | null
-  /**
-   * The session, when the effect has one.
-   */
-  session_id: SessionId | null
-}
-/**
- * A response correlated to one request.
- */
-export interface Response {
-  /**
-   * The result.
-   */
-  outcome:
-    | {
-        ok: ParamsValue
-      }
-    | {
-        error: ProtocolError
-      }
-  /**
-   * The request this response answers.
-   */
-  request_id: string
-}
-/**
- * The response to a mutation request.
- *
- * A duplicate request from a still-authorised actor returns the retained receipt without
- * dispatch. The host checks current authority before returning it, so a revoked device cannot use
- * an old action identifier to retrieve protected information.
- */
-export interface ReceiptResponse {
-  receipt: Receipt2
-  /**
-   * The request this response correlates with.
-   */
-  request_id: string
-}
-/**
- * The current receipt.
- */
-export interface Receipt2 {
-  /**
-   * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
-   * plus the requested time to live, and any applicable authority or subject deadline. An exact
-   * retry never receives a new deadline.
-   */
-  accepted_deadline_ms: TimestampMs | null
-  /**
-   * The durable operation identity.
-   */
-  action_id: string
-  /**
-   * The verified actor that submitted it.
-   */
-  actor_id: string
-  /**
-   * The failure recorded with a refusal, rejection or unknown outcome.
-   */
-  error: ProtocolError | null
-  /**
-   * The method and version the digest covers.
-   */
-  method: string
-  /**
-   * The method version the digest covers.
-   */
-  method_version: number
-  /**
-   * The digest of the submitted payload, used to detect a reused identifier.
-   */
-  payload_digest: string
-  /**
-   * Why the action was rejected, when the state is `rejected`.
-   */
-  reason: RejectionReason | null
-  /**
-   * A monotonically increasing revision.
-   */
-  revision: string
-  /**
-   * The current state.
-   */
-  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  updated_at_ms: string
-}
-/**
- * One event on a subscribed stream.
- *
- * Stream sequences are application sequence numbers. Transport streams do not replace them, and a
- * client that falls behind receives `RESYNC_REQUIRED` rather than holding the read loop.
- */
-export interface Notification {
-  /**
-   * What happened.
-   */
-  event_type: string
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  payload: unknown
-  /**
-   * The position of this event in that stream.
-   */
-  sequence: string
-  /**
-   * Which stream the event belongs to.
-   */
-  stream_id: string
-}
-/**
- * A worker's startup claim, signed with the key it just generated.
- */
-export interface WorkerRendezvous {
-  boot_identity: BootIdentity1
-  process_start_identity: ProcessStartIdentity2
-  /**
-   * The reservation this worker was started for.
-   */
-  reservation_id: string
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * The signature over [`rendezvous_elements`].
+   * The signature over the connection transcript, made with the paired authorisation key.
    */
   signature: string
-  /**
-   * The public half of the worker's new per-session key.
-   */
-  worker_public_key: string
-}
-/**
- * The boot the worker started in.
- */
-export interface BootIdentity1 {
-  /**
-   * Where the value came from.
-   */
-  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
-  /**
-   * The opaque value. Compared for equality, never interpreted.
-   */
-  value: string
-}
-/**
- * The worker's own process identity, which the controller compares with what the launcher
- * reported and with the connecting peer.
- */
-export interface ProcessStartIdentity2 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  pid: string
-  /**
-   * Where the start value came from.
-   */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  start_value: string
-}
-/**
- * What the controller tells a worker to become, over the private rendezvous channel.
- *
- * The job definition that started the worker carries only non-secret facts: the reservation, the
- * rendezvous address and the runtime directory. Everything else arrives here, after the worker
- * has proved which reservation it belongs to, so a creator's environment snapshot never sits in
- * an argument vector or an environment variable where another process could read it.
- */
-export interface WorkerLaunchSpec {
-  /**
-   * The generation that spawned this worker.
-   */
-  controller_generation: string
-  /**
-   * The controller's public key, recorded so the worker can check generation tokens.
-   */
-  controller_public_key: string
-  create: SessionCreateParams
-  /**
-   * The local alias, which also names the worker's endpoint.
-   */
-  display_number: string
-  /**
-   * The environment the session belongs to.
-   */
-  environment_id: string
-  /**
-   * The release string the session reports as its terminal program version.
-   */
-  release: string
-  /**
-   * The session epoch, fixed at 1 in protocol version 1.
-   */
-  session_epoch: string
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * The qualified shell package the controller resolved, as an absolute directory.
-   *
-   * Null for a create that launches no managed package. Where it is present the worker launches
-   * that package and no other: the daemon and the worker can be configured with different
-   * package roots, and a session must run the package its create was admitted against rather
-   * than whichever one the worker's own environment would have found.
-   */
-  shell_package: string | null
-}
-/**
- * The create request the controller admitted.
- */
-export interface SessionCreateParams {
-  /**
-   * The working directory. Null selects the caller's directory from the snapshot.
-   */
-  cwd: string | null
-  /**
-   * The starting geometry. Null uses the invisible default of 120x40.
-   */
-  dimensions: Dimensions | null
-  /**
-   * The environment to create in.
-   */
-  environment_id: string
-  /**
-   * The creator's environment snapshot. The host filters terminal identity and reserved
-   * KalaReach variables out of it, and execution-context values take precedence over it.
-   */
-  environment_snapshot: EnvironmentVariable[]
-  launch_profile: LaunchProfile
-  /**
-   * The palette this session starts with. Null takes the profile default.
-   *
-   * This is the one moment the palette can be chosen: section 8 fixes it at creation, and
-   * afterwards only an authorised explicit change moves it. The provenance is recorded either
-   * way, so a palette query can say where the session's colours came from.
-   */
-  palette: PaletteRequest | null
-  /**
-   * How the session is presented locally.
-   */
-  presentation: 'attach' | 'terminal' | 'invisible'
-  /**
-   * The shell to launch. Null selects the environment's configured default.
-   */
-  shell: string | null
-  /**
-   * The shell integration mode.
-   */
-  shell_mode: 'managed' | 'native_compat'
-  /**
-   * The terminal application a `terminal` presentation opens in, by its stable identifier.
-   *
-   * The first step of section 7's order. Null leaves the choice to the host, which detects what
-   * is installed; a named application this host does not have is `TERMINAL_UNAVAILABLE` rather
-   * than a substitution, because somebody asked for that terminal.
-   */
-  terminal: string | null
-  /**
-   * How long a worker's execution context lasts.
-   *
-   * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
-   * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
-   * survives logout where the platform's user service manager does.
-   */
-  worker_profile: 'desktop_bound' | 'headless_user'
-}
-/**
- * One environment variable in a create request's snapshot.
- */
-export interface EnvironmentVariable {
-  /**
-   * The name.
-   */
-  name: string
-  /**
-   * The value.
-   */
-  value: string
-}
-/**
- * How this session starts its root shell and what may be launched inside it.
- */
-export interface LaunchProfile {
-  /**
-   * The opt-in command integrations this session applies to interactive invocations.
-   */
-  command_integrations: CommandIntegration[]
-  /**
-   * Whether a host-authorised `shell.launch` may install a command in this session's editor.
-   *
-   * A profile that says no keeps everything else a managed session has: the fence, the
-   * empty-prompt end-of-file gesture and the attributed acceptance. What it refuses is the one
-   * operation that puts text a person did not type into their editor.
-   */
-  fenced_launch: boolean
-  /**
-   * Which startup files the root shell reads.
-   */
-  startup: 'host_default' | 'interactive' | 'login'
-}
-/**
- * One agent's opt-in command integration.
- *
- * Section 12: where an agent needs integration flags, an explicitly enabled integration adds them
- * to interactive invocations inside a managed root shell. The command name and the argument
- * vector the person typed are preserved; the flags are added and nothing is removed or reordered.
- */
-export interface CommandIntegration {
-  /**
-   * The command name this integration applies to, as typed.
-   */
-  command: string
-  /**
-   * Whether the user has enabled it. A disabled integration changes nothing.
-   */
-  enabled: boolean
-  /**
-   * The flags the agent needs, added to an interactive invocation.
-   */
-  flags: string[]
-}
-/**
- * The default foreground and background a client's bounded probe established.
- */
-export interface ProbedPalette {
-  background: Rgb
-  foreground: Rgb1
-}
-/**
- * A direct colour.
- */
-export interface Rgb {
-  /**
-   * Blue.
-   */
-  blue: number
-  /**
-   * Green.
-   */
-  green: number
-  /**
-   * Red.
-   */
-  red: number
-}
-/**
- * A direct colour.
- */
-export interface Rgb1 {
-  /**
-   * Blue.
-   */
-  blue: number
-  /**
-   * Green.
-   */
-  green: number
-  /**
-   * Red.
-   */
-  red: number
-}
-/**
- * What a worker reports once its root shell is running.
- */
-export interface WorkerReady {
-  dimensions: Dimensions3
-  /**
-   * The worker's private endpoint.
-   */
-  endpoint: string
-  root_process: ProcessStartIdentity3
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * The executable actually launched.
-   */
-  shell_path: string
-}
-/**
- * A terminal geometry in columns and rows.
- *
- * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
- * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
- */
-export interface Dimensions3 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  columns: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  rows: string
-}
-/**
- * The root shell's process identity.
- */
-export interface ProcessStartIdentity3 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  pid: string
-  /**
-   * Where the start value came from.
-   */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  start_value: string
-}
-/**
- * A fresh challenge sent to a worker's private endpoint.
- */
-export interface WorkerVerifyChallenge {
-  /**
-   * Thirty-two fresh random bytes. A reused challenge proves nothing.
-   */
-  nonce: string
-}
-/**
- * A worker's answer to a challenge.
- *
- * The verifier checks the signature against the descriptor's public key **and** compares every
- * identity field with the descriptor. A worker that answers with a different session, epoch, boot
- * or process is not the worker the descriptor named.
- */
-export interface WorkerVerifyProof {
-  boot_identity: BootIdentity2
-  /**
-   * The endpoint the challenge arrived on.
-   */
-  endpoint: string
-  process_start_identity: ProcessStartIdentity4
-  protocol_version: ProtocolVersion2
-  /**
-   * The session epoch, fixed at 1 in protocol version 1.
-   */
-  session_epoch: string
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * The signature over [`verify_elements`].
-   */
-  signature: string
-}
-/**
- * The boot the worker is running in.
- */
-export interface BootIdentity2 {
-  /**
-   * Where the value came from.
-   */
-  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
-  /**
-   * The opaque value. Compared for equality, never interpreted.
-   */
-  value: string
-}
-/**
- * The worker's process identity.
- */
-export interface ProcessStartIdentity4 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  pid: string
-  /**
-   * Where the start value came from.
-   */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  start_value: string
-}
-/**
- * One public protocol version.
- */
-export interface ProtocolVersion2 {
-  /**
-   * The major version. A mismatch is not negotiable.
-   */
-  major: number
-  /**
-   * The minor version. A peer selects the highest minor both sides support.
-   */
-  minor: number
-}
-/**
- * A worker's challenge to a controller that wants to speak for a generation.
- */
-export interface GenerationChallenge {
-  /**
-   * Thirty-two fresh random bytes, bound to this connection and consumed once.
-   */
-  nonce: string
-}
-/**
- * A controller's proof that it speaks for the current generation.
- *
- * The nonce comes from the worker, so a token cannot be replayed onto a later connection. A
- * worker accepts its current generation again only after a fresh challenge, which fences that
- * generation's previous connection; it rejects a lower generation outright and requires a
- * strictly higher one from a replacement.
- */
-export interface ControllerGenerationToken {
-  boot_identity: BootIdentity3
-  /**
-   * The environment the controller owns.
-   */
-  environment_id: string
-  /**
-   * The generation this controller holds.
-   */
-  generation: string
-  /**
-   * The challenge the worker issued.
-   */
-  nonce: string
-  /**
-   * The signature over [`generation_elements`].
-   */
-  signature: string
-}
-/**
- * The boot the controller is running in.
- */
-export interface BootIdentity3 {
-  /**
-   * Where the value came from.
-   */
-  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
-  /**
-   * The opaque value. Compared for equality, never interpreted.
-   */
-  value: string
-}
-/**
- * A worker's answer to a generation token.
- */
-export interface GenerationAccepted {
-  /**
-   * True when accepting this token fenced an earlier connection of the same generation.
-   */
-  fenced_previous: boolean
-  /**
-   * The generation the worker now accepts.
-   */
-  generation: string
-}
-/**
- * A mutation the host admitted for a caller, passed to the component that owns its subject.
- *
- * The control daemon owns admission: it authenticates the caller, stamps the freshness window,
- * checks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding
- * carries the caller's mutation to the worker **unchanged**, because the mutation is what the
- * payload digest covers and what the caller will retry with: rewriting any of it would give the
- * worker a different action from the one the caller asked for.
- *
- * What travels beside it is what the worker cannot establish for itself: which principal the host
- * verified, the rights the grant it was checked against carries, and the deadline the host
- * accepted. The worker performs the action under all three.
- */
-export interface ForwardedMutation {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  accepted_deadline_boot_ms: string
-  actor: ActorEnvelope1
-  /**
-   * The rights the grant named in the envelope carries, as the host resolved them.
-   *
-   * Section 8 makes an attachment's granted capabilities the requested ones intersected with
-   * the actor's rights, and the worker is where an attachment is admitted. It holds no grants,
-   * so the rights travel with the mutation that needs them rather than being asked for again.
-   *
-   * Empty when the envelope names no grant, which is what a locally authenticated caller's
-   * operating-system identity is. The worker narrows nothing for such a caller: there is no
-   * grant to narrow by, and its peer credentials already proved it is this user.
-   */
-  grant_rights: ActionRight[]
-  mutation: MutationRequest1
-}
-/**
- * The actor the host verified, with the ingress it arrived on.
- */
-export interface ActorEnvelope1 {
-  /**
-   * The stable host-issued principal for this actor.
-   */
-  actor_id: string
-  /**
-   * The connection the request arrived on. Closing the control stream revokes every associated
-   * data stream.
-   */
-  connection_id: string
-  /**
-   * The controller generation that admitted the connection. Remote dispatch is fenced when this
-   * generation is replaced.
-   */
-  controller_generation: string
-  /**
-   * The paired device, when the ingress is a device.
-   */
-  device_id: DeviceId | null
-  /**
-   * The grant the request is being checked against, when one applies.
-   */
-  grant_id: GrantId | null
-  /**
-   * The authority revision the grant was validated at.
-   */
-  grant_revision: AuthorityRevision | null
-  /**
-   * Where the request entered the host.
-   */
-  ingress:
-    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
-}
-/**
- * A mutation request.
- *
- * The payload digest covers the method and version, the actor and grant, the complete target, the
- * preconditions, the action identifier, the freshness window and time to live, and the
- * parameters. Replacing the window changes the digest, so it is never an automatic retry.
- */
-export interface MutationRequest1 {
-  /**
-   * The durable operation identity, a cryptographically generated UUIDv4.
-   */
-  action_id: string
-  /**
-   * The host-issued action window this first admission is bound to.
-   */
-  action_window_id: string
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  expected: unknown
-  /**
-   * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
-   * null and the host resolves its own owner authority.
-   */
-  grant_id: GrantId | null
-  /**
-   * The method name.
-   */
-  method: string
-  /**
-   * The method version.
-   */
-  method_version: number
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  params: unknown
-  /**
-   * Correlates the response. Durable operation identity is `action_id`, not this.
-   */
-  request_id: string
-  /**
-   * The requested lifetime. The host derives the accepted deadline and may shorten it. This is
-   * a duration, not permission to refresh a replay.
-   */
-  requested_ttl_ms: string
-  target: ActionTarget
-}
-/**
- * A read the host admitted for a caller, passed to the component that owns its subject.
- *
- * A read needs forwarding for the same reason a mutation does, and for one reason more. The
- * subject is the worker's, and the daemon owns admission; but a read is also *attributed*: the
- * de-duplication key of a retained receipt is the verified actor and the action together, so a
- * read that asks about an action has to ask as the caller rather than as the proxy. A plain
- * request carries no actor, and serving one on the proxy's own principal would answer about the
- * proxy's actions instead of the caller's.
- *
- * What travels beside the request is the actor the host verified, including the ingress it
- * arrived on. The worker checks the method against *that* ingress, so a method the registry keeps
- * to private IPC stays unreachable for a paired device even though the frame arrived on a socket.
- */
-export interface ForwardedRequest {
-  actor: ActorEnvelope2
-  /**
-   * When the authority behind this request runs out, on the machine's own continuous clock.
-   *
-   * A read is not a mutation and carries no accepted deadline, but the authority behind it
-   * still ends: a grant expires while the request is in the worker's queue, and raw input is a
-   * request. The worker compares this inside the boundary that decides what reaches the
-   * application, so bytes admitted a moment before an expiry are not written after it. Null
-   * when the caller's authority is not something that expires, which is what a locally
-   * authenticated caller's operating-system identity is.
-   */
-  authority_deadline_boot_ms: U64 | null
-  request: Request1
-}
-/**
- * The actor the host verified, with the ingress it arrived on.
- */
-export interface ActorEnvelope2 {
-  /**
-   * The stable host-issued principal for this actor.
-   */
-  actor_id: string
-  /**
-   * The connection the request arrived on. Closing the control stream revokes every associated
-   * data stream.
-   */
-  connection_id: string
-  /**
-   * The controller generation that admitted the connection. Remote dispatch is fenced when this
-   * generation is replaced.
-   */
-  controller_generation: string
-  /**
-   * The paired device, when the ingress is a device.
-   */
-  device_id: DeviceId | null
-  /**
-   * The grant the request is being checked against, when one applies.
-   */
-  grant_id: GrantId | null
-  /**
-   * The authority revision the grant was validated at.
-   */
-  grant_revision: AuthorityRevision | null
-  /**
-   * Where the request entered the host.
-   */
-  ingress:
-    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
-}
-/**
- * A read request.
- */
-export interface Request1 {
-  /**
-   * The method name. A name that is not in the registry is denied.
-   */
-  method: string
-  /**
-   * The method version. Schemas are closed for the negotiated version.
-   */
-  method_version: number
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  params: unknown
-  /**
-   * Correlates the response. Unique for the lifetime of one connection.
-   */
-  request_id: string
 }
 /**
  * Every capability record for one desktop, with the context they are about.
@@ -6188,7 +6345,7 @@ export interface DesktopContext {
    * Whether the desktop is usable right now, separately from process life.
    */
   availability: 'available' | 'locked' | 'background' | 'ended' | 'unknown'
-  boot_identity: BootIdentity4
+  boot_identity: BootIdentity5
   /**
    * The desktop environment or compositor the login session runs, where the platform names it.
    */
@@ -6254,7 +6411,7 @@ export interface DesktopContext {
 /**
  * The boot this desktop belongs to.
  */
-export interface BootIdentity4 {
+export interface BootIdentity5 {
   /**
    * Where the value came from.
    */
@@ -6275,7 +6432,7 @@ export interface DesktopContext1 {
    * Whether the desktop is usable right now, separately from process life.
    */
   availability: 'available' | 'locked' | 'background' | 'ended' | 'unknown'
-  boot_identity: BootIdentity4
+  boot_identity: BootIdentity5
   /**
    * The desktop environment or compositor the login session runs, where the platform names it.
    */
@@ -7798,6 +7955,241 @@ export interface SleepInhibitionState {
   withheld_reason: string | null
 }
 /**
+ * The parameters of `environment.enrol`.
+ */
+export interface EnvironmentEnrolParams {
+  enrolment: EnvironmentEnrolment
+}
+/**
+ * The record the owner is approving.
+ */
+export interface EnvironmentEnrolment {
+  /**
+   * How this host reaches it.
+   */
+  access: 'wsl_distribution' | 'container' | 'ssh_host' | 'paired_host'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  approved_at_ms: string
+  /**
+   * Where this environment's clipboard writes go, when the owner named a destination.
+   *
+   * Section 18 asks for explicit clipboard destinations. Absent means this environment has
+   * none, not that it inherits this host's.
+   */
+  clipboard_destination: string | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The absolute path of the helper installed in the target.
+   */
+  helper_path: string
+  /**
+   * The name a person selects this record by. A label, never an identity.
+   */
+  label: string
+  /**
+   * The operating-system user the helper runs as inside the target.
+   */
+  os_user: string
+  /**
+   * The identity the platform issues: the distribution name WSL registered, the container
+   * identifier the runtime issued, or the SSH destination. Compared exactly.
+   */
+  target: string
+}
+/**
+ * The result of `environment.enrol`.
+ */
+export interface EnvironmentEnrolResult {
+  row: EnvironmentInventoryRow
+}
+/**
+ * The row this enrolment now has in the inventory.
+ */
+export interface EnvironmentInventoryRow {
+  enrolment: EnvironmentEnrolment1
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  last_observed_at_ms: string
+  /**
+   * Whether that observation was read from the cache or made by asking the platform.
+   */
+  observation: 'cache' | 'refresh'
+  readiness: EnvironmentReadiness
+  /**
+   * What was observed then.
+   */
+  status: 'running' | 'environment_stopped' | 'stale'
+}
+/**
+ * The enrolment this row describes.
+ */
+export interface EnvironmentEnrolment1 {
+  /**
+   * How this host reaches it.
+   */
+  access: 'wsl_distribution' | 'container' | 'ssh_host' | 'paired_host'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  approved_at_ms: string
+  /**
+   * Where this environment's clipboard writes go, when the owner named a destination.
+   *
+   * Section 18 asks for explicit clipboard destinations. Absent means this environment has
+   * none, not that it inherits this host's.
+   */
+  clipboard_destination: string | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The absolute path of the helper installed in the target.
+   */
+  helper_path: string
+  /**
+   * The name a person selects this record by. A label, never an identity.
+   */
+  label: string
+  /**
+   * The operating-system user the helper runs as inside the target.
+   */
+  os_user: string
+  /**
+   * The identity the platform issues: the distribution name WSL registered, the container
+   * identifier the runtime issued, or the SSH destination. Compared exactly.
+   */
+  target: string
+}
+/**
+ * What this environment still needs.
+ */
+export interface EnvironmentReadiness {
+  /**
+   * Whether the owner has granted this environment its own scoped local channel.
+   */
+  channel_scoped: boolean
+  /**
+   * What a person should do when either is missing.
+   */
+  detail: string
+  /**
+   * Whether the enrolment names a helper this host would run.
+   */
+  helper_enrolled: boolean
+}
+/**
+ * One enrolled environment, as its owner approved it.
+ *
+ * Enrolment is what section 3 requires to be recorded: the distribution or container identity,
+ * the operating-system user inside it, and the absolute path of the helper installed there. The
+ * label is what a person types; it selects a record and is never compared as an identity, which
+ * is why a container that is destroyed and recreated under the same name does not inherit this
+ * row.
+ */
+export interface EnvironmentEnrolment2 {
+  /**
+   * How this host reaches it.
+   */
+  access: 'wsl_distribution' | 'container' | 'ssh_host' | 'paired_host'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  approved_at_ms: string
+  /**
+   * Where this environment's clipboard writes go, when the owner named a destination.
+   *
+   * Section 18 asks for explicit clipboard destinations. Absent means this environment has
+   * none, not that it inherits this host's.
+   */
+  clipboard_destination: string | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The absolute path of the helper installed in the target.
+   */
+  helper_path: string
+  /**
+   * The name a person selects this record by. A label, never an identity.
+   */
+  label: string
+  /**
+   * The operating-system user the helper runs as inside the target.
+   */
+  os_user: string
+  /**
+   * The identity the platform issues: the distribution name WSL registered, the container
+   * identifier the runtime issued, or the SSH destination. Compared exactly.
+   */
+  target: string
+}
+/**
+ * The parameters of `environment.forget`.
+ */
+export interface EnvironmentForgetParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+}
+/**
+ * The result of `environment.forget`.
+ */
+export interface EnvironmentForgetResult {
+  /**
+   * Whether a record was there to remove.
+   */
+  forgotten: boolean
+}
+/**
+ * The parameters of `environment.inventory`.
+ */
+export interface EnvironmentInventoryParams {
+  /**
+   * Report only this access class, when one is named.
+   */
+  access: EnvironmentAccess | null
+}
+/**
+ * The result of `environment.inventory`.
+ *
+ * Every row here was read from the cache. Nothing was contacted and nothing was started to
+ * produce this answer, which is what section 3 requires of a listing.
+ */
+export interface EnvironmentInventoryResult {
+  /**
+   * The rows, in enrolment order.
+   */
+  rows: EnvironmentInventoryRow1[]
+}
+/**
+ * One row of the owner-approved cached inventory.
+ */
+export interface EnvironmentInventoryRow1 {
+  enrolment: EnvironmentEnrolment1
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  last_observed_at_ms: string
+  /**
+   * Whether that observation was read from the cache or made by asking the platform.
+   */
+  observation: 'cache' | 'refresh'
+  readiness: EnvironmentReadiness
+  /**
+   * What was observed then.
+   */
+  status: 'running' | 'environment_stopped' | 'stale'
+}
+/**
  * The result of `environment.list`.
  */
 export interface EnvironmentListResult {
@@ -7842,6 +8234,51 @@ export interface EnvironmentSummary {
    * The state directory holding the registry, journals and spools.
    */
   state_directory: string
+}
+/**
+ * The parameters of `environment.refresh`.
+ */
+export interface EnvironmentRefreshParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Whether this refresh may start the environment it selected.
+   *
+   * A listing never starts anything. A refresh may, and says so here rather than deciding for
+   * the caller.
+   */
+  start: boolean
+}
+/**
+ * The result of `environment.refresh`.
+ */
+export interface EnvironmentRefreshResult {
+  row: EnvironmentInventoryRow2
+  /**
+   * Whether this refresh started the environment.
+   */
+  started: boolean
+}
+/**
+ * One row of the owner-approved cached inventory.
+ */
+export interface EnvironmentInventoryRow2 {
+  enrolment: EnvironmentEnrolment1
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  last_observed_at_ms: string
+  /**
+   * Whether that observation was read from the cache or made by asking the platform.
+   */
+  observation: 'cache' | 'refresh'
+  readiness: EnvironmentReadiness
+  /**
+   * What was observed then.
+   */
+  status: 'running' | 'environment_stopped' | 'stale'
 }
 /**
  * Parameters of `events.snapshot`.
@@ -8107,7 +8544,7 @@ export interface HistoryGap {
  * that had already run out.
  */
 export interface ExpirationTombstone {
-  boot_identity: BootIdentity5
+  boot_identity: BootIdentity6
   /**
    * Whether the object could still be presented in another boot.
    *
@@ -8138,7 +8575,7 @@ export interface ExpirationTombstone {
 /**
  * The boot the expiry was observed in.
  */
-export interface BootIdentity5 {
+export interface BootIdentity6 {
   /**
    * Where the value came from.
    */
@@ -8921,7 +9358,7 @@ export interface HostSelection {
    */
   host_nonce: string
   limits: ReceiveLimits3
-  selected_version: ProtocolVersion3
+  selected_version: ProtocolVersion5
 }
 /**
  * The negotiated limits.
@@ -8951,7 +9388,7 @@ export interface ReceiveLimits3 {
 /**
  * One public protocol version.
  */
-export interface ProtocolVersion3 {
+export interface ProtocolVersion5 {
   /**
    * The major version. A mismatch is not negotiable.
    */
@@ -9134,7 +9571,7 @@ export interface EffectiveConfiguration1 {
  * The result of `host.info`.
  */
 export interface HostInfoResult {
-  boot_identity: BootIdentity6
+  boot_identity: BootIdentity7
   /**
    * The controller build.
    */
@@ -9160,7 +9597,7 @@ export interface HostInfoResult {
    */
   live_sessions: string
   power: SleepInhibitionState1
-  protocol_version: ProtocolVersion4
+  protocol_version: ProtocolVersion6
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9173,7 +9610,7 @@ export interface HostInfoResult {
 /**
  * The boot this host is running.
  */
-export interface BootIdentity6 {
+export interface BootIdentity7 {
   /**
    * Where the value came from.
    */
@@ -9235,7 +9672,7 @@ export interface SleepInhibitionState1 {
 /**
  * One public protocol version.
  */
-export interface ProtocolVersion4 {
+export interface ProtocolVersion6 {
   /**
    * The major version. A mismatch is not negotiable.
    */
@@ -9805,6 +10242,10 @@ export interface MethodEntry {
     | 'environment.list'
     | 'environment.capabilities'
     | 'host.doctor'
+    | 'environment.enrol'
+    | 'environment.forget'
+    | 'environment.inventory'
+    | 'environment.refresh'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -15481,6 +15922,10 @@ export interface ServiceRequestPayload {
     | 'environment.list'
     | 'environment.capabilities'
     | 'host.doctor'
+    | 'environment.enrol'
+    | 'environment.forget'
+    | 'environment.inventory'
+    | 'environment.refresh'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -15807,11 +16252,7 @@ export interface SessionCreateParams1 {
    */
   terminal: string | null
   /**
-   * How long a worker's execution context lasts.
-   *
-   * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
-   * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
-   * survives logout where the platform's user service manager does.
+   * How long the worker's execution context should last.
    */
   worker_profile: 'desktop_bound' | 'headless_user'
 }
@@ -17250,7 +17691,7 @@ export interface TimeAdapterReading1 {
  * than as time remaining.
  */
 export interface TimeCheckpoint {
-  boot_identity: BootIdentity7
+  boot_identity: BootIdentity8
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -17268,7 +17709,7 @@ export interface TimeCheckpoint {
 /**
  * The boot the mark was taken in.
  */
-export interface BootIdentity7 {
+export interface BootIdentity8 {
   /**
    * Where the value came from.
    */
@@ -18677,7 +19118,7 @@ export interface VoiceStopResult {
  * against, and the identity fields are what the challenge's answer must match.
  */
 export interface WorkerDescriptor {
-  boot_identity: BootIdentity8
+  boot_identity: BootIdentity9
   /**
    * The local alias.
    */
@@ -18691,7 +19132,7 @@ export interface WorkerDescriptor {
    */
   environment_id: string
   process_start_identity: ProcessStartIdentity8
-  protocol_version: ProtocolVersion5
+  protocol_version: ProtocolVersion7
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -18721,7 +19162,7 @@ export interface WorkerDescriptor {
 /**
  * The boot the worker started in.
  */
-export interface BootIdentity8 {
+export interface BootIdentity9 {
   /**
    * Where the value came from.
    */
@@ -18755,7 +19196,7 @@ export interface ProcessStartIdentity8 {
 /**
  * One public protocol version.
  */
-export interface ProtocolVersion5 {
+export interface ProtocolVersion7 {
   /**
    * The major version. A mismatch is not negotiable.
    */
