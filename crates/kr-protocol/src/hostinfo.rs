@@ -303,6 +303,13 @@ pub struct EffectiveConfiguration {
     /// in force and this sentence saying what the document asked for and did not get. A report
     /// that stayed silent about it would be a report of a value nothing is enforcing.
     pub not_in_force: Nullable<String>,
+    /// What this host's workers still owe the authority fence a ceiling here raised.
+    ///
+    /// Null once every worker has acknowledged it. A revision that advanced is not a completed
+    /// revocation: a worker that has not acknowledged its fence still holds work admitted under
+    /// the ceiling that was withdrawn, and this says so for as long as that is true. It is not a
+    /// failure - the values above are in force for everything admitted from now on.
+    pub fence_outstanding: Nullable<String>,
 }
 
 impl EffectiveConfiguration {
@@ -362,6 +369,7 @@ impl EffectiveConfiguration {
             // The sentence carries whatever the failure said, which on a registry error is a
             // filesystem path and a platform message.
             not_in_force: Nullable(self.not_in_force.0.as_deref().map(redaction::redact)),
+            fence_outstanding: Nullable(self.fence_outstanding.0.as_deref().map(redaction::redact)),
             ..self
         }
     }
@@ -393,6 +401,7 @@ impl EffectiveConfiguration {
             secrets: Vec::new(),
             stale_documents: Vec::new(),
             not_in_force: Nullable::null(),
+            fence_outstanding: Nullable::null(),
         }
     }
 }
@@ -2321,7 +2330,21 @@ pub mod redaction {
     const PUBLIC_EXCUSES: &[&str] = &["key", "keys"];
 
     /// Authorization schemes whose value follows the scheme word rather than a separator.
-    const SCHEMES: &[&str] = &["Bearer", "Basic", "Token", "Digest"];
+    /// Authorization scheme words whose value is a credential wherever they appear.
+    ///
+    /// None of them is ordinary English in front of a word, so what follows one is taken whatever
+    /// its case and whatever it looks like. HTTP defines no case for a scheme, and a library that
+    /// spells it `bearer` is carrying exactly the credential a library that spells it `Bearer`
+    /// carries.
+    const CREDENTIAL_SCHEMES: &[&str] = &["Bearer", "Negotiate", "NTLM"];
+
+    /// Scheme words that are also ordinary English.
+    ///
+    /// "digest mismatch" and "basic configuration is invalid" are sentences a person needs, so a
+    /// value here is taken only where the text says it is a scheme: a capital, which is how a
+    /// writer who meant the scheme spells it, or a value that carries something other than
+    /// lower-case letters.
+    const AMBIGUOUS_SCHEMES: &[&str] = &["Basic", "Token", "Digest"];
 
     /// Components whose value runs to the end of the line rather than to the next space.
     ///
@@ -2360,10 +2383,11 @@ pub mod redaction {
     /// Returns a desktop context with every free-text field taken through [`redact`].
     ///
     /// The context travels beside the capability records, to a paired device, into `kr doctor`'s
-    /// output and into a support bundle. Three of its fields are strings the platform or the
+    /// output and into a support bundle. Four of its fields carry strings the platform or the
     /// account supplied rather than values this build chose: the operating-system user name, the
-    /// platform's own session identifier and the compositor's name. The context this host keeps
-    /// for its own comparisons is untouched.
+    /// platform's own session identifier, the compositor's name, and the desktop identity this
+    /// host derives, which has the user name inside it. The context this host keeps for its own
+    /// comparisons is untouched.
     #[must_use]
     pub fn desktop_context(
         context: crate::desktop::DesktopContext,
@@ -2374,8 +2398,23 @@ pub mod redaction {
                 context.platform_session.0.as_deref().map(redact),
             ),
             compositor: crate::scalars::Nullable(context.compositor.0.as_deref().map(redact)),
+            desktop_session_id: crate::scalars::Nullable(
+                context.desktop_session_id.0.as_ref().map(desktop_session),
+            ),
             ..context
         }
+    }
+
+    /// Returns a desktop identity safe to export.
+    ///
+    /// The identity this host derives is not an opaque number: it spells out the login kind, the
+    /// user name, the numeric user, the platform session and the boot identity, so whatever an
+    /// account's own name contains is inside it. A redaction that leaves nothing a valid
+    /// identifier is replaced by the marker rather than by the text it was meant to remove.
+    fn desktop_session(id: &crate::ids::DesktopSessionId) -> crate::ids::DesktopSessionId {
+        crate::ids::DesktopSessionId::new(redact(id.as_str())).unwrap_or_else(|_| {
+            crate::ids::DesktopSessionId::new(MARKER).expect("the marker is a valid identifier")
+        })
     }
 
     /// Returns capability evidence with every free-text field taken through [`redact`].
@@ -2396,12 +2435,39 @@ pub mod redaction {
                 disabled_reason: crate::scalars::Nullable(
                     record.disabled_reason.0.as_deref().map(redact),
                 ),
+                // The same derived desktop identity the context carries, through the same
+                // boundary: one copy of it redacted and the other not would be no boundary.
+                subject: crate::desktop::CapabilitySubject {
+                    desktop_session_id: crate::scalars::Nullable(
+                        record
+                            .subject
+                            .desktop_session_id
+                            .0
+                            .as_ref()
+                            .map(desktop_session),
+                    ),
+                    application: crate::scalars::Nullable(
+                        record.subject.application.0.as_deref().map(redact),
+                    ),
+                    terminal: crate::scalars::Nullable(
+                        record.subject.terminal.0.as_deref().map(redact),
+                    ),
+                    ..record.subject
+                },
                 identity: crate::desktop::CapabilityIdentity {
                     binary: crate::scalars::Nullable(
                         record.identity.binary.0.as_deref().map(redact),
                     ),
                     version: crate::scalars::Nullable(
                         record.identity.version.0.as_deref().map(redact),
+                    ),
+                    // Every string in the identity, so the boundary does not have to be revisited
+                    // the first time a catalogue fills a field this host leaves empty today.
+                    package: crate::scalars::Nullable(
+                        record.identity.package.0.as_deref().map(redact),
+                    ),
+                    schema: crate::scalars::Nullable(
+                        record.identity.schema.0.as_deref().map(redact),
                     ),
                     ..record.identity
                 },
@@ -2427,14 +2493,16 @@ pub mod redaction {
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         while at < text.len() {
-            let Some((found, length)) = SCHEMES
+            let Some((found, length, ambiguous)) = CREDENTIAL_SCHEMES
                 .iter()
-                .filter_map(|scheme| {
+                .map(|scheme| (scheme, false))
+                .chain(AMBIGUOUS_SCHEMES.iter().map(|scheme| (scheme, true)))
+                .filter_map(|(scheme, ambiguous)| {
                     folded[at..]
                         .find(&scheme.to_ascii_lowercase())
-                        .map(|offset| (at + offset, scheme.len()))
+                        .map(|offset| (at + offset, scheme.len(), ambiguous))
                 })
-                .min_by_key(|(offset, _)| *offset)
+                .min_by_key(|(offset, _, _)| *offset)
             else {
                 break;
             };
@@ -2450,17 +2518,16 @@ pub mod redaction {
             let value_end = text[value_start..]
                 .find(char::is_whitespace)
                 .map_or(text.len(), |offset| value_start + offset);
-            // A scheme written with a capital is the HTTP scheme wherever it appears, so its value
-            // goes whatever the value looks like. A scheme written in lower case may be the
-            // ordinary English word instead, so there the value has to look like a credential.
+            // A scheme that is never ordinary English takes its value whatever the value looks
+            // like and however the scheme was spelled. One that is also an English word takes it
+            // where the text says it is a scheme: a capital, which is how a writer who meant the
+            // scheme spells it, or a value that could not be a word in a sentence.
             let written_as_a_scheme = text[found..after]
                 .chars()
                 .any(|character| character.is_ascii_uppercase());
-            if own_word
-                && spacing > 0
-                && value_end > value_start
-                && (written_as_a_scheme || carries_a_value(&text[value_start..value_end]))
-            {
+            let a_credential_follows =
+                !ambiguous || written_as_a_scheme || carries_a_value(&text[value_start..value_end]);
+            if own_word && spacing > 0 && value_end > value_start && a_credential_follows {
                 out.push_str(&text[at..value_start]);
                 out.push_str(MARKER);
                 at = value_end;
@@ -2895,13 +2962,27 @@ mod tests {
             let redacted = redaction::redact(text);
             assert!(!redacted.contains("hunter2"), "{text} -> {redacted}");
         }
-        // A scheme written with a capital takes its value whatever the value looks like, because a
-        // short lower-case secret is still a secret.
-        for text in ["Bearer secret", "BEARER secret", "Basic opensesame"] {
+        // A short lower-case secret is still a secret. `bearer` is never the English word in
+        // front of another word, so its value goes however the scheme was spelled; the schemes
+        // that are also English words take a value that looks like a word only where the writer
+        // spelled the scheme with a capital.
+        for text in [
+            "Bearer secret",
+            "BEARER secret",
+            "bearer secret",
+            "request failed for bearer secret at upstream",
+            "Basic opensesame",
+            "Negotiate opensesame",
+        ] {
             let redacted = redaction::redact(text);
             assert!(!redacted.contains("secret"), "{text} -> {redacted}");
             assert!(!redacted.contains("opensesame"), "{text} -> {redacted}");
         }
+        assert_eq!(
+            redaction::redact("request failed for bearer secret at upstream"),
+            "request failed for bearer [redacted] at upstream",
+            "and the sentence around it survives"
+        );
         // The scheme has to be its own word: a name that merely ends in one is not a scheme, and
         // a scheme with nothing after it has no value to take. A scheme word written in lower
         // case in the middle of a sentence is the English word, and the sentence survives.
@@ -2994,9 +3075,16 @@ mod tests {
                 environment_id: crate::ids::EnvironmentId::new(crate::scalars::Uuid::from_bytes(
                     [0; 16],
                 )),
-                desktop_session_id: Nullable::null(),
+                // The identity this host derives has the account's own name inside it, so a name
+                // that carries a credential carries it into every export of this record.
+                desktop_session_id: Nullable::some(
+                    crate::ids::DesktopSessionId::new(
+                        "graphical:user=password=A1b2C3d4E5f6G7h8I9j0:uid=501".to_owned(),
+                    )
+                    .expect("a desktop identity"),
+                ),
                 session_id: Nullable::null(),
-                application: Nullable::null(),
+                application: Nullable::some("token=A1b2C3d4E5f6G7h8I9j0".to_owned()),
                 terminal: Nullable::null(),
             },
             revision: crate::ids::CapabilityRevision::new(3),
@@ -3017,12 +3105,68 @@ mod tests {
             one.identity.binary.0.clone().unwrap_or_default(),
             one.identity.version.0.clone().unwrap_or_default(),
             one.disabled_reason.0.clone().unwrap_or_default(),
+            one.subject
+                .desktop_session_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())
+                .unwrap_or_default(),
+            one.subject.application.0.clone().unwrap_or_default(),
         ] {
             assert!(!text.contains("A1b2C3d4E5f6"), "{text}");
         }
         assert_eq!(
             one.capability, record.capability,
             "the record is still the record it was"
+        );
+    }
+
+    /// KR-REQ-26.44: the desktop identity this host derives carries the account's own name.
+    #[test]
+    fn a_derived_desktop_identity_never_reaches_the_wire_unredacted() {
+        let context = crate::desktop::DesktopContext {
+            desktop_session_id: Nullable::some(
+                crate::ids::DesktopSessionId::new(
+                    "graphical:user=password=A1b2C3d4E5f6G7h8I9j0:uid=501:session=c2".to_owned(),
+                )
+                .expect("a desktop identity"),
+            ),
+            kind: crate::desktop::DesktopSessionKind::None,
+            platform_session: Nullable::null(),
+            login_generation: Nullable::null(),
+            generation_source: crate::desktop::DesktopGenerationSource::Unavailable,
+            os_user: "password=A1b2C3d4E5f6G7h8I9j0".to_owned(),
+            uid: Nullable::some(U64::new(501)),
+            boot_identity: crate::identity::BootIdentity {
+                source: crate::identity::BootIdentitySource::BootTime,
+                value: crate::scalars::Bytes::from(Vec::new()),
+            },
+            graphic_access: false,
+            remote: false,
+            availability: crate::desktop::DesktopAvailability::Unknown,
+            container: crate::desktop::ContainerEnvironment::Host,
+            display_server: crate::desktop::DisplayServer::None,
+            compositor: Nullable::null(),
+            worker_profile: crate::identity::WorkerProfile::HeadlessUser,
+        };
+        let exported = redaction::desktop_context(context.clone());
+        assert!(!exported.os_user.contains("A1b2C3d4E5f6"), "{exported:?}");
+        assert!(
+            !exported
+                .desktop_session_id
+                .as_ref()
+                .expect("the identity is still there")
+                .as_str()
+                .contains("A1b2C3d4E5f6"),
+            "{exported:?}"
+        );
+        assert!(
+            context
+                .desktop_session_id
+                .as_ref()
+                .expect("the host keeps its own copy")
+                .as_str()
+                .contains("A1b2C3d4E5f6"),
+            "and what this host compares against is untouched"
         );
     }
 

@@ -523,20 +523,27 @@ async fn run(cli: Cli) -> Result<Completion> {
         Command::Doctor(arguments) => {
             let environment = kr_cli::resolve::select(&paths, None)?;
             let mut client = open_controller(&environment.paths, build_id()).await?;
-            let info: HostInfoResult = typed(client.request(Method::HostInfo, &()).await?)?;
-            let checks: HostDoctorResult = typed(client.request(Method::HostDoctor, &()).await?)?;
+            // The diagnostics first, because asking for them is what puts this host's
+            // configuration into force: a ceiling somebody edited by hand takes effect here, and
+            // a ceiling that withdraws authority also withdraws what this connection was admitted
+            // under. Each read is therefore made again on a new connection when that happens, and
+            // everything after it is read under the authority now in force rather than beside a
+            // number the change has already replaced.
+            let checks: HostDoctorResult =
+                diagnostic(&mut client, &environment, Method::HostDoctor, &()).await?;
+            let info: HostInfoResult =
+                diagnostic(&mut client, &environment, Method::HostInfo, &()).await?;
             // What this environment can currently do, which is where the desktop, what a logout
             // does to each profile, and the capability evidence come from.
-            let capabilities: kr_protocol::desktop::EnvironmentCapabilitiesResult = typed(
-                client
-                    .request(
-                        Method::EnvironmentCapabilities,
-                        &kr_protocol::desktop::EnvironmentCapabilitiesParams {
-                            environment_id: environment.environment_id,
-                        },
-                    )
-                    .await?,
-            )?;
+            let capabilities: kr_protocol::desktop::EnvironmentCapabilitiesResult = diagnostic(
+                &mut client,
+                &environment,
+                Method::EnvironmentCapabilities,
+                &kr_protocol::desktop::EnvironmentCapabilitiesParams {
+                    environment_id: environment.environment_id,
+                },
+            )
+            .await?;
             let report = kr_cli::doctor::doctor_lines(&checks, arguments.verbose);
             // The bundle is written before anything is printed, so `--json` produces one document
             // and a bundle that could not be written is the command's failure rather than a note
@@ -1264,6 +1271,34 @@ fn stdio_is_terminal() -> bool {
     use std::io::IsTerminal as _;
 
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Reads one diagnostic, on a new connection when the authority behind this one was withdrawn.
+///
+/// Reading the configuration is what puts it into force, so a ceiling edited outside this host
+/// takes effect during a `kr doctor` run, and a ceiling that changes what a caller may do
+/// deregisters every connection admitted under the authority it replaced - including this
+/// command's own. That is the change working, not a failure, so the read is made again under the
+/// authority now in force. A second refusal is the answer.
+async fn diagnostic<
+    T: serde::de::DeserializeOwned + serde::Serialize,
+    P: serde::Serialize + ?Sized,
+>(
+    client: &mut kr_ipc::client::LocalClient,
+    environment: &kr_cli::resolve::KnownEnvironment,
+    method: Method,
+    params: &P,
+) -> Result<T> {
+    match client.request(method, params).await? {
+        Ok(value) => value
+            .to_typed()
+            .map_err(|error| CliError::Other(error.to_string())),
+        Err(refused) if refused.code == kr_protocol::error::ErrorCode::PermissionDenied => {
+            *client = open_controller(&environment.paths, build_id()).await?;
+            typed(client.request(method, params).await?)
+        }
+        Err(refused) => Err(CliError::Refused(refused)),
+    }
 }
 
 fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(

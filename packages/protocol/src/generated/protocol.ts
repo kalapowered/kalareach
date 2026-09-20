@@ -7366,6 +7366,15 @@ export interface EffectiveConfiguration {
    */
   document: string
   /**
+   * What this host's workers still owe the authority fence a ceiling here raised.
+   *
+   * Null once every worker has acknowledged it. A revision that advanced is not a completed
+   * revocation: a worker that has not acknowledged its fence still holds work admitted under
+   * the ceiling that was withdrawn, and this says so for as long as that is true. It is not a
+   * failure - the values above are in force for everything admitted from now on.
+   */
+  fence_outstanding: string | null
+  /**
    * Why this host could not put the document into force, when something stopped it.
    *
    * Null on an ordinary host. A registry this host cannot write, a fence it cannot raise or
@@ -8987,6 +8996,15 @@ export interface EffectiveConfiguration1 {
    * Where the configuration document is.
    */
   document: string
+  /**
+   * What this host's workers still owe the authority fence a ceiling here raised.
+   *
+   * Null once every worker has acknowledged it. A revision that advanced is not a completed
+   * revocation: a worker that has not acknowledged its fence still holds work admitted under
+   * the ceiling that was withdrawn, and this says so for as long as that is true. It is not a
+   * failure - the values above are in force for everything admitted from now on.
+   */
+  fence_outstanding: string | null
   /**
    * Why this host could not put the document into force, when something stopped it.
    *
@@ -16817,6 +16835,15 @@ export interface EffectiveConfiguration2 {
    * Where the configuration document is.
    */
   document: string
+  /**
+   * What this host's workers still owe the authority fence a ceiling here raised.
+   *
+   * Null once every worker has acknowledged it. A revision that advanced is not a completed
+   * revocation: a worker that has not acknowledged its fence still holds work admitted under
+   * the ceiling that was withdrawn, and this says so for as long as that is true. It is not a
+   * failure - the values above are in force for everything admitted from now on.
+   */
+  fence_outstanding: string | null
   /**
    * Why this host could not put the document into force, when something stopped it.
    *

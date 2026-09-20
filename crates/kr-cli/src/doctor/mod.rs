@@ -51,6 +51,11 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Value {
             "state": effective.status.state.as_str(),
             "detail": effective.status.detail,
         },
+        // Whether the values below are what this host is acting on, and what its workers still
+        // owe a fence one of them raised. A reader that saw only the values would have no way to
+        // tell a configuration in force from one that could not be applied.
+        "not_in_force": effective.not_in_force.as_ref().cloned(),
+        "fence_outstanding": effective.fence_outstanding.as_ref().cloned(),
         "runtime_directory": effective.runtime_directory,
         "state_directory": effective.state_directory,
         "precedence": effective.precedence,

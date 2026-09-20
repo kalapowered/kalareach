@@ -700,6 +700,23 @@ async fn an_external_edit_fences_dispatch_and_invalidates_evidence() {
         .expect("this host's authority revision")
         .authority_revision;
     let evidence_before = evidence_revision(&mut control, host.environment_id).await;
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &control
+            .request(Method::HostInfo, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.info succeeds"),
+    );
+    // Whatever this platform answers, the document chooses the other one, so the evidence has to
+    // move whether this test runs on a desktop or on a headless build machine.
+    let chosen = match info.default_worker_profile {
+        kr_protocol::identity::WorkerProfile::DesktopBound => {
+            kr_protocol::identity::WorkerProfile::HeadlessUser
+        }
+        kr_protocol::identity::WorkerProfile::HeadlessUser => {
+            kr_protocol::identity::WorkerProfile::DesktopBound
+        }
+    };
 
     // One edit, made the way a person makes it: a text editor and no daemon. It moves both the
     // authority ceiling and the profile a session is created in.
@@ -708,8 +725,7 @@ async fn an_external_edit_fences_dispatch_and_invalidates_evidence() {
     edited.revision = 1;
     edited.ceilings.grant_rights =
         Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]);
-    edited.preferences.worker_profile =
-        Nullable::some(kr_protocol::identity::WorkerProfile::HeadlessUser);
+    edited.preferences.worker_profile = Nullable::some(chosen);
     kr_ipc::paths::write_owner_only_file(
         &document,
         kr_protocol::hostinfo::configuration::contents(&edited).as_bytes(),
@@ -825,10 +841,38 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
         "and which worker it is: {refused}"
     );
 
+    // Asking for the same change again is told the same thing. The document does not move, so
+    // nothing derived from it would raise the fence a second time; what is outstanding is this
+    // host's own debt, and a caller told the second attempt succeeded would be told the barrier
+    // holds when it does not.
+    let again = controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionRename.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("the fence is still not acknowledged");
+    assert!(
+        format!("{again}").contains("have not acknowledged"),
+        "{again}"
+    );
+
     // The revision is on disk and the ceiling is in force, which is what "written and not
     // acknowledged" means: the change is not undone by the worker that has not answered.
     let effective = controller.effective_configuration().await;
-    assert_eq!(effective.revision.get(), 2);
+    assert!(
+        effective
+            .fence_outstanding
+            .as_ref()
+            .is_some_and(|pending| pending.contains(&session_id.to_string())),
+        "and the report says so too: {:?}",
+        effective.fence_outstanding
+    );
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "the values are in force; what is outstanding is the acknowledgement: {:?}",
+        effective.not_in_force
+    );
+    assert_eq!(effective.revision.get(), 3);
     assert_eq!(
         effective
             .ceilings
@@ -851,6 +895,19 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
         barrier.holds(),
         "a worker confirmed gone satisfies the barrier: {barrier:?}"
     );
+    assert!(
+        controller
+            .effective_configuration()
+            .await
+            .fence_outstanding
+            .0
+            .is_none(),
+        "and the debt is settled without anything being written again"
+    );
+    controller
+        .apply_configuration(&Change::GrantRights(None))
+        .await
+        .expect("a change is acknowledged once every barrier holds");
 
     host.stop().await;
 }

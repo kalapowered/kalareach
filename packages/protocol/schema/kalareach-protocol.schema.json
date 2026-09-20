@@ -7435,6 +7435,17 @@
           "description": "Where the configuration document is.",
           "type": "string"
         },
+        "fence_outstanding": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this host's workers still owe the authority fence a ceiling here raised.\n\nNull once every worker has acknowledged it. A revision that advanced is not a completed\nrevocation: a worker that has not acknowledged its fence still holds work admitted under\nthe ceiling that was withdrawn, and this says so for as long as that is true. It is not a\nfailure - the values above are in force for everything admitted from now on."
+        },
         "not_in_force": {
           "anyOf": [
             {
@@ -7515,7 +7526,8 @@
         "ceilings",
         "secrets",
         "stale_documents",
-        "not_in_force"
+        "not_in_force",
+        "fence_outstanding"
       ],
       "type": "object"
     },

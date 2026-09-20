@@ -78,6 +78,28 @@ pub struct Accepted {
 }
 
 impl Accepted {
+    /// Returns what this host's workers still owe the fence a ceiling here raised.
+    ///
+    /// `None` once every one of them has acknowledged it, which is what a completed revocation
+    /// is. A revision that advanced is not one: a worker that has not answered still holds work
+    /// admitted under the ceiling that was withdrawn.
+    #[must_use]
+    pub fn fence_outstanding(&self) -> Option<String> {
+        let barrier = self.barrier.as_ref().filter(|barrier| !barrier.holds())?;
+        Some(format!(
+            "authority revision {} is in force for everything admitted from now on, and {} of \
+             this host's workers have not acknowledged the fence yet ({})",
+            barrier.authority_revision,
+            barrier.pending().len(),
+            barrier
+                .pending()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
     /// The state of a host acting on exactly what this document says.
     ///
     /// What the daemon's acceptance comes to when every effect landed, and what a report built
@@ -127,7 +149,44 @@ pub struct AcceptedState {
     /// The document those effects came from, when this host could use one.
     pub document: Option<configuration::ConfigurationDocument>,
     /// The session number admission enforces because of it.
+    ///
+    /// Written as soon as the registry takes it, before the effects after it are attempted, so a
+    /// later failure cannot leave this describing a number admission has stopped enforcing.
     pub sessions: u64,
+    /// True while a worker has not acknowledged the fence a ceiling here raised.
+    ///
+    /// A debt of this host's rather than of the document: the document does not move again, so
+    /// nothing derived from it would raise the fence a second time, and the same change asked for
+    /// again would be told it was done. It is settled by a worker answering or ending.
+    pub fence_outstanding: bool,
+}
+
+/// The ordinary preferences in force, for the effects that act on them.
+///
+/// A preference takes effect by being read, and the things that read one - the sleep inhibitor,
+/// the desktop reading a session is created in - run outside the acceptance that decided it. This
+/// is the value they read, written from the document that was accepted, so an effect acts on the
+/// reading the report describes rather than on a second reading taken a moment later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InForce {
+    /// Whether this host keeps itself awake for work it has admitted, and on which power source.
+    pub sleep_inhibition: SleepInhibitionSetting,
+    /// The execution context a session is created in, where the configuration chooses one.
+    ///
+    /// The product default is the platform's own answer, which is established when the desktop is
+    /// read rather than here, so this is the choice above it rather than the resolved value.
+    pub worker_profile: Option<WorkerProfile>,
+}
+
+impl InForce {
+    /// Reads both preferences from one configuration.
+    #[must_use]
+    pub fn of(resolver: &Resolver) -> Self {
+        Self {
+            sleep_inhibition: resolver.sleep_inhibition(None).value,
+            worker_profile: resolver.chosen_worker_profile(),
+        }
+    }
 }
 
 /// What one applied edit did.
@@ -436,6 +495,7 @@ pub fn effective(
             .map(|path| path.display().to_string())
             .collect(),
         not_in_force: kr_protocol::scalars::Nullable(accepted.not_in_force.clone()),
+        fence_outstanding: kr_protocol::scalars::Nullable(accepted.fence_outstanding()),
     }
 }
 
@@ -486,25 +546,42 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
     checks.push(DoctorCheck::new(
         "configuration-in-force",
         "This host is acting on the configuration it reports",
+        // Three answers, because there are three states. The values do not describe what is
+        // enforced: a failure. They do, and a worker has not yet acknowledged the fence one of
+        // them raised: worth knowing, and not a failure, because everything admitted from now on
+        // is under the new ceiling. Neither: a pass.
         if effective.not_in_force.is_present() {
             DoctorStatus::Failed
+        } else if effective.fence_outstanding.is_present() {
+            DoctorStatus::Warning
         } else {
             DoctorStatus::Ok
         },
-        effective.not_in_force.as_ref().map_or_else(
-            || {
+        effective
+            .not_in_force
+            .as_ref()
+            .or(effective.fence_outstanding.as_ref())
+            .cloned()
+            .unwrap_or_else(|| {
                 format!(
                     "revision {} is in force; every value below is the one this host acts on",
                     effective.revision.get()
                 )
-            },
-            Clone::clone,
-        ),
-        effective.not_in_force.as_ref().map(|_| {
-            "The values below are what this host is enforcing, not what the document asks for. \
-             Fix what the line above names and run this again."
-                .to_owned()
-        }),
+            }),
+        if effective.not_in_force.is_present() {
+            Some(
+                "The values below are what this host is enforcing, not what the document asks \
+                 for. Fix what the line above names and run this again."
+                    .to_owned(),
+            )
+        } else {
+            effective.fence_outstanding.as_ref().map(|_| {
+                "A revocation is complete for a worker once it acknowledges the revision or is \
+                 confirmed ended. Nothing here has to be repeated: this host asks again each time \
+                 it reads its configuration."
+                    .to_owned()
+            })
+        },
     ));
     checks.push(DoctorCheck::new(
         "configuration-precedence",

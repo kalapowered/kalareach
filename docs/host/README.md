@@ -109,12 +109,20 @@ in force. A change to the execution context invalidates the capability evidence 
 one and migrates no worker: a running session keeps the context it was created in.
 
 Those effects belong to the document, not to the command that wrote it. The host puts the document
-on disk into force whenever it reads it, and what it does is decided by what moved since the last
-time it read one, so a ceiling lowered in a text editor fences dispatch and a profile changed there
-replaces the evidence, exactly as the same edit made through `kr` does. It is also one reading:
-what `kr doctor` prints is what was put into force, so a value in a report is never a value nothing
-is enforcing. Where an effect cannot be applied, the report prints what is in force, says what the
-document asked for, and the `configuration-in-force` check fails with the reason.
+on disk into force whenever it is asked what it is configured as, and what it does is decided by
+what moved since the last time it read one, so a ceiling lowered in a text editor fences dispatch
+and a profile changed there replaces the evidence, exactly as the same edit made through `kr` does.
+Fencing dispatch withdraws the authority every open connection was admitted under, so a command
+that asked reconnects and asks again under the authority now in force; that is the change working
+rather than a failure.
+
+It is also one reading: what `kr doctor` prints is what was put into force, so a value in a report
+is never a value nothing is enforcing. Where an effect cannot be applied, the report prints what is
+in force, says what the document asked for, and the `configuration-in-force` check fails with the
+reason. Where the fence a ceiling raised has not been acknowledged by every worker, that same check
+warns and names them: the values are in force for everything admitted from then on, and the
+revocation is complete for a worker once it acknowledges the revision or is confirmed ended. Asking
+for the same change again is told the same thing until it is.
 
 The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
 assertion under; `worker_profile` is the execution context a create request gets when it does not

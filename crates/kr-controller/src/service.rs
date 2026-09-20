@@ -311,6 +311,13 @@ pub struct Controller {
     /// them in order: two acceptances cannot interleave, so the one that finishes last is the one
     /// that read the document on disk.
     accepted_configuration: Mutex<crate::config::AcceptedState>,
+    /// The ordinary preferences in force, for the effects that act on them.
+    ///
+    /// The sleep inhibitor and the desktop reading run outside the acceptance that decided what
+    /// they act on, and a document they read for themselves is a second reading: an external
+    /// writer can publish between the two, and then an effect acts on one document while the
+    /// report describes another. They read this instead, which acceptance writes.
+    in_force: std::sync::Mutex<crate::config::InForce>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -509,6 +516,9 @@ impl Controller {
             revision: startup_configuration.revision(),
             document: startup_configuration.loaded().document.clone(),
             sessions: registry.session_limit()?,
+            // A fence outlives no daemon: a replacement asks every worker for the revision in
+            // force as it reaches them, which is the same question answered from the start.
+            fence_outstanding: false,
         };
         if let Some(limit) = crate::config::session_limit_in_force(
             &startup_configuration,
@@ -519,6 +529,7 @@ impl Controller {
             registry.set_session_limit(limit)?;
             accepted_configuration.sessions = limit;
         }
+        let in_force = crate::config::InForce::of(&startup_configuration);
         drop(startup_configuration);
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
@@ -586,7 +597,7 @@ impl Controller {
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
-        let (initial_desktop, initial_evidence) = resolved_desktop(&paths, &boot);
+        let (initial_desktop, initial_evidence) = resolved_desktop(in_force.worker_profile, &boot);
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -602,6 +613,7 @@ impl Controller {
             paths: setup.paths,
             catalogue_evidence: None,
             accepted_configuration: Mutex::new(accepted_configuration),
+            in_force: std::sync::Mutex::new(in_force),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -3987,6 +3999,11 @@ impl Controller {
     }
 
     async fn host_info(self: &Arc<Self>) -> Result<ParamsValue> {
+        // Asking what this host is configured as is what puts its configuration into force, the
+        // same way asking for its diagnostics is. Reading the numbers without accepting the
+        // document first is how this answer comes to name a session ceiling or a sleep policy a
+        // later reading has already replaced.
+        drop(self.accept_configuration().await);
         let registry = self.registry.lock().await;
         let live = registry.occupancy()?;
         let limit = registry.session_limit()?;
@@ -4011,7 +4028,8 @@ impl Controller {
     async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
         let mut reading = self.desktop.lock().await;
         if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
-            let (context, evidence) = resolved_desktop(&self.paths, &self.boot_identity);
+            let (context, evidence) =
+                resolved_desktop(self.in_force().worker_profile, &self.boot_identity);
             reading.context = context;
             reading.evidence = evidence;
             reading.read_at = std::time::Instant::now();
@@ -4130,7 +4148,7 @@ impl Controller {
     /// paths that produce one schedule the look rather than awaiting it.
     async fn evaluate_power(self: &Arc<Self>, claim: Claim) -> (SleepInhibitionState, Review) {
         let mut inhibitor = self.inhibitor.lock().await;
-        let setting = power::read(&self.paths);
+        let setting = self.in_force().sleep_inhibition;
         let off = setting == kr_protocol::desktop::SleepInhibitionSetting::Off;
         // A host whose owner has not chosen this pays nothing for it: no worker is asked and no
         // power source is read. An assertion held under a setting that has since been turned off
@@ -4462,6 +4480,14 @@ impl Controller {
         crate::config::open(&self.paths)
     }
 
+    /// The ordinary preferences the last acceptance put in force.
+    fn in_force(&self) -> crate::config::InForce {
+        *self
+            .in_force
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Returns what this host's configuration currently resolves to.
     ///
     /// The document is put into force first and the report is built from that same reading, so a
@@ -4507,7 +4533,22 @@ impl Controller {
             state.document.as_ref(),
             resolver.loaded().document.as_ref(),
         );
+        // The ordinary preferences take effect by being read, so this reading is what the things
+        // that act on them read until the next acceptance replaces it. It is written whatever the
+        // effects below do: a sleep policy is in force because the document says it, not because
+        // a registry write succeeded.
+        *self
+            .in_force
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::config::InForce::of(&resolver);
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
+        if sessions.from_document {
+            // Recorded the moment the registry took it, separately from everything below. A later
+            // effect that fails does not put this number back, and a state that said it had would
+            // make the next report describe a ceiling admission is no longer enforcing.
+            state.sessions = sessions.value;
+        }
         let mut barrier = None;
         if failure.is_none() && owed.fences_dispatch {
             // Before anything is told the ceiling moved. Work admitted under the ceiling this
@@ -4516,12 +4557,26 @@ impl Controller {
                 Ok(raised) => barrier = Some(raised),
                 Err(error) => failure = Some(format!("dispatch could not be fenced: {error}")),
             }
+        } else if failure.is_none() && state.fence_outstanding {
+            // A fence this host raised earlier that a worker had not acknowledged. The debt is
+            // this host's, not the document's: the document has not moved since, so nothing above
+            // would raise it again, and a change asked for a second time would otherwise be told
+            // it was done. Announcing again is how a worker that has since answered, or since
+            // ended, clears it, and it advances no revision.
+            match self.announce_authority_revision().await {
+                Ok(reported) => barrier = Some(reported),
+                Err(error) => {
+                    failure = Some(format!(
+                        "the outstanding fence could not be checked: {error}"
+                    ));
+                }
+            }
         }
         if failure.is_none()
             && owed
                 .invalidated
                 .contains(&kr_protocol::desktop::CapabilityInvalidation::WorkerProfile)
-            && let Err(error) = self.invalidate_profile_evidence().await
+            && let Err(error) = self.invalidate_profile_evidence(&resolver).await
         {
             failure = Some(format!(
                 "the capability evidence taken under the old profile could not be replaced: \
@@ -4530,12 +4585,11 @@ impl Controller {
         }
         if failure.is_none() {
             // Recorded once every effect has landed, so a failed acceptance is retried by the
-            // next one instead of being remembered as done.
-            *state = crate::config::AcceptedState {
-                revision: resolver.revision(),
-                document: resolver.loaded().document.clone(),
-                sessions: sessions.value,
-            };
+            // next one instead of being remembered as done. The fence debt is kept whatever the
+            // document did, because only a worker answering can settle it.
+            state.revision = resolver.revision();
+            state.document = resolver.loaded().document.clone();
+            state.fence_outstanding = barrier.as_ref().is_some_and(|raised| !raised.holds());
         }
         drop(state);
         crate::config::Accepted {
@@ -4599,7 +4653,17 @@ impl Controller {
     /// Returns an error when the replacement evidence could not be recorded. Reporting success
     /// would publish records under a revision that no longer describes them, which is the one
     /// thing a revision exists to prevent.
-    async fn invalidate_profile_evidence(&self) -> Result<()> {
+    async fn invalidate_profile_evidence(
+        &self,
+        resolver: &kr_worker::config::Resolver,
+    ) -> Result<()> {
+        // Taken from the configuration this acceptance read, so the evidence is replaced under
+        // the profile the report describes rather than under whatever is on disk a moment later.
+        *self
+            .in_force
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::config::InForce::of(resolver);
         let mut reading = self.desktop.lock().await;
         reading.read_at = std::time::Instant::now()
             .checked_sub(DESKTOP_REREAD_INTERVAL)
@@ -6565,14 +6629,14 @@ const fn forwarded_to_worker(method: Method) -> bool {
 /// The platform reading comes first either way, because what the platform offers decides the
 /// default the configuration may then override.
 fn resolved_desktop(
-    paths: &EnvironmentPaths,
+    chosen: Option<kr_protocol::identity::WorkerProfile>,
     boot: &BootIdentity,
 ) -> (DesktopContext, DesktopContext) {
     let mut physical = crate::desktop::current(boot.clone());
     let platform = crate::desktop::default_profile(&physical);
-    let resolved = crate::config::open(paths)
-        .worker_profile(None, platform)
-        .value;
+    // The product default is the platform's own answer, established here; the rungs above it were
+    // read when the configuration was accepted, so this is not a second reading of the document.
+    let resolved = chosen.unwrap_or(platform);
     let evidence = if resolved == physical.worker_profile {
         physical.clone()
     } else {

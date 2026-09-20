@@ -227,6 +227,23 @@ impl Resolver {
         )
     }
 
+    /// Returns the execution context this configuration chooses, when it chooses one.
+    ///
+    /// The three rungs above the product default, without it: a caller that has to establish the
+    /// platform's own answer first needs to know whether the configuration will override it
+    /// before it spends anything finding out. It is the same ladder in the same order, which is
+    /// why it is here and not assembled at a call site.
+    #[must_use]
+    pub fn chosen_worker_profile(&self) -> Option<WorkerProfile> {
+        self.selected()
+            .and_then(|(_, set)| set.worker_profile.0)
+            .or_else(|| {
+                self.loaded
+                    .preferences()
+                    .and_then(|set| set.worker_profile.0)
+            })
+    }
+
     /// Resolves the execution context a session is created in.
     ///
     /// The product default is what the platform establishes rather than a constant, so the caller

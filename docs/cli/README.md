@@ -555,7 +555,14 @@ Each engineering default the product makes configurable is printed with the valu
 rung it came from, so what this host is doing and why are one reading rather than two. The value in
 force is the one the host is enforcing, not the one the document asks for: where an effect could
 not be applied, the `configuration-in-force` check fails and says what stopped it, and the ceiling
-lines show both what was asked for and what is in force.
+lines show both what was asked for and what is in force. `--json` carries the same two facts as
+`configuration.not_in_force` and `configuration.fence_outstanding`.
+
+Asking for the diagnostics is what puts this host's configuration into force, so a ceiling somebody
+edited by hand takes effect during the run. One that changes what a caller may do withdraws the
+authority this command's own connection was admitted under; the command opens a new one and asks
+again, so the report is the one this host is acting on rather than the one it was acting on a
+moment ago.
 
 The exit status is 0 when no check failed and 1 when one did. `--json` returns one document with
 `ok`, `host`, `doctor`, `configuration` and `environment`, and `bundle` when one was written.
