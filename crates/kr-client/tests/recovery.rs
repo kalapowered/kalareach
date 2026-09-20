@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{
-    Admission, BundleStore, FreshRestore, MAX_RECOVERY_KIT_BYTES, Material, RECOVERY_KIT_FORMAT,
-    RecoveryError, RestoreLimits, RetrievalPolicy, SeedSource, ServiceAccess, bundle_collection,
-    may_back_up, may_restore, parse_kit, qr_payload, render_kit,
+    Admission, BundleStore, FreshRestore, MAX_RECOVERY_KIT_BYTES, Material, OfflineExport,
+    RECOVERY_KIT_FORMAT, RecoveryError, RestoreLimits, RetrievalPolicy, SeedSource, ServiceAccess,
+    bundle_collection, may_back_up, may_restore, parse_kit, qr_payload, render_kit,
 };
 use kr_client::services::{ServiceFuture, SyncBackupService};
 use kr_crypto::backup::{
@@ -1182,15 +1182,14 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
         encrypted_manifest: sealed.encrypted_manifest.clone(),
         objects: vec![staged.bytes().to_vec()],
     };
-    let bytes = kr_cbor::to_canonical_vec(&export).expect("canonical bytes");
+    let bytes = export.to_canonical_bytes().expect("canonical bytes");
     assert!(
         !contains(&bytes, b"notes.cbor"),
         "an offline export carries no filename in the clear"
     );
 
     // Read back with nothing but the kit and the export, no service in sight.
-    let restored: OfflineExport =
-        kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("the export");
+    let restored = OfflineExport::from_canonical_slice(&bytes).expect("the export");
     let key = seed.bundle_key_for(&context(ORIGIN)).expect("a key");
     let offline_bundle =
         kr_crypto::archive::decrypt_recovery_bundle(&key, &restored.encrypted_bundle)
@@ -1223,18 +1222,6 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
         .restore_object(&reader, &sender, staged.object_id(), &restored.objects[0])
         .expect("the exported object restores");
     assert_eq!(object.plaintext.expose(), b"kept offline");
-}
-
-/// One offline export: the encrypted bundle and the selected archives' own ciphertext.
-///
-/// Everything in it is already encrypted, so the export adds no protection of its own and claims
-/// none. It exists so an owner can keep a copy somewhere the service is not.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct OfflineExport {
-    encrypted_bundle: Vec<u8>,
-    descriptor: Vec<u8>,
-    encrypted_manifest: Vec<u8>,
-    objects: Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------------------------

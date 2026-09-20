@@ -20,6 +20,7 @@ use kr_protocol::archive::{
     RecoveryKit, TrustedProducer, TrustedWriter,
 };
 use kr_protocol::scalars::{KeyId, StoredEnvelopeKey, TimestampMs, U64};
+use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::recovery::{RecoveryError, Result};
@@ -478,6 +479,45 @@ pub struct Migrated {
     pub record: MigrationRecord,
     /// The kit a person keeps from now on. The old one points at a location the bundle has left.
     pub updated_kit: RecoveryKit,
+}
+
+/// One offline export: the encrypted bundle and the selected archives' own ciphertext.
+///
+/// Everything in it is already encrypted, so the export adds no protection of its own and claims
+/// none. It exists so an owner can keep a copy somewhere the service is not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineExport {
+    /// The encrypted recovery bundle, as the service holds it.
+    pub encrypted_bundle: Vec<u8>,
+    /// The archive's public descriptor bytes.
+    pub descriptor: Vec<u8>,
+    /// The encrypted archive manifest object.
+    pub encrypted_manifest: Vec<u8>,
+    /// The selected member objects' encrypted bytes.
+    pub objects: Vec<Vec<u8>>,
+}
+
+impl OfflineExport {
+    /// Encodes this offline export into its canonical KR-CBOR-1 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::Cbor`] when the export cannot be encoded.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
+        Ok(kr_cbor::to_canonical_vec(self)?)
+    }
+
+    /// Decodes an offline export from its canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::Cbor`] when the bytes cannot be decoded.
+    pub fn from_canonical_slice(bytes: &[u8]) -> Result<Self> {
+        Ok(kr_cbor::from_canonical_slice(
+            bytes,
+            &kr_cbor::Limits::DEFAULT,
+        )?)
+    }
 }
 
 /// Turns a compare-and-exchange refusal into a conflict where that is what it was.

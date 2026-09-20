@@ -31,7 +31,7 @@ mod kit;
 mod restore;
 
 pub use crate::recovery::bundle::{
-    BundleStore, Migrated, MigrationRecord, WriterEnabled, bundle_collection,
+    BundleStore, Migrated, MigrationRecord, OfflineExport, WriterEnabled, bundle_collection,
 };
 pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse as parse_kit, qr_payload,
