@@ -66,6 +66,26 @@ pub struct DescriptionFence {
     fenced: Arc<Mutex<BTreeMap<SessionId, PrivacyGeneration>>>,
 }
 
+/// What happened when attempting to publish under the fence lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublishGate {
+    /// Publication succeeded.
+    Allowed,
+    /// The session's fence was raised.
+    Fenced,
+    /// A fence was raised at a newer generation.
+    LateGeneration {
+        /// What the fence recorded.
+        expected: PrivacyGeneration,
+        /// What the job was produced under.
+        found: PrivacyGeneration,
+    },
+    /// The job's cancellation token fired.
+    Cancelled,
+    /// The whole-job deadline was exceeded.
+    DeadlineExceeded,
+}
+
 impl DescriptionFence {
     /// Builds a fence that is down for every session.
     #[must_use]
@@ -110,6 +130,54 @@ impl DescriptionFence {
     #[must_use]
     pub fn fenced_sessions(&self) -> usize {
         self.fenced.lock().map_or(0, |held| held.len())
+    }
+
+    /// Publishes a description under the fence's lock if the session is not fenced, not cancelled,
+    /// and has not exceeded its whole-job deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_under_lock(
+        &self,
+        store: &DescriptionStore,
+        session_id: &SessionId,
+        description: &crate::output::GeneratedDescription,
+        wall_ms: u64,
+        produced_generation: PrivacyGeneration,
+        fallback_generation: PrivacyGeneration,
+        cancellation: &Cancellation,
+        job_clock: &crate::time::JobClock,
+        dequeued_ms: u64,
+        deadline_ms: u64,
+    ) -> crate::error::Result<PublishGate> {
+        let held = self
+            .fenced
+            .lock()
+            .map_err(|_| crate::DescribeError::Runtime {
+                detail: "fence mutex poisoned".to_owned(),
+            })?;
+        if let Some(&fence_gen) = held.get(session_id) {
+            if fence_gen != produced_generation {
+                return Ok(PublishGate::LateGeneration {
+                    expected: fence_gen,
+                    found: produced_generation,
+                });
+            }
+            return Ok(PublishGate::Fenced);
+        }
+        if fallback_generation != produced_generation {
+            return Ok(PublishGate::LateGeneration {
+                expected: fallback_generation,
+                found: produced_generation,
+            });
+        }
+        if cancellation.is_cancelled() {
+            return Ok(PublishGate::Cancelled);
+        }
+        let elapsed = job_clock.now_ms().saturating_sub(dequeued_ms);
+        if elapsed > deadline_ms {
+            return Ok(PublishGate::DeadlineExceeded);
+        }
+        store.publish(session_id, description, wall_ms)?;
+        Ok(PublishGate::Allowed)
     }
 }
 
@@ -213,6 +281,18 @@ impl RunningJob {
             held.as_ref()
                 .is_some_and(|(running, _)| running == session_id)
         })
+    }
+
+    /// Returns the cancellation token for the running job when it is this session's.
+    #[must_use]
+    pub fn cancellation(&self, session_id: &SessionId) -> Option<Cancellation> {
+        let Ok(held) = self.held.lock() else {
+            return None;
+        };
+        match held.as_ref() {
+            Some((running, cancellation)) if running == session_id => Some(cancellation.clone()),
+            _ => None,
+        }
     }
 
     /// Cancels the running job when it is this session's, and says whether it did.

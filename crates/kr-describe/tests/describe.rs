@@ -42,7 +42,7 @@ use kr_describe::service::{
     DescriptionService, DownloadProgress, HostPlacement, IDLE_UNLOAD_MS, RuntimeFactory, Tick,
 };
 use kr_describe::store::{DescriptionStore, Published};
-use kr_describe::time::Reading;
+use kr_describe::time::{JobClock, Reading};
 use kr_protocol::ids::{SessionEpoch, SessionId};
 use kr_protocol::scalars::TimestampMs;
 use kr_worker::privacy::{
@@ -367,6 +367,204 @@ fn a_model_load_that_is_cancelled_is_abandoned_and_publishes_nothing() {
     );
     assert!(!service.is_mapped());
     assert!(service.store().generated(&session(1)).unwrap().is_none());
+}
+
+/// A job whose cancellation fires between generation and publication publishes nothing.
+#[test]
+fn a_job_whose_cancellation_fires_between_generation_and_publication_publishes_nothing() {
+    let behaviour = SharedBehaviour::new();
+    behaviour.set(Behaviour::CancelBeforePublish);
+    let mut service = service(&behaviour);
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let tick = service.tick(&roomy(), at(0)).expect("a tick");
+    assert!(
+        matches!(tick, Tick::Cancelled { session_id } if session_id == session(1)),
+        "{tick:?}"
+    );
+    assert!(service.store().generated(&session(1)).unwrap().is_none());
+}
+
+/// Publication under the fence's lock refuses a result when a fence was raised from another thread.
+#[test]
+fn a_fence_raised_concurrently_between_generation_and_publication_publishes_nothing() {
+    #[derive(Debug)]
+    struct FencingRuntime {
+        inner: StubRuntime,
+        fence: DescriptionFence,
+        session_id: SessionId,
+        generation: PrivacyGeneration,
+    }
+    impl InferenceRuntime for FencingRuntime {
+        fn handle(&self) -> kr_describe::runtime::RuntimeHandle {
+            self.inner.handle()
+        }
+        fn resident_cost(&self) -> kr_describe::budget::ResidentCost {
+            self.inner.resident_cost()
+        }
+        fn generate(
+            &mut self,
+            request: &GenerationRequest,
+        ) -> kr_describe::error::Result<Produced> {
+            let res = self.inner.generate(request)?;
+            self.fence.raise(self.session_id, self.generation);
+            Ok(res)
+        }
+        fn unload(&mut self) {
+            self.inner.unload();
+        }
+    }
+
+    let behaviour = SharedBehaviour::new();
+    let fence_holder: Arc<std::sync::Mutex<Option<DescriptionFence>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let fence_holder_clone = fence_holder.clone();
+    let b_clone = behaviour.clone();
+    let factory: RuntimeFactory = Box::new(move |profile, _cancellation, _deadline_ms| {
+        let inner = StubRuntime::sharing(profile, b_clone.clone());
+        let fence = fence_holder_clone
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("fence set");
+        Ok(LoadOutcome::Loaded(Box::new(FencingRuntime {
+            inner,
+            fence,
+            session_id: session(1),
+            generation: PrivacyGeneration::new(2),
+        })))
+    });
+
+    let mut service = DescriptionService::new(
+        HostPlacement {
+            environment: native(1),
+            data_access: None,
+            target: MAC.to_owned(),
+        },
+        built_in(),
+        MetGates::default(),
+        ResourceSettings::default(),
+        DescriptionStore::in_memory().expect("store"),
+        factory,
+    );
+    *fence_holder.lock().unwrap() = Some(service.fence().clone());
+
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let tick = service.tick(&roomy(), at(0)).expect("a tick");
+    assert!(
+        matches!(
+            tick,
+            Tick::Rejected {
+                session_id,
+                rejection: Rejection::LateGeneration {
+                    expected,
+                    found,
+                }
+            } if session_id == session(1) && expected == PrivacyGeneration::new(2) && found == PrivacyGeneration::INITIAL
+        ),
+        "{tick:?}"
+    );
+    assert!(service.store().generated(&session(1)).unwrap().is_none());
+}
+
+/// A whole-job deadline that expires between generation and publication with the synthetic clock publishes nothing.
+#[test]
+fn a_deadline_exceeded_between_generation_and_publication_with_synthetic_clock_publishes_nothing() {
+    #[derive(Debug)]
+    struct AdvancingRuntime {
+        inner: StubRuntime,
+        clock: JobClock,
+        advance_ms: u64,
+    }
+    impl InferenceRuntime for AdvancingRuntime {
+        fn handle(&self) -> kr_describe::runtime::RuntimeHandle {
+            self.inner.handle()
+        }
+        fn resident_cost(&self) -> kr_describe::budget::ResidentCost {
+            self.inner.resident_cost()
+        }
+        fn generate(
+            &mut self,
+            request: &GenerationRequest,
+        ) -> kr_describe::error::Result<Produced> {
+            let res = self.inner.generate(request)?;
+            self.clock.advance_ms(self.advance_ms);
+            Ok(res)
+        }
+        fn unload(&mut self) {
+            self.inner.unload();
+        }
+    }
+
+    let clock = JobClock::by_hand();
+    let clock_clone = clock.clone();
+    let behaviour = SharedBehaviour::new();
+    let b_clone = behaviour.clone();
+    let factory: RuntimeFactory = Box::new(move |profile, _cancellation, _deadline_ms| {
+        let inner = StubRuntime::sharing(profile, b_clone.clone());
+        Ok(LoadOutcome::Loaded(Box::new(AdvancingRuntime {
+            inner,
+            clock: clock_clone.clone(),
+            advance_ms: 31_000,
+        })))
+    });
+
+    let mut service = DescriptionService::new(
+        HostPlacement {
+            environment: native(1),
+            data_access: None,
+            target: MAC.to_owned(),
+        },
+        built_in(),
+        MetGates::default(),
+        ResourceSettings::default(),
+        DescriptionStore::in_memory().expect("store"),
+        factory,
+    );
+    service.set_job_clock(clock);
+
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let tick = service.tick(&roomy(), at(0)).expect("a tick");
+    assert!(
+        matches!(tick, Tick::DeadlineExceeded { session_id } if session_id == session(1)),
+        "{tick:?}"
+    );
+    assert!(service.store().generated(&session(1)).unwrap().is_none());
+}
+
+/// A running job exposes its cancellation token and can be cancelled through the shared handle or service.
+#[test]
+fn a_running_job_can_be_cancelled_from_owning_thread_or_shared_handle() {
+    let running = RunningJob::new();
+    let session_id = session(1);
+    let cancellation = running.started(session_id);
+    assert!(running.is_running(&session_id));
+    assert!(!running.cancellation(&session_id).unwrap().is_cancelled());
+
+    assert!(running.cancel(&session_id));
+    assert!(cancellation.is_cancelled());
+    assert!(running.cancellation(&session_id).unwrap().is_cancelled());
+
+    running.finished();
+    assert!(!running.is_running(&session_id));
+    assert!(running.cancellation(&session_id).is_none());
 }
 
 /// KR-PERF-009: the paused case is driven on a host that is otherwise admitting inference.

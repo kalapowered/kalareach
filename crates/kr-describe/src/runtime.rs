@@ -147,6 +147,8 @@ pub enum Behaviour {
     },
     /// Cancel the job during load.
     CancelDuringLoad,
+    /// Generate a description and then cancel the job before publication.
+    CancelBeforePublish,
 }
 
 /// A behaviour two owners share: whatever sets it, and the runtime that reads it.
@@ -366,6 +368,9 @@ impl InferenceRuntime for StubRuntime {
             )
             .into_bytes(),
         };
+        if matches!(behaviour, Behaviour::CancelBeforePublish) {
+            request.cancellation.cancel();
+        }
         Ok(Produced::Json(bytes))
     }
 

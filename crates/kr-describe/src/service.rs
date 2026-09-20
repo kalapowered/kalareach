@@ -41,7 +41,9 @@ use crate::metadata::{
 use crate::metrics::LatencyLedger;
 use crate::output::{Expectation, ProducedUnder, Rejection, prompt, validate};
 use crate::priority::{Applied, Cancellation};
-use crate::privacy::{CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, RunningJob};
+use crate::privacy::{
+    CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, PublishGate, RunningJob,
+};
 use crate::profile::catalogue::{Catalogue, MetGates, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
 use crate::queue::{Enqueued, Freshness, NothingToDequeue, Priority, Scheduler, SessionStanding};
@@ -359,6 +361,11 @@ impl DescriptionService {
         &self.running
     }
 
+    /// Cancels a running job for this session if one is running, and returns whether it did.
+    pub fn cancel_running(&self, session_id: &SessionId) -> bool {
+        self.running.cancel(session_id)
+    }
+
     /// Returns the clock used to measure the execution deadline.
     #[must_use]
     pub const fn job_clock(&self) -> &JobClock {
@@ -443,6 +450,9 @@ impl DescriptionService {
     /// Returns the generation a session's jobs are being admitted under.
     #[must_use]
     pub fn privacy_generation(&self, session_id: &SessionId) -> PrivacyGeneration {
+        if let Some(generation) = self.fence.generation(session_id) {
+            return generation;
+        }
         self.generations
             .get(session_id)
             .copied()
@@ -954,27 +964,47 @@ impl DescriptionService {
             }
         };
 
-        self.store
-            .publish(&session_id, &description, now.wall_ms().get())?;
-        self.scheduler.record_success(&session_id, now);
-        let published = Tick::Published {
-            session_id,
-            queue_wait_ms,
-            execution_ms,
-        };
-        // The ceiling is a process figure, so it is checked against the process rather than against
-        // the profile's estimate. A run that has grown past it unloads: section 22's budget is a
-        // bound on what this product costs, not a prediction it is allowed to be wrong about.
-        if let Some(rss) = process_rss_bytes()
-            && rss > budgets.process_memory_ceiling_bytes
-        {
-            self.unload();
-            return Ok(Tick::ResourcePaused {
-                reason: PauseReason::MemoryPressure,
-                unloaded: true,
-            });
+        match self.fence.publish_under_lock(
+            &self.store,
+            &session_id,
+            &description,
+            now.wall_ms().get(),
+            produced_under.generation,
+            self.privacy_generation(&session_id),
+            &cancellation,
+            &self.job_clock,
+            dequeued_ms,
+            budgets.execution_deadline_ms,
+        )? {
+            PublishGate::Allowed => {
+                self.scheduler.record_success(&session_id, now);
+                let published = Tick::Published {
+                    session_id,
+                    queue_wait_ms,
+                    execution_ms,
+                };
+                // The ceiling is a process figure, so it is checked against the process rather than against
+                // the profile's estimate. A run that has grown past it unloads: section 22's budget is a
+                // bound on what this product costs, not a prediction it is allowed to be wrong about.
+                if let Some(rss) = process_rss_bytes()
+                    && rss > budgets.process_memory_ceiling_bytes
+                {
+                    self.unload();
+                    return Ok(Tick::ResourcePaused {
+                        reason: PauseReason::MemoryPressure,
+                        unloaded: true,
+                    });
+                }
+                Ok(published)
+            }
+            PublishGate::Cancelled => Ok(Tick::Cancelled { session_id }),
+            PublishGate::DeadlineExceeded => Ok(Tick::DeadlineExceeded { session_id }),
+            PublishGate::Fenced => Ok(Tick::Fenced),
+            PublishGate::LateGeneration { expected, found } => Ok(Tick::Rejected {
+                session_id,
+                rejection: Rejection::LateGeneration { expected, found },
+            }),
         }
-        Ok(published)
     }
 
     /// Loads the profile when it is not loaded, releasing whatever was there first.
