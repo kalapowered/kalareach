@@ -2684,29 +2684,46 @@ impl WorkerService {
     /// Returns the bytes the journal keeps as this mutation's intent.
     ///
     /// Ordinarily that is the mutation exactly as it arrived, because the intent is what a
-    /// recovering worker reads to know what the action was going to do. A cancellation from a
-    /// question's source is the exception: it carries the caller token, and section 11 keeps that
-    /// token out of every durable record but the ledger's own sealed copy. The journal is such a
-    /// record, and so is its write-ahead log, so the token is emptied before the intent is
-    /// encoded. What remains still says which question was to be cancelled and under whose
-    /// authority, which is everything a recovery needs; the token itself is not a fact about the
-    /// action, it is the caller proving it may ask.
+    /// recovering worker reads to know what the action was going to do. The two exceptions carry
+    /// something a caller presents to prove it may ask, rather than a fact about the action, and
+    /// section 11 keeps such a secret out of every durable record but the ledger's own sealed
+    /// copy. The journal is such a record, and so is its write-ahead log.
+    ///
+    /// A cancellation from a question's source carries the caller token, and a detach carries the
+    /// capability its line was given. Both are emptied before the intent is encoded. What remains
+    /// says which question was to be cancelled and under whose authority, and which attachment a
+    /// detach had resolved to by the time it was recorded, which is everything a recovery needs.
     fn intent_of(mutation: &MutationRequest, method: Method) -> Result<Vec<u8>> {
         let redacted;
-        let recorded = if method == Method::QuestionCancelOwn {
-            let params: kr_protocol::question::QuestionCancelOwnParams = parse(&mutation.params)?;
-            let params = kr_protocol::question::QuestionCancelOwnParams {
-                caller_token: kr_protocol::question::CallerToken::new(Vec::new()),
-                ..params
-            };
-            redacted = MutationRequest {
-                params: ParamsValue::from_typed(&params)
-                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?,
-                ..mutation.clone()
-            };
-            &redacted
-        } else {
-            mutation
+        let recorded = match method {
+            Method::QuestionCancelOwn => {
+                let params: kr_protocol::question::QuestionCancelOwnParams =
+                    parse(&mutation.params)?;
+                let params = kr_protocol::question::QuestionCancelOwnParams {
+                    caller_token: kr_protocol::question::CallerToken::new(Vec::new()),
+                    ..params
+                };
+                redacted = MutationRequest {
+                    params: ParamsValue::from_typed(&params)
+                        .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?,
+                    ..mutation.clone()
+                };
+                &redacted
+            }
+            Method::SessionDetach => {
+                let params: SessionDetachParams = parse(&mutation.params)?;
+                let params = SessionDetachParams {
+                    line_token: Nullable::null(),
+                    ..params
+                };
+                redacted = MutationRequest {
+                    params: ParamsValue::from_typed(&params)
+                        .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?,
+                    ..mutation.clone()
+                };
+                &redacted
+            }
+            _ => mutation,
         };
         kr_cbor::to_canonical_vec(recorded)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))
@@ -5280,6 +5297,64 @@ mod tests {
         assert!(
             nothing.is_err(),
             "the peer receives no frame of a span whose authority has gone"
+        );
+    }
+
+    /// The journal keeps what a detach was going to do, never the capability that asked for it.
+    ///
+    /// A line's capability is the caller proving it may ask, like a question's caller token, and
+    /// section 11 keeps such a secret out of every durable record. The intent is what a recovering
+    /// worker reads, and it is written to the journal and its write-ahead log; a token left in it
+    /// would outlive the line it was minted for by as long as the journal is kept.
+    #[test]
+    fn a_detachs_recorded_intent_carries_no_line_capability() {
+        use kr_protocol::attachment::SessionDetachParams;
+        use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+        use kr_protocol::ids::{
+            ActionId, ActionWindowId, EnvironmentId, RequestId, SessionEpoch, SessionId,
+        };
+        use kr_protocol::method::{Method, MethodVersion};
+        use kr_protocol::scalars::{DurationMs, Nullable, Uuid};
+
+        let params = SessionDetachParams {
+            attachment_id: Nullable::null(),
+            line_token: Nullable::some("a-line-capability".to_owned()),
+        };
+        let mutation = MutationRequest {
+            request_id: RequestId::new(1),
+            method: Method::SessionDetach.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(Uuid::from_bytes([0xAC; 16])),
+            grant_id: Nullable::null(),
+            target: ActionTarget {
+                environment_id: EnvironmentId::new(Uuid::from_bytes([0xE0; 16])),
+                session_id: Nullable::some(SessionId::new(Uuid::from_bytes([0x5E; 16]))),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("host-issued-window-id".to_owned())
+                .expect("a window name"),
+            requested_ttl_ms: DurationMs::new(5_000),
+            params: ParamsValue::from_typed(&params).expect("encodes"),
+        };
+
+        let intent = super::WorkerService::intent_of(&mutation, Method::SessionDetach)
+            .expect("the intent is encoded");
+        let recorded: MutationRequest =
+            kr_cbor::from_canonical_slice(&intent, &kr_cbor::Limits::default())
+                .expect("the intent reads back");
+        let recorded: SessionDetachParams = recorded.params.to_typed().expect("decodes");
+        assert!(
+            !recorded.line_token.is_present(),
+            "the capability is not in the durable record"
+        );
+        assert!(
+            !intent
+                .windows(b"a-line-capability".len())
+                .any(|window| window == b"a-line-capability"),
+            "and its bytes are nowhere in it"
         );
     }
 }
