@@ -52,6 +52,38 @@ pub const DELIVERY_JOURNAL: &str = "delivery.sqlite3";
 /// How many deliveries one pass takes out of the outbox.
 pub const MAX_PASS: usize = 32;
 
+/// Where one pass reads the time.
+///
+/// A pass blocks: it opens a connection, waits for a gateway and waits for a destination, and the
+/// clock it started with says nothing about the moment it comes back. Section 16 stops at expiry,
+/// so the time is read again immediately before each dispatch and again as soon as each answer
+/// arrives, and both readings come from here. A fixed instant is a closure over one, which is what
+/// makes a schedule reproducible in a test without the pass ever holding a stale figure.
+pub trait Clock {
+    /// The current time, in UTC milliseconds.
+    fn now_ms(&self) -> u64;
+}
+
+impl<F: Fn() -> u64> Clock for F {
+    fn now_ms(&self) -> u64 {
+        self()
+    }
+}
+
+/// The host's own clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+}
+
 /// The delivery service for one environment.
 #[derive(Debug)]
 pub struct DeliveryModule {
@@ -257,16 +289,20 @@ impl DeliveryModule {
         sender: &dyn PushSender,
         credentials: &dyn SenderCredentials,
         external: &dyn ExternalSender,
-        now_ms: u64,
+        clock: &dyn Clock,
     ) -> Result<usize> {
         let selected: Vec<DueDelivery> = self.with(|producer| {
             producer
                 .journal()
-                .due(now_ms, MAX_PASS)
+                .due(clock.now_ms(), MAX_PASS)
                 .map_err(unavailable)
         })?;
         let mut attempted = 0;
         for selection in selected {
+            // The clock is read again here, immediately before the claim, rather than once for
+            // the pass: a pass that blocked on the previous destination for a minute would
+            // otherwise claim this one against a time that has gone.
+            let now_ms = clock.now_ms();
             let claim = self.with(|producer| {
                 producer
                     .journal_mut()
@@ -290,15 +326,15 @@ impl DeliveryModule {
                     &claimed,
                     DeliveryState::Revoked,
                     "the destination is no longer configured or enabled",
-                    now_ms,
+                    clock.now_ms(),
                 )?;
                 continue;
             };
             attempted += 1;
             if record.as_push().is_some() {
-                self.attempt_push(&claimed, &record, sender, credentials, now_ms)?;
+                self.attempt_push(&claimed, &record, sender, credentials, now_ms, clock)?;
             } else {
-                self.attempt_external(&claimed, &record, external, now_ms)?;
+                self.attempt_external(&claimed, &record, external, now_ms, clock)?;
             }
         }
         Ok(attempted)
@@ -337,6 +373,7 @@ impl DeliveryModule {
         sender: &dyn PushSender,
         credentials: &dyn SenderCredentials,
         now_ms: u64,
+        clock: &dyn Clock,
     ) -> Result<()> {
         let push = record.as_push().expect("a push destination");
         let request: PushDeliveryRequest =
@@ -365,11 +402,15 @@ impl DeliveryModule {
             credential = renewed;
         }
         let outcome = sender.send(&credential, &request);
+        // The answer arrived now, not when the pass started. Everything that follows - whether
+        // there is time for another attempt, when it is due, what the attempt row is stamped
+        // with - is decided from this reading.
+        let answered_at_ms = clock.now_ms().max(now_ms);
         let decision = kr_delivery::push::decide(
             &outcome,
             delivery.notification_id,
             attempt,
-            now_ms,
+            answered_at_ms,
             delivery.expires_at_ms,
         );
         if decision.next == NextAction::RenewThenSend {
@@ -390,7 +431,7 @@ impl DeliveryModule {
                     attempt,
                     state: decision.state,
                     started_at_ms: TimestampMs::new(now_ms),
-                    settled_at_ms: Some(TimestampMs::new(now_ms)),
+                    settled_at_ms: Some(TimestampMs::new(answered_at_ms)),
                     next_attempt_at_ms: decision.next_attempt_at_ms,
                     detail: Some(decision.detail.clone()),
                     suppression: decision.suppression.clone(),
@@ -407,17 +448,19 @@ impl DeliveryModule {
         record: &DestinationRecord,
         external: &dyn ExternalSender,
         now_ms: u64,
+        clock: &dyn Clock,
     ) -> Result<()> {
         let destination = record.as_external().expect("an external destination");
         let message = client::message_from(&delivery.content)?;
         let attempt = delivery.attempt;
         let outcome = external.send(destination, &message);
+        let answered_at_ms = clock.now_ms().max(now_ms);
         let decision = kr_delivery::external::decide_external(
             &outcome,
             &destination.idempotency,
             delivery.notification_id,
             attempt,
-            now_ms,
+            answered_at_ms,
             delivery.expires_at_ms,
         );
         self.with(|producer| {
@@ -428,7 +471,7 @@ impl DeliveryModule {
                     attempt,
                     state: decision.state,
                     started_at_ms: TimestampMs::new(now_ms),
-                    settled_at_ms: Some(TimestampMs::new(now_ms)),
+                    settled_at_ms: Some(TimestampMs::new(answered_at_ms)),
                     next_attempt_at_ms: decision.next_attempt_at_ms,
                     detail: Some(decision.detail.clone()),
                     suppression: None,

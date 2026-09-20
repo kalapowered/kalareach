@@ -271,6 +271,23 @@ fn take_and_produce(
         .expect("the producer")
 }
 
+/// A clock stopped at one instant, which is what makes a pass reproducible.
+const fn at(now_ms: u64) -> impl Fn() -> u64 {
+    move || now_ms
+}
+
+/// A clock that moves on after its first reading, which is what a pass that blocked looks like.
+fn ticking(first: u64, rest: u64) -> impl Fn() -> u64 {
+    let readings = std::sync::atomic::AtomicUsize::new(0);
+    move || {
+        if readings.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            first
+        } else {
+            rest
+        }
+    }
+}
+
 /// Claims the first delivery the outbox offers, the way a pass does.
 fn claim_first(environment: &Environment, now_ms: u64) -> kr_delivery::journal::ClaimedDelivery {
     environment
@@ -364,7 +381,7 @@ fn a_provider_that_queued_it_is_recorded_as_queued() {
     assert_eq!(
         environment
             .module
-            .run_due(&gateway, &credentials, &external, NOW)
+            .run_due(&gateway, &credentials, &external, &at(NOW))
             .expect("a pass"),
         1
     );
@@ -405,7 +422,7 @@ fn what_reaches_the_gateway_carries_no_command_text_and_no_project_name() {
             &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
 
@@ -461,7 +478,7 @@ fn a_destination_with_previews_disabled_still_gets_the_alert() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
     let sent = gateway.sent();
@@ -541,7 +558,7 @@ fn a_rejected_token_disables_the_destination() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
     environment
@@ -553,6 +570,46 @@ fn a_rejected_token_disables_the_destination() {
                 .expect("a read")
                 .expect("the record");
             assert!(!record.enabled, "nothing more is sent to it");
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-16.12: section 16 stops at expiry, and a pass reads the clock again before each
+/// dispatch rather than acting on the figure it started with.
+#[test]
+fn a_delivery_whose_expiry_arrives_during_the_pass_is_settled_without_sending() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let notice = notice(1, "an approval is waiting");
+    take_and_produce(&environment, &notice, std::slice::from_ref(&destination), 1);
+    let gateway = GatewayDouble::queued();
+    // The outbox is read while the notification is still worth delivering, and the pass reaches
+    // the claim after its expiry: the clock it reads there is the one that decides.
+    let attempted = environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &ticking(NOW, NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1),
+        )
+        .expect("a pass");
+    assert_eq!(attempted, 0, "nothing was attempted");
+    assert!(
+        gateway.sent().is_empty(),
+        "an expired notification is settled rather than presented"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Expired);
+            assert_eq!(record.content, None, "an expired record keeps no bytes");
             Ok(())
         })
         .expect("a read");
@@ -582,7 +639,7 @@ fn an_unknown_outcome_is_recorded_and_left_alone() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
     environment
@@ -605,7 +662,7 @@ fn an_unknown_outcome_is_recorded_and_left_alone() {
                 &gateway,
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &ExternalDouble::answering(Vec::new()),
-                NOW + 60_000
+                &at(NOW + 60_000),
             )
             .expect("a pass"),
         0
@@ -636,7 +693,7 @@ fn a_credential_close_to_expiry_is_renewed_before_it_is_used() {
             &GatewayDouble::queued(),
             &credentials,
             &ExternalDouble::answering(Vec::new()),
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
     assert_eq!(
@@ -671,7 +728,7 @@ fn a_refused_credential_is_renewed_rather_than_presented_again() {
             &gateway,
             &credentials,
             &ExternalDouble::answering(Vec::new()),
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
     assert_eq!(gateway.sent().len(), 1, "it is not presented again at once");
@@ -899,7 +956,7 @@ fn an_external_message_never_claims_to_be_private() {
             &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
     let sent = external.sent();
@@ -946,7 +1003,7 @@ fn a_destination_without_an_idempotent_identifier_is_not_sent_to_twice() {
             &GatewayDouble::queued(),
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &external,
-            NOW,
+            &at(NOW),
         )
         .expect("a pass");
     environment
@@ -1159,7 +1216,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                 &GatewayDouble::queued(),
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &ExternalDouble::answering(Vec::new()),
-                NOW + 2
+                &at(NOW + 2),
             )
             .expect("a pass"),
         0
