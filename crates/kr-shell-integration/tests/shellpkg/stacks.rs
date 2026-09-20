@@ -834,9 +834,9 @@ impl Session {
     /// before the probe was drawn is put behind a barrier first, because a check that has already
     /// typed and cleared a line left reports that look exactly like the two this is about to wait
     /// for. After that barrier, two reports decide it: the first holds the probe, and the second
-    /// holds an empty line, at the same prompt, at a later buffer revision, with nothing queued
-    /// behind it, which is the clear having run and the reader being back at a key wait. A length
-    /// of silence would be a guess at the same thing.
+    /// holds an empty line with nothing queued behind it, later at this prompt or at one after it,
+    /// which is the reader back at a key wait with nothing in the line. A length of silence would
+    /// be a guess at the same thing.
     ///
     /// # Panics
     ///
@@ -893,19 +893,21 @@ impl Session {
         let BridgeEvent::ReaderIdle(held) = held else {
             unreachable!("the predicate accepted an idle report")
         };
-        let probe = held.editor.buffer_revision.get();
-        let prompt = held.prompt_generation.get();
+        let since = (
+            held.prompt_generation.get(),
+            held.editor.buffer_revision.get(),
+        );
         self.clear_line();
-        // The same prompt, a later buffer and nothing queued: the prompt keeps a report of an
-        // older line out, the revision keeps the report this probe answered out, and what is left
-        // is the reader at the line the clear took away, waiting for the next key.
+        // An empty line with nothing queued, reported later than the one this probe held: later
+        // at this prompt is the clear having run, and later at a prompt after it is a reader that
+        // has started a new line, which is the same answer to the same question. A report the
+        // probe itself produced, or one from before it, is behind that mark and is not this.
         self.expect_event("the reader at the line the clear took away", |event| {
             matches!(
                 event,
                 BridgeEvent::ReaderIdle(idle)
-                    if idle.prompt_generation.get() == prompt
+                    if (idle.prompt_generation.get(), idle.editor.buffer_revision.get()) > since
                         && idle.editor.buffer_empty
-                        && idle.editor.buffer_revision.get() > probe
                         && idle.snapshot.queued_keys == U64::ZERO
                         && idle.snapshot.pending_bytes == U64::ZERO
             )
