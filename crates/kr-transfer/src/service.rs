@@ -960,6 +960,12 @@ impl TransferService {
                 return match current.state {
                     UploadState::Published => self.finish_published(&current, params, action),
                     UploadState::Publishing => self.finish_publishing(actor, params, action, now),
+                    // An upload that ended took its payload with it, and the row says how it
+                    // ended. That is the answer every copy of this action is owed, rather than
+                    // one copy reading the state and another reading the absence of a file.
+                    UploadState::Cancelled | UploadState::Invalidated | UploadState::Expired => {
+                        self.refuse_publication(action, publication_refusal(&current))
+                    }
                     _ => Err(error),
                 };
             }

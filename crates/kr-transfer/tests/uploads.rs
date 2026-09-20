@@ -2728,3 +2728,60 @@ fn a_copy_of_one_finish_action_that_finds_the_payload_gone_is_answered_by_the_ro
         .expect("the repeat reads the recorded answer");
     assert_eq!(repeat.handle.content_digest, result.handle.content_digest);
 }
+
+/// KR-REQ-24.09: a copy of one action that finds the payload gone because the upload ended reads
+/// the ending, not the absence.
+///
+/// The other side of the case above. A cancellation, an expiry or an invalidation takes the
+/// payload with it, and a copy of `upload.finish` that was already past its live check then opens
+/// nothing. What ended the upload is what every copy of the action is owed; a storage failure is
+/// an answer about a file rather than about the upload, and two copies reading two different
+/// answers is what a shared claim exists to prevent.
+#[test]
+fn a_copy_of_one_finish_action_whose_upload_ended_reads_the_ending() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "ended_race.bin")
+        .expect("reserves upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends chunks");
+    let transfer_id = begun.transfer_id;
+    let claim = action(&harness, "upload.finish", &bytes);
+
+    let (staged_path, _) = payload_paths(&harness, transfer_id, "ended_race.bin");
+    harness
+        .service
+        .set_staged_open_race_hook(move |store, tid| {
+            if tid == transfer_id {
+                // What the cancellation does: it closes the row and takes the payload away.
+                store
+                    .close_upload(
+                        tid,
+                        UploadState::Cancelled,
+                        None,
+                        kr_protocol::scalars::TimestampMs::new(support::START_MS + 5),
+                        None,
+                    )
+                    .expect("closes the upload");
+                std::fs::remove_file(&staged_path).expect("removes the payload");
+            }
+        });
+
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("a cancelled upload is not finished");
+    harness.service.clear_staged_open_race_hook();
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::ResourceUnavailable,
+        "the answer is what ended the upload: {refusal}"
+    );
+
+    // The claim carries that refusal, so the other copy of the action is owed the same one.
+    let repeat = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("the repeat reads the recorded refusal");
+    assert_eq!(repeat.code(), refusal.code());
+}
