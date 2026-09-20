@@ -2428,3 +2428,100 @@ fn two_concurrent_copies_of_one_cancel_action_release_once() {
         0
     );
 }
+
+/// D-114.9: upload_finish when already in Publishing state waits for or resolves publication
+/// and returns the attachment handle rather than throwing ResourceUnavailable.
+#[test]
+fn upload_finish_when_already_publishing_resolves_and_succeeds() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let (transfer_id, _staged) = interrupted_publication(&harness, &bytes, "in_flight.bin", None);
+
+    // Now call upload_finish on the in-flight publication. Under the lock it finds Publishing.
+    // It must resolve the publication and succeed without throwing RESOURCE_UNAVAILABLE.
+    let result = harness
+        .finish_as(transfer_id, &bytes, None)
+        .expect("upload_finish on Publishing state resolves and succeeds");
+    assert_eq!(result.handle.content_digest, digest(&bytes));
+
+    let status = harness
+        .service
+        .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+        .expect("reads status");
+    assert_eq!(status.state, UploadState::Published);
+}
+
+/// D-114.9: upload_finish when already in Published state returns the handle without throwing
+/// ResourceUnavailable.
+#[test]
+fn upload_finish_when_already_published_returns_handle_without_unavailable_error() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "published.bin")
+        .expect("reserves upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends chunks");
+
+    // First finish publishes the attachment.
+    let first = harness
+        .finish_as(begun.transfer_id, &bytes, None)
+        .expect("first finish succeeds");
+    assert!(!first.already_published);
+
+    // Second finish on the already published upload under lock must return already_published: true
+    // and the same handle, rather than throwing RESOURCE_UNAVAILABLE.
+    let second = harness
+        .finish_as(begun.transfer_id, &bytes, None)
+        .expect("second finish on Published upload succeeds");
+    assert!(second.already_published);
+    assert_eq!(second.handle, first.handle);
+}
+
+/// D-114.9: an expired upload claim settled by resolve_claims unifies with check_live and
+/// publication_refusal by returning ResourceUnavailable (not AttachmentIntegrity).
+#[test]
+fn an_expired_upload_claim_settled_by_recovery_unifies_as_resource_unavailable() {
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let claim = action(&harness, "upload.finish", &bytes);
+    let (transfer_id, _) =
+        interrupted_publication(&harness, &bytes, "expired_claim.bin", Some(&claim));
+
+    // Close the upload as Expired directly in the store, simulating expiry with claim still open.
+    {
+        let mut store = kr_transfer::Store::open(
+            kr_transfer::StagingArea::store_path(&harness.host.environment()),
+            harness.host.environment_id(),
+        )
+        .expect("opens store");
+        store
+            .close_upload(
+                transfer_id,
+                UploadState::Expired,
+                Some("upload expired before finish completed"),
+                kr_protocol::scalars::TimestampMs::new(support::START_MS + 5),
+                None,
+            )
+            .expect("closes upload as expired");
+    }
+
+    // Run recovery which calls resolve_claims() to settle the open claim.
+    let recovery = harness.service.recover().expect("recovery runs");
+    assert_eq!(
+        recovery.resolved_claims, 1,
+        "the expired upload's claim was settled by recovery"
+    );
+
+    // Reading the settled claim via finish_as must return ErrorCode::ResourceUnavailable,
+    // unifying with check_live and publication_refusal.
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("reading the settled expired claim returns refusal");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::ResourceUnavailable,
+        "expired claim settlement unifies to ResourceUnavailable"
+    );
+}

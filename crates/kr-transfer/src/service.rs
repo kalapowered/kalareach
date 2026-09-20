@@ -797,73 +797,10 @@ impl TransferService {
             };
             match row.state {
                 UploadState::Published => {
-                    check_declaration(&row, params)?;
-                    // One read, one decision. The record can settle between two reads, and
-                    // asking twice is how two copies of one action end up with two answers.
-                    //
-                    // Answered: that is the answer. Claimed: the claim is this action's and its
-                    // publication is done, so this action published this attachment. Absent: this
-                    // call found an attachment something else published.
-                    let mine = match self.recorded(action)? {
-                        Recorded::Answered(answered) => return Ok(answered),
-                        Recorded::Claimed => true,
-                        Recorded::Absent => false,
-                    };
-                    let result = UploadFinishResult {
-                        handle: handle_of(&row)?,
-                        already_published: !mine,
-                        preview_unavailable: Nullable(row.preview_unavailable.clone()),
-                    };
-                    // A claim this action left without a result is completed here, so every copy
-                    // of it and every later repeat are answered the same.
-                    self.complete_claim(action, &result)?;
-                    return Ok(result);
+                    return self.finish_published(&row, params, action);
                 }
                 UploadState::Publishing => {
-                    check_declaration(&row, params)?;
-                    let payloads = self.payloads.lock().map_err(|_| poisoned())?;
-                    // Read again under the lock that guards the payload. The state above was read
-                    // before this lock, and a copy of this action, a cancellation or a sweep can
-                    // have moved the row since. Resolving a publication from a state that is no
-                    // longer there is how a payload another state now owns gets removed.
-                    let publishing = {
-                        let store = self.locked()?;
-                        upload_of(&store, params.transfer_id, actor)?
-                    };
-                    if publishing.state == UploadState::Publishing {
-                        self.resolve_publication(&publishing, now)?;
-                    }
-                    drop(payloads);
-                    let store = self.locked()?;
-                    let row = upload_of(&store, params.transfer_id, actor)?;
-                    return match row.state {
-                        UploadState::Published => {
-                            let published_at = row.preview_unavailable.clone();
-                            let handle = handle_of(&row)?;
-                            drop(store);
-                            let mine = match self.recorded(action)? {
-                                Recorded::Answered(answered) => return Ok(answered),
-                                Recorded::Claimed => true,
-                                Recorded::Absent => false,
-                            };
-                            let result = UploadFinishResult {
-                                handle,
-                                already_published: !mine,
-                                preview_unavailable: Nullable(published_at),
-                            };
-                            self.complete_claim(action, &result)?;
-                            Ok(result)
-                        }
-                        _ => {
-                            drop(store);
-                            // The claim this publication was made under is answered with the
-                            // refusal it ended in, so a copy that arrives before the next recovery
-                            // pass is owed this answer rather than one for the state this action's
-                            // own publication reached. Where the action was settled first, that
-                            // answer is the one that comes back.
-                            self.refuse_publication(action, publication_refusal(&row))
-                        }
-                    };
+                    return self.finish_publishing(actor, params, action, now);
                 }
                 _ => {}
             }
@@ -878,16 +815,24 @@ impl TransferService {
             if let Recorded::Answered(answered) = recorded_with(&store, action)? {
                 return Ok(answered);
             }
-            // An upload that has already ended will never publish, and that is this action's
-            // answer: recorded on its own claim, so a copy of it, and the sweep that may be
-            // resolving claims behind this call, cannot produce a second one. An invalidated row
-            // answers with the reason it recorded; any other ended state answers as that state.
-            if matches!(
-                row.state,
-                UploadState::Cancelled | UploadState::Invalidated | UploadState::Expired
-            ) {
-                drop(store);
-                return self.refuse_publication(action, publication_refusal(&row));
+            match row.state {
+                UploadState::Published => {
+                    drop(store);
+                    return self.finish_published(&row, params, action);
+                }
+                UploadState::Publishing => {
+                    drop(store);
+                    return self.finish_publishing(actor, params, action, now);
+                }
+                // An upload that has already ended will never publish, and that is this action's
+                // answer: recorded on its own claim, so a copy of it, and the sweep that may be
+                // resolving claims behind this call, cannot produce a second one. An invalidated row
+                // answers with the reason it recorded; any other ended state answers as that state.
+                UploadState::Cancelled | UploadState::Invalidated | UploadState::Expired => {
+                    drop(store);
+                    return self.refuse_publication(action, publication_refusal(&row));
+                }
+                _ => {}
             }
             self.check_live(&mut store, &row, "it cannot be finished")?;
             check_declaration(&row, params)?;
@@ -973,25 +918,14 @@ impl TransferService {
         // Rechecked under the lock: a cancellation could have landed while the file was read.
         let row = upload_of(&store, params.transfer_id, actor)?;
         if row.state == UploadState::Published {
-            // Published while this call was reading the file. The same one read, one decision
-            // rule as the paths above: a claim of this action's means this action published it,
-            // and no claim means this call found somebody else's attachment.
-            let handle = handle_of(&row)?;
-            let reason = row.preview_unavailable.clone();
             drop(store);
             drop(payloads);
-            let mine = match self.recorded(action)? {
-                Recorded::Answered(answered) => return Ok(answered),
-                Recorded::Claimed => true,
-                Recorded::Absent => false,
-            };
-            let result = UploadFinishResult {
-                handle,
-                already_published: !mine,
-                preview_unavailable: Nullable(reason),
-            };
-            self.complete_claim(action, &result)?;
-            return Ok(result);
+            return self.finish_published(&row, params, action);
+        }
+        if row.state == UploadState::Publishing {
+            drop(store);
+            drop(payloads);
+            return self.finish_publishing(actor, params, action, now);
         }
         if !row.state.accepts_chunks() {
             return Err(TransferError::WrongState {
@@ -1067,6 +1001,75 @@ impl TransferService {
         // told the outcome is unknown. Nothing replaces a result already recorded.
         self.complete_claim(action, &result)?;
         Ok(result)
+    }
+
+    fn finish_published(
+        &self,
+        row: &UploadRow,
+        params: &UploadFinishParams,
+        action: Option<&Action>,
+    ) -> Result<UploadFinishResult> {
+        check_declaration(row, params)?;
+        let mine = match self.recorded(action)? {
+            Recorded::Answered(answered) => return Ok(answered),
+            Recorded::Claimed => true,
+            Recorded::Absent => false,
+        };
+        let result = UploadFinishResult {
+            handle: handle_of(row)?,
+            already_published: !mine,
+            preview_unavailable: Nullable(row.preview_unavailable.clone()),
+        };
+        self.complete_claim(action, &result)?;
+        Ok(result)
+    }
+
+    fn finish_publishing(
+        &self,
+        actor: &ActorId,
+        params: &UploadFinishParams,
+        action: Option<&Action>,
+        now: TimestampMs,
+    ) -> Result<UploadFinishResult> {
+        let publishing = {
+            let store = self.locked()?;
+            upload_of(&store, params.transfer_id, actor)?
+        };
+        check_declaration(&publishing, params)?;
+        let payloads = self.payloads.lock().map_err(|_| poisoned())?;
+        let publishing = {
+            let store = self.locked()?;
+            upload_of(&store, params.transfer_id, actor)?
+        };
+        if publishing.state == UploadState::Publishing {
+            self.resolve_publication(&publishing, now)?;
+        }
+        drop(payloads);
+        let store = self.locked()?;
+        let row = upload_of(&store, params.transfer_id, actor)?;
+        match row.state {
+            UploadState::Published => {
+                let published_at = row.preview_unavailable.clone();
+                let handle = handle_of(&row)?;
+                drop(store);
+                let mine = match self.recorded(action)? {
+                    Recorded::Answered(answered) => return Ok(answered),
+                    Recorded::Claimed => true,
+                    Recorded::Absent => false,
+                };
+                let result = UploadFinishResult {
+                    handle,
+                    already_published: !mine,
+                    preview_unavailable: Nullable(published_at),
+                };
+                self.complete_claim(action, &result)?;
+                Ok(result)
+            }
+            _ => {
+                drop(store);
+                self.refuse_publication(action, publication_refusal(&row))
+            }
+        }
     }
 
     /// Completes, or invalidates, one publication whose intent is already durable.
@@ -1959,14 +1962,18 @@ impl TransferService {
                 }
                 // A publication that ended in neither of those ways ended as a refusal, and the
                 // repeat is owed that refusal rather than a handle that names nothing.
-                (UPLOAD_FINISH, UploadState::Invalidated | UploadState::Expired) => {
-                    Settled::Failure(
-                        ErrorCode::AttachmentIntegrity,
-                        row.invalid_reason.clone().unwrap_or_else(|| {
-                            "this upload ended without being published".to_owned()
-                        }),
-                    )
-                }
+                (UPLOAD_FINISH, UploadState::Invalidated) => Settled::Failure(
+                    ErrorCode::AttachmentIntegrity,
+                    row.invalid_reason
+                        .clone()
+                        .unwrap_or_else(|| "this upload ended without being published".to_owned()),
+                ),
+                (UPLOAD_FINISH, UploadState::Expired) => Settled::Failure(
+                    ErrorCode::ResourceUnavailable,
+                    row.invalid_reason
+                        .clone()
+                        .unwrap_or_else(|| "this upload ended without being published".to_owned()),
+                ),
                 // Cancelled *and* released: the bytes are only back in the budget once the payload
                 // is gone, and a result that said otherwise would be wrong. A row still marked for
                 // cleanup is left to the next pass, which runs after the retry that removes it.
