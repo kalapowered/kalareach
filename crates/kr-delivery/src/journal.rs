@@ -2147,7 +2147,8 @@ impl DeliveryJournal {
             .query_row(
                 "SELECT burst_scaled, sustained_scaled, refilled_at_ms, collapse_into,
                         collapse_opened_at_ms, collapse_count
-                   FROM delivery_budget WHERE destination_id = ?1",
+                   FROM delivery_budget WHERE policy_key = (SELECT COALESCE(installation_id, destination_id)
+                          FROM delivery_destinations WHERE destination_id = ?1)",
                 params![destination_id.as_str()],
                 |row| {
                     Ok(StoredBudget {
@@ -2177,7 +2178,9 @@ impl DeliveryJournal {
         self.connection.execute(
             "UPDATE delivery_budget
              SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
-             WHERE destination_id = ?1 AND collapse_into = ?2",
+             WHERE policy_key = (SELECT COALESCE(installation_id, destination_id)
+                     FROM delivery_destinations WHERE destination_id = ?1)
+               AND collapse_into = ?2",
             params![destination_id.as_str(), notification_id.to_string()],
         )?;
         Ok(())
@@ -2916,10 +2919,11 @@ fn record_budget_in(
 
 /// The statement one destination's allowance is written with.
 const BUDGET_UPSERT: &str = "INSERT INTO delivery_budget \
-     (destination_id, burst_scaled, sustained_scaled, refilled_at_ms, \
+     (policy_key, burst_scaled, sustained_scaled, refilled_at_ms, \
       collapse_into, collapse_opened_at_ms, collapse_count) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-     ON CONFLICT (destination_id) DO UPDATE SET \
+     VALUES ((SELECT COALESCE(installation_id, destination_id) FROM delivery_destinations \
+                WHERE destination_id = ?1), ?2, ?3, ?4, ?5, ?6, ?7) \
+     ON CONFLICT (policy_key) DO UPDATE SET \
          burst_scaled = excluded.burst_scaled, \
          sustained_scaled = excluded.sustained_scaled, \
          refilled_at_ms = excluded.refilled_at_ms, \
@@ -3128,8 +3132,12 @@ const SCHEMA: &str = "
         expires_at_ms INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS delivery_budget (
-        destination_id TEXT PRIMARY KEY
-            REFERENCES delivery_destinations(destination_id),
+        -- The subject of the rate policy rather than the row that names it. Section 16 counts a
+        -- destination installation, so a paired device's allowance is keyed by its installation
+        -- and follows it through any reconfiguration; an external destination has no installation
+        -- and is its own subject. No foreign key, because the allowance outlives the row: a
+        -- destination configured again under another identifier must not start its hour afresh.
+        policy_key TEXT PRIMARY KEY,
         burst_scaled INTEGER NOT NULL,
         sustained_scaled INTEGER NOT NULL,
         refilled_at_ms INTEGER NOT NULL,
@@ -4223,6 +4231,77 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("only have one configured destination")
+        );
+    }
+
+    /// Section 16's burst and hourly limits are per destination **installation**, so the spent
+    /// allowance belongs to the installation rather than to the row that names it. Configuring
+    /// the same device under another destination identifier is not twenty more notifications.
+    #[test]
+    fn a_reconfigured_installation_keeps_the_allowance_it_has_already_spent() {
+        let mut journal = journal();
+        let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+        let installation = InstallationId::new(uuid(5));
+        let phone = |id: &str| DestinationRecord {
+            id: DestinationId::new(id).expect("an identifier"),
+            destination: Destination::Push(Box::new(PushDestination {
+                installation_id: installation,
+                sender_record_id: PushSenderRecordId::new(uuid(6)),
+                preview_keys: PreviewKeys::only(*device.public(), 1),
+                previews_enabled: true,
+                mailbox_key: None,
+            })),
+            rule: Some(DeliveryRule {
+                name: "anything".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        };
+        let first = phone("phone-1");
+        journal
+            .configure_destination(&first)
+            .expect("a destination");
+        journal
+            .record_budget(
+                &first.id,
+                &StoredBudget {
+                    burst_scaled: 19_000,
+                    sustained_scaled: 41_000,
+                    refilled_at_ms: 1_000,
+                    collapse_into: None,
+                    collapse_opened_at_ms: None,
+                    collapse_count: 0,
+                },
+            )
+            .expect("a budget");
+        // The device is configured again under another destination identifier, and the first row
+        // is pointed at another installation so the one-destination rule is not what is being
+        // tested here.
+        let mut moved = phone("phone-1");
+        if let Destination::Push(push) = &mut moved.destination {
+            push.installation_id = InstallationId::new(uuid(9));
+        }
+        journal
+            .configure_destination(&moved)
+            .expect("the first row moves");
+        let second = phone("phone-2");
+        journal
+            .configure_destination(&second)
+            .expect("a second destination");
+        let carried = journal
+            .budget(&second.id)
+            .expect("a read")
+            .expect("the installation's own allowance");
+        assert_eq!(carried.burst_scaled, 19_000);
+        assert_eq!(carried.sustained_scaled, 41_000);
+        assert_eq!(
+            journal
+                .budget(&moved.id)
+                .expect("a read")
+                .map(|budget| budget.burst_scaled),
+            None,
+            "and the installation it was moved to has spent nothing"
         );
     }
 
