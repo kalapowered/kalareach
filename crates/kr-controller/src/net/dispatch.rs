@@ -48,7 +48,9 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::EnvironmentSelector;
-use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, RequestId, SessionId};
+use kr_protocol::ids::{
+    AuthorityRevision, ConnectionId, DeviceId, EnvironmentId, RequestId, SessionId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::session::SessionListResult;
@@ -1940,150 +1942,145 @@ impl RemoteConnection {
         }
     }
 
-    /// Checks destination and source authority for paired-device project mutations against the grant.
+    /// Refuses a project mutation whose destination or source the device's grant does not reach.
+    ///
+    /// Section 14 asks for an authorised destination handle and section 23 for a destination
+    /// policy, and this is that policy: **one rule, in one place**, rather than a restriction
+    /// written again inside each method. What differs per method is only where the subject is —
+    /// a creation carries the destination it wants, a working copy names the repository it comes
+    /// from, a removal names the working copy it takes away — so each method says what it names
+    /// and the same rule decides all of them.
+    ///
+    /// A grant bounded to environments reaches the environments it names and nothing else. An
+    /// unbounded grant reaches none of these at all: these five name a directory on this host's
+    /// own filesystem, and a grant that bounds nothing would make the action right the whole of
+    /// the restriction. For a caller on the machine's own socket the authority is the user's own
+    /// over the user's own filesystem, and this does not apply.
     fn check_project_authority(
         &self,
         method: Method,
         mutation: &MutationRequest,
     ) -> std::result::Result<(), ProtocolError> {
-        let names = match method {
-            Method::ProjectInit | Method::ProjectClone | Method::ProjectAdopt => {
-                "the directory it creates a repository in"
-            }
-            Method::WorkspaceCreate => "the repository it takes a working copy from",
-            Method::WorkspaceRemove => "the working copy it removes",
-            _ => return Ok(()),
+        let Some(named) = self.project_subjects(method, mutation)? else {
+            return Ok(());
         };
-        let selector = &self.device.grant.environment_selector;
-        match selector {
+        match &self.device.grant.environment_selector {
             EnvironmentSelector::Any => Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 format!(
                     "{} names {}, and this device's grant does not bound destinations to specific environments: an unbounded grant cannot authorise a host-local path",
                     method.as_str(),
-                    names
+                    named.names
                 ),
             )),
             EnvironmentSelector::These { environment_ids } => {
-                match method {
-                    Method::ProjectInit => {
-                        let params = mutation
-                            .params
-                            .to_typed::<kr_protocol::project::ProjectInitParams>()
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
-                            })?;
-                        if !environment_ids.contains(&params.destination.environment_id) {
-                            return Err(ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                format!(
-                                    "{} destination environment {} is not admitted by grant",
-                                    method.as_str(),
-                                    params.destination.environment_id
-                                ),
-                            ));
-                        }
+                for subject in named.environments {
+                    if !environment_ids.contains(&subject) {
+                        return Err(ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            format!(
+                                "{} names {} in environment {subject}, which this device\'s grant does not admit",
+                                method.as_str(),
+                                named.names
+                            ),
+                        ));
                     }
-                    Method::ProjectClone => {
-                        let params = mutation
-                            .params
-                            .to_typed::<kr_protocol::project::ProjectCloneParams>()
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
-                            })?;
-                        if !environment_ids.contains(&params.destination.environment_id) {
-                            return Err(ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                format!(
-                                    "{} destination environment {} is not admitted by grant",
-                                    method.as_str(),
-                                    params.destination.environment_id
-                                ),
-                            ));
-                        }
-                    }
-                    Method::ProjectAdopt => {
-                        let params = mutation
-                            .params
-                            .to_typed::<kr_protocol::project::ProjectAdoptParams>()
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
-                            })?;
-                        if !environment_ids.contains(&params.destination.environment_id) {
-                            return Err(ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                format!(
-                                    "{} destination environment {} is not admitted by grant",
-                                    method.as_str(),
-                                    params.destination.environment_id
-                                ),
-                            ));
-                        }
-                    }
-                    Method::WorkspaceCreate => {
-                        let params = mutation
-                            .params
-                            .to_typed::<kr_protocol::project::WorkspaceCreateParams>()
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
-                            })?;
-                        if let Some(destination) = params.destination.as_ref()
-                            && !environment_ids.contains(&destination.environment_id)
-                        {
-                            return Err(ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                format!(
-                                    "{} destination environment {} is not admitted by grant",
-                                    method.as_str(),
-                                    destination.environment_id
-                                ),
-                            ));
-                        }
-                        if let Ok(read) = self.controller.project.service().project_read(
-                            &kr_protocol::project::ProjectReadParams {
-                                project_repository_id: params.project_repository_id,
-                            },
-                        ) && !environment_ids.contains(&read.project.environment_id)
-                        {
-                            return Err(ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                format!(
-                                    "{} repository environment {} is not admitted by grant",
-                                    method.as_str(),
-                                    read.project.environment_id
-                                ),
-                            ));
-                        }
-                    }
-                    Method::WorkspaceRemove => {
-                        let params = mutation
-                            .params
-                            .to_typed::<kr_protocol::project::WorkspaceRemoveParams>()
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
-                            })?;
-                        if let Ok(read) = self.controller.project.service().workspace_read(
-                            &kr_protocol::project::WorkspaceReadParams {
-                                workspace_id: params.workspace_id,
-                            },
-                        ) && !environment_ids.contains(&read.workspace.environment_id)
-                        {
-                            return Err(ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                format!(
-                                    "{} workspace environment {} is not admitted by grant",
-                                    method.as_str(),
-                                    read.workspace.environment_id
-                                ),
-                            ));
-                        }
-                    }
-                    _ => {}
                 }
                 Ok(())
             }
         }
     }
+
+    /// Returns what one project mutation names, for the policy above to decide.
+    ///
+    /// A subject the service cannot read is not named here: an unknown repository or working copy
+    /// is nothing this grant could reach, and the service refuses the mutation itself for the
+    /// subject not existing rather than this returning an environment it invented.
+    fn project_subjects(
+        &self,
+        method: Method,
+        mutation: &MutationRequest,
+    ) -> std::result::Result<Option<NamedSubjects>, ProtocolError> {
+        let service = self.controller.project.service();
+        let (names, environments) = match method {
+            Method::ProjectInit => (
+                "the directory it creates a repository in",
+                vec![
+                    typed_params::<kr_protocol::project::ProjectInitParams>(mutation)?
+                        .destination
+                        .environment_id,
+                ],
+            ),
+            Method::ProjectClone => (
+                "the directory it creates a repository in",
+                vec![
+                    typed_params::<kr_protocol::project::ProjectCloneParams>(mutation)?
+                        .destination
+                        .environment_id,
+                ],
+            ),
+            Method::ProjectAdopt => (
+                "the directory it creates a repository in",
+                vec![
+                    typed_params::<kr_protocol::project::ProjectAdoptParams>(mutation)?
+                        .destination
+                        .environment_id,
+                ],
+            ),
+            Method::WorkspaceCreate => {
+                let params = typed_params::<kr_protocol::project::WorkspaceCreateParams>(mutation)?;
+                // Two subjects: the repository the working copy comes from, and, for an isolated
+                // one, the directory its working tree goes in.
+                let mut environments: Vec<EnvironmentId> = params
+                    .destination
+                    .as_ref()
+                    .map(|destination| destination.environment_id)
+                    .into_iter()
+                    .collect();
+                if let Ok(read) = service.project_read(&kr_protocol::project::ProjectReadParams {
+                    project_repository_id: params.project_repository_id,
+                }) {
+                    environments.push(read.project.environment_id);
+                }
+                ("the repository it takes a working copy from", environments)
+            }
+            Method::WorkspaceRemove => {
+                let params = typed_params::<kr_protocol::project::WorkspaceRemoveParams>(mutation)?;
+                let mut environments = Vec::new();
+                if let Ok(read) =
+                    service.workspace_read(&kr_protocol::project::WorkspaceReadParams {
+                        workspace_id: params.workspace_id,
+                    })
+                {
+                    environments.push(read.workspace.environment_id);
+                }
+                ("the working copy it removes", environments)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(NamedSubjects {
+            names,
+            environments,
+        }))
+    }
+}
+
+/// What one project mutation names that a device's grant has to reach.
+struct NamedSubjects {
+    /// What the method acts on, in the refusal's own words.
+    names: &'static str,
+    /// The environments its subjects belong to.
+    environments: Vec<EnvironmentId>,
+}
+
+/// Decodes one mutation's parameters, under the code a malformed request is answered with.
+fn typed_params<T: serde::de::DeserializeOwned + serde::Serialize>(
+    mutation: &MutationRequest,
+) -> std::result::Result<T, ProtocolError> {
+    mutation
+        .params
+        .to_typed()
+        .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))
 }
 
 /// Returns whether one request claims or adds a geometry claim.
