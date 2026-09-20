@@ -958,8 +958,9 @@ carries it now. Anything typed is put to the runtime first, and the identifier i
 what the record keeps.
 
 The identity of a WSL distribution or a container is either given at enrolment or asked of the
-destination. Asking means running the helper inside it, which starts a stopped environment, so it
-happens only when the person asks for it by name.
+destination. Asking means running the helper inside it, which would start a stopped environment, so
+the platform is asked first and a destination that is not running is refused: enrolment starts
+nothing, and starting belongs to refresh, create and attach.
 
 `environment.inventory` reads the owner-approved cache. Every row carries the environment identity,
 when it was last observed, and an explicit status: `running`, `environment_stopped` or `stale`. A

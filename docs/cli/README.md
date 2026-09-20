@@ -665,8 +665,9 @@ to select the record; it is never compared as an identity, so a container recrea
 name does not inherit the old one. `--helper` is absolute, in the target environment's own terms.
 
 An enrolment names the environment's own identity. Pass it with `--environment-id`, or pass
-`--probe` to ask the destination for it — which runs the helper inside that environment, and so
-starts it when it is stopped. A container's `--target` is resolved through the container runtime
+`--probe` to ask the destination for it. A probe runs the helper inside that environment, so the
+environment has to be running already: enrolment starts nothing, and a probe of a stopped
+environment is refused rather than starting it. A container's `--target` is resolved through the container runtime
 first, and the identifier it answers with is what the record keeps; a name, or a short prefix of an
 identifier, is not one.
 

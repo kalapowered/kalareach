@@ -83,9 +83,11 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
             .parse::<EnvironmentId>()
             .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))?,
         // Asking a destination which environment it is means running the helper inside it, and
-        // running anything inside a stopped distribution starts it. Section 3 leaves starting to
-        // refresh, create and attach, so this happens only when the person asked for it by name.
+        // running anything inside a stopped environment starts it. Section 3 leaves starting to
+        // refresh, create and attach, so a probe is asked for by name and is put only to an
+        // environment that is already running.
         None if arguments.probe => {
+            probe_permitted(access_class, &target, &arguments.user, &arguments.helper)?;
             query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
                 .await
                 .map_err(|error| {
@@ -98,8 +100,7 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
         None => {
             return Err(CliError::Usage(
                 "an enrolment records the environment's own identity: pass --environment-id \
-                 <uuid>, or pass --probe to ask the destination, which starts it when it is \
-                 stopped"
+                 <uuid>, or start the environment and pass --probe to ask it"
                     .to_owned(),
             ));
         }
@@ -166,6 +167,40 @@ fn resolve_container_target(target: &str) -> Result<String> {
         )));
     }
     Ok(resolved)
+}
+
+/// Decides whether the destination may be asked which environment it is.
+///
+/// Observing starts nothing, so the platform is asked first. A destination that is not running is
+/// refused here rather than started by the question, because starting one belongs to refresh,
+/// create and attach.
+fn probe_permitted(
+    access: EnvironmentAccess,
+    target: &str,
+    user: &str,
+    helper: &str,
+) -> Result<()> {
+    let observed = kr_controller::bridge::platform::destination_state(access, target, user, helper)
+        .map_err(|error| {
+            CliError::Usage(format!(
+                "this host could not ask whether {target} is running, so it will not start it by \
+                 asking ({error}); pass --environment-id <uuid> instead"
+            ))
+        })?;
+    probe_decision(observed, target)
+}
+
+/// The rule a probe follows once the platform has answered.
+fn probe_decision(observed: EnvironmentPresence, target: &str) -> Result<()> {
+    match observed {
+        EnvironmentPresence::Running => Ok(()),
+        EnvironmentPresence::EnvironmentStopped | EnvironmentPresence::Stale => {
+            Err(CliError::Usage(format!(
+                "{target} is not running, and asking it which environment it is would start it; \
+                 start it yourself, or pass --environment-id <uuid>"
+            )))
+        }
+    }
 }
 
 /// Asks the destination which environment it is.
@@ -315,5 +350,22 @@ pub const fn observation_text(observation: ObservationSource) -> &'static str {
     match observation {
         ObservationSource::Cache => "from this host's cache",
         ObservationSource::Refresh => "observed now",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_probe_is_put_only_to_an_environment_that_is_already_running() {
+        probe_decision(EnvironmentPresence::Running, "Ubuntu-24.04").expect("running is asked");
+        for quiet in [
+            EnvironmentPresence::EnvironmentStopped,
+            EnvironmentPresence::Stale,
+        ] {
+            let refused = probe_decision(quiet, "Ubuntu-24.04").expect_err("not asked");
+            assert!(refused.to_string().contains("would start it"), "{refused}");
+        }
     }
 }

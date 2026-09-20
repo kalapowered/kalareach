@@ -138,8 +138,8 @@ pub struct BridgeEnrolArguments {
     /// The environment identity this record names, when it is already known.
     #[arg(long)]
     pub environment_id: Option<String>,
-    /// Ask the destination which environment it is, instead of naming it. This runs the helper
-    /// inside the destination, which starts a stopped one.
+    /// Ask the destination which environment it is, instead of naming it. The destination has to
+    /// be running: asking runs the helper inside it, and enrolment starts nothing.
     #[arg(long)]
     pub probe: bool,
 }

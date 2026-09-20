@@ -17,6 +17,39 @@ use crate::error::{ControllerError, Result};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlatformObserver;
 
+/// Asks the platform whether one destination is running, before there is a record naming it.
+///
+/// Enrolment needs this: asking a destination which environment it is means running the helper
+/// inside it, and running anything inside a stopped distribution starts it. Observing starts
+/// nothing, so the question can be put first.
+///
+/// # Errors
+///
+/// Returns an invalid-argument failure for an access class that is not a process bridge, and a
+/// supervision failure when the platform's own command could not be run.
+pub fn destination_state(
+    access: EnvironmentAccess,
+    target: &str,
+    os_user: &str,
+    helper_path: &str,
+) -> Result<EnvironmentPresence> {
+    let enrolment = EnvironmentEnrolment {
+        // The identity is what enrolment is about to learn. Nothing below reads it: the platform is
+        // asked about the target, which is the name it knows.
+        environment_id: kr_protocol::ids::EnvironmentId::new(
+            kr_protocol::scalars::Uuid::from_bytes([0; 16]),
+        ),
+        access,
+        label: target.to_owned(),
+        target: target.to_owned(),
+        os_user: os_user.to_owned(),
+        helper_path: helper_path.to_owned(),
+        clipboard_destination: kr_protocol::scalars::Nullable::null(),
+        approved_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+    };
+    PlatformObserver.observe(&enrolment)
+}
+
 impl Observer for PlatformObserver {
     fn observe(&self, enrolment: &EnvironmentEnrolment) -> Result<EnvironmentPresence> {
         let command = launch::observe(enrolment)
