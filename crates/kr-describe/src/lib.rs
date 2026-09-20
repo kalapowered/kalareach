@@ -14,6 +14,10 @@
 //! | [`context`] | The context revision, what advances it, and the bounded input a job is built from |
 //! | [`output`] | The grammar, the validated result and every reason one is rejected |
 //! | [`budget`] | Section 22's defaults, and what a resident model actually costs |
+//! | [`resource`] | The memory reserve, power and pressure, and `resource_paused` |
+//! | [`priority`] | Background CPU and IO priority, through the mechanism each platform qualifies |
+//! | [`queue`] | One latest job per session, aging, fairness and the cadence |
+//! | [`metrics`] | Queue-wait and execution latency, published separately, beside whole-product figures |
 //! | [`error`] | What this crate refuses |
 //!
 //! # Four properties the design rests on
@@ -69,8 +73,12 @@ pub mod context;
 pub mod environment;
 pub mod error;
 pub mod metadata;
+pub mod metrics;
 pub mod output;
+pub mod priority;
 pub mod profile;
+pub mod queue;
+pub mod resource;
 pub mod time;
 
 pub use crate::error::{DescribeError, Result};

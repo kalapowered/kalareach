@@ -5,10 +5,12 @@
 //! drives that area, where a reader can see what it does without leaving the test.
 #![allow(dead_code)]
 
+use kr_describe::budget::GIB;
 use kr_describe::context::ContextBinding;
 use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment};
 use kr_describe::profile::ModelProfile;
 use kr_describe::profile::catalogue::Catalogue;
+use kr_describe::resource::{HostConditions, PowerSource, ThermalState};
 use kr_describe::time::Reading;
 use kr_protocol::ids::{EnvironmentId, SessionId};
 use kr_protocol::scalars::Uuid;
@@ -49,4 +51,14 @@ pub fn built_in() -> Catalogue {
 /// The default profile.
 pub fn default_profile() -> ModelProfile {
     built_in().default_profile().clone()
+}
+
+/// Conditions a host with plenty of everything reports.
+pub fn roomy() -> HostConditions {
+    HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Mains,
+        ThermalState::Nominal,
+    )
 }
