@@ -160,7 +160,7 @@ toml_edit = "=0.25.15"
 tokio-rustls = { version = "=0.26.5", default-features = false, features = ["logging", "ring", "tls12"] }
 # The Update Framework client. The same exact release the catalogue publishing pipeline signs with,
 # so the end that writes a generation and the end that verifies one run the same code.
-tough = "=0.24.0"
+tough = { version = "=0.24.0", features = ["http"] }
 tokio-util = "=0.7.18"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"

@@ -418,6 +418,8 @@ async fn kr_req_11_09_an_installed_package_is_enabled_without_its_repository() {
 fn a_repository_this_host_cannot_fetch_is_refused_by_name() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    assert!(catalogue.fetches_network());
+    catalogue.set_fetches_network(false);
     assert!(!catalogue.fetches_network());
     let enrolment = Enrolment::new(
         repository(),

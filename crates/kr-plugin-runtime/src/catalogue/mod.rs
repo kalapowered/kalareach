@@ -185,12 +185,10 @@ impl Catalogue {
             root: root.to_path_buf(),
             repositories: BTreeMap::new(),
             installations: Installations::new(),
-            fetches_network: false,
+            fetches_network: true,
             broker,
-            // The client's own transport, which reads a local directory or a mirror of one and
-            // refuses a scheme it was not built to fetch. A host with a network fetcher supplies
-            // it through `set_transport`; this build ships no HTTP client for a repository, and
-            // an https enrolment is refused by name rather than failing somewhere later.
+            // The client's default transport, which reads a local directory mirror or fetches
+            // over HTTP/HTTPS using tough's HTTP feature with rustls-platform-verifier.
             transport: Arc::new(tough::DefaultTransport::new()),
         };
         // What an earlier daemon enrolled and installed is still enrolled and installed. Reading
@@ -269,6 +267,11 @@ impl Catalogue {
         self.fetches_network = true;
     }
 
+    /// Sets whether this host may fetch a repository over the network.
+    pub fn set_fetches_network(&mut self, fetches_network: bool) {
+        self.fetches_network = fetches_network;
+    }
+
     /// Returns true when this host can fetch a repository over the network.
     #[must_use]
     pub const fn fetches_network(&self) -> bool {
@@ -277,7 +280,11 @@ impl Catalogue {
 
     /// Refuses a repository this host's transport cannot fetch.
     fn check_reachable(&self, enrolment: &Enrolment) -> CatalogueResult<()> {
-        if self.fetches_network || enrolment.metadata_url.scheme() == "file" {
+        let scheme = enrolment.metadata_url.scheme();
+        if scheme == "file" {
+            return Ok(());
+        }
+        if self.fetches_network && (scheme == "http" || scheme == "https") {
             return Ok(());
         }
         Err(CatalogueError::UnavailableOffline {
