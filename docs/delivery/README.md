@@ -111,7 +111,8 @@ under an earlier generation is refused rather than published.
 
 What has already left is not erased and is not claimed to be. Notifications a provider queued and
 messages another service accepted are listed as retained artifacts, each saying that this host holds
-no way to recall it. Deleting one is a separate action, authorised on its own.
+no way to recall it. Every entry is marked non-deletable (`deletable: false`), as the host implements
+no deletion action for artifacts that have already left.
 
 ## Where the state lives
 

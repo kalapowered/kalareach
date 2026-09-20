@@ -431,6 +431,33 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_duplicate_delivery_is_shown_as_a_retained_artifact() {
+        let mut journal = journal_with_work();
+        claim(&mut journal, 11, 1_500);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(11)),
+                attempt: 1,
+                state: DeliveryState::Duplicate,
+                started_at_ms: TimestampMs::new(1_500),
+                settled_at_ms: Some(TimestampMs::new(1_600)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("the destination had already seen this".to_owned()),
+                suppression: None,
+                keep_content: false,
+                left_this_host: true,
+            })
+            .expect("a transition");
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
+        let exported = outbox.exported();
+        assert_eq!(exported.len(), 1);
+        assert!(exported[0].kind.contains("webhook"));
+        assert!(exported[0].reference.contains("duplicate"));
+        assert!(!exported[0].deletable);
+    }
+
+    #[test]
     fn what_is_kept_is_named_rather_than_quietly_retained() {
         let mut journal = journal_with_work();
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);

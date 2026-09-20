@@ -1976,7 +1976,7 @@ impl DeliveryJournal {
                FROM delivery_notifications n
                JOIN delivery_destinations d ON d.destination_id = n.destination_id
                LEFT JOIN delivery_attempts a ON a.notification_id = n.notification_id
-              WHERE n.state IN ('accepted', 'duplicate_uncertain', 'outcome_unknown')
+              WHERE n.state IN ('accepted', 'duplicate', 'duplicate_uncertain', 'outcome_unknown')
               GROUP BY n.notification_id
               ORDER BY n.admitted_at_ms",
         )?;
