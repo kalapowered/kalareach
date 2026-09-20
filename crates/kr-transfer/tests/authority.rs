@@ -624,6 +624,36 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
                 acl,
                 "the list read through the handle is the one the file was given"
             );
+            // The entries themselves, not merely the fact of them: a list that came back with the
+            // right number of entries and none of their rights would pass everything else here.
+            #[cfg(target_os = "macos")]
+            {
+                let kr_transfer::AccessControl::Apple(apple) = &acl else {
+                    panic!("this platform's list is an Apple list");
+                };
+                assert_eq!(apple.entry_count(), 2, "both entries came back");
+                let raw = apple.as_bytes();
+                assert_eq!(
+                    u32::from_ne_bytes(raw[60..64].try_into().expect("four bytes")),
+                    1,
+                    "the first entry still allows"
+                );
+                assert_eq!(
+                    u32::from_ne_bytes(raw[64..68].try_into().expect("four bytes")),
+                    0x0000_0002,
+                    "the right it allows came back"
+                );
+                assert_eq!(
+                    u32::from_ne_bytes(raw[84..88].try_into().expect("four bytes")),
+                    2,
+                    "the second entry still denies"
+                );
+                assert_eq!(
+                    u32::from_ne_bytes(raw[88..92].try_into().expect("four bytes")),
+                    0x0000_0400,
+                    "the right it denies came back"
+                );
+            }
             drop(file);
 
             // Restoring the read access-control list onto a second file descriptor sets the same list.
@@ -692,13 +722,30 @@ fn give_an_access_control_list(
     let file = authority.open_write(name).ok()?;
     #[cfg(target_os = "macos")]
     let wanted = {
-        // One entry, allowing one right, under this platform's external representation: a 44-byte
-        // header declaring one entry, and 24 bytes of entry after it.
-        let mut raw = vec![0_u8; 68];
+        // This platform's external representation: a 44-byte header declaring how many entries
+        // follow, then 24 bytes an entry, each one the user or group it applies to (16 bytes),
+        // what kind of entry it is, and the rights it decides. Two entries, one allowing and one
+        // denying, so a list that lost a kind, a right or an entry would be seen to have. What
+        // the second entry denies is deliberately not deletion: this platform checks that right
+        // against the file a rename replaces, so denying it would stop the very replacement these
+        // cases are about.
+        let owner = file.owner().ok()?;
+        let mut applicable = [
+            0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0, 0, 0, 0,
+        ];
+        applicable[12..16].copy_from_slice(&owner.user.to_be_bytes());
+        let mut raw = vec![0_u8; 44 + 2 * 24];
         raw[0..4].copy_from_slice(&0x012c_c16d_u32.to_ne_bytes());
-        raw[36..40].copy_from_slice(&1_u32.to_ne_bytes());
-        raw[44..48].copy_from_slice(&1_u32.to_ne_bytes());
-        raw[60..64].copy_from_slice(&1_u32.to_ne_bytes());
+        raw[36..40].copy_from_slice(&2_u32.to_ne_bytes());
+        for (index, (kind, rights)) in [(1_u32, 0x0000_0002_u32), (2, 0x0000_0400)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = 44 + index * 24;
+            raw[at..at + 16].copy_from_slice(&applicable);
+            raw[at + 16..at + 20].copy_from_slice(&kind.to_ne_bytes());
+            raw[at + 20..at + 24].copy_from_slice(&rights.to_ne_bytes());
+        }
         kr_transfer::AccessControl::Apple(kr_transfer::AppleAcl::from_bytes(&raw).ok()?)
     };
     #[cfg(target_os = "linux")]
