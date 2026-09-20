@@ -1,0 +1,217 @@
+/*
+ * The voice screen.
+ *
+ * It defines no colour of its own: light, dark, high contrast and reduced transparency all reach
+ * this screen from `styles/tokens.css`, the way the mobile shell's do. What it does define is
+ * spacing in `rem`, so a larger system text size makes the layout grow with the text rather than
+ * clipping it, and targets at the platform minimum.
+ */
+
+.kr-voice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-4);
+  padding: var(--gap-4);
+  max-width: 44rem;
+  margin: 0 auto;
+  color: var(--ink);
+}
+
+.kr-voice__title {
+  /* Tracking tightens as the type grows: letters read too far apart at display sizes. */
+  font-size: 1.5rem;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.kr-voice__panel h2 {
+  font-size: 1rem;
+  line-height: 1.3;
+  margin: 0 0 var(--gap-2);
+}
+
+.kr-voice__subhead {
+  font-size: 0.9375rem;
+  margin: var(--gap-3) 0 var(--gap-1);
+}
+
+.kr-voice__panel {
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  padding: var(--gap-3);
+}
+
+.kr-voice__provider {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--gap-1) var(--gap-3);
+  margin: 0;
+}
+
+.kr-voice__provider dt {
+  color: var(--muted);
+}
+
+.kr-voice__provider dd {
+  margin: 0;
+  font-family: var(--font-mono);
+}
+
+.kr-voice__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+}
+
+.kr-voice__list--muted {
+  color: var(--muted);
+}
+
+.kr-voice__kind {
+  display: block;
+  font-weight: 600;
+}
+
+.kr-voice__summary {
+  display: block;
+  color: var(--muted);
+}
+
+.kr-voice__cap {
+  margin: var(--gap-2) 0 0;
+  color: var(--muted);
+}
+
+.kr-voice__cap--over {
+  color: var(--danger);
+}
+
+.kr-voice__note {
+  margin: var(--gap-2) 0 0;
+  color: var(--muted);
+}
+
+.kr-voice__capture {
+  margin: 0;
+  font-weight: 600;
+  /* The state a person reads first. Colour carries it, and so does the word, because colour alone
+     is not a state anybody using high contrast can rely on. */
+}
+
+.kr-voice__capture--off {
+  color: var(--danger);
+}
+
+.kr-voice__refusal {
+  margin: 0;
+  padding: var(--gap-2) var(--gap-3);
+  border-left: 3px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--ink);
+}
+
+.kr-voice__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+}
+
+.kr-voice__control {
+  /* The platform minimum in both dimensions: 44 points on iOS, 48 dp on Android. `--target` is
+     what the mobile shell already resolves per platform. */
+  min-height: var(--target, 2.75rem);
+  min-width: var(--target, 2.75rem);
+  padding: 0 var(--gap-3);
+  border: 1px solid var(--control-line);
+  border-radius: 0.5rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  /* Feedback on press, not on release, and only the property that moves. */
+  transition: transform 120ms var(--ease-out), background-color 120ms var(--ease-out);
+}
+
+.kr-voice__control:active {
+  transform: scale(0.97);
+  background: var(--press);
+}
+
+.kr-voice__control:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.kr-voice__control[aria-pressed='true'] {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.kr-voice__control--end,
+.kr-voice__control--danger {
+  border-color: var(--danger-line);
+  color: var(--danger);
+}
+
+.kr-voice__panel--cancel {
+  /* Set apart from the three local controls deliberately: the two things a person can stop must
+     not sit next to each other or look alike. */
+  border-color: var(--danger-line);
+}
+
+.kr-voice__confirm {
+  display: flex;
+  gap: var(--gap-2);
+  flex-wrap: wrap;
+  margin-top: var(--gap-2);
+}
+
+.kr-voice__start {
+  min-height: var(--target, 2.75rem);
+  padding: 0 var(--gap-4);
+  border: 1px solid var(--accent-line);
+  border-radius: 0.5rem;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 120ms var(--ease-out);
+}
+
+.kr-voice__start:active {
+  transform: scale(0.97);
+}
+
+.kr-voice__start:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.kr-voice__delegation {
+  border-bottom: 1px solid var(--faint);
+  padding-bottom: var(--gap-2);
+}
+
+.kr-voice__delegation:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+/* Reduced motion means gentler, not none: the colour and opacity changes that say what state a
+   control is in stay, and the movement goes. */
+@media (prefers-reduced-motion: reduce) {
+  .kr-voice__control,
+  .kr-voice__start {
+    transition: background-color 120ms var(--ease-out);
+  }
+
+  .kr-voice__control:active,
+  .kr-voice__start:active {
+    transform: none;
+  }
+}
