@@ -180,25 +180,63 @@ function Get-KrPublishedQualification {
     $answer
 }
 
-function Get-KrFinalPath {
+function Get-KrResolvedPath {
     <#
     .SYNOPSIS
-    Where a path ends up, with every link on the way followed.
+    A path with every link on the way to it followed, not only one at its end.
 
     .DESCRIPTION
-    Two spellings of one directory are one directory, and two directories whose names differ only
-    in case are two directories wherever the filesystem says so. Comparing where each path ends is
-    what tells those apart; comparing the spellings tells neither.
+    Used where the filesystem will not name a directory for this module: each component is resolved
+    from the last back to the root, so a link anywhere above the name is followed as well. The
+    recursion is bounded, and a component nothing can be read for ends it with the path as written.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path, [int]$Depth = 0)
+
+    if ([string]::IsNullOrEmpty($Path) -or $Depth -ge 64) { return $Path }
+    $item = try { Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { $null }
+    if ($null -eq $item) { return $Path }
+    $target = try { $item.ResolveLinkTarget($true) } catch { $null }
+    if ($null -ne $target) { $item = $target }
+    $full = "$($item.FullName)"
+    $parent = try { [System.IO.Path]::GetDirectoryName($full) } catch { '' }
+    $name = try { [System.IO.Path]::GetFileName($full) } catch { '' }
+    if ([string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($name)) { return $full }
+    [System.IO.Path]::Combine((Get-KrResolvedPath -Path $parent -Depth ($Depth + 1)), $name)
+}
+
+function Get-KrPathIdentity {
+    <#
+    .SYNOPSIS
+    What the filesystem says a directory is, rather than how the path to it is spelt.
+
+    .DESCRIPTION
+    One directory has many paths: a link at the end of the path, a link in one of the directories
+    above it, or a name this filesystem matches without regard to case. Two directories stay two
+    directories even where their names differ only in case, wherever the filesystem keeps both.
+    Nothing in a path says which of those two situations a pair of spellings is in, so the
+    filesystem is asked instead: the device and the inode it reports name one directory whatever
+    path led to it, and the read that gets them follows the links above the name for free. Where it
+    reports neither, the resolved path is the answer, compared the way this platform compares its
+    own names. A path nothing can be read for is its own identity, equal to itself and to no other.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
 
     if ([string]::IsNullOrEmpty($Path)) { return '' }
-    try {
-        $directory = [System.IO.DirectoryInfo]::new($Path)
-        $final = $directory.ResolveLinkTarget($true)
-        if ($null -ne $final) { return $final.FullName }
-        return $directory.FullName
-    } catch { return $Path }
+    $item = try { Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { $null }
+    if ($null -eq $item) { return "path $Path" }
+    # A link at the end of the path is followed to what it names: the directory the editor was
+    # loaded from is the question, not the link somebody reached it through.
+    $target = try { $item.ResolveLinkTarget($true) } catch { $null }
+    if ($null -ne $target) {
+        $item = try { Get-Item -LiteralPath $target.FullName -Force -ErrorAction Stop } catch { $item }
+    }
+    $stat = $item.PSObject.Properties['UnixStat']
+    if ($null -ne $stat -and $null -ne $stat.Value) {
+        return "device $($stat.Value.DeviceId) inode $($stat.Value.Inode)"
+    }
+    $resolved = Get-KrResolvedPath "$($item.FullName)"
+    if ($IsWindows) { return "path $($resolved.ToUpperInvariant())" }
+    "path $resolved"
 }
 
 function Test-KrQualifiedEditor {
@@ -238,11 +276,11 @@ function Test-KrQualifiedEditor {
             }
         }
         $base = try { "$((Get-Module PSReadLine).ModuleBase)" } catch { '' }
-        # Where each path ends, compared as the bytes it is: a filesystem that keeps two
-        # directories whose names differ only in case keeps two editors, and this package was
-        # qualified against one of them.
-        $here = Get-KrFinalPath $base
-        $there = Get-KrFinalPath $published.ModuleBase
+        # What the filesystem calls each directory, rather than how each path is spelt: a module
+        # search path can reach one editor by several spellings, and a filesystem that keeps two
+        # directories whose names differ only in case keeps two editors.
+        $here = Get-KrPathIdentity $base
+        $there = Get-KrPathIdentity $published.ModuleBase
         if (-not [string]::Equals("$version", $published.Version, [System.StringComparison]::Ordinal) -or
             -not [string]::Equals($here, $there, [System.StringComparison]::Ordinal)) {
             return @{

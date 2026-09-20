@@ -2401,22 +2401,51 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
         "a package bound into an editor whose version it never qualified"
     );
 
-    // A name that differs only in case is another directory wherever the filesystem says so, and
-    // this package was qualified against one of the two.
+    // A directory that is not the qualified editor, refused for being another directory rather
+    // than for how its name is spelt: this one exists and reads perfectly well.
     let base = qualified["psreadline_module_base"]
         .as_str()
         .expect("the published module base");
-    let mut spelled = published.clone();
-    spelled["qualified"]["psreadline_module_base"] = serde_json::Value::String(flip_case(base));
-    write_record(&record_path, &spelled);
+    let another = root.path().join("another-editor");
+    std::fs::create_dir_all(&another).expect("a directory that is not the qualified editor");
+    let mut other_directory = published.clone();
+    other_directory["qualified"]["psreadline_module_base"] =
+        serde_json::Value::String(another.display().to_string());
+    write_record(&record_path, &other_directory);
     assert_eq!(
         refusal(&package, &copy),
         "psreadline_not_the_qualified_editor",
-        "a package bound into a directory whose name is another spelling of the one it qualified"
+        "a package bound into a directory that is not the editor it was qualified against"
     );
 
-    // One directory reached by two paths is one editor: a link on the way to the qualified editor
-    // is the qualified editor, and refusing it would refuse the installation this package holds.
+    // A name whose case is turned over is another directory on a filesystem that keeps both, and
+    // another spelling of one directory on a filesystem that does not. Which of the two this host
+    // has is the filesystem's answer rather than this test's, so it is asked, and the package has
+    // to say what it says: refusing a spelling of the very directory the package is holding would
+    // refuse the installation itself.
+    let flipped = flip_case(base);
+    let one_and_the_same = one_directory(&flipped, base);
+    let mut spelled = published.clone();
+    spelled["qualified"]["psreadline_module_base"] = serde_json::Value::String(flipped.clone());
+    write_record(&record_path, &spelled);
+    assert_eq!(
+        refusal(&package, &copy),
+        if one_and_the_same {
+            ""
+        } else {
+            "psreadline_not_the_qualified_editor"
+        },
+        "this filesystem makes {flipped} and {base} {}, and the package said otherwise",
+        if one_and_the_same {
+            "one directory"
+        } else {
+            "two directories"
+        }
+    );
+
+    // One directory reached by two paths is one editor, whether the link is the last name in the
+    // path or one of the directories above it. Both are how a module search path reaches an
+    // installed editor, and refusing either would refuse the installation this package holds.
     let through = root.path().join("through-a-link");
     std::os::unix::fs::symlink(base, &through).expect("a link to the qualified editor");
     let mut linked = published.clone();
@@ -2427,6 +2456,28 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
         refusal(&package, &copy),
         "",
         "the package refused the editor it was qualified against, reached through a link"
+    );
+    let editor = std::path::Path::new(base);
+    let above = root.path().join("through-a-parent");
+    std::os::unix::fs::symlink(
+        editor
+            .parent()
+            .expect("the editor's own directory has a parent"),
+        &above,
+    )
+    .expect("a link to the directory the qualified editor is in");
+    let mut linked_above = published.clone();
+    linked_above["qualified"]["psreadline_module_base"] = serde_json::Value::String(
+        above
+            .join(editor.file_name().expect("the editor's own name"))
+            .display()
+            .to_string(),
+    );
+    write_record(&record_path, &linked_above);
+    assert_eq!(
+        refusal(&package, &copy),
+        "",
+        "the package refused the editor it was qualified against, reached through a link above it"
     );
 
     // A record that names no editor decides nothing, whether it holds no qualification at all,
@@ -2478,6 +2529,19 @@ fn flip_case(path: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Whether two paths name one directory, as the filesystem this test runs on answers it.
+///
+/// The device and the inode, which is the same question the package asks and the only thing that
+/// tells a second directory from a second spelling of one.
+fn one_directory(left: &str, right: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(one), Ok(other)) => one.dev() == other.dev() && one.ino() == other.ino(),
+        _ => false,
+    }
 }
 
 /// Writes one package record back the way a package holds it.
