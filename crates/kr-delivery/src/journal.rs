@@ -950,6 +950,23 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn configure_destination(&mut self, record: &DestinationRecord) -> Result<()> {
+        if let Destination::Push(push) = &record.destination {
+            let conflict: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT destination_id FROM delivery_destinations
+                     WHERE installation_id = ?1 AND destination_id != ?2",
+                    params![push.installation_id.to_string(), record.id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = conflict {
+                return Err(DeliveryError::JournalUnavailable(format!(
+                    "an installation may only have one configured destination; installation {} is already configured as destination {existing}",
+                    push.installation_id
+                )));
+            }
+        }
         let (
             installation,
             sender_record,
@@ -2860,6 +2877,8 @@ const SCHEMA: &str = "
         endpoint TEXT,
         idempotency_field TEXT
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS delivery_destinations_installation_idx
+        ON delivery_destinations(installation_id) WHERE installation_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS delivery_notifications (
         notification_id TEXT PRIMARY KEY,
         event_key TEXT NOT NULL REFERENCES delivery_events(event_key),
@@ -3048,7 +3067,9 @@ mod tests {
             "the cleanup decided it rather than leaving it to be produced later"
         );
         assert!(
-            !journal.produce(&event(1), &[], &[], &[]).expect("a decision"),
+            !journal
+                .produce(&event(1), &[], &[], &[])
+                .expect("a decision"),
             "an event the cleanup decided produces nothing afterwards"
         );
     }
@@ -3621,6 +3642,56 @@ mod tests {
                 })
             ),
             "a producer that still holds the old generation is refused"
+        );
+    }
+
+    #[test]
+    fn an_installation_may_only_have_one_configured_destination() {
+        let mut journal = journal();
+        let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+        let id1 = DestinationId::new("phone-1").expect("an identifier");
+        let id2 = DestinationId::new("phone-2").expect("an identifier");
+        let installation = InstallationId::new(uuid(5));
+        journal
+            .configure_destination(&DestinationRecord {
+                id: id1,
+                destination: Destination::Push(Box::new(PushDestination {
+                    installation_id: installation,
+                    sender_record_id: PushSenderRecordId::new(uuid(6)),
+                    preview_keys: PreviewKeys::only(*device.public(), 1),
+                    previews_enabled: true,
+                    mailbox_key: None,
+                })),
+                rule: Some(DeliveryRule {
+                    name: "anything".to_owned(),
+                    grant_id: None,
+                }),
+                enabled: true,
+                configured_at_ms: TimestampMs::new(1),
+            })
+            .expect("first destination configured");
+
+        let err = journal
+            .configure_destination(&DestinationRecord {
+                id: id2,
+                destination: Destination::Push(Box::new(PushDestination {
+                    installation_id: installation,
+                    sender_record_id: PushSenderRecordId::new(uuid(7)),
+                    preview_keys: PreviewKeys::only(*device.public(), 1),
+                    previews_enabled: true,
+                    mailbox_key: None,
+                })),
+                rule: Some(DeliveryRule {
+                    name: "anything".to_owned(),
+                    grant_id: None,
+                }),
+                enabled: true,
+                configured_at_ms: TimestampMs::new(1),
+            })
+            .expect_err("second destination for same installation must be refused");
+        assert!(
+            err.to_string()
+                .contains("only have one configured destination")
         );
     }
 
