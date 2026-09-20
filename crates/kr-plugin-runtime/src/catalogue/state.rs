@@ -67,6 +67,10 @@ struct InstallationRecord {
     enabled: bool,
     pinned: bool,
     grant: Vec<String>,
+    #[serde(default)]
+    requested: Vec<String>,
+    #[serde(default)]
+    payloads: Vec<String>,
 }
 
 /// Everything the catalogue holds across a restart.
@@ -141,6 +145,16 @@ impl CatalogueState {
                         .capabilities()
                         .into_iter()
                         .map(|capability| capability.as_str().to_owned())
+                        .collect(),
+                    requested: installation
+                        .requested
+                        .iter()
+                        .map(|request| request.capability.as_str().to_owned())
+                        .collect(),
+                    payloads: installation
+                        .payloads
+                        .iter()
+                        .map(PayloadDigest::to_string)
                         .collect(),
                 })
                 .collect(),
@@ -228,6 +242,20 @@ impl CatalogueState {
             for name in &record.grant {
                 grant.add(capability_from_str(name)?);
             }
+            let mut requested = Vec::new();
+            for name in &record.requested {
+                requested.push(kr_plugin_sdk::capability::CapabilityRequest {
+                    capability: capability_from_str(name)?,
+                    reason: kr_plugin_sdk::text::Summary::new(
+                        "recorded when the package was installed",
+                    )
+                    .map_err(invalid)?,
+                });
+            }
+            let mut payloads = Vec::new();
+            for digest in &record.payloads {
+                payloads.push(PayloadDigest::parse(digest).map_err(invalid)?);
+            }
             installations.push(Installation {
                 plugin_id: PluginId::new(record.plugin_id.clone()).map_err(invalid)?,
                 publisher_id: PublisherId::new(record.publisher_id.clone()).map_err(invalid)?,
@@ -239,6 +267,8 @@ impl CatalogueState {
                 enabled: record.enabled,
                 pinned: record.pinned,
                 grant,
+                requested,
+                payloads,
             });
         }
         Ok(installations)

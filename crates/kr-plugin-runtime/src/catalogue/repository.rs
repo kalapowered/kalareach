@@ -133,11 +133,14 @@ pub struct RepositoryId(String);
 impl RepositoryId {
     /// The characters an identifier may use.
     ///
-    /// The identifier becomes a directory name, so it uses the portable alphabet for the same
-    /// reason package paths do: a name two filesystems disagree about is a name that finds a
-    /// different repository on a different machine.
+    /// The identifier becomes a directory name, so it is restricted to one spelling per name.
+    /// Upper case is rejected rather than folded: on a filesystem that ignores case, `official`
+    /// and `Official` would be two enrolments in this host's map and one directory on disk, so the
+    /// second would adopt its root over the first's.
     fn is_permitted(character: char) -> bool {
-        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '-' | '_' | '.')
     }
 
     /// Parses a repository identifier.
@@ -164,8 +167,27 @@ impl RepositoryId {
         if let Some(character) = text.chars().find(|c| !Self::is_permitted(*c)) {
             return Err(CatalogueError::InvalidArgument {
                 detail: format!(
-                    "a repository identifier uses A-Z, a-z, 0-9, '-', '_' and '.', not {character:?}"
+                    "a repository identifier uses a-z, 0-9, '-', '_' and '.', not {character:?}"
                 ),
+            });
+        }
+        // Windows strips a trailing dot and resolves these names wherever they appear, so an
+        // identifier that ends in one, or that names a device, is two names for one directory.
+        if text.ends_with('.') {
+            return Err(CatalogueError::InvalidArgument {
+                detail: "a repository identifier does not end with a dot, which Windows strips"
+                    .to_owned(),
+            });
+        }
+        const WINDOWS_DEVICES: &[&str] = &[
+            "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+            "com8", "com9", "com0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8",
+            "lpt9", "lpt0",
+        ];
+        let stem = text.split('.').next().unwrap_or(&text);
+        if WINDOWS_DEVICES.contains(&stem) {
+            return Err(CatalogueError::InvalidArgument {
+                detail: format!("{text} names the Windows device {stem}"),
             });
         }
         Ok(Self(text))
@@ -457,6 +479,12 @@ mod tests {
         assert!(RepositoryId::new("a/b").is_err());
         assert!(RepositoryId::new("caf\u{e9}").is_err());
         assert!(RepositoryId::new("x".repeat(65)).is_err());
+        // One spelling per name: a filesystem that ignores case must not give two enrolments one
+        // directory, and Windows must not give two names one file.
+        assert!(RepositoryId::new("Official").is_err());
+        assert!(RepositoryId::new("official.").is_err());
+        assert!(RepositoryId::new("con").is_err());
+        assert!(RepositoryId::new("nul.json").is_err());
     }
 
     #[test]

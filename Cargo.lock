@@ -4337,6 +4337,7 @@ dependencies = [
  "aws-lc-rs",
  "cap-fs-ext",
  "cap-std",
+ "futures",
  "jiff",
  "kr-cbor",
  "kr-crypto",

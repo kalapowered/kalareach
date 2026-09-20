@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 
+use kr_plugin_sdk::capability::CapabilityRequest;
 use kr_plugin_sdk::catalogue::{IndexEntry, RevocationRecord};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::{PluginId, PluginName, PublisherId};
@@ -121,6 +122,17 @@ pub struct Installation {
     pub pinned: bool,
     /// What it has been permitted beyond its repository's ceiling.
     pub grant: InstallationGrant,
+    /// What the installed package asks to be permitted, as its manifest declared it.
+    ///
+    /// Recorded here rather than read from the index on demand. An installed package is usable
+    /// offline, and a repository that moved on must not turn "what may this do?" into a question
+    /// this host cannot answer.
+    pub requested: Vec<CapabilityRequest>,
+    /// Every payload the installed package consists of, by content hash.
+    ///
+    /// The package hash names the manifest. A cache that protected only that would leave the
+    /// component and the assets a live binding runs on evictable.
+    pub payloads: Vec<PayloadDigest>,
 }
 
 impl Installation {
@@ -143,7 +155,21 @@ impl Installation {
             enabled: false,
             pinned: false,
             grant,
+            requested: entry.capabilities.clone(),
+            payloads: entry
+                .payloads
+                .iter()
+                .map(|payload| payload.digest)
+                .collect(),
         }
+    }
+
+    /// Returns every content hash this installation needs, including its manifest.
+    #[must_use]
+    pub fn all_payloads(&self) -> Vec<PayloadDigest> {
+        let mut digests = vec![self.package_digest];
+        digests.extend(self.payloads.iter().copied());
+        digests
     }
 }
 
@@ -434,8 +460,6 @@ impl Installations {
     }
 
     /// Returns every package hash a live binding or a pinned installation still needs.
-    ///
-    /// These are the payloads a sync never evicts to finish.
     #[must_use]
     pub fn protected_packages(&self) -> Vec<PayloadDigest> {
         let mut protected: Vec<PayloadDigest> = self
@@ -449,6 +473,24 @@ impl Installations {
                 .filter(|installation| installation.pinned)
                 .map(|installation| installation.package_digest),
         );
+        protected.sort_unstable();
+        protected.dedup();
+        protected
+    }
+
+    /// Returns every content hash a live binding or a pinned installation still needs.
+    ///
+    /// These are the payloads a sync never evicts to finish: the manifest a binding is pinned to
+    /// and every file that package consists of.
+    #[must_use]
+    pub fn protected_payloads(&self) -> Vec<PayloadDigest> {
+        let packages = self.protected_packages();
+        let mut protected = packages.clone();
+        for installation in self.installations.values() {
+            if packages.contains(&installation.package_digest) {
+                protected.extend(installation.payloads.iter().copied());
+            }
+        }
         protected.sort_unstable();
         protected.dedup();
         protected

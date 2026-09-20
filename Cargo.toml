@@ -51,6 +51,9 @@ clap = { version = "=4.6.7", features = ["derive"] }
 # refuse replacing a document whose protection this host cannot carry across, rather than to grant
 # anything.
 exacl = { version = "=0.13.0", default-features = false }
+# Stream combinators. The catalogue wraps the update client's transport to hold a whole metadata
+# fetch inside the repository's approved byte budget, whatever length the metadata declares.
+futures = "=0.3.34"
 hex = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", features = ["zeroize"] }

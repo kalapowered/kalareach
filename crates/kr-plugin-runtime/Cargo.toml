@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true
+futures.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 jiff.workspace = true

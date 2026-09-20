@@ -52,9 +52,15 @@ pub struct ActiveGeneration {
     /// The generation number.
     pub generation: u64,
     /// The digest of the index's canonical rendering.
+    ///
+    /// A generation number names one immutable index. Holding the digest beside the number is what
+    /// lets a later sync refuse different bytes under a number this host already accepted.
     pub index_digest: PayloadDigest,
     /// The exact length of the index document held.
     pub index_bytes: u64,
+    /// The metadata versions this generation was accepted at.
+    #[serde(default)]
+    pub versions: crate::catalogue::trust::MetadataVersions,
 }
 
 impl Store {
@@ -134,14 +140,6 @@ impl Store {
         self.payload_path(digest).is_file()
     }
 
-    /// Returns the directory one package is staged in.
-    #[must_use]
-    pub fn stage_path(&self, manifest_digest: PayloadDigest) -> PathBuf {
-        self.root
-            .join("staging")
-            .join(format!("package-{manifest_digest}"))
-    }
-
     /// Returns true when the package is already activated here.
     #[must_use]
     pub fn has_package(&self, manifest_digest: PayloadDigest) -> bool {
@@ -180,7 +178,7 @@ impl Store {
         let active = self.active()?.ok_or_else(|| CatalogueError::NotFound {
             detail: "this repository has no activated generation yet".to_owned(),
         })?;
-        let path = self.index_path(active.generation);
+        let path = self.index_path(active.index_digest);
         let bytes =
             std::fs::read(&path).map_err(|source| CatalogueError::storage(&path, &source))?;
         if PayloadDigest::of(&bytes) != active.index_digest {
@@ -197,8 +195,13 @@ impl Store {
         })
     }
 
-    fn index_path(&self, generation: u64) -> PathBuf {
-        self.root.join("index").join(format!("{generation}.json"))
+    /// Returns the file one index document sits in.
+    ///
+    /// The document is named by its own digest, so a generation republished with different bytes
+    /// is a different file and the pointer can never end up naming content it did not verify.
+    #[must_use]
+    pub fn index_path(&self, digest: PayloadDigest) -> PathBuf {
+        self.root.join("index").join(format!("{digest}.json"))
     }
 
     /// Makes one verified generation current.
@@ -215,6 +218,7 @@ impl Store {
         &self,
         generation: RepositoryGeneration,
         index: &CatalogueIndex,
+        versions: crate::catalogue::trust::MetadataVersions,
     ) -> CatalogueResult<ActiveGeneration> {
         let rendered = index
             .canonical_json()
@@ -222,13 +226,15 @@ impl Store {
                 detail: format!("the index could not be rendered: {source}"),
             })?;
         let bytes = rendered.into_bytes();
-        let path = self.index_path(generation.get());
+        let digest = PayloadDigest::of(&bytes);
+        let path = self.index_path(digest);
         write_atomically(&self.root.join("staging"), &path, &bytes)?;
 
         let active = ActiveGeneration {
             generation: generation.get(),
-            index_digest: PayloadDigest::of(&bytes),
+            index_digest: digest,
             index_bytes: bytes.len() as u64,
+            versions,
         };
         let pointer =
             serde_json::to_vec(&active).map_err(|source| CatalogueError::StorageUnavailable {
@@ -293,19 +299,36 @@ impl Store {
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the staging directory cannot be made.
     pub fn stage_package(&self, manifest_digest: PayloadDigest) -> CatalogueResult<StagedPackage> {
-        let path = self.stage_path(manifest_digest);
-        // A directory left by an interrupted run is removed rather than reused: its contents were
-        // never verified as a set, and adding to it would activate a mixture of two attempts.
-        if path.exists() {
-            std::fs::remove_dir_all(&path)
-                .map_err(|source| CatalogueError::storage(&path, &source))?;
+        // Each attempt stages into a directory of its own, created rather than reused. A shared
+        // one would let a second attempt's incomplete contents be renamed into place by the first
+        // attempt's activation, and would make an interrupted run's leftovers part of a set
+        // nobody verified as a set.
+        let staging = self.root.join("staging");
+        std::fs::create_dir_all(&staging)
+            .map_err(|source| CatalogueError::storage(&staging, &source))?;
+        let mut attempt = 0u32;
+        loop {
+            let path = staging.join(format!(
+                "package-{manifest_digest}-{}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(StagedPackage {
+                        destination: self.package_dir(manifest_digest),
+                        path,
+                        written: BTreeMap::new(),
+                    });
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt > 1024 {
+                        return Err(CatalogueError::storage(&path, &source));
+                    }
+                }
+                Err(source) => return Err(CatalogueError::storage(&path, &source)),
+            }
         }
-        std::fs::create_dir_all(&path).map_err(|source| CatalogueError::storage(&path, &source))?;
-        Ok(StagedPackage {
-            destination: self.package_dir(manifest_digest),
-            path,
-            written: BTreeMap::new(),
-        })
     }
 
     /// Removes an activated package.
@@ -462,6 +485,12 @@ impl StagedPackage {
         Ok(())
     }
 
+    /// Returns the directory this attempt is staging into.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Returns how many bytes have been staged.
     #[must_use]
     pub fn staged_bytes(&self) -> u64 {
@@ -495,8 +524,20 @@ impl StagedPackage {
             std::fs::create_dir_all(parent)
                 .map_err(|source| CatalogueError::storage(parent, &source))?;
         }
-        std::fs::rename(&self.path, &self.destination)
-            .map_err(|source| CatalogueError::storage(&self.destination, &source))?;
+        match std::fs::rename(&self.path, &self.destination) {
+            Ok(()) => {}
+            // Another writer activated the same package between the check and the rename. The
+            // directory is named by the manifest digest, which covers every other file, so what
+            // is there is the same package: this attempt's copy is discarded.
+            Err(_) if self.destination.is_dir() => {
+                let _ = std::fs::remove_dir_all(&self.path);
+                return Ok(self.destination);
+            }
+            Err(source) => return Err(CatalogueError::storage(&self.destination, &source)),
+        }
+        if let Some(parent) = self.destination.parent() {
+            flush_directory(parent);
+        }
         Ok(self.destination)
     }
 
@@ -512,8 +553,9 @@ impl StagedPackage {
 /// Writes `bytes` to `path` by writing a temporary file beside it and renaming.
 ///
 /// The rename is what makes the change atomic for a reader: it sees the old contents or the new
-/// ones. The flush before it is what makes the new contents complete, so a machine that loses
-/// power between the two finds the old file rather than a truncated new one.
+/// ones, on every platform this ships on. The flush before it is what makes the new contents
+/// complete, and the directory flush after it is what makes the rename itself survive a power
+/// loss where the platform offers one.
 pub(crate) fn write_document(root: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
     let staging = root.join("staging");
     std::fs::create_dir_all(&staging)
@@ -530,19 +572,58 @@ fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResul
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("document");
-    let temporary = staging.join(format!("{name}.{}.writing", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&temporary)
-            .map_err(|source| CatalogueError::storage(&temporary, &source))?;
-        file.write_all(bytes)
-            .map_err(|source| CatalogueError::storage(&temporary, &source))?;
-        file.sync_all()
-            .map_err(|source| CatalogueError::storage(&temporary, &source))?;
-    }
+    std::fs::create_dir_all(staging).map_err(|source| CatalogueError::storage(staging, &source))?;
+    // The temporary name is this writer's alone and is created rather than opened, so a name
+    // another writer is using, or a link somebody left, fails instead of being written through.
+    let mut attempt = 0u32;
+    let (temporary, mut file) = loop {
+        let candidate = staging.join(format!("{name}.{}.{attempt}.writing", std::process::id()));
+        match std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt.saturating_add(1);
+                if attempt > 1024 {
+                    return Err(CatalogueError::storage(&candidate, &source));
+                }
+            }
+            Err(source) => return Err(CatalogueError::storage(&candidate, &source)),
+        }
+    };
+    file.write_all(bytes)
+        .map_err(|source| CatalogueError::storage(&temporary, &source))?;
+    file.sync_all()
+        .map_err(|source| CatalogueError::storage(&temporary, &source))?;
+    drop(file);
     std::fs::rename(&temporary, path).map_err(|source| {
         let _ = std::fs::remove_file(&temporary);
         CatalogueError::storage(path, &source)
-    })
+    })?;
+    if let Some(parent) = path.parent() {
+        flush_directory(parent);
+    }
+    Ok(())
+}
+
+/// Flushes a directory entry so a rename survives a power loss, where the platform offers it.
+///
+/// Unix can open a directory and flush it. Windows cannot, and its own rename durability is the
+/// filesystem's; the comment above a rename says what the platform gives rather than claiming one
+/// guarantee everywhere.
+fn flush_directory(path: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(directory) = std::fs::File::open(path) {
+            let _ = directory.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 #[cfg(test)]
@@ -571,22 +652,28 @@ mod tests {
         }
     }
 
+    fn versions(number: u64) -> crate::catalogue::trust::MetadataVersions {
+        crate::catalogue::trust::MetadataVersions {
+            root: 1,
+            timestamp: number,
+            snapshot: number,
+            targets: number,
+        }
+    }
+
     #[test]
     fn an_interrupted_index_fetch_leaves_the_previous_index_usable() {
         let (_directory, store) = store();
         store
-            .activate_index(RepositoryGeneration::new(1), &index(1))
+            .activate_index(RepositoryGeneration::new(1), &index(1), versions(1))
             .expect("the first generation activates");
         assert_eq!(store.active_index().expect("readable").generation.get(), 1);
 
         // A sync that wrote the next generation's document and stopped before the pointer moved.
-        let path = store.index_path(2);
-        write_atomically(
-            &store.root.join("staging"),
-            &path,
-            index(2).canonical_json().expect("renderable").as_bytes(),
-        )
-        .expect("the document is written");
+        let rendered = index(2).canonical_json().expect("renderable");
+        let path = store.index_path(PayloadDigest::of(rendered.as_bytes()));
+        write_atomically(&store.root.join("staging"), &path, rendered.as_bytes())
+            .expect("the document is written");
         assert!(path.is_file());
         assert_eq!(
             store.active_index().expect("readable").generation.get(),
@@ -595,9 +682,32 @@ mod tests {
         );
 
         store
-            .activate_index(RepositoryGeneration::new(2), &index(2))
+            .activate_index(RepositoryGeneration::new(2), &index(2), versions(2))
             .expect("the second generation activates");
         assert_eq!(store.active_index().expect("readable").generation.get(), 2);
+        assert_eq!(
+            store.active().expect("readable").expect("active").versions,
+            versions(2),
+            "the metadata versions are held beside the generation they were accepted at"
+        );
+    }
+
+    #[test]
+    fn an_index_document_is_named_by_its_own_digest() {
+        let (_directory, store) = store();
+        let first = store
+            .activate_index(RepositoryGeneration::new(1), &index(1), versions(1))
+            .expect("activated");
+        // A second generation with different bytes is a different file, so a pointer can never
+        // end up naming content this store did not verify.
+        let mut changed = index(1);
+        changed.produced_at = TimestampMs::new(1_760_000_100_000);
+        let second = store
+            .activate_index(RepositoryGeneration::new(1), &changed, versions(1))
+            .expect("activated");
+        assert_ne!(first.index_digest, second.index_digest);
+        assert!(store.index_path(first.index_digest).is_file());
+        assert!(store.index_path(second.index_digest).is_file());
     }
 
     #[test]

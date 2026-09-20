@@ -44,6 +44,12 @@ pub const INDEX_TARGET: &str = "index.json";
 /// The target-name prefix every package payload sits under.
 pub const PACKAGE_PREFIX: &str = "packages/";
 
+/// Every character the path matcher gives a meaning other than itself.
+///
+/// A delegation's publisher segment is compared as a name, so any of these in it means the segment
+/// is a pattern and the role claims more than one publisher.
+const GLOB_METACHARACTERS: &str = "*?[]{}!\\,";
+
 /// How deep a delegation chain may go beneath the top-level targets role.
 ///
 /// Three levels is a vendor, a product line inside that vendor and a release channel inside that
@@ -51,17 +57,41 @@ pub const PACKAGE_PREFIX: &str = "packages/";
 /// level costs a host another signed document to fetch and verify on every sync.
 pub const MAX_DELEGATION_DEPTH: usize = 3;
 
-/// How a host treats metadata expiry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExpiryPolicy {
-    /// Expired metadata refuses the generation. This is what a sync uses.
-    Enforce,
-    /// Expiry is not checked.
-    ///
-    /// This reads a generation this host already verified and activated, so that an installed,
-    /// pinned package stays usable offline after its repository's metadata expires. It never
-    /// admits a generation the host has not already accepted.
-    AlreadyAccepted,
+/// The versions of the roles one load trusted.
+///
+/// The client keeps its own trusted metadata in a datastore and refuses a version lower than the
+/// one it holds. That protection is only as durable as the datastore: a document it cannot parse
+/// after an interrupted write is a document it skips rather than one it refuses on. These are the
+/// same numbers held beside the activated generation, so rollback protection survives a datastore
+/// this host can no longer read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetadataVersions {
+    /// The root metadata version.
+    pub root: u64,
+    /// The timestamp metadata version.
+    pub timestamp: u64,
+    /// The snapshot metadata version.
+    pub snapshot: u64,
+    /// The targets metadata version.
+    pub targets: u64,
+}
+
+impl MetadataVersions {
+    /// Returns the role whose version went backwards, where one did.
+    #[must_use]
+    pub fn rollback_from(&self, accepted: Self) -> Option<&'static str> {
+        for (role, mine, theirs) in [
+            ("root", self.root, accepted.root),
+            ("timestamp", self.timestamp, accepted.timestamp),
+            ("snapshot", self.snapshot, accepted.snapshot),
+            ("targets", self.targets, accepted.targets),
+        ] {
+            if mine < theirs {
+                return Some(role);
+            }
+        }
+        None
+    }
 }
 
 /// One delegated role, as this host understands its scope.
@@ -99,6 +129,14 @@ pub struct VerifiedGeneration {
     pub targets: BTreeMap<String, TargetRecord>,
     /// The delegations beneath the top-level targets role.
     pub delegations: Vec<DelegationScope>,
+    /// The versions of the roles this load trusted.
+    pub versions: MetadataVersions,
+    /// The trusted root this load ended on, which is what the next load starts from.
+    ///
+    /// A root rotation is signed by the root it replaces, so the root a host should carry forward
+    /// is the one verification arrived at rather than the one it started with. Starting from the
+    /// original root again would let a repository restore old trust by withholding the newer root.
+    pub root: Vec<u8>,
     /// The loaded client, for reading payloads out of this same generation.
     repository: Repository,
 }
@@ -199,34 +237,51 @@ pub async fn verify(
     enrolment: &Enrolment,
     datastore: &Path,
     ledger: &BudgetLedger,
-    expiry: ExpiryPolicy,
-    transport: Option<&std::sync::Arc<dyn tough::Transport + Send + Sync>>,
+    transport: &std::sync::Arc<dyn tough::Transport + Send + Sync>,
 ) -> CatalogueResult<VerifiedGeneration> {
     std::fs::create_dir_all(datastore)
         .map_err(|source| CatalogueError::storage(datastore, &source))?;
-    let mut loader = RepositoryLoader::new(
+    // The client's own per-document ceilings are ignored wherever the snapshot declares a length,
+    // so the budget is enforced on the bytes instead: every metadata fetch this load makes is
+    // counted against the repository's approved metadata budget, whatever the metadata says about
+    // its own size.
+    let budgeted = BudgetedTransport::new(
+        std::sync::Arc::clone(transport),
+        &enrolment.metadata_url,
+        enrolment.budgets.metadata_bytes.get(),
+    );
+    let loader = RepositoryLoader::new(
         &enrolment.root,
         enrolment.metadata_url.clone(),
         enrolment.targets_url.clone(),
     )
     .datastore(datastore.to_path_buf())
-    .expiration_enforcement(match expiry {
-        ExpiryPolicy::Enforce => ExpirationEnforcement::Safe,
-        ExpiryPolicy::AlreadyAccepted => ExpirationEnforcement::Unsafe,
-    })
+    .expiration_enforcement(ExpirationEnforcement::Safe)
+    .transport(budgeted.clone())
     .limits(tough::Limits {
-        // The whole snapshot is held so that offline search works, so the client's own ceiling on
-        // each metadata document is the enrolment's metadata budget rather than the crate default.
         max_root_size: enrolment.budgets.metadata_bytes.get(),
         max_targets_size: enrolment.budgets.metadata_bytes.get(),
         max_timestamp_size: enrolment.budgets.metadata_bytes.get(),
         max_snapshot_size: enrolment.budgets.metadata_bytes.get(),
         ..tough::Limits::default()
     });
-    if let Some(transport) = transport {
-        loader = loader.transport(SharedTransport(std::sync::Arc::clone(transport)));
-    }
-    let repository = loader.load().await.map_err(|source| classify(&source))?;
+    let repository = match loader.load().await {
+        Ok(repository) => repository,
+        // A load the budget stopped is a budget refusal, not a repository this host cannot reach.
+        // The transport can only report a transport failure, so the overflow is recorded there and
+        // read back here, where it can be named as the resource it is.
+        Err(source) => return Err(budgeted.overflow().unwrap_or_else(|| classify(&source))),
+    };
+    let versions = MetadataVersions {
+        root: repository.root().signed.version.get(),
+        timestamp: repository.timestamp().signed.version.get(),
+        snapshot: repository.snapshot().signed.version.get(),
+        targets: repository.targets().signed.version.get(),
+    };
+    let root =
+        serde_json::to_vec(repository.root()).map_err(|source| CatalogueError::Untrusted {
+            detail: format!("the trusted root could not be recorded: {source}"),
+        })?;
 
     let delegations = scope_delegations(&repository.targets().signed)?;
 
@@ -284,6 +339,25 @@ pub async fn verify(
             detail: format!("{INDEX_TARGET} is not a catalogue index: {source}"),
         })?;
     ledger.check_metadata_entries(index.entries.len() as u64, Stage::Actual, INDEX_TARGET)?;
+    if index.index_version != kr_plugin_sdk::catalogue::INDEX_VERSION {
+        return Err(CatalogueError::Untrusted {
+            detail: format!(
+                "the index is format version {} and this build reads version {}",
+                index.index_version,
+                kr_plugin_sdk::catalogue::INDEX_VERSION
+            ),
+        });
+    }
+    if index.generation.get() == 0 {
+        return Err(CatalogueError::Untrusted {
+            detail: "a catalogue generation starts at one".to_owned(),
+        });
+    }
+    for name in declared_target_names(&index) {
+        if let Some(record) = resolve_target(&repository, &name)? {
+            targets.insert(name, record);
+        }
+    }
     // What each entry declares is checked before the index and the metadata are compared. A
     // package whose declared layout is unsafe is refused for that, rather than for whichever of
     // its consequences the comparison happens to notice first.
@@ -298,6 +372,8 @@ pub async fn verify(
         index_bytes,
         targets,
         delegations,
+        versions,
+        root,
         repository,
     })
 }
@@ -310,20 +386,32 @@ pub async fn verify(
 /// [`CatalogueError::InvalidArgument`] when a pin names another generation.
 pub fn check_generation(
     candidate: RepositoryGeneration,
-    accepted: Option<RepositoryGeneration>,
+    candidate_digest: PayloadDigest,
+    accepted: Option<(RepositoryGeneration, PayloadDigest)>,
     pinned: Option<RepositoryGeneration>,
 ) -> CatalogueResult<()> {
-    if let Some(accepted) = accepted
-        && candidate.get() < accepted.get()
-    {
-        return Err(CatalogueError::Untrusted {
-            detail: format!(
-                "generation {} is older than the accepted generation {}; a generation replayed \
-                 after a later one is a rollback",
-                candidate.get(),
-                accepted.get()
-            ),
-        });
+    if let Some((accepted, accepted_digest)) = accepted {
+        if candidate.get() < accepted.get() {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "generation {} is older than the accepted generation {}; a generation \
+                     replayed after a later one is a rollback",
+                    candidate.get(),
+                    accepted.get()
+                ),
+            });
+        }
+        // A generation number names one immutable index. Accepting different bytes under a number
+        // this host has already accepted would let a repository change what a pin means.
+        if candidate.get() == accepted.get() && candidate_digest != accepted_digest {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "generation {} is already accepted as {accepted_digest} and this one is \
+                     {candidate_digest}; a generation is written once",
+                    candidate.get()
+                ),
+            });
+        }
     }
     if let Some(pinned) = pinned
         && candidate.get() != pinned.get()
@@ -338,6 +426,50 @@ pub fn check_generation(
         });
     }
     Ok(())
+}
+
+/// Returns every target name the index declares, in a stable order.
+fn declared_target_names(index: &CatalogueIndex) -> Vec<String> {
+    let mut names = Vec::new();
+    for entry in &index.entries {
+        let prefix = format!(
+            "{PACKAGE_PREFIX}{}/{}/{}",
+            entry.publisher_id, entry.plugin_name, entry.version
+        );
+        names.push(format!(
+            "{prefix}/{}",
+            kr_plugin_sdk::package::MANIFEST_FILE
+        ));
+        for payload in &entry.payloads {
+            names.push(format!("{prefix}/{}", payload.path.as_str()));
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Resolves one target name through the client's own delegation search.
+fn resolve_target(repository: &Repository, name: &str) -> CatalogueResult<Option<TargetRecord>> {
+    let target_name = TargetName::new(name).map_err(|source| CatalogueError::Untrusted {
+        detail: format!("{name} is not a target name the client will resolve: {source}"),
+    })?;
+    let Ok(target) = repository.targets().signed.find_target(&target_name, false) else {
+        return Ok(None);
+    };
+    let digest: [u8; 32] =
+        target
+            .hashes
+            .sha256
+            .as_ref()
+            .try_into()
+            .map_err(|_| CatalogueError::Untrusted {
+                detail: format!("{name} is pinned without a SHA-256 digest"),
+            })?;
+    Ok(Some(TargetRecord {
+        digest: PayloadDigest::from_bytes(digest),
+        length: target.length,
+    }))
 }
 
 /// Checks every delegation's publisher and path scope, and the tree's depth.
@@ -355,6 +487,11 @@ fn walk_delegations(
     let Some(delegations) = targets.delegations.as_ref() else {
         return Ok(());
     };
+    if delegations.roles.is_empty() {
+        // A role that delegates to nobody adds no level. Counting it would refuse a chain of the
+        // permitted depth whose last role simply carries an empty delegations object.
+        return Ok(());
+    }
     if depth > MAX_DELEGATION_DEPTH {
         return Err(CatalogueError::Untrusted {
             detail: format!(
@@ -421,11 +558,23 @@ fn delegated_publisher(role: &str, paths: &PathSet) -> CatalogueResult<String> {
                 ),
             });
         };
-        if name.is_empty() || name.contains(['*', '?', '[', ']']) {
+        // The publisher segment is read as a literal name, not as a pattern that happens to look
+        // like one. The matcher understands wildcards, character classes, brace alternatives and
+        // escapes, so `packages/{acme,other}/*` is two publishers written as one segment, and a
+        // segment that is not a publisher identifier this build would accept is refused outright.
+        if name.is_empty() || name.contains(|c| GLOB_METACHARACTERS.contains(c)) {
             return Err(CatalogueError::Untrusted {
                 detail: format!(
-                    "the delegation {role} claims {value}, whose publisher is a wildcard; a \
-                     vendor delegation names its publisher"
+                    "the delegation {role} claims {value}, whose publisher segment is a pattern \
+                     rather than a name; a vendor delegation names one publisher"
+                ),
+            });
+        }
+        if kr_plugin_sdk::ids::PublisherId::new(name).is_err() {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "the delegation {role} claims {value}, whose publisher segment is not a \
+                     publisher identifier"
                 ),
             });
         }
@@ -498,20 +647,105 @@ fn classify(error: &tough::error::Error) -> CatalogueError {
             role: role.to_string(),
             expired_at: "the time the metadata states".to_owned(),
         },
+        // A repository this host cannot reach is an absence. Everything else the client refuses
+        // keeps its own classification: a bad signature, a rollback and a delegation out of scope
+        // are refusals of trust, and reporting them as "offline" would tell somebody to check
+        // their network about a repository that answered and lied.
+        tough::error::Error::Transport { .. } => CatalogueError::UnavailableOffline {
+            detail: error.to_string(),
+        },
         other => CatalogueError::Untrusted {
             detail: other.to_string(),
         },
     }
 }
 
-/// Carries a shared transport into the client, which wants an owned implementation.
+/// A transport that holds one load's metadata inside the repository's byte budget.
+///
+/// The client's own per-document ceilings apply only where the metadata does not declare a length.
+/// Where it does, the declared length wins, so a snapshot inside the budget can name a targets
+/// document of any size. Counting the bytes as they arrive is the only place that can be refused
+/// before they are held.
 #[derive(Clone, Debug)]
-struct SharedTransport(std::sync::Arc<dyn tough::Transport + Send + Sync>);
+struct BudgetedTransport {
+    inner: std::sync::Arc<dyn tough::Transport + Send + Sync>,
+    metadata_base: String,
+    budget: u64,
+    spent: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BudgetedTransport {
+    fn new(
+        inner: std::sync::Arc<dyn tough::Transport + Send + Sync>,
+        metadata_base: &url::Url,
+        budget: u64,
+    ) -> Self {
+        Self {
+            inner,
+            metadata_base: metadata_base.as_str().to_owned(),
+            budget,
+            spent: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            overflowed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns the budget refusal this transport stopped a load with, where it did.
+    fn overflow(&self) -> Option<CatalogueError> {
+        if !self.overflowed.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Some(CatalogueError::ResourceLimit(
+            crate::catalogue::budget::ResourceLimit {
+                resource: crate::catalogue::budget::Resource::MetadataBytes,
+                limit: self.budget,
+                requested: self.spent.load(std::sync::atomic::Ordering::Relaxed),
+                stage: Stage::Actual,
+                subject: "this repository's metadata".to_owned(),
+            },
+        ))
+    }
+
+    /// Returns true when a fetch is metadata rather than a target.
+    ///
+    /// Metadata is everything under the repository's metadata location. A target comes from the
+    /// targets location and is bounded by the length its own signed metadata pins.
+    fn is_metadata(&self, url: &url::Url) -> bool {
+        url.as_str().starts_with(&self.metadata_base)
+    }
+}
 
 #[tough::async_trait]
-impl tough::Transport for SharedTransport {
+impl tough::Transport for BudgetedTransport {
     async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
-        self.0.fetch(url).await
+        use futures::StreamExt as _;
+
+        let counted = self.is_metadata(&url);
+        let stream = self.inner.fetch(url.clone()).await?;
+        let budget = self.budget;
+        let spent = std::sync::Arc::clone(&self.spent);
+        let overflowed = std::sync::Arc::clone(&self.overflowed);
+        let named = url;
+        Ok(Box::pin(stream.map(move |chunk| {
+            let chunk = chunk?;
+            if counted {
+                let total = spent
+                    .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(chunk.len() as u64);
+                if total > budget {
+                    overflowed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(tough::TransportError::new_with_cause(
+                        tough::TransportErrorKind::Other,
+                        named.clone(),
+                        format!(
+                            "this repository's metadata reached {total} bytes against a budget \
+                             of {budget}"
+                        ),
+                    ));
+                }
+            }
+            Ok(chunk)
+        })))
     }
 }
 
@@ -589,23 +823,175 @@ mod tests {
     fn a_replayed_generation_is_a_rollback() {
         let three = RepositoryGeneration::new(3);
         let two = RepositoryGeneration::new(2);
-        assert!(check_generation(three, Some(two), None).is_ok());
-        assert!(check_generation(three, Some(three), None).is_ok());
-        let refusal = check_generation(two, Some(three), None).expect_err("a rollback");
+        let digest = PayloadDigest::of(b"index");
+        assert!(check_generation(three, digest, Some((two, digest)), None).is_ok());
+        assert!(check_generation(three, digest, Some((three, digest)), None).is_ok());
+        let refusal =
+            check_generation(two, digest, Some((three, digest)), None).expect_err("a rollback");
         assert!(refusal.to_string().contains("rollback"), "{refusal}");
+    }
+
+    #[test]
+    fn one_generation_number_names_one_index() {
+        let three = RepositoryGeneration::new(3);
+        let accepted = PayloadDigest::of(b"the index this host accepted");
+        let changed = PayloadDigest::of(b"different bytes under the same number");
+        let refusal = check_generation(three, changed, Some((three, accepted)), None)
+            .expect_err("a generation rewritten in place");
+        assert!(refusal.to_string().contains("written once"), "{refusal}");
     }
 
     #[test]
     fn a_pin_holds_the_repository_on_its_generation() {
         let three = RepositoryGeneration::new(3);
         let four = RepositoryGeneration::new(4);
-        assert!(check_generation(three, Some(three), Some(three)).is_ok());
-        let refusal = check_generation(four, Some(three), Some(three)).expect_err("pinned");
+        let digest = PayloadDigest::of(b"index");
+        assert!(check_generation(three, digest, Some((three, digest)), Some(three)).is_ok());
+        let refusal =
+            check_generation(four, digest, Some((three, digest)), Some(three)).expect_err("pinned");
         assert!(
             refusal
                 .to_string()
                 .contains("pinned generation stays usable"),
             "{refusal}"
         );
+    }
+
+    #[test]
+    fn a_rollback_is_seen_in_any_role() {
+        let accepted = MetadataVersions {
+            root: 1,
+            timestamp: 7,
+            snapshot: 7,
+            targets: 7,
+        };
+        assert!(accepted.rollback_from(accepted).is_none());
+        for (role, older) in [
+            (
+                "root",
+                MetadataVersions {
+                    root: 0,
+                    ..accepted
+                },
+            ),
+            (
+                "timestamp",
+                MetadataVersions {
+                    timestamp: 6,
+                    ..accepted
+                },
+            ),
+            (
+                "snapshot",
+                MetadataVersions {
+                    snapshot: 6,
+                    ..accepted
+                },
+            ),
+            (
+                "targets",
+                MetadataVersions {
+                    targets: 6,
+                    ..accepted
+                },
+            ),
+        ] {
+            assert_eq!(older.rollback_from(accepted), Some(role));
+        }
+    }
+
+    #[test]
+    fn a_publisher_segment_that_is_a_pattern_is_refused() {
+        // The matcher understands brace alternatives, so one segment can name two publishers.
+        for pattern in [
+            "packages/{acme,other}/*/*/*",
+            "packages/acme,other/*/*/*",
+            "packages/ac[me]/*/*/*",
+            "packages/acme\\x2f/*/*/*",
+        ] {
+            let refusal = delegated_publisher("vendor", &paths(&[pattern])).expect_err("a pattern");
+            assert!(
+                matches!(refusal, CatalogueError::Untrusted { .. }),
+                "{pattern}: {refusal}"
+            );
+        }
+    }
+
+    fn role(name: &str, pattern: &str, child: Option<Targets>) -> tough::schema::DelegatedRole {
+        tough::schema::DelegatedRole {
+            name: name.to_owned(),
+            keyids: Vec::new(),
+            threshold: std::num::NonZeroU64::new(1).expect("one is not zero"),
+            paths: paths(&[pattern]),
+            terminating: false,
+            targets: child.map(|targets| tough::schema::Signed {
+                signed: targets,
+                signatures: Vec::new(),
+            }),
+        }
+    }
+
+    fn targets_with(delegations: Option<tough::schema::Delegations>) -> Targets {
+        let mut targets = Targets::new(
+            "1.0.0".to_owned(),
+            std::num::NonZeroU64::new(1).expect("one is not zero"),
+            "2036-01-01T00:00:00Z".parse().expect("a literal instant"),
+        );
+        targets.delegations = delegations;
+        targets
+    }
+
+    fn chain(depth: usize) -> Targets {
+        let mut current = targets_with(None);
+        for level in (0..depth).rev() {
+            current = targets_with(Some(tough::schema::Delegations {
+                keys: std::collections::HashMap::new(),
+                roles: vec![role(
+                    &format!("level-{level}"),
+                    "packages/acme/*/*/*",
+                    Some(current),
+                )],
+            }));
+        }
+        current
+    }
+
+    #[test]
+    fn a_delegation_chain_is_bounded() {
+        let permitted = scope_delegations(&chain(MAX_DELEGATION_DEPTH)).expect("inside the bound");
+        assert_eq!(permitted.len(), MAX_DELEGATION_DEPTH);
+        assert_eq!(permitted[0].depth, 1);
+        assert_eq!(
+            permitted[MAX_DELEGATION_DEPTH - 1].depth,
+            MAX_DELEGATION_DEPTH
+        );
+
+        let refusal =
+            scope_delegations(&chain(MAX_DELEGATION_DEPTH + 1)).expect_err("past the bound");
+        assert!(
+            refusal.to_string().contains("deeper than 3 roles"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_role_that_delegates_to_nobody_adds_no_level() {
+        // A deepest role carrying an empty delegations object is a chain of the permitted depth,
+        // not one past it.
+        let mut deepest = chain(MAX_DELEGATION_DEPTH);
+        let mut role_at = &mut deepest;
+        for _ in 0..MAX_DELEGATION_DEPTH {
+            let delegations = role_at.delegations.as_mut().expect("a level");
+            role_at = &mut delegations.roles[0]
+                .targets
+                .as_mut()
+                .expect("a child")
+                .signed;
+        }
+        role_at.delegations = Some(tough::schema::Delegations {
+            keys: std::collections::HashMap::new(),
+            roles: Vec::new(),
+        });
+        assert!(scope_delegations(&deepest).is_ok());
     }
 }

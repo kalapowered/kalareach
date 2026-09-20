@@ -76,7 +76,7 @@ pub use crate::catalogue::repository::{
 pub use crate::catalogue::search::{Candidate, MatchIndex, Observation, Resolution};
 pub use crate::catalogue::state::{CatalogueState, capability_from_str};
 pub use crate::catalogue::store::{ActiveGeneration, Store};
-pub use crate::catalogue::trust::{ExpiryPolicy, VerifiedGeneration};
+pub use crate::catalogue::trust::{MetadataVersions, VerifiedGeneration};
 
 use crate::catalogue::trust::{PACKAGE_PREFIX, TargetRecord};
 
@@ -134,14 +134,34 @@ struct RepositoryState {
     ledger: BudgetLedger,
 }
 
+impl RepositoryState {
+    /// Recounts the cached payloads from the directory that holds them.
+    ///
+    /// The ledger is arithmetic and the cache is a directory, and the two drift whenever a write
+    /// replaced an object already counted or another writer changed one. Recounting after each
+    /// change costs a directory read and removes a class of accounting bug that only shows up as
+    /// a budget nobody can explain.
+    fn refresh_payload_ledger(&mut self) -> CatalogueResult<()> {
+        let held = self.store.cached_payloads()?;
+        let mut ledger = BudgetLedger::new(self.enrolment.budgets);
+        ledger.accept_metadata(self.ledger.metadata_bytes(), self.ledger.metadata_entries());
+        for size in held.values() {
+            ledger.add_payload_bytes(*size);
+        }
+        self.ledger = ledger;
+        Ok(())
+    }
+}
+
 /// The host's catalogue.
 #[derive(Debug)]
 pub struct Catalogue {
     root: PathBuf,
     repositories: BTreeMap<RepositoryId, RepositoryState>,
     installations: Installations,
+    fetches_network: bool,
     broker: Arc<dyn BrokerBridge>,
-    transport: Option<Arc<dyn tough::Transport + Send + Sync>>,
+    transport: Arc<dyn tough::Transport + Send + Sync>,
 }
 
 impl Catalogue {
@@ -165,8 +185,13 @@ impl Catalogue {
             root: root.to_path_buf(),
             repositories: BTreeMap::new(),
             installations: Installations::new(),
+            fetches_network: false,
             broker,
-            transport: Some(Arc::new(tough::FilesystemTransport)),
+            // The client's own transport, which reads a local directory or a mirror of one and
+            // refuses a scheme it was not built to fetch. A host with a network fetcher supplies
+            // it through `set_transport`; this build ships no HTTP client for a repository, and
+            // an https enrolment is refused by name rather than failing somewhere later.
+            transport: Arc::new(tough::DefaultTransport::new()),
         };
         // What an earlier daemon enrolled and installed is still enrolled and installed. Reading
         // it back is what stops a restart from asking the owner to adopt every root again, and
@@ -204,7 +229,11 @@ impl Catalogue {
             ledger.add_payload_bytes(*size);
         }
         if let Some(active) = store.active()? {
-            ledger.accept_metadata(active.index_bytes, 0);
+            let entries = store
+                .active_index()
+                .map(|index| index.entries.len() as u64)
+                .unwrap_or(0);
+            ledger.accept_metadata(active.index_bytes, entries);
         }
         self.repositories.insert(
             enrolment.id.clone(),
@@ -219,7 +248,28 @@ impl Catalogue {
 
     /// Replaces the transport repositories are fetched through.
     pub fn set_transport(&mut self, transport: Arc<dyn tough::Transport + Send + Sync>) {
-        self.transport = Some(transport);
+        self.transport = transport;
+        self.fetches_network = true;
+    }
+
+    /// Returns true when this host can fetch a repository over the network.
+    #[must_use]
+    pub const fn fetches_network(&self) -> bool {
+        self.fetches_network
+    }
+
+    /// Refuses a repository this host's transport cannot fetch.
+    fn check_reachable(&self, enrolment: &Enrolment) -> CatalogueResult<()> {
+        if self.fetches_network || enrolment.metadata_url.scheme() == "file" {
+            return Ok(());
+        }
+        Err(CatalogueError::UnavailableOffline {
+            detail: format!(
+                "{} is at {}, and this host has no network transport for a repository; enrol a \
+                 local mirror of it instead",
+                enrolment.id, enrolment.metadata_url
+            ),
+        })
     }
 
     /// Returns the installations and bindings this host holds.
@@ -316,6 +366,11 @@ impl Catalogue {
             ledger.add_payload_bytes(state.ledger.payload_bytes());
             ledger
         };
+        if state.enrolment.root != proposed.root {
+            // The owner adopted a different root. It is written where the client reads one from,
+            // so a restart verifies against what was adopted rather than what was replaced.
+            state.store.write_root(&proposed.root)?;
+        }
         state.enrolment = proposed;
         self.persist()
     }
@@ -394,41 +449,70 @@ impl Catalogue {
                 state.enrolment.clone(),
                 state.store.datastore(),
                 state.ledger.clone(),
-                state.store.active()?.map(|active| active.generation),
+                state.store.active()?,
             )
         };
+        self.check_reachable(&enrolment)?;
 
-        let verified = trust::verify(
-            &enrolment,
-            &datastore,
-            &ledger,
-            ExpiryPolicy::Enforce,
-            self.transport.as_ref(),
-        )
-        .await?;
+        let verified = trust::verify(&enrolment, &datastore, &ledger, &self.transport).await?;
+        // Rollback protection that does not depend on the client's datastore surviving. A document
+        // an interrupted write left unreadable is one the client skips; these numbers are written
+        // beside the activated generation and are compared whatever state that datastore is in.
+        if let Some(active) = accepted
+            && let Some(role) = verified.versions.rollback_from(active.versions)
+        {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "this generation's {role} metadata is older than the one already accepted; a \
+                     replayed document is a rollback"
+                ),
+            });
+        }
+        let index_digest = verified
+            .index
+            .digest()
+            .map_err(|source| CatalogueError::Integrity {
+                detail: format!("the index could not be rendered: {source}"),
+            })?;
         trust::check_generation(
             verified.generation,
-            accepted.map(RepositoryGeneration::new),
+            index_digest,
+            accepted.map(|active| {
+                (
+                    RepositoryGeneration::new(active.generation),
+                    active.index_digest,
+                )
+            }),
             enrolment.pinned_generation,
         )?;
-        // The index is activated before any payload is fetched. A full mirror that runs out of
-        // budget half way therefore leaves the host on the generation it just verified, with the
-        // payloads it managed to cache, rather than on the previous one with none of them.
+
+        // A full mirror runs before the index is activated. Section 11 asks for the whole
+        // generation inside the approved budget, so a mirror that cannot be completed leaves the
+        // previous generation in place rather than activating a new index it has no payloads for.
+        let mut mirrored = 0usize;
+        if enrolment.budgets.full_offline_mirror {
+            mirrored = self.mirror(id, &verified).await?;
+        }
+
         let active = {
             let state = self.state_mut(id)?;
-            let active = state
-                .store
-                .activate_index(verified.generation, &verified.index)?;
+            let active = state.store.activate_index(
+                verified.generation,
+                &verified.index,
+                verified.versions,
+            )?;
+            // The root verification arrived at, which is the one the next load starts from. A
+            // rotation is signed by the root it replaces, and a host that went on starting from
+            // the original could have old trust restored by a repository that withheld the new
+            // root.
+            state.store.write_root(&verified.root)?;
+            state.enrolment.root.clone_from(&verified.root);
             state
                 .ledger
                 .accept_metadata(verified.index_bytes, verified.index.entries.len() as u64);
             active
         };
-
-        let mut mirrored = 0usize;
-        if enrolment.budgets.full_offline_mirror {
-            mirrored = self.mirror(id, &verified).await?;
-        }
+        self.persist()?;
 
         Ok(SyncOutcome {
             generation: RepositoryGeneration::new(active.generation),
@@ -472,39 +556,6 @@ impl Catalogue {
             .collect())
     }
 
-    /// Reads one payload, and never fetches for a reason section 11 does not name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::UnavailableOffline`] when the payload is not cached and the
-    /// reason does not permit fetching it.
-    pub async fn payload(
-        &mut self,
-        id: &RepositoryId,
-        digest: PayloadDigest,
-        target: &str,
-        reason: FetchReason,
-    ) -> CatalogueResult<Vec<u8>> {
-        if let Ok(bytes) = self.state(id)?.store.read_payload(digest) {
-            return Ok(bytes);
-        }
-        let declared = {
-            let state = self.state(id)?;
-            state
-                .store
-                .active()?
-                .ok_or_else(|| CatalogueError::UnavailableOffline {
-                    detail: format!(
-                        "{id} has no activated generation, so {target} cannot be fetched by \
-                         content hash"
-                    ),
-                })?
-        };
-        let _ = declared;
-        let bytes = self.fetch(id, target, digest, reason).await?;
-        Ok(bytes)
-    }
-
     /// Activates one package: fetches every payload, verifies all of them, then makes it visible.
     ///
     /// Package activation is independent of index activation, and atomic on its own. A package
@@ -521,6 +572,10 @@ impl Catalogue {
         version: &PackageVersion,
         reason: FetchReason,
     ) -> CatalogueResult<PayloadDigest> {
+        // Which of the three reasons section 11 names this is, and whether it holds. A package is
+        // not fetched because something matched; it is fetched because somebody installed it,
+        // enabled it, or already did both and an application it recognises started.
+        self.check_reason(id, plugin_id, reason)?;
         let index = self.index(id)?;
         let entry =
             index
@@ -585,7 +640,7 @@ impl Catalogue {
 
         let staged_bytes = staged.staged_bytes();
         let staged_files = staged.staged_files();
-        let directory = self.state(id)?.store.stage_path(entry.manifest_digest);
+        let directory = staged.path().to_path_buf();
         let checked = extract::check_staged(&directory, &subject).and_then(|manifest| {
             extract::check_actual(
                 &entry,
@@ -604,51 +659,84 @@ impl Catalogue {
     }
 
     /// Fetches every payload the index references, inside the approved budget.
+    ///
+    /// The whole set is measured first. Fetching one object at a time and making room for each in
+    /// turn would evict the ones already fetched, and the loop could finish "successfully" with
+    /// part of a generation cached, which is not a mirror.
     async fn mirror(
         &mut self,
         id: &RepositoryId,
         verified: &VerifiedGeneration,
     ) -> CatalogueResult<usize> {
-        let mut fetched = 0usize;
+        let mut wanted: BTreeMap<PayloadDigest, (String, u64)> = BTreeMap::new();
         for entry in &verified.index.entries {
             let prefix = format!(
                 "{PACKAGE_PREFIX}{}/{}/{}",
                 entry.publisher_id, entry.plugin_name, entry.version
             );
-            let mut wanted: Vec<(String, PayloadDigest, u64)> = vec![(
-                format!("{prefix}/{MANIFEST_FILE}"),
+            wanted.insert(
                 entry.manifest_digest,
-                entry.manifest_size_bytes.get(),
-            )];
+                (
+                    format!("{prefix}/{MANIFEST_FILE}"),
+                    entry.manifest_size_bytes.get(),
+                ),
+            );
             for payload in &entry.payloads {
-                wanted.push((
-                    format!("{prefix}/{}", payload.path.as_str()),
+                wanted.insert(
                     payload.digest,
-                    payload.size_bytes.get(),
-                ));
+                    (
+                        format!("{prefix}/{}", payload.path.as_str()),
+                        payload.size_bytes.get(),
+                    ),
+                );
             }
-            for (target, digest, length) in wanted {
-                if self.state(id)?.store.has_payload(digest) {
-                    continue;
-                }
-                self.reclaim_for(id, length, &target)?;
-                let bytes = verified
-                    .read_target(
-                        &target,
-                        TargetRecord { digest, length },
-                        &self.state(id)?.ledger,
-                    )
-                    .await?;
-                let state = self.state_mut(id)?;
-                state.store.cache_payload(digest, &bytes)?;
-                state.ledger.add_payload_bytes(bytes.len() as u64);
-                fetched += 1;
+        }
+
+        // Everything the mirror will hold, including what it already holds, against the budget.
+        let held = self.state(id)?.store.cached_payloads()?;
+        let needed: u64 = wanted
+            .iter()
+            .filter(|(digest, _)| !held.contains_key(*digest))
+            .fold(0u64, |total, (_, (_, size))| total.saturating_add(*size));
+        let mirror_set: BTreeSet<PayloadDigest> = wanted.keys().copied().collect();
+        self.reclaim_for(id, needed, "the full offline mirror", &mirror_set)?;
+
+        let mut fetched = 0usize;
+        for (digest, (target, length)) in &wanted {
+            if self.state(id)?.store.has_payload(*digest) {
+                continue;
+            }
+            let bytes = verified
+                .read_target(
+                    target,
+                    TargetRecord {
+                        digest: *digest,
+                        length: *length,
+                    },
+                    &self.state(id)?.ledger,
+                )
+                .await?;
+            let state = self.state_mut(id)?;
+            state.store.cache_payload(*digest, &bytes)?;
+            fetched += 1;
+            state.refresh_payload_ledger()?;
+        }
+
+        // A mirror reports success only when the whole set is here.
+        for digest in &mirror_set {
+            if !self.state(id)?.store.has_payload(*digest) {
+                return Err(CatalogueError::UnavailableOffline {
+                    detail: format!(
+                        "the full offline mirror is missing {digest}; the previous generation \
+                         stays usable"
+                    ),
+                });
             }
         }
         Ok(fetched)
     }
 
-    /// Fetches one payload by content hash, for a reason section 11 names.
+    /// Fetches one payload by content hash, out of the generation this host accepted.
     async fn fetch(
         &mut self,
         id: &RepositoryId,
@@ -659,38 +747,50 @@ impl Catalogue {
         if let Ok(bytes) = self.state(id)?.store.read_payload(digest) {
             return Ok(bytes);
         }
-        let (enrolment, datastore, ledger) = {
+        let (enrolment, datastore, ledger, accepted) = {
             let state = self.state(id)?;
             (
                 state.enrolment.clone(),
                 state.store.datastore(),
                 state.ledger.clone(),
+                state.store.active()?,
             )
         };
-        // The metadata is read again rather than kept from the sync: a payload fetched now is
-        // fetched against the metadata that is current now, and expired metadata blocks it.
-        let verified = trust::verify(
-            &enrolment,
-            &datastore,
-            &ledger,
-            ExpiryPolicy::Enforce,
-            self.transport.as_ref(),
-        )
-        .await
-        .map_err(|error| match error {
-            CatalogueError::Untrusted { detail } => CatalogueError::UnavailableOffline {
-                detail: format!(
-                    "{target} is not cached here and {id} could not be reached to fetch it for \
-                     an {}: {detail}",
-                    reason.as_str()
-                ),
-            },
-            other => other,
+        let accepted = accepted.ok_or_else(|| CatalogueError::UnavailableOffline {
+            detail: format!(
+                "{target} is not cached here and {id} has no activated generation to fetch it \
+                 from for an {}",
+                reason.as_str()
+            ),
         })?;
+        self.check_reachable(&enrolment)?;
+
+        // The metadata is read again rather than kept from the sync, so expired metadata blocks
+        // this too. What it may not do is admit a different generation: a payload is fetched out
+        // of the generation this host accepted, and one the repository has moved on from is an
+        // absence rather than a quiet substitution.
+        let verified = trust::verify(&enrolment, &datastore, &ledger, &self.transport).await?;
+        let index_digest = verified
+            .index
+            .digest()
+            .map_err(|source| CatalogueError::Integrity {
+                detail: format!("the index could not be rendered: {source}"),
+            })?;
+        if verified.generation.get() != accepted.generation || index_digest != accepted.index_digest
+        {
+            return Err(CatalogueError::UnavailableOffline {
+                detail: format!(
+                    "{target} is not cached here and {id} now publishes generation {}; \
+                     synchronise before installing from generation {}",
+                    verified.generation.get(),
+                    accepted.generation
+                ),
+            });
+        }
         let declared = verified
             .target(target)
             .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{target} is not in {id}'s current generation"),
+                detail: format!("{target} is not in {id}'s accepted generation"),
             })?;
         if declared.digest != digest {
             return Err(CatalogueError::Integrity {
@@ -701,14 +801,58 @@ impl Catalogue {
                 ),
             });
         }
-        self.reclaim_for(id, declared.length, target)?;
+        self.reclaim_for(id, declared.length, target, &BTreeSet::new())?;
         let bytes = verified
             .read_target(target, declared, &self.state(id)?.ledger)
             .await?;
         let state = self.state_mut(id)?;
         state.store.cache_payload(digest, &bytes)?;
-        state.ledger.add_payload_bytes(bytes.len() as u64);
+        state.refresh_payload_ledger()?;
         Ok(bytes)
+    }
+
+    /// Checks that a fetch has one of the three reasons section 11 names, and that it holds.
+    fn check_reason(
+        &self,
+        id: &RepositoryId,
+        plugin_id: &PluginId,
+        reason: FetchReason,
+    ) -> CatalogueResult<()> {
+        match reason {
+            // The owner asked for it. Whether they may is the ceiling's and the grant's decision,
+            // which `install` makes before it gets here.
+            FetchReason::ExplicitInstall | FetchReason::ExplicitEnable => Ok(()),
+            FetchReason::FullOfflineMirror => {
+                if self.state(id)?.enrolment.budgets.full_offline_mirror {
+                    Ok(())
+                } else {
+                    Err(CatalogueError::UnavailableOffline {
+                        detail: format!(
+                            "{id} does not keep a full offline mirror, so a payload is fetched on \
+                             an explicit install or enable or an already-authorised activation"
+                        ),
+                    })
+                }
+            }
+            // An activation fetches only what this environment already installed and enabled.
+            // Anything else would make a matching application enough to pull bytes nobody asked
+            // this host to hold.
+            FetchReason::AuthorisedActivation => {
+                let authorised = self.installations.all().into_iter().any(|installation| {
+                    installation.plugin_id.as_str() == plugin_id.as_str() && installation.enabled
+                });
+                if authorised {
+                    Ok(())
+                } else {
+                    Err(CatalogueError::UnavailableOffline {
+                        detail: format!(
+                            "{plugin_id} is not installed and enabled here, so a matching \
+                             application does not authorise fetching its payloads"
+                        ),
+                    })
+                }
+            }
+        }
     }
 
     /// Makes room for `length` more bytes, without touching a live-bound or pinned payload.
@@ -717,13 +861,29 @@ impl Catalogue {
         id: &RepositoryId,
         length: u64,
         subject: &str,
+        also_protected: &BTreeSet<PayloadDigest>,
     ) -> CatalogueResult<()> {
+        // A package's hash names its manifest. Protecting only that would leave the component and
+        // the assets a live binding actually runs on evictable, so every payload of a protected
+        // package is protected with it.
         let mut protected: BTreeSet<PayloadDigest> = self
             .installations
-            .protected_packages()
+            .protected_payloads()
             .into_iter()
             .collect();
         protected.extend(self.broker.live_packages());
+        protected.extend(also_protected.iter().copied());
+        // A pinned generation is what a pin holds the repository at, so everything that generation
+        // references stays too.
+        if let Some(pinned) = self.state(id)?.enrolment.pinned_generation
+            && let Ok(index) = self.index(id)
+            && index.generation == pinned
+        {
+            for entry in &index.entries {
+                protected.insert(entry.manifest_digest);
+                protected.extend(entry.payloads.iter().map(|payload| payload.digest));
+            }
+        }
         let state = self
             .repositories
             .get_mut(id)
@@ -863,17 +1023,8 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{plugin_id} is not installed in this environment"),
             })?;
-        let index = self.index(&installation.repository)?;
-        let entry = index
-            .find(plugin_id, &installation.version)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!(
-                    "{plugin_id} {} is not in this repository's index",
-                    installation.version
-                ),
-            })?;
         ceiling::check_installable(
-            &entry.capabilities,
+            &installation.requested,
             &self.state(&installation.repository)?.enrolment.ceiling,
             &grant,
         )?;
@@ -947,17 +1098,11 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{plugin_id} is not installed in this environment"),
             })?;
-        let index = self.index(id)?;
-        let entry = index
-            .find(plugin_id, &installation.version)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!(
-                    "{plugin_id} {} is not in this repository's index",
-                    installation.version
-                ),
-            })?;
+        // What the installed package asks for was recorded when it was installed. Reading the
+        // current index instead would make an answer about an installed package depend on a
+        // generation that may no longer carry it, which is the opposite of usable offline.
         Ok(ceiling::decide(
-            &entry.capabilities,
+            &installation.requested,
             &self.state(id)?.enrolment.ceiling,
             &installation.grant,
         ))
