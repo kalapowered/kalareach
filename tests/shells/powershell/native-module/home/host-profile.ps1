@@ -28,7 +28,7 @@ if (Get-Module -Name KrWrongAbi) {
 }
 Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'stack'
 
-Set-PSReadLineKeyHandler -Chord Alt+q -BriefDescription 'kr-user-binding' -LongDescription 'the person own binding' -ScriptBlock {
+Set-PSReadLineKeyHandler -Chord Alt+q -BriefDescription 'kr-user-binding' -LongDescription 'the binding this person made' -ScriptBlock {
     [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
     [Microsoft.PowerShell.PSConsoleReadLine]::Insert('kr-user-binding-ran')
 }

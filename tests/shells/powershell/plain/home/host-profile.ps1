@@ -13,7 +13,7 @@ Set-PSReadLineKeyHandler -Chord Ctrl+j -Function AcceptLine
 Set-PSReadLineKeyHandler -Chord Ctrl+d -Function DeleteChar
 
 # A handler of the person's own, on a chord nothing in the integration claims.
-Set-PSReadLineKeyHandler -Chord Alt+q -BriefDescription 'kr-user-binding' -LongDescription 'the person own binding' -ScriptBlock {
+Set-PSReadLineKeyHandler -Chord Alt+q -BriefDescription 'kr-user-binding' -LongDescription 'the binding this person made' -ScriptBlock {
     [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
     [Microsoft.PowerShell.PSConsoleReadLine]::Insert('kr-user-binding-ran')
 }
