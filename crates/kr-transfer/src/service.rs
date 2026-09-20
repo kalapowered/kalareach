@@ -339,6 +339,7 @@ pub struct TransferService {
     /// Set to stage every snapshot by copying its bytes, even where the filesystem clones.
     pub(crate) copy_snapshots: std::sync::atomic::AtomicBool,
     pub(crate) finish_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
+    pub(crate) staged_open_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
     pub(crate) post_verification_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
 }
 
@@ -379,6 +380,7 @@ impl TransferService {
             clock,
             copy_snapshots: std::sync::atomic::AtomicBool::new(false),
             finish_race_hook: Arc::new(std::sync::RwLock::new(None)),
+            staged_open_race_hook: Arc::new(std::sync::RwLock::new(None)),
             post_verification_race_hook: Arc::new(std::sync::RwLock::new(None)),
         })
     }
@@ -394,6 +396,19 @@ impl TransferService {
     #[doc(hidden)]
     pub fn clear_finish_race_hook(&self) {
         *self.finish_race_hook.write().expect("not poisoned") = None;
+    }
+
+    #[doc(hidden)]
+    pub fn set_staged_open_race_hook<F>(&self, hook: F)
+    where
+        F: Fn(&mut Store, TransferId) + Send + Sync + 'static,
+    {
+        *self.staged_open_race_hook.write().expect("not poisoned") = Some(RaceHook(Arc::new(hook)));
+    }
+
+    #[doc(hidden)]
+    pub fn clear_staged_open_race_hook(&self) {
+        *self.staged_open_race_hook.write().expect("not poisoned") = None;
     }
 
     #[doc(hidden)]
@@ -911,6 +926,17 @@ impl TransferService {
             }
             row
         };
+        {
+            let hook = self
+                .staged_open_race_hook
+                .read()
+                .expect("not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                let mut store = self.locked()?;
+                (hook.0)(&mut store, params.transfer_id);
+            }
+        }
         // The whole-file verification and the preview happen without the store lock: they read the
         // payload, which for a large file takes long enough that holding the journal would stop
         // every other transfer in this environment.
@@ -919,8 +945,21 @@ impl TransferService {
             // Another copy of this action can have moved the payload between the checks above and
             // this open. Its answer is this call's answer; anything else is the failure it is.
             Err(error) => {
-                return match self.recorded(action)? {
-                    Recorded::Answered(answered) => Ok(answered),
+                if let Recorded::Answered(answered) = self.recorded(action)? {
+                    return Ok(answered);
+                }
+                // A copy that has claimed the publication but not yet recorded its result leaves
+                // no answer to read, and the staged name it renamed is gone. The row says what
+                // became of the payload, and this call is owed that rather than the open's
+                // failure, which would reach the caller as a refusal of a publication that
+                // succeeded. Every other failure is the storage failure it is.
+                let current = {
+                    let store = self.locked()?;
+                    upload_of(&store, params.transfer_id, actor)?
+                };
+                return match current.state {
+                    UploadState::Published => self.finish_published(&current, params, action),
+                    UploadState::Publishing => self.finish_publishing(actor, params, action, now),
                     _ => Err(error),
                 };
             }

@@ -2429,9 +2429,11 @@ fn two_concurrent_copies_of_one_cancel_action_release_once() {
     );
 }
 
-/// D-114.9: upload_finish when state transitions to Publishing between initial read and lock
-/// waits for or resolves publication and returns the attachment handle rather than throwing
-/// ResourceUnavailable.
+/// KR-REQ-24.09: a publication another copy of this action began is finished, not refused.
+///
+/// One copy reads a row that still takes chunks; another claims it and moves it to publishing
+/// before the first reaches the lock. The first is owed the attachment, and was refused as
+/// unavailable until the state it now finds is the one it answers from.
 #[test]
 fn upload_finish_transition_to_publishing_before_lock_resolves_and_succeeds() {
     let harness = Harness::create();
@@ -2480,8 +2482,10 @@ fn upload_finish_transition_to_publishing_before_lock_resolves_and_succeeds() {
     harness.service.clear_finish_race_hook();
 }
 
-/// D-114.9: upload_finish when state transitions to Published between initial read and lock
-/// returns the handle without throwing ResourceUnavailable.
+/// KR-REQ-24.09: an attachment another copy of this action published is answered with its handle.
+///
+/// The same interleaving one step further on: the other copy has finished publishing by the time
+/// this one reaches the lock, and what is there is the attachment rather than a refusal.
 #[test]
 fn upload_finish_transition_to_published_before_lock_returns_handle() {
     let harness = Harness::create();
@@ -2533,8 +2537,10 @@ fn upload_finish_transition_to_published_before_lock_returns_handle() {
     harness.service.clear_finish_race_hook();
 }
 
-/// D-114.9: upload_finish when state transitions to Publishing during file verification resolves
-/// publication and returns the attachment handle rather than throwing ResourceUnavailable.
+/// KR-REQ-24.09: a publication that began while this copy was reading the file is finished.
+///
+/// Verifying a file takes long enough for another copy to claim the publication, and the state
+/// this copy finds when it comes back is the one it answers from.
 #[test]
 fn upload_finish_transition_to_publishing_after_verification_resolves() {
     let harness = Harness::create();
@@ -2585,8 +2591,10 @@ fn upload_finish_transition_to_publishing_after_verification_resolves() {
     harness.service.clear_post_verification_race_hook();
 }
 
-/// D-114.9: an expired upload claim settled by resolve_claims unifies with check_live and
-/// publication_refusal by returning ResourceUnavailable (not AttachmentIntegrity).
+/// KR-REQ-24.09: an expiry is answered as an expiry, whichever path settles it.
+///
+/// An upload that ran out of time is not an upload whose bytes were tampered with, and the claim
+/// recovery settles is owed the same code the live check and the refusal give it.
 #[test]
 fn an_expired_upload_claim_settled_by_recovery_unifies_as_resource_unavailable() {
     let harness = Harness::create();
@@ -2630,4 +2638,93 @@ fn an_expired_upload_claim_settled_by_recovery_unifies_as_resource_unavailable()
         ErrorCode::ResourceUnavailable,
         "expired claim settlement unifies to ResourceUnavailable"
     );
+}
+
+/// KR-REQ-24.09: a copy of one action that finds the payload gone is answered by the row, not by
+/// the open that failed.
+///
+/// This is the interleaving the two above leave open. One copy of `upload.finish` reads a row that
+/// still takes chunks and goes on to verify the staged file; another copy claims the publication
+/// and renames the payload to its published name in the window before that read. The first copy's
+/// open then fails, and its claim carries no answer yet, because the copy that made it has not
+/// recorded one. The row says the attachment was published, and that is what this copy is owed:
+/// answering with the open's failure would refuse a publication that succeeded.
+#[test]
+fn a_copy_of_one_finish_action_that_finds_the_payload_gone_is_answered_by_the_row() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "claimed_race.bin")
+        .expect("reserves upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends chunks");
+    let transfer_id = begun.transfer_id;
+    let claim = action(&harness, "upload.finish", &bytes);
+
+    let (staged_path, published_path) = payload_paths(&harness, transfer_id, "claimed_race.bin");
+    let bytes_copy = bytes.clone();
+    // The claim a publication commits with its intent: the transfer it acts on and no result,
+    // because the handle does not exist until the second commit fills it in.
+    let claim_copy = kr_transfer::store::RetainedAction {
+        actor_id: claim.actor_id.clone(),
+        action_id: claim.action_id,
+        method: claim.method.clone(),
+        payload_digest: claim.payload_digest,
+        subject: Some(transfer_id),
+        result: None,
+        recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+    };
+    harness
+        .service
+        .set_staged_open_race_hook(move |store, tid| {
+            if tid == transfer_id {
+                // What the other copy of this action does: it publishes the payload under the claim
+                // the two share, and it has not recorded the result yet.
+                std::fs::rename(&staged_path, &published_path).expect("moves to complete");
+                store
+                    .begin_publish(
+                        tid,
+                        &kr_transfer::store::Publication {
+                            content_digest: digest(&bytes_copy),
+                            payload_identity: identity_of(&published_path),
+                            preview: None,
+                            preview_unavailable: None,
+                        },
+                        kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                        Some(&claim_copy),
+                    )
+                    .expect("records intent to publish");
+                store
+                    .complete_publish(
+                        tid,
+                        kr_protocol::scalars::TimestampMs::new(support::START_MS + 10),
+                        kr_protocol::scalars::TimestampMs::new(support::START_MS + 100_000),
+                    )
+                    .expect("records the publication");
+            }
+        });
+
+    let result = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect("the copy whose open failed is answered with the attachment");
+    harness.service.clear_staged_open_race_hook();
+    assert_eq!(result.handle.content_digest, digest(&bytes));
+    assert!(
+        !result.already_published,
+        "the claim is this action's, so this action published the attachment"
+    );
+
+    let status = harness
+        .service
+        .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+        .expect("reads status");
+    assert_eq!(status.state, UploadState::Published);
+
+    // The claim now carries the answer, so a repeat of the action reads it rather than publishing
+    // a second time.
+    let repeat = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect("the repeat reads the recorded answer");
+    assert_eq!(repeat.handle.content_digest, result.handle.content_digest);
 }
