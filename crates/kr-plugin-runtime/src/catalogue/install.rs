@@ -242,6 +242,20 @@ impl Installations {
         &self.bindings
     }
 
+    /// Returns a copy a caller can change before committing it.
+    ///
+    /// Bindings are live state rather than durable state, so a copy carries them unchanged: what
+    /// is being proposed is a change to what is installed, not to what is running.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        Self {
+            installations: self.installations.clone(),
+            bindings: self.bindings.clone(),
+            next_binding: self.next_binding,
+            policy: self.policy,
+        }
+    }
+
     /// Records an installation, replacing any earlier one of the same package.
     pub fn insert(&mut self, installation: Installation) {
         self.installations.insert(
@@ -332,36 +346,6 @@ impl Installations {
         Ok(installation)
     }
 
-    /// Moves an installation to a newer release, leaving live bindings where they are.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and
-    /// [`CatalogueError::InvalidArgument`] when the installation is pinned.
-    pub fn upgrade(
-        &mut self,
-        environment_id: EnvironmentId,
-        entry: &IndexEntry,
-    ) -> CatalogueResult<()> {
-        let installation = self
-            .installations
-            .get_mut(&Self::key(environment_id, &entry.plugin_id))
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{} is not installed in this environment", entry.plugin_id),
-            })?;
-        if installation.pinned {
-            return Err(CatalogueError::InvalidArgument {
-                detail: format!(
-                    "{} is pinned to {}; unpin it before installing {}",
-                    entry.plugin_id, installation.package_digest, entry.version
-                ),
-            });
-        }
-        installation.version = entry.version.clone();
-        installation.package_digest = entry.manifest_digest;
-        Ok(())
-    }
-
     /// Opens a binding against an installed, enabled, unrevoked package.
     ///
     /// # Errors
@@ -385,6 +369,32 @@ impl Installations {
             return Err(CatalogueError::Disabled {
                 detail: format!(
                     "{} is installed and disabled in this environment",
+                    entry.plugin_id
+                ),
+            });
+        }
+        // The release this binding is for is the one installed here, at the hash it was installed
+        // at. A caller that supplied another release's entry would otherwise have its revocation
+        // record and its match rules decide an admission for a different set of bytes.
+        if entry.manifest_digest != installation.package_digest {
+            return Err(CatalogueError::InvalidArgument {
+                detail: format!(
+                    "{} is installed at {} and this is {}; a binding is admitted against the \
+                     release that is installed",
+                    entry.plugin_id, installation.package_digest, entry.manifest_digest
+                ),
+            });
+        }
+        // The rules the installed package declares have to recognise what is running. A binding
+        // made without that check would be an instantiation nothing matched.
+        if !entry
+            .match_rules
+            .iter()
+            .any(|rule| rule.executable.matches_path(executable_path))
+        {
+            return Err(CatalogueError::InvalidArgument {
+                detail: format!(
+                    "{} declares no rule that recognises {executable_path}",
                     entry.plugin_id
                 ),
             });
@@ -431,7 +441,12 @@ impl Installations {
         };
         self.bindings
             .iter()
-            .filter(|binding| binding.plugin_id == entry.plugin_id)
+            // The exact release, not the package: another version being revoked says nothing
+            // about the bytes this binding is on.
+            .filter(|binding| {
+                binding.plugin_id == entry.plugin_id
+                    && binding.package_digest == entry.manifest_digest
+            })
             .map(|binding| RevocationNotice {
                 binding_id: binding.binding_id,
                 plugin_id: binding.plugin_id.clone(),
@@ -552,41 +567,37 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_leaves_a_live_binding_on_its_own_hash() {
+    fn a_binding_is_admitted_against_the_release_that_is_installed() {
         let (mut installations, first) = installed(true);
-        let binding = installations
-            .bind(environment(), &first, "/usr/local/bin/example-agent")
-            .expect("enabled");
+        // Another release's entry does not admit a binding, whatever it says about itself.
         let second = entry("0.2.0");
-        installations
-            .upgrade(environment(), &second)
-            .expect("upgradable");
+        let refusal = installations
+            .bind(environment(), &second, "/usr/local/bin/example-agent")
+            .expect_err("another release");
+        assert!(
+            refusal.to_string().contains("release that is installed"),
+            "{refusal}"
+        );
 
-        assert_eq!(
-            installations
-                .get(environment(), &second.plugin_id)
-                .expect("installed")
-                .package_digest,
-            second.manifest_digest
-        );
-        assert_eq!(
-            installations.bindings()[0].package_digest,
-            binding.package_digest,
-            "the live binding stays on the hash it was made against"
-        );
-        assert_ne!(binding.package_digest, second.manifest_digest);
+        // Nor does an executable the package's own rules do not recognise.
+        let refusal = installations
+            .bind(environment(), &first, "/usr/local/bin/unrelated")
+            .expect_err("nothing recognises it");
+        assert!(refusal.to_string().contains("no rule"), "{refusal}");
     }
 
     #[test]
-    fn a_pinned_installation_refuses_an_upgrade() {
+    fn a_pin_names_the_hash_that_is_installed() {
         let (mut installations, first) = installed(true);
         installations
             .set_pinned(environment(), &first.plugin_id, Some(first.manifest_digest))
             .expect("installed");
-        let refusal = installations
-            .upgrade(environment(), &entry("0.2.0"))
-            .expect_err("pinned");
-        assert!(refusal.to_string().contains("pinned"), "{refusal}");
+        assert!(
+            installations
+                .get(environment(), &first.plugin_id)
+                .expect("installed")
+                .pinned
+        );
 
         let wrong = installations.set_pinned(
             environment(),

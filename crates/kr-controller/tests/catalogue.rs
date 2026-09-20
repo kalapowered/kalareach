@@ -682,6 +682,162 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Through the daemon's own endpoint
+// ---------------------------------------------------------------------------------------------
+
+/// A supervisor that starts nothing. No worker is needed to enrol a catalogue.
+#[derive(Debug)]
+struct NoWorkers;
+
+impl kr_controller::supervision::WorkerSupervisor for NoWorkers {
+    fn start(
+        &self,
+        _launch: &kr_controller::supervision::WorkerLaunch,
+    ) -> kr_controller::supervision::LaunchOutcome {
+        kr_controller::supervision::LaunchOutcome::NotStarted {
+            detail: "this test starts no workers".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor that starts nothing"
+    }
+}
+
+/// Both groups reach the catalogue through the daemon's own admission, not only through the
+/// module. A method the envelope check does not know about is refused before it is dispatched, and
+/// nothing that drives the module directly would notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_groups_reach_the_catalogue_through_the_daemon() {
+    use kr_crypto::store::{StoreSelection, open_store_in};
+    use kr_protocol::local::LocalClientKind;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let secrets = environment.secrets_dir();
+    let build = kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier");
+    let controller =
+        kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = open_store_in(&secrets).expect("a secret store");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(NoWorkers),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: build.clone(),
+            release: "0".to_owned(),
+            shell_packages: None,
+        })
+        .await
+        .expect("the daemon starts");
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+    tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
+
+    let mut client = kr_ipc::client::LocalClient::connect(&endpoint, LocalClientKind::Cli, build)
+        .await
+        .expect("connects");
+
+    // A read reaches the module and answers.
+    let listed: wire::CatalogueListResult = client
+        .request(
+            Method::CatalogueList,
+            &wire::CatalogueListParams { environment_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("and is answered")
+        .to_typed()
+        .expect("a readable result");
+    assert!(listed.catalogues.is_empty());
+
+    // And so does a mutation: what this proves is that the envelope check admits it, which is the
+    // one thing driving the module directly cannot show.
+    let working_temp = tempfile::tempdir().expect("a temporary directory");
+    let working = working_temp.path().join("development");
+    copy_tree(&fixture(), &working);
+    let params = {
+        use base64::Engine as _;
+        wire::CatalogueAddParams {
+            environment_id,
+            catalogue_id: "development".to_owned(),
+            kind: wire::CatalogueKind::Local,
+            metadata_url: directory_url(&working.join("metadata")),
+            targets_url: directory_url(&working.join("targets")),
+            root: base64::engine::general_purpose::STANDARD
+                .encode(std::fs::read(working.join("root.json")).expect("a trust root")),
+            budgets: budgets(),
+            ceiling: Vec::new(),
+        }
+    };
+    let target = ActionTarget {
+        environment_id,
+        session_id: Nullable::null(),
+        session_epoch: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let added: wire::CatalogueAddResult = client
+        .mutate(
+            Method::CatalogueAdd,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("and is answered")
+        .to_typed()
+        .expect("a readable result");
+    assert_eq!(added.catalogue.catalogue_id, "development");
+
+    let listed: wire::PluginListResult = client
+        .request(
+            Method::PluginList,
+            &wire::PluginListParams { environment_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("and is answered")
+        .to_typed()
+        .expect("a readable result");
+    assert!(listed.plugins.is_empty());
+}
+
+#[test]
+fn a_catalogue_mutation_names_an_environment_and_never_a_session() {
+    let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+    let params = wire::CatalogueSyncParams {
+        environment_id,
+        catalogue_id: "development".to_owned(),
+    };
+    let mut named = mutation(Method::CatalogueSync, environment_id, &params);
+    assert!(CatalogueModule::check_subject(Method::CatalogueSync, &named).is_ok());
+
+    // A target that names a session is a receipt against something the effect never touched.
+    named.target.session_id = Nullable(Some(kr_protocol::ids::SessionId::new(kr_ipc::new_uuid())));
+    assert!(CatalogueModule::check_subject(Method::CatalogueSync, &named).is_err());
+
+    // And the envelope and the parameters have to name one environment.
+    let elsewhere = mutation(
+        Method::CatalogueSync,
+        EnvironmentId::new(kr_ipc::new_uuid()),
+        &params,
+    );
+    assert!(CatalogueModule::check_subject(Method::CatalogueSync, &elsewhere).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
 // The generated authority table
 // ---------------------------------------------------------------------------------------------
 

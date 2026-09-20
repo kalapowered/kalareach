@@ -186,17 +186,7 @@ pub fn check_actual(
         "{}/{} {}",
         entry.publisher_id, entry.plugin_name, entry.version
     );
-    if manifest.publisher_id != entry.publisher_id
-        || manifest.plugin_name != entry.plugin_name
-        || manifest.version != entry.version
-    {
-        return Err(CatalogueError::Integrity {
-            detail: format!(
-                "{subject} arrived as {}/{} {}; a target name is not a package's identity",
-                manifest.publisher_id, manifest.plugin_name, manifest.version
-            ),
-        });
-    }
+    reconcile(entry, manifest, &subject)?;
     // Undeclared expansion: the bytes on disk are measured, not the bytes the index promised.
     let declared = entry.total_size_bytes.get();
     if staged_bytes > declared {
@@ -208,6 +198,57 @@ pub fn check_actual(
         });
     }
     ledger.check_package(staged_bytes, staged_files, Stage::Actual, &subject)?;
+    Ok(())
+}
+
+/// Checks that the index entry describes the package that actually arrived.
+///
+/// An index is signed, and so is a manifest, and they are signed by the same repository. That does
+/// not make them agree: an entry that omits a capability the manifest requests would be an
+/// installation decided against a shorter list than the package carries, and an entry whose
+/// identity names another package would label somebody else's manifest.
+///
+/// Everything the entry derives from the manifest is compared with what the manifest says. What
+/// the entry adds on its own, the qualification results and the revocation record, is the
+/// catalogue's and is not in the manifest to compare against.
+fn reconcile(entry: &IndexEntry, manifest: &PluginManifest, subject: &str) -> CatalogueResult<()> {
+    let derived = IndexEntry::from_manifest(
+        manifest,
+        entry.manifest_digest,
+        entry.manifest_size_bytes.get(),
+    );
+    let mismatch = if derived.plugin_id != entry.plugin_id {
+        Some("plugin identifier")
+    } else if derived.publisher_id != entry.publisher_id || derived.plugin_name != entry.plugin_name
+    {
+        Some("publisher and name")
+    } else if derived.version != entry.version {
+        Some("version")
+    } else if derived.capabilities != entry.capabilities {
+        Some("requested capabilities")
+    } else if derived.match_rules != entry.match_rules {
+        Some("match rules")
+    } else if derived.platforms != entry.platforms {
+        Some("platform support")
+    } else if derived.payloads != entry.payloads {
+        Some("payloads")
+    } else if derived.sdk_range != entry.sdk_range || derived.wit_range != entry.wit_range {
+        Some("SDK and WIT ranges")
+    } else if derived.total_size_bytes != entry.total_size_bytes {
+        Some("total size")
+    } else if derived.has_component != entry.has_component {
+        Some("component")
+    } else {
+        None
+    };
+    if let Some(field) = mismatch {
+        return Err(CatalogueError::Integrity {
+            detail: format!(
+                "{subject}: the index and the package's own manifest disagree about its {field}; \
+                 an installation is decided against the manifest the host verified"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -337,5 +378,39 @@ mod tests {
             kr_plugin_sdk::version::PackageVersion::parse("9.9.9").expect("a valid version");
         let refusal = check_actual(&entry, &manifest, 1, 1, &ledger()).expect_err("a swap");
         assert!(matches!(refusal, CatalogueError::Integrity { .. }));
+    }
+
+    #[test]
+    fn an_index_that_understates_a_package_is_refused() {
+        // A signed index that lists fewer capabilities than the package's own manifest requests
+        // would be an installation decided against a shorter list than the package carries.
+        let mut understated = entry();
+        understated.capabilities.clear();
+        let manifest = example_manifest();
+        let refusal = check_actual(
+            &understated,
+            &manifest,
+            understated.total_size_bytes.get(),
+            2,
+            &ledger(),
+        )
+        .expect_err("an understated entry");
+        assert!(
+            refusal.to_string().contains("requested capabilities"),
+            "{refusal}"
+        );
+
+        // And one whose match rules were widened after the manifest was signed.
+        let mut widened = entry();
+        widened.match_rules.clear();
+        let refusal = check_actual(
+            &widened,
+            &manifest,
+            widened.total_size_bytes.get(),
+            2,
+            &ledger(),
+        )
+        .expect_err("a widened entry");
+        assert!(refusal.to_string().contains("match rules"), "{refusal}");
     }
 }

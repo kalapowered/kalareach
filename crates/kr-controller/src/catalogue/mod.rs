@@ -81,6 +81,51 @@ impl CatalogueModule {
         )
     }
 
+    /// Checks that a catalogue mutation's envelope and its parameters name the same subject.
+    ///
+    /// A catalogue and a package belong to an environment, not to a session or a foreground
+    /// application, so a target that names one is refused rather than producing a receipt against
+    /// something the effect never touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ControllerError::InvalidArgument`] when the two disagree.
+    pub fn check_subject(method: Method, mutation: &MutationRequest) -> crate::Result<()> {
+        if mutation.target.session_id.is_present()
+            || mutation.target.application_instance_id.is_present()
+        {
+            return Err(crate::ControllerError::InvalidArgument(format!(
+                "{} acts on a catalogue or a package, not on a session or an application",
+                method.as_str()
+            )));
+        }
+        let named = match method {
+            Method::CatalogueAdd => subject::<wire::CatalogueAddParams>(&mutation.params)?,
+            Method::CatalogueSync => subject::<wire::CatalogueSyncParams>(&mutation.params)?,
+            Method::CataloguePin => subject::<wire::CataloguePinParams>(&mutation.params)?,
+            Method::CatalogueRemove => subject::<wire::CatalogueRemoveParams>(&mutation.params)?,
+            Method::PluginInstall => subject::<wire::PluginInstallParams>(&mutation.params)?,
+            Method::PluginRemove => subject::<wire::PluginRemoveParams>(&mutation.params)?,
+            Method::PluginPin => subject::<wire::PluginPinParams>(&mutation.params)?,
+            Method::PluginEnable | Method::PluginDisable => {
+                subject::<wire::PluginEnableParams>(&mutation.params)?
+            }
+            Method::PluginGrant => subject::<wire::PluginGrantParams>(&mutation.params)?,
+            _ => {
+                return Err(crate::ControllerError::InvalidArgument(format!(
+                    "{} is not a catalogue mutation this daemon serves",
+                    method.as_str()
+                )));
+            }
+        };
+        if named != mutation.target.environment_id {
+            return Err(crate::ControllerError::InvalidArgument(
+                "the request's target and its parameters name different environments".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns the catalogue itself, for a caller that already holds the daemon.
     #[must_use]
     pub const fn catalogue(&self) -> &Arc<Mutex<Catalogue>> {
@@ -518,15 +563,28 @@ fn evidence(
     );
     let mut records = Vec::new();
     for qualification in &entry.qualification {
-        // A qualification this host will not read is left out rather than reported as evidence.
-        // Reporting it would be repeating a claim the host refused.
-        if let Ok(record) = kr_plugin_runtime::catalogue::evidence::from_qualification(
+        match kr_plugin_runtime::catalogue::evidence::from_qualification(
             entry,
             installation,
             qualification,
             now,
         ) {
-            records.push(wire_evidence(&record)?);
+            Ok(record) => records.push(wire_evidence(&record)?),
+            // A qualification this host will not read is reported as refused rather than left
+            // out. Dropping it would make a publisher's rejected claim look the same as no claim
+            // at all, and the person deciding whether to trust this package would not be told.
+            Err(refusal) => records.push(wire::PluginCapabilityEvidence {
+                capability: qualification.capability_id.clone(),
+                state: wire::PluginCapabilityState::NotTested,
+                source: wire::PluginEvidenceSource::SignedRecord,
+                package_digest: installation.package_digest.to_string(),
+                profile_digest: Nullable(Some(qualification.profile_digest.to_string())),
+                invalidated_by: vec![wire::PluginInvalidationTrigger::ProfileChanged],
+                disabled_reason: Nullable(Some(format!(
+                    "this host refused the publisher's qualification: {refusal}"
+                ))),
+                observed_at_ms: now,
+            }),
         }
     }
     for request in &entry.capabilities {
@@ -750,6 +808,47 @@ pub(crate) fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> Cont
         },
     })
 }
+
+/// Returns the environment a mutation's parameters name.
+fn subject<T>(params: &ParamsValue) -> crate::Result<EnvironmentId>
+where
+    T: kr_protocol::wire::WireMessage + HasEnvironment,
+{
+    let params: T = params
+        .to_typed()
+        .map_err(|error| crate::ControllerError::InvalidArgument(error.to_string()))?;
+    Ok(params.environment_id())
+}
+
+/// What every catalogue and plugin mutation names.
+trait HasEnvironment {
+    /// Returns the environment the request acts in.
+    fn environment_id(&self) -> EnvironmentId;
+}
+
+macro_rules! has_environment {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl HasEnvironment for $type {
+                fn environment_id(&self) -> EnvironmentId {
+                    self.environment_id
+                }
+            }
+        )+
+    };
+}
+
+has_environment!(
+    wire::CatalogueAddParams,
+    wire::CatalogueSyncParams,
+    wire::CataloguePinParams,
+    wire::CatalogueRemoveParams,
+    wire::PluginInstallParams,
+    wire::PluginRemoveParams,
+    wire::PluginPinParams,
+    wire::PluginEnableParams,
+    wire::PluginGrantParams,
+);
 
 fn typed<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Answer<T> {
     params

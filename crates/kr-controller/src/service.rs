@@ -3246,6 +3246,9 @@ impl Controller {
             _ if crate::project::ProjectModule::serves(method) => {
                 crate::project::ProjectModule::check_subject(method, mutation)?;
             }
+            _ if crate::catalogue::CatalogueModule::serves(method) => {
+                crate::catalogue::CatalogueModule::check_subject(method, mutation)?;
+            }
             _ if crate::changeset::ChangeSetModule::serves(method) => {
                 crate::changeset::ChangeSetModule::check_subject(method, mutation)?;
             }

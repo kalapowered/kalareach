@@ -453,15 +453,21 @@ pub struct StagedPackage {
 impl StagedPackage {
     /// Writes one verified file into the staging directory.
     ///
-    /// `relative` has already been through the package path rules, so it cannot escape the
-    /// directory, name a device or collide with a sibling. The file is created rather than opened,
-    /// so an existing name, including a link somebody put there, fails instead of being followed.
+    /// `relative` is a [`kr_plugin_sdk::paths::PackagePath`], which is the proof that the package
+    /// path rules were applied to it: it cannot escape the directory, name a device or spell a
+    /// name two filesystems disagree about. The file is created rather than opened, so an existing
+    /// name, including a link somebody put there, fails instead of being followed.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::UnsafePackage`] when the name is already staged, and
     /// [`CatalogueError::StorageUnavailable`] when the bytes cannot be written.
-    pub fn write(&mut self, relative: &str, bytes: &[u8]) -> CatalogueResult<()> {
+    pub fn write(
+        &mut self,
+        relative: &kr_plugin_sdk::paths::PackagePath,
+        bytes: &[u8],
+    ) -> CatalogueResult<()> {
+        let relative = relative.as_str();
         if self.written.contains_key(relative) {
             return Err(CatalogueError::UnsafePackage {
                 detail: format!("{relative} appears twice in the package"),
@@ -642,6 +648,10 @@ mod tests {
         (directory, store)
     }
 
+    fn path(text: &str) -> kr_plugin_sdk::paths::PackagePath {
+        kr_plugin_sdk::paths::PackagePath::new(text).expect("a safe path")
+    }
+
     fn index(generation: u64) -> CatalogueIndex {
         CatalogueIndex {
             index_version: kr_plugin_sdk::catalogue::INDEX_VERSION,
@@ -715,15 +725,19 @@ mod tests {
         let (_directory, store) = store();
         let digest = PayloadDigest::of(b"manifest");
         let mut staged = store.stage_package(digest).expect("a staging directory");
-        staged.write("plugin.json", b"manifest").expect("written");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
         assert!(!store.has_package(digest));
         staged.abandon();
         assert!(!store.has_package(digest));
 
         let mut staged = store.stage_package(digest).expect("a staging directory");
-        staged.write("plugin.json", b"manifest").expect("written");
         staged
-            .write("presentation.json", b"presentation")
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        staged
+            .write(&path("presentation.json"), b"presentation")
             .expect("written");
         assert_eq!(staged.staged_files(), 2);
         let activated = staged.activate().expect("activated");
@@ -740,9 +754,9 @@ mod tests {
         let (_directory, store) = store();
         let digest = PayloadDigest::of(b"twice");
         let mut staged = store.stage_package(digest).expect("a staging directory");
-        staged.write("plugin.json", b"one").expect("written");
+        staged.write(&path("plugin.json"), b"one").expect("written");
         let refusal = staged
-            .write("plugin.json", b"two")
+            .write(&path("plugin.json"), b"two")
             .expect_err("the same name twice");
         assert!(matches!(refusal, CatalogueError::UnsafePackage { .. }));
     }

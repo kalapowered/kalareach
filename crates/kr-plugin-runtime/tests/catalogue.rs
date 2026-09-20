@@ -187,7 +187,7 @@ async fn kr_req_11_07_a_tampered_target_does_not_verify() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn kr_req_11_08_a_two_level_vendor_delegation_verifies_and_names_its_publisher() {
+async fn kr_req_11_08_vendor_delegations_verify_and_each_names_one_publisher() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(
         home.path(),
@@ -246,7 +246,7 @@ async fn kr_req_11_08_a_two_level_vendor_delegation_verifies_and_names_its_publi
 }
 
 #[tokio::test]
-async fn kr_req_11_09_a_root_rotation_is_carried_forward() {
+async fn kr_req_11_07_the_verified_root_is_what_the_next_load_starts_from() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
     let adopted = generation.root_bytes();
@@ -1195,7 +1195,7 @@ async fn kr_req_11_12_a_pinned_payload_is_never_evicted_to_finish_a_sync() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn kr_req_11_13_only_a_matching_enabled_package_is_instantiated() {
+async fn kr_req_11_13_only_a_matching_enabled_package_binds() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
     let mut catalogue = enrolled(
@@ -1483,9 +1483,11 @@ fn kr_req_11_14_ten_thousand_definitions_are_searched_and_matched_offline() {
 }
 
 #[tokio::test]
-async fn kr_ac_017_catalogue_work_never_stands_between_a_terminal_and_its_input() {
-    // A task that ticks while the catalogue is searched, on the same runtime. Nothing in the
-    // catalogue holds the runtime, so the ticker keeps its cadence.
+async fn kr_ac_017_catalogue_search_does_not_hold_the_runtime_a_terminal_shares() {
+    // A task that ticks while the catalogue is searched, on the same runtime, with the search on
+    // a blocking task exactly as a host would run one. What this establishes is that the search
+    // does not take the reactor away from something that has to keep ticking; it does not measure
+    // a terminal's input latency, which needs the terminal.
     let index = Arc::new(support::synthetic_index(10_000));
     let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter = Arc::clone(&ticks);
@@ -1703,10 +1705,38 @@ fn the_development_fixture_names_the_commit_it_was_copied_from() {
         text.contains("44084fc058106bca25bfb4f2118cc349187419df"),
         "the fixture names the commit it came from"
     );
-    assert!(
-        !text.contains("PRIVATE KEY"),
-        "no private key material is ever copied"
-    );
+
+    // And the files themselves carry no key material, which is checked by reading them rather
+    // than by believing the sentence above that says so.
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins/catalogue/development");
+    let mut seen = 0usize;
+    for path in walk(&directory) {
+        seen += 1;
+        let bytes = std::fs::read(&path).expect("readable");
+        let text = String::from_utf8_lossy(&bytes);
+        for marker in [
+            "PRIVATE KEY",
+            "BEGIN RSA",
+            "BEGIN EC PARAMETERS",
+            "BEGIN OPENSSH",
+        ] {
+            assert!(
+                !text.contains(marker),
+                "{} carries {marker}",
+                path.display()
+            );
+        }
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("readable")
+                .file_type()
+                .is_file(),
+            "{} is not a regular file",
+            path.display()
+        );
+    }
+    assert_eq!(seen, 30, "the generation's files and its README");
 }
 
 // ---------------------------------------------------------------------------------------------

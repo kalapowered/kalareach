@@ -207,6 +207,23 @@ impl Catalogue {
         Ok(catalogue)
     }
 
+    /// Applies one change to the installations and commits it before it is served.
+    ///
+    /// The change is made against a copy, written durably, and only then published in memory. A
+    /// host that answered an error while carrying on with the changed state would disagree with
+    /// itself after a restart, which is the one thing a durable record exists to prevent.
+    fn commit<F>(&mut self, change: F) -> CatalogueResult<()>
+    where
+        F: FnOnce(&mut Installations),
+    {
+        let mut proposed = self.installations.snapshot();
+        change(&mut proposed);
+        CatalogueState::of(&self.repositories(), &proposed.all(), proposed.policy())
+            .write(&self.root)?;
+        self.installations = proposed;
+        Ok(())
+    }
+
     /// Writes the enrolments and installations that survive a restart.
     ///
     /// # Errors
@@ -611,7 +628,16 @@ impl Catalogue {
                 return Err(error);
             }
         };
-        if let Err(error) = staged.write(MANIFEST_FILE, &manifest) {
+        let manifest_path = match kr_plugin_sdk::paths::PackagePath::new(MANIFEST_FILE) {
+            Ok(path) => path,
+            Err(source) => {
+                staged.abandon();
+                return Err(CatalogueError::UnsafePackage {
+                    detail: format!("{MANIFEST_FILE} is not a package path: {source}"),
+                });
+            }
+        };
+        if let Err(error) = staged.write(&manifest_path, &manifest) {
             staged.abandon();
             return Err(error);
         }
@@ -626,7 +652,7 @@ impl Catalogue {
             };
             match self.fetch(id, &target, payload.digest, reason).await {
                 Ok(bytes) => {
-                    if let Err(error) = staged.write(relative.as_str(), &bytes) {
+                    if let Err(error) = staged.write(&relative, &bytes) {
                         staged.abandon();
                         return Err(error);
                     }
@@ -940,13 +966,34 @@ impl Catalogue {
                 ),
             });
         }
-        ceiling::check_installable(
-            &entry.capabilities,
-            &self.state(id)?.enrolment.ceiling,
-            &grant,
-        )?;
+        let repository_ceiling = self.state(id)?.enrolment.ceiling.clone();
+        ceiling::check_installable(&entry.capabilities, &repository_ceiling, &grant)?;
         if let Some(previous) = self.installations.get(environment_id, plugin_id) {
-            ceiling::check_upgrade(&previous.grant, &grant, false)?;
+            // A pin holds an installation at the hash it names. Installing something else over it
+            // is the pin's decision to make, not the install's.
+            if previous.pinned && previous.package_digest != entry.manifest_digest {
+                return Err(CatalogueError::InvalidArgument {
+                    detail: format!(
+                        "{plugin_id} is pinned to {}; unpin it before installing {}",
+                        previous.package_digest, entry.version
+                    ),
+                });
+            }
+            // What an upgrade may do is compared as effective sets rather than as grant lists. A
+            // release that newly requests something the repository's ceiling already permits
+            // would otherwise widen an installation with both grants empty.
+            let held =
+                ceiling::effective(&previous.requested, &repository_ceiling, &previous.grant);
+            let proposed = ceiling::effective(&entry.capabilities, &repository_ceiling, &grant);
+            if let Some(added) = proposed.difference(&held).next().copied() {
+                return Err(CatalogueError::GrantRequired {
+                    capability: added,
+                    requirement: format!(
+                        "an explicit installation grant: the installed release was not permitted \
+                         {added}, and an upgrade does not widen what a package may do"
+                    ),
+                });
+            }
         }
 
         self.activate_package(id, plugin_id, version, FetchReason::ExplicitInstall)
@@ -955,9 +1002,10 @@ impl Catalogue {
         let mut installation = Installation::from_entry(&entry, id.clone(), environment_id, grant);
         if let Some(previous) = self.installations.get(environment_id, plugin_id) {
             installation.enabled = previous.enabled;
+            installation.pinned =
+                previous.pinned && previous.package_digest == entry.manifest_digest;
         }
-        self.installations.insert(installation.clone());
-        self.persist()?;
+        self.commit(|installations| installations.insert(installation.clone()))?;
         Ok(installation)
     }
 
@@ -993,9 +1041,11 @@ impl Catalogue {
             )
             .await?;
         }
-        self.installations
-            .set_enabled(environment_id, plugin_id, enabled)?;
-        self.persist()?;
+        let mut outcome = Ok(());
+        self.commit(|installations| {
+            outcome = installations.set_enabled(environment_id, plugin_id, enabled);
+        })?;
+        outcome?;
         self.installations
             .get(environment_id, plugin_id)
             .cloned()
@@ -1023,15 +1073,37 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{plugin_id} is not installed in this environment"),
             })?;
-        ceiling::check_installable(
-            &installation.requested,
-            &self.state(&installation.repository)?.enrolment.ceiling,
-            &grant,
-        )?;
+        // A grant may name only capabilities the package asks for and the ceiling can reach. It
+        // may name fewer than the package asks for: withdrawing one leaves the installation in
+        // place and the capability unavailable, which is what withdrawing is.
+        let requested: BTreeSet<PluginCapability> = installation
+            .requested
+            .iter()
+            .map(|request| request.capability)
+            .collect();
+        let ceiling = self
+            .state(&installation.repository)?
+            .enrolment
+            .ceiling
+            .clone();
+        for capability in grant.capabilities() {
+            if !requested.contains(&capability) {
+                return Err(CatalogueError::GrantRequired {
+                    capability,
+                    requirement: format!(
+                        "a package that asks for it: {plugin_id} does not request {capability}"
+                    ),
+                });
+            }
+            if ceiling::requirement_for(capability, &ceiling)
+                == ceiling::GrantRequirement::WithinCeiling
+            {
+                continue;
+            }
+        }
         let mut updated = installation;
         updated.grant = grant;
-        self.installations.insert(updated.clone());
-        self.persist()?;
+        self.commit(|installations| installations.insert(updated.clone()))?;
         Ok(updated)
     }
 
@@ -1053,8 +1125,11 @@ impl Catalogue {
                 binding.environment_id == environment_id && &binding.plugin_id == plugin_id
             })
             .count();
-        self.installations.remove(environment_id, plugin_id)?;
-        self.persist()?;
+        let mut outcome = Ok(());
+        self.commit(|installations| {
+            outcome = installations.remove(environment_id, plugin_id).map(|_| ());
+        })?;
+        outcome?;
         Ok(closed)
     }
 
@@ -1069,9 +1144,11 @@ impl Catalogue {
         plugin_id: &PluginId,
         package_digest: Option<PayloadDigest>,
     ) -> CatalogueResult<Installation> {
-        self.installations
-            .set_pinned(environment_id, plugin_id, package_digest)?;
-        self.persist()?;
+        let mut outcome = Ok(());
+        self.commit(|installations| {
+            outcome = installations.set_pinned(environment_id, plugin_id, package_digest);
+        })?;
+        outcome?;
         self.installations
             .get(environment_id, plugin_id)
             .cloned()

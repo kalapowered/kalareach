@@ -497,17 +497,19 @@ catalogue/
   <repository>/
     root.json                the trust root this host adopted for it, and no other
     datastore/               the client's own trusted metadata
-    index/<n>.json           each verified generation's index, whole
+    index/<digest>.json      each verified generation's index, whole and named by its own digest
     index/active.json        which generation is current
     payloads/<digest>        cached payloads, by content hash
     packages/<digest>/       an activated package's files, under its manifest digest
 ```
 
 Both method groups arrive through the ordinary path. A read is checked against current authority; a
-mutation carries an action window, is checked against the method registry, and the admission is
-checked once more immediately before the change, because everything in between can wait and an
-action whose accepted deadline passed while it queued does not go on to change a trust root or
-install a package.
+mutation carries an action window and is checked against the method registry and its envelope, and
+the admission is checked again before the catalogue is entered. A sync and an install then reach
+the network and the filesystem behind the catalogue's own lock, so the gap between that check and
+the effect is the wait for that lock and for the fetch; closing it needs the admission carried into
+the catalogue's own transaction, which is written up in the handoff as work this daemon still
+owes.
 
 Two decisions are the owner's and are not side effects of anything else. Adopting a trust root is
 `catalogue.add`, performed by a caller this endpoint authenticated as the owner; a sync verifies

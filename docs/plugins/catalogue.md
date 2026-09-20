@@ -167,8 +167,8 @@ prompts. Past the default, each decision is somebody's and they are not intercha
 | What the package asks for | Who has to say so |
 | --- | --- |
 | Metadata matching, declarative presentation, authorised broker events | Nobody; the enrolment already did |
-| Transcript tails, process observation, upstream actions | An explicit package or repository grant |
-| Raw terminal streams, terminal input, filesystem, network, approval decoding and answering | An explicit installation grant |
+| Raw terminal streams, transcript tails, process observation, upstream actions | An explicit package or repository grant |
+| Terminal input, filesystem, network, approval decoding and answering | An explicit installation grant, which a repository ceiling cannot reach |
 | A native bridge, which runs under the application's own permissions | An installation grant the owner confirms |
 | Anything the previous installation did not hold | An installation grant, because an increase is a new decision |
 
