@@ -751,17 +751,31 @@ impl Session {
     ///
     /// Panics when the reader does not answer inside [`REPLY`].
     pub fn answer(&mut self, id: RequestId) -> BridgeAnswer {
-        let deadline = Instant::now() + REPLY;
+        self.answer_before(id, Instant::now() + REPLY)
+    }
+
+    /// Waits for the reader's answer to one request, no later than `deadline`.
+    ///
+    /// A caller that asks the reader the same thing more than once for one condition gives every
+    /// one of those waits the same instant, so the condition is bounded by that instant rather
+    /// than by a fresh reply window per request. The wait fails at the deadline and starts no
+    /// slice of the pump after it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader has not answered by `deadline`.
+    pub fn answer_before(&mut self, id: RequestId, deadline: Instant) -> BridgeAnswer {
         loop {
             if let Some(answer) = self.answers.remove(&id) {
                 return answer;
             }
+            let left = deadline.saturating_duration_since(Instant::now());
             assert!(
-                Instant::now() < deadline,
-                "the reader did not answer request {id:?}\nterminal output:\n{}",
+                !left.is_zero(),
+                "the reader did not answer request {id:?} before its deadline\nterminal output:\n{}",
                 self.terminal_output()
             );
-            self.pump(Duration::from_millis(50));
+            self.pump(left.min(Duration::from_millis(50)));
         }
     }
 

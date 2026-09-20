@@ -69,6 +69,25 @@ impl Session {
         enter: &RootEditorEnterParams,
         fence: FenceId,
     ) -> kr_protocol::root::FenceAcknowledgement {
+        self.fence_exchange_before(enter, fence, Instant::now() + REPLY)
+    }
+
+    /// Runs one fence exchange the reader has until `deadline` to answer.
+    ///
+    /// A caller that exchanges more than once while it waits for the reader's state to settle
+    /// passes every exchange the same instant, so the settlement is bounded by that one instant
+    /// instead of by a reply window each time it asks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader refuses a fence for the reader it is actually running, and when it
+    /// has not answered by `deadline`.
+    pub fn fence_exchange_before(
+        &mut self,
+        enter: &RootEditorEnterParams,
+        fence: FenceId,
+        deadline: Instant,
+    ) -> kr_protocol::root::FenceAcknowledgement {
         let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
             session_id: self.session_id,
             fence_id: fence,
@@ -77,7 +96,7 @@ impl Session {
             deadline_ms: FENCE_EXCHANGE_TIMEOUT,
             cause: FenceCause::EditorEntry,
         }));
-        match self.answer(id) {
+        match self.answer_before(id, deadline) {
             BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
                 acknowledgement
             }
@@ -92,15 +111,24 @@ impl Session {
     pub fn fenced_prompt(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         let enter = self.next_prompt();
         let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
+        // One deadline covers the exchanges and the waits between them, so asking the reader again
+        // never buys it another reply window.
         let deadline = Instant::now() + REPLY;
-        let mut acknowledgement = self.fence_exchange(&enter, fence.fence_id);
+        let mut acknowledgement = self.fence_exchange_before(&enter, fence.fence_id, deadline);
         while !(acknowledgement.queues.tty_typeahead_drained
             && acknowledgement.queues.macro_input_drained
             && acknowledgement.queues.partial_key_drained)
             && Instant::now() < deadline
         {
-            std::thread::sleep(Duration::from_millis(20));
-            acknowledgement = self.fence_exchange(&enter, fence.fence_id);
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(20)),
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+            acknowledgement = self.fence_exchange_before(&enter, fence.fence_id, deadline);
         }
         assert!(
             acknowledgement.queues.tty_typeahead_drained
@@ -280,17 +308,25 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
     );
 
     // The fence rests on the reader's own atomic read: the queues, the buffer and the invoking
-    // sequence together, at one instant. Poll under the reply deadline so initial prompt startup
-    // bytes drain under heavy machine load before checking the settled empty state.
+    // sequence together, at one instant. The reader reaches that instant once the bytes its own
+    // startup left behind have drained, so this asks again until the state it reports has settled.
+    // One deadline covers every exchange and every wait between them.
     let deadline = Instant::now() + REPLY;
-    let mut acknowledgement = session.fence_exchange(&first, fence_id(1));
+    let mut acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline);
     while Instant::now() < deadline
         && (!acknowledgement.editor.buffer_empty
             || acknowledgement.snapshot.queued_keys != U64::new(0)
             || acknowledgement.snapshot.pending_bytes != U64::new(0))
     {
-        std::thread::sleep(Duration::from_millis(10));
-        acknowledgement = session.fence_exchange(&first, fence_id(1));
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+        if Instant::now() >= deadline {
+            break;
+        }
+        acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline);
     }
     assert_eq!(acknowledgement.fence_id, fence_id(1));
     assert_eq!(acknowledgement.prompt_generation, first.prompt_generation);
