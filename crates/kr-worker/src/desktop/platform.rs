@@ -309,13 +309,16 @@ fn capture_files() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path:
     let directory = std::env::temp_dir().join(format!("kr-desktop-{}", kr_ipc::new_uuid()));
     // `create_dir` and not `create_dir_all`: a directory that is already there is one this host
     // did not make, and on a shared temporary directory that is somebody else's to write in.
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt as _;
 
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder.create(&directory).ok()?;
     Some((directory.join("out"), directory.join("err"), directory))
 }

@@ -229,13 +229,16 @@ fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
     // has modes. `/tmp` is shared: a name another account can guess is a name it can pre-create,
     // and a file opened through it is a file this host writes on somebody else's behalf.
     let directory = std::env::temp_dir().join(format!("kr-shell-ask-{}", kr_ipc::new_uuid()));
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt as _;
 
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder.create(&directory).ok()?;
     let said = directory.join("said");
     let mut options = std::fs::OpenOptions::new();

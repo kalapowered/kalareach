@@ -220,7 +220,8 @@ struct Terminal<'a, W: std::io::Write> {
 /// for a terminal, and no write of an ended lease's bytes can begin after that change.
 ///
 /// What makes this a boundary and not a wait is that the write inside it cannot wait. Every terminal
-/// this host opens answers rather than waits - that is what [`crate::conpty`] exists for on Windows
+/// this host opens answers rather than waits - that is what the ConPTY module (`windows::conpty`)
+/// exists for on Windows
 /// - so a write takes what there is room for and says so, and what it took is what is released.
 ///
 /// A piece is at most [`WRITE_PIECE_BYTES`], so a takeover reaches a writer between pieces instead
