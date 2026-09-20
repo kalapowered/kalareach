@@ -1,10 +1,14 @@
-//! Native desktop voice call implementing WebRTC peer connection and audio pipeline.
+//! One desktop voice call: what the person holds locally, and what the far end may send it.
 //!
-//! Section 15 paragraph 2 is the hard constraint: native WebRTC and native platform audio
-//! own capture and playback, not a background WebView `getUserMedia` path.
+//! Section 15 paragraph 2 is the hard constraint: native WebRTC and native platform audio own
+//! capture and playback, not a background WebView `getUserMedia` path. This end has the local
+//! half of that, and not the connection: the mute controls, the playback silence, the bounded
+//! queue of what the provider's channel delivered, and the platform device. Opening a call
+//! refuses, because negotiating one is what the desktop cannot do yet, and a call that says it
+//! opened when no audio can reach it is worse than one that says it cannot.
 //!
-//! Section 15 paragraph 6 is the other constraint: the provider's data channel is read-only.
-//! The client sends zero bytes on it. What arrives is dispatched to the subscriber as raw events.
+//! Section 15 paragraph 6 is the other constraint: the provider's data channel is read-only. The
+//! client sends zero bytes on it. What arrives is held, bounded, for whatever reads it.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,8 +47,13 @@ pub struct DesktopVoiceCall {
     closes_at_ms: Arc<AtomicU64>,
     /// Whether the call has been stopped.
     is_stopped: Arc<AtomicBool>,
-    /// Generated local offer SDP.
-    offer_sdp: Mutex<Option<String>>,
+    /// The local description a negotiated connection produced.
+    ///
+    /// A real peer connection is what fills this in, and this build has none, so it stays empty
+    /// and acceptance refuses. Section 15 paragraph 3 makes the offer the client's own: one this
+    /// end wrote out by hand would name candidates and a fingerprint no transport here holds, and
+    /// the provider would answer an offer nothing could carry.
+    local_description: Mutex<Option<String>>,
     /// Accepted remote answer SDP.
     answer_sdp: Mutex<Option<String>>,
     /// Events received from the provider's read-only data channel.
@@ -88,7 +97,7 @@ impl DesktopVoiceCall {
             start_time: Instant::now(),
             closes_at_ms: Arc::new(AtomicU64::new(now_ms + duration_seconds * 1000)),
             is_stopped: Arc::new(AtomicBool::new(false)),
-            offer_sdp: Mutex::new(None),
+            local_description: Mutex::new(None),
             answer_sdp: Mutex::new(None),
             provider_events: Arc::new(Mutex::new(Vec::new())),
         })
@@ -99,46 +108,28 @@ impl DesktopVoiceCall {
         self.closes_at_ms.store(closes_at_ms, Ordering::SeqCst);
     }
 
-    /// Generates the SDP offer for the voice call.
+    /// The offer this end would send to open a call.
     ///
-    /// Section 15 paragraph 3: The client creates the offer; the host forwards it.
+    /// Section 15 paragraph 3 makes the offer the client's own, and an offer is what a peer
+    /// connection produced: the candidates it gathered, the fingerprint of the certificate it
+    /// holds, the codecs it will actually carry. This build negotiates no connection on the
+    /// desktop, so it has no offer to give and says so.
+    ///
+    /// It says so rather than writing plausible SDP out by hand, because a hand-written offer
+    /// would be answered. The service would hold a call open, the person would be told one had
+    /// started, and no audio could ever reach it.
     ///
     /// # Errors
     ///
-    /// Returns an error if offer generation fails.
+    /// Returns `UNAVAILABLE` on every call, until this end can negotiate a connection.
     pub async fn offer(&self) -> Result<String> {
         if self.is_stopped.load(Ordering::Relaxed) {
             return Err(CommandError::refused("the call has already been stopped"));
         }
 
-        let mut lock = self
-            .offer_sdp
-            .lock()
-            .map_err(|_| CommandError::local_failure("internal state lock poisoned"))?;
-
-        if let Some(ref existing) = *lock {
-            return Ok(existing.clone());
-        }
-
-        // Standard WebRTC audio offer SDP containing Opus 48 kHz mono format.
-        let sdp = format!(
-            "v=0\r\n\
-             o=- {} 2 IN IP4 127.0.0.1\r\n\
-             s=-\r\n\
-             t=0 0\r\n\
-             a=group:BUNDLE 0\r\n\
-             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
-             c=IN IP4 0.0.0.0\r\n\
-             a=rtcp:9 IN IP4 0.0.0.0\r\n\
-             a=sendrecv\r\n\
-             a=rtcp-mux\r\n\
-             a=rtpmap:111 opus/48000/2\r\n\
-             a=fmtp:111 minptime=10;useinbandfec=1\r\n",
-            self.start_time.elapsed().as_millis()
-        );
-
-        *lock = Some(sdp.clone());
-        Ok(sdp)
+        Err(CommandError::unavailable(
+            "this desktop build cannot open a voice call yet; use an iOS or Android device",
+        ))
     }
 
     /// Applies the provider's SDP answer to establish the media path.
@@ -157,17 +148,6 @@ impl DesktopVoiceCall {
             return Err(CommandError::refused("the call has already been stopped"));
         }
 
-        let offer_present = self
-            .offer_sdp
-            .lock()
-            .map(|opt| opt.is_some())
-            .unwrap_or(false);
-        if !offer_present {
-            return Err(CommandError::refused(
-                "cannot accept answer without an active offer",
-            ));
-        }
-
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -175,6 +155,20 @@ impl DesktopVoiceCall {
         let closes_at = self.closes_at_ms.load(Ordering::SeqCst);
         if closes_at > 0 && now_ms >= closes_at {
             return Err(CommandError::refused("the voice call session has expired"));
+        }
+
+        // An answer answers a local description, and only a negotiated connection has one. The
+        // order matters: a stopped or expired call is refused for what it is, and only a call that
+        // could still carry audio is refused for having nothing to carry it on.
+        let negotiated = self
+            .local_description
+            .lock()
+            .map(|held| held.is_some())
+            .unwrap_or(false);
+        if !negotiated {
+            return Err(CommandError::unavailable(
+                "this call negotiated no connection, so there is nothing for an answer to complete",
+            ));
         }
 
         let _parsed = RTCSessionDescription::answer(answer_sdp.to_owned())
@@ -306,15 +300,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn call_offer_generation_and_local_controls() {
+    async fn the_local_controls_work_on_a_call_this_build_cannot_open() {
         let call = DesktopVoiceCall::new().expect("call creates");
         assert!(!call.is_muted_by_person());
         assert!(!call.is_playback_muted());
         assert!(!call.is_stopped());
 
-        let offer = call.offer().await.expect("offer succeeds");
-        assert!(offer.contains("m=audio"));
-        assert!(offer.contains("opus/48000/2"));
+        // No connection is negotiated here, so there is no offer to give. Answering with SDP this
+        // end wrote out by hand would have the service hold a call open that no audio could reach.
+        let refusal = call.offer().await.expect_err("this build has no offer");
+        assert_eq!(
+            refusal.code,
+            kr_protocol::error::ErrorCode::ResourceUnavailable
+        );
 
         // Mute microphone
         call.set_muted_by_person(true);
@@ -351,16 +349,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_without_offer_is_refused() {
+    async fn an_answer_to_a_call_that_negotiated_nothing_is_refused() {
         let call = DesktopVoiceCall::new().expect("call creates");
         let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
-        assert!(result.is_err(), "must refuse answer without prior offer");
+        assert!(
+            result.is_err(),
+            "must refuse an answer with nothing to complete"
+        );
     }
 
     #[tokio::test]
     async fn stopped_call_acceptance_is_refused() {
         let call = DesktopVoiceCall::new().expect("call creates");
-        let _offer = call.offer().await.expect("offer succeeds");
         call.stop();
         assert!(call.is_stopped());
 
@@ -372,7 +372,6 @@ mod tests {
     async fn expired_call_acceptance_is_refused() {
         let call = DesktopVoiceCall::new().expect("call creates");
         call.set_closes_at_ms(1); // Expired timestamp
-        let _offer = call.offer().await.expect("offer succeeds");
 
         let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
         assert!(result.is_err(), "must refuse answer on expired call");

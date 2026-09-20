@@ -3,13 +3,15 @@
 //! Section 15 paragraph 2 mandates that native WebRTC and native platform audio own capture
 //! and playback, excluding any background WebView `getUserMedia` path.
 //!
-//! This module provides:
-//! - WebRTC peer connection, audio track, and SDP offer/answer handling ([`call`]).
-//! - Bounded PCM ring buffer at 120 ms target depth with libopus PLC and drop-oldest on overrun ([`buffer`]).
-//! - Opus codec encoding, decoding, and PLC at 48 kHz mono ([`codec`]).
-//! - macOS VoiceProcessingIO AudioUnit or unavailable error on Linux/Windows ([`device`]).
-//! - Dedicated WebSocket control socket and return path with 20-second heartbeat and frame validation ([`control`]).
-//! - Unlocked-screen owner verification ceremony and Ed25519 proof signing ([`ceremony`]).
+//! What is here:
+//! - one call's local state, its mute controls and the bound on what the provider's channel may
+//!   leave in memory ([`call`]); opening a call refuses, because this end negotiates no connection;
+//! - a bounded PCM ring buffer at 120 ms target depth, dropping the oldest on overrun ([`buffer`]);
+//! - Opus encoding, decoding and packet-loss concealment at 48 kHz mono ([`codec`]);
+//! - the macOS `VoiceProcessingIO` unit, and a refusal on Linux and Windows ([`device`]);
+//! - the control frames' own rules: what each frame must carry, what is refused, and the
+//!   heartbeat's interval ([`control`]). Nothing opens a socket yet;
+//! - the unlocked-screen ceremony and the signature over the host's challenge ([`ceremony`]).
 
 pub mod buffer;
 pub mod call;
