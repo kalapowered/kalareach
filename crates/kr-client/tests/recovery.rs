@@ -1068,7 +1068,9 @@ async fn migrating_a_kit_with_mismatched_context_is_refused() {
         )
         .await
         .expect_err("a kit pointing to another locator is refused");
-    assert!(matches!(err, RecoveryError::BundleNotAuthentic));
+    // The caller's kit is wrong, and nothing was fetched: saying an authentication failed would be
+    // saying something that never happened.
+    assert!(matches!(err, RecoveryError::KitLocatorMismatch));
     assert!(
         destination_service
             .collections
@@ -1402,4 +1404,241 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// A destination that takes a write and then serves something else back.
+///
+/// It is the one failure a migration cannot check before it writes, so it is the one the caller
+/// has to be left able to recover from.
+#[derive(Debug, Default)]
+struct ForgetfulService {
+    generation: Mutex<u64>,
+}
+
+impl SyncBackupService for ForgetfulService {
+    fn compare_exchange<'a>(
+        &'a self,
+        _collection: &'a str,
+        _expected_generation: u64,
+        _ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, u64> {
+        Box::pin(async move {
+            let mut generation = self.generation.lock().expect("the generation");
+            *generation += 1;
+            Ok(*generation)
+        })
+    }
+
+    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
+        Box::pin(async move {
+            let generation = *self.generation.lock().expect("the generation");
+            Ok((generation, vec![0u8; 64]))
+        })
+    }
+}
+
+#[tokio::test]
+async fn migrating_a_kit_that_belongs_to_another_seed_is_refused() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let other = RecoverySeed::generate().expect("another seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // The kit names the right origin and the right locator, and belongs to another recovery
+    // authority. The updated kit is built from the seed, so accepting this one would hand back a
+    // kit that opens nothing the owner's archives were wrapped for.
+    let kit = kit_of(&other, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let err = store
+        .migrate(
+            &seed,
+            &mut bundle,
+            &kit,
+            Arc::clone(&destination_service) as Arc<_>,
+            RecoveryContext {
+                service_origin: OTHER_ORIGIN.to_owned(),
+                bundle_locator: "moved-bundle-locator".to_owned(),
+            },
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("a kit for another seed is refused");
+    assert!(matches!(err, RecoveryError::KitIsForAnotherSeed));
+    assert!(
+        destination_service
+            .collections
+            .lock()
+            .expect("store")
+            .is_empty(),
+        "nothing is written at the destination"
+    );
+}
+
+#[tokio::test]
+async fn migrating_a_kit_this_build_cannot_read_is_refused_before_anything_is_written() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    let destination = RecoveryContext {
+        service_origin: OTHER_ORIGIN.to_owned(),
+        bundle_locator: "moved-bundle-locator".to_owned(),
+    };
+    for broken in [
+        RecoveryKit {
+            profile_version: U64::new(2),
+            ..kit_of(&seed, &[ORIGIN])
+        },
+        RecoveryKit {
+            seed_checksum: kr_protocol::scalars::Bytes::new(vec![0, 0, 0, 0]),
+            ..kit_of(&seed, &[ORIGIN])
+        },
+    ] {
+        let destination_service = ScriptedService::shared();
+        let err = store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &broken,
+                Arc::clone(&destination_service) as Arc<_>,
+                destination.clone(),
+                TimestampMs::new(2_000),
+            )
+            .await
+            .expect_err("a kit this build cannot read is refused");
+        assert!(matches!(err, RecoveryError::Crypto(_)));
+        assert!(
+            destination_service
+                .collections
+                .lock()
+                .expect("store")
+                .is_empty(),
+            "nothing is written at the destination"
+        );
+    }
+}
+
+#[tokio::test]
+async fn migrating_a_bundle_another_device_has_written_since_is_refused() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second_writer = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // Another device enrols a second writer at the same locator. This store's snapshot is now one
+    // revision behind, and moving it would take the new writer's enrolment off the bundle.
+    let mut elsewhere = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut theirs = elsewhere.fetch(&seed).await.expect("they read it");
+    elsewhere
+        .enable_writer(
+            &seed,
+            &mut theirs,
+            trusted(&second_writer),
+            TimestampMs::new(1_500),
+        )
+        .await
+        .expect("their commit lands");
+
+    let destination_service = ScriptedService::shared();
+    let err = store
+        .migrate(
+            &seed,
+            &mut bundle,
+            &kit_of(&seed, &[ORIGIN]),
+            Arc::clone(&destination_service) as Arc<_>,
+            RecoveryContext {
+                service_origin: OTHER_ORIGIN.to_owned(),
+                bundle_locator: "moved-bundle-locator".to_owned(),
+            },
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("a snapshot from before somebody else's write is refused");
+    assert!(matches!(err, RecoveryError::BundleConflict { .. }));
+    assert!(
+        destination_service
+            .collections
+            .lock()
+            .expect("store")
+            .is_empty(),
+        "nothing is written at the destination"
+    );
+}
+
+#[tokio::test]
+async fn a_migration_that_does_not_read_back_leaves_the_caller_holding_what_it_had() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let before = bundle.clone();
+
+    let err = store
+        .migrate(
+            &seed,
+            &mut bundle,
+            &kit_of(&seed, &[ORIGIN]),
+            Arc::new(ForgetfulService::default()) as Arc<_>,
+            RecoveryContext {
+                service_origin: OTHER_ORIGIN.to_owned(),
+                bundle_locator: "moved-bundle-locator".to_owned(),
+            },
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("a migration that cannot be read back is not a migration");
+    assert!(matches!(err, RecoveryError::BundleNotAuthentic));
+
+    // The caller still holds the bundle at the old location, so reading it again and trying once
+    // more is a retry rather than a revision it can never commit.
+    assert_eq!(bundle, before);
+    assert_eq!(store.context(), &context(ORIGIN));
+    let still_there = store
+        .fetch(&seed)
+        .await
+        .expect("the old location is intact");
+    assert_eq!(still_there, before);
 }

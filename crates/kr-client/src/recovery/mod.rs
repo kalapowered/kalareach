@@ -100,6 +100,16 @@ pub enum RecoveryError {
         /// The generation that was offered.
         offered: u64,
     },
+    /// The kit names another bundle than the one this store holds.
+    ///
+    /// It is the caller's kit that is wrong, not the bytes a service served, which is why it is
+    /// not [`Self::BundleNotAuthentic`]: nothing has been fetched and nothing has failed to
+    /// authenticate.
+    #[error("that recovery kit names another bundle than the one this store holds")]
+    KitLocatorMismatch,
+    /// The kit and the seed offered with it are not the same recovery authority.
+    #[error("that recovery kit belongs to another recovery seed")]
+    KitIsForAnotherSeed,
     /// Migrating this kit would drop a service origin it names.
     ///
     /// A kit's origins share one bundle locator, so a kit that names several cannot be migrated one

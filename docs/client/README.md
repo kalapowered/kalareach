@@ -296,6 +296,20 @@ delete, and because removing a bundle before its owner has the new kit in hand w
 that lost what it was moving. `MigrationRecord::describe` says exactly that: keep the updated kit
 and destroy the old one, which still opens the superseded copy.
 
+**Everything that can be checked is checked before anything is written.** The kit has to be the one
+this bundle belongs to - this origin, this locator, this recovery seed - and the bundle at the old
+location is read again and has to be the one the caller is holding, so a write another device made
+in between is a conflict rather than a migration that quietly moves an older writer set. A kit that
+names another seed is refused outright, because the updated kit is built from the seed and handing
+back a kit the owner's existing archives were never wrapped for would be losing them.
+
+What cannot be checked first is the write itself, so a migration is **not** atomic and does not
+claim to be: a destination that takes the bundle and then fails to serve it back leaves the new
+location populated while this store stays where it was. The caller's bundle is untouched in that
+case, which is what makes reading the old location again and trying once more a valid retry rather
+than a revision it can never commit. The destination object has to be cleared before that retry can
+succeed, and there is no operation here that clears it.
+
 ### A fresh restore
 
 A restore obtains service access through the configured retrieval policy - a managed account or a

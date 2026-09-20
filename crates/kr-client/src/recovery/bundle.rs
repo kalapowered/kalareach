@@ -334,9 +334,24 @@ impl BundleStore {
     /// lost the archive it was moving. [`MigrationRecord::describe`] says so, because an owner who
     /// keeps the old kit keeps a kit that still opens a superseded bundle.
     ///
+    /// **Everything that can be checked is checked before anything is written.** The kit is the
+    /// one this store's bundle belongs to and carries the seed being migrated; the bundle at the
+    /// old location is read again and has to be the one the caller is holding, so a write another
+    /// device made in between is a conflict rather than a migration that quietly moves an older
+    /// writer set. What cannot be checked first is the write itself: a destination that takes the
+    /// bundle and then fails to serve it back leaves the new location populated and this store
+    /// where it was. The caller's bundle is untouched in that case, so reading the old location
+    /// again is a valid retry, and the destination object has to be cleared before one can
+    /// succeed.
+    ///
     /// # Errors
     ///
-    /// Returns [`RecoveryError::BundleNotAuthentic`] when the bundle does not read back at the new
+    /// Returns [`RecoveryError::UnknownServiceOrigin`] when the kit does not name this store's
+    /// origin, [`RecoveryError::KitLocatorMismatch`] when it names another bundle,
+    /// [`RecoveryError::MigrationWouldLoseAnOrigin`] for a kit that names several origins,
+    /// [`RecoveryError::KitIsForAnotherSeed`] when the kit and the seed disagree,
+    /// [`RecoveryError::BundleConflict`] when the old location has moved on,
+    /// [`RecoveryError::BundleNotAuthentic`] when the bundle does not read back at the new
     /// location, and whatever [`Self::commit`] returns for the write itself.
     pub async fn migrate(
         &mut self,
@@ -365,28 +380,45 @@ impl BundleStore {
             return Err(RecoveryError::UnknownServiceOrigin);
         }
         if kit.bundle_locator != self.context.bundle_locator {
-            return Err(RecoveryError::BundleNotAuthentic);
+            return Err(RecoveryError::KitLocatorMismatch);
+        }
+        // The kit has to be this seed's. `from_kit` reads it under its declared profile and checks
+        // its own checksum, which is what a mistyped or foreign-profile kit fails; the checksums
+        // then have to agree, because the updated kit this call returns is built from the *seed*,
+        // and a caller that handed in a kit for another seed would be handed back a kit that opens
+        // nothing it owns while its existing archives still wrap their keys for the old recovery
+        // recipient.
+        let kit_seed = RecoverySeed::from_kit(kit)?;
+        if !kit_seed
+            .bundle_key_for(&self.context)?
+            .constant_time_eq(&seed.bundle_key_for(&self.context)?)
+        {
+            return Err(RecoveryError::KitIsForAnotherSeed);
         }
 
-        // The bundle being moved has to be the one this store last authenticated. Migrating a
-        // snapshot from before somebody else's write would move an older writer set and older
-        // checkpoints to the new location and point the updated kit at them.
-        if self
-            .held
-            .as_ref()
-            .is_some_and(|held| held.revision.get() != bundle.revision.get())
-        {
+        // The bundle being moved has to be the one at the old location *now*, not the one this
+        // device read at some point. Migrating a snapshot from before somebody else's write would
+        // move an older writer set and older checkpoints to the new location and point the updated
+        // kit at them. Reading it again is also what proves this seed opens it: a seed that does
+        // not is an authentication failure here rather than a bundle re-encrypted under the wrong
+        // authority at the destination.
+        let current = self.fetch(seed).await?;
+        if &current != bundle {
             return Err(RecoveryError::BundleConflict {
                 expected: self.generation.unwrap_or(0),
             });
         }
         let origin = self.context.clone();
+        // The candidate is prepared beside the caller's bundle. A destination that takes the write
+        // and then fails to serve it back must not leave the caller holding a revision it has
+        // nowhere to commit: what it holds is still the bundle at the old location.
+        let mut candidate = bundle.clone();
         let mut moved = Self::new(destination_service, destination.clone());
-        let generation = moved.commit(seed, bundle, now_ms).await?;
+        let generation = moved.commit(seed, &mut candidate, now_ms).await?;
         // Read back and authenticate at the new location. The key there is a different key, so a
         // service that stored the old ciphertext under the new name fails here.
         let verified = moved.fetch(seed).await?;
-        if &verified != bundle {
+        if verified != candidate {
             // The revision alone would not do: a service that served a different bundle at the
             // same revision would pass. What was written is what has to come back.
             return Err(RecoveryError::BundleNotAuthentic);
@@ -396,6 +428,7 @@ impl BundleStore {
         let updated_kit =
             kr_crypto::kdf::RecoverySeed::to_kit(seed, origins, destination.bundle_locator.clone());
 
+        *bundle = candidate;
         *self = moved;
         Ok(Migrated {
             record: MigrationRecord {
