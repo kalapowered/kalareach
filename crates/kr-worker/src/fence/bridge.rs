@@ -285,16 +285,29 @@ mod tests {
         session
     }
 
+    /// The address a client in this process connects to.
+    ///
+    /// The endpoint publishes the form the shell is given, which on Windows is the full
+    /// `\\.\pipe\` path an ordinary client opens. `kr-ipc` holds the namespaced name that the
+    /// prefix is added to, so handing the published form straight back asks for a pipe whose name
+    /// carries the prefix twice: nothing serves it, the connection fails at once, and a server
+    /// waiting to accept one waits for ever. `ScriptedBridge::connect` strips it for the same
+    /// reason. On Unix there is nothing to strip, because both forms are the socket's path.
+    fn client_address(endpoint: &HostEndpoint) -> kr_ipc::paths::Endpoint {
+        let published = &endpoint.address().path;
+        kr_ipc::paths::Endpoint::from_path(
+            published
+                .strip_prefix(kr_shell_integration::contract::transport::WINDOWS_PIPE_PREFIX)
+                .unwrap_or(published),
+        )
+        .expect("an address")
+    }
+
     /// A writer that fails ends the connection, even while the read is still waiting.
     ///
     /// A peer can close the side it reads from and leave the side it writes to open. The worker's
     /// write fails; its read waits for a frame that is never coming. Nothing else would report the
     /// loss, so every caller waiting on a launch would wait with it.
-    ///
-    #[cfg_attr(
-        windows,
-        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where the suites qualified for this platform passed and several others failed, and what holds it has not been established"
-    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_ends_when_the_writer_it_shares_a_connection_with_does() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -317,9 +330,7 @@ mod tests {
 
         // A real connection on that endpoint, so the read below is a read of a socket rather than
         // of something this test is pretending with. Nothing is ever sent on it.
-        let address =
-            kr_ipc::paths::Endpoint::from_path(std::path::Path::new(&endpoint.address().path))
-                .expect("an address");
+        let address = client_address(&endpoint);
         let connecting =
             tokio::spawn(async move { kr_ipc::endpoint::Connection::connect(&address).await });
         let (served, _peer) = endpoint.listener().accept().await.expect("accepts");
@@ -368,11 +379,6 @@ mod tests {
     ///
     /// The read waits in a different arm of the same choice when a deadline is set, and a writer
     /// that stopped has to end the connection from either one.
-    ///
-    #[cfg_attr(
-        windows,
-        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where the suites qualified for this platform passed and several others failed, and what holds it has not been established"
-    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_with_a_deadline_armed_ends_with_its_writer_too() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -448,9 +454,7 @@ mod tests {
             session_id,
         )
         .expect("binds the bridge");
-        let address =
-            kr_ipc::paths::Endpoint::from_path(std::path::Path::new(&endpoint.address().path))
-                .expect("an address");
+        let address = client_address(&endpoint);
         let connecting =
             tokio::spawn(async move { kr_ipc::endpoint::Connection::connect(&address).await });
         let (served, _peer) = endpoint.listener().accept().await.expect("accepts");

@@ -549,8 +549,8 @@ drive it, which the runner can do.
 The worker's other integration suites are compiled here and not run. They drive a session the way a
 Unix pseudo-terminal behaves, and on Windows a number of them fail on that difference rather than
 on the code they are checking; running them and calling the result a Windows failure would say
-something nobody has established. Two tests in the worker's library and one in its service are
-skipped here for their own stated reasons, which `cargo test` prints.
+something nobody has established. One test in the worker's service is skipped here for its own
+stated reason, which `cargo test` prints.
 
 What the runner cannot do is the release matrix. It has no interactive logon, no window manager, no
 IME and no physical keyboard, so nothing about Windows Terminal, a real desktop session, IME
