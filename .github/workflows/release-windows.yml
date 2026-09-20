@@ -3,12 +3,14 @@ name: release-windows
 # Builds the Windows host artefacts for one commit, signs every one of them, refuses anything the
 # signature does not hold for, and only then publishes.
 #
-# The signing identity is an Azure Artifact Signing certificate profile. There is no private key
-# here to protect: the key is held in the service and the signature comes back over the wire. There
-# is no client secret either, because the runner authenticates with a token GitHub mints for this
-# workflow and Entra trusts for this repository's `release-signing` environment alone. So no secret
-# is read, written or referenced anywhere below; the three identifiers the login needs are
-# repository variables, and all three are public.
+# The signing key is an Azure Artifact Signing key. It stays inside the service, in hardware, and
+# what comes back over the wire is a signature: no copy of it exists in this repository, on a
+# runner, or on anyone's machine. Nor is there a stored credential to reach it with. The runner
+# proves who it is with a token GitHub mints for one environment of one repository, and Microsoft
+# Entra will exchange that token and nothing else, so there is no client secret and no certificate
+# credential anywhere below. The three identifiers the login needs are repository variables, and all
+# three are public. Short-lived tokens do exist on the runner while the job runs, which is what the
+# environment's reviewer and the narrow role assignment are for.
 #
 # `docs/releases/windows-signing.md` is the whole of the procedure: what the operator set up once,
 # how a release is signed, how to read a refusal, and how the profile is rotated.
@@ -33,6 +35,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The name the certificate profile issues under. Every signature is held to it, because a trusted
+  # signature somebody else made is not this project's signature.
+  KR_SIGNING_SUBJECT: 'CN=Kala Holdings Inc., O=Kala Holdings Inc., L=Newark, S=Delaware, C=US'
 
 defaults:
   run:
@@ -47,17 +52,36 @@ jobs:
   # separate: it holds `contents: read` and nothing else, so it cannot ask for the token that
   # reaches the signing service, and the fixture signer and the release identity are never on the
   # same runner.
+  #
+  # It also settles which commit this run is about, and writes it into the run's summary. The
+  # release job checks out that commit by its identifier rather than resolving the ref a second
+  # time, so a branch that moves while the run waits for approval cannot change what gets signed,
+  # and the person approving can see what they are approving.
   gate:
     name: the gate refuses what it must
     runs-on: windows-2025
     timeout-minutes: 20
     permissions:
       contents: read
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Settle which commit this run signs
+        id: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (git rev-parse HEAD).Trim()
+          if ($commit -notmatch '^[0-9a-f]{40}$') {
+            throw "This run does not resolve to one commit: [$commit]"
+          }
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "This run builds and signs commit ``$commit``." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Host "commit $commit"
 
       - name: Drive the gate with artefacts made to fail
         run: |
@@ -90,10 +114,12 @@ jobs:
       RUSTFLAGS: "-Clink-arg=/IGNORE:4099"
       CARGO_INCREMENTAL: "0"
     steps:
-      - name: Check out
+      # By identifier, not by ref: the commit the gate job settled, whatever has happened to the
+      # branch since.
+      - name: Check out the commit the gate settled
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.gate.outputs.commit }}
 
       - name: Install the pinned toolchain
         run: |
@@ -111,21 +137,46 @@ jobs:
             target
           key: release-windows-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
-      # What this release is, settled before anything is built, and on a tag held to the tag. A
-      # host tag is `host/v<version>+<first twelve characters of the commit>`, so it names both the
+      # What this release is, settled before anything is built, and on a tag held to the tag. A host
+      # tag is `host/v<version>+<first twelve characters of the commit>`, so it names both the
       # version the archive carries and the commit it came from; a tag that names either of them
       # wrongly stops the run here rather than producing an archive nobody can place.
+      #
+      # This is also where the executables this release carries are settled. The four below are
+      # built one step each, and the workspace is asked what binaries those three crates declare: a
+      # binary added to one of them fails this step by name until it is built and staged too, rather
+      # than being left out of the release quietly.
       - name: What this release is
         id: release
         run: |
           $ErrorActionPreference = 'Stop'
           $commit = (git rev-parse HEAD).Trim()
+          if ($commit -ne '${{ needs.gate.outputs.commit }}') {
+            throw "This job checked out $commit and the gate settled ${{ needs.gate.outputs.commit }}."
+          }
           $metadata = (cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json)
           $version = ($metadata.packages | Where-Object { $_.name -eq 'kr-cli' }).version
           if (-not $version) {
             throw 'The workspace does not report a version for kr-cli.'
           }
           $short = $commit.Substring(0, 12)
+
+          $declared = @(
+            $metadata.packages |
+              Where-Object { $_.name -in @('kr-cli', 'kr-worker', 'kr-controller') } |
+              ForEach-Object { $_.targets } |
+              Where-Object { $_.kind -contains 'bin' } |
+              ForEach-Object { $_.name } |
+              Sort-Object
+          )
+          $built = @('kr', 'kr-attach-guard', 'kr-controller', 'kr-worker')
+          if (($declared -join ',') -ne ($built -join ',')) {
+            throw (
+              "The crates this release builds declare [$($declared -join ', ')] and this workflow " +
+              "builds [$($built -join ', ')]. Add the missing binary to the build and staging " +
+              'steps, or remove the one that is gone.'
+            )
+          }
 
           if ($env:GITHUB_REF.StartsWith('refs/tags/host/v')) {
             $tag = $env:GITHUB_REF_NAME
@@ -135,7 +186,6 @@ jobs:
             }
           }
 
-          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "archive=kalareach-windows-x64-$version+$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "version $version, commit $commit"
@@ -154,46 +204,64 @@ jobs:
       - name: Build the controller
         run: cargo build --locked --release -p kr-controller --bin kr-controller
 
-      # Everything that goes in the archive, gathered before anything is signed. Nothing is named
-      # here that the build did not produce, and nothing the build produced is left out: the
-      # executables are whatever `target\release` holds, so a binary added to one of the crates
-      # above is signed because it is there rather than because somebody remembered it. The four
-      # this release is known to carry are still checked by name, so a build that quietly produced
-      # none of them fails here instead of publishing an empty archive.
+      # Two directories, because an archive carries two kinds of file and they are not held to the
+      # same thing. Everything under `staging` is signed and verified, and the signing step is
+      # pointed at the directory rather than at a list, so nothing in it can be missed. Everything
+      # under `data` is a package manifest or a licence: data, not code, and nothing SignTool would
+      # sign. Both are named here and both are hashed into the record the archive carries.
       #
-      # The PowerShell package's module goes in whole. Its manifest loads the module, the module
-      # dot-sources the three scripts beside it, and PowerShell will not run any of them under an
-      # all-signed policy unless every one carries a signature.
+      # The executables are named rather than swept up out of `target\release`, because that
+      # directory is restored from a cache and Cargo leaves behind outputs it no longer builds. The
+      # step above holds this list to what the workspace declares.
+      #
+      # The PowerShell package's module goes in whole, with its startup script. The manifest loads
+      # the module, the module dot-sources the three scripts beside it and reads the manifest and
+      # the startup script by path, and PowerShell will not run any of the code under an all-signed
+      # policy unless every file of it carries a signature.
       - name: Assemble what this release signs
         run: |
           $ErrorActionPreference = 'Stop'
           $staging = Join-Path $env:RUNNER_TEMP 'staging'
-          if (Test-Path -LiteralPath $staging) {
-            Remove-Item -LiteralPath $staging -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $staging -Force | Out-Null
-
-          $built = @(Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'target\release') -Filter '*.exe' -File)
-          if ($built.Count -eq 0) {
-            throw 'The build produced no executables.'
-          }
-          foreach ($executable in $built) {
-            Copy-Item -LiteralPath $executable.FullName -Destination $staging
-          }
-
-          foreach ($expected in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe')) {
-            if (-not (Test-Path -LiteralPath (Join-Path $staging $expected) -PathType Leaf)) {
-              throw "The build did not produce $expected."
+          $data = Join-Path $env:RUNNER_TEMP 'data'
+          foreach ($directory in @($staging, $data)) {
+            if (Test-Path -LiteralPath $directory) {
+              Remove-Item -LiteralPath $directory -Recurse -Force
             }
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
           }
 
-          $module = Join-Path $staging 'shells\psreadline\module'
-          New-Item -ItemType Directory -Path $module -Force | Out-Null
-          Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'shells\psreadline\module') -File |
-            Copy-Item -Destination $module
+          function Copy-Into {
+            param([string] $Root, [string] $Relative, [string] $From)
+            $destination = Join-Path $Root $Relative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $From -PathType Leaf)) {
+              throw "$From is not there, so $Relative cannot go in the archive."
+            }
+            Copy-Item -LiteralPath $From -Destination $destination
+          }
 
-          Get-ChildItem -LiteralPath $staging -File -Recurse |
-            ForEach-Object { Write-Host ($_.FullName.Substring($staging.Length).TrimStart('\')) }
+          $target = Join-Path $env:GITHUB_WORKSPACE 'target\release'
+          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe')) {
+            Copy-Into -Root $staging -Relative $executable -From (Join-Path $target $executable)
+          }
+
+          $moduleSource = Join-Path $env:GITHUB_WORKSPACE 'shells\psreadline\module'
+          foreach ($file in (Get-ChildItem -LiteralPath $moduleSource -File -Force | Sort-Object Name)) {
+            Copy-Into -Root $staging -Relative "shells\psreadline\module\$($file.Name)" -From $file.FullName
+          }
+          Copy-Into -Root $staging -Relative 'shells\psreadline\startup\kr-profile.ps1' `
+            -From (Join-Path $env:GITHUB_WORKSPACE 'shells\psreadline\startup\kr-profile.ps1')
+
+          foreach ($file in @('LICENSE', 'shells\psreadline\manifest.json', 'shells\psreadline\LICENSE')) {
+            Copy-Into -Root $data -Relative $file -From (Join-Path $env:GITHUB_WORKSPACE $file)
+          }
+
+          Write-Host 'signed:'
+          Get-ChildItem -LiteralPath $staging -File -Recurse -Force |
+            ForEach-Object { Write-Host ('  ' + $_.FullName.Substring($staging.Length).TrimStart('\')) }
+          Write-Host 'data:'
+          Get-ChildItem -LiteralPath $data -File -Recurse -Force |
+            ForEach-Object { Write-Host ('  ' + $_.FullName.Substring($data.Length).TrimStart('\')) }
 
       # The token exchange. `client-id`, `tenant-id` and `subscription-id` are repository variables
       # because all three are public identifiers; none of them is a secret and none of them would be
@@ -238,22 +306,25 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      # The refusal. Every artefact is held to the default Authenticode policy and to carrying a
-      # timestamp, signtool's whole verdict on each one goes into this run's log, and what comes out
-      # is a record of what passed. Nothing below reads the staging directory again: the step that
-      # packs the archive takes its file list from this record, so an artefact that did not pass
-      # through here has no way into a release.
+      # The refusal. Every artefact is held to the default Authenticode policy, to carrying a
+      # timestamp, and to the name this project signs as; signtool's whole verdict on each one goes
+      # into this run's log; and what comes out is a record of what passed. Nothing below reads the
+      # staging directory on its own account: the step that packs the archive takes its file list
+      # from this record, so an artefact that did not pass through here has no way into a release.
       - name: Refuse any artefact the signature does not hold for
         run: |
           & "$env:GITHUB_WORKSPACE\scripts\verify-windows-signatures.ps1" `
             -Path "$env:RUNNER_TEMP\staging" `
+            -ExpectedSubject "$env:KR_SIGNING_SUBJECT" `
             -Receipt "$env:RUNNER_TEMP\gate\signatures.txt"
           exit $LASTEXITCODE
 
-      # Built from the record the gate wrote, and from nothing else. Each artefact is hashed again
-      # on the way in and held to the digest the gate recorded, so a file changed between the two
-      # steps stops the run; and the count is held to the record's, so a file that appeared after
-      # the gate ran cannot travel with the ones that passed.
+      # Built from the record the gate wrote, and from an explicit list of the files that carry no
+      # signature because they are data. Each one is hashed after it has been copied, so what is
+      # held to the record is the byte sequence that goes into the archive rather than the one that
+      # was read; the counts are held to the record's, so a file that appeared after the gate ran
+      # cannot travel with the ones that passed; and the finished archive is opened and every member
+      # in it checked against the same list before anything can upload it.
       - name: Pack what the gate accepted
         id: pack
         env:
@@ -261,6 +332,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $staging = Join-Path $env:RUNNER_TEMP 'staging'
+          $data = Join-Path $env:RUNNER_TEMP 'data'
           $receipt = Join-Path $env:RUNNER_TEMP 'gate\signatures.txt'
           $payload = Join-Path $env:RUNNER_TEMP 'payload'
           $release = Join-Path $env:RUNNER_TEMP 'release'
@@ -271,45 +343,110 @@ jobs:
             New-Item -ItemType Directory -Path $directory -Force | Out-Null
           }
 
-          $accepted = 0
+          $inventory = [ordered]@{}
+
+          function Add-ToPayload {
+            param([string] $Relative, [string] $From, [string] $Expected)
+
+            $destination = Join-Path $payload $Relative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $From -Destination $destination
+            $digest = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($Expected -and $digest -ne $Expected) {
+              throw "$Relative changed between being verified and being packed: expected $Expected, packed $digest."
+            }
+            $inventory[($Relative -replace '\\', '/')] = $digest
+            return $digest
+          }
+
+          $signed = 0
           foreach ($line in (Get-Content -LiteralPath $receipt)) {
             if ($line.StartsWith('#') -or -not $line.Trim()) { continue }
             $fields = $line -split '\s\s+', 3
-            $digest = $fields[0]
+            $expected = $fields[0]
             $relative = $fields[1]
 
             $source = Join-Path $staging $relative
             if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
               throw "$relative passed the gate and is no longer where it was."
             }
-            $now = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($now -ne $digest) {
-              throw "$relative changed after it was verified: the gate recorded $digest, it is now $now."
-            }
-
-            $destination = Join-Path $payload $relative
-            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
-            Copy-Item -LiteralPath $source -Destination $destination
-            $accepted += 1
+            Add-ToPayload -Relative $relative -From $source -Expected $expected | Out-Null
+            $signed += 1
           }
 
-          $staged = @(Get-ChildItem -LiteralPath $staging -File -Recurse).Count
-          if ($accepted -ne $staged) {
-            throw "The gate recorded $accepted artefacts and the staging directory holds $staged."
+          $staged = @(Get-ChildItem -LiteralPath $staging -File -Recurse -Force).Count
+          if ($signed -ne $staged) {
+            throw "The gate recorded $signed artefacts and the staging directory holds $staged."
           }
-          if ($accepted -eq 0) {
+          if ($signed -eq 0) {
             throw 'The gate recorded no artefacts.'
           }
 
+          # The unsigned half, named one by one rather than swept up, and recorded with its digests
+          # in the same file so that a reader can tell which is which.
+          $unsigned = @(Get-ChildItem -LiteralPath $data -File -Recurse -Force | Sort-Object FullName)
+          $notes = @(
+            '',
+            '# The files below carry no signature. They are data rather than code: a package',
+            '# manifest and licence text. Their digests are recorded here for the same reason the',
+            '# signed artefacts are.',
+            '#',
+            '# sha256  path'
+          )
+          foreach ($file in $unsigned) {
+            $relative = $file.FullName.Substring($data.Length).TrimStart('\')
+            $digest = Add-ToPayload -Relative $relative -From $file.FullName -Expected ''
+            $notes += ('{0}  {1}' -f $digest, $relative)
+          }
+
           Copy-Item -LiteralPath $receipt -Destination (Join-Path $payload 'signatures.txt')
+          Add-Content -LiteralPath (Join-Path $payload 'signatures.txt') -Value $notes -Encoding utf8NoBOM
+          $inventory['signatures.txt'] =
+            (Get-FileHash -LiteralPath (Join-Path $payload 'signatures.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
 
           $archive = Join-Path $release ($env:KR_ARCHIVE + '.zip')
           Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $archive -CompressionLevel Optimal
+
+          # What is in the archive, rather than what was meant to be. Every member is read back out
+          # and held to the list above, and the list is held to the members, before this archive can
+          # be uploaded anywhere.
+          $seen = 0
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            foreach ($entry in $zip.Entries) {
+              if (-not $entry.Name) { continue }
+              $name = $entry.FullName -replace '\\', '/'
+              if (-not $inventory.Contains($name)) {
+                throw "The archive carries $name, which nothing put there."
+              }
+              $stream = $entry.Open()
+              try {
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try {
+                  $digest = (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '')
+                } finally {
+                  $sha.Dispose()
+                }
+              } finally {
+                $stream.Dispose()
+              }
+              if ($digest -ne $inventory[$name]) {
+                throw "The archive's copy of $name is not the one that was packed."
+              }
+              $seen += 1
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          if ($seen -ne $inventory.Count) {
+            throw "The archive holds $seen files and $($inventory.Count) were packed."
+          }
+
           $digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS') `
             -Value "$digest  $(Split-Path -Leaf $archive)" -Encoding utf8NoBOM
 
-          Write-Host "$accepted signed artefacts in $(Split-Path -Leaf $archive)"
+          Write-Host "$signed signed artefacts and $($unsigned.Count) data files in $(Split-Path -Leaf $archive)"
           "directory=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # Every run keeps what it signed, whether or not a release follows.
@@ -362,14 +499,15 @@ jobs:
           # rebuilds the notes around it with the URLs GitHub reports.
           {
             echo
-            echo 'Every executable and every PowerShell module file in the archive is signed and'
-            echo 'timestamped. Check one for yourself after unpacking it:'
+            echo 'Every executable and every PowerShell file in the archive is signed by'
+            echo 'Kala Holdings Inc. and timestamped. The manifest and the licences are not signed;'
+            echo 'they are data, and signatures.txt inside the archive records the digest of every'
+            echo 'file either way. Check one signature for yourself after unpacking:'
             echo
             echo '    Get-AuthenticodeSignature .\kr.exe | Format-List'
             echo '    signtool verify /pa /v .\kr.exe'
             echo
-            echo 'signatures.txt inside the archive records what each signature is. Verify the'
-            echo 'archive itself against the sum:'
+            echo 'Verify the archive itself against the sum:'
             echo
             echo "    sha256sum -c SHA256SUMS"
             echo
@@ -512,16 +650,16 @@ jobs:
           served="$temp/served"
           mkdir -p "$served"
 
-          # GitHub's own record of where each asset is served, rather than a URL built here: it
-          # percent-encodes parts of a tag, and what a person pins has to be what resolves. Asked of
-          # the tag for the same reason, and attempted a few times, because a read that follows a
-          # write can reach a copy that has not caught up and answer with part of the set.
+          # GitHub's own record of each asset: its identifier, which is what fetches the bytes, and
+          # the address it serves them at, which is what a person pins. Asked of the tag, because
+          # the tag is what a person resolves, and attempted a few times, because a read that
+          # follows a write can reach a copy that has not caught up and answer with part of the set.
           cut -d' ' -f1 <"$temp/packed-assets" | sort >"$temp/packed-names"
 
           attempt=1
           while :; do
             if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-                 --jq '.assets[] | "\(.name) \(.browser_download_url)"' \
+                 --jq '.assets[] | "\(.name) \(.id) \(.browser_download_url)"' \
                  >"$temp/served-assets" \
                && cut -d' ' -f1 <"$temp/served-assets" | sort \
                  | cmp -s - "$temp/packed-names"; then
@@ -539,10 +677,21 @@ jobs:
             sleep 3
           done
 
-          while read -r name url; do
-            curl --fail --silent --show-error --location \
-              --retry 5 --retry-delay 3 --retry-all-errors \
-              --output "$served/$name" "$url"
+          # Fetched through the API with this run's token rather than from the public address,
+          # because this repository's releases are not public and an unauthenticated request for one
+          # of its assets is answered with a 404 rather than the bytes. The address a person pins is
+          # still the one GitHub reported, and it is what goes in the notes below.
+          while read -r name id _; do
+            attempt=1
+            until gh api "repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              --header 'Accept: application/octet-stream' >"$served/$name"; do
+              if [ "$attempt" -ge 5 ]; then
+                echo "Could not fetch $name back from the release it was published to." >&2
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
           done <"$temp/served-assets"
 
           cmp "$release_dir/SHA256SUMS" "$served/SHA256SUMS"
@@ -551,7 +700,7 @@ jobs:
           {
             echo "The signed Windows host artefacts, built from commit $GITHUB_SHA."
             echo
-            while read -r name url; do
+            while read -r name _ url; do
               case "$name" in
                 *.zip) echo "- $url" ;;
               esac
@@ -560,7 +709,7 @@ jobs:
           } >"$temp/notes.md"
 
           # By the identifier the creation returned, because resolving a tag first would be a
-          # fourth read after a write; this is a write to one known release.
+          # further read after a write; this is a write to one known release.
           release="$(cut -d' ' -f1 <"$temp/draft")"
 
           case "$release" in

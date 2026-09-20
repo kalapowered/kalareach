@@ -3,30 +3,39 @@
 Refuses a Windows release artefact that is not signed the way a release requires.
 
 .DESCRIPTION
-Every file under -Path is held to three conditions, and a file that fails any of them is named
-with the condition it failed:
+Every file under -Path is held to four conditions, and a file that fails any of them is named with
+the condition it failed:
 
-  unsigned       it carries no signature at all;
-  untrusted      its signature is not accepted by the default Authenticode policy, which is what
-                 a signature that does not chain to a trusted root looks like from here, and what
-                 an altered file looks like too;
-  untimestamped  it is signed without a timestamp, so the signature stops verifying when the
-                 signing certificate expires. The certificates this release signs with are valid
-                 for three days, so an untimestamped artefact is worthless by the end of the week.
+  unsigned         it carries no signature at all;
+  untrusted        its signature is not accepted by the default Authenticode policy, which is what
+                   a signature that does not chain to a trusted root looks like from here, and what
+                   an altered file looks like too;
+  wrong-publisher  the signature is good and it is somebody else's. A trusted signature is not the
+                   same as our signature, and an artefact signed by another publisher has no
+                   business in this release;
+  untimestamped    it is signed without a timestamp, so the signature stops verifying when the
+                   signing certificate expires. The certificates this release signs with are valid
+                   for three days, so an untimestamped artefact is worthless by the end of the week.
 
 A file can fail more than one, and all of them are reported. `signtool verify /pa /v` is run over
 every file and its whole output is printed, so the run's log carries the verdict this script acted
 on rather than a summary of it.
 
-Nothing is published from this script. What it writes instead, with -Receipt, is a record of what
-it accepted: one line per artefact with its SHA-256, the certificate that signed it and the
-timestamp it carries. The step that assembles a release archive takes its file list from that
-record, so an artefact that did not pass through here has no way into the archive.
+Nothing is published from this script. What it writes instead, with -Receipt, is a record of what it
+accepted: one line per artefact with its SHA-256, the certificate that signed it, the timestamp it
+carries and the chain the signature was verified against, root first. The step that assembles a
+release archive takes its file list from that record, so an artefact that did not pass through here
+has no way into the archive.
 
 An empty directory is a refusal. A build that produced nothing must not read as a clean run.
 
 .PARAMETER Path
-The directory holding the artefacts. Every file below it is verified, at any depth.
+The directory holding the artefacts. Every file below it is verified, at any depth, hidden files
+included.
+
+.PARAMETER ExpectedSubject
+The distinguished name the signing certificate must carry. Compared by its parts rather than as a
+string, so the order and spacing of the components do not matter.
 
 .PARAMETER Receipt
 Where to write the record of what was accepted. Written only when every artefact passed.
@@ -39,6 +48,9 @@ param(
     [Parameter(Mandatory)]
     [string] $Path,
 
+    [Parameter(Mandatory)]
+    [string] $ExpectedSubject,
+
     [string] $Receipt,
 
     [string] $SignToolPath
@@ -47,23 +59,42 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# The whole of the judgement, kept apart from the machinery that gathers the facts so that each of
-# the three refusals can be reached on its own and checked without a signing identity, a Windows
-# API or a file. `scripts/check-windows-signature-gate.ps1` drives it with real files; the release
-# rehearsal drives this function directly.
+# Two distinguished names are the same name when they carry the same components, whatever order and
+# spacing they were written in. X500DistinguishedName does the decoding, including quoted values.
+function Get-SubjectParts {
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Subject)
+
+    if ([string]::IsNullOrWhiteSpace($Subject)) {
+        return @()
+    }
+    $name = [System.Security.Cryptography.X509Certificates.X500DistinguishedName]::new($Subject)
+    return @(
+        $name.Format($true) -split "`r?`n" |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ } |
+            Sort-Object
+    )
+}
+
+# The whole of the judgement, kept apart from the machinery that gathers the facts so that each
+# refusal can be reached on its own and checked without a signing identity, a Windows API or a file.
+# `scripts/check-windows-signature-gate.ps1` drives it with real files; the release rehearsal drives
+# this function directly.
 function Get-SignatureRefusal {
     param(
         [Parameter(Mandatory)] [AllowEmptyString()] [string] $Status,
         [Parameter(Mandatory)] [AllowEmptyString()] [string] $StatusMessage,
         [Parameter(Mandatory)] [AllowEmptyString()] [string] $SignatureType,
         [Parameter(Mandatory)] [bool] $PolicyAccepted,
-        [Parameter(Mandatory)] [bool] $HasTimestamp
+        [Parameter(Mandatory)] [bool] $HasTimestamp,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Subject,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $ExpectedSubject
     )
 
     $refusals = @()
 
-    # Nothing else can be said about a file with no signature, and saying it has no timestamp
-    # either would only bury the one fact that matters.
+    # Nothing else can be said about a file with no signature, and saying it has no timestamp either
+    # would only bury the one fact that matters.
     if ($Status -eq 'NotSigned') {
         $refusals += [pscustomobject]@{
             Reason = 'unsigned'
@@ -80,6 +111,22 @@ function Get-SignatureRefusal {
                 "(status $Status, signature type $SignatureType, signtool " +
                 "$(if ($PolicyAccepted) { 'accepted it' } else { 'refused it' })): $StatusMessage"
             )
+        }
+    }
+
+    # A trusted signature from somebody else is still somebody else's. Compared by parts, because
+    # the same name can be written several ways.
+    $actualParts = Get-SubjectParts -Subject $Subject
+    $expectedParts = Get-SubjectParts -Subject $ExpectedSubject
+    if ($expectedParts.Count -eq 0) {
+        $refusals += [pscustomobject]@{
+            Reason = 'wrong-publisher'
+            Detail = 'this run named no expected publisher, so no signature can be held to one'
+        }
+    } elseif (($actualParts -join '|') -ne ($expectedParts -join '|')) {
+        $refusals += [pscustomobject]@{
+            Reason = 'wrong-publisher'
+            Detail = "it was signed by [$Subject] and this release signs as [$ExpectedSubject]"
         }
     }
 
@@ -121,7 +168,7 @@ function Resolve-SignTool {
     ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
 
     foreach ($root in $roots) {
-        $found = Get-ChildItem -LiteralPath $root -Filter 'signtool.exe' -Recurse -File -ErrorAction Ignore |
+        $found = Get-ChildItem -LiteralPath $root -Filter 'signtool.exe' -Recurse -File -Force -ErrorAction Ignore |
             Where-Object { $_.FullName -match '\\x64\\' } |
             Sort-Object -Property FullName -Descending |
             Select-Object -First 1
@@ -137,6 +184,23 @@ function Resolve-SignTool {
     )
 }
 
+# The certificates the signature was verified against, root first. This is what a key record needs
+# and what nobody should be copying out of a document: it comes from the release that produced the
+# artefact.
+function Get-ChainSubjects {
+    param([Parameter(Mandatory)] $Certificate)
+
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        [void]$chain.Build($Certificate)
+        $elements = @($chain.ChainElements | ForEach-Object { $_.Certificate.Subject })
+        [array]::Reverse($elements)
+        return ($elements -join ' -> ')
+    } finally {
+        $chain.Dispose()
+    }
+}
+
 if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
     Write-Host "REFUSED: $Path is not a directory, so there is nothing to verify."
     exit 1
@@ -147,9 +211,11 @@ $signtool = Resolve-SignTool -Preferred $SignToolPath
 
 Write-Host "Verifying every artefact under $root"
 Write-Host "signtool: $signtool"
+Write-Host "expected publisher: $ExpectedSubject"
 Write-Host ''
 
-$artefacts = @(Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object -Property FullName)
+# -Force, so a hidden file is verified rather than skipped.
+$artefacts = @(Get-ChildItem -LiteralPath $root -File -Recurse -Force | Sort-Object -Property FullName)
 
 # A run that built nothing must not read as a run that verified everything it built.
 if ($artefacts.Count -eq 0) {
@@ -173,13 +239,16 @@ foreach ($artefact in $artefacts) {
 
     $signature = Get-AuthenticodeSignature -LiteralPath $artefact.FullName
     $timestamp = $signature.TimeStamperCertificate
+    $signer = $signature.SignerCertificate
 
     $refusals = Get-SignatureRefusal `
         -Status ([string]$signature.Status) `
         -StatusMessage ([string]$signature.StatusMessage) `
         -SignatureType ([string]$signature.SignatureType) `
         -PolicyAccepted $policyAccepted `
-        -HasTimestamp ($null -ne $timestamp)
+        -HasTimestamp ($null -ne $timestamp) `
+        -Subject $(if ($signer) { $signer.Subject } else { '' }) `
+        -ExpectedSubject $ExpectedSubject
 
     if ($refusals.Count -gt 0) {
         foreach ($refusal in $refusals) {
@@ -192,10 +261,11 @@ foreach ($artefact in $artefacts) {
     $accepted += [pscustomobject]@{
         Path        = $relative
         Sha256      = (Get-FileHash -LiteralPath $artefact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        Signer      = $signature.SignerCertificate.Subject
-        Thumbprint  = $signature.SignerCertificate.Thumbprint
-        NotAfter    = $signature.SignerCertificate.NotAfter.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Signer      = $signer.Subject
+        Thumbprint  = $signer.Thumbprint
+        NotAfter    = $signer.NotAfter.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         TimestampBy = $timestamp.Subject
+        Chain       = (Get-ChainSubjects -Certificate $signer)
     }
 
     Write-Host "ACCEPTED $relative"
@@ -219,19 +289,23 @@ if ($Receipt) {
     $lines = @(
         '# The Windows artefacts this release signed, and what each signature is.',
         '#',
-        '# Every artefact below carries an Authenticode signature that the default policy accepts',
-        '# and an RFC 3161 timestamp, checked on the machine that built it before anything was',
-        '# published. Verify a downloaded copy for yourself with:',
+        '# Every artefact below carries an Authenticode signature that the default policy accepts,',
+        '# made by the publisher this release signs as, and an RFC 3161 timestamp. All of that was',
+        '# checked on the machine that built it, before anything was published. Check a downloaded',
+        '# copy for yourself with:',
         '#',
         '#     Get-AuthenticodeSignature .\kr.exe | Format-List',
         '#     signtool verify /pa /v .\kr.exe',
         '#',
-        "# sha256  path  signer  thumbprint  certificate expires  timestamped by"
+        "# expected publisher: $ExpectedSubject",
+        '#',
+        '# sha256  path  signer  thumbprint  certificate expires  timestamped by  chain from the root'
     )
     foreach ($entry in $accepted) {
         $lines += (
-            '{0}  {1}  {2}  {3}  {4}  {5}' -f
-            $entry.Sha256, $entry.Path, $entry.Signer, $entry.Thumbprint, $entry.NotAfter, $entry.TimestampBy
+            '{0}  {1}  {2}  {3}  {4}  {5}  {6}' -f
+            $entry.Sha256, $entry.Path, $entry.Signer, $entry.Thumbprint, $entry.NotAfter,
+            $entry.TimestampBy, $entry.Chain
         )
     }
 
