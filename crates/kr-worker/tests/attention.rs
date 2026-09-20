@@ -103,8 +103,10 @@ async fn host() -> Host {
         dimensions: Dimensions::new(80, 24),
         journal_path: Some(journal_path.clone()),
         spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
