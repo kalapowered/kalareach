@@ -448,6 +448,26 @@ export type EventStream = 'session_state' | 'output' | 'attachments' | 'input_le
 export type HistoryGapCause =
   'retention' | 'host_capacity' | 'session_capacity' | 'spool_unavailable' | 'archive_incomplete'
 /**
+ * What the payload of a `signed_authority_object` envelope decodes as.
+ *
+ * Section 20 signs an authorisation-bearing payload **before** encryption, so pairwise message
+ * authentication can never substitute for an issuer's grant signature. The set is closed, and it
+ * is closed on one property: every member carries its issuer's key identifier and a signature
+ * over a domain-separated transcript of its own fields. A payload outside it carries no authority
+ * a reader could check, so the mailbox does not forward it as authority.
+ *
+ * Nothing here is authority by arriving. [`Self::issuer_key_id`] names the key the signature must
+ * verify under, and a reader resolves that name through the authority it already holds: section
+ * 19 makes content data, and the envelope supplies no key of its own.
+ */
+export type ForwardedAuthority =
+  | {
+      revocation_request: RevocationRequest
+    }
+  | {
+      authority_revision: AuthorityRevisionRecord
+    }
+/**
  * An upstream approval request identifier. Opaque to KalaReach.
  */
 export type ApprovalRequestId = string
@@ -1290,6 +1310,7 @@ export interface KalaReachProtocol {
   expiration_tombstone?: ExpirationTombstone
   fence_evidence?: FenceEvidence
   fenced_action?: FencedAction
+  forwarded_authority?: ForwardedAuthority
   forwarded_mutation?: ForwardedMutation
   forwarded_request?: ForwardedRequest
   generation_accepted?: GenerationAccepted
@@ -7695,6 +7716,58 @@ export interface BootIdentity5 {
   value: string
 }
 /**
+ * A remote owner's signed revocation request.
+ *
+ * A device cannot assign a higher host revision to its own request: the record carries no host
+ * revision, because only the target host issues ordered authority revisions.
+ */
+export interface RevocationRequest {
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * The key identifier of the issuer's authorisation key.
+   */
+  issuer_key_id: string
+  /**
+   * One signed revocation request published by a remote owner.
+   */
+  request_id: string
+  /**
+   * The Ed25519 signature over `CBOR(["kr-revocation/1", request without this field])`.
+   */
+  signature: string
+  /**
+   * What it revokes.
+   */
+  target:
+    | {
+        grants: {
+          /**
+           * The grants to revoke.
+           */
+          grant_ids: GrantId[]
+        }
+      }
+    | {
+        devices: {
+          /**
+           * The devices to revoke.
+           */
+          device_ids: DeviceId[]
+        }
+      }
+}
+/**
  * A stored backup checkpoint a pairing transfers.
  *
  * A fresh client needs a trusted latest-generation checkpoint to detect a service replaying an
@@ -14043,58 +14116,6 @@ export interface WorkerBarrier {
    * What this worker's barrier has reached.
    */
   state: 'acknowledged' | 'ended' | 'pending'
-}
-/**
- * A remote owner's signed revocation request.
- *
- * A device cannot assign a higher host revision to its own request: the record carries no host
- * revision, because only the target host issues ordered authority revisions.
- */
-export interface RevocationRequest {
-  /**
-   * One paired device.
-   */
-  host_device_id: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  issued_at_ms: string
-  /**
-   * One paired device.
-   */
-  issuer_device_id: string
-  /**
-   * The key identifier of the issuer's authorisation key.
-   */
-  issuer_key_id: string
-  /**
-   * One signed revocation request published by a remote owner.
-   */
-  request_id: string
-  /**
-   * The Ed25519 signature over `CBOR(["kr-revocation/1", request without this field])`.
-   */
-  signature: string
-  /**
-   * What it revokes.
-   */
-  target:
-    | {
-        grants: {
-          /**
-           * The grants to revoke.
-           */
-          grant_ids: GrantId[]
-        }
-      }
-    | {
-        devices: {
-          /**
-           * The devices to revoke.
-           */
-          device_ids: DeviceId[]
-        }
-      }
 }
 /**
  * The result of `grant.revoke` and `device.revoke`.

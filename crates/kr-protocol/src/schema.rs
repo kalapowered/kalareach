@@ -62,7 +62,7 @@ use crate::input::{
 use crate::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalHello, LocalHelloAck,
 };
-use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
+use crate::mailbox::{EnvelopePlaintext, ForwardedAuthority, SealedEnvelope};
 use crate::method::{Method, REGISTRY};
 use crate::pairing::{
     AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
@@ -241,6 +241,7 @@ pub fn protocol_schema() -> Value {
         "events_snapshot_result" => EventsSnapshotResult,
         "events_subscribe_params" => EventsSubscribeParams,
         "events_subscribe_result" => EventsSubscribeResult,
+        "forwarded_authority" => ForwardedAuthority,
         "forwarded_mutation" => ForwardedMutation,
         "forwarded_request" => ForwardedRequest,
         "generation_accepted" => GenerationAccepted,

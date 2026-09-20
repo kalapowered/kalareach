@@ -8233,6 +8233,37 @@
       ],
       "type": "object"
     },
+    "ForwardedAuthority": {
+      "description": "What the payload of a `signed_authority_object` envelope decodes as.\n\nSection 20 signs an authorisation-bearing payload **before** encryption, so pairwise message\nauthentication can never substitute for an issuer's grant signature. The set is closed, and it\nis closed on one property: every member carries its issuer's key identifier and a signature\nover a domain-separated transcript of its own fields. A payload outside it carries no authority\na reader could check, so the mailbox does not forward it as authority.\n\nNothing here is authority by arriving. [`Self::issuer_key_id`] names the key the signature must\nverify under, and a reader resolves that name through the authority it already holds: section\n19 makes content data, and the envelope supplies no key of its own.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A remote owner's signed revocation request.",
+          "properties": {
+            "revocation_request": {
+              "$ref": "#/$defs/RevocationRequest"
+            }
+          },
+          "required": [
+            "revocation_request"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One ordered authority revision a host issued.",
+          "properties": {
+            "authority_revision": {
+              "$ref": "#/$defs/AuthorityRevisionRecord"
+            }
+          },
+          "required": [
+            "authority_revision"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ForwardedMutation": {
       "additionalProperties": false,
       "description": "A mutation the host admitted for a caller, passed to the component that owns its subject.\n\nThe control daemon owns admission: it authenticates the caller, stamps the freshness window,\nchecks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding\ncarries the caller's mutation to the worker **unchanged**, because the mutation is what the\npayload digest covers and what the caller will retry with: rewriting any of it would give the\nworker a different action from the one the caller asked for.\n\nWhat travels beside it is what the worker cannot establish for itself: which principal the host\nverified, the rights the grant it was checked against carries, and the deadline the host\naccepted. The worker performs the action under all three.",
@@ -24483,6 +24514,9 @@
     },
     "fenced_action": {
       "$ref": "#/$defs/FencedAction"
+    },
+    "forwarded_authority": {
+      "$ref": "#/$defs/ForwardedAuthority"
     },
     "forwarded_mutation": {
       "$ref": "#/$defs/ForwardedMutation"
