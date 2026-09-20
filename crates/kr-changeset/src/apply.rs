@@ -1935,16 +1935,15 @@ fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool 
     !staged.carries_access_control()
 }
 
+/// Returns a second authority over one working tree, confined to the tree's own mount.
+///
+/// Everything this module reaches through the returned authority is content of the tree it named:
+/// what it reads back to decide whether a destination still holds what the request expects, and
+/// what it writes. A mount arriving over a directory of that path names another tree entirely, and
+/// a read through it would answer about a file this request never named. So the descent carries
+/// the same rule the capture's reads do.
 fn clone_handle(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
-    let handle = directory
-        .handle()
-        .try_clone()
-        .map_err(ChangeSetError::storage)?;
-    Ok(AuthorisedDirectory::from_handle(
-        directory.environment_id(),
-        handle,
-        directory.display_path().to_path_buf(),
-    )?)
+    Ok(directory.try_clone()?.confined_to_one_mount()?)
 }
 
 /// Captures the destination as it stands, so there is a recoverable version of it.

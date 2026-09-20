@@ -59,10 +59,11 @@
 //!   authorised, and nothing here prevents that. Where immutability matters, as it does for a
 //!   download, the host stages its own copy instead of trusting an open handle.
 //! * A directory moved out of the authorised tree *while* a name is being resolved through it is
-//!   still descended into, because the handle is what the descent holds and a handle keeps its
-//!   object wherever the name goes. That is the same rule the rest of this module is built on: the
-//!   grant follows the object, not the name. What it is not is an escape to somewhere a caller
-//!   never named, and it is the price of the leaf being the thing the descent checked.
+//!   still descended into, and so is everything under it: the handle is what the descent holds,
+//!   and a handle keeps its object wherever the name goes. Nothing re-establishes that such a
+//!   directory is still beneath the root. That is the same rule the rest of this module is built
+//!   on — the grant follows the object, not the name — and it is the price of the leaf being the
+//!   thing the descent checked rather than whatever the name reaches next.
 //! * A regular file with a **second hard link** is an alias this module does not decide. A
 //!   confined authority compares the mount of every directory it descends through and of the file
 //!   a read returns, so a directory or a file mounted into the tree is refused; a second name in

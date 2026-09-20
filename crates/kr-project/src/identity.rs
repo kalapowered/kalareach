@@ -455,6 +455,11 @@ mod tests {
             .output()
             .expect("git runs");
         assert!(made.status.success(), "the repository is made");
+        std::fs::write(
+            checkout.join(".git/kr-witness"),
+            b"the object that was opened\n",
+        )
+        .expect("a file only the real directory holds");
         let opened = OpenedRepository::open(&profile, environment_id, &checkout)
             .expect("the repository opens");
         let recorded = opened.identity().git_dir;
@@ -469,22 +474,33 @@ mod tests {
             .expect("the administrative directory is moved away");
         std::fs::create_dir(checkout.join(".git")).expect("something else takes the name");
 
-        assert_eq!(
-            opened.git_dir().identity(),
-            recorded,
-            "and it is still on that object, not on what took the name"
-        );
+        // Asked of the handle rather than of anything it remembered: what it reads is what the
+        // object it opened holds, and the name reaches none of it.
+        let witness = kr_transfer::RelativeName::parse("kr-witness").expect("a name");
+        let mut held = opened
+            .git_dir()
+            .open_read(&witness, kr_transfer::ObjectPolicy::ReadableFile)
+            .expect("the handle still reaches what it opened");
+        let mut said = String::new();
+        std::io::Read::read_to_string(held.handle_mut(), &mut said).expect("it reads");
+        assert_eq!(said, "the object that was opened\n");
         assert_eq!(
             opened.own_dir().identity(),
             recorded,
             "an ordinary repository keeps its own data in the one place, and that is this object"
         );
+        let taken = AuthorisedDirectory::open_root(environment_id, &checkout.join(".git"))
+            .expect("the name opens");
         assert_ne!(
             opened.git_dir().identity(),
-            AuthorisedDirectory::open_root(environment_id, &checkout.join(".git"))
-                .expect("the name opens")
-                .identity(),
+            taken.identity(),
             "which is a different object from the one the path reaches now"
+        );
+        assert!(
+            taken
+                .open_read(&witness, kr_transfer::ObjectPolicy::ReadableFile)
+                .is_err(),
+            "and what took the name holds none of it"
         );
     }
 

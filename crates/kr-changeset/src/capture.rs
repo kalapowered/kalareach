@@ -1222,20 +1222,35 @@ fn nested_repositories(
         return Err(unplaceable("this working tree"));
     }
     refused.insert((reported.device, reported.file_id));
-    for handle in [repository.git_dir(), repository.own_dir()] {
-        // **The handle this repository's identity was read through**, not the path it was read
-        // from. A path resolved a second time can reach a different object: something mounted over
-        // the administrative directory while this ran would be the thing this scan accounted for,
-        // and the data it covered would go unexamined. The handle cannot be covered.
-        //
+    // **The handle this repository's identity was read through**, not the path it was read from. A
+    // path resolved a second time can reach a different object: something mounted over the
+    // administrative directory while this ran would be the thing this scan accounted for, and the
+    // data it covered would go unexamined. The handle cannot be covered, and this one's object is
+    // what the recorded identity names, so an open that reached anything else refused before this
+    // capture began.
+    let common = repository
+        .git_dir()
+        .try_clone()
+        .and_then(AuthorisedDirectory::confined_to_one_mount)
+        .map_err(|_| unplaceable("this repository's own data"))?;
+    // And this worktree's own directory, when that is a different object. Nothing records it, so
+    // the reported one is used only when this host can reach the same object through a handle it
+    // has already established.
+    let own = if identity_of(repository.own_dir()) == identity_of(&common) {
+        None
+    } else {
+        Some(private_directory(
+            tree,
+            &common,
+            repository.own_dir(),
+            &mut budget,
+        )?)
+    };
+    for held in std::iter::once(&common).chain(own.iter()) {
         // Outside this working tree or inside it, the object is the object, and it goes in
         // unconditionally: what decides anything later is whether a directory this capture opens
         // **is** it, and holding one that nothing reaches costs nothing.
-        let held = handle
-            .try_clone()
-            .and_then(AuthorisedDirectory::confined_to_one_mount)
-            .map_err(|_| unplaceable("this repository's own data"))?;
-        let identity = identity_of(&held);
+        let identity = identity_of(held);
         if identity == here {
             return Err(unplaceable("this working tree"));
         }
@@ -1250,7 +1265,7 @@ fn nested_repositories(
         // the working tree: a repository can keep its data on another filesystem altogether, and
         // an ordinary directory of that data is then on neither the tree's mount nor anything
         // near it. What this refuses is a mount **inside** the administrative tree.
-        administrative_descendants(&held, &mut refused, &mut inspected, &mut budget, 0)?;
+        administrative_descendants(held, &mut refused, &mut inspected, &mut budget, 0)?;
     }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
@@ -1319,6 +1334,89 @@ fn nested_repositories(
         }
     }
     Ok(found)
+}
+
+/// Returns this working tree's **own** administrative directory, reached through a handle this
+/// host has already established, and refuses the capture when it cannot reach it that way.
+///
+/// The common directory needs none of this: it is the object this repository's recorded identity
+/// names, and an open that reached anything else refused before a capture began. Nothing records
+/// this worktree's own directory, and Git reports it as a path. A directory mounted over that path
+/// between Git's answer and this host's open would then be the object a scan accounted for, while
+/// the data it covered went unexamined and its files were captured as ordinary content.
+///
+/// So the reported object is accepted only when the same object is reachable another way: through
+/// the working tree's own `.git`, which is where a repository that keeps its own directory inside
+/// its tree keeps it, or among the directories the recorded common directory keeps for its linked
+/// worktrees. Each of those descents carries the mount comparison, so a directory covered by a
+/// mount is refused rather than followed, and the handle this returns is the one that was reached
+/// rather than the one that was reported.
+fn private_directory(
+    tree: &AuthorisedDirectory,
+    common: &AuthorisedDirectory,
+    reported: &AuthorisedDirectory,
+    budget: &mut usize,
+) -> Result<AuthorisedDirectory> {
+    let wanted = identity_of(reported);
+    let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
+    match tree.probe(&administrative) {
+        // It is inside the tree, under the name every repository uses.
+        Ok(kr_transfer::authority::ObjectKind::Directory) => {
+            if let Ok(held) = open_beneath(tree, &administrative, ".git")?
+                && identity_of(&held) == wanted
+            {
+                return Ok(held);
+            }
+        }
+        // Or named by the file that stands in for it, descended one component at a time from the
+        // tree. A target this host cannot follow from here, an absolute one among them, is not the
+        // end of it: the directory may still be one the common directory keeps.
+        Ok(kr_transfer::authority::ObjectKind::File) => {
+            let from = vec![clone_of(tree)?];
+            if let Ok(Some(stack)) = resolve_target(from, ".git", tree, &administrative)
+                && let Some(last) = stack.last()
+                && identity_of(last) == wanted
+            {
+                return clone_of(last);
+            }
+        }
+        _ => {}
+    }
+    let worktrees = RelativeName::parse("worktrees")?;
+    if matches!(
+        common.probe(&worktrees),
+        Ok(kr_transfer::authority::ObjectKind::Directory)
+    ) && let Ok(held) = open_beneath(common, &worktrees, "worktrees")?
+    {
+        let entries = held
+            .handle()
+            .entries()
+            .map_err(|_| unplaceable("this repository's own data"))?;
+        for entry in entries {
+            let entry = entry.map_err(|_| unplaceable("this repository's own data"))?;
+            *budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| ChangeSetError::QuotaExceeded {
+                    detail: format!(
+                        "this repository keeps more than {MAX_WALK_ENTRIES} worktree directories, \
+                         which is more than this host reads to find its own"
+                    )
+                    .into(),
+                })?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(name) = RelativeName::parse(&name) else {
+                continue;
+            };
+            if let Ok(each) = open_beneath(&held, &name, "worktrees")?
+                && identity_of(&each) == wanted
+            {
+                return Ok(each);
+            }
+        }
+    }
+    Err(unplaceable("this repository's own data"))
 }
 
 /// Adds the identity of every directory beneath one administrative directory, and refuses a

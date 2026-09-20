@@ -1267,20 +1267,9 @@ fn both_administrative_directories_a_repository_reports_are_excluded() {
         None,
         None,
     );
-    let record = match outcome {
-        Ok(record) => record,
-        // A shape this host will not read at all is a refusal rather than an exposure, and it
-        // says which shape.
-        Err(refusal) => {
-            assert!(
-                refusal.to_string().contains("could not reach")
-                    || refusal.to_string().contains("nested at")
-                    || refusal.to_string().contains("own data"),
-                "a refusal says which shape it would not read: {refusal}"
-            );
-            return;
-        }
-    };
+    // This layout is read, not refused: the directory named by the tree's own `.git` is reached
+    // through the tree's handle, which is what makes the reported one trustworthy enough to scan.
+    let record = outcome.expect("a repository whose two directories are apart is captured");
     let manifest = fixture
         .service()
         .manifest(record.change_set_id, record.version)
@@ -1819,7 +1808,9 @@ fn a_file_mounted_inside_administrative_data() {
         .expect_err("a repository whose own data holds a mounted file is not captured around");
     let said = failure.to_string();
     assert!(
-        said.contains("cannot account for") && said.contains("holds a mount at"),
+        said.contains("cannot account for")
+            && said.contains("holds a mount at")
+            && said.contains("main"),
         "the refusal names the mounted file it found: {failure}"
     );
 }
