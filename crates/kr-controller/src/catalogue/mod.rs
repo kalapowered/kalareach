@@ -236,6 +236,29 @@ pub struct CatalogueModule {
     environment_id: EnvironmentId,
 }
 
+/// Carries an admission refusal into the catalogue's own vocabulary, keeping its class.
+///
+/// What the daemon decided is what the caller needs to act on. A withdrawn registration, an
+/// expired window and a storage failure are three different answers, and an adapter that called
+/// all of them "permission denied" would tell somebody to ask for authority when the disk is what
+/// failed.
+fn admission_refusal(error: ProtocolError) -> CatalogueError {
+    match error.code {
+        ErrorCode::StorageUnavailable => CatalogueError::StorageUnavailable {
+            detail: error.message,
+        },
+        ErrorCode::ResourceUnavailable => CatalogueError::NotFound {
+            detail: error.message,
+        },
+        ErrorCode::InvalidArgument => CatalogueError::InvalidArgument {
+            detail: error.message,
+        },
+        _ => CatalogueError::PermissionDenied {
+            detail: error.message,
+        },
+    }
+}
+
 impl CatalogueModule {
     /// Opens the environment's catalogue.
     ///
@@ -563,8 +586,7 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: &(impl Fn() -> Answer<()> + Send + Sync),
     ) -> Answer<ParamsValue> {
-        let mut admit =
-            || admission().map_err(|e| CatalogueError::PermissionDenied { detail: e.message });
+        let mut admit = || admission().map_err(admission_refusal);
         match method {
             Method::CatalogueAdd => {
                 let params: wire::CatalogueAddParams = typed(&mutation.params)?;

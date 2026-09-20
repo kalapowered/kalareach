@@ -185,18 +185,17 @@ impl VerifiedGeneration {
         let target = TargetName::new(name).map_err(|source| CatalogueError::InvalidArgument {
             detail: format!("{name} is not a target name: {source}"),
         })?;
-        // A target the metadata pins and the repository cannot supply is an absence, not a
-        // failure of trust: the signature over the name is fine and the bytes are not there.
+        // A target the metadata pins and the repository cannot supply is an absence, not a failure
+        // of trust: the signature over the name is fine and the bytes are not there. That is the
+        // `None` below. An error is something else, and it keeps the class it had: a datastore
+        // this host cannot read is a storage failure, a hash that does not match is an integrity
+        // failure, and reporting either as "offline" would tell somebody to check their network
+        // about a disk or about a repository that answered and lied.
         let stream = self
             .repository
             .read_target(&target)
             .await
-            .map_err(|source| match source {
-                tough::error::Error::ExpiredMetadata { .. } => classify(&source),
-                other => CatalogueError::UnavailableOffline {
-                    detail: format!("{name} is not cached here and could not be read: {other}"),
-                },
-            })?
+            .map_err(|source| classify(&source))?
             .ok_or_else(|| CatalogueError::UnavailableOffline {
                 detail: format!("the repository does not carry {name}"),
             })?;

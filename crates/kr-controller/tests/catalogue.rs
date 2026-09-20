@@ -1080,6 +1080,51 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
     assert!(listed.plugins.is_empty());
 }
 
+/// An admission refusal reaches the caller as the class the daemon decided.
+///
+/// A withdrawn registration and a storage failure are different answers, and the adapter between
+/// the daemon's admission and the catalogue's own vocabulary must not flatten them: somebody told
+/// to ask for authority when the disk is what failed will do the wrong thing about it.
+#[tokio::test]
+async fn an_admission_refusal_keeps_the_class_the_daemon_decided() {
+    let host = host();
+    let actor = ActorId::new("kr:actor:test").expect("a valid actor");
+
+    for (code, expected) in [
+        (ErrorCode::StorageUnavailable, ErrorCode::StorageUnavailable),
+        (ErrorCode::PermissionDenied, ErrorCode::PermissionDenied),
+    ] {
+        let refused = refusal(
+            host.module
+                .write_frame(
+                    &actor,
+                    &mutation(
+                        Method::CatalogueSync,
+                        host.environment_id,
+                        &wire::CatalogueSyncParams {
+                            environment_id: host.environment_id,
+                            catalogue_id: "development".to_owned(),
+                        },
+                    ),
+                    Method::CatalogueSync,
+                    Some(host.confirmations()),
+                    || {
+                        Err(kr_protocol::error::ProtocolError::new(
+                            code,
+                            "the daemon's own answer",
+                        ))
+                    },
+                )
+                .await,
+        );
+        assert_eq!(refused.code, expected, "{refused:?}");
+        assert!(
+            refused.message.contains("the daemon's own answer"),
+            "the refusal carries what the daemon said: {refused:?}"
+        );
+    }
+}
+
 #[test]
 fn a_catalogue_mutation_names_an_environment_and_never_a_session() {
     let environment_id = EnvironmentId::new(kr_ipc::new_uuid());

@@ -155,10 +155,11 @@ it bound to and not against the bytes that arrived afterwards.
 A revoked release stops receiving new bindings immediately, and stops matching, so nothing new is
 ever offered it.
 
-An active binding is not torn down under a request that is already running. Each live binding on a
-revoked release is reported against that exact release, with the administrator's explicit disable
-policy beside it: keep serving, admit nothing new, or disable at the next admission. The report is
-what a host acts on at its next admission; a revocation changes nothing under a running request.
+An active binding is not torn down under a request that is already running: the process was
+qualified against the bytes it bound to. Each live binding on a revoked release is listed against
+that exact release, with the administrator's explicit disable policy beside it — keep serving, admit
+nothing new, or disable at the next admission — which is what the host decides that binding's next
+admission against. A revocation changes nothing under a request already running.
 
 ## Capabilities and qualification
 

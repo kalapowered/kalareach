@@ -526,7 +526,20 @@ the capabilities it is about; an install refuses a grant wider than the installa
 and says which method that decision belongs to.
 
 Removing a repository stops trusting its root and uninstalls nothing. A package installed from it is
-still installed, on the hash it was installed at, and the answer names what is still there.
+still installed, on the hash it was installed at, and the answer names what is still there. What it
+may do goes on being answered from what the installation recorded: the capabilities the package
+asked for and the ceiling of the repository it came from, both held with the installation, so
+enabling, pinning, granting and uninstalling it all work with no enrolment behind them. Enabling one
+whose payloads are no longer cached is refused as unavailable offline, because there is no longer a
+root to verify a fetch against.
+
+The registry admits a paired device to all thirteen of these methods, and the daemon serves them
+through the same module a local caller reaches, so a device's `catalogue.list` and the owner's are
+one answer. A catalogue and an installed package belong to the environment, so there is no worker to
+forward a mutation to and no session content to narrow: the grant's environment selector and
+`host.manage` are what admit them, the envelope check refuses a target naming a session or an
+application, and the effect runs on a task a dropped connection cannot cancel part way. The owner's
+confirmation is the same ceremony on both doors, and a device cannot stand in for it.
 
 `docs/plugins/catalogue.md` has the sync, the budgets, the extraction rules and what a signed
 qualification may not do.
