@@ -63,7 +63,7 @@ there instead.
 | `identity` | the handshake's declaration against the identity record the build wrote beside the binary: the executable, the editor ABI, the integration version, the upstream version, the patch set and the module tree |
 | `profile_order` | the markers the startup wrote, in the order the case declares |
 | `profile_once` | each marker exactly once, which is what "a PowerShell profile executes exactly once" means here |
-| `plugin_active` | the shell's own answer to "is this customisation loaded", and, where a case gives one, the customisation doing the thing it is for and the shell reading back what it did |
+| `plugin_active` | the shell's own answer to "is this customisation loaded", and, where a case gives one, the customisation doing the thing it is for and the shell reading back what it did. A case's `notes` say where that is the customisation's own operation rather than the hook that calls it |
 | `plugin_writes_buffer` | the customisation putting text in the reader's buffer that nobody typed: a remembered line accepted and then run, or a widget's own choice inserted by two keys that are not characters |
 | `plugin_buffer` | the reader reporting a line a customisation has drawn over as a line, and a cleared one as cleared |
 | `user_bindings` | the person's own key still running the person's own binding |

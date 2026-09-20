@@ -2138,27 +2138,35 @@ fn a_live_session_keeps_the_package_it_started_with() {
         .expect("an installation root on the internal disk");
     let shell = root.path().join("zsh");
     // Two builds, not two copies of one: this host keeps every identity it has built, so the one
-    // that is current and one built before it are two packages a person could really have.
-    let older = another_build(&installed);
+    // that is current and one built before it are two packages a person could really have. With
+    // only one build there is nothing to replace it with, and this says so rather than copying
+    // the same bytes twice and calling them two packages.
+    let Some(older) = another_build(&installed) else {
+        let reason = format!(
+            "this host holds one build of the {} package, so there is no second one to install \
+             over it; run scripts/build-shells.sh --{} --force",
+            ShellKind::Zsh.as_str(),
+            ShellKind::Zsh.as_str()
+        );
+        assert!(
+            std::env::var_os(shellpkg::REQUIRE).is_none(),
+            "{} is set and {reason}",
+            shellpkg::REQUIRE
+        );
+        println!("skipped: {reason}");
+        return;
+    };
     let before = copy_installation(&shell, &installed, "aaaaaaaaaaaaaaaa", "before");
-    let after = copy_installation(
-        &shell,
-        older.as_ref().unwrap_or(&installed),
-        "bbbbbbbbbbbbbbbb",
-        "after",
-    );
+    let after = copy_installation(&shell, &older, "bbbbbbbbbbbbbbbb", "after");
     assert_ne!(
         before.executable, after.executable,
         "the two installations share a binary, so neither could be told from the other"
     );
-    if let Some(older) = older.as_ref() {
-        assert_ne!(
-            std::fs::read(&before.executable).expect("a binary"),
-            std::fs::read(&after.executable).expect("a binary"),
-            "the two installations were built from the same inputs"
-        );
-        let _ = older;
-    }
+    assert_ne!(
+        std::fs::read(&before.executable).expect("a binary"),
+        std::fs::read(&after.executable).expect("a binary"),
+        "the two installations were built from the same inputs"
+    );
     std::fs::write(shell.join("current"), "aaaaaaaaaaaaaaaa").expect("the pointer");
     assert_eq!(resolved_executable(root.path()), before.executable);
 
@@ -2195,24 +2203,36 @@ fn a_live_session_keeps_the_package_it_started_with() {
         !session.terminal_output().contains("=after"),
         "the live session reported the installation that replaced it"
     );
-    // The shell itself says which binary it is running, and it is still the one it started.
-    assert!(
-        session.run(
-            "echo kr-running=$ZSH_ARGZERO",
-            &format!("kr-running={}", before.executable.display())
-        ),
-        "the live session is running another binary than the one it started; the terminal \
-         showed:\n{}",
-        session.terminal_output()
+    // What the operating system says this process is executing, rather than what it was invoked
+    // as: an invocation name can be anything, and the question is which image is running.
+    assert_eq!(
+        running_image(&mut session),
+        Some(before.executable.clone()),
+        "the live session is running another image than the one it started"
     );
     let (enter, fence) = session.fenced_after_a_command(30);
     assert_eq!(fence.prompt_generation, enter.prompt_generation);
     assert!(session.alive());
     drop(session);
 
-    // A session started now takes the installation the pointer names, which is the other one.
-    let second = CaseSetup::prepare(&case, &after, &index);
-    let mut next = Session::start_for(&after, &case, &second);
+    // A session started now takes the installation the pointer names, and the package it starts
+    // from is the product resolver's own answer rather than one this test chose.
+    let resolved = kr_shell_integration::host::package::PackageSet::discover(root.path())
+        .expect("the installation reads")
+        .get(ShellKind::Zsh)
+        .expect("the installation holds a Zsh package")
+        .executable();
+    assert_eq!(resolved, after.executable);
+    let chosen = Package {
+        kind: after.kind,
+        identity: after.identity.clone(),
+        executable: resolved,
+        startup_entry: after.startup_entry.clone(),
+        module_directory: after.module_directory.clone(),
+        record: after.record.clone(),
+    };
+    let second = CaseSetup::prepare(&case, &chosen, &index);
+    let mut next = Session::start_for(&chosen, &case, &second);
     next.first_prompt_within(STARTUP);
     settle(&mut next, Duration::from_millis(300), REPLY);
     assert!(

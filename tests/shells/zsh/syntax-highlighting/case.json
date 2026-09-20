@@ -4,6 +4,7 @@
   "stack": "zsh-syntax-highlighting",
   "title": "zsh-syntax-highlighting, which hooks the reader's own redrawing and loads after the integration",
   "supported": true,
+  "notes": "What the operation drives is the highlighter's own painter: it is given a line and what it produced is read back, so a plugin that is loaded and highlights nothing fails the case. That the reader calls the painter at every redraw is the plugin's own hook, which this corpus does not drive separately.",
   "requires": [
     "zsh-syntax-highlighting"
   ],

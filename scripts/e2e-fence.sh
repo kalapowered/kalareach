@@ -69,6 +69,14 @@ fail() {
   failed=1
 }
 
+require() {
+  if [ "$1" != "$2" ]; then
+    fail "$3 (expected $2, got $1)"
+  else
+    echo "  ok: $3"
+  fi
+}
+
 # The run's own root, on the internal disk, with the binaries beside it.
 # Short on purpose: a Unix socket address is 103 bytes on this platform, and the endpoint a case
 # binds is under a directory of its own beneath the temporary directory. A run root of the usual
@@ -217,8 +225,26 @@ if "$kr" new --invisible --shell-mode managed --shell "$managed_shell" --cwd "$r
   else
     fail "the session the daemon made reports shell_mode=$mode"
   fi
-  "$kr" status "$display" --json >"$artifacts/fence-status.json" 2>&1 || true
-  "$kr" close "$display" >/dev/null 2>&1 || true
+
+  # What the session says about itself, through the daemon that made it.
+  if "$kr" status "$display" --json >"$artifacts/fence-status.json" 2>&1; then
+    status_mode="$(read_json "$artifacts/fence-status.json" session.shell_mode)"
+    require "$status_mode" "managed" "the session reports the managed mode it was created in"
+  else
+    fail "the daemon could not report on the session it made"
+  fi
+
+  # The session is closed through the daemon, and the daemon is asked again: a session that did
+  # not go is a session this run left behind.
+  if ! "$kr" close "$display" >"$run_root/close.log" 2>&1; then
+    cat "$run_root/close.log"
+    fail "the daemon could not close the session it made"
+  fi
+  if "$kr" status "$display" --json >/dev/null 2>&1; then
+    fail "the session is still there after it was closed"
+  else
+    echo "  ok: the session closed and the daemon no longer has it"
+  fi
 else
   # A refusal that names another shell's record is a condition of this installation rather than of
   # the package this run qualified: a daemon that cannot read one shell's record refuses the whole
