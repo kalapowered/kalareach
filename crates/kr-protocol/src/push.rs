@@ -239,9 +239,12 @@ impl RegistrationToken {
                 "a registration token is at most 1024 bytes",
             ));
         }
-        if value.bytes().any(|byte| !(b'!'..=b'~').contains(&byte)) {
+        if value
+            .bytes()
+            .any(|byte| byte == b'"' || byte == b'\\' || !(b'!'..=b'~').contains(&byte))
+        {
             return Err(RegistrationTokenError(
-                "a registration token is printable ASCII without spaces",
+                "a registration token is printable ASCII without spaces, quotes or backslashes",
             ));
         }
         Ok(Self(value))
@@ -1420,6 +1423,8 @@ mod tests {
         assert!(RegistrationToken::new("fZ9k:APA91bExample").is_ok());
         assert!(RegistrationToken::new("").is_err());
         assert!(RegistrationToken::new("has a space").is_err());
+        assert!(RegistrationToken::new("has\"quote").is_err());
+        assert!(RegistrationToken::new("has\\backslash").is_err());
         assert!(RegistrationToken::new("\u{7f}").is_err());
         assert!(RegistrationToken::new("x".repeat(MAX_REGISTRATION_TOKEN_LEN + 1)).is_err());
     }

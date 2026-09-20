@@ -324,17 +324,11 @@ pub fn open_preview(
 /// How many bytes are reserved for the registration token the gateway will add.
 ///
 /// The host does not hold the token: the gateway binds it to the installation, and section 16
-/// keeps it there. So the measurement reserves the largest token the protocol admits. The check is
-/// therefore strictly stronger than the gateway's, and a payload that passes here passes there
-/// whatever token the destination turns out to have.
-///
-/// It is the token's own length, not its escaped length. A JSON string spends two bytes on a
-/// character that has to be escaped, so a maximum-length token made entirely of quotes would
-/// occupy twice this. Reserving that instead would leave no room for any preview at all inside
-/// 3,500 bytes, so the reserve stays at the unescaped maximum and the gap is recorded rather than
-/// hidden: a registration token a provider actually issues is a couple of hundred characters of
-/// base64url, an order of magnitude inside this, and closing the gap properly means the gateway
-/// declaring an escape-free alphabet for the field.
+/// keeps it there. The measurement reserves the unescaped maximum token size
+/// ([`MAX_REGISTRATION_TOKEN_LEN`], 1,024 bytes), documented with its escape-free alphabet:
+/// printable ASCII without spaces, quotes or backslashes. A token outside that alphabet is
+/// refused by the protocol before it can be stored, so the reserve is an exact upper bound on
+/// the token's JSON representation.
 pub const RESERVED_TOKEN_BYTES: usize = MAX_REGISTRATION_TOKEN_LEN;
 
 /// The longest time-to-live a notification's own expiry can produce, in seconds.
@@ -834,5 +828,16 @@ mod tests {
         let sealed = vec![0u8; sealed_length(bucket) as usize];
         assert_eq!(base64url(&sealed).len(), (sealed.len() * 4).div_ceil(3));
         assert_eq!(preview_granularity(1_800), 1_024);
+    }
+
+    #[test]
+    fn the_reserved_token_size_matches_unescaped_maximum_under_escape_free_alphabet() {
+        let max_token = "a".repeat(RESERVED_TOKEN_BYTES);
+        let escaped = serde_json::to_string(&max_token).expect("json string");
+        assert_eq!(
+            escaped.len(),
+            RESERVED_TOKEN_BYTES + 2,
+            "an escape-free token expands by exactly the two enclosing quotes"
+        );
     }
 }
