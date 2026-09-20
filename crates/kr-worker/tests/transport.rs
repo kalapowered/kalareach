@@ -2517,6 +2517,33 @@ async fn kr_req_11_32_an_owner_nothing_holds_any_longer_ends_its_connection() {
     drop(client);
 }
 
+/// KR-REQ-11.32: an owner dropped while a caller retains a dispatch closes its upstream sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_owner_drop_with_retained_dispatch_closes_upstream() {
+    let broker = broker();
+    let (owner, upstream, client, writes) = duplex_over_pipes(&broker, 1 << 20);
+    let driving = tokio::spawn(writes);
+    let dispatch = owner.dispatch().expect("dispatch is created");
+
+    assert!(!dispatch.is_closed());
+
+    // Dropping the owner shuts down the connection.
+    drop(owner);
+    tokio::time::timeout(std::time::Duration::from_secs(30), driving)
+        .await
+        .expect("the owner's own work finishes")
+        .expect("task is joined");
+
+    // An owner dropped while a caller retains a dispatch closes its upstream sender.
+    assert!(
+        dispatch.is_closed(),
+        "a retained dispatch upstream sender is closed after the owner has dropped"
+    );
+
+    drop(upstream);
+    drop(client);
+}
+
 /// KR-REQ-11.32 and KR-REQ-09: a write that does not finish ends the connection, and every frame
 /// behind it is reported as the unsent frame it is.
 ///

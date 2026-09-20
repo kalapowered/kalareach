@@ -219,14 +219,35 @@ impl std::fmt::Debug for Completion {
     }
 }
 
+/// One queued frame waiting to be written.
+///
+/// It holds its byte reservation and reporting channel. When dropped through destruction
+/// (e.g. if the queue receiver is dropped on cancellation or shutdown), it unconditionally
+/// refunds its byte reservation, delivers [`Delivery::Unsent`] to its reporter, and runs any
+/// completion work.
+struct QueuedFrame {
+    body: Vec<u8>,
+    queued: Arc<AtomicUsize>,
+    report: Option<tokio::sync::oneshot::Sender<Delivery>>,
+    after: Option<Completion>,
+}
+
+impl Drop for QueuedFrame {
+    fn drop(&mut self) {
+        if let Some(report) = self.report.take() {
+            self.queued.fetch_sub(self.body.len(), Ordering::Release);
+            let _ = report.send(Delivery::Unsent);
+            if let Some(after) = self.after.take() {
+                let _ = after.run(Delivery::Unsent);
+            }
+        }
+    }
+}
+
 /// One thing on its way to one end of a connection.
 enum Outbound {
     /// A frame to write.
-    Frame {
-        body: Vec<u8>,
-        report: tokio::sync::oneshot::Sender<Delivery>,
-        after: Option<Completion>,
-    },
+    Frame(QueuedFrame),
     /// The end of this end's admission.
     ///
     /// It travels in the queue rather than beside it, so the boundary is exact: everything queued
@@ -238,9 +259,9 @@ enum Outbound {
 impl std::fmt::Debug for Outbound {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Frame { body, .. } => formatter
+            Self::Frame(frame) => formatter
                 .debug_struct("Frame")
-                .field("bytes", &body.len())
+                .field("bytes", &frame.body.len())
                 .finish(),
             Self::Close => formatter.write_str("Close"),
         }
@@ -288,7 +309,12 @@ impl Sink {
         let framed = self.framing.encode(body);
         self.reserve(framed.len())?;
         let (report, receiver) = tokio::sync::oneshot::channel();
-        let length = framed.len();
+        let frame = QueuedFrame {
+            body: framed,
+            queued: Arc::clone(&self.queued),
+            report: Some(report),
+            after,
+        };
         // The refused frame comes back out of the lock rather than being dropped inside it.
         // Dropping it runs the work that waited on it, and that work may close this very end; a
         // drop under the guard would be this thread waiting for itself.
@@ -296,38 +322,30 @@ impl Sink {
             let closed = self.admitting();
             if *closed {
                 Some((
-                    Outbound::Frame {
-                        body: framed,
-                        report,
-                        after,
-                    },
+                    frame,
                     BrokerError::UpstreamUnavailable {
                         detail: "this connection has stopped taking frames".to_owned(),
                     },
                 ))
             } else {
-                match self.frames.send(Outbound::Frame {
-                    body: framed,
-                    report,
-                    after,
-                }) {
+                match self.frames.send(Outbound::Frame(frame)) {
                     Ok(()) => None,
-                    Err(tokio::sync::mpsc::error::SendError(outbound)) => Some((
-                        outbound,
+                    Err(tokio::sync::mpsc::error::SendError(Outbound::Frame(frame))) => Some((
+                        frame,
                         BrokerError::UpstreamUnavailable {
                             detail: "this connection is no longer being written".to_owned(),
                         },
                     )),
+                    Err(tokio::sync::mpsc::error::SendError(Outbound::Close)) => unreachable!(),
                 }
             }
         };
         match refused {
             None => Ok(Queued { report: receiver }),
-            Some((outbound, error)) => {
-                // Nothing was taken, so nothing is reserved. The work that waited on this frame
-                // runs now, outside the lock, for the unsent frame it is.
-                self.queued.fetch_sub(length, Ordering::Release);
-                drop(outbound);
+            Some((frame, error)) => {
+                // Drop the frame outside the lock: QueuedFrame::drop refunds the bytes,
+                // sends Delivery::Unsent, and runs Completion.
+                drop(frame);
                 Err(error)
             }
         }
@@ -489,10 +507,7 @@ where
         admission: Arc::clone(&admission),
         limit: MAX_QUEUED_BYTES,
     };
-    // The writer holds the admission and not a sink. Holding a sink would hold a sender, and a
-    // connection whose every sink had been dropped would leave a writer waiting for a frame that
-    // nothing could ever queue.
-    (sink, drain(writer, queue, queued, admission, failing, peer))
+    (sink, drain(writer, queue, admission, failing, peer))
 }
 
 /// How an end tells the owner it can no longer be used.
@@ -510,33 +525,73 @@ impl Stopping {
     }
 }
 
+/// An RAII guard for the writer loop, ensuring that queue cleanup, byte refunds,
+/// admission closure, and peer closing run unconditionally on normal exit, break, unwind, or cancellation.
+struct DrainGuard {
+    queue: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+    admission: Arc<std::sync::Mutex<bool>>,
+    failing: Stopping,
+    peer: Peer,
+}
+
+impl DrainGuard {
+    fn close(&self) {
+        *self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.failing.stop();
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        // 1. Close admission first so no more frames are accepted into this end.
+        self.close();
+
+        // 2. Whatever is left in the queue: none of them went, each one's sender is told so,
+        // and the bytes they reserved are given back.
+        // Importantly, this happens BEFORE closing the peer so that any callbacks (e.g. telling
+        // the client that a forwarded request could not be carried) can queue their refusal
+        // frames to the client before the client end is closed.
+        while let Ok(outbound) = self.queue.try_recv() {
+            drop(outbound);
+        }
+
+        // 3. This end is finished, so the other one is too. It is closed AFTER everything
+        // this writer was holding has been reported.
+        self.peer.close();
+    }
+}
+
 /// Writes one end's frames, one at a time, and says what happened to each.
 async fn drain<W: AsyncWrite + Unpin>(
     mut writer: W,
-    mut queue: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
-    queued: Arc<AtomicUsize>,
+    queue: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
     admission: Arc<std::sync::Mutex<bool>>,
     failing: Stopping,
     peer: Peer,
 ) {
-    while let Some(outbound) = queue.recv().await {
-        let Outbound::Frame {
-            body,
-            report,
-            after,
-        } = outbound
-        else {
+    let mut guard = DrainGuard {
+        queue,
+        admission,
+        failing,
+        peer,
+    };
+    while let Some(outbound) = guard.queue.recv().await {
+        let Outbound::Frame(mut frame) = outbound else {
             // Admission closed, and everything that was queued before it has been written.
             break;
         };
         // The frame in flight is held by a guard, so the bytes it reserved are released and its
         // own work runs whether this writer finishes the frame, is dropped mid-frame, or unwinds
         // through a panic in some earlier frame's work.
+        let body = std::mem::take(&mut frame.body);
         let mut flight = InFlight {
             length: body.len(),
-            queued: Arc::clone(&queued),
-            report: Some(report),
-            after,
+            queued: Arc::clone(&frame.queued),
+            report: frame.report.take(),
+            after: frame.after.take(),
             progress: Arc::new(AtomicUsize::new(0)),
             ran: Ran::Finished,
         };
@@ -550,35 +605,10 @@ async fn drain<W: AsyncWrite + Unpin>(
             // rather than every later frame being lost quietly.
             // Closing under the same lock a caller admits under is what makes the queue final: no
             // frame can be taken after this point, so what is in it now is all there will be.
-            *admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-            failing.stop();
+            guard.close();
             break;
         }
     }
-    // Whatever is left: the frames behind a failed write, and any that were admitted before a
-    // close. None of them went, each one's sender is told so, and the bytes they reserved are
-    // given back.
-    while let Ok(outbound) = queue.try_recv() {
-        if let Outbound::Frame {
-            body,
-            report,
-            after,
-        } = outbound
-        {
-            queued.fetch_sub(body.len(), Ordering::Release);
-            let _ = report.send(Delivery::Unsent);
-            if let Some(after) = after {
-                let _ = after.run(Delivery::Unsent);
-            }
-        }
-    }
-    // This end is finished, so the other one is too: a connection with one writer left is one
-    // whose frames would be taken and never written. It is closed *after* everything this writer
-    // was holding has been reported, because that reporting is what tells the terminal about the
-    // requests that never went, and it writes those refusals to the other end.
-    peer.close();
 }
 
 /// One frame the writer is part way through, and everything owed for it.
@@ -1236,10 +1266,21 @@ impl Dispatch {
             })
         }))
     }
+
+    /// Returns true when this connection's upstream sender has been closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.upstream.is_closed()
+    }
 }
 
 impl UpstreamDispatch for Dispatch {
     fn admit(&self, request: &UpstreamRequest) -> Result<()> {
+        if self.upstream.is_closed() {
+            return Err(BrokerError::UpstreamUnavailable {
+                detail: "this connection has stopped taking frames".to_owned(),
+            });
+        }
         // An approval's answer is the frame the core prepared, which needs no method of this
         // table; everything else needs one, and the table has to name exactly one for it.
         if matches!(request.body, UpstreamBody::Approval { .. }) {
@@ -1249,6 +1290,11 @@ impl UpstreamDispatch for Dispatch {
     }
 
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
+        if self.upstream.is_closed() {
+            return Err(BrokerError::UpstreamUnavailable {
+                detail: "this connection has stopped taking frames".to_owned(),
+            });
+        }
         if matches!(request.body, UpstreamBody::Approval { .. }) {
             return self.answer(request);
         }
@@ -2031,6 +2077,12 @@ impl Duplex {
     }
 }
 
+impl Drop for Duplex {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// One frame the native client sent that is a request or a notification of its own.
 #[derive(Debug)]
 struct ClientFrame {
@@ -2408,5 +2460,140 @@ mod tests {
         assert!(delivery.refusal().is_some(), "and that is not a success");
         drop(reader);
         driving.abort();
+    }
+
+    /// Cancellation of the writer loop unconditionally cleans up remaining queue bytes and closes peer.
+    #[tokio::test]
+    async fn cancellation_during_partial_write_cleans_up_queue_and_peer() {
+        let (writer, _reader) = tokio::io::duplex(8);
+        let peer_ends = Arc::new(std::sync::OnceLock::new());
+        let (other_sink, _other_writes) = sink(
+            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            tokio::io::duplex(64).0,
+            stopping(),
+            Peer::client(&peer_ends),
+        );
+        let ends_struct = Arc::new(Ends {
+            upstream: other_sink.clone(),
+            client: other_sink.clone(),
+        });
+        let _ = peer_ends.set(Arc::downgrade(&ends_struct));
+
+        let (sink, writes) = sink(
+            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            writer,
+            stopping(),
+            Peer::upstream(&peer_ends),
+        );
+        let driving = tokio::spawn(writes);
+
+        // First frame: 4096 bytes. Fills the 8-byte duplex pipe and blocks.
+        let q1 = sink.queue(&vec![b'a'; 4096]).expect("queued first");
+        // Second and third frames queued behind it.
+        let q2 = sink.queue(b"{\"id\":2}\n").expect("queued second");
+        let q3 = sink.queue(b"{\"id\":3}\n").expect("queued third");
+
+        assert!(sink.queued_bytes() > 0);
+
+        // Allow the writer task to start and begin partial write.
+        tokio::task::yield_now().await;
+
+        // Cancel the writer loop.
+        driving.abort();
+        let _ = driving.await;
+
+        // InFlight / QueuedFrame drop guarantees:
+        // 1) First frame resolves to Partial or Unsent.
+        let d1 = q1.delivered().await;
+        assert!(matches!(d1, Delivery::Partial | Delivery::Unsent));
+
+        // 2) Queued frames behind it resolve to Unsent.
+        assert_eq!(q2.delivered().await, Delivery::Unsent);
+        assert_eq!(q3.delivered().await, Delivery::Unsent);
+
+        // 3) Byte reservations are completely refunded.
+        assert_eq!(sink.queued_bytes(), 0);
+
+        // 4) Admission is closed on both ends.
+        assert!(sink.is_closed());
+        assert!(other_sink.is_closed());
+    }
+
+    struct BlockingFlushWriter {
+        written: usize,
+    }
+
+    impl tokio::io::AsyncWrite for BlockingFlushWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.written += buf.len();
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Cancellation during flush preserves partial delivery and refunds all queued bytes.
+    #[tokio::test]
+    async fn cancellation_during_flush_cleans_up_queue_and_peer() {
+        let writer = BlockingFlushWriter { written: 0 };
+        let peer_ends = Arc::new(std::sync::OnceLock::new());
+        let (other_sink, _other_writes) = sink(
+            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            tokio::io::duplex(64).0,
+            stopping(),
+            Peer::client(&peer_ends),
+        );
+        let ends_struct = Arc::new(Ends {
+            upstream: other_sink.clone(),
+            client: other_sink.clone(),
+        });
+        let _ = peer_ends.set(Arc::downgrade(&ends_struct));
+
+        let (sink, writes) = sink(
+            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            writer,
+            stopping(),
+            Peer::upstream(&peer_ends),
+        );
+        let driving = tokio::spawn(writes);
+
+        let q1 = sink.queue(b"{\"id\":1}\n").expect("queued first");
+        let q2 = sink.queue(b"{\"id\":2}\n").expect("queued second");
+
+        // Allow the writer task to write the first frame and enter poll_flush.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Cancel during flush.
+        driving.abort();
+        let _ = driving.await;
+
+        // The frame whose bytes were written but flush did not complete resolves to Partial.
+        assert_eq!(q1.delivered().await, Delivery::Partial);
+        // Frame queued behind it resolves to Unsent.
+        assert_eq!(q2.delivered().await, Delivery::Unsent);
+
+        // Byte reservations are completely refunded.
+        assert_eq!(sink.queued_bytes(), 0);
+
+        // Both ends are closed.
+        assert!(sink.is_closed());
+        assert!(other_sink.is_closed());
     }
 }
