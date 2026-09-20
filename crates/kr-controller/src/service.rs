@@ -3278,8 +3278,8 @@ impl Controller {
         // to agree. A revocation of somebody else's device advances the revision and leaves every
         // surviving registration stamped with the new one, so a door that read the revision after
         // a retained lookup, a lock or a task being scheduled would admit a mutation under an
-        // authority the other door refuses the same mutation under. Only the project path uses it;
-        // every other effect still reads it where its own transaction does.
+        // authority the other door refuses the same mutation under. The project and change-set
+        // paths use it; every other effect still reads it where its own transaction does.
         let admitted = self.admitted_revision(connection_id).ok();
         let mut retained = self
             .retained(actor_id, &mutation, method, connection_id)

@@ -1772,17 +1772,23 @@ fn install(
     // whole of what this fixture reproduces, and cleaning up here would hide it.
     if !matches!(outcome, Ok(Installed::Written(_))) && !stopped_here {
         // The temporary this host made goes away — **that object**, not that name. A file somebody
-        // put at the name after this host created its own is a file this host leaves alone.
+        // put at the name after this host created its own is a file this host leaves alone. The
+        // handle stays open across the removal, so the object cannot be taken away and its number
+        // handed to something else while this host is deciding about it.
         match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
             Ok(found) if found.identity() == staged_identity => {
                 if here.remove(&temporary).is_ok() {
                     staging.gone(path)?;
                 }
+                drop(found);
             }
-            // Either the name holds nothing, or it holds something this host did not make. Both
-            // are names this apply has nothing of its own left at, and a record of one would send
-            // a recovery after somebody else's file.
-            _ => staging.gone(path)?,
+            // The name holds nothing, or it holds something this host did not make. Neither is a
+            // name this apply has anything of its own left at, and a record of one would send a
+            // recovery after somebody else's file.
+            Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => staging.gone(path)?,
+            // Anything else is a name this host could not look at, which is not the same as one
+            // that holds nothing. The record stays, so recovery accounts for it.
+            Err(_) => {}
         }
     }
     outcome
@@ -2784,18 +2790,38 @@ fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -
     let Ok(temporary) = RelativeName::parse(&entry.entry) else {
         return Staged::NotOurs;
     };
-    match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
-        Ok(found) if found.identity() == identity => {
-            if here.remove(&temporary).is_ok() {
-                let _ = here.sync();
-                Staged::TakenAway
-            } else {
-                Staged::NotOurs
-            }
-        }
-        Err(kr_transfer::Escape::NotFound { .. }) => Staged::NotThere,
-        _ => Staged::NotOurs,
+    // The handle is **held open across the removal**. An object nothing holds open can be taken
+    // away and its number handed to a file somebody makes a moment later, and a check against a
+    // number that has since been reused would prove nothing. Holding it keeps the object alive
+    // for as long as this host is deciding about it, so the identity that was compared is the
+    // identity of the object that is still there.
+    //
+    // What holding it does not do is bind the *name* to that object: this platform removes a
+    // name, not an object, and between the comparison and the removal another writer can put
+    // something else at the name. That window is the same one the live cleanup states and no call
+    // on these platforms closes it. What bounds it is that the name is this host's own staged
+    // name, which nothing else writes to by design, and that the removal happens before this
+    // daemon serves anything.
+    let found = match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
+        Ok(found) => found,
+        Err(kr_transfer::Escape::NotFound { .. }) => return Staged::NotThere,
+        // Anything else is a name this host could not look at, which is not the same as one that
+        // holds nothing. The record stays and the path is reported.
+        Err(_) => return Staged::NotOurs,
+    };
+    if found.identity() != identity {
+        return Staged::NotOurs;
     }
+    if here.remove(&temporary).is_err() {
+        return Staged::NotOurs;
+    }
+    // The name is gone durably before the record of it is cleared. A power failure between the
+    // two would otherwise leave a temporary nothing accounts for.
+    if here.sync().is_err() {
+        return Staged::NotOurs;
+    }
+    drop(found);
+    Staged::TakenAway
 }
 
 /// Settles the action one recovered apply was performed under, from what the journal holds.

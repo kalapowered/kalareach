@@ -2281,11 +2281,14 @@ fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
     let workspace = fixture.workspace("theirs-destination");
     let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
 
-    // Somebody replaces what is at the staged name with a file of their own, so the object the
-    // journal recorded is not what is there any more.
+    // Somebody puts a file of their own at the staged name, in place of what this host staged, so
+    // the object the journal recorded is not what is there any more. It is **renamed** over the
+    // name rather than written after a removal, so the object this host recorded is still alive
+    // somewhere else and its number cannot be handed to the replacement.
     let entry = staged_entry("README.md");
-    std::fs::remove_file(destination.join(&entry)).expect("their editor replaces it");
-    std::fs::write(destination.join(&entry), b"somebody else's file\n").expect("their file");
+    let theirs = destination.join("their-own-file");
+    std::fs::write(&theirs, b"somebody else's file\n").expect("their file");
+    std::fs::rename(&theirs, destination.join(&entry)).expect("their editor replaces it");
 
     let replacement = fixture.reopen();
     let recovery = replacement.recover_before_serving().expect("recovery runs");

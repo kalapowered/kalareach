@@ -364,8 +364,9 @@ impl ChangeSetService {
 
     /// Returns true when nothing this host knows of holds one workspace.
     ///
-    /// The project service records every session and every automation run bound to a workspace,
-    /// and this is the one mechanism behind a quiesced capture that is not a declaration.
+    /// The project service records every session and every automation run bound to a workspace.
+    /// This is a reading at one instant and decides no consistency class: what makes a capture a
+    /// quiesced capture is a reservation that held the workspace across the whole read.
     ///
     /// # Errors
     ///

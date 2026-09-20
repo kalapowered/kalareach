@@ -4021,7 +4021,7 @@
           "type": "boolean"
         },
         "quiescence_held": {
-          "description": "True when a reservation held this workspace still for the whole of the read.\n\nThis is what actually happened, and it is the only thing that makes a capture a quiesced\ncapture. A capture with nowhere to ask for a reservation, one that was refused, and one\nwhose reservation stopped holding before the read finished all record `false` and are\nper-file captures.",
+          "description": "True when a reservation held this workspace still for the whole of the read.\n\nThis is what actually happened, and it is the only thing that makes a capture of a live\nworking tree a quiesced capture. A capture with nowhere to ask for a reservation, one that\nwas refused, and one whose reservation stopped holding before the read finished all record\n`false`. An atomic snapshot records `false` too and is the stronger class: it reads no\nworking tree at all, so there is nothing to hold still.",
           "type": "boolean"
         },
         "required_consistency": {

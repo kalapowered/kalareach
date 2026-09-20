@@ -320,10 +320,11 @@ pub struct CapturePolicy {
     pub quiescence_declared: bool,
     /// True when a reservation held this workspace still for the whole of the read.
     ///
-    /// This is what actually happened, and it is the only thing that makes a capture a quiesced
-    /// capture. A capture with nowhere to ask for a reservation, one that was refused, and one
-    /// whose reservation stopped holding before the read finished all record `false` and are
-    /// per-file captures.
+    /// This is what actually happened, and it is the only thing that makes a capture of a live
+    /// working tree a quiesced capture. A capture with nowhere to ask for a reservation, one that
+    /// was refused, and one whose reservation stopped holding before the read finished all record
+    /// `false`. An atomic snapshot records `false` too and is the stronger class: it reads no
+    /// working tree at all, so there is nothing to hold still.
     pub quiescence_held: bool,
     /// The class the caller required, when it required one.
     pub required_consistency: Nullable<SourceConsistency>,
