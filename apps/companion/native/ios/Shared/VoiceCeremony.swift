@@ -18,28 +18,34 @@ import LocalAuthentication
 /// A request from the host to confirm a sensitive voice action on an unlocked screen.
 public struct VoiceConfirmationChallenge: Equatable, Sendable {
     public let confirmationId: Data
+    public let voiceSessionId: Data
     public let action: String
     public let actionDigest: Data
     public let actionId: Data
     public let hostDeviceId: Data
     public let clientDeviceId: Data
+    public let nonce: Data
     public let expiresAtMilliseconds: UInt64
 
     public init(
         confirmationId: Data,
+        voiceSessionId: Data,
         action: String,
         actionDigest: Data,
         actionId: Data,
         hostDeviceId: Data,
         clientDeviceId: Data,
+        nonce: Data,
         expiresAtMilliseconds: UInt64
     ) {
         self.confirmationId = confirmationId
+        self.voiceSessionId = voiceSessionId
         self.action = action
         self.actionDigest = actionDigest
         self.actionId = actionId
         self.hostDeviceId = hostDeviceId
         self.clientDeviceId = clientDeviceId
+        self.nonce = nonce
         self.expiresAtMilliseconds = expiresAtMilliseconds
     }
 
@@ -47,11 +53,13 @@ public struct VoiceConfirmationChallenge: Equatable, Sendable {
     public func signingInput() -> Data {
         var data = Data("kr-voice/confirm/1".utf8)
         data.append(confirmationId)
+        data.append(voiceSessionId)
         data.append(Data(action.utf8))
         data.append(actionDigest)
         data.append(actionId)
         data.append(hostDeviceId)
         data.append(clientDeviceId)
+        data.append(nonce)
         var expires = expiresAtMilliseconds.bigEndian
         data.append(Data(bytes: &expires, count: MemoryLayout<UInt64>.size))
         return data

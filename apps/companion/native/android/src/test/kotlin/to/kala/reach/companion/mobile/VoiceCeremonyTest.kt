@@ -7,9 +7,11 @@ import org.junit.Test
 
 class VoiceCeremonyTest {
     private val confirmationId = ByteArray(16) { 0x11.toByte() }
+    private val voiceSessionId = ByteArray(16) { 0x12.toByte() }
     private val actionId = ByteArray(16) { 0x22.toByte() }
     private val hostDeviceId = ByteArray(16) { 0x33.toByte() }
     private val clientDeviceId = ByteArray(16) { 0x44.toByte() }
+    private val nonce = ByteArray(32) { 0x55.toByte() }
     private val actionDigest = ByteArray(32) { 0xaa.toByte() }
     private val nowMillis = 1_000_000L
 
@@ -20,11 +22,13 @@ class VoiceCeremonyTest {
     ): VoiceConfirmationChallenge {
         return VoiceConfirmationChallenge(
             confirmationId = confirmationId,
+            voiceSessionId = voiceSessionId,
             action = action,
             actionDigest = digest ?: actionDigest,
             actionId = actionId,
             hostDeviceId = hostDeviceId,
             clientDeviceId = clientDeviceId,
+            nonce = nonce,
             expiresAtMillis = expiresAt ?: (nowMillis + 120_000L)
         )
     }

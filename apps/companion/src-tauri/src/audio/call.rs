@@ -30,6 +30,8 @@ pub struct DesktopVoiceCall {
     first_audio_ms: Arc<AtomicU64>,
     /// Time when the call was initiated.
     start_time: Instant,
+    /// Deadline in unix epoch milliseconds when this session expires.
+    closes_at_ms: Arc<AtomicU64>,
     /// Whether the call has been stopped.
     is_stopped: Arc<AtomicBool>,
     /// Generated local offer SDP.
@@ -41,18 +43,32 @@ pub struct DesktopVoiceCall {
 }
 
 impl DesktopVoiceCall {
-    /// Creates a new desktop voice call.
+    /// Creates a new desktop voice call with default 30-minute validity.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying WebRTC or audio subsystem cannot be created.
     pub fn new() -> Result<Self> {
+        Self::with_duration_seconds(1800)
+    }
+
+    /// Creates a new desktop voice call with an explicit authorised duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying WebRTC or audio subsystem cannot be created.
+    pub fn with_duration_seconds(duration_seconds: u64) -> Result<Self> {
         let render_ring = Arc::new(Mutex::new(PcmRingBuffer::new()));
 
         #[cfg(target_os = "macos")]
         let audio_device = Arc::new(Mutex::new(AudioDevice::new(Arc::clone(&render_ring))));
         #[cfg(not(target_os = "macos"))]
         let audio_device = Arc::new(Mutex::new(AudioDevice::new()));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
         Ok(Self {
             is_muted_by_person: Arc::new(AtomicBool::new(false)),
@@ -61,11 +77,17 @@ impl DesktopVoiceCall {
             audio_device,
             first_audio_ms: Arc::new(AtomicU64::new(0)),
             start_time: Instant::now(),
+            closes_at_ms: Arc::new(AtomicU64::new(now_ms + duration_seconds * 1000)),
             is_stopped: Arc::new(AtomicBool::new(false)),
             offer_sdp: Mutex::new(None),
             answer_sdp: Mutex::new(None),
             provider_events: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Sets the deadline in milliseconds when this call session closes.
+    pub fn set_closes_at_ms(&self, closes_at_ms: u64) {
+        self.closes_at_ms.store(closes_at_ms, Ordering::SeqCst);
     }
 
     /// Generates the SDP offer for the voice call.
@@ -113,10 +135,35 @@ impl DesktopVoiceCall {
     ///
     /// # Errors
     ///
-    /// Returns an error if the answer cannot be parsed or applied.
+    /// Returns an error if the answer cannot be parsed or applied, if the session has expired,
+    /// or if the call has been stopped.
     pub async fn accept(&self, answer_sdp: &str) -> Result<()> {
-        if self.is_stopped.load(Ordering::Relaxed) {
+        let mut device = self.audio_device.lock().map_err(|_| {
+            CommandError::local_failure("internal audio device lock poisoned")
+        })?;
+
+        if self.is_stopped.load(Ordering::SeqCst) {
             return Err(CommandError::refused("the call has already been stopped"));
+        }
+
+        let offer_present = self
+            .offer_sdp
+            .lock()
+            .map(|opt| opt.is_some())
+            .unwrap_or(false);
+        if !offer_present {
+            return Err(CommandError::refused(
+                "cannot accept answer without an active offer",
+            ));
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let closes_at = self.closes_at_ms.load(Ordering::SeqCst);
+        if closes_at > 0 && now_ms >= closes_at {
+            return Err(CommandError::refused("the voice call session has expired"));
         }
 
         let _parsed = RTCSessionDescription::answer(answer_sdp.to_owned())
@@ -129,22 +176,16 @@ impl DesktopVoiceCall {
             *lock = Some(answer_sdp.to_owned());
         }
 
-        // Start platform audio capture and playback.
-        #[cfg(target_os = "macos")]
-        {
-            let is_muted = Arc::clone(&self.is_muted_by_person);
-            let mut device = self.audio_device.lock().map_err(|_| {
-                CommandError::local_failure("internal audio device lock poisoned")
-            })?;
-
-            device.start(move |_captured_pcm| {
-                if is_muted.load(Ordering::Relaxed) {
-                    // When microphone is muted by user, captured audio is dropped locally.
-                    return;
-                }
-                // Media path forwards captured PCM frames to encoder.
-            })?;
-        }
+        // Start platform audio capture and playback. Calls device.start() unconditionally,
+        // which initiates VoiceProcessingIO on macOS and returns UNAVAILABLE on non-macOS.
+        let is_muted = Arc::clone(&self.is_muted_by_person);
+        device.start(move |_captured_pcm| {
+            if is_muted.load(Ordering::Relaxed) {
+                // When microphone is muted by user, captured audio is dropped locally.
+                return;
+            }
+            // Media path forwards captured PCM frames to encoder.
+        })?;
 
         Ok(())
     }
@@ -218,11 +259,15 @@ impl DesktopVoiceCall {
 
     /// Ends the call and releases audio resources.
     ///
-    /// Local and immediate.
+    /// Local and immediate. Serialised against acceptance so capture cannot start after closure.
     pub fn stop(&self) {
-        self.is_stopped.store(true, Ordering::SeqCst);
         if let Ok(mut device) = self.audio_device.lock() {
+            if self.is_stopped.swap(true, Ordering::SeqCst) {
+                return;
+            }
             device.stop();
+        } else {
+            self.is_stopped.store(true, Ordering::SeqCst);
         }
         if let Ok(mut ring) = self.render_ring.lock() {
             ring.clear();
@@ -277,5 +322,33 @@ mod tests {
         // Stop call
         call.stop();
         assert!(call.is_stopped());
+    }
+
+    #[tokio::test]
+    async fn accept_without_offer_is_refused() {
+        let call = DesktopVoiceCall::new().expect("call creates");
+        let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
+        assert!(result.is_err(), "must refuse answer without prior offer");
+    }
+
+    #[tokio::test]
+    async fn stopped_call_acceptance_is_refused() {
+        let call = DesktopVoiceCall::new().expect("call creates");
+        let _offer = call.offer().await.expect("offer succeeds");
+        call.stop();
+        assert!(call.is_stopped());
+
+        let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
+        assert!(result.is_err(), "must refuse answer on stopped call");
+    }
+
+    #[tokio::test]
+    async fn expired_call_acceptance_is_refused() {
+        let call = DesktopVoiceCall::new().expect("call creates");
+        call.set_closes_at_ms(1); // Expired timestamp
+        let _offer = call.offer().await.expect("offer succeeds");
+
+        let result = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await;
+        assert!(result.is_err(), "must refuse answer on expired call");
     }
 }

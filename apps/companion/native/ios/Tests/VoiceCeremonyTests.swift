@@ -19,9 +19,11 @@ private struct MockPresenceEvaluator: OwnerPresenceEvaluating {
 
 final class VoiceCeremonyTests: XCTestCase {
     private let confirmationId = Data(repeating: 0x11, count: 16)
+    private let voiceSessionId = Data(repeating: 0x12, count: 16)
     private let actionId = Data(repeating: 0x22, count: 16)
     private let hostDeviceId = Data(repeating: 0x33, count: 16)
     private let clientDeviceId = Data(repeating: 0x44, count: 16)
+    private let nonce = Data(repeating: 0x55, count: 32)
     private let actionDigest = Data(repeating: 0xaa, count: 32)
     private let nowMs: UInt64 = 1_000_000
 
@@ -32,11 +34,13 @@ final class VoiceCeremonyTests: XCTestCase {
     ) -> VoiceConfirmationChallenge {
         VoiceConfirmationChallenge(
             confirmationId: confirmationId,
+            voiceSessionId: voiceSessionId,
             action: action,
             actionDigest: digest ?? actionDigest,
             actionId: actionId,
             hostDeviceId: hostDeviceId,
             clientDeviceId: clientDeviceId,
+            nonce: nonce,
             expiresAtMilliseconds: expiresAt ?? (nowMs + 120_000)
         )
     }

@@ -11,11 +11,13 @@ import java.security.Signature
  */
 data class VoiceConfirmationChallenge(
     val confirmationId: ByteArray,
+    val voiceSessionId: ByteArray,
     val action: String,
     val actionDigest: ByteArray,
     val actionId: ByteArray,
     val hostDeviceId: ByteArray,
     val clientDeviceId: ByteArray,
+    val nonce: ByteArray,
     val expiresAtMillis: Long
 ) {
     /**
@@ -26,16 +28,18 @@ data class VoiceConfirmationChallenge(
         val actionBytes = action.toByteArray(Charsets.UTF_8)
         val expiresBuf = ByteBuffer.allocate(8).putLong(expiresAtMillis).array()
 
-        val totalLen = domain.size + confirmationId.size + actionBytes.size +
-            actionDigest.size + actionId.size + hostDeviceId.size + clientDeviceId.size + expiresBuf.size
+        val totalLen = domain.size + confirmationId.size + voiceSessionId.size + actionBytes.size +
+            actionDigest.size + actionId.size + hostDeviceId.size + clientDeviceId.size + nonce.size + expiresBuf.size
         val buf = ByteBuffer.allocate(totalLen)
         buf.put(domain)
         buf.put(confirmationId)
+        buf.put(voiceSessionId)
         buf.put(actionBytes)
         buf.put(actionDigest)
         buf.put(actionId)
         buf.put(hostDeviceId)
         buf.put(clientDeviceId)
+        buf.put(nonce)
         buf.put(expiresBuf)
         return buf.array()
     }
@@ -44,21 +48,25 @@ data class VoiceConfirmationChallenge(
         if (this === other) return true
         if (other !is VoiceConfirmationChallenge) return false
         return confirmationId.contentEquals(other.confirmationId) &&
+            voiceSessionId.contentEquals(other.voiceSessionId) &&
             action == other.action &&
             actionDigest.contentEquals(other.actionDigest) &&
             actionId.contentEquals(other.actionId) &&
             hostDeviceId.contentEquals(other.hostDeviceId) &&
             clientDeviceId.contentEquals(other.clientDeviceId) &&
+            nonce.contentEquals(other.nonce) &&
             expiresAtMillis == other.expiresAtMillis
     }
 
     override fun hashCode(): Int {
         var result = confirmationId.contentHashCode()
+        result = 31 * result + voiceSessionId.contentHashCode()
         result = 31 * result + action.hashCode()
         result = 31 * result + actionDigest.contentHashCode()
         result = 31 * result + actionId.contentHashCode()
         result = 31 * result + hostDeviceId.contentHashCode()
         result = 31 * result + clientDeviceId.contentHashCode()
+        result = 31 * result + nonce.contentHashCode()
         result = 31 * result + expiresAtMillis.hashCode()
         return result
     }
