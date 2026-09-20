@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { act, render, screen } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
@@ -40,6 +40,25 @@ function node(index: number): DocumentNode {
     revision: '1',
     body: { kind: 'message', author: 'agent', text: `token ${index}` }
   } as unknown as DocumentNode
+}
+
+/**
+ * Appends a burst and waits for the whole of it to be on the screen.
+ *
+ * The batching under test is what makes this a wait at all: the events are folded into one frame's
+ * work rather than rendered one at a time, so the screen catches up on an animation frame. What
+ * follows waits for the last of the burst to be drawn, which is the batch having been published,
+ * rather than for a length of time an animation frame is assumed to fit inside.
+ */
+async function burst(controls: { appendNode: (node: DocumentNode) => void }, count: number): Promise<void> {
+  act(() => {
+    for (let index = 0; index < count; index += 1) controls.appendNode(node(index))
+  })
+  await waitFor(() => {
+    expect(
+      screen.getByTestId('conversation-scroll').querySelector(`[data-node-id="stream-${count - 1}"]`)
+    ).not.toBeNull()
+  })
 }
 
 /** The middle sample, which is what a noisy environment's timings are read by. */
@@ -111,10 +130,7 @@ describe('KR-PERF-008', () => {
 
     const small = median(await measure('short history', false))
 
-    await act(async () => {
-      for (let index = 0; index < 4_000; index += 1) controls.appendNode(node(index))
-      await new Promise((resolve) => setTimeout(resolve, 60))
-    })
+    await burst(controls, 4_000)
     // One keystroke absorbs the frame that folds the whole backlog in. That frame is the batching
     // working, and it happens once; the steady state is what follows it.
     await user.type(input, '.')
@@ -144,10 +160,7 @@ describe('KR-PERF-008', () => {
     const input = await screen.findByTestId('composer-input')
     const document_ = await screen.findByTestId('conversation-scroll')
 
-    await act(async () => {
-      for (let index = 0; index < 2_000; index += 1) controls.appendNode(node(index))
-      await new Promise((resolve) => setTimeout(resolve, 60))
-    })
+    await burst(controls, 2_000)
 
     // Counting what changed is the deterministic form of the measurement above: a composer that
     // re-rendered the document would show up here however fast the machine is.
@@ -179,10 +192,7 @@ describe('KR-PERF-008', () => {
     )
     await screen.findByTestId('conversation')
 
-    await act(async () => {
-      for (let index = 0; index < 4_000; index += 1) controls.appendNode(node(index))
-      await new Promise((resolve) => setTimeout(resolve, 60))
-    })
+    await burst(controls, 4_000)
 
     const rendered = screen.getByTestId('conversation-scroll').querySelectorAll('[data-node-id]')
     record('rendered nodes', `${rendered.length} of 4000 held`, rendered.length <= 200 ? 'met' : 'missed')

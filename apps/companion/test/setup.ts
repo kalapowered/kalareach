@@ -7,12 +7,25 @@
  */
 
 import '@testing-library/jest-dom/vitest'
-import { cleanup } from '@testing-library/react'
-import { afterEach } from 'vitest'
+import { cleanup, configure } from '@testing-library/react'
+import { afterEach, vi } from 'vitest'
 
 // The testing library tidies up after itself only when it can see a global `afterEach`, and this
 // project does not put the test globals on `globalThis`.
 afterEach(cleanup)
+
+// How long a wait is given before the run is called hung.
+//
+// Neither of these is an estimate of how long the interface takes, and nothing in these tests waits
+// for a length of time: every wait below is a condition, and it costs what it always did when it is
+// met. They are here because some of what is waited for is motion. A sheet arrives and leaves over
+// a fixed number of animation frames, so what it costs is a count of frames, and how long a frame
+// lasts is the machine's answer rather than this application's: the flick that dismisses one spends
+// three quarters of the library's own one-second default on an idle machine, and a machine running
+// several builds at once would lose to it while nothing at all was wrong. These two are outside
+// anything a machine that is still running frames reaches.
+configure({ asyncUtilTimeout: 20_000 })
+vi.setConfig({ testTimeout: 30_000 })
 
 // jsdom has no layout, so an element's height is zero and the sheet's own measurements would be
 // meaningless. A fixed height makes the drag arithmetic testable.
