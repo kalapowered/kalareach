@@ -98,6 +98,29 @@ export function VoiceRoute({
     }
   }, [surface])
 
+  /**
+   * Which input device the person last used.
+   *
+   * The same signal the desktop and mobile shells publish, set here because this screen is reached
+   * without either of them around it. It decides whether a press moves: a pointer or a finger press
+   * is a physical one and gets its movement, and a key press is not and does not.
+   */
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const keyboard = () => {
+      document.documentElement.dataset.input = 'keyboard'
+    }
+    const pointer = () => {
+      document.documentElement.dataset.input = 'pointer'
+    }
+    window.addEventListener('keydown', keyboard, true)
+    window.addEventListener('pointerdown', pointer, true)
+    return () => {
+      window.removeEventListener('keydown', keyboard, true)
+      window.removeEventListener('pointerdown', pointer, true)
+    }
+  }, [])
+
   const choice = useMemo<ProviderChoice>(() => {
     if (params.get('over_cap') === '1') {
       return { ...DEFAULT_PROVIDER_CHOICE, tokenCap: 50 }

@@ -139,8 +139,13 @@
 }
 
 .kr-voice__control:active {
-  transform: scale(0.97);
   background: var(--subtle);
+}
+
+/* The press moves for a press: a pointer or a finger. A key is not a press of the control, so it
+   gets the same instant colour change and none of the movement. */
+:root:not([data-input='keyboard']) .kr-voice__control:active {
+  transform: scale(0.97);
 }
 
 .kr-voice__control:disabled {
@@ -185,7 +190,7 @@
   transition: transform var(--press) var(--ease-out);
 }
 
-.kr-voice__start:active {
+:root:not([data-input='keyboard']) .kr-voice__start:active {
   transform: scale(0.97);
 }
 

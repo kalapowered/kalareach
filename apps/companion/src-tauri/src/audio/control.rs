@@ -143,8 +143,12 @@ impl ControlSocketHandler {
                 delegations,
             } => {
                 self.call_id = Some(call_id.clone());
-                self.known_delegations = delegations.clone();
-                self.known_delegations.truncate(MAX_KNOWN_DELEGATIONS);
+                // The service lists these oldest first, so a list longer than the bound keeps its
+                // end. Keeping the beginning would drop exactly the delegations a reconnecting
+                // call is most likely to be asked about, and the membership check would then
+                // refuse a result for one the call really did hear.
+                let keep = delegations.len().saturating_sub(MAX_KNOWN_DELEGATIONS);
+                self.known_delegations = delegations[keep..].to_vec();
             }
             VoiceControlEvent::HeartbeatAcknowledged { remaining_seconds } => {
                 self.remaining_seconds = Some(*remaining_seconds);
@@ -257,14 +261,49 @@ mod tests {
     #[test]
     fn the_handler_bounds_what_one_call_remembers() {
         let mut handler = ControlSocketHandler::new();
-        for index in 0..(MAX_KNOWN_DELEGATIONS + 20) {
-            handler.handle_event(&json!({
+        let announced = MAX_KNOWN_DELEGATIONS + 20;
+        for index in 0..announced {
+            let read = handler.handle_event(&json!({
                 "type": "delegation",
                 "delegationId": format!("del_{index}"),
-                "at": 0
+                "offsetMs": index
             }));
+            assert!(
+                matches!(read, Some(VoiceControlEvent::Delegation { .. })),
+                "the announcement must parse, or this test bounds an empty list"
+            );
         }
-        assert!(handler.known_delegations.len() <= MAX_KNOWN_DELEGATIONS);
+
+        // The bound holds, and what it keeps is the end: the delegations most recently announced
+        // are the ones a result is most likely to answer.
+        assert_eq!(handler.known_delegations.len(), MAX_KNOWN_DELEGATIONS);
+        assert_eq!(
+            handler.known_delegations.last().map(String::as_str),
+            Some(format!("del_{}", announced - 1).as_str())
+        );
+        assert!(!handler.known_delegations.contains(&"del_0".to_owned()));
+    }
+
+    #[test]
+    fn a_reconnection_keeps_the_newest_delegations_it_is_given() {
+        let mut handler = ControlSocketHandler::new();
+        // The service lists them oldest first.
+        let listed: Vec<String> = (0..(MAX_KNOWN_DELEGATIONS + 5))
+            .map(|index| format!("del_{index}"))
+            .collect();
+        let read = handler.handle_event(&json!({
+            "type": "ready",
+            "callId": "call_1",
+            "delegations": listed
+        }));
+        assert!(matches!(read, Some(VoiceControlEvent::Ready { .. })));
+
+        assert_eq!(handler.known_delegations.len(), MAX_KNOWN_DELEGATIONS);
+        assert_eq!(
+            handler.known_delegations.last().map(String::as_str),
+            Some(format!("del_{}", MAX_KNOWN_DELEGATIONS + 4).as_str())
+        );
+        assert!(!handler.known_delegations.contains(&"del_0".to_owned()));
     }
 
     #[test]

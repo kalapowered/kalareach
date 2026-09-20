@@ -1,14 +1,17 @@
 package to.kala.reach.companion.voice
 
+import android.app.KeyguardManager
+import android.os.Build
+import android.os.Looper
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
-import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import to.kala.reach.companion.mobile.OwnerPresenceEvaluator
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The unlocked-screen ceremony on Android: the device owner, on this device, right now.
@@ -20,29 +23,28 @@ import java.util.concurrent.TimeUnit
  * no enrolled fingerprint or face still has a ceremony.
  *
  * A device with neither is refused. Answering "verified" without a ceremony would make exactly the
- * claim the specification forbids, and that is why the check below returns false rather than
+ * claim the specification forbids, and that is why every path below returns false rather than
  * assuming an absent prompt means consent.
  */
 class BiometricOwnerPresence(
     private val activity: FragmentActivity,
-    private val executor: Executor = ContextCompat.getMainExecutor(activity),
+    private val executor: Executor = Executors.newSingleThreadExecutor(),
     private val timeoutSeconds: Long = PROMPT_TIMEOUT_SECONDS,
 ) : OwnerPresenceEvaluator {
 
     /**
      * Asks the owner, and answers only what the system said.
      *
-     * This blocks until the person answers, so it is called from the ceremony's own thread and
-     * never from the main thread: the prompt it waits for is drawn on the main thread.
+     * This blocks until the person answers, so the main thread is refused rather than deadlocked:
+     * the prompt is drawn on the main thread, and a main thread waiting here could never draw it.
+     * The callbacks arrive on this object's own executor, which is never the main thread either.
      */
     override fun evaluatePresence(reason: String): Boolean {
-        val authenticators = usableAuthenticators() ?: return false
+        check(Looper.myLooper() != Looper.getMainLooper()) {
+            "the unlocked-screen ceremony waits for the person and cannot run on the main thread"
+        }
 
-        val information = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Confirm on this device")
-            .setSubtitle(reason)
-            .setAllowedAuthenticators(authenticators)
-            .build()
+        val information = promptInformation(reason) ?: return false
 
         val answered = CountDownLatch(1)
         val verified = AtomicBoolean(false)
@@ -79,18 +81,34 @@ class BiometricOwnerPresence(
     /**
      * What this device can actually ask, or null when it can ask nothing.
      *
-     * Biometric with a device-credential fallback is the first choice. Some platform versions do
-     * not support that combination, and there the credential alone is still a ceremony the owner
-     * performs on an unlocked screen. A device that can do neither is refused.
+     * Android 11 took the authenticator set as a value; before it, a device credential is allowed
+     * through its own flag and the two cannot be named together. Both routes end at the same place:
+     * the owner authenticating on an unlocked screen. A device that can do neither is refused.
      */
-    private fun usableAuthenticators(): Int? {
+    private fun promptInformation(reason: String): BiometricPrompt.PromptInfo? {
         val manager = BiometricManager.from(activity)
-        for (candidate in listOf(AUTHENTICATORS, BiometricManager.Authenticators.DEVICE_CREDENTIAL)) {
-            if (manager.canAuthenticate(candidate) == BiometricManager.BIOMETRIC_SUCCESS) {
-                return candidate
+        val builder = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Confirm on this device")
+            .setSubtitle(reason)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            for (candidate in listOf(AUTHENTICATORS, BiometricManager.Authenticators.DEVICE_CREDENTIAL)) {
+                if (manager.canAuthenticate(candidate) == BiometricManager.BIOMETRIC_SUCCESS) {
+                    return builder.setAllowedAuthenticators(candidate).build()
+                }
             }
+            return null
         }
-        return null
+
+        val hasBiometric =
+            manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) ==
+                BiometricManager.BIOMETRIC_SUCCESS
+        val hasCredential =
+            activity.getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true
+        if (!hasBiometric && !hasCredential) return null
+
+        @Suppress("DEPRECATION")
+        return builder.setDeviceCredentialAllowed(true).build()
     }
 
     companion object {

@@ -44,6 +44,12 @@ class VoiceCallService : android.app.Service() {
         /** Mute or unmute the person's own microphone, from the notification. */
         const val ACTION_TOGGLE_MUTE = "to.kala.reach.companion.voice.TOGGLE_MUTE"
 
+        /** Republish the notification with what the microphone is doing now. */
+        const val ACTION_CAPTURE = "to.kala.reach.companion.voice.CAPTURE"
+
+        /** The capture state carried by [ACTION_CAPTURE]. */
+        const val EXTRA_CAPTURE = "capture"
+
         /** The notification this service is in the foreground with. */
         const val NOTIFICATION_ID = 0x4B56
 
@@ -70,6 +76,21 @@ class VoiceCallService : android.app.Service() {
                 Intent(context, VoiceCallService::class.java).setAction(ACTION_STOP),
             )
         }
+
+        /**
+         * Tells the notification what the microphone is doing.
+         *
+         * The screen and the notification say the same thing about capture, because while the
+         * screen is locked the notification is the only one of the two a person can read.
+         */
+        @JvmStatic
+        fun publishCapture(context: Context, state: VoiceCaptureState) {
+            context.startService(
+                Intent(context, VoiceCallService::class.java)
+                    .setAction(ACTION_CAPTURE)
+                    .putExtra(EXTRA_CAPTURE, state.name),
+            )
+        }
     }
 
     /** What this service last published about the microphone. */
@@ -80,7 +101,15 @@ class VoiceCallService : android.app.Service() {
         }
 
     private var running = false
-    private var muted = false
+
+    /**
+     * Whether the person has muted their own microphone.
+     *
+     * Read from the running call rather than kept here. Two copies of one fact disagree the first
+     * time mute is pressed somewhere else.
+     */
+    private val muted: Boolean
+        get() = VoiceCallHolder.current?.isMutedByPerson == true
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -92,9 +121,20 @@ class VoiceCallService : android.app.Service() {
                 return START_NOT_STICKY
             }
             ACTION_TOGGLE_MUTE -> {
-                muted = !muted
-                VoiceCallHolder.current?.setMutedByPerson(muted)
-                capture = if (muted) VoiceCaptureState.MUTED_BY_PERSON else VoiceCaptureState.CAPTURING
+                val call = VoiceCallHolder.current
+                if (call != null) {
+                    call.setMutedByPerson(!call.isMutedByPerson)
+                } else {
+                    // No call owns this notification any more, so the microphone is not this
+                    // service's to change and the notification should not suggest it is.
+                    stopCall()
+                }
+                return START_NOT_STICKY
+            }
+            ACTION_CAPTURE -> {
+                val named = intent.getStringExtra(EXTRA_CAPTURE)
+                val state = VoiceCaptureState.entries.firstOrNull { it.name == named }
+                if (state != null && running) capture = state
                 return START_NOT_STICKY
             }
             ACTION_START -> {

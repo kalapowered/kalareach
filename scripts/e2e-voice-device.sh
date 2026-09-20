@@ -169,24 +169,37 @@ run_ios() {
         python3 "$here/scripts/simulator-identity.py" describe "$ios_udid")"
     printf 'iOS device: %s\n' "$desc" | tee "$artefacts/ios-device.txt" | tee -a "${log:?}"
 
+    # A screenshot is evidence only when it was taken and is not empty. Each leg below claims its
+    # clause only if its own screenshots succeeded.
+    local choice_shot=0 capture_shot=0
     shoot_ios() {
         local state_param=$1 name=$2
         xcrun simctl openurl "$ios_udid" \
             "http://localhost:$port/harness.html?surface=ios&tab=voice$state_param" || return 1
         sleep "${KR_MOBILE_SETTLE:-4}"
         xcrun simctl io "$ios_udid" screenshot --type=png "$shots/$name" >/dev/null || return 1
+        [ -s "$shots/$name" ] || return 1
         say "iOS screenshot $shots/$name"
     }
 
-    shoot_ios "" "kr-voice-ios-15.09-disclosure.png" || fail "iOS provider choice screenshot"
-    cp "$shots/kr-voice-ios-15.09-disclosure.png" "$shots/kr-voice-ios-15.19-context-scope.png"
-    shoot_ios "&state=unavailable" "kr-voice-ios-15.36-capture-unavailable.png" ||
-        fail "iOS unavailable capture screenshot"
-    shoot_ios "&state=muted" "kr-voice-ios-15.36-muted.png" || fail "iOS muted capture screenshot"
+    if shoot_ios "" "kr-voice-ios-15.09-disclosure.png"; then
+        cp "$shots/kr-voice-ios-15.09-disclosure.png" "$shots/kr-voice-ios-15.19-context-scope.png"
+        choice_shot=1
+    else
+        fail "iOS provider choice screenshot"
+    fi
+    if shoot_ios "&state=unavailable" "kr-voice-ios-15.36-capture-unavailable.png" &&
+        shoot_ios "&state=muted" "kr-voice-ios-15.36-muted.png"; then
+        capture_shot=1
+    else
+        fail "iOS capture state screenshots"
+    fi
     shoot_ios "&state=capturing" "kr-voice-ios-15.22-call-screen.png" || fail "iOS call screen screenshot"
 
-    proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the iOS Simulator | $desc"
-    proved "KR-REQ-15.36 | the unavailable and muted capture states render on the iOS Simulator | $desc"
+    [ "$choice_shot" = 1 ] &&
+        proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the iOS Simulator | $desc"
+    [ "$capture_shot" = 1 ] &&
+        proved "KR-REQ-15.36 | the unavailable and muted capture states render on the iOS Simulator | $desc"
     unproved "KR-REQ-15.34 | duplex audio after a screen lock | the iOS Simulator has no microphone input and no lock screen"
     unproved "KR-ACC-014 | a screen-lock call | the same; the device leg is the operator gate"
     return 0
@@ -214,16 +227,37 @@ run_android() {
             missing_platforms+=("android: no emulator")
             return 3
         fi
-        say "starting the emulator $avd"
-        "$emulator" -avd "$avd" -crash-report-mode disabled -no-snapshot-save -no-boot-anim \
-            -netdelay none -netspeed full >"$artefacts/emulator.log" 2>&1 &
+        # A console port of this run's own choosing, so the emulator this run started is named
+        # rather than guessed. Taking the first device `adb` lists would attach to, and later kill,
+        # an emulator somebody else started.
+        local console=""
+        for candidate in 5554 5556 5558 5560 5562 5564 5566 5568 5570 5572; do
+            if ! nc -z 127.0.0.1 "$candidate" >/dev/null 2>&1; then
+                console="$candidate"
+                break
+            fi
+        done
+        if [ -z "$console" ]; then
+            say "no free emulator console port"
+            missing_platforms+=("android: no free console port")
+            return 3
+        fi
+
+        say "starting the emulator $avd on console port $console"
+        "$emulator" -avd "$avd" -port "$console" -crash-report-mode disabled -no-snapshot-save \
+            -no-boot-anim -netdelay none -netspeed full >"$artefacts/emulator.log" 2>&1 &
+        local emulator_pid=$!
         android_started_here=1
         # Bounded: `adb wait-for-device` on a virtual device that never appears waits for ever.
-        local up=0
+        local up=0 expected="emulator-$console"
         for _ in $(seq 1 180); do
-            android_serial="$("$adb_path" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
-            if [ -n "$android_serial" ] &&
-                [ "$("$adb_path" -s "$android_serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+            if ! kill -0 "$emulator_pid" 2>/dev/null; then
+                say "the emulator process ended before it booted"
+                break
+            fi
+            if "$adb_path" devices | grep -q "^$expected	device$" &&
+                [ "$("$adb_path" -s "$expected" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+                android_serial="$expected"
                 up=1
                 break
             fi
@@ -231,6 +265,10 @@ run_android() {
         done
         if [ "$up" != 1 ]; then
             say "the emulator did not come up within six minutes; see $artefacts/emulator.log"
+            # Its own process, by the identity this run recorded, and nothing else.
+            kill "$emulator_pid" 2>/dev/null || true
+            android_started_here=0
+            android_serial=""
             missing_platforms+=("android: emulator did not boot")
             return 3
         fi
@@ -247,6 +285,7 @@ run_android() {
 
     "$adb_path" -s "$android_serial" reverse "tcp:$port" "tcp:$port" >/dev/null 2>&1 || true
 
+    local choice_shot=0 capture_shot=0
     shoot_android() {
         local state_param=$1 name=$2
         "$adb_path" -s "$android_serial" shell \
@@ -254,14 +293,23 @@ run_android() {
             >/dev/null || return 1
         sleep "${KR_MOBILE_SETTLE:-5}"
         "$adb_path" -s "$android_serial" exec-out screencap -p >"$shots/$name" || return 1
+        [ -s "$shots/$name" ] || return 1
         say "Android screenshot $shots/$name"
     }
 
-    shoot_android "" "kr-voice-android-15.09-disclosure.png" || fail "Android provider choice screenshot"
-    cp "$shots/kr-voice-android-15.09-disclosure.png" "$shots/kr-voice-android-15.19-context-scope.png"
-    shoot_android "&state=unavailable" "kr-voice-android-15.36-capture-unavailable.png" ||
-        fail "Android unavailable capture screenshot"
-    shoot_android "&state=muted" "kr-voice-android-15.36-muted.png" || fail "Android muted capture screenshot"
+    if shoot_android "" "kr-voice-android-15.09-disclosure.png"; then
+        cp "$shots/kr-voice-android-15.09-disclosure.png" \
+            "$shots/kr-voice-android-15.19-context-scope.png"
+        choice_shot=1
+    else
+        fail "Android provider choice screenshot"
+    fi
+    if shoot_android "&state=unavailable" "kr-voice-android-15.36-capture-unavailable.png" &&
+        shoot_android "&state=muted" "kr-voice-android-15.36-muted.png"; then
+        capture_shot=1
+    else
+        fail "Android capture state screenshots"
+    fi
 
     # The emulator's simulated call is a telephony state change, not a call on a handset. It is
     # recorded as what it is.
@@ -270,9 +318,12 @@ run_android() {
         sleep 3
         "$adb_path" -s "$android_serial" exec-out screencap -p \
             >"$shots/kr-voice-android-15.35-incoming-call.png" || fail "Android incoming call screenshot"
-        "$adb_path" -s "$android_serial" emu gsm cancel 15555215554 >/dev/null 2>&1 || true
-        sleep 2
-        proved "KR-REQ-15.35 | the emulator's simulated incoming call was raised and cancelled with the surface open | $desc"
+        if "$adb_path" -s "$android_serial" emu gsm cancel 15555215554 >/dev/null 2>&1; then
+            sleep 2
+            proved "KR-REQ-15.35 | the emulator's simulated incoming call was raised and cancelled with the surface open | $desc"
+        else
+            fail "the simulated call would not cancel, and this emulator is left with it raised"
+        fi
         unproved "KR-REQ-15.35 | audio focus loss to a real call | the emulator's telephony state change is not a call on a handset, and no call is connected to lose focus from"
     else
         unproved "KR-REQ-15.35 | the simulated incoming call | this emulator refused the telephony command"
@@ -280,8 +331,10 @@ run_android() {
 
     shoot_android "&state=capturing" "kr-voice-android-15.22-call-screen.png" || fail "Android call screen screenshot"
 
-    proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the Android emulator | $desc"
-    proved "KR-REQ-15.36 | the unavailable and muted capture states render on the Android emulator | $desc"
+    [ "$choice_shot" = 1 ] &&
+        proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the Android emulator | $desc"
+    [ "$capture_shot" = 1 ] &&
+        proved "KR-REQ-15.36 | the unavailable and muted capture states render on the Android emulator | $desc"
     unproved "KR-REQ-15.34 | audio from the foreground service after a screen lock | an emulator does not qualify a foreground microphone service; the device leg is the operator gate"
     return 0
 }
@@ -306,6 +359,11 @@ run_desktop() {
       await shoot('&state=capturing', 'kr-voice-desktop-15.22-call-screen.png');
       await browser.close();
     " ) || { fail "desktop screenshots"; return 0; }
+    for name in kr-voice-desktop-15.09-disclosure.png kr-voice-desktop-15.19-context-scope.png \
+        kr-voice-desktop-15.36-muted.png kr-voice-desktop-15.36-capture-unavailable.png \
+        kr-voice-desktop-15.22-call-screen.png; do
+        [ -s "$shots/$name" ] || { fail "desktop screenshot $name"; return 0; }
+    done
     say "desktop screenshots under $shots"
     proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render in the desktop window | headless Chromium, 1280x800"
     return 0

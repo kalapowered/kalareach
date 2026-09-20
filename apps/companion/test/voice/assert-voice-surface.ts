@@ -151,19 +151,39 @@ async function assertBrokerFailure(page: Page, base: string, target: Target): Pr
     expect(await control.isEnabled(), `${name} must stay available when the broker does not answer`)
   }
 
-  // Mute survives a broker that does not answer: the control acts locally and the displayed capture
-  // state follows it without any round trip.
+  // Each of the three is pressed, and each is checked by what it changed. A control that is
+  // merely enabled proves nothing: it could be wired to nothing at all.
   await page.getByRole('button', { name: 'Mute microphone' }).click()
   const afterMute = await page.textContent('.kr-voice__capture')
   expect(
     afterMute?.includes('Microphone muted') === true,
     `muting with the broker refused must change the capture state, got ${afterMute}`
   )
+  await page.getByRole('button', { name: 'Unmute microphone' }).click()
+
+  await page.getByRole('button', { name: 'Stop the voice' }).click()
+  expect(
+    (await page.getByRole('button', { name: 'Stop the voice' }).getAttribute('aria-pressed')) ===
+      'true',
+    'stopping the voice with the broker refused must silence playback'
+  )
+
+  await page.getByRole('button', { name: 'End session' }).click()
+  await page.waitForSelector('button.kr-voice__start')
+  expect(
+    (await page.locator('.kr-voice--live').count()) === 0,
+    'ending the session with the broker refused must close the call'
+  )
   prove(
     'KR-REQ-15.17',
-    'local microphone mute, playback stop and closure all act with the broker unreachable',
+    'muting, silencing playback and ending the session each act with the broker unreachable, and each changes what it claims to change',
     where
   )
+
+  await page.goto(
+    `${base}/harness.html?surface=${target.surface}&tab=voice&state=capturing&broker=unreachable`
+  )
+  await page.waitForSelector('.kr-voice')
 
   // Cancelling a turn goes to the host, not to the voice service, so a voice service that has
   // stopped answering must not take it away.
@@ -203,12 +223,21 @@ async function assertStopIsNotCancel(page: Page, base: string, target: Target): 
   await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice&state=capturing`)
   await page.waitForSelector('.kr-voice')
 
-  // Stopping the voice takes one press and changes only playback.
+  // Stopping the voice takes one press, silences playback, and changes nothing else.
   await page.getByRole('button', { name: 'Stop the voice' }).click()
+  expect(
+    (await page.getByRole('button', { name: 'Stop the voice' }).getAttribute('aria-pressed')) ===
+      'true',
+    'stopping the voice must silence playback'
+  )
   const captureAfterStop = await page.textContent('.kr-voice__capture')
   expect(
-    captureAfterStop?.includes('Microphone muted') !== true,
-    'stopping playback must not mute the microphone'
+    captureAfterStop?.includes('Microphone on') === true,
+    `stopping playback must leave the microphone alone, got ${captureAfterStop}`
+  )
+  expect(
+    (await page.locator('.kr-voice--live').count()) === 1,
+    'stopping playback must not end the call'
   )
 
   // Cancelling a turn is a separate control, in a separate panel, and it takes a confirmation.

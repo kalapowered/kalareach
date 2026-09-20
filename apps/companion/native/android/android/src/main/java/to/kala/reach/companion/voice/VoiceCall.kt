@@ -89,6 +89,12 @@ class VoiceCall private constructor(
          */
         @JvmStatic
         fun start(context: Context, observer: Observer): VoiceCall {
+            // One microphone, one call. A second call started over a running one would leave the
+            // first one's track and connection live with nothing owning them, and the
+            // notification's stop would reach whichever was published last.
+            if (VoiceCallHolder.current != null) {
+                throw IllegalStateException("a voice call is already running on this device")
+            }
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
                     .createInitializationOptions(),
@@ -103,7 +109,15 @@ class VoiceCall private constructor(
                 .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
                 .createPeerConnectionFactory()
             val call = VoiceCall(context.applicationContext, factory, observer)
-            call.open()
+            // Published before the microphone opens, so the notification's mute and stop reach
+            // this call from the moment its service exists. Cleared again if opening fails.
+            VoiceCallHolder.current = call
+            try {
+                call.open()
+            } catch (failure: Throwable) {
+                VoiceCallHolder.claimStopped(call)
+                throw failure
+            }
             return call
         }
     }
@@ -134,10 +148,6 @@ class VoiceCall private constructor(
         }
         observer.onCaptureState(VoiceCaptureState.CAPTURING)
         watchRoute()
-        // The notification's mute and stop act on this call, and they are pressed while no
-        // interface is running. Publishing the call is what connects them to the media; without it
-        // they change a notification and nothing else.
-        VoiceCallHolder.current = this
     }
 
     /**
@@ -172,9 +182,7 @@ class VoiceCall private constructor(
     fun setMutedByPerson(muted: Boolean) {
         isMutedByPerson = muted
         microphone?.setEnabled(!muted)
-        observer.onCaptureState(
-            if (muted) VoiceCaptureState.MUTED_BY_PERSON else VoiceCaptureState.CAPTURING,
-        )
+        publish(if (muted) VoiceCaptureState.MUTED_BY_PERSON else VoiceCaptureState.CAPTURING)
     }
 
     /**
@@ -192,8 +200,10 @@ class VoiceCall private constructor(
     fun stop() {
         if (stopped) return
         stopped = true
-        // Cleared before the service is told, so the service's own stop cannot re-enter this call.
-        VoiceCallHolder.current = null
+        // Cleared before the service is told, so the service's own stop cannot re-enter this call,
+        // and only if this call is the one published: a call that was already replaced must not
+        // take its replacement's place in the holder with it.
+        VoiceCallHolder.claimStopped(this)
         microphone?.setEnabled(false)
         routeCallback?.let {
             context.getSystemService(AudioManager::class.java)?.unregisterAudioDeviceCallback(it)
@@ -205,21 +215,51 @@ class VoiceCall private constructor(
         observer.onCaptureState(VoiceCaptureState.IDLE)
     }
 
-    /** Reports what the system did to the microphone, so each is an explicit state. */
+    /**
+     * Acts on what the system did to the microphone, and then says so.
+     *
+     * Losing focus takes the microphone away, so the track is disabled rather than only relabelled:
+     * a state that says the person is not being heard while the track is still live would be the
+     * claim section 15 paragraph 22 forbids. Regaining it restores what the person chose, which is
+     * their own mute if they set one.
+     */
     fun onFocusChange(change: Int) {
-        val state = when (change) {
-            AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ->
-                VoiceCaptureState.FOCUS_LOST
-            AudioManager.AUDIOFOCUS_GAIN -> VoiceCaptureState.CAPTURING
+        if (stopped) return
+        when (change) {
+            AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                microphone?.setEnabled(false)
+                publish(VoiceCaptureState.FOCUS_LOST)
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                microphone?.setEnabled(!isMutedByPerson)
+                publish(
+                    if (isMutedByPerson) {
+                        VoiceCaptureState.MUTED_BY_PERSON
+                    } else {
+                        VoiceCaptureState.CAPTURING
+                    },
+                )
+            }
             else -> return
         }
-        observer.onCaptureState(state)
     }
 
     /** True while the platform reports a call on the cellular radio. */
     fun isInPhoneCall(): Boolean =
         context.getSystemService(TelephonyManager::class.java)?.callState !=
             TelephonyManager.CALL_STATE_IDLE
+
+    /**
+     * Tells the application and the notification the same thing.
+     *
+     * While the screen is locked the notification is the only surface there is, so a state that
+     * reached the screen and not the notification would be a state half the surfaces disagree
+     * about.
+     */
+    private fun publish(state: VoiceCaptureState) {
+        observer.onCaptureState(state)
+        VoiceCallService.publishCapture(context, state)
+    }
 
     private fun watchRoute() {
         val manager = context.getSystemService(AudioManager::class.java) ?: return
@@ -348,4 +388,17 @@ object VoiceCallHolder {
     @JvmStatic
     @Volatile
     var current: VoiceCall? = null
+        internal set
+
+    /**
+     * Clears the holder, but only when the call that stopped is the one it holds.
+     *
+     * A call that was already replaced clearing the holder would leave its replacement running with
+     * nothing published, and the service's stop would then find nothing to stop.
+     */
+    @JvmStatic
+    @Synchronized
+    fun claimStopped(call: VoiceCall) {
+        if (current === call) current = null
+    }
 }

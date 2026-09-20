@@ -168,47 +168,58 @@ function CallScreen({
    *
    * A confirmation that read the current turn at the moment it was answered would cancel whatever
    * the host had moved on to while the question sat on screen. It names its turn when it opens, and
-   * it stops being a live confirmation the moment the host publishes a different one.
+   * the host moving to another turn throws it away rather than hiding it: a question the person can
+   * no longer see has not been answered, and it must not come back answered if the host returns to
+   * the turn it was asked about.
    */
-  const [askedAbout, setAskedAbout] = useState<{
+  const [confirmingCancel, setConfirmingCancel] = useState<{
     readonly sessionId: string
     readonly turnId: string
   } | null>(null)
+  const [turnWhenAsked, setTurnWhenAsked] = useState(currentTurn)
 
-  /** The confirmation, but only while the turn it named is still the one the host is on. */
-  const confirmingCancel =
-    askedAbout !== null &&
-    currentTurn !== null &&
-    currentTurn.sessionId === askedAbout.sessionId &&
-    currentTurn.turnId === askedAbout.turnId
-      ? askedAbout
-      : null
+  if (
+    turnWhenAsked?.sessionId !== currentTurn?.sessionId ||
+    turnWhenAsked?.turnId !== currentTurn?.turnId
+  ) {
+    setTurnWhenAsked(currentTurn)
+    if (confirmingCancel) setConfirmingCancel(null)
+  }
 
   const muted = call.capture === 'muted_by_person'
   const heard = speechCouldHaveBeenHeard(call.capture)
+  const canCancel = controlAvailable('cancel_task', call) && currentTurn !== null
   const headingId = useId()
 
   const askRef = useRef<HTMLButtonElement | null>(null)
   const confirmRef = useRef<HTMLButtonElement | null>(null)
+  const panelRef = useRef<HTMLElement | null>(null)
   const wasConfirming = useRef(false)
 
   // Focus follows the question and comes back to the control that asked it. A confirmation that
   // replaced the focused control without moving focus would leave a keyboard or screen-reader user
-  // at the top of the document, reading the page again to find what they just pressed.
+  // at the top of the document, reading the page again to find what they just pressed. When the
+  // control that asked is no longer available, focus lands on the panel it belongs to instead of
+  // on a button nothing can press.
   useEffect(() => {
     if (confirmingCancel) {
       confirmRef.current?.focus()
     } else if (wasConfirming.current) {
-      askRef.current?.focus()
+      const ask = askRef.current
+      if (ask && !ask.disabled) ask.focus()
+      else panelRef.current?.focus()
     }
     wasConfirming.current = confirmingCancel !== null
   }, [confirmingCancel])
 
   const cancel = useCallback(() => {
-    if (!confirmingCancel) return
+    // Checked again here, not only when the control was drawn: the host can become unreachable
+    // while the question is on screen, and a cancellation that cannot be delivered must not be
+    // reported to the person as one that was.
+    if (!confirmingCancel || !controlAvailable('cancel_task', call)) return
     actions.cancelTask(confirmingCancel.sessionId, confirmingCancel.turnId)
-    setAskedAbout(null)
-  }, [actions, confirmingCancel])
+    setConfirmingCancel(null)
+  }, [actions, call, confirmingCancel])
 
   const admitted = useMemo(
     () => call.requests.filter((request) => request.outcome === 'admitted').length,
@@ -278,7 +289,7 @@ function CallScreen({
           confirmation step. Section 15 paragraph 13 says the interface must not let a person
           confuse stopping speech with cancelling work, and adjacency is how that confusion is
           usually built. */}
-      <section className="kr-voice__panel kr-voice__panel--cancel">
+      <section className="kr-voice__panel kr-voice__panel--cancel" ref={panelRef} tabIndex={-1}>
         <h2>Cancel what the agent is doing</h2>
         <p className="kr-voice__note">{STOP_MEANS.task}</p>
         {confirmingCancel ? (
@@ -287,6 +298,7 @@ function CallScreen({
               type="button"
               ref={confirmRef}
               className="kr-voice__control kr-voice__control--danger"
+              disabled={!canCancel}
               onClick={cancel}
             >
               Cancel this turn
@@ -294,7 +306,7 @@ function CallScreen({
             <button
               type="button"
               className="kr-voice__control"
-              onClick={() => setAskedAbout(null)}
+              onClick={() => setConfirmingCancel(null)}
             >
               Keep it running
             </button>
@@ -304,8 +316,8 @@ function CallScreen({
             type="button"
             ref={askRef}
             className="kr-voice__control"
-            disabled={!controlAvailable('cancel_task', call) || !currentTurn}
-            onClick={() => currentTurn && setAskedAbout(currentTurn)}
+            disabled={!canCancel}
+            onClick={() => currentTurn && setConfirmingCancel(currentTurn)}
           >
             Cancel the current turn
           </button>

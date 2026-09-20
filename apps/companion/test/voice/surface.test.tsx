@@ -233,6 +233,52 @@ describe('while a call is running', () => {
     expect(acted.cancelTask).not.toHaveBeenCalled()
   })
 
+  // KR-REQ-15.22: a question the host moved past is thrown away, not hidden. Returning to the
+  // same turn must not bring back an answer nobody gave.
+  it.each([
+    ['another turn', { sessionId: 's-1', turnId: 't-10' }],
+    ['no turn at all', null]
+  ])('does not revive a confirmation after the host moves to %s', async (_name, moved) => {
+    const acted = actions()
+    const person = userEvent.setup()
+    const view = (turn: { sessionId: string; turnId: string } | null) => (
+      <VoiceSurface choice={choice()} call={call()} currentTurn={turn} actions={acted} />
+    )
+    const { rerender } = render(view({ sessionId: 's-1', turnId: 't-9' }))
+    await person.click(screen.getByRole('button', { name: 'Cancel the current turn' }))
+    expect(screen.getByRole('button', { name: 'Cancel this turn' })).toBeInTheDocument()
+
+    rerender(view(moved))
+    rerender(view({ sessionId: 's-1', turnId: 't-9' }))
+
+    expect(screen.queryByRole('button', { name: 'Cancel this turn' })).not.toBeInTheDocument()
+    expect(acted.cancelTask).not.toHaveBeenCalled()
+  })
+
+  // KR-REQ-15.22: the host can go while the question is on screen. A cancellation that cannot be
+  // delivered is refused rather than reported as sent.
+  it('refuses to send a confirmed cancellation once the host has gone', async () => {
+    const acted = actions()
+    const person = userEvent.setup()
+    const turn = { sessionId: 's-1', turnId: 't-9' }
+    const view = (reachable: boolean) => (
+      <VoiceSurface
+        choice={choice()}
+        call={call({ hostReachable: reachable })}
+        currentTurn={turn}
+        actions={acted}
+      />
+    )
+    const { rerender } = render(view(true))
+    await person.click(screen.getByRole('button', { name: 'Cancel the current turn' }))
+
+    rerender(view(false))
+    const confirm = screen.getByRole('button', { name: 'Cancel this turn' })
+    expect(confirm).toBeDisabled()
+    await person.click(confirm)
+    expect(acted.cancelTask).not.toHaveBeenCalled()
+  })
+
   // Section 13 line 879: focus follows the question and returns to the control that asked it.
   it('moves focus into the confirmation and back again', async () => {
     const person = userEvent.setup()
@@ -251,24 +297,33 @@ describe('while a call is running', () => {
     expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toHaveFocus()
   })
 
-  // KR-REQ-15.17: an append acknowledgement is shown as admission, never as execution.
-  it('says what an acknowledgement does not establish', () => {
-    render(
-      <VoiceSurface
-        choice={choice()}
-        call={call({
-          requests: [{ id: 'r-1', command: 'commentary', outcome: 'admitted' }],
-          delegations: [
-            { delegationId: 'd-1', offsetMs: 1200, state: 'submitted', detail: 'Read session 1' }
-          ]
-        })}
-        currentTurn={null}
-        actions={actions()}
-      />
-    )
-    expect(screen.getByText(/not evidence that anything ran on a host/)).toBeInTheDocument()
-    expect(screen.queryByText(/\bexecuted\b/i)).not.toBeInTheDocument()
-  })
+  // KR-REQ-15.17: an append acknowledgement is shown as admission, never as execution. Every
+  // outcome the model defines is rendered, so an outcome added later that reads as execution fails
+  // here rather than reaching a person.
+  it.each([['sent'], ['accepted'], ['admitted'], ['refused']] as const)(
+    'never presents the %s outcome as work a host did',
+    (outcome) => {
+      render(
+        <VoiceSurface
+          choice={choice()}
+          call={call({
+            requests: [{ id: 'r-1', command: 'commentary', outcome }],
+            delegations: [
+              { delegationId: 'd-1', offsetMs: 1200, state: 'submitted', detail: 'Read session 1' }
+            ]
+          })}
+          currentTurn={null}
+          actions={actions()}
+        />
+      )
+      expect(screen.queryByText(/\bexecuted\b|\bcompleted\b|\bsucceeded\b/i)).not.toBeInTheDocument()
+      if (outcome === 'admitted') {
+        expect(screen.getByText(/not evidence that anything ran on a host/)).toBeInTheDocument()
+      } else {
+        expect(screen.queryByText(/not evidence that anything ran on a host/)).not.toBeInTheDocument()
+      }
+    }
+  )
 
   // Section 13 line 879: every control this screen adds meets the platform's target minimum and
   // carries a name a screen reader can speak.

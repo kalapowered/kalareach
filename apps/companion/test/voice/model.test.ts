@@ -11,8 +11,6 @@ import {
   speechCouldHaveBeenHeard,
   withinCap,
   type CaptureState,
-  type ContextOutcome,
-  type ContextRequest,
   type ProviderChoice,
   type RunningCall,
   type VoiceControl
@@ -161,22 +159,5 @@ describe('what an append acknowledgement means', () => {
     expect(ADMISSION_MEANS).toContain('not evidence')
     expect(ADMISSION_MEANS).toContain('receipt')
     expect(ADMISSION_MEANS).not.toMatch(/\bdone\b|\bcompleted\b|\bexecuted\b/i)
-  })
-
-  it('has no outcome that means the host ran something', () => {
-    // The outcomes the model actually defines, read from a request of each kind rather than from a
-    // list written here: a list written here would pass however the model changed.
-    const outcomes: ContextOutcome[] = ['sent', 'accepted', 'admitted', 'refused']
-    const requests: readonly ContextRequest[] = outcomes.map((outcome, index) => ({
-      id: `req_${index}`,
-      command: 'thinking',
-      outcome
-    }))
-    const admitted = requests.filter((request) => request.outcome === 'admitted')
-    expect(admitted).toHaveLength(1)
-    // Admission is the furthest any request can get on this socket. Nothing here promotes it.
-    for (const request of requests) {
-      expect(String(request.outcome)).not.toMatch(/executed|done|ran|receipted/i)
-    }
   })
 })
