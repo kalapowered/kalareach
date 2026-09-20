@@ -249,6 +249,19 @@ pub enum ActionRoute {
     Existing(RoutedAction),
 }
 
+/// What recording a device's notification-preview key came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewKeyOutcome {
+    /// The key and its revision are now the device's.
+    Recorded,
+    /// The device already held exactly this key at exactly this revision.
+    AlreadyRecorded,
+    /// The revision offered does not follow the one recorded, which is carried here.
+    RevisionBehind(DeviceKeyRevision),
+    /// No paired device answers to that identity.
+    NotPaired,
+}
+
 /// One paired device, as the host recorded it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceRecord {
@@ -873,6 +886,16 @@ impl DeviceDirectory {
 
     /// Updates the notification-preview public key and key revision for a device.
     ///
+    /// The revision only moves forward. A registration is a key and the number the device gave it,
+    /// and a number that does not follow the one recorded belongs to a registration this host has
+    /// already replaced: writing it would put a retired key back into service, and the same
+    /// revision is also what a connection is authenticated against. The condition is part of the
+    /// write rather than a read before it, so two registrations racing cannot both pass it.
+    ///
+    /// A repeat of the registration already recorded is not a move backwards and is not refused:
+    /// an answer lost on the way to the device is resubmitted, and the store it reaches says the
+    /// same thing it said the first time.
+    ///
     /// # Errors
     ///
     /// Returns an error when the row cannot be written.
@@ -881,14 +904,26 @@ impl DeviceDirectory {
         device_id: DeviceId,
         preview_key: NotificationPreviewKey,
         revision: DeviceKeyRevision,
-    ) -> Result<bool> {
+    ) -> Result<PreviewKeyOutcome> {
+        let Some(record) = self.record_for_device(device_id)? else {
+            return Ok(PreviewKeyOutcome::NotPaired);
+        };
+        if record.revoked_at_ms.is_some() {
+            return Ok(PreviewKeyOutcome::NotPaired);
+        }
+        if record.device_key_revision == revision
+            && record.notification_preview == Some(preview_key)
+        {
+            return Ok(PreviewKeyOutcome::AlreadyRecorded);
+        }
         let bytes = device_id.get().as_bytes().to_vec();
         let changed = self.with(|connection| {
             connection.execute(
                 "UPDATE network_devices
                  SET notification_preview = ?2,
                      device_key_revision = ?3
-                 WHERE device_id = ?1 AND revoked_at_ms IS NULL",
+                 WHERE device_id = ?1 AND revoked_at_ms IS NULL
+                   AND device_key_revision < ?3",
                 params![
                     bytes,
                     preview_key.as_bytes().as_slice(),
@@ -896,7 +931,12 @@ impl DeviceDirectory {
                 ],
             )
         })?;
-        Ok(changed > 0)
+        if changed > 0 {
+            return Ok(PreviewKeyOutcome::Recorded);
+        }
+        Ok(PreviewKeyOutcome::RevisionBehind(
+            record.device_key_revision,
+        ))
     }
 }
 
@@ -1144,7 +1184,7 @@ mod tests {
         let updated = directory
             .update_preview_key(device.device_id, preview_key, revision)
             .expect("update succeeds");
-        assert!(updated);
+        assert_eq!(updated, PreviewKeyOutcome::Recorded);
 
         let stored = directory
             .record_for_device(device.device_id)
@@ -1157,6 +1197,49 @@ mod tests {
         let not_found = directory
             .update_preview_key(missing, preview_key, revision)
             .expect("update succeeds");
-        assert!(!not_found);
+        assert_eq!(not_found, PreviewKeyOutcome::NotPaired);
+    }
+
+    /// A revision that does not follow the one recorded belongs to a registration this host has
+    /// already replaced, and the same registration again is not a move backwards.
+    #[test]
+    fn a_preview_key_revision_only_moves_forward_in_the_directory() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let device = record(1);
+        directory.commit(&device).expect("the row is written");
+        let third = NotificationPreviewKey::from_bytes([3; 32]);
+        assert_eq!(
+            directory
+                .update_preview_key(device.device_id, third, DeviceKeyRevision::new(3))
+                .expect("a write"),
+            PreviewKeyOutcome::Recorded
+        );
+        for behind in [0, 2, 3] {
+            let outcome = directory
+                .update_preview_key(
+                    device.device_id,
+                    NotificationPreviewKey::from_bytes([9; 32]),
+                    DeviceKeyRevision::new(behind),
+                )
+                .expect("a write");
+            assert_eq!(
+                outcome,
+                PreviewKeyOutcome::RevisionBehind(DeviceKeyRevision::new(3)),
+                "revision {behind} does not follow 3"
+            );
+        }
+        assert_eq!(
+            directory
+                .update_preview_key(device.device_id, third, DeviceKeyRevision::new(3))
+                .expect("a write"),
+            PreviewKeyOutcome::AlreadyRecorded,
+            "the same registration again is the registration this host already holds"
+        );
+        let stored = directory
+            .record_for_device(device.device_id)
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(stored.notification_preview, Some(third));
+        assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(3));
     }
 }

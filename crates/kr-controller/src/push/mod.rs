@@ -183,6 +183,11 @@ impl DeliveryModule {
                     "a notification-preview key belongs to a paired device".to_owned(),
                 ));
             };
+            if push.preview_keys.revision == revision && push.preview_keys.current == key {
+                // The registration already recorded. A device whose answer was lost sends the
+                // same one again, and the same registration twice is one registration.
+                return Ok(());
+            }
             if revision <= push.preview_keys.revision {
                 return Err(ControllerError::InvalidArgument(format!(
                     "revision {revision} does not follow the recorded revision {}",

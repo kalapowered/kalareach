@@ -4063,18 +4063,44 @@ impl Controller {
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DevicePreviewKeyUpdateParams = parse(&mutation.params)?;
-        if self
-            .paired_device(actor_id)
-            .is_some_and(|paired| paired != params.device_id)
-        {
+        // Section 16 registers this key through the device's own authenticated channel, so the
+        // caller has to be a paired device and the device has to be the one it names. An actor
+        // this host cannot resolve to a paired device is not one of them: a revocation between
+        // the connection's admission and this write leaves exactly that, and it refuses here.
+        if self.paired_device(actor_id) != Some(params.device_id) {
             return Err(ControllerError::InvalidArgument(
-                "a paired device may rotate only its own preview key".to_owned(),
+                "a paired device may register only its own preview key".to_owned(),
             ));
         }
         let now_ms = self.settled_now_ms();
         let destination_id =
             kr_delivery::destination::DestinationId::new(params.device_id.to_string())
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // The device directory is written first, because it is the authority on which key and
+        // revision belong to the device. Both stores take the same registration again without
+        // complaint, so a resubmission after a lost answer, and a restart between the two writes,
+        // both end with the two agreeing.
+        match self.devices.update_preview_key(
+            params.device_id,
+            params.notification_preview,
+            params.revision,
+        )? {
+            net::devices::PreviewKeyOutcome::Recorded
+            | net::devices::PreviewKeyOutcome::AlreadyRecorded => {}
+            net::devices::PreviewKeyOutcome::RevisionBehind(recorded) => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "revision {} does not follow the recorded revision {}",
+                    params.revision.get(),
+                    recorded.get()
+                )));
+            }
+            net::devices::PreviewKeyOutcome::NotPaired => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "device {} is not paired or has been revoked",
+                    params.device_id
+                )));
+            }
+        }
         match self.delivery.update_preview_key(
             &destination_id,
             params.notification_preview,
@@ -4085,20 +4111,11 @@ impl Controller {
             Err(ControllerError::InvalidArgument(message))
                 if message.contains("is not a destination this host has configured") =>
             {
-                // Not configured in delivery journal as a push destination yet; updating device directory.
+                // The device has registered a key before this host configured it as a delivery
+                // destination. The directory holds the key, and configuring the destination takes
+                // it from there.
             }
             Err(error) => return Err(error),
-        }
-        let updated = self.devices.update_preview_key(
-            params.device_id,
-            params.notification_preview,
-            params.revision,
-        )?;
-        if !updated {
-            return Err(ControllerError::InvalidArgument(format!(
-                "device {} is not paired or has been revoked",
-                params.device_id
-            )));
         }
         encode(&kr_protocol::sharing::DevicePreviewKeyUpdateResult {
             device_id: params.device_id,

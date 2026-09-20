@@ -2335,14 +2335,10 @@ async fn device_preview_key_update_via_controller() {
         })
         .unwrap();
 
-    // Verify stale revision is refused
-    let stale_params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
-        device_id,
-        notification_preview: *new_key.public(),
-        revision: DeviceKeyRevision::new(2),
-    };
-    let stale_mutation = MutationRequest {
-        action_id: kr_protocol::ids::ActionId::new(uuid(100)),
+    // The same registration again is the one this host already holds: a device whose answer was
+    // lost sends it again, and both stores say what they said the first time.
+    let repeat_mutation = MutationRequest {
+        action_id: kr_protocol::ids::ActionId::new(uuid(99)),
         request_id: kr_protocol::ids::RequestId::new(2),
         method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
         method_version: kr_protocol::method::MethodVersion::V1,
@@ -2351,13 +2347,54 @@ async fn device_preview_key_update_via_controller() {
         expected: ParamsValue::empty(),
         action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").unwrap(),
         requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
-        params: ParamsValue::from_typed(&stale_params).unwrap(),
+        params: ParamsValue::from_typed(&params).unwrap(),
     };
-    assert!(
-        controller
-            .device_preview_key_update(&actor_id, &stale_mutation)
-            .await
-            .is_err()
+    let repeated: kr_protocol::sharing::DevicePreviewKeyUpdateResult = controller
+        .device_preview_key_update(&actor_id, &repeat_mutation)
+        .await
+        .expect("a resubmission is answered rather than refused")
+        .to_typed()
+        .unwrap();
+    assert_eq!(repeated.revision, DeviceKeyRevision::new(2));
+    assert_eq!(repeated.notification_preview, *new_key.public());
+
+    // A registration that does not follow the recorded one is refused, in both stores.
+    let replaced = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
+    for behind in [1_u64, 2] {
+        let stale_params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+            device_id,
+            notification_preview: *replaced.public(),
+            revision: DeviceKeyRevision::new(behind),
+        };
+        let stale_mutation = MutationRequest {
+            action_id: kr_protocol::ids::ActionId::new(uuid(100)),
+            request_id: kr_protocol::ids::RequestId::new(2),
+            method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(controller.paths().environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").unwrap(),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&stale_params).unwrap(),
+        };
+        assert!(
+            controller
+                .device_preview_key_update(&actor_id, &stale_mutation)
+                .await
+                .is_err(),
+            "revision {behind} does not follow 2"
+        );
+    }
+    let stored = controller
+        .devices()
+        .record_for_device(device_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.notification_preview,
+        Some(*new_key.public()),
+        "a refused registration leaves the recorded key alone"
     );
 
     // Verify another device cannot rotate
@@ -2385,6 +2422,57 @@ async fn device_preview_key_update_via_controller() {
             .await
             .is_err()
     );
+
+    // An actor this host cannot resolve to a paired device is not a paired device. A revocation
+    // between the connection's admission and this write leaves exactly that, and the registration
+    // it carries reaches neither store.
+    let unresolved = kr_transport::listener::device_principal(&DeviceId::new(uuid(88)));
+    let stolen = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
+    let stolen_params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+        device_id,
+        notification_preview: *stolen.public(),
+        revision: DeviceKeyRevision::new(9),
+    };
+    let stolen_mutation = MutationRequest {
+        action_id: kr_protocol::ids::ActionId::new(uuid(102)),
+        request_id: kr_protocol::ids::RequestId::new(4),
+        method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(controller.paths().environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").unwrap(),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&stolen_params).unwrap(),
+    };
+    assert!(
+        controller
+            .device_preview_key_update(&unresolved, &stolen_mutation)
+            .await
+            .is_err(),
+        "an unresolved actor may not register a key for a device it does not hold"
+    );
+    let stored = controller
+        .devices()
+        .record_for_device(device_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.notification_preview, Some(*new_key.public()));
+    assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(2));
+    controller
+        .delivery()
+        .with(|producer| {
+            let destination = producer
+                .journal()
+                .destination(&destination_id)
+                .unwrap()
+                .unwrap();
+            let push = destination.as_push().unwrap();
+            assert_eq!(push.preview_keys.current, *new_key.public());
+            assert_eq!(push.preview_keys.revision, 2);
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]
