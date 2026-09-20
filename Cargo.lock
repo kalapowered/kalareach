@@ -4015,6 +4015,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-automation"
+version = "0.1.0"
+dependencies = [
+ "kr-attention",
+ "kr-changeset",
+ "kr-ipc",
+ "kr-project",
+ "kr-protocol",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kr-cbor"
 version = "0.1.0"
 dependencies = [
