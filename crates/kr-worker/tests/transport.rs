@@ -282,8 +282,26 @@ fn broker() -> Arc<Broker> {
     broker_with_rich(rich())
 }
 
+/// The same broker over a journal on disk, which is what a restart reads back.
+///
+/// The connection comes back with it: a restart numbers its connections above everything the
+/// ledger has seen, so the one this opens is not the one the process before it had.
+fn broker_at(journal: &std::path::Path) -> (Arc<Broker>, GatewayConnectionId) {
+    broker_from(
+        Broker::open(Some(journal), session()).expect("the broker opens"),
+        rich(),
+    )
+}
+
 fn broker_with_rich(rich: RichMethodTable) -> Arc<Broker> {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    broker_from(
+        Broker::open(None, session()).expect("the broker opens"),
+        rich,
+    )
+    .0
+}
+
+fn broker_from(broker: Broker, rich: RichMethodTable) -> (Arc<Broker>, GatewayConnectionId) {
     broker
         .register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
         .expect("the instance is registered");
@@ -302,7 +320,7 @@ fn broker_with_rich(rich: RichMethodTable) -> Arc<Broker> {
     broker
         .pin_table(instance(), table(), rich)
         .expect("the installed tables are pinned");
-    broker
+    let connection = broker
         .open_native_connection(
             instance(),
             &CREDENTIAL,
@@ -312,7 +330,7 @@ fn broker_with_rich(rich: RichMethodTable) -> Arc<Broker> {
         )
         .expect("the native connection is authenticated");
     record_capabilities(&broker);
-    Arc::new(broker)
+    (Arc::new(broker), connection)
 }
 
 /// Builds one connection's owner over two real socket pairs and returns the ends a test drives.
@@ -346,16 +364,21 @@ struct Served {
 
 /// The same, with every end of the connection and the observer subscription.
 async fn duplex_watched(broker: &Arc<Broker>) -> Served {
+    duplex_watched_on(broker, GatewayConnectionId::new(1)).await
+}
+
+/// The same over one named connection, which a restart's own connection needs.
+async fn duplex_watched_on(broker: &Arc<Broker>, connection: GatewayConnectionId) -> Served {
     let (upstream_here, upstream_there) =
         tokio::net::UnixStream::pair().expect("a socket pair is made");
     let (client_here, client_there) =
         tokio::net::UnixStream::pair().expect("a socket pair is made");
     let framing = Framing::new(NativeFraming::JsonLines);
-    let observations = broker.observatory().subscribe(GatewayConnectionId::new(1));
+    let observations = broker.observatory().subscribe(connection);
     let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
     let (owner, writes) = Duplex::new(
         Arc::clone(broker),
-        GatewayConnectionId::new(1),
+        connection,
         framing,
         upstream_writes,
         tokio::io::split(client_here).1,
@@ -1745,6 +1768,29 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
     .expect("the contested resource reaches a state nothing follows");
     assert!(settled.is_terminal());
 
+    // What the race produced is drained from both observers, so the order it was announced in is
+    // compared rather than assumed: two paths settling one resource is exactly where an order
+    // could differ between two observers, and it does not.
+    let raced_first = told(&mut first).await;
+    let raced_second = told(&mut second).await;
+    assert_eq!(
+        raced_first, raced_second,
+        "both observers read the race in the same order"
+    );
+    assert!(
+        raced_first.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "and in the order the transitions committed: {raced_first:?}"
+    );
+    assert!(
+        told(&mut unrelated).await.is_empty(),
+        "and the observer of another instance still reads none of it"
+    );
+    let announced: Vec<(u64, PendingState)> = told_first
+        .iter()
+        .copied()
+        .chain(raced_first.iter().copied())
+        .collect();
+
     // And the outbox holds exactly what was announced, because it was written with it.
     let recorded = broker.transitions_after(0).expect("the outbox reads");
     // Each resource's own events form a chain: the first names no parent and every later one
@@ -1783,10 +1829,9 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
     assert_eq!(
         recorded
             .iter()
-            .take(told_first.len())
             .map(|event| (event.sequence, event.state))
             .collect::<Vec<_>>(),
-        told_first,
+        announced,
         "a crash between the change and its event would have shown up here"
     );
     for event in &recorded {
@@ -1990,6 +2035,14 @@ async fn kr_req_12_13_a_client_request_the_upstream_never_answers_is_bounded_and
         bound,
         "and the refusal added nothing"
     );
+    // The caller is told, and so is the terminal: a request this host refused is answered under
+    // the identifier the terminal used, rather than left for a person to wait on.
+    let refusal = read_available(&mut client).await;
+    assert!(
+        refusal.contains("\"id\":9999") && refusal.contains("error"),
+        "the terminal reads an error for the request the bound refused: {}",
+        &refusal[..refusal.len().min(300)]
+    );
 
     // The upstream reads them and answers none. The deadline is what removes them.
     tokio::time::advance(
@@ -2060,6 +2113,288 @@ async fn kr_req_12_13_a_client_request_the_upstream_never_answers_is_bounded_and
     );
     assert_eq!(owner.forwarded_client_requests(), 0);
     drop(upstream);
+}
+
+/// KR-REQ-12.11 and section 24: every event says what class of content its resource holds.
+///
+/// Section 24 asks an event to carry a content classification. The method class the table gave
+/// the request is a different thing, and both are on the event: one says what the method may do,
+/// the other what a consumer would be reading if it followed the resource back to its retained
+/// frame. An opaque request is the connector's own bytes; once a granted decoder's interpretation
+/// is verified, what the resource offers is the decoded proposal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_every_event_says_what_class_of_content_its_resource_holds() {
+    use kr_worker::persistence::stores::ContentClass;
+
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let mut observations = served.observations;
+    let owner = Arc::clone(&served.owner);
+    let mut client = tokio::io::BufReader::new(served.client);
+
+    owner
+        .from_upstream(
+            br#"{"id":91,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut client).await;
+    let opaque = broker
+        .pending_resources()
+        .into_iter()
+        .find(|resource| resource.state == PendingState::Pending)
+        .expect("the request is recorded");
+    assert!(
+        !opaque.interpretation_verified,
+        "nothing has interpreted it yet"
+    );
+    let recorded = broker.transitions_after(0).expect("the outbox reads");
+    let first = recorded
+        .iter()
+        .find(|event| event.resource_id == opaque.resource_id)
+        .expect("its recording is in the outbox");
+    assert_eq!(
+        first.content,
+        ContentClass::TerminalContent,
+        "an uninterpreted native frame is the widest class its bytes can be"
+    );
+    assert_eq!(
+        first.classification.class,
+        kr_protocol::gateway::NativeMethodClass::Mutation,
+        "and the method class is its own field, about what the method may do"
+    );
+
+    // A granted decoder's interpretation is verified, which is what makes it answerable.
+    broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the interpretation is verified");
+    let after = broker
+        .transitions_after(first.sequence)
+        .expect("the outbox reads");
+    let interpreted = after
+        .iter()
+        .find(|event| event.cause == kr_worker::broker::TransitionCause::Interpreted)
+        .expect("the interpretation has an event of its own");
+    assert_eq!(
+        interpreted.content,
+        ContentClass::AuthoredContent,
+        "what a person is asked to answer is the decoded proposal, not the frame"
+    );
+    assert_eq!(
+        interpreted.parent_sequence,
+        Some(first.sequence),
+        "and it follows the recording"
+    );
+
+    // An observer reading the live stream is told the same thing the outbox holds.
+    let mut live = Vec::new();
+    while let Ok(Some(transition)) =
+        tokio::time::timeout(std::time::Duration::from_millis(250), observations.next()).await
+    {
+        live.push((transition.event_id, transition.content));
+    }
+    for event in recorded.iter().chain(after.iter()) {
+        if let Some((_, content)) = live.iter().find(|(id, _)| *id == event.event_id) {
+            assert_eq!(
+                *content, event.content,
+                "the live stream says what the outbox records"
+            );
+        }
+    }
+    assert!(
+        live.iter().any(|(id, _)| *id == interpreted.event_id),
+        "and the interpretation reached the observer"
+    );
+
+    served.drained.abort();
+}
+
+/// KR-REQ-12.11 and section 24: a restart goes on from the event it last announced.
+///
+/// The chain is what a consumer reads to know it has the whole of a resource's history. A restart
+/// that began a second chain for a resource this host was already answering would make the two
+/// indistinguishable, so the last event about each live resource comes back with the resource.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_restart_goes_on_from_the_event_it_last_announced() {
+    let directory = private_directory();
+    let journal = directory.join("broker.sqlite3");
+    let recorded = {
+        let (broker, connection) = broker_at(&journal);
+        broker
+            .forward_native(
+                connection,
+                br#"{"id":93,"method":"session/request_permission","params":{}}"#,
+                TimestampMs::new(2),
+            )
+            .expect("the request is forwarded");
+        broker.transitions_after(0).expect("the outbox reads")
+    };
+    let last = recorded.last().expect("the recording").clone();
+    assert_eq!(
+        last.parent_sequence, None,
+        "the first event names no parent"
+    );
+    assert_eq!(last.cause, kr_worker::broker::TransitionCause::Recorded);
+
+    // A second process over the same journal: the resource comes back, and so does the event it
+    // was last announced under.
+    let (restarted, _) = broker_at(&journal);
+    let restored = restarted
+        .pending_resources()
+        .into_iter()
+        .find(|resource| resource.resource_id == last.resource_id)
+        .expect("the unresolved resource comes back");
+    assert_eq!(restored.state, PendingState::Pending);
+    restarted
+        .upstream_resolved(&restored.request, TimestampMs::new(4))
+        .expect("the upstream withdraws its own request");
+    let after = restarted
+        .transitions_after(last.sequence)
+        .expect("the outbox reads");
+    let settlement = after
+        .iter()
+        .find(|event| event.resource_id == last.resource_id)
+        .expect("the settlement is recorded");
+    assert!(
+        settlement.sequence > last.sequence,
+        "the stream has one order across the restart"
+    );
+    assert_eq!(
+        settlement.parent_sequence,
+        Some(last.sequence),
+        "and the chain goes on from the event this host last announced"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.32 and KR-REQ-09: a write that does not finish reports every frame behind it.
+///
+/// The frames behind a failure are the ones a connection would lose quietly. Here the terminal's
+/// own requests are queued behind a frame the upstream never drains: the write deadline passes,
+/// the writers finish rather than waiting for a sentinel nothing will send, every identifier this
+/// host was holding is given back, and the terminal is told about each one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_writers_finish() {
+    let broker = broker();
+    // An upstream whose pipe takes a few bytes and then blocks for ever, and a terminal that
+    // reads everything this host sends it.
+    let (upstream_here, upstream_there) = tokio::io::duplex(8);
+    let (client_here, client_there) = tokio::io::duplex(1 << 20);
+    let (owner, writes) = Duplex::new(
+        Arc::clone(&broker),
+        GatewayConnectionId::new(1),
+        Framing::new(NativeFraming::JsonLines),
+        upstream_here,
+        client_here,
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        "agent-user",
+    );
+    let driving = tokio::spawn(writes);
+    let read_back = Arc::new(std::sync::Mutex::new(String::new()));
+    let reading = {
+        let read_back = Arc::clone(&read_back);
+        let mut client = client_there;
+        tokio::spawn(async move {
+            let mut chunk = [0_u8; 8192];
+            while let Ok(bytes) = tokio::io::AsyncReadExt::read(&mut client, &mut chunk).await {
+                if bytes == 0 {
+                    break;
+                }
+                read_back
+                    .lock()
+                    .expect("the record is not poisoned")
+                    .push_str(&String::from_utf8_lossy(&chunk[..bytes]));
+            }
+        })
+    };
+
+    // One request big enough to block the writer, and two behind it.
+    let filling = "z".repeat(8192);
+    owner
+        .from_client(
+            format!(r#"{{"id":71,"method":"session/update","params":{{"why":"{filling}"}}}}"#)
+                .as_bytes(),
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the first request is carried");
+    for id in [72, 73] {
+        owner
+            .from_client(
+                format!(r#"{{"id":{id},"method":"session/update","params":{{}}}}"#).as_bytes(),
+                TimestampMs::new(3),
+            )
+            .await
+            .expect("the requests behind it are carried");
+    }
+    assert_eq!(owner.forwarded_client_requests(), 3);
+
+    // The deadline passes, the connection ends, and the writers finish on their own.
+    tokio::time::timeout(std::time::Duration::from_secs(120), driving)
+        .await
+        .expect("the writers finish rather than waiting for a sentinel nothing will send")
+        .expect("their task is joined");
+    assert!(
+        owner.stopping(),
+        "a write that did not finish is a connection this host stops using"
+    );
+    assert_eq!(
+        owner.forwarded_client_requests(),
+        0,
+        "every identifier behind the failure is given back"
+    );
+    reading.await.expect("the terminal's reader finished");
+    let told = read_back
+        .lock()
+        .expect("the record is not poisoned")
+        .clone();
+    for id in [71, 72, 73] {
+        assert!(
+            told.contains(&format!("\"id\":{id}")),
+            "the terminal is told about the request it made under {id}: {told}"
+        );
+    }
+    assert!(
+        told.matches("error").count() >= 3,
+        "and each one is an error rather than an answer: {told}"
+    );
+    drop(upstream_there);
+}
+
+/// KR-REQ-11.32: an owner nothing holds any longer ends its connection.
+///
+/// Nothing inside the owner may outlive the callers that hold it. A supervisor that dropped its
+/// handle and left the connection running would leave a terminal talking to a host that has
+/// forgotten it, so the last handle going is the connection ending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_an_owner_nothing_holds_any_longer_ends_its_connection() {
+    let broker = broker();
+    let (owner, upstream, client, writes) = duplex_over_pipes(&broker, 1 << 20);
+    let driving = tokio::spawn(writes);
+    owner
+        .from_client(
+            br#"{"id":71,"method":"session/update","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the terminal's own request is carried");
+    assert_eq!(owner.forwarded_client_requests(), 1);
+
+    // Everything that held it lets go.
+    drop(owner);
+    tokio::time::timeout(std::time::Duration::from_secs(30), driving)
+        .await
+        .expect("the owner's own work finishes when nothing holds it")
+        .expect("its task is joined");
+    drop(upstream);
+    drop(client);
 }
 
 /// KR-REQ-11.32 and KR-REQ-09: a write that does not finish ends the connection, and every frame

@@ -497,8 +497,12 @@ impl Broker {
         // connection never lands in an old one's namespace.
         let next_connection = ledger.highest_connection()?;
         // And transition events are numbered above everything this ledger has recorded, so the
-        // stream a consumer follows has one order across a restart.
+        // stream a consumer follows has one order across a restart. What each live resource was
+        // last announced under comes back with it, so the next event about one this host was
+        // already answering names that event as its parent rather than starting a second chain.
         let next_event = ledger.highest_event()?.saturating_add(1);
+        let announced: BTreeMap<PendingResourceId, u64> =
+            ledger.latest_events()?.into_iter().collect();
         Ok(Self {
             state: Mutex::new(BrokerState {
                 session_id,
@@ -516,7 +520,7 @@ impl Broker {
                 connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
                 watchers: crate::broker::duplex::Observatory::new(),
-                announced: BTreeMap::new(),
+                announced,
                 next_event,
             }),
         })
@@ -3196,6 +3200,7 @@ impl BrokerState {
             binding_revision,
             state: resource.state,
             classification: resource.classification,
+            content: crate::broker::ledger::content_class(resource),
             durability: resource.durability,
             cause,
             actor_id,
@@ -3236,6 +3241,7 @@ impl BrokerState {
                 resource_id: resource.resource_id,
                 binding_revision: event.binding_revision,
                 state: resource.state,
+                content: event.content,
                 durability: event.durability,
                 cause: event.cause,
                 actor_id: event.actor_id.clone(),

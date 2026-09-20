@@ -173,18 +173,42 @@ impl Completion {
         }
     }
 
-    /// Runs the work for what actually happened.
-    fn run(mut self, delivery: Delivery) {
-        if let Some(work) = self.work.take() {
-            work(delivery);
-        }
+    /// Runs the work for what actually happened, and says whether it finished.
+    ///
+    /// A panic in one frame's work is caught here rather than unwinding the writer that is
+    /// running it. Letting it through would take the writer down between a frame and its
+    /// accounting: the bytes would stay reserved, the frames behind it would never be told what
+    /// became of them, and the owner would never be stopped. So the panic ends here, and the
+    /// caller ends the connection instead, because the work this frame depended on did not
+    /// happen and nothing can say what the peer now believes.
+    fn run(mut self, delivery: Delivery) -> Ran {
+        self.work.take().map_or(Ran::Finished, |work| {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(delivery))).is_ok() {
+                Ran::Finished
+            } else {
+                Ran::Panicked
+            }
+        })
     }
+}
+
+/// Whether one frame's work finished or panicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ran {
+    /// It ran to the end.
+    Finished,
+    /// It panicked, and the panic was caught rather than taking the writer with it.
+    Panicked,
 }
 
 impl Drop for Completion {
     fn drop(&mut self) {
         if let Some(work) = self.work.take() {
-            work(Delivery::Unsent);
+            // A frame that never went, dropped rather than reported: the same rule applies, and a
+            // panic here must not turn an unwind into an abort.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                work(Delivery::Unsent);
+            }));
         }
     }
 }
@@ -373,10 +397,84 @@ impl Sink {
 /// `failing` is the owner's own stop: a write that does not finish is a connection this host
 /// cannot go on using, and the owner is told rather than left to discover it one lost frame at a
 /// time.
+/// Builds the error one client request is refused with, in the connection's own framing.
+///
+/// It is a free function because the writer's own work needs it too: a request whose bytes never
+/// went is answered from inside the writer that established that, where there is no owner to
+/// borrow.
+fn refusal_frame(
+    broker: &Broker,
+    connection: GatewayConnectionId,
+    id: &UpstreamRequestId,
+    client: &serde_json::Value,
+    why: &str,
+) -> Option<Vec<u8>> {
+    let held = broker.connection(connection)?;
+    let mut body = serde_json::Map::new();
+    body.insert(held.table.response_id_field.clone(), client.clone());
+    body.insert(
+        held.table.error_field.clone(),
+        serde_json::json!({
+            "code": -32_603,
+            "message": format!("{why} ({id})"),
+        }),
+    );
+    serde_json::to_vec(&serde_json::Value::Object(body)).ok()
+}
+
+/// The end one writer closes when it has finished with its own.
+///
+/// It reaches the connection's ends weakly. A writer that outlives its owner has nothing to
+/// close: both ends went with the owner.
+#[derive(Clone)]
+struct Peer {
+    ends: Arc<std::sync::OnceLock<std::sync::Weak<Ends>>>,
+    side: Side,
+}
+
+/// Which end of a connection something is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    /// The end the upstream reads.
+    Upstream,
+    /// The end the terminal reads.
+    Client,
+}
+
+impl Peer {
+    /// The terminal's end, which the upstream's writer closes when it ends.
+    fn client(ends: &Arc<std::sync::OnceLock<std::sync::Weak<Ends>>>) -> Self {
+        Self {
+            ends: Arc::clone(ends),
+            side: Side::Client,
+        }
+    }
+
+    /// The upstream's end, which the terminal's writer closes when it ends.
+    fn upstream(ends: &Arc<std::sync::OnceLock<std::sync::Weak<Ends>>>) -> Self {
+        Self {
+            ends: Arc::clone(ends),
+            side: Side::Upstream,
+        }
+    }
+
+    /// Closes it, if the owner is still there to hold it.
+    fn close(&self) {
+        let Some(ends) = self.ends.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        match self.side {
+            Side::Upstream => ends.upstream.close(),
+            Side::Client => ends.client.close(),
+        }
+    }
+}
+
 fn sink<W>(
     framing: Framing,
     writer: W,
     failing: Stopping,
+    peer: Peer,
 ) -> (Sink, impl std::future::Future<Output = ()> + Send)
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -394,7 +492,7 @@ where
     // The writer holds the admission and not a sink. Holding a sink would hold a sender, and a
     // connection whose every sink had been dropped would leave a writer waiting for a frame that
     // nothing could ever queue.
-    (sink, drain(writer, queue, queued, admission, failing))
+    (sink, drain(writer, queue, queued, admission, failing, peer))
 }
 
 /// How an end tells the owner it can no longer be used.
@@ -419,6 +517,7 @@ async fn drain<W: AsyncWrite + Unpin>(
     queued: Arc<AtomicUsize>,
     admission: Arc<std::sync::Mutex<bool>>,
     failing: Stopping,
+    peer: Peer,
 ) {
     while let Some(outbound) = queue.recv().await {
         let Outbound::Frame {
@@ -439,13 +538,16 @@ async fn drain<W: AsyncWrite + Unpin>(
             report: Some(report),
             after,
             progress: Arc::new(AtomicUsize::new(0)),
+            ran: Ran::Finished,
         };
         let delivery = write_frame(&mut writer, &body, &flight.progress).await;
-        flight.settle(delivery);
-        if delivery != Delivery::Transmitted {
+        let ran = flight.settle(delivery);
+        if delivery != Delivery::Transmitted || ran == Ran::Panicked {
             // A connection with a half-written frame on it is one nothing can go on using: the
-            // peer has seen a fragment and nothing can say what it made of it. So admission ends
-            // here and the owner stops reading, rather than every later frame being lost quietly.
+            // peer has seen a fragment and nothing can say what it made of it. A frame whose own
+            // work panicked is the same: the record, the mapping or the settlement that had to
+            // follow it did not happen. So admission ends here and the owner stops reading,
+            // rather than every later frame being lost quietly.
             // Closing under the same lock a caller admits under is what makes the queue final: no
             // frame can be taken after this point, so what is in it now is all there will be.
             *admission
@@ -468,10 +570,15 @@ async fn drain<W: AsyncWrite + Unpin>(
             queued.fetch_sub(body.len(), Ordering::Release);
             let _ = report.send(Delivery::Unsent);
             if let Some(after) = after {
-                after.run(Delivery::Unsent);
+                let _ = after.run(Delivery::Unsent);
             }
         }
     }
+    // This end is finished, so the other one is too: a connection with one writer left is one
+    // whose frames would be taken and never written. It is closed *after* everything this writer
+    // was holding has been reported, because that reporting is what tells the terminal about the
+    // requests that never went, and it writes those refusals to the other end.
+    peer.close();
 }
 
 /// One frame the writer is part way through, and everything owed for it.
@@ -485,12 +592,14 @@ struct InFlight {
     report: Option<tokio::sync::oneshot::Sender<Delivery>>,
     after: Option<Completion>,
     progress: Arc<AtomicUsize>,
+    ran: Ran,
 }
 
 impl InFlight {
-    /// Settles this frame for what the writer established.
-    fn settle(&mut self, delivery: Delivery) {
+    /// Settles this frame for what the writer established, and says whether its work finished.
+    fn settle(&mut self, delivery: Delivery) -> Ran {
         self.finish(delivery);
+        self.ran
     }
 
     fn finish(&mut self, delivery: Delivery) {
@@ -498,7 +607,7 @@ impl InFlight {
             self.queued.fetch_sub(self.length, Ordering::Release);
             let _ = report.send(delivery);
             if let Some(after) = self.after.take() {
-                after.run(delivery);
+                self.ran = after.run(delivery);
             }
         }
     }
@@ -809,6 +918,12 @@ pub struct ResourceTransition {
     pub binding_revision: kr_protocol::ids::AgentBindingRevision,
     /// What it became.
     pub state: PendingState,
+    /// What class of content the resource holds, which is section 24's content classification.
+    ///
+    /// An observer reading the live stream is told what the outbox records, so a consumer that
+    /// follows the resource back to its content knows what kind of content it would be reading
+    /// before it asks for it.
+    pub content: crate::persistence::stores::ContentClass,
     /// What the resource's own history is: durable, or lived through an evidence gap.
     ///
     /// A transition made while the journal is faulted is announced and not recorded, exactly as
@@ -1216,14 +1331,26 @@ pub enum Closure {
     Shutdown,
 }
 
+/// The two ends of one connection, held once so that each writer can close the other.
+///
+/// A writer that ends - because its write did not finish, or because admission closed - leaves
+/// the other end with a queue nothing will ever take. It closes that end once it has reported
+/// every frame it was holding, which is what makes the whole owner finish when any part of it
+/// does. It reaches the other end weakly, so this is the only strong hold on either: when the
+/// owner goes, both senders go with it, and both writers end.
+#[derive(Debug)]
+struct Ends {
+    upstream: Sink,
+    client: Sink,
+}
+
 /// One live connection, owned by one supervised task.
 #[derive(Debug)]
 pub struct Duplex {
     broker: Arc<Broker>,
     connection: GatewayConnectionId,
     framing: Framing,
-    upstream: Sink,
-    client: Sink,
+    ends: Arc<Ends>,
     outstanding: Arc<Outstanding>,
     site: kr_protocol::ids::EnvironmentId,
     os_user: String,
@@ -1254,14 +1381,22 @@ impl Duplex {
             stopping: Arc::new(tokio::sync::Notify::new()),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let (to_upstream, upstream_writes) = sink(framing, upstream, failing.clone());
-        let (to_client, client_writes) = sink(framing, client, failing.clone());
+        let ends: Arc<std::sync::OnceLock<std::sync::Weak<Ends>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let (to_upstream, upstream_writes) =
+            sink(framing, upstream, failing.clone(), Peer::client(&ends));
+        let (to_client, client_writes) =
+            sink(framing, client, failing.clone(), Peer::upstream(&ends));
+        let both = Arc::new(Ends {
+            upstream: to_upstream,
+            client: to_client,
+        });
+        let _ = ends.set(Arc::downgrade(&both));
         let owner = Arc::new(Self {
             broker,
             connection,
             framing,
-            upstream: to_upstream,
-            client: to_client,
+            ends: both,
             outstanding: Arc::new(Outstanding::default()),
             site,
             os_user: os_user.into(),
@@ -1269,8 +1404,13 @@ impl Duplex {
             stopped: Arc::clone(&failing.stopped),
         });
         let sweeping = {
-            let owner = Arc::clone(&owner);
-            async move { owner.sweep().await }
+            // The sweep watches the owner rather than owning it. A strong reference here would
+            // keep a connection alive after the last caller let go of it, so the supervisor would
+            // be the only thing that could ever end one. Holding it weakly means the opposite: a
+            // dropped owner drops both ends, the writers see their queues close and finish, and
+            // this ends with them.
+            let owner = Arc::downgrade(&owner);
+            async move { Self::sweep_while_held(&owner).await }
         };
         let writes = async move {
             tokio::join!(upstream_writes, client_writes, sweeping);
@@ -1283,20 +1423,35 @@ impl Duplex {
     /// It runs beside the two writers and ends with them. A request nothing will ever answer is an
     /// entry nothing would ever remove, so the deadline is what removes it, and the client is told
     /// rather than left holding an identifier this host has forgotten.
-    async fn sweep(self: &Arc<Self>) {
-        while !self.stopped.load(Ordering::Acquire) {
-            for (id, client) in self.outstanding.expired() {
-                self.refuse_to_client(&id, &client, "the upstream did not answer this request");
+    async fn sweep_while_held(owner: &std::sync::Weak<Self>) {
+        loop {
+            // Taken for the work and let go of before the wait, so a caller that drops the last
+            // owner while this is waiting is not held up by this reference.
+            let Some(held) = owner.upgrade() else {
+                // Nothing holds the owner any more. There is no client end left to tell and no
+                // map left to empty: both went with it.
+                return;
+            };
+            if held.stopped.load(Ordering::Acquire) {
+                break;
             }
+            for (id, client) in held.outstanding.expired() {
+                held.refuse_to_client(&id, &client, "the upstream did not answer this request");
+            }
+            let stopping = Arc::clone(&held.stopping);
+            drop(held);
             tokio::select! {
                 () = tokio::time::sleep(SWEEP_INTERVAL) => {}
-                () = self.stopping.notified() => break,
+                () = stopping.notified() => break,
             }
         }
-        // The connection is ending. Everything still waiting is given up here rather than left in
-        // a map nobody will read again.
-        for (id, client) in self.outstanding.abandon() {
-            self.give_up(
+        // The connection is ending while someone still holds it. Everything still waiting is
+        // given up here rather than left in a map nobody will read again.
+        let Some(held) = owner.upgrade() else {
+            return;
+        };
+        for (id, client) in held.outstanding.abandon() {
+            held.give_up(
                 &id,
                 &client,
                 "this connection ended before the upstream answered",
@@ -1313,8 +1468,8 @@ impl Duplex {
         self.stopped.store(true, Ordering::Release);
         self.stopping.notify_waiters();
         self.abandon_client_requests(why);
-        self.upstream.close();
-        self.client.close();
+        self.ends.upstream.close();
+        self.ends.client.close();
     }
 
     /// Tells the client that one of its own requests will not be answered.
@@ -1322,22 +1477,8 @@ impl Duplex {
     /// Returns true when the terminal was told. A refusal that cannot be handed over is a person
     /// left waiting on a reply that is not coming, so its caller ends the connection instead.
     fn give_up(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) -> bool {
-        let Some(held) = self.broker.connection(self.connection) else {
-            return false;
-        };
-        let mut body = serde_json::Map::new();
-        body.insert(held.table.response_id_field.clone(), client.clone());
-        body.insert(
-            held.table.error_field.clone(),
-            serde_json::json!({
-                "code": -32_603,
-                "message": format!("{why} ({id})"),
-            }),
-        );
-        let Ok(encoded) = serde_json::to_vec(&serde_json::Value::Object(body)) else {
-            return false;
-        };
-        self.client.queue(&encoded).is_ok()
+        refusal_frame(&self.broker, self.connection, id, client, why)
+            .is_some_and(|encoded| self.ends.client.queue(&encoded).is_ok())
     }
 
     /// Returns how many of the client's own requests are waiting for the upstream.
@@ -1363,7 +1504,7 @@ impl Duplex {
         })?;
         Ok(Arc::new(Dispatch {
             connection: self.connection,
-            upstream: self.upstream.clone(),
+            upstream: self.ends.upstream.clone(),
             outstanding: Arc::clone(&self.outstanding),
             rich: connection.rich.clone(),
             params_field: connection.table.params_field.clone(),
@@ -1375,7 +1516,7 @@ impl Duplex {
     /// Returns how many bytes are waiting to be written to the upstream.
     #[must_use]
     pub fn queued_to_upstream(&self) -> usize {
-        self.upstream.queued_bytes()
+        self.ends.upstream.queued_bytes()
     }
 
     /// Asks this owner to stop reading both ends, and stops either end taking new frames.
@@ -1390,8 +1531,8 @@ impl Duplex {
         // Given up while the client end is still taking frames, so the terminal is actually told
         // about the requests this connection is ending with rather than told into a closed end.
         self.abandon_client_requests("this connection ended before the upstream answered");
-        self.upstream.close();
-        self.client.close();
+        self.ends.upstream.close();
+        self.ends.client.close();
     }
 
     /// Gives up every request of the client's this connection is still holding, and says why.
@@ -1471,7 +1612,7 @@ impl Duplex {
         // Queued, not awaited. Waiting here for the client's own socket would hold this reader,
         // and everything the upstream said behind this frame, behind one end that is not
         // draining. What the write turns out to be is the owner's to act on.
-        self.client.queue(frame)?;
+        self.ends.client.queue(frame)?;
         Ok(Carried::UpstreamRequest {
             method: forwarded.method,
             resource_id: resource.map(|resource| resource.resource_id),
@@ -1551,7 +1692,7 @@ impl Duplex {
         // The guard travels with the work that reports the write. If the frame is refused here it
         // is dropped instead, which settles the resource uncertain: the admission was spent and
         // no answer went.
-        self.upstream.queue_then(
+        self.ends.upstream.queue_then(
             &body,
             Some(Completion::new(move |delivery| admitted.settle(delivery))),
         )?;
@@ -1698,14 +1839,36 @@ impl Duplex {
     ) -> Result<()> {
         let broker = Arc::clone(&self.broker);
         let outstanding = Arc::clone(&self.outstanding);
-        let queued = self.upstream.queue_then(
+        let connection = self.connection;
+        let client_end = self.ends.client.clone();
+        let failing = Stopping {
+            stopping: Arc::clone(&self.stopping),
+            stopped: Arc::clone(&self.stopped),
+        };
+        let queued = self.ends.upstream.queue_then(
             encoded,
             Some(Completion::new(move |delivery| {
                 let _ = broker.client_request_settled(&admitted, outcome_of(delivery));
                 if delivery != Delivery::Transmitted
                     && let Some(id) = forwarded.as_ref()
                 {
-                    outstanding.client_identifier(id);
+                    // The bytes did not go, so nothing will ever answer this. The terminal is
+                    // waiting on it under its own identifier, so it is told here rather than left
+                    // waiting; a refusal that cannot be handed over ends the connection, which is
+                    // the same rule every other refusal follows.
+                    if let Some(client) = outstanding.client_identifier(id) {
+                        let told = refusal_frame(
+                            &broker,
+                            connection,
+                            id,
+                            &client,
+                            "this connection could not carry the request",
+                        )
+                        .is_some_and(|encoded| client_end.queue(&encoded).is_ok());
+                        if !told {
+                            failing.stop();
+                        }
+                    }
                 }
             })),
         );
@@ -1762,7 +1925,7 @@ impl Duplex {
         })?;
         // Queued, not awaited: a refusal is not an effect, and this reader has other frames to
         // read whether or not the upstream is draining.
-        self.upstream.queue(&body)?;
+        self.ends.upstream.queue(&body)?;
         Ok(false)
     }
 
@@ -1795,8 +1958,9 @@ impl Duplex {
             stopping: Arc::clone(&self.stopping),
             stopped: Arc::clone(&self.stopped),
         };
-        let client = self.client.clone();
-        self.client
+        let client = self.ends.client.clone();
+        self.ends
+            .client
             .queue_then(
                 &encoded,
                 Some(Completion::new(move |delivery| {
@@ -1971,6 +2135,11 @@ fn read_reply(
 mod tests {
     use super::*;
 
+    /// The other end of a sink built on its own: there is no connection, so there is none.
+    fn no_peer() -> Peer {
+        Peer::client(&Arc::new(std::sync::OnceLock::new()))
+    }
+
     /// A stop nothing is listening for, for a sink built on its own.
     fn stopping() -> Stopping {
         Stopping {
@@ -2068,6 +2237,7 @@ mod tests {
             Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             upstream,
             stopping(),
+            no_peer(),
         );
         let body = vec![b'x'; 4096];
         let mut accepted = 0;
@@ -2085,6 +2255,133 @@ mod tests {
         );
     }
 
+    /// Work that panics does not take the writer with it, and the frame is still accounted for.
+    ///
+    /// A panic in one frame's work used to unwind the writer between the write and its
+    /// accounting: the bytes stayed reserved, the frames behind it were never told what became of
+    /// them, and nothing stopped the owner. Now the panic ends at the frame, the queue is given
+    /// its bytes back, and the connection ends because the work that frame depended on did not
+    /// happen.
+    #[tokio::test]
+    async fn work_that_panics_leaves_the_writer_accounting_and_stops_the_owner() {
+        let (writer, mut reader) = tokio::io::duplex(1 << 16);
+        let failing = stopping();
+        let (sink, writes) = sink(
+            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            writer,
+            failing.clone(),
+            no_peer(),
+        );
+        let driving = tokio::spawn(writes);
+        let queued = sink
+            .queue_then(
+                b"{\"id\":1}",
+                Some(Completion::new(|_| panic!("this frame's work panics"))),
+            )
+            .expect("it is queued");
+        assert_eq!(
+            queued.delivered().await,
+            Delivery::Transmitted,
+            "the frame itself went: it is the work after it that panicked"
+        );
+        // The bytes the frame reserved come back, whatever its work did.
+        for _ in 0..200 {
+            if sink.queued_bytes() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(sink.queued_bytes(), 0, "the frame's bytes are released");
+        for _ in 0..200 {
+            if failing.stopped.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            failing.stopped.load(Ordering::Acquire),
+            "and the connection ends rather than going on without the work"
+        );
+        assert!(
+            sink.queue(b"{\"id\":2}").is_err(),
+            "nothing is admitted after it"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), driving)
+            .await
+            .expect("the writer finishes rather than unwinding")
+            .expect("its task is joined");
+        drop(reader.shutdown());
+    }
+
+    /// Everything admitted before a close is written; nothing admitted after it exists.
+    ///
+    /// Frames are queued from several tasks while one of them closes the end. Whichever way that
+    /// race goes, a caller that was told its frame was admitted sees it on the peer's side, and a
+    /// caller that was refused sees nothing of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_admitted_as_the_end_closes_is_written_and_a_refused_one_is_not() {
+        let (writer, reader) = tokio::io::duplex(1 << 20);
+        let (sink, writes) = sink(
+            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            writer,
+            stopping(),
+            no_peer(),
+        );
+        let driving = tokio::spawn(writes);
+        let sink = Arc::new(sink);
+        let admitting = {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut admitted = Vec::new();
+                for id in 0..64_u32 {
+                    if sink.queue(format!("{{\"id\":{id}}}").as_bytes()).is_ok() {
+                        admitted.push(id);
+                    }
+                    tokio::task::yield_now().await;
+                }
+                admitted
+            })
+        };
+        let closing = {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                sink.close();
+            })
+        };
+        let admitted = admitting.await.expect("the admitting task finished");
+        closing.await.expect("the closing task finished");
+        tokio::time::timeout(std::time::Duration::from_secs(10), driving)
+            .await
+            .expect("the writer ends at the close")
+            .expect("its task is joined");
+        let mut written = String::new();
+        let mut reader = tokio::io::BufReader::new(reader);
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut written)
+            .await
+            .expect("what went is readable");
+        let lines: Vec<&str> = written.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            admitted.len(),
+            "every frame admitted before the close went, and nothing else did"
+        );
+        for id in &admitted {
+            assert!(
+                written.contains(&format!("{{\"id\":{id}}}")),
+                "an admitted frame reached the peer: {id}"
+            );
+        }
+        for id in 0..64_u32 {
+            if !admitted.contains(&id) {
+                assert!(
+                    !written.contains(&format!("{{\"id\":{id}}}")),
+                    "a refused frame never existed: {id}"
+                );
+            }
+        }
+    }
+
     /// A frame the peer never reads leaves the write deadline, not an unbounded wait.
     #[tokio::test(start_paused = true)]
     async fn a_peer_that_never_reads_leaves_a_partial_delivery() {
@@ -2094,6 +2391,7 @@ mod tests {
             Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             writer,
             stopping(),
+            no_peer(),
         );
         let driving = tokio::spawn(writes);
         let queued = sink.queue(&vec![b'y'; 4096]).expect("it is queued");

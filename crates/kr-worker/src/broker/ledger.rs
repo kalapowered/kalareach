@@ -34,7 +34,9 @@
 //!   every observer is told in.
 
 use kr_protocol::broker::{BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile};
-use kr_protocol::gateway::{EvidenceGap, NativeClassification, PendingResource, PendingState};
+use kr_protocol::gateway::{
+    EvidenceGap, NativeClassification, PendingKind, PendingResource, PendingState,
+};
 use kr_protocol::ids::{
     ApplicationInstanceId, BrokerBindingId, GatewayConnectionId, PendingResourceId,
     SourceEventHandle, StreamCursor, UpstreamMethod, UpstreamRequestId,
@@ -44,9 +46,10 @@ use kr_protocol::session::Durability;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::broker::error::{BrokerError, Result};
+use crate::persistence::stores::ContentClass;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// How long the ledger waits for another connection to finish writing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -161,6 +164,51 @@ pub enum TransitionCause {
     Reconciliation,
 }
 
+/// Returns the class of content one resource's own content belongs to.
+///
+/// Section 24 asks every event to carry a content classification beside its identity and its
+/// causal chain, and the classes are the worker's own
+/// ([`crate::persistence::stores::ContentClass`]), not a second vocabulary. It is a different
+/// question from [`NativeClassification`], which says what a method may *do*.
+///
+/// No broker row holds the content itself. A native request's bytes stay in the retained source
+/// frame they arrived in, and the resource names that frame; this says what a consumer would be
+/// reading if it followed the name back, so it is the widest class the content can be:
+///
+/// * a recorded native request, approval or reverse operation alike, is the connector's own
+///   frame, and the widest thing a frame can quote is the application's own output, so it is
+///   terminal content for as long as nothing has interpreted it;
+/// * once a granted decoder's interpretation is verified, what the resource offers is the decoded
+///   proposal a person is asked to answer, which is text an agent asked for;
+/// * an action this host prepared carries what the person wrote.
+#[must_use]
+pub const fn content_class(resource: &PendingResource) -> ContentClass {
+    match resource.kind {
+        PendingKind::UpstreamAction => ContentClass::AuthoredContent,
+        PendingKind::Approval | PendingKind::ReverseRpc => {
+            if resource.interpretation_verified {
+                ContentClass::AuthoredContent
+            } else {
+                ContentClass::TerminalContent
+            }
+        }
+    }
+}
+
+/// Returns the stable stored name of one content class.
+///
+/// The names are the journal's, because the classes are one vocabulary and a reader of either
+/// store has to find the same word for the same thing.
+const fn class_text(class: ContentClass) -> &'static str {
+    match class {
+        ContentClass::Metadata => "metadata",
+        ContentClass::TerminalContent => "terminal",
+        ContentClass::AuthoredContent => "authored",
+        ContentClass::ApplicationNotice => "notice",
+        ContentClass::Secret => "secret",
+    }
+}
+
 impl TransitionCause {
     /// Every cause, in declaration order.
     pub const ALL: &'static [Self] = &[
@@ -213,8 +261,13 @@ pub struct TransitionEvent {
     pub binding_revision: kr_protocol::ids::AgentBindingRevision,
     /// What the resource became.
     pub state: PendingState,
-    /// How the request behind the resource was classified.
+    /// How the connection's own pinned table classified the method behind the resource.
+    ///
+    /// This is the method's effect class, which is what decides whether an unclassified request
+    /// suspends rich mutations. Section 24's content classification is `content`, beside it.
     pub classification: NativeClassification,
+    /// What class of content the resource holds, which is section 24's content classification.
+    pub content: ContentClass,
     /// What the resource's own history is: durable, or lived through an evidence gap.
     pub durability: Durability,
     /// Which of the broker's paths decided this transition.
@@ -238,6 +291,20 @@ fn class_from(text: &str) -> Result<kr_protocol::gateway::NativeMethodClass> {
         .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored classification")))
 }
 
+/// Reads one stored content class back.
+fn content_from(text: &str) -> Result<ContentClass> {
+    match text {
+        "metadata" => Ok(ContentClass::Metadata),
+        "terminal" => Ok(ContentClass::TerminalContent),
+        "authored" => Ok(ContentClass::AuthoredContent),
+        "notice" => Ok(ContentClass::ApplicationNotice),
+        "secret" => Ok(ContentClass::Secret),
+        other => Err(BrokerError::ledger(format!(
+            "{other} is not a stored content class"
+        ))),
+    }
+}
+
 /// Reads one stored pending state back.
 fn state_from(text: &str) -> Result<PendingState> {
     PendingState::ALL
@@ -253,9 +320,9 @@ fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent)
         .execute(
             "INSERT INTO broker_events
                  (sequence, event_id, application_instance_id, resource_id, binding_revision,
-                  state, class, declared, durability, cause, actor_id, causal_root,
+                  state, class, declared, content, durability, cause, actor_id, causal_root,
                   parent_sequence, recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 i64::try_from(event.sequence).unwrap_or(i64::MAX),
                 event.event_id.as_bytes().as_slice(),
@@ -265,6 +332,7 @@ fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent)
                 event.state.as_str(),
                 event.classification.class.as_str(),
                 i64::from(event.classification.declared),
+                class_text(event.content),
                 event.durability.as_str(),
                 event.cause.as_str(),
                 event
@@ -328,6 +396,7 @@ struct StoredEvent {
     state: String,
     class: String,
     declared: i64,
+    content: String,
     durability: String,
     cause: String,
     actor_id: Option<String>,
@@ -483,6 +552,7 @@ impl Ledger {
                      state                   TEXT NOT NULL,
                      class                   TEXT NOT NULL,
                      declared                INTEGER NOT NULL,
+                     content                 TEXT NOT NULL,
                      durability              TEXT NOT NULL,
                      cause                   TEXT NOT NULL,
                      actor_id                TEXT,
@@ -909,6 +979,49 @@ impl Ledger {
         Ok(u64::try_from(highest).unwrap_or_default())
     }
 
+    /// Reads the last event about each resource that has not reached a terminal state.
+    ///
+    /// This is what a restart needs to go on writing causal chains. Without it the first event
+    /// after a restart would name no parent, and a consumer reading the outbox could not tell a
+    /// resource that has just begun from one this host has been answering since before the
+    /// restart. A resource whose last event is terminal is not here: nothing follows it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails or a row is unreadable.
+    pub fn latest_events(&self) -> Result<Vec<(PendingResourceId, u64)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT resource_id, sequence, state FROM broker_events
+                 WHERE sequence IN (SELECT MAX(sequence) FROM broker_events GROUP BY resource_id)
+                 ORDER BY sequence",
+            )
+            .map_err(BrokerError::ledger)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(BrokerError::ledger)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(BrokerError::ledger)?;
+        let mut latest = Vec::new();
+        for (resource, sequence, state) in rows {
+            if state_from(&state)?.is_terminal() {
+                continue;
+            }
+            latest.push((
+                PendingResourceId::new(uuid_from(&resource)?),
+                u64::try_from(sequence).unwrap_or_default(),
+            ));
+        }
+        Ok(latest)
+    }
+
     /// Reads the transitions recorded after one cursor, in order.
     ///
     /// # Errors
@@ -919,8 +1032,8 @@ impl Ledger {
             .connection
             .prepare(
                 "SELECT sequence, event_id, application_instance_id, resource_id,
-                        binding_revision, state, class, declared, durability, cause, actor_id,
-                        causal_root, parent_sequence, recorded_at_ms
+                        binding_revision, state, class, declared, content, durability, cause,
+                        actor_id, causal_root, parent_sequence, recorded_at_ms
                  FROM broker_events WHERE sequence > ?1 ORDER BY sequence",
             )
             .map_err(BrokerError::ledger)?;
@@ -937,12 +1050,13 @@ impl Ledger {
                         state: row.get(5)?,
                         class: row.get(6)?,
                         declared: row.get(7)?,
-                        durability: row.get(8)?,
-                        cause: row.get(9)?,
-                        actor_id: row.get(10)?,
-                        causal_root: row.get(11)?,
-                        parent_sequence: row.get(12)?,
-                        recorded: row.get(13)?,
+                        content: row.get(8)?,
+                        durability: row.get(9)?,
+                        cause: row.get(10)?,
+                        actor_id: row.get(11)?,
+                        causal_root: row.get(12)?,
+                        parent_sequence: row.get(13)?,
+                        recorded: row.get(14)?,
                     })
                 },
             )
@@ -964,6 +1078,7 @@ impl Ledger {
                         class: class_from(&row.class)?,
                         declared: row.declared != 0,
                     },
+                    content: content_from(&row.content)?,
                     durability: durability_from(&row.durability)?,
                     cause: cause_from(&row.cause)?,
                     actor_id: row
@@ -1751,6 +1866,79 @@ mod tests {
         );
     }
 
+    /// An event the outbox refuses takes its transition back with it.
+    ///
+    /// Section 24 commits the change and the event that announces it in one transaction, so the
+    /// failure of either is the failure of both. A settle whose event cannot be written leaves
+    /// the resource as it was, and the event it would have followed is still the last one, so the
+    /// next event about that resource names the same parent it would have named before.
+    #[test]
+    fn a_transition_whose_event_cannot_be_written_goes_back_whole() {
+        let ledger = Ledger::open(None).expect("the ledger opens");
+        let pending = resource(31, "71", PendingState::Pending);
+        let recording = event(1, &pending);
+        ledger
+            .record_opaque(&pending, &recording)
+            .expect("the request is recorded");
+
+        // An event under an identifier the outbox already holds cannot be written.
+        let settled = PendingResource {
+            state: PendingState::Resolved,
+            ..pending.clone()
+        };
+        let duplicate = TransitionEvent {
+            sequence: 2,
+            ..event(1, &settled)
+        };
+        let refused = ledger.settle_pending(
+            &settled,
+            PendingState::Pending,
+            false,
+            TimestampMs::new(12),
+            &duplicate,
+        );
+        assert!(
+            refused.is_err(),
+            "an event the outbox will not take is not a transition this host records"
+        );
+        let held = ledger.unresolved().expect("the records read");
+        assert_eq!(
+            held.iter()
+                .find(|record| record.resource.resource_id == pending.resource_id)
+                .expect("the resource is still there")
+                .resource
+                .state,
+            PendingState::Pending,
+            "the change went back with the event"
+        );
+        let outbox = ledger.events_after(0).expect("the outbox reads");
+        assert_eq!(outbox.len(), 1, "and nothing was announced for it");
+        assert_eq!(outbox[0].event_id, recording.event_id);
+
+        // The next event about it, under an identifier of its own, still follows the recording.
+        let following = TransitionEvent {
+            sequence: 3,
+            parent_sequence: Some(recording.sequence),
+            ..event(3, &settled)
+        };
+        ledger
+            .settle_pending(
+                &settled,
+                PendingState::Pending,
+                false,
+                TimestampMs::new(13),
+                &following,
+            )
+            .expect("the retry succeeds");
+        let outbox = ledger.events_after(0).expect("the outbox reads");
+        assert_eq!(outbox.len(), 2);
+        assert_eq!(
+            outbox[1].parent_sequence,
+            Some(recording.sequence),
+            "the rollback left the chain where it was"
+        );
+    }
+
     /// One transition event, as a settle writes beside the change it records.
     fn event(sequence: u64, resource: &PendingResource) -> TransitionEvent {
         TransitionEvent {
@@ -1761,6 +1949,7 @@ mod tests {
             binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
             state: resource.state,
             classification: resource.classification,
+            content: content_class(resource),
             durability: resource.durability,
             cause: TransitionCause::Recorded,
             actor_id: None,
