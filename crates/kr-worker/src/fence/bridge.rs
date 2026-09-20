@@ -293,7 +293,7 @@ mod tests {
     ///
     #[cfg_attr(
         windows,
-        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where every other suite in this workspace passed, and what holds it has not been established"
+        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where the suites qualified for this platform passed and several others failed, and what holds it has not been established"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_ends_when_the_writer_it_shares_a_connection_with_does() {
@@ -371,7 +371,7 @@ mod tests {
     ///
     #[cfg_attr(
         windows,
-        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where every other suite in this workspace passed, and what holds it has not been established"
+        ignore = "on Windows this does not finish: it was seen still running after a minute with its shell alive, on a machine where the suites qualified for this platform passed and several others failed, and what holds it has not been established"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_with_a_deadline_armed_ends_with_its_writer_too() {

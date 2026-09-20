@@ -524,7 +524,9 @@ selects the ConPTY backend so that a mode request from its own console is record
 ignored. What does not exist is the transport between them: the session protocol carries input as
 bytes, so a local attach client on Windows still sends bytes rather than typed key records, and the
 worker does not yet choose the encoding per client. A session therefore runs on the legacy VT path
-today, and says so rather than claiming the record path it does not yet use.
+today. Nothing reports that at runtime: the engine tracks which fidelity the backend asked for and
+the reader knows which one it is reading, but no receipt, diagnostic or client message carries
+either answer yet, so this page is where the limit is stated.
 
 ### Running the Windows tests
 
