@@ -284,6 +284,14 @@ line, at a `command_block` that reports an exit status, at a reader entry or idl
 generation, and at `integration_lost`. A package needs no expiry logic of its own; it needs only to
 stop exporting a token once the command it exported it for has ended.
 
+One acceptance is not a line: the input a running command reads through the editor. A shell reports
+it with `command_accepted` like any other, because to the editor it is one, and the worker tells
+them apart by the context the reader entered and acknowledged in. An acceptance from a
+`read_builtin` reader records no origin and mints no capability; the answer carries the origin that
+stays in force and a null `detach_token`, and the line that started the command goes on holding
+both. A `continuation` acceptance is not this case: it is part of the line being typed, at the same
+prompt, and that line is the one that runs.
+
 The packaged shells do not export it yet, for the same reason they emit no `command_resolve` or
 `command_block`: the hooks that would carry them are the package builder's. Until a package does,
 a bare `kr detach` inside it is answered with the instruction to name the attachment, which is the

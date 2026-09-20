@@ -485,6 +485,7 @@ pub fn scenarios() -> Vec<Scenario> {
         veof_disabled(),
         psreadline_chord_gesture(),
         acceptance_mixed_context(),
+        acceptance_read_builtin(),
         editor_leave_boundaries(),
         retry_at_entry_and_leave(),
         interrupt_bypasses_the_hold(),
@@ -648,6 +649,23 @@ fn drained(candidate: u8, prompt: u64, revision: u64, state: EditorState) -> Sti
         KeyQueueSnapshot::drained(),
         state,
     )
+}
+
+/// A drained acknowledgement from a reader that says which context it is reading in.
+fn drained_in(
+    candidate: u8,
+    prompt: u64,
+    revision: u64,
+    state: EditorState,
+    context: ReaderContext,
+) -> Stimulus {
+    let Stimulus::FenceAcknowledged(mut acknowledgement) =
+        drained(candidate, prompt, revision, state)
+    else {
+        unreachable!("a drained acknowledgement is one")
+    };
+    acknowledgement.reader_context = context;
+    Stimulus::FenceAcknowledged(acknowledgement)
 }
 
 fn idle(prompt: u64, revision: u64, candidate: u8) -> Stimulus {
@@ -3846,6 +3864,114 @@ fn psreadline_chord_gesture() -> Scenario {
 }
 
 // ----- acceptance, leave boundaries, retries and the remaining machine rules -------------------
+
+fn acceptance_read_builtin() -> Scenario {
+    fence_scenario(
+        "acceptance-read-builtin",
+        "Input a running command reads through the line editor is accepted like a line and is not \
+         one. The record stays with the line that started the command, whoever answers the read \
+         and whatever fence that reader is given, so an unqualified kr detach still belongs to the \
+         terminal the command was typed in.",
+        &["KR-REQ-07.84"],
+        every_shell(),
+        held_by_a(),
+        vec![
+            entered(1),
+            step(
+                5,
+                drained(1, 1, 1, empty_editor(1)),
+                expect(
+                    FenceState::Fenced,
+                    Some(1),
+                    &[],
+                    vec![publish(1, 1, 1, 3, attachment_a())],
+                ),
+            ),
+            // A types the line, which is the record every later detach resolves against.
+            step(
+                10,
+                accepted_command(Some(1), 1, fenced_origin(attachment_a(), 3)),
+                with_target(
+                    expect(
+                        FenceState::Fenced,
+                        Some(1),
+                        &[],
+                        vec![ActionShape::RecordAcceptance(fenced_origin(
+                            attachment_a(),
+                            3,
+                        ))],
+                    ),
+                    DetachTarget::Attachment(attachment_a()),
+                ),
+            ),
+            step(
+                15,
+                leave(1, 1, EditorLeaveReason::CommandAccepted),
+                with_target(
+                    expect(
+                        FenceState::Outside,
+                        None,
+                        &[],
+                        vec![invalidate(FenceInvalidation::EditorLeft)],
+                    ),
+                    DetachTarget::Attachment(attachment_a()),
+                ),
+            ),
+            // The command it started asks a question, and B has the keys by the time it does.
+            step(
+                20,
+                lease_change(4, Some(attachment_b()), 2, 0),
+                with_target(
+                    expect(
+                        FenceState::Outside,
+                        None,
+                        &[],
+                        vec![lease_ack(4, Some(attachment_b()), 0, &[])],
+                    ),
+                    DetachTarget::Attachment(attachment_a()),
+                ),
+            ),
+            step(
+                25,
+                enter_in(1, 2, 2, ReaderContext::ReadBuiltin),
+                expect(
+                    FenceState::Unfenced,
+                    None,
+                    &[],
+                    vec![ask(2, 1, 2, FenceCause::EditorEntry)],
+                ),
+            ),
+            step(
+                30,
+                drained_in(2, 1, 2, empty_editor(1), ReaderContext::ReadBuiltin),
+                expect(
+                    FenceState::Fenced,
+                    Some(2),
+                    &[],
+                    vec![publish(2, 1, 2, 4, attachment_b())],
+                ),
+            ),
+            // B answers the question. It is B's input, under B's fence, and it is not a line: the
+            // command A typed is still the one running and still the one a detach is about.
+            step(
+                35,
+                accepted_command(Some(2), 1, fenced_origin(attachment_b(), 4)),
+                with_target(
+                    expect(
+                        FenceState::Fenced,
+                        Some(2),
+                        &[],
+                        vec![ActionShape::RetainAcceptance(Some(fenced_origin(
+                            attachment_a(),
+                            3,
+                        )))],
+                    ),
+                    DetachTarget::Attachment(attachment_a()),
+                ),
+            ),
+        ],
+    )
+}
 
 fn acceptance_mixed_context() -> Scenario {
     fence_scenario(

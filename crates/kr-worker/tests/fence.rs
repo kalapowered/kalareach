@@ -619,6 +619,49 @@ fn drained(prompt: u64, revision: u64, fence_id: kr_protocol::root::FenceId) -> 
     }))
 }
 
+/// Takes the session to a published fence for a reader the `read` builtin opened.
+///
+/// The same exchange the primary prompt has, with the context the reader is actually in: a command
+/// is running and it is reading its own input through the editor.
+async fn fenced_read(
+    wired: &mut Wired,
+    prompt: u64,
+    revision: u64,
+) -> kr_protocol::root::EditorFence {
+    let mut entry = enter(wired.session_id, prompt, revision);
+    if let BridgeEvent::EditorEnter(params) = &mut entry {
+        params.reader_context = ReaderContext::ReadBuiltin;
+    }
+    wired.bridge.send_event(entry).await.expect("enters");
+    let fence_id = loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Fence(params) => break params.fence_id,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    };
+    let mut answer = drained(prompt, revision, fence_id);
+    if let BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) = &mut answer {
+        acknowledgement.reader_context = ReaderContext::ReadBuiltin;
+    }
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), answer)
+        .await
+        .expect("acknowledges");
+    loop {
+        match wired.next().await {
+            ToBridge::FencePublished(kr_protocol::root::FencePublication::Published(fence)) => {
+                return fence;
+            }
+            ToBridge::FencePublished(other) => panic!("the fence was withheld: {other:?}"),
+            _ => {}
+        }
+    }
+}
+
 /// Takes the session through entry to a published fence, and returns it.
 async fn fenced(wired: &mut Wired, prompt: u64, revision: u64) -> kr_protocol::root::EditorFence {
     wired
@@ -2126,6 +2169,74 @@ async fn a_capability_from_an_earlier_line_names_nothing_after_another_is_accept
         wired.runtime.session().attachments().len(),
         1,
         "and nothing was detached"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.84: input a running command reads is not a line, and does not move the capability.
+///
+/// `read -e answer; kr detach` is one accepted line. The `read` builtin opens another reader and
+/// the shell reports what it accepts there exactly as it reports a line, because to the editor it
+/// is one. It is not: the command A typed is still running, and a detach from inside it is still
+/// A's. Another attachment answering the question, under a fence of its own, changes neither the
+/// record nor the capability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_a_command_reads_is_not_a_line_and_leaves_the_capability_alone() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let typist = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    accept(&mut wired, &fence, typist).await;
+    let token = recorded_token(&mut wired)
+        .await
+        .expect("a capability for the line");
+
+    // The reader leaves, which is what running the command looks like from here.
+    wired
+        .bridge
+        .send_event(BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: wired.session_id,
+            prompt_generation: fence.prompt_generation,
+            reader_revision: ReaderRevision::new(1),
+            reason: kr_protocol::root::EditorLeaveReason::CommandAccepted,
+        }))
+        .await
+        .expect("leaves");
+
+    // The command asks its question, and another client has the keys by the time it does.
+    let answerer = holder_over(&mut client, &wired).await;
+    assert_ne!(answerer, typist);
+    let read = fenced_read(&mut wired, 1, 2).await;
+    accept(&mut wired, &read, answerer).await;
+    assert!(
+        recorded_token(&mut wired).await.is_none(),
+        "an answer to a question is not a line, so nothing is minted for it"
+    );
+
+    // The capability the line holds is untouched, and it still names the terminal that typed it.
+    let detached = detach(&mut client, &wired, Nullable::null(), Nullable::some(token))
+        .await
+        .expect("detaches");
+    assert_eq!(
+        detached.attachment_id, typist,
+        "the line's own terminal goes, not the one that answered its question"
+    );
+    assert!(
+        wired
+            .runtime
+            .session()
+            .attachment_capabilities(typist)
+            .is_none()
+    );
+    assert!(
+        wired
+            .runtime
+            .session()
+            .attachment_capabilities(answerer)
+            .is_some(),
+        "and the attachment that answered stays"
     );
     wired.close().await;
 }

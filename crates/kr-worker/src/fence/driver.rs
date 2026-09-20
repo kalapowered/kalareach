@@ -1067,6 +1067,21 @@ impl FenceDriver {
                     }),
                 );
             }
+            Action::RetainAcceptance(origin) => {
+                // Input a running command read through the editor. The record and the capability
+                // both belong to the line that started that command and neither is touched; the
+                // bridge is told what still stands and is given no capability, because nothing is
+                // about to run that one would belong to.
+                self.accepting = None;
+                self.answer(
+                    &mut effects,
+                    EventOutcome::CommandRecorded(RootCommandAcceptedResult {
+                        origin: origin.clone().unwrap_or(AcceptedOrigin::Unverifiable),
+                        detach_token: Nullable::null(),
+                        state,
+                    }),
+                );
+            }
             Action::CloseTakeoverReceipt {
                 epoch,
                 reader_discards,

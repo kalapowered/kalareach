@@ -440,6 +440,12 @@ pub enum Action {
     RefuseInterrupt(LeaseFault),
     /// Record where an accepted line came from.
     RecordAcceptance(AcceptedOrigin),
+    /// Keep the record this session already has, because what was accepted is not a line.
+    ///
+    /// Input a running command read through the editor is accepted like a line and is not one. The
+    /// origin this carries is the one that stays in force, which is the line the command came
+    /// from, and nothing: a session that has recorded no line yet.
+    RetainAcceptance(Option<AcceptedOrigin>),
     /// Complete the takeover receipt for this epoch.
     ///
     /// The lease change is acknowledged the moment it happens, because it stands whatever the
@@ -600,6 +606,8 @@ pub enum ActionShape {
     RefuseInterrupt(LeaseFault),
     /// [`Action::RecordAcceptance`].
     RecordAcceptance(AcceptedOrigin),
+    /// [`Action::RetainAcceptance`].
+    RetainAcceptance(Option<AcceptedOrigin>),
     /// [`Action::CloseTakeoverReceipt`].
     CloseTakeoverReceipt {
         /// The epoch the receipt belongs to.
@@ -695,6 +703,7 @@ impl Action {
             Self::Interrupt(action) => ActionShape::Interrupt(*action),
             Self::RefuseInterrupt(fault) => ActionShape::RefuseInterrupt(*fault),
             Self::RecordAcceptance(origin) => ActionShape::RecordAcceptance(origin.clone()),
+            Self::RetainAcceptance(origin) => ActionShape::RetainAcceptance(origin.clone()),
             Self::CloseTakeoverReceipt {
                 epoch,
                 reader_discards,
@@ -1589,6 +1598,21 @@ impl FenceMachine {
     fn command_accepted(&mut self, params: &RootCommandAcceptedParams, actions: &mut Vec<Action>) {
         if self.state == FenceState::Closing {
             actions.push(Action::IgnoreStale(StaleMessage::ReaderEvent));
+            return;
+        }
+        // A reader the `read` builtin opened is reading a running command's own input, not a line
+        // of the shell. A shell reports the acceptance of that input the same way it reports a
+        // line, because to the editor it is one; the difference is the context the reader entered
+        // in, which the worker holds. The line that started the command is still running, is still
+        // the line a detach belongs to and is still what this session has a record of, so nothing
+        // about it changes here. A continuation is not this case: its acceptance is part of the
+        // line being typed, at the same prompt, and it is the line that runs.
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.reader_context == ReaderContext::ReadBuiltin)
+        {
+            actions.push(Action::RetainAcceptance(self.acceptance.clone()));
             return;
         }
         let origin = self.resolve_origin(params);

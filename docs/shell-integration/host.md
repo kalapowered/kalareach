@@ -122,6 +122,7 @@ gone, or interrupt an application before the launch that interrupt revoked had b
 | `install_launch`, `reject_launch`, `revoke_launch`, `late_installation` | The launch transaction's outcome, and what is recorded beside it |
 | `interrupt`, `refuse_interrupt` | The configured native interrupt, which bypasses the hold |
 | `record_acceptance` | The origin a detach with no attachment identifier resolves against, and the capability minted for that line |
+| `retain_acceptance` | Input a running command read through the editor: the record and the capability both stay with the line that started it |
 
 ## The takeover receipt
 
