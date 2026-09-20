@@ -51,7 +51,9 @@ resolve the remote's name over the same kind of connection. Nothing may listen t
 
 **Only this operation's directories are written.** The repository's working tree and its Git common
 directory, the destination the operation reserved, and one temporary directory created for this
-invocation. Git's temporary files go in that directory rather than in one shared with everything
+invocation. An invocation is granted the directories its own work needs and no more: the one that
+moves a reference with its expected old value is granted the Git common directory alone, and the
+working tree is not writable by it. Git's temporary files go in that directory rather than in one shared with everything
 else on the machine. When the invocation ends the directory is taken away by the record this service
 wrote before it made it, and only if it is empty but for this service's own mark; what is not is
 left where it is, with a line saying so. The paragraph on it below says what that does and does not

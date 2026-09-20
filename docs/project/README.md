@@ -253,6 +253,15 @@ allowlist does not contain `clean`, `stash`, `reset`, `restore`, `commit`, `push
 `rebase`, `merge`, `gc` or `prune`, and no invocation carries `--force` in any form. They are not
 commands this service can run at all.
 
+The one subcommand here that writes a reference is `update-ref`, and it is admitted in one shape
+only: exactly three positional arguments — the reference, the new object and the **expected old
+object** — with `--no-deref` as the only option it accepts. A deletion (`-d`, `--delete`), a batch
+read from standard input (`--stdin`), an update with no expected old value, a fourth argument, and
+any abbreviation of those long options are each refused by name, as `--force` in any form and an
+attached `-c` are refused for every subcommand. The invocation runs with the repository's Git
+common directory as its working directory and a write grant for that directory alone: the working
+tree is not writable by it.
+
 ### Cleanup and retention
 
 Cleanup is explicit, and it happens only after every session bound to the workspace has finished. A
@@ -531,7 +540,7 @@ and reading one refuses it: a store that will not open is a daemon that never se
 | `workspaces` | One row per working copy, with its policy, its base and its tree's identity |
 | `workspace_sessions` | Which sessions are bound to a workspace, and which are still live |
 | `workspace_runs` | Which automation runs are bound to it, and which are still live |
-| `workspace_retained` | Dirty content, pinned change sets and review evidence, each identified by its kind, its reason and the change set it names |
+| `workspace_retained` | Dirty content, pinned change sets and review evidence, each identified by its kind, its reason and the change set it names. Indexed by that change set as well as by the workspace, so a deletion counting what holds a version asks the pin's own question |
 | `actions` | One row per claimed action: the claim, and its result when there is one |
 | `events`, `cursors` | The outbox and its consumers |
 
@@ -806,7 +815,7 @@ work is the one a caller gets by asking for it plainly.
 | Class | What it is |
 | --- | --- |
 | `proposal` | Two immutable versions and no write to any working tree: what the destination holds now, and what it would hold. A person decides |
-| `versioned_reference` | The expected-old-value comparison, and then the limitation. This host reads the reference and compares it: a value that differs is `DRAFT_CONFLICT`. It does **not** move the reference, because its restricted execution profile runs no subcommand that writes one, so what a caller gets is the limitation rather than the update. A compare-and-swap **update** is not implemented here and this row is not closed by it |
+| `versioned_reference` | Reference compare-and-swap. The apply reads the reference and compares it with the value the request expects; a value that differs is `DRAFT_CONFLICT`, and nothing is written. The move is the expected-old-value update described under the restricted profile above, performed under a write grant for the repository's Git common directory and nothing wider. It does **not** atomically update a dirty working tree: what moves is the reference, and a tree with uncommitted work in it is unchanged by one. The apply returns the comparison and that statement; the reference is moved by the service that owns the repository |
 | `shared_existing` | The user's own working tree, written in place. Best-effort conflict detection, not universal no-clobber compare-and-swap |
 
 An apply carries **operations**, not only content: a path the version holds is installed, and a
@@ -984,9 +993,15 @@ counting and the removal are one transaction inside the change-set store, and a 
 result with both the version it attests and the reading it carries beside it, a derived version and
 an apply with every version it names on either side are each written under a check, in the same
 transaction, that those versions are still there — so a holder recorded while a deletion is
-deciding is either counted or refused, and never left pointing at something that is gone. The
-project service's pin lives in another store and is checked first; a pin recorded between that
-check and the transaction is not covered, and that is written down rather than hidden.
+deciding is either counted or refused, and never left pointing at something that is gone.
+
+The project service's pin lives in another store, and the two stores do not share a transaction.
+What joins them is the project journal itself: the pins against one change set are read with that
+journal **held**, and the caller's own removal happens inside that hold. Recording a pin takes the
+same lock, so a pin either lands before the reading and is counted, or waits until the removal has
+finished. The pins are found by the change set they name rather than through the workspace that
+holds them, so the reading does not depend on knowing which workspaces to ask about: recording one
+pin twice is one pin, and two pins whose reasons read alike are two pins.
 
 ### Authority, and where it is decided
 

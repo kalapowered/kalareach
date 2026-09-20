@@ -1435,23 +1435,27 @@ is the one place either door reaches the service from, and it asks about the adm
 recorded immediately before the write.
 
 What a device is additionally held to is its grant: `project.create` for initialising, cloning and
-adopting, `workspace.manage` for creating and removing a working copy. The four reads require no
-right of their own, so a grant that covers the environment reads the whole repository and workspace
-surface.
+adopting, `workspace.manage` for creating and removing a working copy, and `session.view` for the
+four reads. A read is narrowed to what the grant admits rather than refused: two grants over one
+host list different repositories and different working copies, and a working copy's bound sessions
+are narrowed the same way.
 
-**Five of the mutations are not served to a device at all yet.** `project.init`, `project.clone`,
-`project.adopt`, `workspace.create` and `workspace.remove` each name a destination or a source that
-this host cannot check a device's authority over. A creation carries the absolute parent directory
-it wants and this host resolves it once with its own filesystem authority; a working copy's source
-is bounded by nothing but the environment. For a caller on the machine's own socket that is the
-user's own authority over the user's own filesystem, and those five run as they always have. For a
-device the grant's action right would be the whole of the restriction — `project.create` would
-reach any directory this host can open, `workspace.manage` every repository the environment holds —
-and section 14 asks for an authorised destination handle while section 23 asks for a destination
-policy and for source and destination grants. So a device is refused them by name, with a refusal
-that says which subject it cannot authorise. It keeps the four reads, and `project.operation.cancel`
-for work it started itself. The refusal is lifted when the project service bounds a destination and
-a source by the grant that asked.
+**Five of the mutations name a place on this host's filesystem**, and for those the action right is
+not the whole of the restriction. `project.init`, `project.clone` and `project.adopt` carry the
+directory they create a repository in; `workspace.create` names the repository it takes a working
+copy from and, for an isolated one, where its working tree goes; `workspace.remove` names the
+working copy it takes away. Each is decided by **one destination policy**, in one place, rather
+than by a rule written again inside each method: the method says which subjects it names, and the
+policy answers whether the device's grant reaches every one of them.
+
+A grant bounded to environments reaches those environments and nothing else, so a device holding
+`project.create` creates repositories where its grant says and nowhere else, and one holding
+`workspace.manage` reaches the working copies of those environments only. An **unbounded** grant
+reaches none of the five: a grant that bounds nothing cannot authorise a host-local path, and the
+refusal says which subject it could not authorise. A device keeps the four reads and
+`project.operation.cancel` for work it started itself either way. For a caller on the machine's own
+socket the authority is the user's own over the user's own filesystem, and the policy does not
+apply: those five run as they always have.
 
 What the resolution does establish, for the caller that is served, is that the directory it opened
 is the one the effect writes into, by the identity it recorded, so nothing is substituted
@@ -1467,20 +1471,22 @@ One further limit, stated rather than implied.
   first, and it works — the service answers the repeat from its own record without performing
   anything twice.
 
-The admission a project mutation carries is asked about twice. Once where the daemon accepts it,
-under the registry lock, and once inside the service's own blocking work, immediately after it has
-failed to find a retained record and immediately before it acts. The second reads the registration
-and the clock from memory, so it costs nothing and covers the waiting that the first cannot: a
-blocking task to be scheduled and a retained record to be looked for. A retry never reaches it,
-because the retained record answered first.
+The admission a project mutation carries is asked about three times, and the third is the one
+section 9 is about. Once where the daemon accepts it, under the registry lock. Once inside the
+service's own blocking work, immediately after it has failed to find a retained record and
+immediately before it acts. And once **inside the transaction that begins the effect**: the
+transaction that writes the operation row, the one that writes the workspace row, and the one that
+reserves a removal. Each reads the registration and the clock from memory, so asking costs nothing.
+A retry never reaches any of them, because the retained record answered first.
 
-What neither covers is the service's own preparation. Resolving a destination and taking the
-store's lock happen after the second answer, and a clone or a materialisation runs behind them, so
-a revocation or an expiry that completes in there reaches an action that then begins. Section 9
-asks for authority and expiry to be revalidated immediately before the effect and says that durable
-acceptance does not preserve expired authority, so this is a gap rather than something the section
-allows. Closing it means asking inside the service's own transaction, which the service would have
-to offer.
+The third answer is what covers the service's own preparation. Resolving a destination, probing it,
+opening a repository and surveying it, and taking the journal's lock all happen after the second
+answer, and a revocation or an expiry completing in there would otherwise reach an action that then
+begins. Inside the transaction there is nothing left to wait for: the journal is held, the check is
+answered, and the first durable write follows with nothing awaited between them. An action refused
+there never claimed its action either, so a repeat under the same identifier is a fresh request
+rather than a retry of something half performed. Section 9 asks for authority and expiry to be
+revalidated immediately before the effect, and that is where they are.
 
 ## What the host owes the transport
 
@@ -2352,10 +2358,9 @@ reaches. The platform task that qualifies this host on Windows is what changes t
 platform, and what a platform refuses rather than pretends.
 
 This daemon's project mutations check the accepted deadline and the connection's authority
-immediately before the write, as its transfer mutations do. That is the boundary the host contract
-has today: a mutation still waits for a blocking thread and for the journal's lock after the check,
-and closing that gap means carrying the admission into the service's own transaction for every
-service rather than re-deriving it here.
+immediately before the write, as its transfer mutations do, and the admission travels into the
+project service so that the last answer is given inside the transaction that begins the effect,
+under the journal's own lock, with nothing awaited between the answer and the write.
 
 At startup the service resolves whatever an earlier daemon left unfinished, before anything is
 served. A publication that landed is completed; one that did not is either finished or cleaned up;
