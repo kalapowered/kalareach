@@ -55,6 +55,14 @@ pub const USER_BINDING_TEXT: &str = "kr-user-binding-ran";
 /// `Alt+q` on the editor that reads a chord, which is the same two bytes at the terminal.
 pub const USER_BINDING_KEY: &[u8] = &[0x1b, b'q'];
 
+/// A key the editor has a binding for, which moves the cursor one place and changes nothing else.
+///
+/// A managed package sits in front of the operations the editor binds, so a key like this one is
+/// how a reader is given a step to take: it ends at the reader's own boundary, where the reader
+/// reads its state and reports it. An ordinary character is the editor's own insertion, which
+/// nothing is in front of, so it is no step at all.
+pub const STEP_KEY: &[u8] = &[0x06];
+
 /// A command every shell here runs, and the word it prints, for proving a shell still answers.
 pub const LIVENESS_COMMAND: &str = "echo kr-answering";
 /// What [`LIVENESS_COMMAND`] prints.
@@ -820,9 +828,18 @@ impl Session {
     /// waits for the prompt; against such an editor this session waits for its drawing, which is
     /// the editor rather than the prompt.
     ///
+    /// The line the probe leaves is then taken away, and the reader's own word for that is what
+    /// this waits on: the reader reports itself idle at each of its key boundaries, and the report
+    /// carries the buffer and the queues it read at that instant. Two reports decide it. The first
+    /// holds the probe, which is what makes it this probe's report rather than one from the prompt
+    /// before it, and the second holds an empty line at a later buffer revision with nothing queued
+    /// behind it, which is the clear having run and the reader being back at a key wait. A length
+    /// of silence would be a guess at the same thing.
+    ///
     /// # Panics
     ///
-    /// Panics when no prompt or no drawing arrives, which is an editor that never started reading.
+    /// Panics when no prompt or no drawing arrives, which is an editor that never started reading,
+    /// and when the reader never reports the line the clear took away.
     pub fn ensure_reading(&mut self) {
         if !dialect(self.package_kind).types_at_the_prompt {
             return;
@@ -839,13 +856,30 @@ impl Session {
             "the editor drew nothing for a key typed at its prompt:\n{}",
             self.terminal_output()
         );
-        let clear_start = self.written();
+        // The probe character is the editor's own insertion, which this package does not sit in
+        // front of, so the reader is given one key it does have a binding for: the cursor moves,
+        // nothing else of the line changes, and the boundary that key ends at is where the reader
+        // reads its own state and reports it.
+        self.type_bytes(STEP_KEY);
+        let (_, held) = self.expect_event(
+            "the reader holding the probe",
+            |event| matches!(event, BridgeEvent::ReaderIdle(idle) if !idle.editor.buffer_empty),
+        );
+        let BridgeEvent::ReaderIdle(held) = held else {
+            unreachable!("the predicate accepted an idle report")
+        };
+        let probe = held.editor.buffer_revision.get();
         self.clear_line();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.written() == clear_start && Instant::now() < deadline {
-            self.pump(Duration::from_millis(10));
-        }
-        self.quiet_for(Duration::from_millis(250), Duration::from_secs(5));
+        self.expect_event("the reader at the line the clear took away", |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.editor.buffer_empty
+                        && idle.editor.buffer_revision.get() > probe
+                        && idle.snapshot.queued_keys == U64::ZERO
+                        && idle.snapshot.pending_bytes == U64::ZERO
+            )
+        });
     }
 
     /// Presses the key the case's own binding is on and waits for what that binding writes.
@@ -869,6 +903,7 @@ impl Session {
             ));
         }
         let start = self.written();
+        let mut settled = true;
         // An editor that takes the terminal out of its own line mode can still be between one
         // read and the next, where the two bytes go to the line discipline instead. The key is
         // offered again once; what the binding writes is the same text either way.
@@ -879,14 +914,11 @@ impl Session {
                 // here abandons what it is part way through on this key, which is what a person
                 // does before pressing theirs again.
                 self.type_bytes(CTRL_G);
-                self.quiet_for(Duration::from_millis(150), Duration::from_secs(2));
+                settled = self.quiet_for(Duration::from_millis(150), Duration::from_secs(2));
             }
+            // This ends at the reader's own report that it is at an empty line and waiting for a
+            // key, so the chord below is offered to a reader that is there to read it.
             self.ensure_reading();
-            // The clear that `ensure_reading` ends with is an operation of the editor's own, and
-            // a chord sent while it is still redrawing is read at whatever it redraws into. A
-            // fixed pause here is a guess at how long that redraw takes, and on a loaded machine
-            // it is the wrong guess, so this waits for the editor to stop drawing instead.
-            self.quiet_for(Duration::from_millis(250), Duration::from_secs(5));
             self.type_bytes(USER_BINDING_KEY);
             let within = if attempt < 3 {
                 Duration::from_secs(6)
@@ -898,16 +930,25 @@ impl Session {
             }
         }
         Err(format!(
-            "the key was offered four times and wrote no {USER_BINDING_TEXT}"
+            "the key was offered four times and wrote no {USER_BINDING_TEXT}; the terminal {} \
+             between the offers",
+            if settled {
+                "went quiet"
+            } else {
+                "never went quiet"
+            }
         ))
     }
 
     /// Waits until the terminal has shown nothing for `quiet`, and no longer than `cap`.
     ///
-    /// What this is for is knowing that an operation of the editor's own has finished, which a
-    /// fixed pause can only guess at: the editor is drawing for as long as it is drawing, and on
-    /// a machine with other work on it that is longer than on an idle one.
-    pub fn quiet_for(&mut self, quiet: Duration, cap: Duration) {
+    /// Returns whether the terminal did go quiet, because the two are not the same answer: a
+    /// terminal still drawing when the cap is reached is a terminal this did not wait out, and a
+    /// caller that reads the return says so rather than carrying on as though it had.
+    ///
+    /// What this is for is knowing that a shell has stopped drawing where nothing of the reader's
+    /// own says so. Where the reader does say so, its own report decides instead.
+    pub fn quiet_for(&mut self, quiet: Duration, cap: Duration) -> bool {
         let deadline = Instant::now() + cap;
         let mut shown = self.written();
         let mut since = Instant::now();
@@ -916,13 +957,14 @@ impl Session {
             let now = self.written();
             if now == shown {
                 if since.elapsed() >= quiet {
-                    return;
+                    return true;
                 }
             } else {
                 shown = now;
                 since = Instant::now();
             }
         }
+        false
     }
 
     /// How much the terminal has shown so far, as an offset a later wait counts from.
