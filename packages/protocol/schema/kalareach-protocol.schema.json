@@ -4833,6 +4833,186 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "DescriptionFreshness": {
+      "description": "How current a generated description is.\n\nThere is no variant meaning \"probably current\". When demand exceeds capacity a client is shown\nthe delay or the staleness rather than text that implies the session is doing what it was doing\nfive minutes ago.",
+      "oneOf": [
+        {
+          "const": "current",
+          "description": "It was produced at the context revision in force.",
+          "type": "string"
+        },
+        {
+          "const": "delayed",
+          "description": "It is at the revision in force, and a newer job has been waiting.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "The session has moved on since it was produced.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "There is no generated description at all, and the title is the deterministic one.",
+          "type": "string"
+        }
+      ]
+    },
+    "DescriptionPause": {
+      "description": "Why a host is not running description inference now.",
+      "oneOf": [
+        {
+          "const": "memory_reserve",
+          "description": "Loading would leave less than the memory reserve.",
+          "type": "string"
+        },
+        {
+          "const": "memory_pressure",
+          "description": "The reserve stopped holding while a model was resident.",
+          "type": "string"
+        },
+        {
+          "const": "thermal",
+          "description": "The host is thermally limited.",
+          "type": "string"
+        },
+        {
+          "const": "battery",
+          "description": "The host is on battery and inference on battery has not been enabled.",
+          "type": "string"
+        },
+        {
+          "const": "signal_unqualified",
+          "description": "The host cannot read a signal the decision needs.",
+          "type": "string"
+        },
+        {
+          "const": "disabled",
+          "description": "An owner turned descriptions off.",
+          "type": "string"
+        },
+        {
+          "const": "no_model_here",
+          "description": "This environment runs no model: a WSL distribution with no data-access choice, or a mobile\ndevice.",
+          "type": "string"
+        }
+      ]
+    },
+    "DescriptionProvenance": {
+      "additionalProperties": false,
+      "description": "The provenance of one generated description.",
+      "properties": {
+        "context_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The context revision it was produced at."
+        },
+        "produced_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was produced."
+        },
+        "profile_id": {
+          "description": "The model profile that produced it.",
+          "type": "string"
+        },
+        "profile_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "That profile's revision. A description produced under a revision the host no longer has\nmapped is not replaced silently; it is shown with the revision it came from."
+        },
+        "source_cursor_from": {
+          "$ref": "#/$defs/U64",
+          "description": "The first semantic cursor it covers."
+        },
+        "source_cursor_to": {
+          "$ref": "#/$defs/U64",
+          "description": "The last semantic cursor it covers."
+        }
+      },
+      "required": [
+        "profile_id",
+        "profile_revision",
+        "context_revision",
+        "source_cursor_from",
+        "source_cursor_to",
+        "produced_at_ms"
+      ],
+      "type": "object"
+    },
+    "DescriptionSetup": {
+      "additionalProperties": false,
+      "description": "The state description setup is in, for the host's own setup surface.\n\nSection 22 offers descriptions during host setup *with visible asset size, cancel/disable\ncontrols and no hosted-account dependency*. These are those facts, so the surface that shows\nthem does not have to work them out.",
+      "properties": {
+        "asset_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Exactly how many bytes that is, before anything is fetched."
+        },
+        "can_cancel": {
+          "description": "Whether a running fetch can be cancelled now.",
+          "type": "boolean"
+        },
+        "can_disable": {
+          "description": "Whether the feature can be turned off now.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Whether an owner has enabled them.",
+          "type": "boolean"
+        },
+        "fetched_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many of those bytes have arrived."
+        },
+        "needs_hosted_account": {
+          "description": "Whether any of this needs a hosted account. It never does.",
+          "type": "boolean"
+        },
+        "offered": {
+          "description": "Whether this host can offer descriptions at all.",
+          "type": "boolean"
+        },
+        "profile_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The profile that would be fetched."
+        }
+      },
+      "required": [
+        "offered",
+        "enabled",
+        "profile_id",
+        "asset_bytes",
+        "fetched_bytes",
+        "can_cancel",
+        "can_disable",
+        "needs_hosted_account"
+      ],
+      "type": "object"
+    },
+    "DescriptionState": {
+      "description": "What state description inference is in on the host serving this session.",
+      "oneOf": [
+        {
+          "const": "ready",
+          "description": "Nothing is loaded and nothing is stopping a load.",
+          "type": "string"
+        },
+        {
+          "const": "resident",
+          "description": "A model is mapped and jobs are running.",
+          "type": "string"
+        },
+        {
+          "const": "resource_paused",
+          "description": "Inference is paused. Deterministic titles are unaffected.",
+          "type": "string"
+        }
+      ]
+    },
     "DesktopAvailability": {
       "description": "Whether the desktop is usable right now.\n\nThis is reported separately from process life on purpose. A locked screen or a switched-away\nuser makes a desktop temporarily unusable; it does not end the session or the processes it\nowns. Only [`DesktopAvailability::Ended`] does that.",
       "oneOf": [
@@ -10130,6 +10310,26 @@
         "stack"
       ],
       "type": "object"
+    },
+    "LabelSource": {
+      "description": "Where a session's shown title came from.",
+      "oneOf": [
+        {
+          "const": "pinned",
+          "description": "A person pinned it. Generated text never replaces one.",
+          "type": "string"
+        },
+        {
+          "const": "metadata",
+          "description": "Deterministic metadata: the directory, the repository or the application. Every host has\nthis, with no model and no network.",
+          "type": "string"
+        },
+        {
+          "const": "generated",
+          "description": "A local model produced it. It is shown as generated wherever it appears.",
+          "type": "string"
+        }
+      ]
     },
     "LaunchCommand": {
       "description": "What a launch installs in the editor./// What a launch installs in the editor.\n\nAn argument vector is the safe form: the integration quotes it for its own shell. A quoted\ncommand is already the exact text to run, and neither form is assembled by interpolation.",
@@ -20192,6 +20392,119 @@
       ],
       "type": "object"
     },
+    "SessionDescribeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.describe`.\n\nOne session, and nothing else. There is deliberately no field that selects a model, sets a\nsampler, supplies a prompt or asks for a description to be produced now.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to describe."
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "SessionDescribeResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.describe`.",
+      "properties": {
+        "activity_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The activity line, when a generated description supplied one."
+        },
+        "cadence_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "The cadence the host is running at, which is not a promise about this session."
+        },
+        "freshness": {
+          "$ref": "#/$defs/DescriptionFreshness",
+          "description": "How current the generated description is."
+        },
+        "last_success_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When this session last had a description published."
+        },
+        "paused": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptionPause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why inference is paused, when it is."
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptionProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What produced the generated description, when one is shown."
+        },
+        "queued_age_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long this session's queued description job has been waiting."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "source": {
+          "$ref": "#/$defs/LabelSource",
+          "description": "Where the title came from."
+        },
+        "state": {
+          "$ref": "#/$defs/DescriptionState",
+          "description": "What state inference is in on the host."
+        },
+        "title": {
+          "description": "The title to show. Every host has one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "title",
+        "source",
+        "activity_text",
+        "freshness",
+        "provenance",
+        "queued_age_ms",
+        "last_success_ms",
+        "cadence_ms",
+        "state",
+        "paused"
+      ],
+      "type": "object"
+    },
     "SessionDetachParams": {
       "additionalProperties": false,
       "description": "Parameters of `session.detach`.",
@@ -20394,6 +20707,61 @@
       "required": [
         "session_id",
         "session_epoch"
+      ],
+      "type": "object"
+    },
+    "SessionRenameParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.rename`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to rename."
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pinned name, or null to clear the pin.\n\nClearing is explicit because section 24 keeps a pinned label *unless explicitly cleared*:\nthere is no other operation in this protocol that removes one."
+        }
+      },
+      "required": [
+        "session_id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "SessionRenameResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.rename`.",
+      "properties": {
+        "pinned": {
+          "description": "Whether a pin is in force.",
+          "type": "boolean"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "source": {
+          "$ref": "#/$defs/LabelSource",
+          "description": "Where it came from. After a pin this is [`LabelSource::Pinned`]; after a clearing it is\nwhatever the host has instead, which is a generated description or the deterministic title."
+        },
+        "title": {
+          "description": "The title now shown.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "title",
+        "source",
+        "pinned"
       ],
       "type": "object"
     },
@@ -25241,6 +25609,18 @@
     "session_create_result": {
       "$ref": "#/$defs/SessionCreateResult"
     },
+    "session_describe_params": {
+      "$ref": "#/$defs/SessionDescribeParams"
+    },
+    "session_describe_result": {
+      "$ref": "#/$defs/SessionDescribeResult"
+    },
+    "session_description_provenance": {
+      "$ref": "#/$defs/DescriptionProvenance"
+    },
+    "session_description_setup": {
+      "$ref": "#/$defs/DescriptionSetup"
+    },
     "session_detach_params": {
       "$ref": "#/$defs/SessionDetachParams"
     },
@@ -25261,6 +25641,12 @@
     },
     "session_ref": {
       "$ref": "#/$defs/SessionRef"
+    },
+    "session_rename_params": {
+      "$ref": "#/$defs/SessionRenameParams"
+    },
+    "session_rename_result": {
+      "$ref": "#/$defs/SessionRenameResult"
     },
     "session_summary": {
       "$ref": "#/$defs/SessionSummary"

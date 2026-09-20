@@ -43,6 +43,10 @@ use crate::changeset::{
     DiffReadParams, DiffReadResult, EvidenceReference, MaterialisationRecord,
     MaterialisationResult, ObservedPath,
 };
+use crate::describe::{
+    DescriptionProvenance, DescriptionSetup, SessionDescribeParams, SessionDescribeResult,
+    SessionRenameParams, SessionRenameResult,
+};
 use crate::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesParams,
     EnvironmentCapabilitiesResult, SleepInhibitionState,
@@ -358,6 +362,10 @@ pub fn protocol_schema() -> Value {
         "session_close_result" => SessionCloseResult,
         "session_create_params" => SessionCreateParams,
         "session_create_result" => SessionCreateResult,
+        "session_describe_params" => SessionDescribeParams,
+        "session_describe_result" => SessionDescribeResult,
+        "session_description_provenance" => DescriptionProvenance,
+        "session_description_setup" => DescriptionSetup,
         "session_detach_params" => SessionDetachParams,
         "session_detach_result" => SessionDetachResult,
         "session_list_params" => SessionListParams,
@@ -365,6 +373,8 @@ pub fn protocol_schema() -> Value {
         "session_read_params" => SessionReadParams,
         "session_read_result" => SessionReadResult,
         "session_ref" => SessionRef,
+        "session_rename_params" => SessionRenameParams,
+        "session_rename_result" => SessionRenameResult,
         "session_summary" => SessionSummary,
         "shell_launch_params" => ShellLaunchParams,
         "shell_launch_result" => ShellLaunchResult,

@@ -105,6 +105,7 @@ pub mod attachment;
 pub mod attention;
 pub mod authority;
 pub mod changeset;
+pub mod describe;
 pub mod desktop;
 pub mod digest;
 pub mod envelope;

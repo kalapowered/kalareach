@@ -1440,6 +1440,50 @@ what it removes is exactly the thing a person cannot check for themselves.
 Each of these is carried as a numbered residual in this task's handoff, with the next step and who
 owns it.
 
+## Session names and descriptions
+
+Every session has a name from the moment it exists, and it costs nothing: the repository and branch,
+the directory, the application, or the display number a person types to reach it. The status beside
+it - starting, running, unreachable, awaiting approval, awaiting input, completed, failed, closed -
+is the host's own lifecycle record. Neither is text a model produced, and no model can set either.
+
+A host may also run a small CPU-only model locally to say what a session is *doing*. One shared
+inference process and one mapped model per execution environment, never one per session. A WSL
+distribution reaches a native-host broker only after somebody explicitly chooses to let local data
+cross; without that choice it shows deterministic titles. Mobile runs no model to label a host
+session. Grouping machines together for display grants nothing: two environments have their own
+mapping and their own context.
+
+Nothing about this is on the shell's input, query or resize path. The only way a description job is
+created is a meaningful context change - the working directory, the foreground application, the
+selected thread, the task intent, completion - and those are the only five things that exist to
+send. Changes inside a two-second window become one revision, so a long active turn still receives
+text rather than invalidating every job.
+
+Before a model is loaded the host checks that its itemised cost plus a reserve of at least the
+larger of 1 GiB or a fifth of physical memory still fits in the memory it can see. When it does not,
+the state is `resource_paused` with the reason named, and the titles are unaffected. Battery pauses
+inference unless an owner enables it, and a host that cannot read its own power source is treated as
+being on battery. Thermal and memory pressure pause it on mains too, and when the pressure clears
+the host resumes on its next evaluation without restarting anything.
+
+The queue holds at most one job per session. A session that changes again has its job's content
+replaced and its waiting position kept, so a busy session never overtakes a quiet one that has been
+waiting longer. Foreground work goes first, and after at most three priority jobs the oldest waiting
+ordinary job is served.
+
+A result is validated before it is published, against what is in force at that moment rather than at
+admission: a malformed answer, an unknown field, a control character, either codepoint bound, a
+wrong session epoch, a changed context or binding, a remapped model, a moved privacy generation and
+a pinned name each refuse it. A refused result costs nothing, because the session keeps the title it
+had.
+
+Pinned names and each description's provenance live in a store of their own, so they survive the
+session closing and the host restarting. Generated text never replaces a pin and never changes the
+status shown beside it. Under privacy mode, description processing stops at once, every queued job
+is taken back, every generated description is removed, pins are kept, and titles come from metadata
+from the instant the fence goes up. `docs/describe/README.md` has the whole of it.
+
 ## What an idle session wakes for
 
 A session with nothing happening in it should cost nothing, and twenty of them are measured

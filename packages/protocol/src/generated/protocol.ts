@@ -1167,6 +1167,17 @@ export type RootEditorFenceResult =
       refused: FenceRefusal
     }
 /**
+ * Why a host is not running description inference now.
+ */
+export type DescriptionPause =
+  | 'memory_reserve'
+  | 'memory_pressure'
+  | 'thermal'
+  | 'battery'
+  | 'signal_unqualified'
+  | 'disabled'
+  | 'no_model_here'
+/**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
@@ -1555,6 +1566,10 @@ export interface KalaReachProtocol {
   session_close_result?: SessionCloseResult
   session_create_params?: SessionCreateParams1
   session_create_result?: SessionCreateResult
+  session_describe_params?: SessionDescribeParams
+  session_describe_result?: SessionDescribeResult
+  session_description_provenance?: DescriptionProvenance
+  session_description_setup?: DescriptionSetup
   session_detach_params?: SessionDetachParams
   session_detach_result?: SessionDetachResult
   session_list_params?: SessionListParams
@@ -1562,6 +1577,8 @@ export interface KalaReachProtocol {
   session_read_params?: SessionReadParams
   session_read_result?: SessionReadResult
   session_ref?: SessionRef
+  session_rename_params?: SessionRenameParams
+  session_rename_result?: SessionRenameResult
   session_summary?: SessionSummary2
   shell_launch_params?: ShellLaunchParams
   shell_launch_result?: ShellLaunchResult
@@ -15345,6 +15362,137 @@ export interface SessionSummary1 {
   worker_profile: 'desktop_bound' | 'headless_user'
 }
 /**
+ * Parameters of `session.describe`.
+ *
+ * One session, and nothing else. There is deliberately no field that selects a model, sets a
+ * sampler, supplies a prompt or asks for a description to be produced now.
+ */
+export interface SessionDescribeParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `session.describe`.
+ */
+export interface SessionDescribeResult {
+  /**
+   * The activity line, when a generated description supplied one.
+   */
+  activity_text: string | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cadence_ms: string
+  /**
+   * How current the generated description is.
+   */
+  freshness: 'current' | 'delayed' | 'stale' | 'none'
+  /**
+   * When this session last had a description published.
+   */
+  last_success_ms: TimestampMs | null
+  /**
+   * Why inference is paused, when it is.
+   */
+  paused: DescriptionPause | null
+  /**
+   * What produced the generated description, when one is shown.
+   */
+  provenance: DescriptionProvenance | null
+  /**
+   * How long this session's queued description job has been waiting.
+   */
+  queued_age_ms: U64 | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * Where the title came from.
+   */
+  source: 'pinned' | 'metadata' | 'generated'
+  /**
+   * What state inference is in on the host.
+   */
+  state: 'ready' | 'resident' | 'resource_paused'
+  /**
+   * The title to show. Every host has one.
+   */
+  title: string
+}
+/**
+ * The provenance of one generated description.
+ */
+export interface DescriptionProvenance {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  context_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  produced_at_ms: string
+  /**
+   * The model profile that produced it.
+   */
+  profile_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  profile_revision: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  source_cursor_from: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  source_cursor_to: string
+}
+/**
+ * The state description setup is in, for the host's own setup surface.
+ *
+ * Section 22 offers descriptions during host setup *with visible asset size, cancel/disable
+ * controls and no hosted-account dependency*. These are those facts, so the surface that shows
+ * them does not have to work them out.
+ */
+export interface DescriptionSetup {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  asset_bytes: string
+  /**
+   * Whether a running fetch can be cancelled now.
+   */
+  can_cancel: boolean
+  /**
+   * Whether the feature can be turned off now.
+   */
+  can_disable: boolean
+  /**
+   * Whether an owner has enabled them.
+   */
+  enabled: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  fetched_bytes: string
+  /**
+   * Whether any of this needs a hosted account. It never does.
+   */
+  needs_hosted_account: boolean
+  /**
+   * Whether this host can offer descriptions at all.
+   */
+  offered: boolean
+  /**
+   * The profile that would be fetched.
+   */
+  profile_id: string | null
+}
+/**
  * Parameters of `session.detach`.
  */
 export interface SessionDetachParams {
@@ -15649,6 +15797,44 @@ export interface SessionRef {
    * One KalaReach terminal session.
    */
   session_id: string
+}
+/**
+ * Parameters of `session.rename`.
+ */
+export interface SessionRenameParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The pinned name, or null to clear the pin.
+   *
+   * Clearing is explicit because section 24 keeps a pinned label *unless explicitly cleared*:
+   * there is no other operation in this protocol that removes one.
+   */
+  title: string | null
+}
+/**
+ * The result of `session.rename`.
+ */
+export interface SessionRenameResult {
+  /**
+   * Whether a pin is in force.
+   */
+  pinned: boolean
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * Where it came from. After a pin this is [`LabelSource::Pinned`]; after a clearing it is
+   * whatever the host has instead, which is a generated description or the deterministic title.
+   */
+  source: 'pinned' | 'metadata' | 'generated'
+  /**
+   * The title now shown.
+   */
+  title: string
 }
 /**
  * Parameters of `shell.launch`.
