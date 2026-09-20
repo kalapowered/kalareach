@@ -178,12 +178,47 @@ fn measured(figure: Option<u64>) -> String {
     figure.map_or_else(|| "not measured".to_owned(), |value| value.to_string())
 }
 
-/// Reads this process's own resident set.
-fn process_rss_bytes() -> u64 {
+/// Reads this process's own resident set, when the operating system answers for it.
+///
+/// `None` is a lookup that found no process to read, which is not a process holding nothing.
+fn process_rss_bytes() -> Option<u64> {
     let pid = sysinfo::Pid::from_u32(std::process::id());
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    system.process(pid).map_or(0, sysinfo::Process::memory)
+    system.process(pid).map(sysinfo::Process::memory)
+}
+
+/// The largest of the readings that exist, or `None` when none of them does.
+fn largest(readings: [Option<u64>; 2]) -> Option<u64> {
+    readings.into_iter().flatten().max()
+}
+
+/// Reports one phase's process ceiling, and records a breach or an absent measurement as unmet.
+///
+/// A ceiling nothing was measured against is not a ceiling that held. Printing `held: true` over an
+/// absent reading is how a budget comes to be passed by not being checked.
+fn report_ceiling(
+    line: &str,
+    resident: Option<u64>,
+    ceiling: u64,
+    phase: &str,
+    machine: &str,
+    unmet: &mut Vec<String>,
+) {
+    let held = resident.map(|bytes| bytes <= ceiling);
+    println!(
+        "{line}: {ceiling} held: {} [{machine}]",
+        held.map_or_else(|| "not measured".to_owned(), |held| held.to_string())
+    );
+    match (held, resident) {
+        (Some(true), _) => {}
+        (Some(false), Some(bytes)) => unmet.push(format!(
+            "the {ceiling} byte process ceiling was breached during {phase}: {bytes} bytes"
+        )),
+        _ => unmet.push(format!(
+            "the {ceiling} byte process ceiling was not measured during {phase}"
+        )),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -229,13 +264,15 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     // model's, and the report says so rather than attributing the harness to the runtime.
     let baseline_rss = process_rss_bytes();
     let baseline_cpu = peak_process_cpu_centis(3 * sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-    let peak_load_rss = Arc::new(AtomicU64::new(baseline_rss));
+    let peak_load_rss = Arc::new(AtomicU64::new(baseline_rss.unwrap_or(0)));
     let peak_load_cpu = Arc::new(AtomicU64::new(0));
+    let load_rss_samples = Arc::new(AtomicU64::new(u64::from(baseline_rss.is_some())));
     let load_cpu_samples = Arc::new(AtomicU64::new(0));
     let load_sampling = Arc::new(AtomicBool::new(true));
 
     let peak_rss_clone = peak_load_rss.clone();
     let peak_cpu_clone = peak_load_cpu.clone();
+    let load_rss_samples_clone = load_rss_samples.clone();
     let load_cpu_samples_clone = load_cpu_samples.clone();
     let load_sampling_clone = load_sampling.clone();
     let load_sampler_thread = std::thread::spawn(move || {
@@ -248,6 +285,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 refreshes += 1;
                 let current_rss = p.memory();
                 peak_rss_clone.fetch_max(current_rss, Ordering::Relaxed);
+                load_rss_samples_clone.fetch_add(1, Ordering::Relaxed);
                 // The first refresh of a fresh view carries a processor nought nobody measured, so
                 // it is counted as a refresh and not as a reading.
                 if refreshes >= 2 {
@@ -281,7 +319,11 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     load_sampling.store(false, Ordering::Release);
     let _ = load_sampler_thread.join();
     let loaded_rss = process_rss_bytes();
-    let peak_rss_during_load = peak_load_rss.load(Ordering::Acquire).max(loaded_rss);
+    let peak_rss_during_load = largest([
+        (load_rss_samples.load(Ordering::Acquire) > 0)
+            .then(|| peak_load_rss.load(Ordering::Acquire)),
+        loaded_rss,
+    ]);
     let model_cpu = (load_cpu_samples.load(Ordering::Acquire) > 0)
         .then(|| peak_load_cpu.load(Ordering::Acquire));
     println!("cold_start_load_ms: {load_ms} [{machine}]");
@@ -312,12 +354,14 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     // workload are in the same process and no per-thread accounting separates them. Calling the
     // difference a measurement is how a benchmark comes to publish its own cost as the product's.
     println!(
-        "baseline_before_load: rss {baseline_rss} bytes, cpu {} centis, benchmark process [{machine}]",
+        "baseline_before_load: rss {} bytes, cpu {} centis, benchmark process [{machine}]",
+        measured(baseline_rss),
         measured(baseline_cpu)
     );
     println!(
-        "measured_load_rss_bytes: benchmark process {peak_rss_during_load}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
-        peak_rss_during_load.saturating_sub(baseline_rss)
+        "measured_load_rss_bytes: benchmark process {}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
+        measured(peak_rss_during_load),
+        measured(peak_rss_during_load.map(|peak| peak.saturating_sub(baseline_rss.unwrap_or(0))))
     );
     println!(
         "measured_load_cpu_centis: benchmark process {}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
@@ -332,17 +376,14 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     // measured everything it can still measure. Stopping here would answer the memory question by
     // withholding the latency ones, and section 27 asks for both.
     let mut unmet: Vec<String> = Vec::new();
-    let ceiling_held = peak_rss_during_load <= budgets.process_memory_ceiling_bytes;
-    println!(
-        "process_ceiling_bytes: {} held: {} [{machine}]",
-        budgets.process_memory_ceiling_bytes, ceiling_held
+    report_ceiling(
+        "process_ceiling_bytes",
+        peak_rss_during_load,
+        budgets.process_memory_ceiling_bytes,
+        "model load",
+        &machine,
+        &mut unmet,
     );
-    if !ceiling_held {
-        unmet.push(format!(
-            "the {} byte process ceiling was breached during model load: {peak_rss_during_load} bytes",
-            budgets.process_memory_ceiling_bytes
-        ));
-    }
 
     // One service, one runtime, the real weights. The runtime is moved into the factory, so the
     // first mapping takes it and a second would be a fault rather than a second set of weights.
@@ -437,6 +478,8 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     let peak_bench_rss_clone = peak_bench_rss.clone();
     let peak_bench_cpu = Arc::new(AtomicU64::new(0));
     let peak_bench_cpu_clone = peak_bench_cpu.clone();
+    let bench_rss_samples = Arc::new(AtomicU64::new(0));
+    let bench_rss_samples_clone = bench_rss_samples.clone();
     let bench_cpu_samples = Arc::new(AtomicU64::new(0));
     let bench_cpu_samples_clone = bench_cpu_samples.clone();
     let bench_sampler_thread = std::thread::spawn(move || {
@@ -449,6 +492,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 refreshes += 1;
                 let current_rss = p.memory();
                 peak_bench_rss_clone.fetch_max(current_rss, Ordering::Relaxed);
+                bench_rss_samples_clone.fetch_add(1, Ordering::Relaxed);
                 if refreshes >= 2 {
                     let current_cpu = p.cpu_usage().round() as u64;
                     peak_bench_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
@@ -554,14 +598,17 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     // when they were over before the sampler's second refresh. Processor use has no such reading:
     // it exists only between two refreshes, and a pass too short for them is reported as unmeasured
     // rather than as nought.
-    let active_rss = peak_bench_rss
-        .load(Ordering::Acquire)
-        .max(process_rss_bytes());
+    let active_rss = largest([
+        (bench_rss_samples.load(Ordering::Acquire) > 0)
+            .then(|| peak_bench_rss.load(Ordering::Acquire)),
+        process_rss_bytes(),
+    ]);
     let active_cpu = (bench_cpu_samples.load(Ordering::Acquire) > 0)
         .then(|| peak_bench_cpu.load(Ordering::Acquire));
     println!(
-        "measured_active_inference_rss_bytes: benchmark process {active_rss}, over the baseline {} (estimate of the model, its runtime and the work of the passes) [{machine}]",
-        active_rss.saturating_sub(baseline_rss)
+        "measured_active_inference_rss_bytes: benchmark process {}, over the baseline {} (estimate of the model, its runtime and the work of the passes) [{machine}]",
+        measured(active_rss),
+        measured(active_rss.map(|peak| peak.saturating_sub(baseline_rss.unwrap_or(0))))
     );
     println!(
         "measured_active_inference_cpu_centis: benchmark process {}, over the terminal workload {} (estimate; the workload's own figure above was measured with no job admitted, and a peak taken under contention is not the workload's share of this one) [{machine}]",
@@ -574,17 +621,14 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             )
         }))
     );
-    let active_ceiling_held = active_rss <= budgets.process_memory_ceiling_bytes;
-    println!(
-        "active_inference_process_ceiling_bytes: {} held: {} [{machine}]",
-        budgets.process_memory_ceiling_bytes, active_ceiling_held
+    report_ceiling(
+        "active_inference_process_ceiling_bytes",
+        active_rss,
+        budgets.process_memory_ceiling_bytes,
+        "active inference",
+        &machine,
+        &mut unmet,
     );
-    if !active_ceiling_held {
-        unmet.push(format!(
-            "the {} byte process ceiling was breached during active inference: {active_rss} bytes",
-            budgets.process_memory_ceiling_bytes
-        ));
-    }
 
     for reading in ledger.published() {
         report(
