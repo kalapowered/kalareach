@@ -3729,11 +3729,11 @@ impl Controller {
                 // recorded either way.
                 //
                 // The recovery pass is not. It opens the session's stores, so it runs only where
-                // the kernel confirms the death, and where it does not the store is left as it is
-                // and the archive reports an action with no ending when a reader asks. Writing
-                // the closure removes the worker row and retires the descriptor, so what stops a
-                // later read or migration is the closure's own record of a worker this host never
-                // saw end.
+                // the kernel confirms the death, and where it does not the store is left exactly
+                // as it is. Nothing reads it afterwards either: writing the closure removes the
+                // worker row and retires the descriptor, so the closure carries the fact itself,
+                // and a session whose closure names a worker this host never saw end is refused
+                // every archive read rather than served an incomplete one.
                 let archive = self.archive();
                 let validated = if let Ok(ownership) = archive.take_ownership(
                     row.session_id,
