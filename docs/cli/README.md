@@ -435,8 +435,9 @@ a `native_compat` session, which records no origin at all. The refusal says `Use
 One remaining terminal is not proof that it is the one the command came from, so it is not treated
 as one.
 
-The packaged shells do not export the capability yet: it reaches them in the answer to
-`root.command.accepted`, and their bridges emit no command events today. Until they do, `kr detach`
+The packaged shells do not export the capability yet. It reaches them in the answer to
+`root.command.accepted`, which they send; what they do not yet do is read that answer and put the
+capability in the environment of the command they are about to run. Until they do, `kr detach`
 inside a managed shell names its attachment with `--attachment <id>`, and a bare `kr detach` there
 is answered with that instruction rather than with an attachment the host cannot stand behind.
 

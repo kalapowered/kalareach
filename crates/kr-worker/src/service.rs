@@ -2692,7 +2692,10 @@ impl WorkerService {
     /// A cancellation from a question's source carries the caller token, and a detach carries the
     /// capability its line was given. Both are emptied before the intent is encoded. What remains
     /// says which question was to be cancelled and under whose authority, and which attachment a
-    /// detach had resolved to by the time it was recorded, which is everything a recovery needs.
+    /// detach named, which is the whole of what it was going to do wherever it named one. A detach
+    /// that named nothing keeps a null there: its subject is resolved from the capability when it
+    /// runs, and the capability is exactly what this record must not hold. That costs a recovery
+    /// nothing, because an intent that was never dispatched is not resumed.
     fn intent_of(mutation: &MutationRequest, method: Method) -> Result<Vec<u8>> {
         let redacted;
         let recorded = match method {
