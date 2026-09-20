@@ -15,8 +15,8 @@ use kr_client::recovery::{
 };
 use kr_client::services::{ServiceFuture, SyncBackupService};
 use kr_crypto::backup::{
-    ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource, CollectionKind, ObjectSource,
-    RestoreGeneration, open_archive, seal_archive, stage_object,
+    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
+    CollectionKind, ObjectSource, RestoreGeneration, open_archive, seal_archive, stage_object,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -519,11 +519,14 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     // A recovery-enabled collection wraps its manifest key for the recovery recipient.
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
     assert!(recipients.add_recovery(&recovery));
-    let staged = stage_object(&ObjectSource {
-        object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),
-        filename: "session-history.cbor",
-        plaintext: b"what the session did",
-    })
+    let staged = stage_object(
+        &ObjectSource {
+            object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),
+            filename: "session-history.cbor",
+            plaintext: b"what the session did",
+        },
+        recipients.rotation(),
+    )
     .expect("a staged object");
     let sealed = seal_archive(
         &writer,
@@ -557,10 +560,17 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     assert_eq!(material.collections.len(), 1);
 
     let reader = ArchiveReader::Recovery(&recovery);
+    let expectation = ArchiveExpectation {
+        archive_id: archive_id(),
+        checkpoint: material
+            .checkpoint(archive_id())
+            .map(|checkpoint| (CheckpointSource::RecoveryBundle, checkpoint)),
+    };
     let opened = open_archive(
         &reader,
         producer.public(),
         &material.trusted_writers,
+        &expectation,
         &sealed.descriptor_bytes,
         &sealed.encrypted_manifest,
     )
@@ -597,6 +607,7 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
             &reader,
             producer.public(),
             &material.trusted_writers,
+            &expectation,
             &forged.descriptor_bytes,
             &forged.encrypted_manifest,
         )
@@ -903,11 +914,14 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
 
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
     assert!(recipients.add_recovery(&recovery));
-    let staged = stage_object(&ObjectSource {
-        object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),
-        filename: "notes.cbor",
-        plaintext: b"kept offline",
-    })
+    let staged = stage_object(
+        &ObjectSource {
+            object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),
+            filename: "notes.cbor",
+            plaintext: b"kept offline",
+        },
+        recipients.rotation(),
+    )
     .expect("a staged object");
     let sealed = seal_archive(
         &writer,
@@ -954,6 +968,10 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
         &reader,
         producer.public(),
         &writers,
+        &ArchiveExpectation {
+            archive_id: archive_id(),
+            checkpoint: None,
+        },
         &restored.descriptor,
         &restored.encrypted_manifest,
     )

@@ -23,6 +23,39 @@ pub enum CollectionKind {
     MutableShared,
 }
 
+/// Which key generation a collection's staged ciphertext belongs to.
+///
+/// It advances when a revocation rotates the keys of a mutable shared collection. A
+/// [`crate::backup::StagedObject`] carries the rotation it was staged under, and
+/// [`crate::backup::seal_archive`] refuses one from before the recipient set's current rotation.
+/// That is what makes rotation a rule rather than a report: a caller cannot revoke a recipient and
+/// then seal the ciphertext that revocation invalidated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyRotation(u64);
+
+impl KeyRotation {
+    /// The rotation a collection starts at.
+    pub const INITIAL: Self = Self(0);
+
+    /// Returns the recorded value, so a producer can keep it beside its staged ciphertext.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Builds a rotation from a recorded value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the rotation after this one.
+    #[must_use]
+    const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
 /// Every recipient one archive's keys are wrapped for.
 ///
 /// The recovery recipient is an ordinary member: section 20 has every new archive of a
@@ -32,6 +65,7 @@ pub enum CollectionKind {
 pub struct ArchiveRecipients {
     kind: CollectionKind,
     keys: Vec<StoredEnvelopeKey>,
+    rotation: KeyRotation,
 }
 
 impl ArchiveRecipients {
@@ -41,7 +75,24 @@ impl ArchiveRecipients {
         Self {
             kind,
             keys: Vec::new(),
+            rotation: KeyRotation::INITIAL,
         }
+    }
+
+    /// Builds a set a device read back from its own store, at the rotation it recorded.
+    #[must_use]
+    pub const fn restored(kind: CollectionKind, rotation: KeyRotation) -> Self {
+        Self {
+            kind,
+            keys: Vec::new(),
+            rotation,
+        }
+    }
+
+    /// Returns the key rotation staged ciphertext must have been made under.
+    #[must_use]
+    pub const fn rotation(&self) -> KeyRotation {
+        self.rotation
     }
 
     /// Returns what kind of collection this is.
@@ -102,9 +153,17 @@ impl ArchiveRecipients {
             .iter()
             .position(|key| &crate::backup::recipient_key_id(key) == key_id)?;
         self.keys.remove(position);
+        let rotates_object_keys = self.kind == CollectionKind::MutableShared;
+        if rotates_object_keys {
+            // Advancing the rotation is the rotation. Every object staged before it is refused by
+            // `seal_archive` and staged again under a new key when it is resumed, so the removed
+            // recipient's wraps open nothing written after this point.
+            self.rotation = self.rotation.next();
+        }
         Some(Revocation {
             removed: *key_id,
-            rotates_object_keys: self.kind == CollectionKind::MutableShared,
+            rotates_object_keys,
+            rotation: self.rotation,
         })
     }
 }
@@ -116,6 +175,8 @@ pub struct Revocation {
     pub removed: KeyId,
     /// Whether the next generation re-keys its objects, which a mutable shared collection does.
     pub rotates_object_keys: bool,
+    /// The rotation the collection is at now. Staged ciphertext from before it is refused.
+    pub rotation: KeyRotation,
 }
 
 impl Revocation {
@@ -124,6 +185,10 @@ impl Revocation {
     /// A rotation says no: that ciphertext is under a key the removed recipient holds a wrap for,
     /// so the object is staged again under a new key rather than resumed. A collection that is not
     /// mutable and shared keeps its staged bytes, because nothing it contains changed.
+    ///
+    /// It is a report of a rule that is already enforced, not the rule itself.
+    /// [`crate::backup::seal_archive`] refuses an object from before
+    /// [`ArchiveRecipients::rotation`] whatever a caller does with this answer.
     #[must_use]
     pub const fn may_reuse_staged_ciphertext(&self) -> bool {
         !self.rotates_object_keys

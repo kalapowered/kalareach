@@ -32,10 +32,11 @@
 //! # Two limits, and which one binds
 //!
 //! Section 20 gives the public descriptor two defaults: 64 KiB and 128 recipients. The first
-//! applicable one binds, and in this encoding that is the byte limit, at
-//! [`RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT`] recipients rather than at 128. The reason is that a
-//! sealed key wrap carries its whole authenticated context beside the box, which is 648 bytes per
-//! recipient. [`seal_archive`] refuses over either limit and names the one it hit.
+//! applicable one binds, and in this encoding that is the byte limit, at about
+//! [`RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT`] recipients rather than at 128, because a sealed key wrap
+//! carries its whole authenticated context beside the box. The exact figure moves with the
+//! generation's integer width, so [`seal_archive`] enforces the encoded size rather than a count
+//! and names the limit it hit.
 //!
 //! # What a backup carries
 //!
@@ -69,13 +70,12 @@ pub use crate::backup::produce::{
     SealedArchive, StagedObject, resume_object, seal_archive, stage_object,
 };
 pub use crate::backup::recipients::{
-    ArchiveRecipients, CollectionKind, RetainedObjectKeys, Revocation,
+    ArchiveRecipients, CollectionKind, KeyRotation, RetainedObjectKeys, Revocation,
     still_readable_after_revocation,
 };
-pub use crate::backup::restore::{ArchiveReader, OpenArchive, RestoredObject, open_archive};
-
-/// The manifest schema version this build writes.
-pub const MANIFEST_SCHEMA_VERSION: u64 = 1;
+pub use crate::backup::restore::{
+    ArchiveExpectation, ArchiveReader, OpenArchive, RestoredObject, open_archive, read_descriptor,
+};
 
 /// The domain a manifest signature covers, re-exported so a producer names one constant.
 pub const ARCHIVE_MANIFEST_DOMAIN: &str = MANIFEST_DOMAIN;

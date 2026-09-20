@@ -8,8 +8,8 @@
 use kr_controller::backup::store::{GenerationState, ObjectState, Step};
 use kr_controller::backup::{BackupService, RestoreRequest, SUBSYSTEM_NAME};
 use kr_crypto::backup::{
-    ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, Material, ObjectSource,
-    SealedArchive, StagedObject, seal_archive, stage_object,
+    ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, KeyRotation, Material,
+    ObjectSource, SealedArchive, StagedObject, seal_archive, stage_object,
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_protocol::archive::{
@@ -131,11 +131,14 @@ impl Producer {
 }
 
 fn stage(seed: u8, filename: &str, plaintext: &[u8]) -> StagedObject {
-    stage_object(&ObjectSource {
-        object_id: object_id(seed),
-        filename,
-        plaintext,
-    })
+    stage_object(
+        &ObjectSource {
+            object_id: object_id(seed),
+            filename,
+            plaintext,
+        },
+        KeyRotation::INITIAL,
+    )
     .expect("a staged object")
 }
 

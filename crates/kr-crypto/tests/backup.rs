@@ -4,12 +4,14 @@
 //! the storage service; everything here is what a device does before it uploads a byte and after
 //! it fetches one back.
 
+use kr_crypto::CryptoError;
 use kr_crypto::archive::{self, EncryptedObject};
 use kr_crypto::backup::{
-    ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource, CollectionKind,
-    GenerationStanding, ObjectSource, RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, RestoreGeneration,
-    ResumeDecision, RetainedObjectKeys, SealedArchive, StagedObject, open_archive,
-    recipient_key_id, resume_object, seal_archive, stage_object, still_readable_after_revocation,
+    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
+    CollectionKind, GenerationStanding, KeyRotation, ObjectSource,
+    RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, RestoreGeneration, ResumeDecision, RetainedObjectKeys,
+    SealedArchive, StagedObject, open_archive, recipient_key_id, resume_object, seal_archive,
+    stage_object, still_readable_after_revocation,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -80,12 +82,27 @@ impl Parties {
 }
 
 fn stage(seed: u8, filename: &str, plaintext: &[u8]) -> StagedObject {
-    stage_object(&ObjectSource {
-        object_id: object_id(seed),
-        filename,
-        plaintext,
-    })
+    stage_at(seed, filename, plaintext, KeyRotation::INITIAL)
+}
+
+fn stage_at(seed: u8, filename: &str, plaintext: &[u8], rotation: KeyRotation) -> StagedObject {
+    stage_object(
+        &ObjectSource {
+            object_id: object_id(seed),
+            filename,
+            plaintext,
+        },
+        rotation,
+    )
     .expect("a staged object")
+}
+
+/// What a restore expects when it is restoring the collection these tests write.
+fn expecting() -> ArchiveExpectation<'static> {
+    ArchiveExpectation {
+        archive_id: archive_id(),
+        checkpoint: None,
+    }
 }
 
 fn seal(parties: &Parties, generation: u64, objects: &[StagedObject]) -> SealedArchive {
@@ -125,10 +142,14 @@ fn an_object_is_written_in_one_mebibyte_records_and_needs_its_final_record() {
         .map(|index| u8::try_from(index % 251).expect("a byte"))
         .collect();
     let staged = stage(3, "large.cbor", &plaintext);
+    let records = plaintext.len().div_ceil(RECORD_LEN);
+    assert_eq!(records, 3, "two full records and a remainder");
     assert_eq!(
         staged.bytes.len(),
-        kr_crypto::stream::encrypted_len(plaintext.len()),
-        "the object is header plus three records"
+        kr_crypto::stream::HEADER_LEN
+            + plaintext.len()
+            + records * kr_crypto::stream::RECORD_OVERHEAD,
+        "the object is a header and three records, each with its own tag"
     );
 
     let parties = Parties::generate();
@@ -138,6 +159,7 @@ fn an_object_is_written_in_one_mebibyte_records_and_needs_its_final_record() {
         &reader,
         &parties.sender_key(),
         &[trusted(&parties.writer)],
+        &expecting(),
         &sealed.descriptor_bytes,
         &sealed.encrypted_manifest,
     )
@@ -153,19 +175,70 @@ fn an_object_is_written_in_one_mebibyte_records_and_needs_its_final_record() {
         .expect("the object restores");
     assert_eq!(restored.plaintext.expose(), plaintext.as_slice());
 
-    // An upload cut short has no final record. It is an error, not a shorter valid object.
+    // A length that is not the manifest's fails first, before the object is decrypted at all.
     let truncated = &staged.bytes[..staged.bytes.len() - 64];
     assert!(
-        opened
-            .restore_object(
+        matches!(
+            opened.restore_object(
                 &reader,
                 &parties.sender_key(),
                 staged.reference.object_id,
                 truncated,
-            )
-            .is_err(),
-        "an object without its final authenticated record is refused"
+            ),
+            Err(CryptoError::HashMismatch { .. })
+        ),
+        "a stored object of another length is refused before it is decrypted"
     );
+
+    // And the final-record rule itself, reached by publishing the *truncated* bytes as the object:
+    // its hash and length are the manifest's, so every check before the framing rule passes and
+    // the only thing left to refuse it is the missing final record.
+    let cut_short = truncated_object(&staged);
+    let sealed = seal(&parties, 2, std::slice::from_ref(&cut_short));
+    let opened = open_archive(
+        &reader,
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &expecting(),
+        &sealed.descriptor_bytes,
+        &sealed.encrypted_manifest,
+    )
+    .expect("the archive opens");
+    assert!(
+        matches!(
+            opened.restore_object(
+                &reader,
+                &parties.sender_key(),
+                cut_short.reference.object_id,
+                &cut_short.bytes,
+            ),
+            Err(CryptoError::MissingFinalRecord)
+        ),
+        "an upload cut short is not a shorter valid object"
+    );
+}
+
+/// Publishes the first two records of an object as if they were the whole of it.
+///
+/// Its reference is the hash and the length of the truncated bytes, so a restore's length and hash
+/// checks both pass and the missing final record is what is left to catch it.
+fn truncated_object(staged: &StagedObject) -> StagedObject {
+    let record = kr_crypto::stream::HEADER_LEN
+        + kr_crypto::stream::RECORD_LEN
+        + kr_crypto::stream::RECORD_OVERHEAD;
+    let bytes = staged.bytes[..record].to_vec();
+    StagedObject {
+        reference: kr_protocol::archive::EncryptedObjectRef {
+            object_id: object_id(4),
+            encrypted_object_hash: Digest256::from_bytes(kr_cbor::sha256(&bytes)),
+            encrypted_len: U64::new(bytes.len() as u64),
+        },
+        filename: "cut-short.cbor".to_owned(),
+        bytes,
+        key: kr_crypto::secret::Secret::from_bytes(*staged.key.expose()),
+        source_digest: staged.source_digest,
+        rotation: staged.rotation,
+    }
 }
 
 #[test]
@@ -212,6 +285,7 @@ fn every_recipient_gets_its_own_wrap_of_every_key() {
             &reader,
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &sealed.descriptor_bytes,
             &sealed.encrypted_manifest,
         )
@@ -236,8 +310,9 @@ fn every_recipient_gets_its_own_wrap_of_every_key() {
             &ArchiveReader::Device(&stranger),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &sealed.descriptor_bytes,
-            &sealed.encrypted_manifest,
+            &sealed.encrypted_manifest
         )
         .is_err(),
         "a device with no wrap cannot open the archive"
@@ -337,6 +412,7 @@ fn a_wrap_is_valid_only_for_its_own_object_and_recipient() {
         &reader,
         &parties.sender_key(),
         &[trusted(&parties.writer)],
+        &expecting(),
         &descriptor_bytes,
         &encrypted_manifest,
     )
@@ -351,6 +427,54 @@ fn a_wrap_is_valid_only_for_its_own_object_and_recipient() {
             )
             .is_err(),
         "a wrap moved to another object does not open"
+    );
+
+    // And a wrap moved to another recipient. The second device's wrap of object one is
+    // re-addressed to the first device; its authenticated context still names the second, so the
+    // first cannot open it.
+    let mut payload = manifest_payload_with(&parties.device, &parties, &sealed);
+    let theirs = payload
+        .member_key_wraps
+        .iter()
+        .find(|wrap| {
+            wrap.context.object_id == first_object.reference.object_id
+                && wrap.context.recipient_key_id == second_device.key_id()
+        })
+        .expect("a wrap")
+        .clone();
+    for wrap in &mut payload.member_key_wraps {
+        if wrap.context.object_id == first_object.reference.object_id
+            && wrap.context.recipient_key_id == parties.device.key_id()
+        {
+            *wrap = theirs.clone();
+            wrap.context.recipient_key_id = parties.device.key_id();
+        }
+    }
+    let (descriptor_bytes, encrypted_manifest) = reseal_manifest(
+        &parties,
+        &[&parties.device, &second_device],
+        &sealed,
+        &payload,
+    );
+    let opened = open_archive(
+        &reader,
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &expecting(),
+        &descriptor_bytes,
+        &encrypted_manifest,
+    )
+    .expect("the manifest still verifies");
+    assert!(
+        opened
+            .restore_object(
+                &reader,
+                &parties.sender_key(),
+                first_object.reference.object_id,
+                &first_object.bytes,
+            )
+            .is_err(),
+        "a wrap addressed to another recipient does not open for this one"
     );
 }
 
@@ -372,6 +496,24 @@ fn only_the_archive_identifier_and_object_references_are_outside_the_encrypted_m
     assert!(
         !contains(&sealed.encrypted_manifest, b"session-history.cbor"),
         "the manifest object is ciphertext"
+    );
+
+    // Exhaustively: the descriptor's own members are the five section 20 lists and no others, so a
+    // field added to it later has to be considered rather than slipping out in the clear.
+    let decoded = kr_cbor::decode(&sealed.descriptor_bytes, &kr_cbor::Limits::DEFAULT)
+        .expect("a canonical descriptor");
+    let map = decoded.as_map().expect("a descriptor is a map");
+    let mut members: Vec<&str> = map.entries().iter().map(|(key, _)| key.as_str()).collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        vec![
+            "archive_id",
+            "backup_generation",
+            "encrypted_manifest",
+            "manifest_key_wraps",
+            "version",
+        ]
     );
 
     // What the descriptor does carry: the version, the archive, the generation, the encrypted
@@ -407,8 +549,9 @@ fn a_manifest_signed_by_an_untrusted_writer_stops_the_restore() {
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
             &[trusted(&impostor)],
+            &expecting(),
             &sealed.descriptor_bytes,
-            &sealed.encrypted_manifest,
+            &sealed.encrypted_manifest
         )
         .is_err(),
         "a writer the bundle does not name is not trusted"
@@ -418,8 +561,9 @@ fn a_manifest_signed_by_an_untrusted_writer_stops_the_restore() {
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
             &[],
+            &expecting(),
             &sealed.descriptor_bytes,
-            &sealed.encrypted_manifest,
+            &sealed.encrypted_manifest
         )
         .is_err(),
         "an empty trusted set trusts nothing"
@@ -446,8 +590,9 @@ fn a_manifest_that_names_another_archive_stops_the_restore() {
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &descriptor_bytes,
-            &encrypted_manifest,
+            &encrypted_manifest
         )
         .is_err(),
         "a verified manifest for another archive is a mismatch"
@@ -464,6 +609,7 @@ fn a_tampered_object_fails_against_the_hash_the_manifest_named() {
         &reader,
         &parties.sender_key(),
         &[trusted(&parties.writer)],
+        &expecting(),
         &sealed.descriptor_bytes,
         &sealed.encrypted_manifest,
     )
@@ -473,15 +619,16 @@ fn a_tampered_object_fails_against_the_hash_the_manifest_named() {
     let last = bytes.len() - 1;
     bytes[last] ^= 0x01;
     assert!(
-        opened
-            .restore_object(
+        matches!(
+            opened.restore_object(
                 &reader,
                 &parties.sender_key(),
                 objects[0].reference.object_id,
                 &bytes,
-            )
-            .is_err(),
-        "a changed byte fails before the object is decrypted"
+            ),
+            Err(CryptoError::HashMismatch { .. })
+        ),
+        "a changed byte fails on the manifest's hash, before the object is decrypted"
     );
 }
 
@@ -498,8 +645,9 @@ fn a_tampered_manifest_object_stops_the_restore_before_any_member_is_reached() {
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &sealed.descriptor_bytes,
-            &manifest,
+            &manifest
         )
         .is_err(),
         "the manifest is verified before any member object is restored"
@@ -577,6 +725,168 @@ fn a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit() {
 }
 
 #[test]
+fn a_larger_generation_number_fits_fewer_recipients() {
+    // The recipient figure is a figure and not a guarantee: a wrap grows with the generation's
+    // integer width. What is enforced is the encoded size, so the same recipient set that fits at
+    // a small generation can be refused at a large one, and the refusal names the byte limit.
+    let parties = Parties::generate();
+    let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
+    let mut devices = Vec::new();
+    for _ in 0..RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT {
+        let device = StoredEnvelopeKeyPair::generate().expect("a device key");
+        assert!(recipients.add(*device.public()));
+        devices.push(device);
+    }
+    let objects = [stage(1, "a.cbor", b"one")];
+    let small = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &recipients,
+        &plan(3),
+        &objects,
+    )
+    .expect("a sealed archive at a small generation");
+
+    let mut large = plan(3);
+    large.backup_generation = BackupGeneration::new(u64::from(u32::MAX) + 1);
+    let refusal = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &recipients,
+        &large,
+        &objects,
+    )
+    .expect_err("the same recipients at a generation whose number is wider");
+    assert!(
+        refusal.to_string().contains("65536-byte limit"),
+        "the byte limit is what binds: {refusal}"
+    );
+    assert!(small.descriptor_bytes.len() <= MAX_ARCHIVE_DESCRIPTOR_LEN);
+}
+
+#[test]
+fn a_generation_of_many_objects_and_many_recipients_seals_and_opens() {
+    // The producer encodes the manifest payload under the bounds the restore decodes with. A
+    // producer with looser bounds would write archives nothing could open, which is the one
+    // failure a backup must not have: it looks complete until somebody needs it.
+    let parties = Parties::generate();
+    let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
+    assert!(recipients.add(*parties.device.public()));
+    let mut devices = Vec::new();
+    for _ in 0..19 {
+        let device = StoredEnvelopeKeyPair::generate().expect("a device key");
+        assert!(recipients.add(*device.public()));
+        devices.push(device);
+    }
+    let objects: Vec<StagedObject> = (0u8..120)
+        .map(|seed| stage(seed, "member.cbor", b"a member object"))
+        .collect();
+    // Two thousand four hundred member wraps: over the default 1 MiB message bound and over the
+    // default four-thousand-member collection bound on items, which is what this pins.
+    assert_eq!(objects.len() * recipients.len(), 2_400);
+
+    let sealed = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &recipients,
+        &plan(1),
+        &objects,
+    )
+    .expect("a sealed archive");
+    let reader = ArchiveReader::Device(&parties.device);
+    let opened = open_archive(
+        &reader,
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &expecting(),
+        &sealed.descriptor_bytes,
+        &sealed.encrypted_manifest,
+    )
+    .expect("what this producer wrote is what this build reads");
+    assert_eq!(opened.objects().len(), objects.len());
+    let restored = opened
+        .restore_object(
+            &reader,
+            &parties.sender_key(),
+            objects[77].reference.object_id,
+            &objects[77].bytes,
+        )
+        .expect("a member object restores");
+    assert_eq!(restored.plaintext.expose(), b"a member object");
+}
+
+#[test]
+fn two_member_objects_under_one_identifier_are_refused_before_the_manifest_is_signed() {
+    let parties = Parties::generate();
+    let duplicated = [
+        stage(1, "a.cbor", b"one"),
+        stage(1, "b.cbor", b"the same identifier"),
+    ];
+    let refusal = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &parties.recipients(),
+        &plan(1),
+        &duplicated,
+    )
+    .expect_err("two objects under one identifier");
+    assert!(
+        refusal.to_string().contains("one object identifier"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a_manifest_under_a_schema_this_build_does_not_read_stops_the_restore() {
+    // The signature authenticates the schema version; it does not establish that this build knows
+    // what that version means. The writer here is genuinely trusted and genuinely signed it.
+    let parties = Parties::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = seal(&parties, 1, &objects);
+    let mut payload = manifest_payload(&parties, &sealed);
+    payload.manifest.manifest.schema_version = U64::new(2);
+    payload.manifest = archive::sign_manifest(&parties.writer, payload.manifest.manifest.clone())
+        .expect("a signed manifest");
+    let (descriptor_bytes, encrypted_manifest) =
+        reseal_manifest(&parties, &[&parties.device], &sealed, &payload);
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&parties.device),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &expecting(),
+            &descriptor_bytes,
+            &encrypted_manifest,
+        )
+        .is_err(),
+        "a later manifest schema is refused rather than read under this one's rules"
+    );
+}
+
+#[test]
+fn a_staged_object_never_prints_its_plaintext_or_its_fingerprint() {
+    let plaintext = b"what the session actually said";
+    let source = ObjectSource {
+        object_id: object_id(1),
+        filename: "a.cbor",
+        plaintext,
+    };
+    let rendered = format!("{source:?}");
+    assert!(!rendered.contains("session actually said"));
+    assert!(rendered.contains("plaintext_len"));
+
+    let staged = stage_object(&source, KeyRotation::INITIAL).expect("a staged object");
+    let rendered = format!("{staged:?}");
+    assert!(!rendered.contains("session actually said"));
+    assert!(
+        rendered.contains("Digest256(redacted)"),
+        "the source digest is a fingerprint of the plaintext: {rendered}"
+    );
+    let digest = kr_protocol::scalars::to_base64url(staged.source_digest.as_bytes().as_slice());
+    assert!(!rendered.contains(&digest));
+}
+
+#[test]
 fn an_archive_with_no_recipient_is_refused() {
     let parties = Parties::generate();
     let empty = ArchiveRecipients::new(CollectionKind::Owned);
@@ -606,8 +916,9 @@ fn an_invalid_descriptor_fails_before_any_object_is_opened() {
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &oversized,
-            &sealed.encrypted_manifest,
+            &sealed.encrypted_manifest
         )
         .is_err()
     );
@@ -621,8 +932,9 @@ fn an_invalid_descriptor_fails_before_any_object_is_opened() {
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &bytes,
-            &sealed.encrypted_manifest,
+            &sealed.encrypted_manifest
         )
         .is_err()
     );
@@ -636,8 +948,9 @@ fn an_invalid_descriptor_fails_before_any_object_is_opened() {
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &bytes,
-            &sealed.encrypted_manifest,
+            &sealed.encrypted_manifest
         )
         .is_err()
     );
@@ -660,11 +973,31 @@ fn an_interrupted_upload_resumes_on_the_ciphertext_it_already_made() {
             filename: "a.cbor",
             plaintext: b"the body",
         },
+        KeyRotation::INITIAL,
     )
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReusedCiphertext);
     assert_eq!(resumed.staged.bytes, before, "not one byte is re-encrypted");
     assert_eq!(resumed.staged.reference, reference);
+
+    // A source that was only renamed keeps its ciphertext and records the name it has now, so the
+    // next manifest does not carry a filename the source no longer has.
+    let renamed = resume_object(
+        resumed.staged,
+        &ObjectSource {
+            object_id: object_id(1),
+            filename: "renamed.cbor",
+            plaintext: b"the body",
+        },
+        KeyRotation::INITIAL,
+    )
+    .expect("a resumed object");
+    assert_eq!(renamed.decision, ResumeDecision::ReusedCiphertextRenamed);
+    assert_eq!(
+        renamed.staged.bytes, before,
+        "still not one byte re-encrypted"
+    );
+    assert_eq!(renamed.staged.filename, "renamed.cbor");
 }
 
 #[test]
@@ -680,6 +1013,7 @@ fn a_source_that_changed_restarts_encryption_under_a_new_key() {
             filename: "a.cbor",
             plaintext: b"a different body",
         },
+        KeyRotation::INITIAL,
     )
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReencryptedUnderNewKey);
@@ -705,6 +1039,7 @@ fn resuming_never_reuses_a_wrap_nonce() {
             filename: "a.cbor",
             plaintext: b"the body",
         },
+        KeyRotation::INITIAL,
     )
     .expect("a resumed object");
     assert_eq!(resumed.decision, ResumeDecision::ReusedCiphertext);
@@ -758,8 +1093,9 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
             &ArchiveReader::Device(&leaving),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &before.descriptor_bytes,
-            &before.encrypted_manifest,
+            &before.encrypted_manifest
         )
         .is_ok(),
         "before the revocation it is a recipient"
@@ -785,6 +1121,7 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
             &ArchiveReader::Device(&leaving),
             &parties.sender_key(),
             &[trusted(&parties.writer)],
+            &expecting(),
             &after.descriptor_bytes,
             &after.encrypted_manifest,
         )
@@ -792,31 +1129,119 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
         "after the revocation there is no wrap for it"
     );
 
+    // Not only the manifest key: the member wraps inside the new manifest name the one recipient
+    // that is left, and none of them is addressed to the device that went.
+    let payload = manifest_payload(&parties, &after);
+    assert!(!payload.member_key_wraps.is_empty());
+    for wrap in &payload.member_key_wraps {
+        assert_ne!(wrap.context.recipient_key_id, leaving.key_id());
+        assert_eq!(wrap.context.recipient_key_id, parties.device.key_id());
+    }
+
+    // And what it already had, it keeps. Revocation is prospective: the earlier generation it
+    // holds a wrap for still opens and still restores.
+    let opened = open_archive(
+        &ArchiveReader::Device(&leaving),
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &expecting(),
+        &before.descriptor_bytes,
+        &before.encrypted_manifest,
+    )
+    .expect("the generation it already held");
+    let restored = opened
+        .restore_object(
+            &ArchiveReader::Device(&leaving),
+            &parties.sender_key(),
+            objects[0].reference.object_id,
+            &objects[0].bytes,
+        )
+        .expect("a removed device reads what it already had");
+    assert_eq!(restored.plaintext.expose(), b"one");
+
     // Revoking something that is not in the set changes nothing.
     assert!(recipients.revoke(&leaving.key_id()).is_none());
 }
 
 #[test]
 fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
+    let parties = Parties::generate();
     let leaving = StoredEnvelopeKeyPair::generate().expect("a device key");
-    let holder = StoredEnvelopeKeyPair::generate().expect("a device key");
 
     let mut shared = ArchiveRecipients::new(CollectionKind::MutableShared);
-    assert!(shared.add(*holder.public()));
+    assert!(shared.add(*parties.device.public()));
     assert!(shared.add(*leaving.public()));
+    let before = shared.rotation();
+    let staged = stage_at(1, "a.cbor", b"shared content", before);
+    let key_before = kr_crypto::secret::Secret::from_bytes(*staged.key.expose());
+
     let rotated = shared.revoke(&leaving.key_id()).expect("a revocation");
     assert!(rotated.rotates_object_keys);
     assert!(
         !rotated.may_reuse_staged_ciphertext(),
         "staged ciphertext is discarded when the keys rotate"
     );
+    assert_ne!(shared.rotation(), before, "the rotation advanced");
 
+    // The rule is enforced, not reported: the ciphertext staged before the revocation cannot be
+    // sealed into the next generation, whatever a caller does with the answer above.
+    let refusal = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &shared,
+        &plan(2),
+        std::slice::from_ref(&staged),
+    )
+    .expect_err("ciphertext from before the rotation");
+    assert!(refusal.to_string().contains("rotated"), "{refusal}");
+
+    // Resuming it makes it again, under a key the removed device holds no wrap for.
+    let resumed = resume_object(
+        staged,
+        &ObjectSource {
+            object_id: object_id(1),
+            filename: "a.cbor",
+            plaintext: b"shared content",
+        },
+        shared.rotation(),
+    )
+    .expect("a resumed object");
+    assert_eq!(resumed.decision, ResumeDecision::ReencryptedAfterRotation);
+    assert!(
+        !resumed.staged.key.constant_time_eq(&key_before),
+        "the object is under a new key"
+    );
+    assert!(
+        seal_archive(
+            &parties.writer,
+            &parties.sender,
+            &shared,
+            &plan(2),
+            std::slice::from_ref(&resumed.staged),
+        )
+        .is_ok(),
+        "the re-staged object seals"
+    );
+
+    // An owned collection does not rotate, so its staged bytes still seal.
     let mut owned = ArchiveRecipients::new(CollectionKind::Owned);
-    assert!(owned.add(*holder.public()));
+    assert!(owned.add(*parties.device.public()));
     assert!(owned.add(*leaving.public()));
+    let staged = stage_at(1, "a.cbor", b"my content", owned.rotation());
     let plain = owned.revoke(&leaving.key_id()).expect("a revocation");
     assert!(!plain.rotates_object_keys);
     assert!(plain.may_reuse_staged_ciphertext());
+    assert!(
+        seal_archive(
+            &parties.writer,
+            &parties.sender,
+            &owned,
+            &plan(2),
+            std::slice::from_ref(&staged),
+        )
+        .is_ok(),
+        "nothing it contains changed, so its ciphertext still seals"
+    );
 
     for revocation in [rotated, plain] {
         assert!(
@@ -922,6 +1347,26 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
     assert!(!replayed.is_admissible());
     assert!(replayed.describe().contains("generation 3"));
 
+    // And the restore itself refuses it, whatever the caller did with the report. Everything else
+    // about the older archive is genuine: the writer is trusted, the wrap is this reader's and the
+    // manifest verifies.
+    let against = ArchiveExpectation {
+        archive_id: archive_id(),
+        checkpoint: Some((CheckpointSource::Pairing, &verified)),
+    };
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&parties.device),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &against,
+            &old.descriptor_bytes,
+            &old.encrypted_manifest,
+        )
+        .is_err(),
+        "a replayed older archive is refused by the restore, not only reported"
+    );
+
     let current = RestoreGeneration::against(
         &new.descriptor,
         Some((CheckpointSource::Pairing, &verified)),
@@ -931,6 +1376,75 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
         GenerationStanding::AtCheckpoint { .. }
     ));
     assert!(current.is_admissible());
+    let opened = open_archive(
+        &ArchiveReader::Device(&parties.device),
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &against,
+        &new.descriptor_bytes,
+        &new.encrypted_manifest,
+    )
+    .expect("the generation the owner verified opens");
+    assert!(matches!(
+        opened.generation().standing,
+        GenerationStanding::AtCheckpoint { .. }
+    ));
+}
+
+#[test]
+fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
+    let parties = Parties::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = seal(&parties, 1, &objects);
+
+    // Everything about it is genuine: a trusted writer, this reader's wrap, a manifest that
+    // verifies. It is simply not the collection being restored.
+    let elsewhere = ArchiveExpectation {
+        archive_id: ArchiveId::new(Uuid::from_bytes([0x99; 16])),
+        checkpoint: None,
+    };
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&parties.device),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &elsewhere,
+            &sealed.descriptor_bytes,
+            &sealed.encrypted_manifest,
+        )
+        .is_err(),
+        "a descriptor for another collection is a substitution"
+    );
+
+    // And a checkpoint for another archive is a mismatch rather than an absence: a caller that
+    // supplied one had an expectation, and this is not what it asked for.
+    let other = ArchiveCheckpoint {
+        archive_id: ArchiveId::new(Uuid::from_bytes([0x77; 16])),
+        ..checkpoint(1, Digest256::from_bytes([0xcd; 32]))
+    };
+    let standing = RestoreGeneration::against(
+        &sealed.descriptor,
+        Some((CheckpointSource::Pairing, &other)),
+    );
+    assert!(matches!(
+        standing.standing,
+        GenerationStanding::OtherArchive { .. }
+    ));
+    assert!(!standing.is_admissible());
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&parties.device),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &ArchiveExpectation {
+                archive_id: archive_id(),
+                checkpoint: Some((CheckpointSource::Pairing, &other)),
+            },
+            &sealed.descriptor_bytes,
+            &sealed.encrypted_manifest,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -949,12 +1463,68 @@ fn an_archive_claiming_the_checkpoints_generation_with_another_manifest_is_refus
         GenerationStanding::Substituted { .. }
     ));
     assert!(!substituted.is_admissible());
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&parties.device),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &ArchiveExpectation {
+                archive_id: archive_id(),
+                checkpoint: Some((CheckpointSource::Pairing, &verified)),
+            },
+            &second.descriptor_bytes,
+            &second.encrypted_manifest,
+        )
+        .is_err(),
+        "an archive claiming the checkpoint's generation with another manifest is refused"
+    );
 }
 
 #[test]
 fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     let parties = Parties::generate();
-    let sealed = seal(&parties, 11, &[stage(1, "a.cbor", b"one")]);
+    let seed = RecoverySeed::generate().expect("a seed");
+    let recovery = seed.recipient().expect("a recovery recipient");
+    let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
+    assert!(recipients.add_recovery(&recovery));
+    let staged = stage(1, "a.cbor", b"one");
+    let sealed = seal_archive(
+        &parties.writer,
+        &parties.sender,
+        &recipients,
+        &plan(11),
+        std::slice::from_ref(&staged),
+    )
+    .expect("a sealed archive");
+
+    // A device that holds only the recovery recipient restores the archive and is told which
+    // generation it got.
+    let reader = ArchiveReader::Recovery(&recovery);
+    let bundle_checkpoint = checkpoint(9, Digest256::from_bytes([0xab; 32]));
+    let opened = open_archive(
+        &reader,
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &ArchiveExpectation {
+            archive_id: archive_id(),
+            checkpoint: Some((CheckpointSource::RecoveryBundle, &bundle_checkpoint)),
+        },
+        &sealed.descriptor_bytes,
+        &sealed.encrypted_manifest,
+    )
+    .expect("the recovery recipient opens it");
+    let restored = opened
+        .restore_object(
+            &reader,
+            &parties.sender_key(),
+            staged.reference.object_id,
+            &staged.bytes,
+        )
+        .expect("the member object restores");
+    assert_eq!(restored.plaintext.expose(), b"one");
+    let shown = opened.generation();
+    assert!(shown.describe().contains("generation 11"));
+    assert!(!shown.proves_no_newer_archive());
 
     // With the bundle's checkpoint: it is newer than what was verified, which is what an owner who
     // kept backing up looks like.
@@ -978,22 +1548,6 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     assert!(bare.is_admissible());
     assert!(!bare.checkpoint_available());
     assert!(bare.describe().contains("generation 11"));
-
-    // A checkpoint for another archive says nothing about this one.
-    let elsewhere = ArchiveCheckpoint {
-        archive_id: ArchiveId::new(Uuid::from_bytes([0x77; 16])),
-        ..checkpoint(99, Digest256::from_bytes([0xcd; 32]))
-    };
-    let other = RestoreGeneration::against(
-        &sealed.descriptor,
-        Some((CheckpointSource::Pairing, &elsewhere)),
-    );
-    assert!(matches!(
-        other.standing,
-        GenerationStanding::OtherArchive { .. }
-    ));
-    assert!(other.is_admissible());
-    assert!(!other.checkpoint_available());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1076,4 +1630,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn the_recipient_key_identifier_is_purpose_separated() {
     let device = StoredEnvelopeKeyPair::generate().expect("a device key");
     assert_eq!(recipient_key_id(device.public()), device.key_id());
+
+    // The purpose is inside the identifier, so the same 32 bytes declared under another purpose
+    // produce another identifier and a wrap addressed to one is not addressed to the other.
+    let bytes = device.public().as_bytes();
+    assert_ne!(
+        kr_crypto::keys::key_id(kr_protocol::pairing::KeyPurpose::StoredEnvelope, bytes),
+        kr_crypto::keys::key_id(kr_protocol::pairing::KeyPurpose::Authorisation, bytes)
+    );
 }

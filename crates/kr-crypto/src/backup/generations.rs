@@ -134,14 +134,18 @@ impl RestoreGeneration {
 
     /// Whether this restore may go ahead.
     ///
-    /// A generation behind the checkpoint, and one that claims the checkpoint's generation with
-    /// another manifest, are both refused: each is a service handing back something other than
-    /// what the owner verified.
+    /// Three refusals. A generation behind the checkpoint is a service replaying an older archive.
+    /// One that claims the checkpoint's generation with another manifest is a substitution. And a
+    /// checkpoint that is for another archive means the caller held an expectation and was handed
+    /// a different collection: *no* checkpoint is the recovery-only case and goes ahead, but the
+    /// wrong one is a mismatch rather than an absence.
     #[must_use]
     pub const fn is_admissible(&self) -> bool {
         !matches!(
             self.standing,
-            GenerationStanding::Replayed { .. } | GenerationStanding::Substituted { .. }
+            GenerationStanding::Replayed { .. }
+                | GenerationStanding::Substituted { .. }
+                | GenerationStanding::OtherArchive { .. }
         )
     }
 
@@ -190,7 +194,9 @@ impl RestoreGeneration {
                 source.as_str()
             ),
             GenerationStanding::OtherArchive { .. } => {
-                "There is no verified generation for this archive to compare it with.".to_owned()
+                "The verified generation supplied is for a different archive, so this is not the \
+                 backup that was asked for and it is not being restored."
+                    .to_owned()
             }
             GenerationStanding::NoCheckpoint => {
                 "There is no verified generation to compare it with.".to_owned()

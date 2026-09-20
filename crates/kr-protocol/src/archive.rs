@@ -211,6 +211,39 @@ pub struct ManifestObject {
     pub filename: String,
 }
 
+/// The manifest schema version this build writes and reads.
+pub const ARCHIVE_MANIFEST_SCHEMA_VERSION: u64 = 1;
+
+/// The most member objects one manifest names.
+pub const MAX_MANIFEST_OBJECTS: usize = 4096;
+
+/// The most member key wraps one manifest payload carries: objects times recipients.
+pub const MAX_MANIFEST_KEY_WRAPS: usize = 65_536;
+
+/// The most bytes one manifest payload encodes to.
+pub const MAX_MANIFEST_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+
+/// The bounds a manifest payload is encoded *and* decoded under.
+///
+/// One set, named once. A producer that wrote under looser bounds than a reader enforces would
+/// write archives nothing could open, and the reader's bounds are the ones that matter, so both
+/// sides use these: [`crate::archive::MANIFEST_PAYLOAD_LIMITS`] is what
+/// `kr_crypto::backup::seal_archive` encodes with and what `kr_crypto::backup::open_archive`
+/// decodes with.
+///
+/// They are wider than [`kr_cbor::Limits::DEFAULT`] because a manifest payload is not a control
+/// frame: it carries every member key wrapped once per recipient, and the default 1 MiB message
+/// and 4 096-member collection would cap an archive at about forty objects for a hundred
+/// recipients.
+pub const MANIFEST_PAYLOAD_LIMITS: kr_cbor::Limits = kr_cbor::Limits {
+    max_message_len: MAX_MANIFEST_PAYLOAD_LEN,
+    max_depth: 32,
+    max_items: 2_097_152,
+    max_collection_len: MAX_MANIFEST_KEY_WRAPS,
+    max_bytes_len: 1 << 20,
+    max_text_len: 1 << 20,
+};
+
 /// The manifest of one archive generation.
 ///
 /// It is encrypted as a separate object before upload. Its signature is verified against a trusted

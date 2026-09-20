@@ -141,37 +141,50 @@ producer does not have to remember it, and it is the only thing in the tree that
 2. **Resume by reusing ciphertext.** An upload that stopped is continued with the bytes already
    created when the source digest still matches, and encryption restarts under a *new* key when it
    does not: continuing the old ciphertext would produce an object whose records came from two
-   different sources under one key. A resume never reuses a wrap nonce, because sealing a
-   generation is a new call and every call draws a fresh nonce.
+   different sources under one key. A source that was only renamed keeps its ciphertext and records
+   the name it has now. A resume never reuses a wrap nonce, because sealing a generation is a new
+   call and every call draws a fresh nonce.
 3. **Seal the generation.** The manifest is signed, every member key is wrapped once per recipient,
    the signed manifest *and those wraps* become the plaintext of one more encrypted object, and the
    manifest key is wrapped once per recipient into the public descriptor. The member wraps travel
    inside the manifest object because each one names an object identifier and an encrypted hash,
    and section 20 keeps both inside the encrypted manifest: only the opaque archive identifier and
    the encrypted-object references stay outside.
-4. **Open it again.** The descriptor is bounded and validated before anything is allocated, the
-   manifest is decrypted and its signature verified against the owner's trusted writers, the
-   manifest is checked against the descriptor it came with, and only then can a member object be
-   restored. `OpenArchive` cannot be built any other way, so a caller cannot reach the reading half
-   without the checking half.
+4. **Open it again.** The descriptor is bounded and validated before anything is allocated; it is
+   checked against the archive the caller said it was restoring and against the generation the
+   owner's checkpoint admits; the manifest is decrypted and its signature verified against the
+   owner's trusted writers; the manifest is checked against the descriptor it came with and against
+   the schema version this build reads; and only then can a member object be restored.
+   `OpenArchive` cannot be built any other way, so a caller cannot reach the reading half without
+   the checking half. `read_descriptor` exists for a caller that wants to *show* what it is about
+   to restore first; reading one grants nothing, because opening enforces the same rules again.
+
+The producer encodes the manifest payload under the same bounds the restore decodes with
+(`MANIFEST_PAYLOAD_LIMITS`), and refuses more objects, more wraps or more bytes than those bounds
+carry. A producer with looser bounds than its reader would write archives nothing could open, which
+is the one failure a backup must not have: it looks complete until the day somebody needs it.
 
 ### Two limits, and which one binds
 
 The public descriptor has two defaults, 64 KiB and 128 recipients, and the first applicable one
-binds. In this encoding that is the byte limit, at **100 recipients**, because a sealed key wrap
-carries its whole authenticated context beside the box and comes to 648 bytes: a hundred of them
-and the descriptor's own fields are 64 902 bytes, and a hundred and one are 65 646. `seal_archive`
-refuses over either limit and names the one it hit, and
-`a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit` pins both numbers, so a
-change to the encoding that moves them is a change a test reports rather than one that quietly
-shrinks how many devices an archive serves.
+binds. In this encoding that is the byte limit, at about **100 recipients**, because a sealed key
+wrap carries its whole authenticated context beside the box and comes to 648 bytes at a small
+generation number. It is a figure rather than a guarantee: a wrap grows with the generation's
+integer width, so an archive at generation 65 536 fits fewer. `seal_archive` enforces the *encoded
+size*, which is the quantity section 20 bounds, and names the limit it hit;
+`a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit` and
+`a_larger_generation_number_fits_fewer_recipients` keep the figure honest.
 
 ### Revocation, rotation and the checkpoint
 
 Revoking a recipient removes it from every future wrap, and for a mutable shared collection it
-rotates the keys as well: ciphertext staged before the revocation is discarded and staged again
-under a new key, because a device that kept reading what the others wrote after it left would have
-lost nothing by being removed. Nothing here claims retroactive secrecy.
+rotates the keys as well. The rotation is a rule rather than a report: revoking advances
+`ArchiveRecipients::rotation`, every staged object carries the rotation it was made under, and
+`seal_archive` refuses one from before the current rotation. Resuming it makes it again under a new
+key. A device that kept reading what the others wrote after it left would have lost nothing by
+being removed, so a caller cannot revoke and then seal the ciphertext that revocation invalidated,
+whatever it does with `Revocation::may_reuse_staged_ciphertext`. Nothing here claims retroactive
+secrecy.
 `still_readable_after_revocation` computes what the removed device keeps - every generation
 published before the revocation - so a host shows a person that rather than implying otherwise, and
 `Revocation::describe` says it in a sentence.
@@ -182,10 +195,13 @@ one it no longer retains goes, keys zeroising as they are dropped.
 
 A signed manifest stops forgery; it does not stop a service handing back an older archive the owner
 really did write. `RestoreGeneration::against` compares one descriptor with the checkpoint the
-owner trusts and says where it stands: at it, ahead of it, replayed from before it, or claiming its
-generation with another manifest. The last two are refused. Where the checkpoint came from travels
-with the answer, because a paired device's and a recovery bundle's mean different things to a
-person. `proves_no_newer_archive` is always false and is a method rather than a comment: a service
+owner trusts and says where it stands: at it, ahead of it, replayed from before it, claiming its
+generation with another manifest, or for a different archive altogether. The last three are
+refused, and refused by `open_archive` itself rather than only reported, so a caller that never
+looked at the report still cannot restore a replay. *No* checkpoint is the recovery-only case and
+goes ahead; the wrong one is a mismatch rather than an absence. Where the checkpoint came from
+travels with the answer, because a paired device's and a recovery bundle's mean different things to
+a person. `proves_no_newer_archive` is always false and is a method rather than a comment: a service
 holding a newer archive back looks exactly like an owner who has not written one, and
 `RestoreGeneration::describe` says so in the sentence a restore displays, alongside the generation
 it is restoring.

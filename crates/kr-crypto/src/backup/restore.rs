@@ -6,13 +6,14 @@
 //! the object identifier and encrypted hash the *manifest* named.
 
 use kr_protocol::archive::{
-    ArchiveDescriptor, ManifestObject, ManifestPayload, SealedKeyWrap, SignedArchiveManifest,
-    TrustedWriter,
+    ARCHIVE_MANIFEST_SCHEMA_VERSION, ArchiveCheckpoint, ArchiveDescriptor, MANIFEST_PAYLOAD_LIMITS,
+    ManifestObject, ManifestPayload, SealedKeyWrap, SignedArchiveManifest, TrustedWriter,
 };
-use kr_protocol::ids::BackupObjectId;
+use kr_protocol::ids::{ArchiveId, BackupObjectId};
 use kr_protocol::scalars::{KeyId, StoredEnvelopeKey};
 
 use crate::archive;
+use crate::backup::generations::{CheckpointSource, RestoreGeneration};
 use crate::backup::{manifest_context, member_context};
 use crate::error::{CryptoError, Result};
 use crate::kdf::RecoveryRecipient;
@@ -57,18 +58,54 @@ impl ArchiveReader<'_> {
     }
 }
 
+/// What a restore expects the archive it is opening to be.
+///
+/// Both halves are what section 20 ¶7 asks for. The archive identity is the collection the caller
+/// means to restore, so a descriptor for another one is a substitution rather than a different
+/// backup. The checkpoint is the latest generation the owner verified, which is what catches a
+/// service replaying an older archive whose signature is perfectly genuine.
+///
+/// A restore that has no checkpoint says so by leaving it `None`, which is the recovery-only case:
+/// it goes ahead, and [`RestoreGeneration::proves_no_newer_archive`] stays false either way.
+#[derive(Clone, Copy, Debug)]
+pub struct ArchiveExpectation<'a> {
+    /// The archive the caller means to restore.
+    pub archive_id: ArchiveId,
+    /// The latest generation the owner verified, and where that came from.
+    pub checkpoint: Option<(CheckpointSource, &'a ArchiveCheckpoint)>,
+}
+
+/// Reads a descriptor, so a caller can show what it is about to restore before it restores it.
+///
+/// It is the same decode and the same validation [`open_archive`] performs, exposed on its own: a
+/// caller that wants to display [`RestoreGeneration::describe`] needs the descriptor first.
+/// Reading one grants nothing - opening the archive enforces the same rules again - so a caller
+/// that skips the display still cannot restore a replayed generation.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::BindingMismatch`] when the bytes are not a descriptor this build reads.
+pub fn read_descriptor(descriptor_bytes: &[u8]) -> Result<ArchiveDescriptor> {
+    ArchiveDescriptor::from_canonical_bytes(descriptor_bytes).map_err(|_| {
+        CryptoError::BindingMismatch {
+            what: "an archive descriptor this build will not read",
+        }
+    })
+}
+
 /// One archive whose manifest has been decrypted and verified.
 ///
 /// Holding one is the evidence that the verification happened: there is no way to build it without
-/// a descriptor that validated, a manifest that decrypted, and a signature that verified against a
-/// writer the caller supplied. [`Self::restore_object`] is therefore reachable only after all
-/// three.
+/// a descriptor that validated, an archive identity the caller expected, a generation the owner's
+/// checkpoint admits, a manifest that decrypted, and a signature that verified against a writer
+/// the caller supplied. [`Self::restore_object`] is therefore reachable only after all five.
 #[derive(Debug)]
 pub struct OpenArchive {
     descriptor: ArchiveDescriptor,
     manifest: SignedArchiveManifest,
     member_key_wraps: Vec<SealedKeyWrap>,
     reader_key_id: KeyId,
+    generation: RestoreGeneration,
 }
 
 /// One restored member object.
@@ -93,6 +130,12 @@ impl OpenArchive {
     #[must_use]
     pub const fn manifest(&self) -> &SignedArchiveManifest {
         &self.manifest
+    }
+
+    /// Returns where this generation stands against the checkpoint, which a restore displays.
+    #[must_use]
+    pub const fn generation(&self) -> RestoreGeneration {
+        self.generation
     }
 
     /// Returns the member objects, in the order the producer wrote them.
@@ -173,17 +216,32 @@ pub fn open_archive(
     reader: &ArchiveReader<'_>,
     sender: &StoredEnvelopeKey,
     trusted_writers: &[TrustedWriter],
+    expectation: &ArchiveExpectation<'_>,
     descriptor_bytes: &[u8],
     encrypted_manifest: &[u8],
 ) -> Result<OpenArchive> {
     // Nothing is allocated for the archive before this returns: the bytes are bounded, decoded and
     // validated first, which is what section 20 means by an invalid descriptor failing before
     // object allocation or a filesystem write.
-    let descriptor = ArchiveDescriptor::from_canonical_bytes(descriptor_bytes).map_err(|_| {
-        CryptoError::BindingMismatch {
-            what: "an archive descriptor this build will not read",
-        }
-    })?;
+    let descriptor = read_descriptor(descriptor_bytes)?;
+
+    // The collection the caller meant. A valid archive of another collection, signed by a writer
+    // this owner trusts and addressed to this reader, is a substitution; without this it would
+    // open.
+    if descriptor.archive_id != expectation.archive_id {
+        return Err(CryptoError::BindingMismatch {
+            what: "an archive descriptor for another collection than the one being restored",
+        });
+    }
+    // And the generation, against the checkpoint the owner verified. Refusing here rather than
+    // leaving it to the caller is what makes the checkpoint a protection instead of a report: a
+    // caller that never asked still cannot restore a replayed generation.
+    let generation = RestoreGeneration::against(&descriptor, expectation.checkpoint);
+    if !generation.is_admissible() {
+        return Err(CryptoError::BindingMismatch {
+            what: "an archive generation the owner's verified checkpoint refuses",
+        });
+    }
 
     let reader_key_id = reader.key_id();
     let wrap = archive::manifest_wrap_for(&descriptor, &reader_key_id).ok_or(
@@ -204,8 +262,9 @@ pub fn open_archive(
         &descriptor.encrypted_manifest,
         encrypted_manifest,
     )?;
+    // The same bounds the producer encoded under, so an archive this build wrote is one it reads.
     let payload: ManifestPayload =
-        kr_cbor::from_canonical_slice(plaintext.expose(), &kr_cbor::Limits::DEFAULT)?;
+        kr_cbor::from_canonical_slice(plaintext.expose(), &MANIFEST_PAYLOAD_LIMITS)?;
 
     // The signature is verified before anything else is read out of the manifest, and before any
     // member object is restored.
@@ -218,6 +277,14 @@ pub fn open_archive(
     {
         return Err(CryptoError::BindingMismatch {
             what: "a manifest that names another archive or backup generation",
+        });
+    }
+    // The signature authenticates the schema version; it does not establish that this build knows
+    // what that version means. A manifest a trusted writer signed under a later schema is refused
+    // rather than read under this one's rules.
+    if payload.manifest.manifest.schema_version.get() != ARCHIVE_MANIFEST_SCHEMA_VERSION {
+        return Err(CryptoError::BindingMismatch {
+            what: "a manifest schema version this build does not read",
         });
     }
     let mut seen: Vec<BackupObjectId> = Vec::with_capacity(payload.manifest.manifest.objects.len());
@@ -235,5 +302,6 @@ pub fn open_archive(
         manifest: payload.manifest,
         member_key_wraps: payload.member_key_wraps,
         reader_key_id,
+        generation,
     })
 }

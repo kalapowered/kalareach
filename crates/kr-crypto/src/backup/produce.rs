@@ -1,15 +1,17 @@
 //! Staging, resuming and sealing one backup generation.
 
 use kr_protocol::archive::{
-    ArchiveDescriptor, ArchiveManifest, EncryptedObjectRef, MAX_ARCHIVE_DESCRIPTOR_LEN,
-    MAX_ARCHIVE_RECIPIENTS, ManifestObject, ManifestPayload, SealedKeyWrap, SignedArchiveManifest,
+    ARCHIVE_MANIFEST_SCHEMA_VERSION, ArchiveDescriptor, ArchiveManifest, EncryptedObjectRef,
+    MANIFEST_PAYLOAD_LIMITS, MAX_ARCHIVE_DESCRIPTOR_LEN, MAX_ARCHIVE_RECIPIENTS,
+    MAX_MANIFEST_KEY_WRAPS, MAX_MANIFEST_OBJECTS, MAX_MANIFEST_PAYLOAD_LEN, ManifestObject,
+    ManifestPayload, SealedKeyWrap, SignedArchiveManifest,
 };
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::scalars::{Digest256, TimestampMs, U64};
 
 use crate::archive;
-use crate::backup::recipients::ArchiveRecipients;
-use crate::backup::{MANIFEST_SCHEMA_VERSION, manifest_context, member_context};
+use crate::backup::recipients::{ArchiveRecipients, KeyRotation};
+use crate::backup::{manifest_context, member_context};
 use crate::error::{CryptoError, Result};
 use crate::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use crate::secret::SymmetricKey;
@@ -18,22 +20,28 @@ use crate::sodium;
 /// The version of the public archive descriptor this producer writes.
 const DESCRIPTOR_VERSION: u64 = kr_protocol::archive::ARCHIVE_DESCRIPTOR_VERSION;
 
-/// The most recipients whose manifest-key wraps fit one descriptor, in this encoding.
+/// About how many recipients' manifest-key wraps fit one descriptor.
 ///
 /// Section 20 gives a descriptor two defaults, 64 KiB and 128 recipients, and the first applicable
-/// one binds. A manifest-key wrap is 648 bytes here, because [`SealedKeyWrap`] carries its whole
-/// authenticated context beside the box: the format, the purpose, the archive, the generation, the
-/// object, the encrypted-object hash and both key identifiers. A hundred of them and the
-/// descriptor's own fields come to 64 902 bytes; a hundred and one come to 65 646, which is over
-/// the byte limit. So the byte limit binds first, and this is where.
+/// one binds. In this encoding that is the byte limit, at roughly a hundred recipients rather than
+/// at a hundred and twenty-eight, because [`SealedKeyWrap`] carries its whole authenticated
+/// context beside the box: the format, the purpose, the archive, the generation, the object, the
+/// encrypted-object hash and both key identifiers, which is 648 bytes at a small generation
+/// number.
 ///
-/// `a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit` pins both numbers, so a
-/// change to the encoding that moves them is a change a test reports rather than one that quietly
-/// shrinks how many devices an archive serves.
+/// **It is a figure, not a guarantee.** A wrap grows with the integer width of the backup
+/// generation, so an archive at generation 65 536 fits fewer recipients than one at generation 3.
+/// [`seal_archive`] enforces the *encoded size*, which is the quantity section 20 bounds, and
+/// refuses whatever does not fit; this constant is what a caller sizing a recipient set should
+/// expect, and `a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit` and
+/// `a_larger_generation_number_fits_fewer_recipients` are what keep it honest.
 pub const RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT: usize = 100;
 
 /// One member object, as the producer is handed it.
-#[derive(Clone, Copy, Debug)]
+///
+/// `Debug` names the object and its filename and says how many bytes there are. It does not print
+/// the plaintext: a derived one would put a session's content into any log that formatted it.
+#[derive(Clone, Copy)]
 pub struct ObjectSource<'a> {
     /// The object's identity inside the archive.
     pub object_id: BackupObjectId,
@@ -48,7 +56,9 @@ pub struct ObjectSource<'a> {
 /// The key and the source digest are encryption state. Section 20 keeps both out of service
 /// storage: a producer uploads [`Self::bytes`] and publishes [`Self::reference`], and everything
 /// else here stays on the device that made it.
-#[derive(Debug)]
+///
+/// `Debug` is written rather than derived for the same reason: the key redacts itself, but the
+/// source digest is a fingerprint of the plaintext and a derived `Debug` would print it.
 pub struct StagedObject {
     /// The reference the manifest and every wrap name.
     pub reference: EncryptedObjectRef,
@@ -63,6 +73,37 @@ pub struct StagedObject {
     /// It is how a resumed upload tells an unchanged source from a changed one, and it never
     /// leaves the device: a service that held it would hold a fingerprint of the plaintext.
     pub source_digest: Digest256,
+    /// The key rotation this ciphertext was staged under.
+    ///
+    /// [`seal_archive`] refuses an object from before the recipient set's current rotation, so a
+    /// revocation that rotates a mutable shared collection's keys cannot be followed by a
+    /// generation sealed from the ciphertext that revocation invalidated.
+    pub rotation: KeyRotation,
+}
+
+impl std::fmt::Debug for ObjectSource<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectSource")
+            .field("object_id", &self.object_id)
+            .field("filename", &self.filename)
+            .field("plaintext_len", &self.plaintext.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for StagedObject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedObject")
+            .field("reference", &self.reference)
+            .field("filename", &self.filename)
+            .field("encrypted_len", &self.bytes.len())
+            .field("key", &self.key)
+            .field("source_digest", &"Digest256(redacted)")
+            .field("rotation", &self.rotation)
+            .finish()
+    }
 }
 
 impl StagedObject {
@@ -76,12 +117,15 @@ impl StagedObject {
     }
 }
 
-/// Encrypts one member object under a fresh random key.
+/// Encrypts one member object under a fresh random key, for one key rotation.
+///
+/// `rotation` is the recipient set's, from [`ArchiveRecipients::rotation`]. It travels with the
+/// ciphertext so that sealing can refuse an object staged before a revocation rotated the keys.
 ///
 /// # Errors
 ///
 /// Returns an error when libsodium is unavailable or reports a failure.
-pub fn stage_object(source: &ObjectSource<'_>) -> Result<StagedObject> {
+pub fn stage_object(source: &ObjectSource<'_>, rotation: KeyRotation) -> Result<StagedObject> {
     let object = archive::encrypt_object(source.object_id, source.plaintext)?;
     Ok(StagedObject {
         reference: object.reference,
@@ -89,6 +133,7 @@ pub fn stage_object(source: &ObjectSource<'_>) -> Result<StagedObject> {
         bytes: object.bytes,
         key: object.key,
         source_digest: Digest256::from_bytes(kr_cbor::sha256(source.plaintext)),
+        rotation,
     })
 }
 
@@ -103,6 +148,16 @@ pub enum ResumeDecision {
     /// Continuing the old ciphertext would have produced an object whose records came from two
     /// different sources under one key, which is not a backup of either of them.
     ReencryptedUnderNewKey,
+    /// The keys rotated, so encryption restarted under a new random key.
+    ///
+    /// The staged ciphertext is under a key a removed recipient holds a wrap for. Reusing it would
+    /// mean that a device removed from a mutable shared collection went on reading what the others
+    /// wrote after it left.
+    ReencryptedAfterRotation,
+    /// The source is what it was, and only its filename changed.
+    ///
+    /// The ciphertext and the key are kept; the manifest records the name the source has now.
+    ReusedCiphertextRenamed,
 }
 
 /// A resumed object and what resuming it did.
@@ -127,16 +182,38 @@ pub struct ResumedObject {
 /// # Errors
 ///
 /// Returns an error when libsodium is unavailable or reports a failure.
-pub fn resume_object(previous: StagedObject, source: &ObjectSource<'_>) -> Result<ResumedObject> {
+pub fn resume_object(
+    mut previous: StagedObject,
+    source: &ObjectSource<'_>,
+    rotation: KeyRotation,
+) -> Result<ResumedObject> {
     if previous.reference.object_id == source.object_id && previous.matches_source(source.plaintext)
     {
+        if previous.rotation != rotation {
+            // The keys rotated under it. Its ciphertext is under a key a removed recipient holds a
+            // wrap for, so it is made again rather than continued.
+            return Ok(ResumedObject {
+                staged: stage_object(source, rotation)?,
+                decision: ResumeDecision::ReencryptedAfterRotation,
+            });
+        }
+        let renamed = previous.filename != source.filename;
+        if renamed {
+            // The bytes did not change and the name did. The manifest records what the source is
+            // called now; re-encrypting it would be work that changed nothing.
+            source.filename.clone_into(&mut previous.filename);
+        }
         return Ok(ResumedObject {
             staged: previous,
-            decision: ResumeDecision::ReusedCiphertext,
+            decision: if renamed {
+                ResumeDecision::ReusedCiphertextRenamed
+            } else {
+                ResumeDecision::ReusedCiphertext
+            },
         });
     }
     Ok(ResumedObject {
-        staged: stage_object(source)?,
+        staged: stage_object(source, rotation)?,
         decision: ResumeDecision::ReencryptedUnderNewKey,
     })
 }
@@ -205,9 +282,43 @@ pub fn seal_archive(
             what: "an archive with no authorised recipient, which nothing could open",
         });
     }
+    if objects.len() > MAX_MANIFEST_OBJECTS {
+        return Err(CryptoError::TooLarge {
+            what: "the member objects of one archive generation",
+            limit: MAX_MANIFEST_OBJECTS,
+            actual: objects.len(),
+        });
+    }
+    let wraps = objects.len().saturating_mul(recipients.len());
+    if wraps > MAX_MANIFEST_KEY_WRAPS {
+        return Err(CryptoError::TooLarge {
+            what: "the member key wraps of one archive generation, which is objects times \
+                   recipients",
+            limit: MAX_MANIFEST_KEY_WRAPS,
+            actual: wraps,
+        });
+    }
+    // Two objects under one identity would produce a manifest that names one of them twice, which
+    // the restore refuses. A producer that wrote it would have written an archive nothing opens,
+    // so it is refused here instead.
+    let mut seen: Vec<BackupObjectId> = Vec::with_capacity(objects.len());
+    for staged in objects {
+        if staged.rotation != recipients.rotation() {
+            return Err(CryptoError::BindingMismatch {
+                what: "an object staged before this collection's keys were rotated, which a \
+                       removed recipient still holds a wrap for",
+            });
+        }
+        if seen.contains(&staged.reference.object_id) {
+            return Err(CryptoError::BindingMismatch {
+                what: "two member objects under one object identifier",
+            });
+        }
+        seen.push(staged.reference.object_id);
+    }
 
     let manifest = ArchiveManifest {
-        schema_version: U64::new(MANIFEST_SCHEMA_VERSION),
+        schema_version: U64::new(ARCHIVE_MANIFEST_SCHEMA_VERSION),
         archive_id: plan.archive_id,
         owner_device_id: plan.owner_device_id,
         backup_generation: plan.backup_generation,
@@ -247,7 +358,18 @@ pub fn seal_archive(
         manifest: signed_manifest.clone(),
         member_key_wraps,
     };
-    let mut payload_bytes = kr_cbor::to_canonical_vec(&payload)?;
+    // Encoded under the same bounds the restore decodes with. A producer that wrote under looser
+    // ones would write an archive nothing could open, which is the one failure a backup must not
+    // have: it looks like a complete backup until the day somebody needs it.
+    let mut payload_bytes = kr_cbor::to_canonical_vec_within(&payload, &MANIFEST_PAYLOAD_LIMITS)?;
+    if payload_bytes.len() > MAX_MANIFEST_PAYLOAD_LEN {
+        sodium::memzero(&mut payload_bytes);
+        return Err(CryptoError::TooLarge {
+            what: "the manifest payload of one archive generation",
+            limit: MAX_MANIFEST_PAYLOAD_LEN,
+            actual: payload_bytes.len(),
+        });
+    }
     let manifest_object = archive::encrypt_object(plan.manifest_object_id, &payload_bytes);
     // The plaintext carried every member wrap and the manifest; it is cleared whether or not the
     // encryption succeeded.
