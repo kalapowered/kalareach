@@ -1580,7 +1580,8 @@ async fn a_delegation_outside_this_calls_timeline_or_already_spent_is_refused() 
 }
 
 /// KR-REQ-23.51: one action identifier is one delegation. The same identifier carrying another
-/// delegation is refused, and an exact retry is answered with what that action came to.
+/// delegation is refused, and an exact retry is refused as the spent delegation it is, so the
+/// effect happens once whatever a caller submits twice.
 #[tokio::test]
 async fn one_action_identifier_carries_one_delegation() {
     let fixture = fixture();
@@ -1608,28 +1609,22 @@ async fn one_action_identifier_carries_one_delegation() {
         VoiceRefusal::UnannouncedDelegation
     );
 
-    // The same identifier and the same delegation: the answer the action already came to, and the
-    // host performed it once.
+    // The same identifier and the same delegation: the delegation is spent, so the answer says so
+    // and the effect happened exactly once.
     let again = fixture
         .coordinator
         .delegate(device(PHONE), action(1), &params, 11_200)
         .await
         .expect("an answer");
-    assert_eq!(again.outcome, first.outcome);
+    assert_eq!(
+        refusal(&again.outcome).0,
+        VoiceRefusal::UnannouncedDelegation
+    );
     assert_eq!(
         fixture.submitter.proposals().len(),
         1,
         "the effect happened once"
     );
-
-    // And a retry is told only while the authority it ran under still carries it.
-    fixture.authority.narrow_device_grant(&[]);
-    let after = fixture
-        .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_300)
-        .await
-        .expect_err("a retry outside the grant is not answered from the record");
-    assert_eq!(after.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
 }
 
 /// KR-REQ-15.11: the delegation event supplies an identifier and a timeline offset, not task text.

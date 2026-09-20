@@ -794,6 +794,22 @@ pub trait ManagedVoiceService: Send + Sync + fmt::Debug {
     fn provider(&self) -> String;
 }
 
+/// One origin in the spelling this crate compares.
+///
+/// Lower case, and without the port a scheme implies. Nothing else is touched: an origin is
+/// already a scheme, a host and an optional port by the time it is accepted.
+fn normalised_origin(origin: &str) -> String {
+    let lowered = origin.to_lowercase();
+    for (scheme, port) in [("https://", ":443"), ("http://", ":80")] {
+        if let Some(rest) = lowered.strip_prefix(scheme)
+            && let Some(host) = rest.strip_suffix(port)
+        {
+            return format!("{scheme}{host}");
+        }
+    }
+    lowered
+}
+
 /// The managed voice broker client.
 #[derive(Clone, Debug)]
 pub struct ManagedVoiceBroker {
@@ -856,9 +872,10 @@ impl ManagedVoiceBroker {
 
 impl ManagedVoiceService for ManagedVoiceBroker {
     fn provider(&self) -> String {
-        // The origin this client reaches. Two clients of the same service are the same provider,
-        // and a client of another service is not.
-        self.origin.clone()
+        // The origin this client reaches, in one spelling. Two clients of the same service are the
+        // same provider however each was configured, and a client of another service is not, so
+        // the spelling a caller happened to write must not decide whose call is whose.
+        normalised_origin(&self.origin)
     }
 
     fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {

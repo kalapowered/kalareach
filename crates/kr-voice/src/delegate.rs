@@ -90,33 +90,13 @@ pub struct Proposal {
     pub destination: Option<kr_protocol::voice::SpokenDestination>,
 }
 
-/// What binding one action identifier came to.
-enum Bound {
-    /// The binding is this caller's and the action has not been answered yet.
-    Proceed,
-    /// The action was answered before, and this is what it came to.
-    Answered(VoiceDelegationOutcome),
-    /// The identifier belongs to another delegation.
-    Refused(VoiceDelegationOutcome),
-}
-
-/// One action identifier of one device, and what it is bound to.
+/// One action identifier of one device, and the delegation it is bound to.
 #[derive(Clone, Debug)]
 struct BoundAction {
     device_id: DeviceId,
     action_id: ActionId,
     delegation_id: VoiceDelegationId,
-    voice_session_id: VoiceSessionId,
-    /// The session the delegation acts on, so a retry is answered only while that is still what
-    /// the device may reach.
-    session_id: Option<SessionId>,
-    /// What the action asks for, so a retry is answered only while the grants still permit it.
-    action: VoiceAction,
-    /// What the action came to, once it came to something. A delegation waiting for its
-    /// confirmation has nothing here, which is what lets the same identifier come back carrying
-    /// the signature.
-    outcome: Option<VoiceDelegationOutcome>,
-    /// When it was bound, so the binding can be forgotten once no window could still admit it.
+    /// When it was bound, so the binding is forgotten once no window could still admit it.
     bound_at_ms: u64,
 }
 
@@ -125,6 +105,13 @@ struct BoundAction {
 /// The longest lifetime a mutation may be admitted for. After it, no window this host issued can
 /// still admit that action, so nothing can arrive under it.
 const ACTION_MEMORY_MS: u64 = kr_protocol::limits::MAX_MUTATION_TTL.get();
+
+/// How many action identifiers of one device this host remembers at once.
+///
+/// A device submits one delegation at a time and the memory lasts minutes, so this is far above
+/// anything a call produces; what it bounds is a device that submits identifiers for the sake of
+/// it.
+const ACTIONS_PER_DEVICE: usize = 256;
 
 /// One call a change withdrew, with the provider that created it.
 #[derive(Debug)]
@@ -1134,44 +1121,26 @@ impl Coordinator {
         // resubmission is the same identifier carrying a different payload; so the identifier is
         // bound to the delegation it was first used for, and what that delegation came to is kept
         // with it. The binding is taken here, in one critical section, before anything is awaited.
-        match self.bind_action(device_id, action_id, params, now_ms)? {
-            Bound::Answered(outcome) => {
-                return Ok(VoiceDelegateResult {
-                    delegation_id: params.delegation_id.clone(),
-                    outcome,
-                });
-            }
-            Bound::Refused(outcome) => {
-                return Ok(VoiceDelegateResult {
-                    delegation_id: params.delegation_id.clone(),
-                    outcome,
-                });
-            }
-            Bound::Proceed => {}
+        if let Some(refused) = self.bind_action(device_id, action_id, params, now_ms)? {
+            return Ok(VoiceDelegateResult {
+                delegation_id: params.delegation_id.clone(),
+                outcome: refused,
+            });
         }
-        let answer = self
-            .answer_delegation(device_id, action_id, params, now_ms)
-            .await;
-        if let Ok(answered) = answer.as_ref() {
-            let settled = match &answered.outcome {
-                // A challenge is not an answer: the same identifier comes back carrying the
-                // signature, and the binding stays where it is until it does.
-                VoiceDelegationOutcome::ConfirmationRequired { .. } => None,
-                settled => Some(settled.clone()),
-            };
-            let mut state = self.state.lock().expect("the coordinator's state");
-            if let Some(bound) = state
-                .actions
-                .iter_mut()
-                .find(|bound| bound.device_id == device_id && bound.action_id == action_id)
-            {
-                bound.outcome = settled;
-            }
-        }
-        answer
+        self.answer_delegation(device_id, action_id, params, now_ms)
+            .await
     }
 
-    /// Binds one action identifier to one delegation, or says what to answer instead.
+    /// Binds one action identifier to one delegation, or says why it cannot be.
+    ///
+    /// Section 9 makes `(actor, action)` one operation and the actor here is a device, so the
+    /// binding is the device's and outlives the call it was taken in. It is not a cache: nothing
+    /// is answered from it, because a stored answer is content and content served later is content
+    /// served under whatever authority stands later. What it does is stop one identifier carrying
+    /// two delegations.
+    ///
+    /// `None` means this caller holds the binding. It is kept for as long as a window could still
+    /// admit that action and swept afterwards.
     ///
     /// # Errors
     ///
@@ -1186,8 +1155,13 @@ impl Coordinator {
         action_id: ActionId,
         params: &VoiceDelegateParams,
         now_ms: u64,
-    ) -> Result<Bound> {
+    ) -> Result<Option<VoiceDelegationOutcome>> {
         let mut state = self.state.lock().expect("the coordinator's state");
+        // The voice session first: a request naming a call this device does not hold binds
+        // nothing, so an identifier nobody can use costs this host no memory.
+        state
+            .sessions
+            .of_device(params.voice_session_id, device_id)?;
         state
             .actions
             .retain(|bound| now_ms < bound.bound_at_ms.saturating_add(ACTION_MEMORY_MS));
@@ -1197,78 +1171,41 @@ impl Coordinator {
             .find(|bound| bound.device_id == device_id && bound.action_id == action_id)
         {
             if bound.delegation_id != params.delegation_id {
-                return Ok(Bound::Refused(VoiceDelegationOutcome::Refused {
+                return Ok(Some(VoiceDelegationOutcome::Refused {
                     reason: VoiceRefusal::UnannouncedDelegation,
                     message: "that action identifier was used for another delegation".to_owned(),
                 }));
             }
-            if let Some(outcome) = bound.outcome.clone() {
-                // The same action again. Its effect happened once and this is what it came to;
-                // whether this caller may still be told is the question below.
-                let (voice_session_id, session_id, action) =
-                    (bound.voice_session_id, bound.session_id, bound.action);
-                drop(state);
-                self.still_may_be_told(device_id, voice_session_id, session_id, action, now_ms)?;
-                return Ok(Bound::Answered(outcome));
-            }
-            return Ok(Bound::Proceed);
+            // The same identifier and the same delegation. What happens next is the ordinary
+            // path's answer: a delegation that was spent is refused as spent, and one waiting for
+            // its confirmation goes on to carry the signature.
+            return Ok(None);
+        }
+        // Bounded per device, so one device cannot fill this host's memory with identifiers, and
+        // the oldest goes first because the newest is the one a caller is still using.
+        let theirs = state
+            .actions
+            .iter()
+            .filter(|bound| bound.device_id == device_id)
+            .count();
+        if theirs >= ACTIONS_PER_DEVICE
+            && let Some(oldest) = state
+                .actions
+                .iter()
+                .enumerate()
+                .filter(|(_, bound)| bound.device_id == device_id)
+                .min_by_key(|(_, bound)| bound.bound_at_ms)
+                .map(|(index, _)| index)
+        {
+            state.actions.remove(oldest);
         }
         state.actions.push(BoundAction {
             device_id,
             action_id,
             delegation_id: params.delegation_id.clone(),
-            voice_session_id: params.voice_session_id,
-            session_id: params.session_id.0,
-            action: params.action,
-            outcome: None,
             bound_at_ms: now_ms,
         });
-        Ok(Bound::Proceed)
-    }
-
-    /// Whether the authority an answered action ran under still admits telling this caller.
-    ///
-    /// A retained answer is a read of somebody's result, and section 23 wants present authority
-    /// over the subject before either half of one goes back.
-    fn still_may_be_told(
-        &self,
-        device_id: DeviceId,
-        voice_session_id: VoiceSessionId,
-        session_id: Option<SessionId>,
-        action: VoiceAction,
-        now_ms: u64,
-    ) -> Result<()> {
-        let voice_grant_id = {
-            let state = self.state.lock().expect("the coordinator's state");
-            let record = state.sessions.of_device(voice_session_id, device_id)?;
-            if let Some(session_id) = session_id
-                && !record.reaches(session_id)
-            {
-                return Err(VoiceError::refused(
-                    VoiceRefusal::SessionOutsideVoiceSession,
-                    "this voice session does not reach that session",
-                ));
-            }
-            record.grant_id
-        };
-        let now_ms = self.authority.now_ms().max(now_ms);
-        let voice_grant = self.live_voice_grant(voice_grant_id, now_ms)?;
-        let device_grant = self
-            .authority
-            .device_grant(device_id, session_id, now_ms)?
-            .ok_or_else(|| {
-                VoiceError::refused(
-                    VoiceRefusal::OutsideDeviceGrant,
-                    "this device's grant does not cover that session",
-                )
-            })?;
-        if !permits(&voice_grant, &device_grant, action) {
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideVoiceGrant,
-                "the authority this action ran under does not carry it any more",
-            ));
-        }
-        Ok(())
+        Ok(None)
     }
 
     async fn answer_delegation(
