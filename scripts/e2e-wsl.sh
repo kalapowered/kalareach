@@ -346,16 +346,20 @@ worker_exe="$(dirname "$kr_exe")/kr-worker.exe"
 [ -f "$controller_exe" ] || fail "no Windows kr-controller.exe beside $kr_exe"
 
 # The Windows daemon this run owns, with its keys in its own directory rather than the platform
-# credential store.
+# credential store. Every path handed to one of these native programs is a Windows path, including
+# the two in the environment: this shell's own form means nothing to them.
 windows_runtime="$run_dir/windows-run"
 windows_state="$run_dir/windows-state"
 mkdir -p "$windows_runtime" "$windows_state"
-"$controller_exe" --runtime-dir "$(cygpath -w "$windows_runtime" 2>/dev/null || echo "$windows_runtime")" \
-  --state-dir "$(cygpath -w "$windows_state" 2>/dev/null || echo "$windows_state")" \
-  --worker "$(cygpath -w "$worker_exe" 2>/dev/null || echo "$worker_exe")" \
+windows_path() { cygpath -w "$1" 2>/dev/null || printf '%s' "$1"; }
+"$controller_exe" --runtime-dir "$(windows_path "$windows_runtime")" \
+  --state-dir "$(windows_path "$windows_state")" \
+  --worker "$(windows_path "$worker_exe")" \
   --secret-store file >"$run_dir/windows-controller.log" 2>&1 &
 windows_daemon=$!
-export KR_RUNTIME_DIR="$windows_runtime" KR_STATE_DIR="$windows_state"
+KR_RUNTIME_DIR="$(windows_path "$windows_runtime")"
+KR_STATE_DIR="$(windows_path "$windows_state")"
+export KR_RUNTIME_DIR KR_STATE_DIR
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if "$kr_exe" bridge list >/dev/null 2>&1; then
     break
