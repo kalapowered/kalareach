@@ -22,13 +22,18 @@ import {
   type RunningCall
 } from './model'
 import { useApp } from '../app/state'
-import { failureMessage as portFailureMessage } from '../host/port'
+import { failureCode as portFailureCode, failureMessage as portFailureMessage } from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
 import type { Surface } from '../mobile/platform'
 
 /** The message to show for a failure, whatever shape it arrived in. */
 function failureMessage(value: unknown): string {
   return portFailureMessage(value instanceof AskFailed ? value.payload : value)
+}
+
+/** The protocol code of a failure, whatever shape it arrived in. */
+function failureCode(value: unknown): string | null {
+  return portFailureCode(value instanceof AskFailed ? value.payload : value)
 }
 
 /**
@@ -81,6 +86,17 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
   const [call, setCall] = useState<RunningCall | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+
+  /**
+   * Whether each of the two connections is carrying requests.
+   *
+   * They are separate because they are separate connections. Cancelling a turn is a typed request
+   * to a host and survives a voice service that has stopped answering; sending context is a
+   * request to that service and does not. Treating them as one would take a cancellation away
+   * because a voice service went quiet, which is the opposite of what section 15 ¶10 asks for.
+   */
+  const [hostReachable, setHostReachable] = useState(true)
+  const [brokerReachable, setBrokerReachable] = useState(true)
 
   /**
    * The platform's own touch target, resolved where the tokens look for it.
@@ -191,6 +207,30 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
     }
   }, [applyLocalState, call, port])
 
+  // Whether this device is reaching the host. The backend publishes the connection's state, and
+  // cancelling a turn is the one control that depends on it, so the screen follows the answer
+  // rather than assuming the connection it started with is still there.
+  useEffect(() => {
+    let current = true
+    void ask(() => port.connectionState())
+      .then((state) => {
+        if (current) setHostReachable(state.connected)
+      })
+      .catch(() => {
+        if (current) setHostReachable(false)
+      })
+    const stop = port.subscribe((event) => {
+      const body = event.body as { kind?: string; connected?: boolean } | null
+      if (body?.kind === 'connection' && typeof body.connected === 'boolean') {
+        setHostReachable(body.connected)
+      }
+    })
+    return () => {
+      current = false
+      stop()
+    }
+  }, [port])
+
   // A delegation the provider announced to this call. It is submitted to the host over this
   // device's own connection, never to the service, and what the row says is what the host answered.
   useEffect(() => {
@@ -242,6 +282,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
               })
             )
             setCall(runningCallFrom(session, state, choice?.admissionMeans ?? ''))
+            setBrokerReachable(true)
           })
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
@@ -309,11 +350,15 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
           })
         )
           .then(() => {
+            setBrokerReachable(true)
             setCall((current) =>
               current ? withRequest(current, requestId, 'voice.context', 'sent') : current
             )
           })
           .catch((error: unknown) => {
+            // A service that cannot be reached is not the same as one that refused: the first
+            // takes the control away until it answers again, and the second leaves it offered.
+            if (failureCode(error) === 'RESOURCE_UNAVAILABLE') setBrokerReachable(false)
             setCall((current) =>
               current
                 ? withRequest(current, requestId, 'voice.context', 'refused', failureMessage(error))
@@ -329,7 +374,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
     <main id="main" tabIndex={-1} data-surface={surface}>
       <VoiceSurface
         choice={choice}
-        call={call}
+        call={call && { ...call, hostReachable, brokerReachable }}
         currentTurn={currentTurn}
         busy={busy}
         notice={notice}

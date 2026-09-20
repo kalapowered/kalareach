@@ -16,14 +16,45 @@ import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
 import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
-function start(): { controls: FakeHostControls; port: HostPort } {
+/** The voice calls this screen made, watched from before it was rendered. */
+type Watched = Record<
+  'voicePrepare' | 'voiceStart' | 'voiceContext' | 'voiceDelegate' | 'voiceSetMuted',
+  ReturnType<typeof vi.fn>
+>
+
+function start(): { controls: FakeHostControls; port: HostPort; watched: Watched } {
   const { port, controls } = fakeHost()
+  // The host's own answers, kept before the screen can reach them, so the count is of what the
+  // screen asked for rather than of a wrapper calling itself.
+  const answers = {
+    voicePrepare: port.voicePrepare.bind(port),
+    voiceStart: port.voiceStart.bind(port),
+    voiceContext: port.voiceContext.bind(port),
+    voiceDelegate: port.voiceDelegate.bind(port),
+    voiceSetMuted: port.voiceSetMuted.bind(port)
+  }
+  const watched = {
+    voicePrepare: vi.fn((...args: Parameters<HostPort['voicePrepare']>) =>
+      answers.voicePrepare(...args)
+    ),
+    voiceStart: vi.fn((...args: Parameters<HostPort['voiceStart']>) => answers.voiceStart(...args)),
+    voiceContext: vi.fn((...args: Parameters<HostPort['voiceContext']>) =>
+      answers.voiceContext(...args)
+    ),
+    voiceDelegate: vi.fn((...args: Parameters<HostPort['voiceDelegate']>) =>
+      answers.voiceDelegate(...args)
+    ),
+    voiceSetMuted: vi.fn((...args: Parameters<HostPort['voiceSetMuted']>) =>
+      answers.voiceSetMuted(...args)
+    )
+  }
+  Object.assign(port, watched)
   render(
     <AppProvider port={port}>
       <VoiceRoute surface="desktop" />
     </AppProvider>
   )
-  return { controls, port }
+  return { controls, port, watched }
 }
 
 /** Waits for the choice screen, which only appears once a host has answered the preparation. */
@@ -37,9 +68,9 @@ describe('before a call exists', () => {
   // KR-REQ-15.19, KR-REQ-15.09: the provider, the scope and the managed access are read from the
   // host before voice starts. None of them is written into this screen.
   it('shows the provider and the scope the host answered, and nothing before it answers', async () => {
-    const { port } = start()
-    const prepare = vi.spyOn(port, 'voicePrepare')
+    const { port, watched } = start()
     expect(screen.queryByText('gpt-live-1')).not.toBeInTheDocument()
+    void port
 
     await waitForChoice()
     expect(screen.getByText('gpt-live-1')).toBeInTheDocument()
@@ -54,8 +85,13 @@ describe('before a call exists', () => {
     expect(within(scope).getByText('the contents of files')).toBeInTheDocument()
     expect(within(scope).getByText(/at most 8,000 tokens/)).toBeInTheDocument()
 
-    // Asking created nothing: the preparation is the only call this screen made.
-    expect(prepare).not.toHaveBeenCalled()
+    // Asking created nothing. Reading what a call would be must not start one, reserve anything
+    // or send any context, so nothing beyond the preparation has been called.
+    expect(watched.voiceStart).not.toHaveBeenCalled()
+    expect(watched.voiceContext).not.toHaveBeenCalled()
+    expect(watched.voiceDelegate).not.toHaveBeenCalled()
+    expect(watched.voiceSetMuted).not.toHaveBeenCalled()
+    expect(watched.voicePrepare).toHaveBeenCalledTimes(1)
   })
 
   // A host that will not answer the preparation leaves the person with its refusal, not with a
@@ -207,9 +243,37 @@ describe('while a call is running', () => {
     controls.setVoiceBrokerReachable(false)
     await person.click(screen.getByRole('button', { name: 'Send what the host selected' }))
 
+    // KR-REQ-15.17: the service going quiet takes its own control away and leaves every local one.
     await waitFor(() => {
-      expect(screen.getByText('The voice service is not answering.')).toBeInTheDocument()
+      expect(
+        screen.getByText(/The voice service is not answering\. Mute, stopping the voice/)
+      ).toBeInTheDocument()
     })
+    expect(screen.getByRole('button', { name: 'Send what the host selected' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Mute microphone' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Stop the voice' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
+  })
+
+  // KR-REQ-15.22: a cancellation is a typed request to the host, so the host going quiet is what
+  // takes it away, and the voice service going quiet is not.
+  it('takes the cancellation away when the host stops answering, and nothing else', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeInTheDocument()
+    })
+
+    controls.setConnected(false)
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeDisabled()
+    })
+    expect(
+      screen.getByText(/This device is not reaching the host\. Mute, stopping the voice/)
+    ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Mute microphone' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
   })
