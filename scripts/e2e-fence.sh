@@ -132,7 +132,6 @@ if ! bash scripts/build-shells.sh --all --no-upstream-tests > "$run_root/build.l
   exit 1
 fi
 grep -E "is current, nothing changed|installed" "$run_root/build.log" || true
-cp "$run_root/build.log" "$artifacts/shell-packages-build.log"
 
 # A second build of one package, from inputs of its own. An installation a person updates holds
 # two builds, and the qualification's replacement case needs two that are really different: the
@@ -150,6 +149,9 @@ if ! bash scripts/build-shells.sh --zsh --no-upstream-tests >> "$run_root/build.
   tail -20 "$run_root/build.log"
   fail "the pinned zsh package could not be put back"
 fi
+# Copied once the log is complete: the restoration above writes into it, and a copy taken before
+# that would leave the run's evidence without the step that put the pinned package back.
+cp "$run_root/build.log" "$artifacts/shell-packages-build.log"
 
 for shell in zsh bash fish; do
   identity="$(cat "$packages/$shell/current" 2>/dev/null || true)"
