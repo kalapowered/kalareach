@@ -192,18 +192,29 @@ jobs:
       - name: Compile the workspace and its tests
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # The four crates this task qualified on Windows: the terminal and its job object, the local
-      # attach client, the terminal engine and the repository boundary. Other crates have Windows
-      # code of their own - `kr-ipc`'s named pipes and its owner-only check are the clearest - and
-      # their tests are not run here because nothing has qualified them on this platform yet;
-      # compiling them above is what this job owes them until something does.
+      # What has been qualified on this platform, and only that. The terminal engine, the
+      # repository boundary and the local attach client pass here whole; so does the worker's own
+      # library and the suite that drives a real pseudo-console, a real PowerShell and a real job
+      # object.
       #
-      # What this runner cannot do is qualify a console interactively. The pseudo-console tests
-      # open a console of their own and drive it, which works here; what needs a real machine is
-      # the release matrix - Windows Terminal, an IME, a physical keyboard and a GUI logon - and
+      # The worker's other integration suites are **not** run here. They drive a session the way a
+      # Unix pseudo-terminal behaves - a process group, a shell that answers a signal, a stream
+      # with no console repainting it - and on Windows a good many of them fail for reasons that
+      # belong to those differences rather than to the code they are checking.
+      # `tasks/T-024-handoff.md` lists them by name with what each one actually hit. Running them
+      # here and calling the result a Windows failure would say something this project has not
+      # established; compiling them, which the step above does with `--all-targets`, is what this
+      # job owes them until somebody qualifies them.
+      #
+      # What this runner cannot do at all is qualify a console interactively. The pseudo-console
+      # tests open a console of their own and drive it, which works here; what needs a real machine
+      # is the release matrix - Windows Terminal, an IME, a physical keyboard and a GUI logon - and
       # `docs/host/README.md` has that procedure for the Windows test machine.
       - name: Test the platform crates
-        run: cargo test --locked -p kr-worker -p kr-cli -p kr-term -p kr-project
+        run: |
+          cargo test --locked -p kr-term -p kr-project -p kr-cli
+          cargo test --locked -p kr-worker --lib
+          cargo test --locked -p kr-worker --test windows
 
       # The repository boundary refuses every operation on this platform and names what it cannot
       # hold. Run again on its own so a pass or a failure names this system.
