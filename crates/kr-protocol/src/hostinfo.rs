@@ -595,14 +595,14 @@ pub mod configuration {
     ) -> std::path::PathBuf {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            if is_normal_linux_install(state_root) {
-                if let Some(config_root) = linux_config_root() {
-                    let prefix = short_prefix(environment_id);
-                    return config_root
-                        .join("environments")
-                        .join(prefix)
-                        .join(FILE_NAME);
-                }
+            if is_normal_linux_install(state_root)
+                && let Some(config_root) = linux_config_root()
+            {
+                let prefix = short_prefix(environment_id);
+                return config_root
+                    .join("environments")
+                    .join(prefix)
+                    .join(FILE_NAME);
             }
         }
         let _ = (state_root, environment_id);
@@ -611,17 +611,17 @@ pub mod configuration {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     fn linux_config_root() -> Option<std::path::PathBuf> {
-        if let Some(value) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !value.is_empty() {
-                return Some(std::path::PathBuf::from(value).join("kalareach"));
-            }
-        }
-        std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(|home| {
-                std::path::PathBuf::from(home)
-                    .join(".config")
-                    .join("kalareach")
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(|value| std::path::PathBuf::from(value).join("kalareach"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| {
+                        std::path::PathBuf::from(home)
+                            .join(".config")
+                            .join("kalareach")
+                    })
             })
     }
 
